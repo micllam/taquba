@@ -296,13 +296,17 @@ mod tests {
     use super::*;
     use taquba::object_store::memory::InMemory;
 
-    #[tokio::test]
-    async fn rejects_invalid_expression() {
-        let q = Arc::new(
+    async fn test_queue() -> Arc<Queue> {
+        Arc::new(
             Queue::open(Arc::new(InMemory::new()), "test")
                 .await
                 .unwrap(),
-        );
+        )
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_expression() {
+        let q = test_queue().await;
         let mut s = CronScheduler::new(q);
         match s.schedule("bad", "this is not a cron", "out", b"x".to_vec()) {
             Err(Error::InvalidExpression { .. }) => {}
@@ -313,11 +317,7 @@ mod tests {
 
     #[tokio::test]
     async fn accepts_valid_posix_expression() {
-        let q = Arc::new(
-            Queue::open(Arc::new(InMemory::new()), "test")
-                .await
-                .unwrap(),
-        );
+        let q = test_queue().await;
         let mut s = CronScheduler::new(q);
         s.schedule("daily", "0 9 * * *", "reports", b"x".to_vec())
             .unwrap();
@@ -329,11 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_duplicate_name() {
-        let q = Arc::new(
-            Queue::open(Arc::new(InMemory::new()), "test")
-                .await
-                .unwrap(),
-        );
+        let q = test_queue().await;
         let mut s = CronScheduler::new(q);
         s.schedule("once", "0 9 * * *", "reports1", b"x".to_vec())
             .unwrap();
@@ -346,11 +342,7 @@ mod tests {
 
     #[tokio::test]
     async fn schedule_options_carries_priority_and_max_attempts() {
-        let q = Arc::new(
-            Queue::open(Arc::new(InMemory::new()), "test")
-                .await
-                .unwrap(),
-        );
+        let q = test_queue().await;
         let mut s = CronScheduler::new(q);
         s.schedule_with(
             "boosted",
@@ -371,16 +363,13 @@ mod tests {
 
     #[tokio::test]
     async fn shuts_down_immediately_when_signal_fires() {
-        let q = Arc::new(
-            Queue::open(Arc::new(InMemory::new()), "test")
-                .await
-                .unwrap(),
-        );
+        let q = test_queue().await;
         let mut s = CronScheduler::new(q);
         s.schedule("daily", "0 9 * * *", "reports", b"x".to_vec())
             .unwrap();
-        // Run scheduler with a future that's ready on first poll. Scheduler should observe
-        // shutdown on its first select! and return immediately rather than sleeping until 9am.
+        // Run scheduler with a future that's ready on first poll. Scheduler
+        // should observe shutdown and return immediately rather than sleeping
+        // until 9am.
         let start = std::time::Instant::now();
         s.run(async {}).await.unwrap();
         assert!(start.elapsed() < Duration::from_secs(1));
