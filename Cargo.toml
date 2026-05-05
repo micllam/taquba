@@ -1,5 +1,5 @@
 [workspace]
-members = ["taquba"]
+members = ["taquba", "taquba-cron"]
 resolver = "2"
 
 [workspace.package]

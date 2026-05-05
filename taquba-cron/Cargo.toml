@@ -1,0 +1,25 @@
+[package]
+name = "taquba-cron"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "POSIX cron-style scheduling on top of the Taquba durable task queue."
+homepage = "https://github.com/micllam/taquba"
+readme = "README.md"
+keywords = ["queue", "cron", "scheduler", "taquba"]
+
+[dependencies]
+taquba = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+croner = "2"
+
+[dev-dependencies]
+# Examples need a multi-thread runtime and Ctrl-C handling on top of the
+# workspace tokio defaults.
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }

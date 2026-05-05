@@ -7,6 +7,7 @@ Backed by object storage via [SlateDB](https://github.com/slatedb/slatedb).
 ## Crates
 
 - [`taquba`](./taquba) — the core durable queue, backed by object storage.
+- [`taquba-cron`](./taquba-cron) — POSIX cron-style scheduling on a Taquba queue.
 
 See each crate's README for details.
 
