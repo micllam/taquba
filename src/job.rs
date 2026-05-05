@@ -33,11 +33,14 @@ pub struct JobRecord {
     /// original enqueue time survives a re-fail cycle.
     pub enqueued_at: u64,
     /// When the most recent claim happened, if the job has ever been claimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimed_at: Option<u64>,
     /// When the current lease expires. `Some` only while `status == Claimed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_expires_at: Option<u64>,
     /// Earliest time at which a scheduled job becomes claimable. `Some` only
     /// while `status == Scheduled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_at: Option<u64>,
     /// Priority bucket; lower numbers are claimed first. See
     /// [`PRIORITY_HIGH`](crate::PRIORITY_HIGH),
@@ -47,18 +50,22 @@ pub struct JobRecord {
     /// The most recent error message reported via
     /// [`Queue::nack`](crate::Queue::nack), or a Taquba-generated message
     /// (e.g. `"lease expired"`) when the reaper dead-letters a job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     /// Set when [`EnqueueOptions::dedup_key`](crate::EnqueueOptions::dedup_key)
     /// was supplied at enqueue. Cleared when the job is first claimed so the
     /// same key can be re-used for a new job after the current one starts
     /// processing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedup_key: Option<String>,
     /// When the job was successfully acked. `Some` only when the record was
     /// kept (see [`OpenOptions::keep_done_jobs`](crate::OpenOptions::keep_done_jobs)).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<u64>,
     /// When the job entered the dead-letter state. Used by the background
     /// retention sweep to age out old dead jobs without depending on
     /// `enqueued_at` (which is stale after a requeue / re-fail cycle).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_at: Option<u64>,
 }
 
