@@ -342,7 +342,7 @@ impl Queue {
         let priority = opts.priority.unwrap_or(cfg.default_priority);
 
         // A `run_at` that is at-or-before now is just an immediate enqueue.
-        let run_at_ms = opts.run_at.and_then(|when| {
+        let run_at = opts.run_at.and_then(|when| {
             let ms = when
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -351,7 +351,7 @@ impl Queue {
         });
 
         let id = Ulid::new().to_string();
-        let (status, key) = match run_at_ms {
+        let (status, key) = match run_at {
             Some(ms) => (JobStatus::Scheduled, scheduled_key(queue, ms, &id)),
             None => (JobStatus::Pending, pending_key(queue, priority, &id)),
         };
@@ -366,7 +366,7 @@ impl Queue {
             enqueued_at: now_ms(),
             claimed_at: None,
             lease_expires_at: None,
-            run_at: run_at_ms,
+            run_at,
             priority,
             last_error: None,
             dedup_key: opts.dedup_key.clone(),
@@ -405,7 +405,7 @@ impl Queue {
             self.job_available.notify_waiters();
         }
 
-        debug!(queue = %queue, job_id = %id, priority, run_at_ms = ?run_at, "job enqueued");
+        debug!(queue = %queue, job_id = %id, priority, ?run_at, "job enqueued");
         Ok(id)
     }
 
@@ -659,10 +659,10 @@ impl Queue {
                     "job re-queued"
                 );
             } else {
-                let run_at_ms = now_ms() + backoff.as_millis() as u64;
+                let run_at = now_ms() + backoff.as_millis() as u64;
                 job.status = JobStatus::Scheduled;
-                job.run_at = Some(run_at_ms);
-                let scheduled = scheduled_key(&job.queue, run_at_ms, &job.id);
+                job.run_at = Some(run_at);
+                let scheduled = scheduled_key(&job.queue, run_at, &job.id);
                 let value = rmp_serde::to_vec_named(&job)?;
                 txn.put(scheduled.as_bytes(), &value)?;
                 txn.put(job_index_key(&job.id).as_bytes(), scheduled.as_bytes())?;
