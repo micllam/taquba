@@ -9,7 +9,7 @@ license = "Apache-2.0"
 repository = "https://github.com/micllam/taquba"
 
 [workspace.dependencies]
-taquba = { path = "taquba", version = "0.1.0" }
+taquba = { path = "taquba", version = "0.2.0" }
 
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
