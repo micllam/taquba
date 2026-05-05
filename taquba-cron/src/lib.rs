@@ -82,9 +82,8 @@ pub enum Error {
 /// Result alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Per-schedule overrides for [`CronScheduler::schedule_with`]. Construct
-/// via [`ScheduleOptions::default`] + struct-update syntax so adding new
-/// fields in future versions is non-breaking:
+/// Per-schedule overrides for [`CronScheduler::schedule_with`]. Construct via
+/// [`ScheduleOptions::default`] + struct-update syntax:
 ///
 /// ```
 /// use std::collections::HashMap;
@@ -92,6 +91,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// let opts = ScheduleOptions {
 ///     headers: HashMap::from([("target_url".into(), "https://example.com/hook".into())]),
+///     priority: Some(taquba::PRIORITY_HIGH),
 ///     ..ScheduleOptions::default()
 /// };
 /// ```
@@ -101,6 +101,14 @@ pub struct ScheduleOptions {
     /// schedule. Useful for cron-driven webhooks (target URL, signing key
     /// id) or alert routing metadata.
     pub headers: HashMap<String, String>,
+    /// Override the queue's `default_priority` for jobs produced by this
+    /// schedule. `None` (default) inherits the queue config. Lower numbers
+    /// are claimed first; see [`taquba::PRIORITY_HIGH`], [`taquba::PRIORITY_NORMAL`],
+    /// [`taquba::PRIORITY_LOW`].
+    pub priority: Option<u32>,
+    /// Override the queue's `max_attempts` for jobs produced by this
+    /// schedule. `None` (default) inherits the queue config.
+    pub max_attempts: Option<u32>,
 }
 
 struct ScheduleEntry {
@@ -109,6 +117,8 @@ struct ScheduleEntry {
     target_queue: String,
     payload: Vec<u8>,
     headers: HashMap<String, String>,
+    priority: Option<u32>,
+    max_attempts: Option<u32>,
 }
 
 /// A single-process cron scheduler that enqueues jobs onto a [`Queue`] when
@@ -174,6 +184,8 @@ impl CronScheduler {
             target_queue: target_queue.into(),
             payload,
             headers: opts.headers,
+            priority: opts.priority,
+            max_attempts: opts.max_attempts,
         });
         Ok(self)
     }
@@ -250,6 +262,8 @@ impl CronScheduler {
                 let opts = EnqueueOptions {
                     dedup_key: Some(format!("cron:{}:{}", entry.name, fire_ms)),
                     headers: entry.headers.clone(),
+                    priority: entry.priority,
+                    max_attempts: entry.max_attempts,
                     ..Default::default()
                 };
                 match queue
@@ -304,6 +318,31 @@ mod tests {
             .unwrap();
         s.schedule("weekday-am", "0 9 * * 1-5", "reports", b"z".to_vec())
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_options_carries_priority_and_max_attempts() {
+        let q = Arc::new(
+            Queue::open(Arc::new(InMemory::new()), "test")
+                .await
+                .unwrap(),
+        );
+        let mut s = CronScheduler::new(q);
+        s.schedule_with(
+            "boosted",
+            "0 9 * * *",
+            "reports",
+            b"x".to_vec(),
+            ScheduleOptions {
+                priority: Some(taquba::PRIORITY_HIGH),
+                max_attempts: Some(7),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let entry = &s.entries[0];
+        assert_eq!(entry.priority, Some(taquba::PRIORITY_HIGH));
+        assert_eq!(entry.max_attempts, Some(7));
     }
 
     #[tokio::test]

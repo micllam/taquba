@@ -25,6 +25,23 @@ scheduler.run(std::future::pending::<()>()).await?;
 # Ok(()) }
 ```
 
+## Per-schedule options
+
+`schedule_with` accepts a `ScheduleOptions` for per-schedule overrides
+(HTTP-style headers, priority, max attempts):
+
+```rust
+# use std::collections::HashMap;
+use taquba_cron::ScheduleOptions;
+
+let opts = ScheduleOptions {
+    headers: HashMap::from([("target_url".into(), "https://example.com/hook".into())]),
+    priority: Some(taquba::PRIORITY_HIGH),
+    max_attempts: Some(10),
+    ..Default::default()
+};
+```
+
 ## Cron syntax
 
 Expressions are 5-field POSIX cron, parsed by [`croner`](https://crates.io/crates/croner):
