@@ -74,6 +74,9 @@ pub enum Error {
         /// Parser-supplied diagnostic message.
         message: String,
     },
+    /// A schedule with this name is already registered.
+    #[error("schedule `{0}` already exists")]
+    DuplicateName(String),
     /// Underlying error from a Taquba queue operation.
     #[error(transparent)]
     Queue(#[from] taquba::Error),
@@ -172,6 +175,10 @@ impl CronScheduler {
         payload: Vec<u8>,
         opts: ScheduleOptions,
     ) -> Result<&mut Self> {
+        let name = name.into();
+        if self.entries.iter().any(|e| e.name == name) {
+            return Err(Error::DuplicateName(name));
+        }
         let parsed = Cron::new(expression)
             .parse()
             .map_err(|e| Error::InvalidExpression {
@@ -179,7 +186,7 @@ impl CronScheduler {
                 message: e.to_string(),
             })?;
         self.entries.push(ScheduleEntry {
-            name: name.into(),
+            name,
             expression: parsed,
             target_queue: target_queue.into(),
             payload,
@@ -318,6 +325,23 @@ mod tests {
             .unwrap();
         s.schedule("weekday-am", "0 9 * * 1-5", "reports", b"z".to_vec())
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_name() {
+        let q = Arc::new(
+            Queue::open(Arc::new(InMemory::new()), "test")
+                .await
+                .unwrap(),
+        );
+        let mut s = CronScheduler::new(q);
+        s.schedule("once", "0 9 * * *", "reports1", b"x".to_vec())
+            .unwrap();
+        match s.schedule("once", "0 10 * * *", "reports2", b"y".to_vec()) {
+            Err(Error::DuplicateName(name)) => assert_eq!(name, "once"),
+            Err(other) => panic!("expected DuplicateName, got {other:?}"),
+            Ok(_) => panic!("expected DuplicateName"),
+        }
     }
 
     #[tokio::test]
