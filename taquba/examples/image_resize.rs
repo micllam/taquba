@@ -1,4 +1,4 @@
-// cargo run --example image_resize
+// cargo run -p taquba --example image_resize
 //
 // Demonstrates a realistic image-processing queue with:
 //

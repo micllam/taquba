@@ -1,4 +1,4 @@
-// cargo run --example email_queue
+// cargo run -p taquba --example email_queue
 //
 // Demonstrates a realistic email notification queue with two tiers:
 //

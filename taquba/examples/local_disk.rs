@@ -1,4 +1,4 @@
-// cargo run --example local_disk
+// cargo run -p taquba --example local_disk
 //
 // Demonstrates taquba backed by the local filesystem.
 // Jobs written in one run survive process restarts; run it twice to see

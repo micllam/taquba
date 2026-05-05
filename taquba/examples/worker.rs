@@ -1,4 +1,4 @@
-// cargo run --example worker
+// cargo run -p taquba --example worker
 //
 // Demonstrates the Worker trait. Implement `process` and taquba handles
 // the claim / ack / nack loop automatically, including retry on failure.

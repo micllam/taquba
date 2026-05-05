@@ -1,0 +1,31 @@
+[package]
+name = "taquba"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A durable, single-process task queue for Rust backed by object storage, built on SlateDB."
+homepage = "https://github.com/micllam/taquba"
+readme = "README.md"
+keywords = ["queue", "task", "worker", "slatedb"]
+
+[features]
+# No backend is enabled by default; the in-memory and local-disk stores work
+# without any feature.
+default = []
+aws = ["slatedb/aws"]
+gcp = ["slatedb/gcp"]
+azure = ["slatedb/azure"]
+
+[dependencies]
+# We always pull in SlateDB's `foyer` cache feature.
+slatedb = { version = "0.12", default-features = false, features = ["foyer"] }
+ulid = { version = "1", features = ["serde"] }
+rmp-serde = "1"
+bytes = "1"
+
+tokio = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

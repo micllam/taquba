@@ -1,4 +1,4 @@
-// cargo run --example in_memory
+// cargo run -p taquba --example in_memory
 //
 // Demonstrates the core taquba API using an in-memory store.
 // Nothing is persisted: the queue disappears when the process exits.

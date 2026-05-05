@@ -1,113 +1,14 @@
-# taquba
+# Taquba
 
-A durable, single-process task queue for Rust, backed by object storage. Built
-on [SlateDB](https://github.com/slatedb/slatedb).
+A durable, single-process task queue for Rust, plus higher-level patterns built on top.
 
-Taquba uses SlateDB's single-writer model: all producers and workers for a
-given store **must run inside one process**.
+Backed by object storage via [SlateDB](https://github.com/slatedb/slatedb).
 
-Taquba is the right fit when you want durable background jobs whose state
-survives node loss, ephemeral disks, and region failures - without operating a
-queue server.
+## Crates
 
-## Features
+- [`taquba`](./taquba) — the core durable queue, backed by object storage.
 
-- At-least-once delivery with lease-based claims and crash recovery.
-- Multiple named queues per store with per-queue configuration.
-- Priority levels (FIFO within each priority).
-- Scheduled jobs, dedup keys, custom priority/attempts.
-- Exponential retry backoff on `nack`.
-- Bounded dead-letter retention with paginated inspection.
-- Atomic batch enqueue.
-- Worker loop with graceful shutdown and notify-based wakeups (no busy polling).
-
-## Stability
-
-Taquba is pre-1.0. The Rust API may evolve between minor versions per Cargo's
-standard `0.x.y` semantics (`0.1` -> `0.2` may break source compatibility), and
-the on-disk format on object storage is *not* guaranteed stable across minor
-versions either. Treat a Taquba minor-version bump as a one-way migration:
-drain your queue first, or be prepared to start the bucket fresh.
-
-Patch releases (`0.1.0` -> `0.1.1`) preserve both the Rust API and the on-disk
-format.
-
-## Install
-
-The in-memory and local-disk stores work with no feature flag, handy for
-tests and the quick-start below:
-
-```toml
-[dependencies]
-taquba = "0.1"
-tokio = { version = "1", features = ["full"] }
-```
-
-For production, opt in to exactly one cloud backend:
-
-```toml
-taquba = { version = "0.1", features = ["aws"] }   # S3 / MinIO
-taquba = { version = "0.1", features = ["gcp"] }   # Google Cloud Storage
-taquba = { version = "0.1", features = ["azure"] } # Azure Blob
-```
-
-## Quick start
-
-```rust
-use std::sync::Arc;
-use std::time::Duration;
-use taquba::{Queue, object_store::memory::InMemory};
-
-#[tokio::main]
-async fn main() -> taquba::Result<()> {
-    let q = Queue::open(Arc::new(InMemory::new()), "demo").await?;
-
-    q.enqueue("email", b"alice@example.com".to_vec()).await?;
-
-    if let Some(job) = q.claim("email", Duration::from_secs(30)).await? {
-        // ... do the work ...
-        q.ack(&job).await?;
-    }
-
-    q.close().await
-}
-```
-
-## Worker loop
-
-Implement `Worker` and let `run_worker` handle the claim / ack / nack
-loop, retries, and graceful shutdown:
-
-```rust
-use taquba::{run_worker, JobRecord, Worker, WorkerError};
-
-struct EmailWorker;
-
-impl Worker for EmailWorker {
-    async fn process(&self, job: &JobRecord) -> Result<(), WorkerError> {
-        let to = std::str::from_utf8(&job.payload)?;
-        send_email(to).await?;
-        Ok(())
-    }
-}
-```
-
-Pass any future as the shutdown signal: `tokio::signal::ctrl_c()`,
-a oneshot, etc. Shutdown is honoured at safe points: between jobs and during
-idle waits. In-flight jobs always finish, so leases are never abandoned to the
-reaper. See [`examples/worker.rs`](examples/worker.rs) for a full setup.
-
-## Examples
-
-| Example | What it shows |
-|---|---|
-| [`in_memory`](examples/in_memory.rs) | Core API: enqueue, claim, ack, nack, dead-letter |
-| [`local_disk`](examples/local_disk.rs) | Persistence across restarts |
-| [`worker`](examples/worker.rs) | `Worker` trait with retry and graceful shutdown |
-| [`email_queue`](examples/email_queue.rs) | Two priority tiers and per-queue config |
-| [`image_resize`](examples/image_resize.rs) | Structured payloads, scheduled jobs, priority |
-
-Run any of them with `cargo run --example <name>`.
+See each crate's README for details.
 
 ## License
 
