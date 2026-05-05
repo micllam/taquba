@@ -193,6 +193,12 @@ pub struct EnqueueOptions {
     /// released when the job is claimed, so re-enqueueing after processing
     /// begins is allowed.
     pub dedup_key: Option<String>,
+    /// Arbitrary string-keyed metadata to attach to the job. Stored alongside
+    /// the payload and surfaced as [`JobRecord::headers`]. Useful for fields
+    /// that should stay separable from the opaque payload, e.g. webhook
+    /// delivery metadata (URL, HTTP headers, signing key id) or cron-style
+    /// metadata (schedule name, nominal fire time). Defaults to empty.
+    pub headers: HashMap<String, String>,
 }
 
 /// A durable task queue backed by object storage.
@@ -353,6 +359,7 @@ impl Queue {
             id,
             queue: queue.to_string(),
             payload,
+            headers: opts.headers,
             status,
             attempts: 0,
             max_attempts,
@@ -917,6 +924,7 @@ impl Queue {
                 id: id.clone(),
                 queue: queue.to_string(),
                 payload,
+                headers: HashMap::new(),
                 status: JobStatus::Pending,
                 attempts: 0,
                 max_attempts,

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// A single job stored in a Taquba queue.
@@ -20,6 +22,14 @@ pub struct JobRecord {
     pub queue: String,
     /// Application-defined payload.
     pub payload: Vec<u8>,
+    /// Optional string-keyed metadata stored alongside the payload. Useful for
+    /// data that benefits from being separable from the opaque body, e.g. HTTP
+    /// headers or a target URL for a webhook delivery, or a schedule name and
+    /// nominal run time for a cron-style job. Set via
+    /// [`EnqueueOptions::headers`](crate::EnqueueOptions::headers); defaults to
+    /// empty.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub headers: HashMap<String, String>,
     /// Current lifecycle state.
     pub status: JobStatus,
     /// How many delivery attempts have been started so far. Incremented on
