@@ -11,6 +11,44 @@ use crate::queue::Queue;
 /// Boxed error type returned from [`Worker::process`].
 pub type WorkerError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// Marker error: returning this from [`Worker::process`] dead-letters the job
+/// immediately rather than retrying. The runner records the error's `Display`
+/// output in the job's `last_error` field.
+///
+/// Use when the failure is *known* not to recover on retry.
+///
+/// ```rust,ignore
+/// async fn process(&self, job: &JobRecord) -> Result<(), WorkerError> {
+///     match http.send(...).await {
+///         Ok(_) => Ok(()),
+///         Err(e) if e.is_4xx() => Err(PermanentFailure::new(e.to_string()).into()),
+///         Err(e) => Err(e.into()),
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct PermanentFailure {
+    /// Human-readable reason; recorded on the job's `last_error` field.
+    pub reason: String,
+}
+
+impl PermanentFailure {
+    /// Build a [`PermanentFailure`] with a human-readable reason.
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for PermanentFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for PermanentFailure {}
+
 /// Implement this trait to define how a job is processed.
 ///
 /// # Example
@@ -82,6 +120,9 @@ where
                 // the job we just took the lease on.
                 match worker.process(&job).await {
                     Ok(()) => queue_handle.ack(&job).await?,
+                    Err(e) if e.downcast_ref::<PermanentFailure>().is_some() => {
+                        queue_handle.dead_letter(job, &e.to_string()).await?
+                    }
                     Err(e) => queue_handle.nack(job, &e.to_string()).await?,
                 }
                 if check_shutdown(shutdown.as_mut()) {
@@ -167,6 +208,11 @@ where
                         Ok(()) => {
                             if let Err(e) = q.ack(&job).await {
                                 warn!(queue = %queue_owned, job_id = %job.id, "ack failed: {e}");
+                            }
+                        }
+                        Err(e) if e.downcast_ref::<PermanentFailure>().is_some() => {
+                            if let Err(se) = q.dead_letter(job, &e.to_string()).await {
+                                warn!(queue = %queue_owned, "dead_letter failed: {se}");
                             }
                         }
                         Err(e) => {

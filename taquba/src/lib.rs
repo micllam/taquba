@@ -97,6 +97,6 @@ pub use queue::{
     EnqueueOptions, OpenOptions, PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_NORMAL, Queue, QueueConfig,
 };
 pub use stats::QueueStats;
-pub use worker::{Worker, WorkerError, run_worker, run_worker_concurrent};
+pub use worker::{PermanentFailure, Worker, WorkerError, run_worker, run_worker_concurrent};
 
 pub use slatedb::object_store;

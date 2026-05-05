@@ -691,6 +691,48 @@ impl Queue {
         Ok(())
     }
 
+    /// Dead-letter a claimed job immediately, regardless of its `attempts`.
+    /// Use this when the failure is *known* to be permanent and retrying
+    /// would be wasted work.
+    ///
+    /// Unlike [`Self::nack`], this does not increment `attempts` or schedule
+    /// a backoff: the job goes straight to the dead-letter set.
+    /// [`worker::run_worker`](crate::worker::run_worker) and
+    /// [`worker::run_worker_concurrent`](crate::worker::run_worker_concurrent)
+    /// call this automatically when a worker returns
+    /// [`worker::PermanentFailure`](crate::worker::PermanentFailure).
+    #[instrument(skip(self, job), fields(queue = %job.queue, job_id = %job.id))]
+    pub async fn dead_letter(&self, mut job: JobRecord, reason: &str) -> Result<()> {
+        let lease_expires_at = job.lease_expires_at.ok_or(Error::InvalidState)?;
+        let claimed = claimed_key(&job.queue, lease_expires_at, &job.id);
+        job.last_error = Some(reason.to_string());
+        job.status = JobStatus::Dead;
+        job.failed_at = Some(now_ms());
+        job.claimed_at = None;
+        job.lease_expires_at = None;
+
+        let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+        txn.delete(claimed.as_bytes())?;
+        let dead = dead_key(&job.queue, &job.id);
+        let value = rmp_serde::to_vec_named(&job)?;
+        txn.put(dead.as_bytes(), &value)?;
+        txn.put(job_index_key(&job.id).as_bytes(), dead.as_bytes())?;
+        update_stats(
+            &txn,
+            &job.queue,
+            &[(JobStatus::Claimed, -1), (JobStatus::Dead, 1)],
+        )?;
+        txn.commit().await?;
+
+        warn!(
+            queue = %job.queue,
+            job_id = %job.id,
+            attempts = job.attempts,
+            "job dead-lettered (permanent failure)"
+        );
+        Ok(())
+    }
+
     /// Return a snapshot of job counts for the given queue.
     pub async fn stats(&self, queue: &str) -> Result<QueueStats> {
         read_stats(&self.db, queue).await
@@ -1833,6 +1875,99 @@ mod tests {
         assert_eq!(j2.payload, b"normal");
 
         q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dead_letter_skips_attempts_check() {
+        // dead_letter() should move a job claimed -> dead unconditionally,
+        // without bumping attempts or honouring max_attempts.
+        let q = Queue::open_with_options(
+            make_store(),
+            "test",
+            OpenOptions {
+                queue_configs: HashMap::from([(
+                    "work".to_string(),
+                    QueueConfig {
+                        max_attempts: 5,
+                        ..QueueConfig::default()
+                    },
+                )]),
+                ..OpenOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let claimed = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.attempts, 1);
+
+        q.dead_letter(claimed, "permanent failure").await.unwrap();
+
+        let job = q.get_job(&id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Dead);
+        assert_eq!(job.attempts, 1, "attempts should not be incremented");
+        assert_eq!(job.last_error.as_deref(), Some("permanent failure"));
+        assert!(job.failed_at.is_some());
+
+        let stats = q.stats("work").await.unwrap();
+        assert_eq!(stats.dead, 1);
+        assert_eq!(stats.claimed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_run_worker_dead_letters_on_permanent_failure() {
+        // A Worker returning PermanentFailure should dead-letter immediately,
+        // skipping the retry/backoff path that a plain error takes.
+        use crate::worker::{PermanentFailure, Worker, WorkerError, run_worker};
+
+        struct PermanentFailWorker;
+        impl Worker for PermanentFailWorker {
+            async fn process(&self, _job: &JobRecord) -> std::result::Result<(), WorkerError> {
+                Err(PermanentFailure::new("HTTP 410 Gone").into())
+            }
+        }
+
+        let q = Arc::new(Queue::open(make_store(), "test").await.unwrap());
+        let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let q2 = q.clone();
+        let handle = tokio::spawn(async move {
+            run_worker(
+                &q2,
+                "work",
+                &PermanentFailWorker,
+                Duration::from_millis(10),
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        // Wait for the dead counter to tick, then shut down.
+        loop {
+            let s = q.stats("work").await.unwrap();
+            if s.dead > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let _ = shutdown_tx.send(());
+        let _ = handle.await;
+
+        let job = q.get_job(&id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Dead);
+        assert_eq!(
+            job.attempts, 1,
+            "PermanentFailure should not consume retries"
+        );
+        assert_eq!(job.last_error.as_deref(), Some("HTTP 410 Gone"));
     }
 
     #[tokio::test]
