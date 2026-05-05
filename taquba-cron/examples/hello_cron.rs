@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     tokio::select! {
-        _ = tokio::time::sleep(Duration::from_mins(10)) => {
+        _ = tokio::time::sleep(Duration::from_secs(600)) => {
             println!("\nTime's up; shutting down.");
         }
         _ = tokio::signal::ctrl_c() => {
