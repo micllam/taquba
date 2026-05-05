@@ -344,32 +344,13 @@ impl Queue {
             (ms > now_ms()).then_some(ms)
         });
 
-        if let Some(dkey) = opts.dedup_key {
-            self.write_unique(queue, payload, max_attempts, priority, run_at_ms, dkey)
-                .await
-        } else {
-            self.write_new(queue, payload, max_attempts, priority, run_at_ms)
-                .await
-        }
-    }
-
-    /// Build, persist, and announce a brand-new job. Used by the non-dedup
-    /// path of [`Self::enqueue_with`].
-    async fn write_new(
-        &self,
-        queue: &str,
-        payload: Vec<u8>,
-        max_attempts: u32,
-        priority: u32,
-        run_at_ms: Option<u64>,
-    ) -> Result<String> {
         let id = Ulid::new().to_string();
         let (status, key) = match run_at_ms {
             Some(ms) => (JobStatus::Scheduled, scheduled_key(queue, ms, &id)),
             None => (JobStatus::Pending, pending_key(queue, priority, &id)),
         };
         let job = JobRecord {
-            id: id.clone(),
+            id,
             queue: queue.to_string(),
             payload,
             status,
@@ -381,16 +362,34 @@ impl Queue {
             run_at: run_at_ms,
             priority,
             last_error: None,
-            dedup_key: None,
+            dedup_key: opts.dedup_key.clone(),
             completed_at: None,
             failed_at: None,
         };
+
+        match opts.dedup_key {
+            Some(dk) => self.write_unique(job, key, dk).await,
+            None => self.write_new(job, key).await,
+        }
+    }
+
+    /// Persist and announce a brand-new job. Used by the non-dedup path of
+    /// [`Self::enqueue_with`].
+    async fn write_new(&self, job: JobRecord, key: String) -> Result<String> {
         let value = rmp_serde::to_vec_named(&job)?;
+        let JobRecord {
+            id,
+            queue,
+            status,
+            priority,
+            run_at,
+            ..
+        } = job;
 
         let txn = self.db.begin(IsolationLevel::Snapshot).await?;
         txn.put(key.as_bytes(), &value)?;
         txn.put(job_index_key(&id).as_bytes(), key.as_bytes())?;
-        update_stats(&txn, queue, &[(status, 1)])?;
+        update_stats(&txn, &queue, &[(status, 1)])?;
         txn.commit().await?;
 
         // Workers can claim a Pending job immediately; a Scheduled job becomes
@@ -399,48 +398,19 @@ impl Queue {
             self.job_available.notify_waiters();
         }
 
-        debug!(queue = queue, job_id = %id, priority, ?run_at_ms, "job enqueued");
+        debug!(queue = %queue, job_id = %id, priority, run_at_ms = ?run_at, "job enqueued");
         Ok(id)
     }
 
     /// Dedup-aware variant: writes a pending or scheduled job behind a
     /// `dedup:` index entry, or returns the existing ID if the index already
     /// points somewhere. Retries on transaction conflict.
-    async fn write_unique(
-        &self,
-        queue: &str,
-        payload: Vec<u8>,
-        max_attempts: u32,
-        priority: u32,
-        run_at_ms: Option<u64>,
-        dedup_key: String,
-    ) -> Result<String> {
-        let dkey = dedup_index_key(queue, &dedup_key);
-        let id = Ulid::new().to_string();
-        let (status, key) = match run_at_ms {
-            Some(ms) => (JobStatus::Scheduled, scheduled_key(queue, ms, &id)),
-            None => (JobStatus::Pending, pending_key(queue, priority, &id)),
-        };
-        // Build and serialize the record once; re-trying on transaction
-        // conflict re-uses the same bytes and avoids cloning the payload.
-        let job = JobRecord {
-            id: id.clone(),
-            queue: queue.to_string(),
-            payload,
-            status,
-            attempts: 0,
-            max_attempts,
-            enqueued_at: now_ms(),
-            claimed_at: None,
-            lease_expires_at: None,
-            run_at: run_at_ms,
-            priority,
-            last_error: None,
-            dedup_key: Some(dedup_key.clone()),
-            completed_at: None,
-            failed_at: None,
-        };
+    async fn write_unique(&self, job: JobRecord, key: String, dedup_key: String) -> Result<String> {
+        let dkey = dedup_index_key(&job.queue, &dedup_key);
         let value = rmp_serde::to_vec_named(&job)?;
+        let JobRecord {
+            id, queue, status, ..
+        } = job;
 
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
@@ -454,14 +424,14 @@ impl Queue {
             txn.put(key.as_bytes(), &value)?;
             txn.put(job_index_key(&id).as_bytes(), key.as_bytes())?;
             txn.put(dkey.as_bytes(), id.as_bytes())?;
-            update_stats(&txn, queue, &[(status, 1)])?;
+            update_stats(&txn, &queue, &[(status, 1)])?;
 
             match txn.commit().await {
                 Ok(_) => {
                     if matches!(status, JobStatus::Pending) {
                         self.job_available.notify_waiters();
                     }
-                    debug!(queue = queue, job_id = %id, dedup_key, "unique job enqueued");
+                    debug!(queue = %queue, job_id = %id, dedup_key, "unique job enqueued");
                     return Ok(id);
                 }
                 Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
