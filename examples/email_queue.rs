@@ -201,11 +201,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
     });
 
-    // Wait for both queues to drain.
+    // Wait for both queues to drain. Note that a nacked job sits in
+    // retry-backoff under `Scheduled` between attempts.
     loop {
         let ts = q.stats("transactional").await?;
         let ms = q.stats("marketing").await?;
-        if ts.pending == 0 && ts.claimed == 0 && ms.pending == 0 && ms.claimed == 0 {
+        if ts.pending == 0
+            && ts.claimed == 0
+            && ts.scheduled == 0
+            && ms.pending == 0
+            && ms.claimed == 0
+            && ms.scheduled == 0
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
