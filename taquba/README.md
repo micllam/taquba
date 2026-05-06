@@ -37,18 +37,17 @@ format.
 The in-memory and local-disk stores work with no feature flag, handy for
 tests and the quick-start below:
 
-```toml
-[dependencies]
-taquba = "0.1"
-tokio = { version = "1", features = ["full"] }
+```bash
+cargo add taquba
+cargo add tokio --features full
 ```
 
 For production, opt in to exactly one cloud backend:
 
-```toml
-taquba = { version = "0.1", features = ["aws"] }   # S3 / MinIO
-taquba = { version = "0.1", features = ["gcp"] }   # Google Cloud Storage
-taquba = { version = "0.1", features = ["azure"] } # Azure Blob
+```bash
+cargo add taquba --features aws    # S3 / MinIO
+cargo add taquba --features gcp    # Google Cloud Storage
+cargo add taquba --features azure  # Azure Blob
 ```
 
 ## Quick start

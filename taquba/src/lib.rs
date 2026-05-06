@@ -70,10 +70,10 @@
 //! No backend is enabled by default: the in-memory and local-disk stores work
 //! without any feature. Pick exactly one for production:
 //!
-//! ```toml
-//! taquba = { version = "0.1", features = ["aws"] }   # S3 / MinIO
-//! taquba = { version = "0.1", features = ["gcp"] }   # Google Cloud Storage
-//! taquba = { version = "0.1", features = ["azure"] } # Azure Blob
+//! ```bash
+//! cargo add taquba --features aws    # S3 / MinIO
+//! cargo add taquba --features gcp    # Google Cloud Storage
+//! cargo add taquba --features azure  # Azure Blob
 //! ```
 //!
 //! [SlateDB]: https://github.com/slatedb/slatedb
