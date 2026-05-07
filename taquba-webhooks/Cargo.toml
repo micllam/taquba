@@ -1,0 +1,26 @@
+[package]
+name = "taquba-webhooks"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP webhook delivery on top of the Taquba durable task queue."
+homepage = "https://github.com/micllam/taquba"
+readme = "README.md"
+keywords = ["queue", "webhook", "http", "taquba"]
+
+[dependencies]
+taquba = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+[dev-dependencies]
+# The hello_webhook example spins up an axum HTTP listener and uses
+# `#[tokio::main]`, so it needs net + rt-multi-thread on top of the workspace
+# tokio defaults.
+tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
+axum = "0.8"
