@@ -2,7 +2,8 @@
 //!
 //! Register named cron expressions paired with a payload; when each
 //! expression's firing time arrives, the corresponding payload is enqueued
-//! onto a Taquba queue.
+//! onto a Taquba queue. The scheduler is single-process and event-driven
+//! (sleeps until the next firing rather than polling on a fixed interval).
 //!
 //! # Quick start
 //!
@@ -19,6 +20,23 @@
 //!
 //! scheduler.run(std::future::pending::<()>()).await?;
 //! # Ok(()) }
+//! ```
+//!
+//! # Per-schedule options
+//!
+//! [`CronScheduler::schedule_with`] accepts a [`ScheduleOptions`] for
+//! per-schedule overrides (HTTP-style headers, priority, max attempts):
+//!
+//! ```
+//! use std::collections::HashMap;
+//! use taquba_cron::ScheduleOptions;
+//!
+//! let opts = ScheduleOptions {
+//!     headers: HashMap::from([("target_url".into(), "https://example.com/hook".into())]),
+//!     priority: Some(taquba::PRIORITY_HIGH),
+//!     max_attempts: Some(10),
+//!     ..Default::default()
+//! };
 //! ```
 //!
 //! # Cron syntax
