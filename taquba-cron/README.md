@@ -7,6 +7,13 @@ firing time arrives, the corresponding payload is enqueued onto a Taquba
 queue. The scheduler is single-process and event-driven (sleeps until the
 next firing rather than polling on a fixed interval).
 
+## Install
+
+```bash
+cargo add taquba-cron taquba
+cargo add tokio --features full
+```
+
 ## Quick start
 
 ```rust
@@ -14,15 +21,17 @@ use std::sync::Arc;
 use taquba::{Queue, object_store::memory::InMemory};
 use taquba_cron::CronScheduler;
 
-# async fn run() -> Result<(), Box<dyn std::error::Error>> {
-let queue = Arc::new(Queue::open(Arc::new(InMemory::new()), "demo").await?);
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = Arc::new(Queue::open(Arc::new(InMemory::new()), "demo").await?);
 
-let mut scheduler = CronScheduler::new(queue);
-scheduler.schedule("daily-report", "0 9 * * *", "reports", b"daily".to_vec())?;
-scheduler.schedule("hourly-sweep", "0 * * * *", "sweeps",  b"sweep".to_vec())?;
+    let mut scheduler = CronScheduler::new(queue);
+    scheduler.schedule("daily-report", "0 9 * * *", "reports", b"daily".to_vec())?;
+    scheduler.schedule("hourly-sweep", "0 * * * *", "sweeps",  b"sweep".to_vec())?;
 
-scheduler.run(std::future::pending::<()>()).await?;
-# Ok(()) }
+    scheduler.run(std::future::pending::<()>()).await?;
+    Ok(())
+}
 ```
 
 ## Per-schedule options
@@ -31,7 +40,7 @@ scheduler.run(std::future::pending::<()>()).await?;
 (HTTP-style headers, priority, max attempts):
 
 ```rust
-# use std::collections::HashMap;
+use std::collections::HashMap;
 use taquba_cron::ScheduleOptions;
 
 let opts = ScheduleOptions {
