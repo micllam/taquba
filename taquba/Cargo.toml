@@ -18,6 +18,11 @@ aws = ["slatedb/aws"]
 gcp = ["slatedb/gcp"]
 azure = ["slatedb/azure"]
 
+[package.metadata.docs.rs]
+# Build docs with every feature on so each backend's docs are visible on
+# docs.rs. They compile together; users pick one per deployment.
+all-features = true
+
 [dependencies]
 # We always pull in SlateDB's `foyer` cache feature.
 slatedb = { version = "0.12", default-features = false, features = ["foyer"] }
