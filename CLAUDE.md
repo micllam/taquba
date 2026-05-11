@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Workspace: `taquba` core, plus `taquba-cron` and `taquba-webhooks` built on it. See each crate's README for surface-level usage.
+Workspace: `taquba` core, plus `taquba-cron`, `taquba-webhooks`, and `taquba-workflow` built on it. See each crate's README for surface-level usage.
 
 ## Build / test
 
