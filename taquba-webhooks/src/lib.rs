@@ -70,6 +70,8 @@
 //! [`WebhookWorker::with_delivery_id_header`]) carrying [`taquba::JobRecord::id`].
 //! Taquba is at-least-once, so receivers must dedupe on this header to handle
 //! retries correctly.
+//!
+//! [Taquba]: https://docs.rs/taquba
 
 #![warn(missing_docs)]
 
