@@ -68,6 +68,8 @@
 //!   must be owned by at most one [`CronScheduler`] at a time.
 //! - **No persistence.** Schedules live only in memory; rebuild them in code
 //!   on startup. The *enqueued jobs* are durable via Taquba.
+//!
+//! [Taquba]: https://docs.rs/taquba
 
 #![warn(missing_docs)]
 
