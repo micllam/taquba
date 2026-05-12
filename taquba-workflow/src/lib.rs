@@ -17,7 +17,8 @@
 //!
 //! `taquba-workflow` is an **imperative step orchestrator**: at each step,
 //! the runner code decides what happens next by returning a
-//! [`StepOutcome`] (Continue, Succeed, Fail). It is *not*:
+//! [`StepOutcome`] (Continue, Succeed, Fail, Cancel). External cancellation
+//! is supported via [`WorkflowRuntime::cancel`]. It is *not*:
 //!
 //! - **A DAG executor.** There's no declarative graph definition, no
 //!   built-in fan-out / fan-in, no dependency-driven scheduling.

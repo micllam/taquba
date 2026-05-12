@@ -71,6 +71,20 @@ pub enum StepOutcome {
         /// Human-readable reason recorded on [`crate::RunOutcome::error`].
         reason: String,
     },
+    /// The run is finished as cancelled by the runner. Use this when the
+    /// runner decides on its own that the workflow should stop early
+    /// without it being a logical failure (e.g. a downstream cancellation
+    /// signal arrived mid-step, the user-supplied input is now obsolete).
+    /// The runtime acks the step and fires the terminal hook with
+    /// [`crate::TerminalStatus::Cancelled`] and `reason` as the error.
+    ///
+    /// For *external* cancellation requested by another component in the
+    /// process, call [`crate::WorkflowRuntime::cancel`] instead; the
+    /// runtime translates that into the same `Cancelled` terminal state.
+    Cancel {
+        /// Human-readable reason recorded on [`crate::RunOutcome::error`].
+        reason: String,
+    },
 }
 
 /// Failure outcomes the runner can return.
@@ -131,8 +145,9 @@ pub trait StepRunner: Send + Sync {
     /// Process a single step of a workflow run. Return [`StepOutcome::Continue`]
     /// to enqueue the next step, [`StepOutcome::Succeed`] to finish the run
     /// successfully, [`StepOutcome::Fail`] to terminate the run as Failed by
-    /// runner verdict, or `Err(StepError)` to retry / dead-letter on
-    /// infrastructure errors.
+    /// runner verdict, [`StepOutcome::Cancel`] to terminate the run as
+    /// Cancelled by runner verdict, or `Err(StepError)` to retry /
+    /// dead-letter on infrastructure errors.
     fn run_step(
         &self,
         step: &Step,

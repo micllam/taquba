@@ -14,6 +14,14 @@ pub enum TerminalStatus {
     /// - the worker hit a permanent runtime error (e.g. malformed step
     ///   headers).
     Failed,
+    /// The run was cancelled. Either:
+    /// - [`crate::WorkflowRuntime::cancel`] was called for this run; or
+    /// - the runner returned [`crate::StepOutcome::Cancel`].
+    ///
+    /// Like [`Self::Failed`] from `StepOutcome::Fail`, this is a clean
+    /// run-level outcome rather than an infrastructure error: the step is
+    /// acked and no dead-letter is produced.
+    Cancelled,
 }
 
 impl TerminalStatus {
@@ -24,6 +32,7 @@ impl TerminalStatus {
         match self {
             TerminalStatus::Succeeded => "succeeded",
             TerminalStatus::Failed => "failed",
+            TerminalStatus::Cancelled => "cancelled",
         }
     }
 }
@@ -45,8 +54,13 @@ pub struct RunOutcome {
     /// Set when `status == Succeeded`: the bytes the runner returned via
     /// [`crate::StepOutcome::Succeed`].
     pub result: Option<Vec<u8>>,
-    /// Set when `status == Failed`: the human-readable reason recorded on the
-    /// terminal step's `last_error`.
+    /// - When `status == Failed`: the human-readable reason recorded on
+    ///   the terminal step's `last_error`.
+    /// - When `status == Cancelled`: `Some(reason)` if the runner
+    ///   returned [`crate::StepOutcome::Cancel`], or `None` if
+    ///   cancellation came from [`crate::WorkflowRuntime::cancel`]
+    ///   (which takes no reason at the API level).
+    /// - When `status == Succeeded`: always `None`.
     pub error: Option<String>,
     /// Submitter-supplied metadata, threaded through from
     /// [`crate::RunSpec::headers`].
@@ -62,8 +76,8 @@ pub struct RunOutcome {
 /// after the step is acked / dead-lettered. Hook errors are not propagated;
 /// implementations should either be infallible or log internally.
 pub trait TerminalHook: Send + Sync {
-    /// Called when a run reaches [`TerminalStatus::Succeeded`] or
-    /// [`TerminalStatus::Failed`].
+    /// Called when a run reaches [`TerminalStatus::Succeeded`],
+    /// [`TerminalStatus::Failed`], or [`TerminalStatus::Cancelled`].
     fn on_termination(&self, outcome: &RunOutcome) -> impl Future<Output = ()> + Send;
 }
 
@@ -151,7 +165,9 @@ mod webhook {
             }
             let body = match outcome.status {
                 TerminalStatus::Succeeded => outcome.result.clone().unwrap_or_default(),
-                TerminalStatus::Failed => outcome.error.clone().unwrap_or_default().into_bytes(),
+                TerminalStatus::Failed | TerminalStatus::Cancelled => {
+                    outcome.error.clone().unwrap_or_default().into_bytes()
+                }
             };
             if let Err(e) = enqueue_webhook(&self.queue, &self.target_queue, req, body).await {
                 tracing::warn!(

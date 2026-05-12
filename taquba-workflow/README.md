@@ -19,7 +19,8 @@ processing, payment flows, etc.
 
 `taquba-workflow` is an **imperative step orchestrator**: at each step
 the runner decides what happens next via `StepOutcome` (Continue,
-Succeed, Fail). It is *not*:
+Succeed, Fail, Cancel). External cancellation is supported via
+`WorkflowRuntime::cancel`. It is *not*:
 
 - **A DAG executor**. There's no declarative graph, no fan-out / fan-in, no
   dependency-driven scheduling.
@@ -95,12 +96,32 @@ a fresh process resumes at step 1.
 | `StepOutcome::ContinueAfter { payload, delay }` | Schedule the next step `delay` from now. |
 | `StepOutcome::Succeed { result }` | Ack; terminal hook fires `Succeeded`. |
 | `StepOutcome::Fail { reason }` | Ack; terminal hook fires `Failed`. Runner verdict: no dead-letter. |
+| `StepOutcome::Cancel { reason }` | Ack; terminal hook fires `Cancelled`. Runner verdict: no dead-letter. |
 | `Err(StepError::transient(_))` | Retry per backoff up to `max_attempts`, then dead-letter. |
 | `Err(StepError::permanent(_))` | Dead-letter immediately. |
 
-`StepOutcome::Fail` vs `Err(StepError::permanent)`: a runner verdict
-acks normally; an infrastructure error dead-letters so operators can
-find it via `queue.dead_jobs()`.
+`StepOutcome::Fail` / `StepOutcome::Cancel` vs `Err(StepError::permanent)`:
+runner verdicts ack normally; an infrastructure error dead-letters so
+operators can find it via `queue.dead_jobs()`.
+
+## Cancellation
+
+Call `WorkflowRuntime::cancel(run_id)` to cancel an active run from
+outside the runner:
+
+- If the current step is **pending or scheduled**, the queued step job is
+  removed and the terminal hook fires from the `cancel` call before it
+  returns.
+- If the current step is **running**, the in-flight step is allowed to
+  run to completion (futures cannot be safely aborted mid-step). The
+  runner's `StepOutcome` is discarded, any pending transient retry is
+  suppressed, and the worker fires the terminal hook with `Cancelled`
+  once the step returns.
+
+Returns `Ok(false)` if the run is unknown or already terminal in this
+runtime. `cancel` only reaches runs submitted to this `WorkflowRuntime`
+instance; a second runtime in the same process (sharing the queue)
+maintains its own registry.
 
 ## Reserved headers
 
@@ -123,11 +144,11 @@ step can be claimed and executed twice if its lease expires before ack.
 
 ## Terminal hook
 
-`TerminalHook::on_termination` fires once per run on `Succeeded` or
-`Failed`, receiving the submitter's headers and the runner's result or
-error. `WebhookTerminalHook` (behind the `webhooks` feature) fires HTTP
-callbacks via `taquba-webhooks`; set the per-run URL on
-`RunSpec::headers["callback_url"]`.
+`TerminalHook::on_termination` fires once per run on `Succeeded`,
+`Failed`, or `Cancelled`, receiving the submitter's headers and the
+runner's result or error. `WebhookTerminalHook` (behind the `webhooks`
+feature) fires HTTP callbacks via `taquba-webhooks`; set the per-run URL
+on `RunSpec::headers["callback_url"]`.
 
 ## License
 
