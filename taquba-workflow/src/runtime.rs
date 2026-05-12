@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use taquba::{EnqueueOptions, JobRecord, PermanentFailure, Queue, Worker, WorkerError};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 
 use crate::error::{Error, Result};
@@ -171,13 +172,15 @@ struct RuntimeInner<R, H> {
 /// [`WorkflowRuntime::cancel`] races: the Taquba job currently
 /// representing the run (so `cancel` can target it), the submitter's
 /// headers (so the terminal hook fires with the right metadata even when
-/// `cancel` fires it directly from a pending step), and a flag for any
-/// pending cancellation request.
+/// `cancel` fires it directly from a pending step), a flag for any
+/// pending cancellation request, and a [`CancellationToken`] cloned into
+/// the in-flight [`Step`] so runners can short-circuit cooperatively.
 struct RegistryEntry {
     status: RunStatus,
     current_job_id: String,
     user_headers: HashMap<String, String>,
     cancel_requested: bool,
+    cancel_token: CancellationToken,
 }
 
 impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
@@ -250,6 +253,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
                 current_job_id: job_id.clone(),
                 user_headers: spec.headers.clone(),
                 cancel_requested: false,
+                cancel_token: CancellationToken::new(),
             },
         );
         drop(registry);
@@ -283,11 +287,13 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     ///
     /// - **Pending / scheduled step**: the queued step job is cancelled in
     ///   Taquba and the hook fires from this call before it returns.
-    /// - **Running step**: the in-flight step is allowed to run to completion
-    ///   (futures cannot be safely aborted mid-step); whatever
-    ///   [`StepOutcome`] or [`StepError`] the runner produces is discarded
-    ///   and the hook fires from the worker once the step returns. A
-    ///   pending transient retry is suppressed; the step is acked rather
+    /// - **Running step**: cancellation is delivered to the runner via
+    ///   [`Step::cancel_token`]; runners that watch the token short-circuit
+    ///   immediately. Runners that ignore the token are allowed to run to
+    ///   completion (futures cannot be safely aborted mid-step). In both
+    ///   cases the runner's [`StepOutcome`] / [`StepError`] is discarded
+    ///   and the hook fires from the worker once the step returns, with
+    ///   any pending transient retry suppressed and the step acked rather
     ///   than nacked.
     ///
     /// Cancellation is best-effort: if the run is already terminal by the
@@ -302,6 +308,12 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
                 return Ok(false);
             };
             entry.cancel_requested = true;
+            // Signal cooperative cancellation. Idempotent on
+            // `CancellationToken`: a second `cancel()` is a no-op. Runners
+            // that watch `step.cancel_token` can short-circuit; runners
+            // that ignore it still get terminated by the worker via the
+            // `cancel_requested` flag after `run_step` returns.
+            entry.cancel_token.cancel();
             (
                 entry.current_job_id.clone(),
                 entry.user_headers.clone(),
@@ -430,22 +442,25 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     /// concurrent [`WorkflowRuntime::cancel`] can target it. Creates a
     /// fresh entry if the run is unknown to this runtime (e.g. after a
     /// restart on another runtime, where the worker first learns of the
-    /// run by claiming its step).
+    /// run by claiming its step). Returns the entry's
+    /// [`CancellationToken`] for cloning into the in-flight [`Step`].
     async fn registry_mark_running(
         &self,
         run_id: &str,
         step_number: u32,
         job_id: &str,
         user_headers: &HashMap<String, String>,
-    ) {
+    ) -> CancellationToken {
         let mut registry = self.registry.lock().await;
         match registry.get_mut(run_id) {
             Some(entry) => {
                 entry.status.state = RunState::Running;
                 entry.status.current_step = step_number;
                 entry.current_job_id = job_id.to_string();
+                entry.cancel_token.clone()
             }
             None => {
+                let cancel_token = CancellationToken::new();
                 registry.insert(
                     run_id.to_string(),
                     RegistryEntry {
@@ -457,8 +472,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                         current_job_id: job_id.to_string(),
                         user_headers: user_headers.clone(),
                         cancel_requested: false,
+                        cancel_token: cancel_token.clone(),
                     },
                 );
+                cancel_token
             }
         }
     }
@@ -477,7 +494,8 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
 
         let user_headers = Self::split_headers(&job.headers);
 
-        self.registry_mark_running(&run_id, step_number, &job.id, &user_headers)
+        let cancel_token = self
+            .registry_mark_running(&run_id, step_number, &job.id, &user_headers)
             .await;
 
         let step = Step {
@@ -487,6 +505,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             headers: user_headers.clone(),
             job_id: job.id.clone(),
             attempts: job.attempts,
+            cancel_token,
         };
 
         // Preserve the run's per-step priority and max_attempts across the
@@ -1455,6 +1474,82 @@ mod tests {
         // flight, the worker must ack and fire `Cancelled` without
         // re-invoking the runner.
         assert_cancel_suppresses_runner_error(StepError::transient("would-retry")).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_signals_step_token_for_cooperative_short_circuit() {
+        // A runner that watches `step.cancel_token` should short-circuit
+        // long after-claim work as soon as `WorkflowRuntime::cancel` is
+        // called. Without the token, cancellation latency is bounded by
+        // step duration; with it, the runner returns essentially
+        // immediately. The test pins this by using a step that would
+        // otherwise sleep for 30 seconds; if the token didn't fire, the
+        // test would time out.
+        struct CooperativeRunner {
+            claimed: Arc<tokio::sync::Notify>,
+        }
+        impl StepRunner for CooperativeRunner {
+            async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                self.claimed.notify_one();
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                        Ok(StepOutcome::Succeed { result: b"slow".to_vec() })
+                    }
+                    _ = step.cancel_token.cancelled() => {
+                        Ok(StepOutcome::Cancel { reason: "cooperative".to_string() })
+                    }
+                }
+            }
+        }
+
+        let queue = fresh_queue().await;
+        let claimed = Arc::new(tokio::sync::Notify::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            CooperativeRunner {
+                claimed: claimed.clone(),
+            },
+            ChannelHook { tx },
+        )
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        let handle = runtime
+            .submit(RunSpec {
+                input: b"x".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), claimed.notified())
+            .await
+            .expect("runner observed token");
+
+        let start = std::time::Instant::now();
+        let was_cancelled = runtime.cancel(&handle.run_id).await.unwrap();
+        assert!(was_cancelled);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("hook fired well before the 30s sleep would have")
+            .expect("hook channel open");
+        let elapsed = start.elapsed();
+
+        assert_eq!(outcome.status, TerminalStatus::Cancelled);
+        // Runner-issued Cancel wins precedence over external cancel, so
+        // the runner's reason surfaces.
+        assert_eq!(outcome.error.as_deref(), Some("cooperative"));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "cooperative cancel must short-circuit the 30s sleep (took {elapsed:?})",
+        );
+        assert!(runtime.status(&handle.run_id).await.is_none());
+
+        let stats = queue.stats("workflow-steps").await.unwrap();
+        assert_eq!(stats.dead, 0);
+
+        let _ = shutdown.send(());
     }
 
     #[tokio::test]

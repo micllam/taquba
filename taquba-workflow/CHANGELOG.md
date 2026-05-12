@@ -9,20 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `TerminalStatus::Cancelled` terminal state, wire form `"cancelled"`.
-  Like `Failed` from `StepOutcome::Fail`, this is a clean run-level
-  outcome: the step is acked and no dead-letter is produced.
-- `StepOutcome::Cancel { reason }` for runner-issued cancellation.
-- `WorkflowRuntime::cancel(run_id)` for external cancellation of an
-  active run. Pending/scheduled step jobs are cancelled in the queue
-  and the terminal hook fires from the `cancel` call; running steps
-  are allowed to finish, their outcome is discarded, any pending
-  transient retry is suppressed, and the hook fires from the worker.
-  In-process only; returns `Ok(false)` for unknown runs.
+- Run cancellation, surfaced as a new `TerminalStatus::Cancelled`
+  terminal state (wire form `"cancelled"`). Reachable via
+  `WorkflowRuntime::cancel(run_id)` (external) or
+  `StepOutcome::Cancel { reason }` (runner-issued). External
+  cancellation suppresses any pending transient retry and never
+  dead-letters: a pending step's queue job is removed and the hook
+  fires from the `cancel` call; a running step's outcome is discarded
+  and the hook fires from the worker once the step returns.
   `RunOutcome::error` is `None` for external cancellation and
-  `Some(reason)` for runner-issued `StepOutcome::Cancel`.
-- `WebhookTerminalHook` now delivers `Cancelled` outcomes, using the
-  same body shape as `Failed` (UTF-8 cancellation reason).
+  `Some(reason)` for runner-issued, so consumers can distinguish the
+  two without an extra field. In-process only; `cancel` returns
+  `Ok(false)` for runs not owned by this runtime instance.
+- Cooperative mid-step cancellation via `Step::cancel_token` (a
+  `tokio_util::sync::CancellationToken`). Runners that `select!` on it
+  short-circuit slow work like LLM calls instead of running to
+  completion before the worker terminates the run.
+- `WebhookTerminalHook` delivers `Cancelled` outcomes, using the same
+  body shape as `Failed` (UTF-8 cancellation reason).
 
 ## [0.1.0] - 2026-05-11
 

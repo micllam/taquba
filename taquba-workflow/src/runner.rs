@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 
+use tokio_util::sync::CancellationToken;
+
 /// A single step within a workflow run, handed to [`StepRunner::run_step`].
 ///
 /// Mirrors [`taquba::JobRecord`]: the `payload` is opaque application bytes
@@ -27,6 +29,31 @@ pub struct Step {
     /// How many times Taquba has attempted to deliver this step. `1` on the
     /// first attempt; `>1` after a lease expiry / nack retry.
     pub attempts: u32,
+    /// Cooperative cancellation signal for the run. The runtime cancels
+    /// this token when [`crate::WorkflowRuntime::cancel`] is called while
+    /// this step is in flight, so a long-running runner (e.g. an LLM call,
+    /// a slow HTTP request) can short-circuit instead of running to
+    /// completion. Typical use:
+    ///
+    /// ```ignore
+    /// tokio::select! {
+    ///     out = do_slow_work(step) => out,
+    ///     _ = step.cancel_token.cancelled() => {
+    ///         Ok(StepOutcome::Cancel { reason: "cooperative".into() })
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Runners that ignore the token remain correct: the runtime still
+    /// discards the outcome of a cancelled step and fires the terminal
+    /// hook with [`crate::TerminalStatus::Cancelled`]. Watching the token
+    /// only reduces cancellation latency for slow steps; it doesn't
+    /// change semantics.
+    ///
+    /// The token is run-scoped, not step-scoped: once cancelled, every
+    /// subsequent step of the run (including any retry of this one)
+    /// observes `is_cancelled() == true` immediately.
+    pub cancel_token: CancellationToken,
 }
 
 /// What the runner wants the runtime to do after this step.
