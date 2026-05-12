@@ -87,6 +87,19 @@ pub enum RunState {
     Pending,
     /// A step is currently being processed by a worker.
     Running,
+    /// [`WorkflowRuntime::cancel`] was called for this run and the
+    /// terminal hook has not yet fired. Reported until the in-flight
+    /// step returns and the runtime settles the run as
+    /// [`crate::TerminalStatus::Cancelled`] (entry removed and hook
+    /// fired); after that, [`WorkflowRuntime::status`] returns `None`.
+    ///
+    /// Only set by external cancellation. A pure runner-issued
+    /// [`crate::StepOutcome::Cancel`] (with no external `cancel()`
+    /// call) terminates as `Cancelled` without ever transitioning
+    /// through `Cancelling`: the registry only learns the runner's
+    /// verdict when `run_step` returns, at which point the entry is
+    /// removed.
+    Cancelling,
 }
 
 /// Builder for [`WorkflowRuntime`].
@@ -267,13 +280,19 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
 
     /// Look up the in-process status of a run. Returns `None` for unknown or
     /// already-terminated runs (the registry only retains active runs).
+    ///
+    /// Returns [`RunState::Cancelling`] for any run with a pending
+    /// cancellation request, regardless of its underlying step lifecycle
+    /// position; the cancellation overlay wins over `Pending`/`Running`
+    /// until the terminal hook fires.
     pub async fn status(&self, run_id: &str) -> Option<RunStatus> {
-        self.inner
-            .registry
-            .lock()
-            .await
-            .get(run_id)
-            .map(|e| e.status.clone())
+        self.inner.registry.lock().await.get(run_id).map(|e| {
+            let mut status = e.status.clone();
+            if e.cancel_requested {
+                status.state = RunState::Cancelling;
+            }
+            status
+        })
     }
 
     /// Request cancellation of an active run.
@@ -1646,6 +1665,83 @@ mod tests {
             rx.try_recv().is_err(),
             "no Cancelled hook may fire after the run already terminated as Succeeded",
         );
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn status_reports_cancelling_while_termination_in_flight() {
+        // Once `cancel()` has been called but the terminal hook hasn't
+        // fired yet, `status()` should report `RunState::Cancelling` so
+        // external observers can see termination is in progress. A gated
+        // runner holds the cancellation window open long enough to
+        // observe it deterministically.
+        struct GatedRunner {
+            claimed: Arc<tokio::sync::Notify>,
+            gate: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        }
+        impl StepRunner for GatedRunner {
+            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                self.claimed.notify_one();
+                let rx = self.gate.lock().await.take().expect("gate consumed twice");
+                let _ = rx.await;
+                Ok(StepOutcome::Succeed {
+                    result: b"would-have-succeeded".to_vec(),
+                })
+            }
+        }
+
+        let queue = fresh_queue().await;
+        let claimed = Arc::new(tokio::sync::Notify::new());
+        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue,
+            GatedRunner {
+                claimed: claimed.clone(),
+                gate: tokio::sync::Mutex::new(Some(gate_rx)),
+            },
+            ChannelHook { tx },
+        )
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        let handle = runtime
+            .submit(RunSpec {
+                input: b"x".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), claimed.notified())
+            .await
+            .expect("runner reached gate");
+
+        // Before cancel: runner is in flight, state is Running.
+        let before = runtime.status(&handle.run_id).await.expect("active");
+        assert_eq!(before.state, RunState::Running);
+
+        runtime.cancel(&handle.run_id).await.unwrap();
+
+        // After cancel but before the gate is released: the step is still
+        // in flight, but the cancellation overlay must dominate the
+        // reported state.
+        let during = runtime
+            .status(&handle.run_id)
+            .await
+            .expect("entry retained while termination is in flight");
+        assert_eq!(during.state, RunState::Cancelling);
+
+        // Release the runner; the worker observes cancel_requested and
+        // settles the run as Cancelled, removing the entry.
+        let _ = gate_tx.send(());
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("hook fired")
+            .expect("hook channel open");
+        assert_eq!(outcome.status, TerminalStatus::Cancelled);
+        assert!(runtime.status(&handle.run_id).await.is_none());
 
         let _ = shutdown.send(());
     }
