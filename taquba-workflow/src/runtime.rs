@@ -315,7 +315,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             // ever see it. Fire the hook here. `error` is `None`: external
             // cancellation carries no reason at the API level.
             self.inner
-                .fire_terminal_hook(RunOutcome {
+                .terminate(RunOutcome {
                     run_id: run_id.to_string(),
                     status: TerminalStatus::Cancelled,
                     result: None,
@@ -324,7 +324,6 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
                     final_step: current_step,
                 })
                 .await;
-            self.inner.registry_remove(run_id).await;
         }
         // Otherwise the job is Claimed (worker has it). The worker will read
         // `cancel_requested` after `run_step` returns and fire the hook.
@@ -416,12 +415,14 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         Ok((run_id, step_number))
     }
 
-    async fn fire_terminal_hook(&self, outcome: RunOutcome) {
+    /// Settle a run into its terminal state: drop its registry entry and
+    /// fire the terminal hook. Removal happens first so that
+    /// [`WorkflowRuntime::status`] doesn't briefly report an
+    /// already-terminated run as active while a slow hook (e.g. a webhook
+    /// delivery) is in flight.
+    async fn terminate(&self, outcome: RunOutcome) {
+        self.registry.lock().await.remove(&outcome.run_id);
         self.terminal_hook.on_termination(&outcome).await;
-    }
-
-    async fn registry_remove(&self, run_id: &str) {
-        self.registry.lock().await.remove(run_id);
     }
 
     /// Transition the entry for `run_id` into [`RunState::Running`] for
@@ -513,7 +514,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         //    consumers can distinguish external vs. runner-issued cancel.
         match outcome {
             Ok(StepOutcome::Cancel { reason }) => {
-                self.fire_terminal_hook(RunOutcome {
+                self.terminate(RunOutcome {
                     run_id: run_id.clone(),
                     status: TerminalStatus::Cancelled,
                     result: None,
@@ -522,11 +523,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     final_step: step_number,
                 })
                 .await;
-                self.registry_remove(&run_id).await;
                 Ok(())
             }
             _ if external_cancel => {
-                self.fire_terminal_hook(RunOutcome {
+                self.terminate(RunOutcome {
                     run_id: run_id.clone(),
                     status: TerminalStatus::Cancelled,
                     result: None,
@@ -535,7 +535,6 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     final_step: step_number,
                 })
                 .await;
-                self.registry_remove(&run_id).await;
                 Ok(())
             }
             Ok(StepOutcome::Continue { payload }) => {
@@ -557,7 +556,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     .await
             }
             Ok(StepOutcome::Succeed { result }) => {
-                self.fire_terminal_hook(RunOutcome {
+                self.terminate(RunOutcome {
                     run_id: run_id.clone(),
                     status: TerminalStatus::Succeeded,
                     result: Some(result),
@@ -566,14 +565,13 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     final_step: step_number,
                 })
                 .await;
-                self.registry_remove(&run_id).await;
                 Ok(())
             }
             Ok(StepOutcome::Fail { reason }) => {
                 // Runner verdict: workflow failed but the step itself ran
                 // cleanly. Ack the step (no dead-letter) and fire the hook
                 // with `Failed`.
-                self.fire_terminal_hook(RunOutcome {
+                self.terminate(RunOutcome {
                     run_id: run_id.clone(),
                     status: TerminalStatus::Failed,
                     result: None,
@@ -582,14 +580,13 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     final_step: step_number,
                 })
                 .await;
-                self.registry_remove(&run_id).await;
                 Ok(())
             }
             Err(StepError {
                 message,
                 kind: StepErrorKind::Permanent,
             }) => {
-                self.fire_terminal_hook(RunOutcome {
+                self.terminate(RunOutcome {
                     run_id: run_id.clone(),
                     status: TerminalStatus::Failed,
                     result: None,
@@ -598,7 +595,6 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     final_step: step_number,
                 })
                 .await;
-                self.registry_remove(&run_id).await;
                 Err(PermanentFailure::new(message).into())
             }
             Err(StepError {
@@ -609,7 +605,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 // hook now so the user is notified once, before the job
                 // record disappears from the registry.
                 if job.attempts >= job.max_attempts {
-                    self.fire_terminal_hook(RunOutcome {
+                    self.terminate(RunOutcome {
                         run_id: run_id.clone(),
                         status: TerminalStatus::Failed,
                         result: None,
@@ -618,7 +614,6 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                         final_step: step_number,
                     })
                     .await;
-                    self.registry_remove(&run_id).await;
                 }
                 Err(message.into())
             }
