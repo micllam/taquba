@@ -1553,6 +1553,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn double_cancel_fires_hook_once_and_second_call_returns_false() {
+        // Submit a run and cancel twice while it sits pending. The first
+        // call removes the queued step, fires the hook, and drops the
+        // registry entry. The second call must see no entry and report
+        // `Ok(false)`; crucially, the hook must NOT fire a second
+        // time.
+        struct UnreachableRunner;
+        impl StepRunner for UnreachableRunner {
+            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                unreachable!("worker must not claim the cancelled step");
+            }
+        }
+
+        let queue = fresh_queue().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime =
+            WorkflowRuntime::builder(queue, UnreachableRunner, ChannelHook { tx }).build();
+        // Deliberately do not spawn the worker loop, so step 0 stays
+        // Pending while both cancels race.
+
+        let handle = runtime
+            .submit(RunSpec {
+                input: b"x".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let first = runtime.cancel(&handle.run_id).await.unwrap();
+        assert!(first, "first cancel initiates termination");
+
+        let second = runtime.cancel(&handle.run_id).await.unwrap();
+        assert!(
+            !second,
+            "second cancel must report Ok(false): registry entry is gone after the first fired the hook",
+        );
+
+        // Hook fires exactly once.
+        let _ = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("hook fired in time")
+            .expect("hook channel open");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "hook must fire exactly once for a double-cancelled run",
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_after_run_already_terminated_returns_false() {
+        // Submit a run that succeeds normally, wait for the terminal
+        // hook, then call `cancel`. The registry entry was removed when
+        // the success hook fired, so `cancel` must report `Ok(false)`
+        // and must not fire a second hook.
+        let queue = fresh_queue().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue,
+            ScriptedRunner::new(vec![StepOutcome::Succeed {
+                result: b"done".to_vec(),
+            }]),
+            ChannelHook { tx },
+        )
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        let handle = runtime
+            .submit(RunSpec {
+                input: b"x".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("Succeeded hook fired")
+            .expect("hook channel open");
+        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        assert!(runtime.status(&handle.run_id).await.is_none());
+
+        let was_cancelled = runtime.cancel(&handle.run_id).await.unwrap();
+        assert!(
+            !was_cancelled,
+            "cancel on an already-terminated run must report Ok(false)",
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "no Cancelled hook may fire after the run already terminated as Succeeded",
+        );
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
     async fn cancel_unknown_run_returns_false() {
         let queue = fresh_queue().await;
         let runtime: WorkflowRuntime<ScriptedRunner, NoopTerminalHook> =
