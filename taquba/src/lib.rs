@@ -95,7 +95,7 @@ pub use error::{Error, Result};
 pub use job::{JobRecord, JobStatus};
 pub use queue::{
     CancelOutcome, EnqueueOptions, OpenOptions, PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_NORMAL,
-    Queue, QueueConfig,
+    Queue, QueueConfig, WaitOutcome,
 };
 pub use stats::QueueStats;
 pub use worker::{PermanentFailure, Worker, WorkerError, run_worker, run_worker_concurrent};

@@ -16,12 +16,13 @@ pub(crate) async fn reap_loop(
     keep_done_jobs: Option<Duration>,
     dead_retention: Option<Duration>,
     job_available: Arc<Notify>,
+    completion_notify: Arc<Notify>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
         tokio::select! {
             _ = tokio::time::sleep(interval) => {
-                match reap_expired(&db).await {
+                match reap_expired(&db, &completion_notify).await {
                     Ok(0) => {}
                     Ok(_) => job_available.notify_waiters(),
                     Err(e) => warn!("lease reaper error: {e}"),
@@ -45,7 +46,7 @@ pub(crate) async fn reap_loop(
 
 /// Returns the number of expired claims that were processed. Callers can use
 /// this to decide whether to wake any waiting workers.
-pub(crate) async fn reap_expired(db: &Db) -> Result<usize> {
+pub(crate) async fn reap_expired(db: &Db, completion_notify: &Notify) -> Result<usize> {
     let now = now_ms();
     let mut expired_keys = Vec::new();
 
@@ -79,13 +80,13 @@ pub(crate) async fn reap_expired(db: &Db) -> Result<usize> {
 
     let count = expired_keys.len();
     for key_bytes in expired_keys {
-        reap_job(db, &key_bytes).await?;
+        reap_job(db, &key_bytes, completion_notify).await?;
     }
 
     Ok(count)
 }
 
-async fn reap_job(db: &Db, claimed_key_bytes: &[u8]) -> Result<()> {
+async fn reap_job(db: &Db, claimed_key_bytes: &[u8], completion_notify: &Notify) -> Result<()> {
     loop {
         let txn = db.begin(IsolationLevel::Snapshot).await?;
 
@@ -142,8 +143,14 @@ async fn reap_job(db: &Db, claimed_key_bytes: &[u8]) -> Result<()> {
             );
         }
 
+        let became_dead = matches!(job.status, JobStatus::Dead);
         match txn.commit().await {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                if became_dead {
+                    completion_notify.notify_waiters();
+                }
+                return Ok(());
+            }
             // Worker acked/nacked while we were running; retry to re-check.
             Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
             Err(e) => return Err(e.into()),

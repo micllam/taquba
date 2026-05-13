@@ -19,6 +19,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the lease expires and the reaper requeues the job, the next claim's
   token starts pre-cancelled. `requeue_dead_job` clears the flag:
   reviving a dead job is an operator decision to give it a fresh start.
+- `Queue::wait_for_completion(id, timeout) -> WaitOutcome`. Notify-based:
+  every terminal transition in the queue (`ack`, `nack`-to-dead,
+  `dead_letter`, `cancel`-Removed, reaper dead-letter) fires a shared
+  `Notify` that the call listens on, so there is no per-job polling.
+  Returns one of:
+  - `WaitOutcome::Completed(Some(Box<JobRecord>))` when taquba kept a
+    terminal record (`Dead` always; `Done` only when `keep_done_jobs`
+    is set).
+  - `WaitOutcome::Completed(None)` when the job terminated but no
+    record was retained (default `ack`, or a `cancel` of a
+    Pending/Scheduled job).
+  - `WaitOutcome::TimedOut` if `timeout` elapsed first.
+  - `WaitOutcome::NotFound` if the job ID was not present at call
+    time. With the default config, `Completed(None)` is ambiguous
+    between "success" and "cancelled before claim"; see the
+    `WaitOutcome` docs for the full retention matrix.
 
 ### Changed
 
