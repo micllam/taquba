@@ -340,24 +340,35 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             )
         };
 
-        let cancelled_in_queue = self.inner.queue.cancel(&job_id).await?;
-        if cancelled_in_queue {
-            // Job was Pending/Scheduled and is now removed; no worker will
-            // ever see it. Fire the hook here. `error` is `None`: external
-            // cancellation carries no reason at the API level.
-            self.inner
-                .terminate(RunOutcome {
-                    run_id: run_id.to_string(),
-                    status: TerminalStatus::Cancelled,
-                    result: None,
-                    error: None,
-                    headers,
-                    final_step: current_step,
-                })
-                .await;
+        match self.inner.queue.cancel(&job_id).await? {
+            taquba::CancelOutcome::Removed => {
+                // Job was Pending/Scheduled and is now removed; no worker
+                // will ever see it. Fire the hook here. `error` is `None`:
+                // external cancellation carries no reason at the API level.
+                self.inner
+                    .terminate(RunOutcome {
+                        run_id: run_id.to_string(),
+                        status: TerminalStatus::Cancelled,
+                        result: None,
+                        error: None,
+                        headers,
+                        final_step: current_step,
+                    })
+                    .await;
+            }
+            taquba::CancelOutcome::Requested => {
+                // Worker is processing the step. The worker reads our own
+                // registry `cancel_requested` flag after `run_step` returns
+                // and fires the hook.
+            }
+            taquba::CancelOutcome::NotFound => {
+                // Job already gone from Taquba (e.g. just acked between our
+                // registry read and the queue call). The worker path still
+                // honours our `cancel_requested` flag if it hasn't fired the
+                // hook yet; if it has, this cancel is a no-op past the
+                // registry update.
+            }
         }
-        // Otherwise the job is Claimed (worker has it). The worker will read
-        // `cancel_requested` after `run_step` returns and fire the hook.
         Ok(true)
     }
 

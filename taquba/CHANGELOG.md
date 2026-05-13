@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Cooperative cancellation of `Claimed` jobs. `Queue::cancel` now
+  handles every lifecycle state and returns a `CancelOutcome` enum
+  (`Removed` | `Requested` | `NotFound`). For `Claimed` jobs it
+  persists a new `cancel_requested` flag and fires the in-process
+  `CancellationToken` exposed on the new `JobRecord::cancel_token`
+  field. Workers receive the token on every `claim*` path and can
+  `select!` on it to short-circuit. The persisted flag ensures that if
+  the lease expires and the reaper requeues the job, the next claim's
+  token starts pre-cancelled. `requeue_dead_job` clears the flag:
+  reviving a dead job is an operator decision to give it a fresh start.
+
+### Changed
+
+- **Breaking:** `Queue::cancel` now returns `Result<CancelOutcome>`
+  instead of `Result<bool>`. Migration: existing call sites that
+  matched on `true` for "removed from queue" should match on
+  `CancelOutcome::Removed`; sites that distinguish "Claimed (worker
+  has it)" from "Pending/Scheduled" should match on
+  `CancelOutcome::Requested` vs `Removed`. `CancelOutcome::acted()`
+  is a `bool` helper covering the previous "any cancellation happened"
+  semantics.
+- `JobRecord` gained two fields:
+  - `cancel_requested: bool` (persisted; defaults to `false` on
+    records written by earlier versions, so the on-disk layout is
+    backward-compatible).
+  - `cancel_token: Option<CancellationToken>` (skipped from serde;
+    populated by `claim*`, `None` everywhere else).
+
+  Code that constructs `JobRecord` directly via a struct literal now
+  has to set both fields.
+
 ## [0.3.0] - 2026-05-06
 
 ### Added

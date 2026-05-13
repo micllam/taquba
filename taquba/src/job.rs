@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 /// A single job stored in a Taquba queue.
 ///
@@ -77,6 +78,36 @@ pub struct JobRecord {
     /// `enqueued_at` (which is stale after a requeue / re-fail cycle).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_at: Option<u64>,
+    /// Whether [`Queue::cancel`](crate::Queue::cancel) has been called while
+    /// this job was `Claimed`. Persisted so that a re-claim after lease
+    /// expiry surfaces a pre-cancelled [`Self::cancel_token`] instead of
+    /// resetting state silently.
+    ///
+    /// Workers do not need to read this directly; they should watch
+    /// [`Self::cancel_token`] instead.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cancel_requested: bool,
+    /// In-process cooperative cancellation token. Populated when the job
+    /// is returned from any `Queue::claim*` call and `None` for jobs read
+    /// via [`Queue::get_job`](crate::Queue::get_job),
+    /// [`Queue::dead_jobs`](crate::Queue::dead_jobs), or any other
+    /// non-claim path.
+    ///
+    /// Workers may `select!` on this token to short-circuit when an
+    /// external [`Queue::cancel`](crate::Queue::cancel) fires. Acks
+    /// normally to clear the job; the queue treats cancellation as a
+    /// request, never as a forced abort.
+    ///
+    /// Not persisted: `tokio_util::sync::CancellationToken` is an
+    /// in-process primitive. After a worker crashes and the reaper
+    /// requeues the job, the next claim creates a fresh token (which is
+    /// immediately fired if [`Self::cancel_requested`] is `true`).
+    #[serde(skip, default)]
+    pub cancel_token: Option<CancellationToken>,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// The lifecycle state of a [`JobRecord`].

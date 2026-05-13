@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** now requires `taquba` 0.4. `taquba-workflow`'s own
+  signatures are unchanged.
+
 ## [0.2.0] - 2026-05-13
 
 ### Added
