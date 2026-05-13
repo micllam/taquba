@@ -132,6 +132,9 @@ outside the runner:
   returns. Watching the token only reduces cancellation latency for slow
   steps; it doesn't change semantics.
 
+While termination is in flight, `WorkflowRuntime::status` reports a
+`RunState::Cancelling` overlay until the entry is dropped.
+
 Returns `Ok(false)` if the run is unknown or already terminal in this
 runtime. `cancel` only reaches runs submitted to this `WorkflowRuntime`
 instance; a second runtime in the same process (sharing the queue)

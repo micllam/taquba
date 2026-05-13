@@ -65,6 +65,43 @@
 //! # Ok(()) }
 //! ```
 //!
+//! # Cancellation
+//!
+//! Call [`WorkflowRuntime::cancel`] to cancel an active run from outside
+//! the runner:
+//!
+//! - If the current step is **pending or scheduled**, the queued step job
+//!   is removed and the terminal hook fires from the `cancel` call before
+//!   it returns.
+//! - If the current step is **running**, cancellation is delivered via
+//!   [`Step::cancel_token`] (a `tokio_util::sync::CancellationToken`).
+//!   Runners that watch the token can short-circuit immediately:
+//!
+//!   ```ignore
+//!   tokio::select! {
+//!       out = call_llm(step) => out,
+//!       _ = step.cancel_token.cancelled() => {
+//!           Ok(StepOutcome::Cancel { reason: "cooperative".into() })
+//!       }
+//!   }
+//!   ```
+//!
+//!   Runners that ignore the token are allowed to run to completion
+//!   (futures cannot be safely aborted mid-step). In both cases the
+//!   runner's [`StepOutcome`] is discarded, any pending transient retry
+//!   is suppressed, and the worker fires the terminal hook with
+//!   [`TerminalStatus::Cancelled`] once the step returns. Watching the
+//!   token only reduces cancellation latency for slow steps; it doesn't
+//!   change semantics.
+//!
+//! While termination is in flight, [`WorkflowRuntime::status`] reports a
+//! [`RunState::Cancelling`] overlay until the entry is dropped.
+//!
+//! `cancel` returns `Ok(false)` if the run is unknown or already
+//! terminal in this runtime. It only reaches runs submitted to this
+//! [`WorkflowRuntime`] instance; a second runtime in the same process
+//! (sharing the queue) maintains its own registry.
+//!
 //! # Idempotency model
 //!
 //! Each step is enqueued with [`taquba::EnqueueOptions::dedup_key`] of
