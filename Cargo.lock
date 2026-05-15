@@ -2910,7 +2910,7 @@ dependencies = [
 
 [[package]]
 name = "taquba"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "rmp-serde",
@@ -2963,7 +2963,7 @@ dependencies = [
 
 [[package]]
 name = "taquba-workflow"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "rig-core",
