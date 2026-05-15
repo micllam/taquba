@@ -2967,6 +2967,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "rig-core",
+ "rmp-serde",
  "serde",
  "serde_json",
  "taquba",

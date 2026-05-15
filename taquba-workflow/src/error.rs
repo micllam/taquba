@@ -26,8 +26,10 @@ pub enum Error {
     ReservedHeaderInSubmit(String),
 
     /// Submission was rejected because a run with the same `run_id` is already
-    /// active in this runtime's in-memory registry.
-    #[error("run `{0}` is already active in this runtime")]
+    /// active. The in-process registry catches the in-runtime case; the
+    /// durable run record in Taquba's KV namespace catches the
+    /// cross-restart case.
+    #[error("run `{0}` is already active")]
     DuplicateRun(String),
 
     /// Underlying error from a Taquba queue operation.

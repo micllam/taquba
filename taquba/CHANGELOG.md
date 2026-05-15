@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Queue::enqueue_with_kv(queue, payload, opts, kv_writes)` enqueues a
+  job *and* applies a set of writes to a caller-owned KV namespace in
+  a single SlateDB transaction. Returns the new
+  `EnqueueResult::{New, AlreadyEnqueued}` enum: on a `dedup_key` hit,
+  the existing job's id is returned and **no KV writes are applied**.
+  Enables downstream crates to keep durable coordination state
+  (status markers, dedup records, pointers to externally-stored blobs)
+  consistent with the queue across crashes.
+- `Queue::kv_get(key)` and `Queue::kv_delete(key)` for reading and
+  cleanup of entries in the user KV namespace. There is no standalone
+  `kv_put` by design: the namespace mutates only as a side effect of
+  queue operations.
+- `MAX_KV_VALUE_SIZE` (256 KiB) constant, enforced at the API
+  boundary. Values exceeding the cap return the new
+  `Error::KvValueTooLarge { size, max }` variant.
+- Reserved `usr:` key prefix for the user KV namespace. Caller keys
+  are internally scoped under this prefix so they cannot collide
+  with Taquba's internal layout (`pending:`, `claimed:`, `dead:`,
+  `done:`, `scheduled:`, `jobindex:`, `dedup:`, `stats:`).
+
 ## [0.4.0] - 2026-05-14
 
 ### Added

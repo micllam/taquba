@@ -96,6 +96,26 @@ a oneshot, etc. Shutdown is honoured at safe points: between jobs and during
 idle waits. In-flight jobs always finish, so leases are never abandoned to the
 reaper. See [`examples/worker.rs`](examples/worker.rs) for a full setup.
 
+## Coordinating with caller state
+
+`Queue::enqueue_with_kv` enqueues a job *and* applies a set of writes to a
+caller-owned KV namespace in a single transaction, so a downstream crate can
+keep its own durable coordination state (status markers, dedup records,
+pointers to externally-stored blobs) consistent with the queue across crashes.
+`Queue::kv_get` and `Queue::kv_delete` read and clean up those entries.
+
+Caller keys live under a reserved `usr:` prefix internally so they cannot
+collide with Taquba's own layout. Per-value size is capped at
+`MAX_KV_VALUE_SIZE` (256 KiB); the namespace is sized for coordination state,
+not bulk payload. Store large blobs in the underlying object store under a
+content-addressed key and put only the pointer in KV.
+
+The namespace is mutated **only** as a side effect of queue operations so there
+is no standalone `kv_put`. To create or update an entry, include it in the
+`kv_writes` map of an `enqueue_with_kv` call (which makes the write atomic
+with the enqueue). `kv_delete` is the one standalone primitive, for terminal
+cleanup of entries whose related queue op has already completed.
+
 ## License
 
 Apache-2.0

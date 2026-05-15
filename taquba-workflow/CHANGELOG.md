@@ -7,10 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Cross-restart duplicate-submission rejection. `WorkflowRuntime::submit`
+  now writes a durable per-run record (key `usr:workflow/runs/{run_id}`,
+  carrying `run_id` and `submitted_at_ms`) atomically with the step-0
+  enqueue via Taquba's new `Queue::enqueue_with_kv`. A resubmit of the
+  same `run_id` after a process restart is rejected with
+  `Error::DuplicateRun` even if the registry has been wiped and the
+  step's dedup key released. The record is cleaned up via `kv_delete`
+  when the run reaches a terminal state.
+
 ### Changed
 
-- **Breaking:** now requires `taquba` 0.4. `taquba-workflow`'s own
-  signatures are unchanged.
+- **Breaking:** now requires `taquba` 0.5 (for the new
+  `enqueue_with_kv` / `kv_get` / `kv_delete` methods).
+  `taquba-workflow`'s own signatures are unchanged.
 
 ## [0.2.0] - 2026-05-13
 

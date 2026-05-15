@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use taquba::{EnqueueOptions, JobRecord, PermanentFailure, Queue, Worker, WorkerError};
+use serde::{Deserialize, Serialize};
+use taquba::{
+    EnqueueOptions, EnqueueResult, JobRecord, PermanentFailure, Queue, Worker, WorkerError,
+};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
@@ -22,6 +25,33 @@ pub const HEADER_STEP: &str = "workflow.step";
 pub const RESERVED_HEADER_PREFIX: &str = "workflow.";
 
 const DEDUP_PREFIX: &str = "run:";
+
+/// Prefix for the durable per-run record in Taquba's user KV namespace.
+const RUN_KV_PREFIX: &[u8] = b"workflow/runs/";
+
+fn run_kv_key(run_id: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(RUN_KV_PREFIX.len() + run_id.len());
+    k.extend_from_slice(RUN_KV_PREFIX);
+    k.extend_from_slice(run_id.as_bytes());
+    k
+}
+
+/// Durable per-run record written atomically with the step-0 enqueue in
+/// [`WorkflowRuntime::submit`] via [`Queue::enqueue_with_kv`]. Carries
+/// just enough state to detect duplicate submissions across runtime
+/// restarts; the in-memory registry remains the source of truth for
+/// active-run status and cancellation while a runtime is up. Cleaned up
+/// in [`RuntimeInner::terminate`] when the run reaches a terminal state.
+///
+/// The cross-restart dedup property only requires the *existence* of
+/// this key, so the body is intentionally minimal: `run_id` keeps the
+/// record self-describing for ad hoc operator inspection, and
+/// `submitted_at_ms` is useful for ordering and stale-record auditing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableRunRecord {
+    run_id: String,
+    submitted_at_ms: u64,
+}
 
 /// Per-step enqueue options the runtime forwards through to Taquba. The
 /// runtime always owns `headers` (it injects [`HEADER_RUN_ID`] and
@@ -218,8 +248,9 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// Submit a new run. Enqueues step 0 with payload `spec.input`. Idempotent
     /// against in-process duplicates: if a run with the same `run_id` is
     /// already active in this runtime, returns [`Error::DuplicateRun`].
-    /// Cross-process / cross-restart duplicate-prevention is enforced by
-    /// Taquba's dedup key on the step job.
+    /// Cross-restart duplicate-prevention is enforced by a durable
+    /// per-run record written to Taquba's user KV namespace atomically
+    /// with the step-0 enqueue.
     #[instrument(skip(self, spec), fields(run_id))]
     pub async fn submit(&self, spec: RunSpec) -> Result<RunHandle> {
         let run_id = spec.run_id.unwrap_or_else(|| ulid::Ulid::new().to_string());
@@ -233,27 +264,62 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
 
         // Hold the registry lock across enqueue so two concurrent submits
         // with the same `run_id` can't both pass the duplicate check before
-        // either inserts. Submission is not on a hot path; queue I/O latency
-        // here is acceptable.
+        // either commits. Submission is not on a hot path; queue I/O
+        // latency here is acceptable.
         let mut registry = self.inner.registry.lock().await;
         if registry.contains_key(&run_id) {
             return Err(Error::DuplicateRun(run_id));
         }
 
-        let job_id = self
+        // Cross-restart duplicate check. The registry lock above closes
+        // the in-process race window; this read closes the across-restart
+        // one (same queue, fresh runtime).
+        if self
             .inner
-            .enqueue_step(
-                &run_id,
-                0,
-                spec.input,
-                &spec.headers,
-                StepEnqueueOpts {
-                    priority: spec.priority,
-                    max_attempts: spec.max_attempts_per_step,
-                    ..Default::default()
-                },
-            )
-            .await?;
+            .queue
+            .kv_get(&run_kv_key(&run_id))
+            .await?
+            .is_some()
+        {
+            return Err(Error::DuplicateRun(run_id));
+        }
+
+        let mut headers = spec.headers.clone();
+        headers.insert(HEADER_RUN_ID.to_string(), run_id.clone());
+        headers.insert(HEADER_STEP.to_string(), "0".to_string());
+        let enqueue_opts = EnqueueOptions {
+            headers,
+            run_at: None,
+            priority: spec.priority,
+            max_attempts: spec.max_attempts_per_step,
+            dedup_key: Some(format!("{DEDUP_PREFIX}{run_id}:0")),
+        };
+
+        let record_bytes = rmp_serde::to_vec_named(&DurableRunRecord {
+            run_id: run_id.clone(),
+            submitted_at_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        })
+        .map_err(taquba::Error::from)?;
+        let kv = HashMap::from([(run_kv_key(&run_id), record_bytes)]);
+
+        let job_id = match self
+            .inner
+            .queue
+            .enqueue_with_kv(&self.inner.queue_name, spec.input, enqueue_opts, kv)
+            .await?
+        {
+            EnqueueResult::New(id) => id,
+            // A dedup_key hit without our durable record means either
+            // another writer beat us, or a prior run on `(run_id, step 0)`
+            // released its dedup key (job claimed) but the durable record
+            // is missing, which only happens if the run terminated
+            // without going through `terminate`. Either way the safe
+            // verdict is duplicate.
+            EnqueueResult::AlreadyEnqueued(_) => return Err(Error::DuplicateRun(run_id)),
+        };
 
         registry.insert(
             run_id.clone(),
@@ -457,13 +523,23 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         Ok((run_id, step_number))
     }
 
-    /// Settle a run into its terminal state: drop its registry entry and
-    /// fire the terminal hook. Removal happens first so that
+    /// Settle a run into its terminal state: drop its registry entry,
+    /// delete the durable run record from Taquba's KV namespace, and
+    /// fire the terminal hook. Registry removal happens first so that
     /// [`WorkflowRuntime::status`] doesn't briefly report an
     /// already-terminated run as active while a slow hook (e.g. a webhook
-    /// delivery) is in flight.
+    /// delivery) is in flight. KV cleanup is best-effort: a transient
+    /// failure here leaves a stale durable record that will block a
+    /// future submit with the same `run_id`, but does not affect the
+    /// already-running cleanup of *this* run.
     async fn terminate(&self, outcome: RunOutcome) {
         self.registry.lock().await.remove(&outcome.run_id);
+        if let Err(err) = self.queue.kv_delete(&run_kv_key(&outcome.run_id)).await {
+            warn!(
+                run_id = %outcome.run_id,
+                "failed to clear durable run record: {err}"
+            );
+        }
         self.terminal_hook.on_termination(&outcome).await;
     }
 
@@ -989,6 +1065,63 @@ mod tests {
         assert!(matches!(err, Error::DuplicateRun(id) if id == "fixed-id"));
 
         let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn duplicate_submit_across_runtime_restart_is_rejected() {
+        // Build a runtime, submit a run, then drop the runtime entirely
+        // (simulating a process restart of the workflow layer) while
+        // keeping the underlying Queue alive. The next runtime instance
+        // sees a fresh in-memory registry but must still reject a
+        // duplicate `run_id` because the durable run record persists
+        // through the enqueue_with_kv path.
+        struct PauseRunner;
+        impl StepRunner for PauseRunner {
+            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                std::future::pending().await
+            }
+        }
+
+        let queue = fresh_queue().await;
+
+        // Submit via the first runtime, drop it without starting its
+        // worker loop or going terminal.
+        {
+            let runtime =
+                WorkflowRuntime::builder(queue.clone(), PauseRunner, NoopTerminalHook).build();
+            runtime
+                .submit(RunSpec {
+                    run_id: Some("durable-id".to_string()),
+                    input: b"x".to_vec(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+
+        // The durable record is queryable independently of any runtime.
+        assert!(
+            queue
+                .kv_get(&run_kv_key("durable-id"))
+                .await
+                .unwrap()
+                .is_some(),
+            "durable run record must persist past runtime drop"
+        );
+
+        // Fresh runtime, same queue. The registry is empty here, so the
+        // duplicate verdict can only come from the durable KV record.
+        let runtime2 =
+            WorkflowRuntime::builder(queue.clone(), PauseRunner, NoopTerminalHook).build();
+        let err = runtime2
+            .submit(RunSpec {
+                run_id: Some("durable-id".to_string()),
+                input: b"y".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::DuplicateRun(id) if id == "durable-id"));
     }
 
     #[tokio::test]

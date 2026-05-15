@@ -159,6 +159,20 @@ step can be claimed and executed twice if its lease expires before ack.
 **`StepRunner` impls must be idempotent for the same
 `(run_id, step_number)`.**
 
+## Duplicate submissions
+
+`WorkflowRuntime::submit` rejects re-submissions of an active `run_id`
+from two sources, in order:
+
+1. An in-process registry catches duplicates within the same runtime.
+2. A **durable per-run record** written atomically with the step-0
+   enqueue (via Taquba's `enqueue_with_kv`) catches duplicates across
+   process restarts, even after step 0 has been claimed and its dedup
+   key released. The record is cleaned up when the run reaches a
+   terminal state.
+
+Both paths surface as `Error::DuplicateRun`.
+
 ## Terminal hook
 
 `TerminalHook::on_termination` fires once per run on `Succeeded`,

@@ -52,6 +52,29 @@
 //!   queue, see [`QueueConfig`]).
 //! - Bounded dead-letter retention with paginated inspection.
 //!
+//! # Coordinating with caller state
+//!
+//! [`Queue::enqueue_with_kv`] enqueues a job *and* applies a set of writes
+//! to a caller-owned KV namespace in a single transaction, so a downstream
+//! crate can keep its own durable coordination state (status markers,
+//! dedup records, pointers to externally-stored blobs) consistent with
+//! the queue across crashes. [`Queue::kv_get`] and [`Queue::kv_delete`]
+//! read and clean up those entries.
+//!
+//! Caller keys live under a reserved `usr:` prefix internally so they
+//! cannot collide with Taquba's own layout. Per-value size is capped at
+//! [`MAX_KV_VALUE_SIZE`]; the namespace is sized for coordination
+//! state, not bulk payload. Store large blobs in the underlying object
+//! store under a content-addressed key and put only the pointer in KV.
+//!
+//! The namespace is mutated **only** as a side effect of queue
+//! operations; there is no standalone `kv_put`. To create or update
+//! an entry, include it in the `kv_writes` map of an
+//! [`Queue::enqueue_with_kv`] call (which makes the write atomic with
+//! the enqueue). [`Queue::kv_delete`] is the one standalone primitive,
+//! for terminal cleanup of entries whose related queue op has already
+//! completed.
+//!
 //! # Background tasks
 //!
 //! [`Queue::open`] spawns two background tokio tasks for the lifetime of the
@@ -94,8 +117,8 @@ pub mod worker;
 pub use error::{Error, Result};
 pub use job::{JobRecord, JobStatus};
 pub use queue::{
-    CancelOutcome, EnqueueOptions, OpenOptions, PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_NORMAL,
-    Queue, QueueConfig, WaitOutcome,
+    CancelOutcome, EnqueueOptions, EnqueueResult, MAX_KV_VALUE_SIZE, OpenOptions, PRIORITY_HIGH,
+    PRIORITY_LOW, PRIORITY_NORMAL, Queue, QueueConfig, WaitOutcome,
 };
 pub use stats::QueueStats;
 pub use worker::{PermanentFailure, Worker, WorkerError, run_worker, run_worker_concurrent};

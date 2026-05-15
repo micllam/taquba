@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use slatedb::object_store::ObjectStore;
 use slatedb::{Db, IsolationLevel};
 use tokio::sync::watch;
@@ -91,6 +92,51 @@ pub(crate) fn job_index_key(id: &str) -> String {
 
 pub(crate) fn dedup_index_key(queue: &str, key: &str) -> String {
     format!("dedup:{}:{}", queue, key)
+}
+
+/// Reserved prefix for the user-facing KV namespace.
+///
+/// Caller-supplied keys are internally scoped under this prefix so they
+/// cannot collide with Taquba's own key layout (`pending:`, `claimed:`,
+/// `dead:`, `done:`, `scheduled:`, `jobindex:`, `dedup:`, `stats:`).
+const USR_PREFIX: &[u8] = b"usr:";
+
+/// Maximum size of a single value in the user KV namespace.
+///
+/// The KV namespace is sized for coordination state (pointers, status
+/// markers, dedup records, small lifecycle records), not bulk payload.
+/// Values exceeding this cap return [`Error::KvValueTooLarge`].
+///
+/// Store large blobs in the underlying [`ObjectStore`] under a
+/// content-addressed key and put only the pointer in KV.
+pub const MAX_KV_VALUE_SIZE: usize = 256 * 1024;
+
+fn user_scoped_key(key: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(USR_PREFIX.len() + key.len());
+    out.extend_from_slice(USR_PREFIX);
+    out.extend_from_slice(key);
+    out
+}
+
+/// Outcome of [`Queue::enqueue_with_kv`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnqueueResult {
+    /// A new job was enqueued. The string is its freshly-allocated id.
+    /// The accompanying `kv_writes` map was applied atomically.
+    New(String),
+    /// A pending or scheduled job with the same `dedup_key` already
+    /// existed; no new job was written and **no KV writes were applied**.
+    /// The string is the existing job's id.
+    AlreadyEnqueued(String),
+}
+
+impl EnqueueResult {
+    /// The id of the underlying job, whether newly enqueued or pre-existing.
+    pub fn id(&self) -> &str {
+        match self {
+            Self::New(id) | Self::AlreadyEnqueued(id) => id,
+        }
+    }
 }
 
 /// Compute the retry delay for the next attempt after a nack.
@@ -520,6 +566,152 @@ impl Queue {
 
         debug!(queue = %queue, job_id = %id, priority, ?run_at, "job enqueued");
         Ok(id)
+    }
+
+    /// Enqueue a job AND apply a set of writes to the user KV namespace
+    /// in a single transaction.
+    ///
+    /// On success ([`EnqueueResult::New`]), the job is enqueued and every
+    /// entry in `kv_writes` is applied atomically. On a `dedup_key` hit
+    /// ([`EnqueueResult::AlreadyEnqueued`]), **no KV writes are applied**
+    /// and the existing job's id is returned.
+    ///
+    /// Caller-supplied KV keys are internally scoped under a reserved
+    /// `usr:` prefix so they cannot collide with Taquba's internal layout.
+    /// Each value is validated against [`MAX_KV_VALUE_SIZE`] up front;
+    /// oversized values return [`Error::KvValueTooLarge`] before the
+    /// transaction begins. Conflict retries are handled internally.
+    ///
+    /// ```no_run
+    /// # use std::collections::HashMap;
+    /// # use taquba::{EnqueueOptions, EnqueueResult};
+    /// # async fn ex(q: &taquba::Queue) -> taquba::Result<()> {
+    /// let mut kv = HashMap::new();
+    /// kv.insert(b"runs/abc".to_vec(), b"submitted".to_vec());
+    /// let outcome = q.enqueue_with_kv(
+    ///     "workflow-steps",
+    ///     b"step-0-payload".to_vec(),
+    ///     EnqueueOptions {
+    ///         dedup_key: Some("run:abc:0".to_string()),
+    ///         ..Default::default()
+    ///     },
+    ///     kv,
+    /// ).await?;
+    /// match outcome {
+    ///     EnqueueResult::New(id) => println!("submitted: {id}"),
+    ///     EnqueueResult::AlreadyEnqueued(id) => println!("already running: {id}"),
+    /// }
+    /// # Ok(()) }
+    /// ```
+    #[instrument(skip(self, payload, kv_writes), fields(queue, job_id))]
+    pub async fn enqueue_with_kv(
+        &self,
+        queue: &str,
+        payload: Vec<u8>,
+        opts: EnqueueOptions,
+        kv_writes: HashMap<Vec<u8>, Vec<u8>>,
+    ) -> Result<EnqueueResult> {
+        for value in kv_writes.values() {
+            if value.len() > MAX_KV_VALUE_SIZE {
+                return Err(Error::KvValueTooLarge {
+                    size: value.len(),
+                    max: MAX_KV_VALUE_SIZE,
+                });
+            }
+        }
+
+        let cfg = self.queue_config(queue);
+        let max_attempts = opts.max_attempts.unwrap_or(cfg.max_attempts);
+        let priority = opts.priority.unwrap_or(cfg.default_priority);
+
+        let run_at = opts.run_at.and_then(|when| {
+            let ms = when
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            (ms > now_ms()).then_some(ms)
+        });
+
+        let id = Ulid::new().to_string();
+        let (status, key) = match run_at {
+            Some(ms) => (JobStatus::Scheduled, scheduled_key(queue, ms, &id)),
+            None => (JobStatus::Pending, pending_key(queue, priority, &id)),
+        };
+        let job = JobRecord {
+            id: id.clone(),
+            queue: queue.to_string(),
+            payload,
+            headers: opts.headers,
+            status,
+            attempts: 0,
+            max_attempts,
+            enqueued_at: now_ms(),
+            claimed_at: None,
+            lease_expires_at: None,
+            run_at,
+            priority,
+            last_error: None,
+            dedup_key: opts.dedup_key.clone(),
+            completed_at: None,
+            failed_at: None,
+            cancel_requested: false,
+            cancel_token: None,
+        };
+        let value = rmp_serde::to_vec_named(&job)?;
+        let dkey = opts.dedup_key.as_ref().map(|dk| dedup_index_key(queue, dk));
+
+        loop {
+            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+
+            if let Some(ref dkey) = dkey {
+                if let Some(bytes) = txn.get(dkey.as_bytes()).await? {
+                    txn.rollback();
+                    let existing =
+                        String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidState)?;
+                    return Ok(EnqueueResult::AlreadyEnqueued(existing));
+                }
+            }
+
+            txn.put(key.as_bytes(), &value)?;
+            txn.put(job_index_key(&id).as_bytes(), key.as_bytes())?;
+            if let Some(ref dkey) = dkey {
+                txn.put(dkey.as_bytes(), id.as_bytes())?;
+            }
+            update_stats(&txn, queue, &[(status, 1)])?;
+
+            for (k, v) in &kv_writes {
+                txn.put(user_scoped_key(k), v)?;
+            }
+
+            match txn.commit().await {
+                Ok(_) => {
+                    if matches!(status, JobStatus::Pending) {
+                        self.job_available.notify_waiters();
+                    }
+                    debug!(queue = %queue, job_id = %id, "job enqueued with kv");
+                    return Ok(EnqueueResult::New(id));
+                }
+                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Read a value from the user KV namespace.
+    ///
+    /// Caller-supplied keys are internally scoped under a reserved
+    /// `usr:` prefix and cannot collide with Taquba's internal layout.
+    pub async fn kv_get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        Ok(self.db.get(user_scoped_key(key)).await?)
+    }
+
+    /// Delete a value from the user KV namespace.
+    ///
+    /// Caller-supplied keys are internally scoped under a reserved
+    /// `usr:` prefix and cannot collide with Taquba's internal layout.
+    pub async fn kv_delete(&self, key: &[u8]) -> Result<()> {
+        self.db.delete(user_scoped_key(key)).await?;
+        Ok(())
     }
 
     /// Dedup-aware variant: writes a pending or scheduled job behind a
@@ -3621,5 +3813,173 @@ mod tests {
         let _ = handle.await;
 
         assert_eq!(q.stats("work").await.unwrap().done, 5);
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_with_kv_new_writes_apply() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let mut kv = HashMap::new();
+        kv.insert(b"runs/abc".to_vec(), b"submitted".to_vec());
+
+        let outcome = q
+            .enqueue_with_kv("work", b"payload".to_vec(), EnqueueOptions::default(), kv)
+            .await
+            .unwrap();
+        let id = match outcome {
+            EnqueueResult::New(id) => id,
+            other => panic!("expected New, got {other:?}"),
+        };
+
+        let s = q.stats("work").await.unwrap();
+        assert_eq!(s.pending, 1);
+
+        let claimed = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, id);
+        assert_eq!(claimed.payload, b"payload");
+
+        let v = q.kv_get(b"runs/abc").await.unwrap();
+        assert_eq!(v.as_deref(), Some(b"submitted".as_slice()));
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_with_kv_dedup_hit_skips_kv_writes() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+
+        let first_outcome = q
+            .enqueue_with_kv(
+                "work",
+                b"first".to_vec(),
+                EnqueueOptions {
+                    dedup_key: Some("run-abc".into()),
+                    ..Default::default()
+                },
+                HashMap::from([(b"runs/abc".to_vec(), b"first-record".to_vec())]),
+            )
+            .await
+            .unwrap();
+        let first_id = match first_outcome {
+            EnqueueResult::New(id) => id,
+            other => panic!("expected New, got {other:?}"),
+        };
+
+        let second_outcome = q
+            .enqueue_with_kv(
+                "work",
+                b"second".to_vec(),
+                EnqueueOptions {
+                    dedup_key: Some("run-abc".into()),
+                    ..Default::default()
+                },
+                HashMap::from([(b"runs/abc".to_vec(), b"second-record".to_vec())]),
+            )
+            .await
+            .unwrap();
+        match second_outcome {
+            EnqueueResult::AlreadyEnqueued(id) => assert_eq!(id, first_id),
+            other => panic!("expected AlreadyEnqueued, got {other:?}"),
+        }
+
+        // Only one job was enqueued.
+        let s = q.stats("work").await.unwrap();
+        assert_eq!(s.pending, 1);
+
+        // First write applied; second was a dedup hit so it did NOT
+        // overwrite the KV value.
+        let v = q.kv_get(b"runs/abc").await.unwrap();
+        assert_eq!(v.as_deref(), Some(b"first-record".as_slice()));
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_with_kv_rejects_oversized_value() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let oversized = vec![0u8; MAX_KV_VALUE_SIZE + 1];
+        let err = q
+            .enqueue_with_kv(
+                "work",
+                b"x".to_vec(),
+                EnqueueOptions::default(),
+                HashMap::from([(b"big".to_vec(), oversized)]),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            Error::KvValueTooLarge { size, max } => {
+                assert_eq!(size, MAX_KV_VALUE_SIZE + 1);
+                assert_eq!(max, MAX_KV_VALUE_SIZE);
+            }
+            other => panic!("expected KvValueTooLarge, got {other:?}"),
+        }
+        // Nothing enqueued: validation runs before the transaction.
+        assert_eq!(q.stats("work").await.unwrap().pending, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_kv_keys_cannot_collide_with_internal_layout() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+
+        // Enqueue a real job so the internal `pending:` keyspace is in use.
+        q.enqueue("work", b"payload".to_vec()).await.unwrap();
+
+        // A user key that *looks* like an internal prefix is scoped under
+        // `usr:` and cannot interfere with queue state.
+        q.enqueue_with_kv(
+            "other",
+            b"sentinel".to_vec(),
+            EnqueueOptions::default(),
+            HashMap::from([(
+                b"pending:work:0000000001:fake-id".to_vec(),
+                b"trickery".to_vec(),
+            )]),
+        )
+        .await
+        .unwrap();
+
+        // The original job is still claimable from the original queue.
+        let s = q.stats("work").await.unwrap();
+        assert_eq!(s.pending, 1);
+        let claimed = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.payload, b"payload");
+
+        // The user-visible key still reads back fine.
+        let v = q.kv_get(b"pending:work:0000000001:fake-id").await.unwrap();
+        assert_eq!(v.as_deref(), Some(b"trickery".as_slice()));
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_kv_delete_removes_value() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        q.enqueue_with_kv(
+            "work",
+            b"x".to_vec(),
+            EnqueueOptions::default(),
+            HashMap::from([(b"runs/xyz".to_vec(), b"active".to_vec())]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            q.kv_get(b"runs/xyz").await.unwrap().as_deref(),
+            Some(b"active".as_slice())
+        );
+
+        q.kv_delete(b"runs/xyz").await.unwrap();
+        assert!(q.kv_get(b"runs/xyz").await.unwrap().is_none());
+
+        q.close().await.unwrap();
     }
 }

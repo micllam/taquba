@@ -29,6 +29,19 @@ pub enum Error {
     /// `requeue_dead_job` on a record that is no longer in the dead state.
     #[error("job is not in the expected state")]
     InvalidState,
+
+    /// A value passed to [`crate::Queue::enqueue_with_kv`] exceeded the
+    /// configured maximum size for the user KV namespace. The cap is
+    /// enforced at the API boundary to keep bulk payload out of the LSM
+    /// tree; store large blobs in the underlying object store and put only
+    /// the pointer in KV. See [`crate::MAX_KV_VALUE_SIZE`].
+    #[error("kv value too large: {size} bytes (max {max})")]
+    KvValueTooLarge {
+        /// The value size that was rejected.
+        size: usize,
+        /// The configured maximum.
+        max: usize,
+    },
 }
 
 /// Convenience alias for `Result<T, Error>` returned throughout the crate.
