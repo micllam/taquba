@@ -34,6 +34,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Queue::sweep_retention_now()` for a sweep that honours each queue's
   configured window.
 
+### Fixed
+
+- `Queue::ack` and `Queue::dead_letter` now retry on transaction conflict,
+  matching every other write path in the crate. Previously, a conflict
+  during ack or dead-letter would surface the error to the caller and
+  leave the job in `Claimed` until the lease expired and the reaper
+  requeued or dead-lettered it, adding up to
+  `lease_duration + reaper_interval` of wall-clock latency to the job's
+  terminal state.
+
 ## [0.5.0] - 2026-05-15
 
 ### Added

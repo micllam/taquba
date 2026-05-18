@@ -912,29 +912,41 @@ impl Queue {
     pub async fn ack(&self, job: &JobRecord) -> Result<()> {
         let lease_expires_at = job.lease_expires_at.ok_or(Error::InvalidState)?;
         let claimed = claimed_key(&job.queue, lease_expires_at, &job.id);
-
-        let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-        txn.delete(claimed.as_bytes())?;
-
-        if self.queue_keep_done_jobs(&job.queue).is_some() {
+        let keep_done = self.queue_keep_done_jobs(&job.queue).is_some();
+        let done_record = if keep_done {
             let mut done_job = job.clone();
             done_job.status = JobStatus::Done;
             done_job.completed_at = Some(now_ms());
-            let value = rmp_serde::to_vec_named(&done_job)?;
-            let done = done_key(&job.queue, &job.id);
-            txn.put(done.as_bytes(), &value)?;
-            txn.put(job_index_key(&job.id).as_bytes(), done.as_bytes())?;
+            Some((
+                done_key(&job.queue, &job.id),
+                rmp_serde::to_vec_named(&done_job)?,
+            ))
         } else {
-            // Default: drop the index pointer too; the ID is no longer
-            // findable via get_job, but the queue stays small.
-            txn.delete(job_index_key(&job.id).as_bytes())?;
+            None
+        };
+
+        loop {
+            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+            txn.delete(claimed.as_bytes())?;
+            if let Some((ref done_k, ref done_v)) = done_record {
+                txn.put(done_k.as_bytes(), done_v)?;
+                txn.put(job_index_key(&job.id).as_bytes(), done_k.as_bytes())?;
+            } else {
+                // Default: drop the index pointer too; the ID is no longer
+                // findable via get_job, but the queue stays small.
+                txn.delete(job_index_key(&job.id).as_bytes())?;
+            }
+            update_stats(
+                &txn,
+                &job.queue,
+                &[(JobStatus::Claimed, -1), (JobStatus::Done, 1)],
+            )?;
+            match txn.commit().await {
+                Ok(_) => break,
+                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
+                Err(e) => return Err(e.into()),
+            }
         }
-        update_stats(
-            &txn,
-            &job.queue,
-            &[(JobStatus::Claimed, -1), (JobStatus::Done, 1)],
-        )?;
-        txn.commit().await?;
 
         self.clear_cancel_token(&job.id);
         self.completion_notify.notify_waiters();
@@ -1059,19 +1071,25 @@ impl Queue {
         job.failed_at = Some(now_ms());
         job.claimed_at = None;
         job.lease_expires_at = None;
-
-        let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-        txn.delete(claimed.as_bytes())?;
         let dead = dead_key(&job.queue, &job.id);
         let value = rmp_serde::to_vec_named(&job)?;
-        txn.put(dead.as_bytes(), &value)?;
-        txn.put(job_index_key(&job.id).as_bytes(), dead.as_bytes())?;
-        update_stats(
-            &txn,
-            &job.queue,
-            &[(JobStatus::Claimed, -1), (JobStatus::Dead, 1)],
-        )?;
-        txn.commit().await?;
+
+        loop {
+            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+            txn.delete(claimed.as_bytes())?;
+            txn.put(dead.as_bytes(), &value)?;
+            txn.put(job_index_key(&job.id).as_bytes(), dead.as_bytes())?;
+            update_stats(
+                &txn,
+                &job.queue,
+                &[(JobStatus::Claimed, -1), (JobStatus::Dead, 1)],
+            )?;
+            match txn.commit().await {
+                Ok(_) => break,
+                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
 
         self.clear_cancel_token(&job.id);
         self.completion_notify.notify_waiters();
