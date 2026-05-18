@@ -37,6 +37,40 @@ lifecycle policy on the object-store prefix (S3 lifecycle rules, GCS
 object-lifecycle management, etc.); a built-in retention option is planned
 for a later release.
 
+## Configuring the queue
+
+Per-queue retention (`QueueConfig::keep_done_jobs` and
+`QueueConfig::dead_retention`) is set on the `taquba::Queue` before it's
+handed to the runner. Pick an explicit name via
+`JobRunnerBuilder::queue_name` and key `OpenOptions::queue_configs` on the
+same string.
+
+```rust
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use taquba::{OpenOptions, Queue, QueueConfig, object_store::memory::InMemory};
+use taquba_jobs::JobRunner;
+
+let store = Arc::new(InMemory::new());
+let opts = OpenOptions {
+    queue_configs: HashMap::from([(
+        "background-jobs".to_string(),
+        QueueConfig {
+            keep_done_jobs: Some(Duration::from_secs(60 * 60)),
+            ..QueueConfig::default()
+        },
+    )]),
+    ..OpenOptions::default()
+};
+let queue = Arc::new(Queue::open_with_options(store.clone(), "db", opts).await?);
+let runner = JobRunner::builder()
+    .queue(queue)
+    .object_store(store)
+    .queue_name("background-jobs") // same string as in queue_configs
+    .build()?;
+```
+
 ## Fan-out from handlers
 
 `JobContext::submit` lets a running handler enqueue follow-up jobs against the

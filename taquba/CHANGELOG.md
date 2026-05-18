@@ -7,10 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Per-queue retention via new `QueueConfig::keep_done_jobs` and
+  `QueueConfig::dead_retention` fields. Different queues sharing one
+  `Queue` instance can now pick different retention windows (e.g.
+  short for ephemeral deliveries, longer for workflow runs).
+  `Queue::ack` and the background reaper consult the per-queue value
+  via the new `Queue::queue_keep_done_jobs` /
+  `Queue::queue_dead_retention` resolvers.
+
 ### Changed
 
 - Updated `slatedb` dependency from 0.12 to 0.13. `taquba`'s public API is
   unchanged.
+- **Breaking:** `keep_done_jobs` and `dead_retention` have moved from
+  `OpenOptions` to `QueueConfig`. Migration: set them on
+  `OpenOptions::default_queue_config` for an instance-wide default, or
+  per queue in `OpenOptions::queue_configs`. The previous defaults
+  (`None` for `keep_done_jobs`, `Some(7 days)` for `dead_retention`)
+  now live on `QueueConfig::default()` and apply unchanged when
+  unspecified.
+- `Queue::sweep_done_now(retention)` / `Queue::sweep_dead_now(retention)`
+  now apply the argument uniformly to every record, overriding per-queue
+  `QueueConfig::keep_done_jobs` / `QueueConfig::dead_retention`. Use
+  `Queue::sweep_retention_now()` for a sweep that honours each queue's
+  configured window.
 
 ## [0.5.0] - 2026-05-15
 

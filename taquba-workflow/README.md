@@ -40,6 +40,45 @@ Enable the `webhooks` feature for `WebhookTerminalHook`:
 cargo add taquba-workflow --features webhooks
 ```
 
+## Configuring the queue
+
+Per-queue retention (`QueueConfig::keep_done_jobs` and
+`QueueConfig::dead_retention`) is set on the `taquba::Queue` before it's
+handed to the runtime. Pick an explicit name via
+`WorkflowRuntimeBuilder::queue_name` and key `OpenOptions::queue_configs`
+on the same string.
+
+```rust
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use taquba::{OpenOptions, Queue, QueueConfig, object_store::memory::InMemory};
+use taquba_workflow::{NoopTerminalHook, StepError, StepOutcome, StepRunner, WorkflowRuntime, Step};
+
+struct EchoRunner;
+impl StepRunner for EchoRunner {
+    async fn run_step(&self, step: &Step) -> Result<StepOutcome, StepError> {
+        Ok(StepOutcome::Succeed { result: step.payload.clone() })
+    }
+}
+
+let store = Arc::new(InMemory::new());
+let opts = OpenOptions {
+    queue_configs: HashMap::from([(
+        "agent-runs".to_string(),
+        QueueConfig {
+            keep_done_jobs: Some(Duration::from_secs(24 * 60 * 60)),
+            ..QueueConfig::default()
+        },
+    )]),
+    ..OpenOptions::default()
+};
+let queue = Arc::new(Queue::open_with_options(store, "db", opts).await?);
+let runtime = WorkflowRuntime::builder(queue, EchoRunner, NoopTerminalHook)
+    .queue_name("agent-runs") // same string as in queue_configs
+    .build();
+```
+
 ## Quick start
 
 ```rust

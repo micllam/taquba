@@ -178,6 +178,19 @@ pub struct QueueConfig {
     /// Upper bound on the retry backoff delay. Ignored when `retry_backoff_base`
     /// is zero.
     pub retry_backoff_max: Duration,
+    /// If `Some(duration)`, completed jobs on this queue are written to the
+    /// `done:` keyspace and retained for `duration`. The reaper purges them
+    /// once `completed_at + duration` has passed.
+    ///
+    /// If `None` (default), [`Queue::ack`] deletes successful jobs outright.
+    ///
+    /// The success counter in [`QueueStats::done`] is incremented either way.
+    pub keep_done_jobs: Option<Duration>,
+    /// Maximum age of a dead-letter job on this queue before the retention
+    /// sweep purges it. Default is 7 days, which gives operators time to
+    /// inspect or requeue without leaking storage. `None` disables the
+    /// sweep for this queue: dead jobs accumulate without bound.
+    pub dead_retention: Option<Duration>,
 }
 
 impl Default for QueueConfig {
@@ -188,6 +201,8 @@ impl Default for QueueConfig {
             default_priority: PRIORITY_NORMAL,
             retry_backoff_base: Duration::from_secs(1),
             retry_backoff_max: Duration::from_secs(300),
+            keep_done_jobs: None,
+            dead_retention: Some(Duration::from_secs(7 * 24 * 3600)),
         }
     }
 }
@@ -200,23 +215,14 @@ pub struct OpenOptions {
     /// How often the background scheduler promotes due jobs to pending. Defaults to 1s.
     pub scheduler_interval: Duration,
     /// Default configuration applied to any queue not listed in
-    /// [`Self::queue_configs`].
+    /// [`Self::queue_configs`]. Retention policies
+    /// ([`QueueConfig::keep_done_jobs`], [`QueueConfig::dead_retention`])
+    /// live on `QueueConfig`, so per-queue overrides can pick different
+    /// retention windows for, say, ephemeral webhook deliveries vs.
+    /// long-running workflows.
     pub default_queue_config: QueueConfig,
     /// Per-queue overrides. Keys are queue names.
     pub queue_configs: HashMap<String, QueueConfig>,
-    /// If `Some(duration)`, completed jobs are written to the `done:` keyspace
-    /// and retained for `duration`. The reaper purges them once
-    /// `enqueued_at + duration` has passed.
-    ///
-    /// If `None` (default), [`Queue::ack`] deletes the job outright.
-    ///
-    /// The success counter in [`QueueStats::done`] is incremented either way.
-    pub keep_done_jobs: Option<Duration>,
-    /// Maximum age of a dead-letter job before the retention sweep purges it.
-    /// Default is 7 days, which gives operators time to inspect or requeue
-    /// without leaking storage. `None` disables the sweep entirely: dead
-    /// jobs accumulate without bound.
-    pub dead_retention: Option<Duration>,
 }
 
 impl Default for OpenOptions {
@@ -226,8 +232,6 @@ impl Default for OpenOptions {
             scheduler_interval: Duration::from_secs(1),
             default_queue_config: QueueConfig::default(),
             queue_configs: HashMap::new(),
-            keep_done_jobs: None,
-            dead_retention: Some(Duration::from_secs(7 * 24 * 3600)),
         }
     }
 }
@@ -303,7 +307,6 @@ pub struct Queue {
     scheduler_handle: JoinHandle<()>,
     default_queue_config: QueueConfig,
     queue_configs: HashMap<String, QueueConfig>,
-    keep_done_jobs: Option<Duration>,
     /// In-process wakeup signal so workers blocked on an empty queue can resume
     /// the moment a job becomes claimable, without waiting out their poll
     /// interval.
@@ -331,7 +334,7 @@ pub struct Queue {
 ///
 /// | Transition                                         | Retained?                                   |
 /// |----------------------------------------------------|---------------------------------------------|
-/// | Worker `ack` (success)                             | Only if [`OpenOptions::keep_done_jobs`] is set |
+/// | Worker `ack` (success)                             | Only if [`QueueConfig::keep_done_jobs`] is set |
 /// | Worker `nack` past `max_attempts` (Dead)           | Always                                      |
 /// | Worker [`Queue::dead_letter`] (permanent failure)  | Always                                      |
 /// | Reaper dead-letter (lease expired past max_attempts) | Always                                    |
@@ -342,7 +345,7 @@ pub struct Queue {
 /// With the default configuration, `Completed(None)` is reachable from
 /// **two** distinct paths: a successful `ack` whose record was deleted,
 /// and a Pending/Scheduled cancellation. Callers that need to tell them
-/// apart should set [`OpenOptions::keep_done_jobs`]. That option keeps
+/// apart should set [`QueueConfig::keep_done_jobs`]. That option keeps
 /// successful records around for a bounded retention window, which,
 /// beyond resolving the ambiguity, also lets the caller inspect
 /// `last_error`, `completed_at`, `attempts`, and the original `payload`
@@ -390,8 +393,8 @@ impl Queue {
         let reaper_handle = tokio::spawn(crate::reaper::reap_loop(
             db.clone(),
             opts.reaper_interval,
-            opts.keep_done_jobs,
-            opts.dead_retention,
+            opts.default_queue_config.clone(),
+            opts.queue_configs.clone(),
             job_available.clone(),
             completion_notify.clone(),
             reaper_rx,
@@ -411,7 +414,6 @@ impl Queue {
             scheduler_handle,
             default_queue_config: opts.default_queue_config,
             queue_configs: opts.queue_configs,
-            keep_done_jobs: opts.keep_done_jobs,
             job_available,
             claimed_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             completion_notify,
@@ -453,6 +455,18 @@ impl Queue {
     /// Look up the configured lease duration for a queue.
     pub fn queue_lease_duration(&self, queue: &str) -> Duration {
         self.queue_config(queue).lease_duration
+    }
+
+    /// Look up the configured `keep_done_jobs` retention for a queue.
+    /// `None` means [`Self::ack`] deletes successful jobs outright on that queue.
+    pub fn queue_keep_done_jobs(&self, queue: &str) -> Option<Duration> {
+        self.queue_config(queue).keep_done_jobs
+    }
+
+    /// Look up the configured dead-letter retention for a queue.
+    /// `None` means the dead-letter sweep is disabled for that queue.
+    pub fn queue_dead_retention(&self, queue: &str) -> Option<Duration> {
+        self.queue_config(queue).dead_retention
     }
 
     /// Enqueue a job using the queue's configured defaults for everything
@@ -891,8 +905,9 @@ impl Queue {
     /// By default the job is deleted outright; the success counter in
     /// [`QueueStats::done`] is still incremented.
     ///
-    /// Set [`OpenOptions::keep_done_jobs`] to retain completed jobs for a
-    /// bounded duration.
+    /// Set [`QueueConfig::keep_done_jobs`] (per-queue, or on
+    /// [`OpenOptions::default_queue_config`] for an instance-wide default)
+    /// to retain completed jobs for a bounded duration.
     #[instrument(skip(self, job), fields(queue = %job.queue, job_id = %job.id))]
     pub async fn ack(&self, job: &JobRecord) -> Result<()> {
         let lease_expires_at = job.lease_expires_at.ok_or(Error::InvalidState)?;
@@ -901,7 +916,7 @@ impl Queue {
         let txn = self.db.begin(IsolationLevel::Snapshot).await?;
         txn.delete(claimed.as_bytes())?;
 
-        if self.keep_done_jobs.is_some() {
+        if self.queue_keep_done_jobs(&job.queue).is_some() {
             let mut done_job = job.clone();
             done_job.status = JobStatus::Done;
             done_job.completed_at = Some(now_ms());
@@ -1502,15 +1517,18 @@ impl Queue {
 
     /// Trigger an immediate done-job retention sweep (primarily useful in tests
     /// and tooling). Deletes any `done:` entries whose retention window has
-    /// expired. The `retention` argument overrides the value configured on the
-    /// instance so callers can run a one-off purge.
+    /// expired. The `retention` argument is applied uniformly to every record,
+    /// overriding per-queue [`QueueConfig::keep_done_jobs`] so callers can run
+    /// a one-off purge.
     pub async fn sweep_done_now(&self, retention: Duration) -> Result<()> {
-        sweep_done(&self.db, retention).await
+        sweep_done(&self.db, &|_| Some(retention)).await
     }
 
-    /// Trigger an immediate dead-job retention sweep.
+    /// Trigger an immediate dead-job retention sweep. The `retention` argument
+    /// is applied uniformly to every record, overriding per-queue
+    /// [`QueueConfig::dead_retention`].
     pub async fn sweep_dead_now(&self, retention: Duration) -> Result<()> {
-        sweep_dead(&self.db, retention).await
+        sweep_dead(&self.db, &|_| Some(retention)).await
     }
 
     /// Shut down the background reaper and scheduler, then close the underlying database.
@@ -2515,7 +2533,10 @@ mod tests {
     async fn test_get_job_tracks_lifecycle() {
         // Opt in to keeping done jobs so get_job can resolve them after ack.
         let opts = OpenOptions {
-            keep_done_jobs: Some(Duration::from_secs(60)),
+            default_queue_config: QueueConfig {
+                keep_done_jobs: Some(Duration::from_secs(60)),
+                ..QueueConfig::default()
+            },
             ..OpenOptions::default()
         };
         let q = Queue::open_with_options(make_store(), "test", opts)
@@ -2575,7 +2596,10 @@ mod tests {
     async fn test_done_retention_sweeps_old_jobs() {
         // Open with a tight retention so the sweep clears the entry quickly.
         let opts = OpenOptions {
-            keep_done_jobs: Some(Duration::from_millis(20)),
+            default_queue_config: QueueConfig {
+                keep_done_jobs: Some(Duration::from_millis(20)),
+                ..QueueConfig::default()
+            },
             ..OpenOptions::default()
         };
         let q = Queue::open_with_options(make_store(), "test", opts)
@@ -2603,10 +2627,167 @@ mod tests {
         q.close().await.unwrap();
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn test_retention_is_per_queue_on_ack_and_sweep() {
+        // Two queues sharing one Queue instance, with very different
+        // retention policies. The default-config queue ("transient") drops
+        // jobs on ack; the per-queue override ("kept") retains them. Then
+        // the same background reaper sweep must respect each queue's window.
+        //
+        // The retention cutoff is wall-clock (`SystemTime::now()`), so the
+        // 60 ms `std::thread::sleep` below is the only real-time wait in
+        // this test. The reaper tick is driven through tokio's paused
+        // virtual clock so the test does not depend on the reaper waking
+        // up by real-time scheduling luck.
+        let reaper_interval = Duration::from_millis(10);
+        let kept_retention = Duration::from_millis(50);
+
+        let opts = OpenOptions {
+            reaper_interval,
+            default_queue_config: QueueConfig {
+                keep_done_jobs: None,
+                ..QueueConfig::default()
+            },
+            queue_configs: HashMap::from([(
+                "kept".to_string(),
+                QueueConfig {
+                    keep_done_jobs: Some(kept_retention),
+                    ..QueueConfig::default()
+                },
+            )]),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        let kept_id = q.enqueue("kept", b"a".to_vec()).await.unwrap();
+        let transient_id = q.enqueue("transient", b"b".to_vec()).await.unwrap();
+
+        let kept_job = q
+            .claim("kept", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let transient_job = q
+            .claim("transient", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.ack(&kept_job).await.unwrap();
+        q.ack(&transient_job).await.unwrap();
+
+        // The "transient" queue has no retention: ack dropped the record.
+        assert!(
+            q.get_job(&transient_id).await.unwrap().is_none(),
+            "queues without keep_done_jobs must drop on ack"
+        );
+        // The "kept" queue has retention: ack preserved the record.
+        assert!(
+            q.get_job(&kept_id).await.unwrap().is_some(),
+            "queues with keep_done_jobs must retain on ack"
+        );
+
+        // Fire a reaper tick (virtual time) before the wall-clock retention
+        // window has elapsed: the kept record must survive.
+        tokio::time::sleep(reaper_interval * 2).await;
+        assert!(
+            q.get_job(&kept_id).await.unwrap().is_some(),
+            "reaper sweep before retention elapses must not purge"
+        );
+
+        // Advance wall clock past the retention window. `std::thread::sleep`
+        // is used because the retention check reads `SystemTime::now()`,
+        // which tokio's paused clock does not virtualise.
+        std::thread::sleep(kept_retention + Duration::from_millis(10));
+
+        // Fire another reaper tick: now the kept record's `completed_at`
+        // is past the cutoff, so the sweep purges it.
+        tokio::time::sleep(reaper_interval * 2).await;
+        assert!(
+            q.get_job(&kept_id).await.unwrap().is_none(),
+            "reaper sweep after retention elapses must purge"
+        );
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_dead_retention_is_per_queue() {
+        // Two queues with different dead-letter retention windows. The
+        // same reaper sweep purges the short-window queue's record while
+        // leaving the long-window one intact. See
+        // `test_retention_is_per_queue_on_ack_and_sweep` for why this
+        // test mixes `std::thread::sleep` (wall clock) and
+        // `tokio::time::sleep` (virtual clock).
+        let reaper_interval = Duration::from_millis(10);
+        let ephemeral_retention = Duration::from_millis(50);
+
+        let opts = OpenOptions {
+            reaper_interval,
+            default_queue_config: QueueConfig {
+                dead_retention: Some(Duration::from_secs(3600)),
+                ..QueueConfig::default()
+            },
+            queue_configs: HashMap::from([(
+                "ephemeral".to_string(),
+                QueueConfig {
+                    dead_retention: Some(ephemeral_retention),
+                    ..QueueConfig::default()
+                },
+            )]),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        for queue in ["ephemeral", "durable"] {
+            q.enqueue_with(
+                queue,
+                b"x".to_vec(),
+                EnqueueOptions {
+                    max_attempts: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let job = q
+                .claim(queue, Duration::from_secs(30))
+                .await
+                .unwrap()
+                .unwrap();
+            q.nack(job, "fatal").await.unwrap();
+        }
+
+        assert_eq!(q.dead_jobs("ephemeral", None, 100).await.unwrap().len(), 1);
+        assert_eq!(q.dead_jobs("durable", None, 100).await.unwrap().len(), 1);
+
+        std::thread::sleep(ephemeral_retention + Duration::from_millis(10));
+        tokio::time::sleep(reaper_interval * 2).await;
+
+        assert_eq!(
+            q.dead_jobs("ephemeral", None, 100).await.unwrap().len(),
+            0,
+            "short-retention queue must be purged"
+        );
+        assert_eq!(
+            q.dead_jobs("durable", None, 100).await.unwrap().len(),
+            1,
+            "long-retention queue must be untouched by the same sweep"
+        );
+
+        q.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_done_retention_uses_completion_time_not_enqueue_time() {
         let opts = OpenOptions {
-            keep_done_jobs: Some(Duration::from_millis(500)),
+            default_queue_config: QueueConfig {
+                keep_done_jobs: Some(Duration::from_millis(500)),
+                ..QueueConfig::default()
+            },
             ..OpenOptions::default()
         };
         let q = Queue::open_with_options(make_store(), "test", opts)
@@ -3053,9 +3234,13 @@ mod tests {
     async fn test_wait_for_completion_with_kept_done_jobs() {
         // When `keep_done_jobs` is set, the terminal `Done` record is
         // retrievable via `get_job` after the wait returns.
+        let base = no_backoff_opts();
         let opts = OpenOptions {
-            keep_done_jobs: Some(Duration::from_secs(60)),
-            ..no_backoff_opts()
+            default_queue_config: QueueConfig {
+                keep_done_jobs: Some(Duration::from_secs(60)),
+                ..base.default_queue_config.clone()
+            },
+            ..base
         };
         let q = Arc::new(
             Queue::open_with_options(make_store(), "test", opts)

@@ -38,6 +38,42 @@
 //! rules, GCS object-lifecycle management, etc.); a built-in retention
 //! option is planned for a later release.
 //!
+//! # Configuring the queue
+//!
+//! Per-queue retention ([`taquba::QueueConfig::keep_done_jobs`] and
+//! [`taquba::QueueConfig::dead_retention`]) is set on the [`taquba::Queue`]
+//! before it's handed to the runner. Pick an explicit name via
+//! [`JobRunnerBuilder::queue_name`] and key
+//! [`taquba::OpenOptions::queue_configs`] on the same string.
+//!
+//! ```no_run
+//! # use std::collections::HashMap;
+//! # use std::sync::Arc;
+//! # use std::time::Duration;
+//! # use taquba::{OpenOptions, Queue, QueueConfig, object_store::memory::InMemory};
+//! # use taquba_jobs::JobRunner;
+//! # async fn run() -> taquba_jobs::Result<()> {
+//! let store = Arc::new(InMemory::new());
+//! let opts = OpenOptions {
+//!     queue_configs: HashMap::from([(
+//!         "background-jobs".to_string(),
+//!         QueueConfig {
+//!             keep_done_jobs: Some(Duration::from_secs(60 * 60)),
+//!             ..QueueConfig::default()
+//!         },
+//!     )]),
+//!     ..OpenOptions::default()
+//! };
+//! let queue = Arc::new(Queue::open_with_options(store.clone(), "db", opts).await?);
+//! let runner = JobRunner::builder()
+//!     .queue(queue)
+//!     .object_store(store)
+//!     .queue_name("background-jobs") // same string as in queue_configs
+//!     .build()?;
+//! # let _ = runner;
+//! # Ok(()) }
+//! ```
+//!
 //! # Fan-out from handlers
 //!
 //! [`JobContext::submit`] lets a running handler enqueue follow-up jobs

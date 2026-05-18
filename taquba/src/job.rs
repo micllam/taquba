@@ -70,7 +70,7 @@ pub struct JobRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedup_key: Option<String>,
     /// When the job was successfully acked. `Some` only when the record was
-    /// kept (see [`OpenOptions::keep_done_jobs`](crate::OpenOptions::keep_done_jobs)).
+    /// kept (see [`QueueConfig::keep_done_jobs`](crate::QueueConfig::keep_done_jobs)).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<u64>,
     /// When the job entered the dead-letter state. Used by the background
@@ -124,8 +124,8 @@ pub enum JobStatus {
     /// [`Queue::nack`](crate::Queue::nack).
     Claimed,
     /// Successfully completed. Only persisted if
-    /// [`OpenOptions::keep_done_jobs`](crate::OpenOptions::keep_done_jobs) is
-    /// set; otherwise the record is deleted on ack.
+    /// [`QueueConfig::keep_done_jobs`](crate::QueueConfig::keep_done_jobs) is
+    /// set on the job's queue; otherwise the record is deleted on ack.
     Done,
     /// Exhausted all retry attempts and was moved to the dead-letter queue.
     /// Inspected via [`Queue::dead_jobs`](crate::Queue::dead_jobs); revived

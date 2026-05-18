@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,18 +8,36 @@ use tracing::{debug, warn};
 
 use crate::error::Result;
 use crate::job::{JobRecord, JobStatus};
-use crate::queue::{dead_key, job_index_key, now_ms, pending_key};
+use crate::queue::{QueueConfig, dead_key, job_index_key, now_ms, pending_key};
 use crate::stats::update_stats;
 
 pub(crate) async fn reap_loop(
     db: Arc<Db>,
     interval: Duration,
-    keep_done_jobs: Option<Duration>,
-    dead_retention: Option<Duration>,
+    default_queue_config: QueueConfig,
+    queue_configs: HashMap<String, QueueConfig>,
     job_available: Arc<Notify>,
     completion_notify: Arc<Notify>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let any_keep_done = default_queue_config.keep_done_jobs.is_some()
+        || queue_configs.values().any(|c| c.keep_done_jobs.is_some());
+    let any_dead_retention = default_queue_config.dead_retention.is_some()
+        || queue_configs.values().any(|c| c.dead_retention.is_some());
+
+    let keep_done_for = |queue: &str| -> Option<Duration> {
+        queue_configs
+            .get(queue)
+            .unwrap_or(&default_queue_config)
+            .keep_done_jobs
+    };
+    let dead_retention_for = |queue: &str| -> Option<Duration> {
+        queue_configs
+            .get(queue)
+            .unwrap_or(&default_queue_config)
+            .dead_retention
+    };
+
     loop {
         tokio::select! {
             _ = tokio::time::sleep(interval) => {
@@ -27,13 +46,13 @@ pub(crate) async fn reap_loop(
                     Ok(_) => job_available.notify_waiters(),
                     Err(e) => warn!("lease reaper error: {e}"),
                 }
-                if let Some(retention) = keep_done_jobs {
-                    if let Err(e) = sweep_done(&db, retention).await {
+                if any_keep_done {
+                    if let Err(e) = sweep_done(&db, &keep_done_for).await {
                         warn!("done retention sweep error: {e}");
                     }
                 }
-                if let Some(retention) = dead_retention {
-                    if let Err(e) = sweep_dead(&db, retention).await {
+                if any_dead_retention {
+                    if let Err(e) = sweep_dead(&db, &dead_retention_for).await {
                         warn!("dead retention sweep error: {e}");
                     }
                 }
@@ -158,11 +177,16 @@ async fn reap_job(db: &Db, claimed_key_bytes: &[u8], completion_notify: &Notify)
     }
 }
 
-/// Delete done jobs whose retention window has expired.
-pub(crate) async fn sweep_done(db: &Db, retention: Duration) -> Result<()> {
-    let cutoff = now_ms().saturating_sub(retention.as_millis() as u64);
+/// Delete done jobs whose retention window has expired. The window is
+/// resolved per-record by looking up the job's queue via `keep_done_for`.
+/// Records on queues with `keep_done_jobs = None` are skipped.
+pub(crate) async fn sweep_done(
+    db: &Db,
+    keep_done_for: &(dyn Fn(&str) -> Option<Duration> + Sync),
+) -> Result<()> {
+    let now = now_ms();
 
-    let mut victims: Vec<(Vec<u8>, String, String)> = Vec::new();
+    let mut victims: Vec<(Vec<u8>, String)> = Vec::new();
     let mut iter = db.scan_prefix(b"done:").await?;
     while let Some(kv) = iter.next().await? {
         let job: JobRecord = match rmp_serde::from_slice(&kv.value) {
@@ -172,13 +196,17 @@ pub(crate) async fn sweep_done(db: &Db, retention: Duration) -> Result<()> {
         let Some(completed_at) = job.completed_at else {
             continue;
         };
+        let Some(retention) = keep_done_for(&job.queue) else {
+            continue;
+        };
+        let cutoff = now.saturating_sub(retention.as_millis() as u64);
         if completed_at < cutoff {
-            victims.push((kv.key.to_vec(), job.queue.clone(), job.id.clone()));
+            victims.push((kv.key.to_vec(), job.id.clone()));
         }
     }
     drop(iter);
 
-    for (key, _queue, id) in victims {
+    for (key, id) in victims {
         let txn = db.begin(IsolationLevel::Snapshot).await?;
         // Re-check existence; could have been swept by a previous tick.
         if txn.get(&key).await?.is_some() {
@@ -194,9 +222,15 @@ pub(crate) async fn sweep_done(db: &Db, retention: Duration) -> Result<()> {
     Ok(())
 }
 
-/// Delete dead-letter jobs whose retention window has expired.
-pub(crate) async fn sweep_dead(db: &Db, retention: Duration) -> Result<()> {
-    let cutoff = now_ms().saturating_sub(retention.as_millis() as u64);
+/// Delete dead-letter jobs whose retention window has expired. The window
+/// is resolved per-record by looking up the job's queue via
+/// `dead_retention_for`. Records on queues with `dead_retention = None`
+/// are skipped.
+pub(crate) async fn sweep_dead(
+    db: &Db,
+    dead_retention_for: &(dyn Fn(&str) -> Option<Duration> + Sync),
+) -> Result<()> {
+    let now = now_ms();
 
     let mut victims: Vec<(Vec<u8>, String, String)> = Vec::new();
     let mut iter = db.scan_prefix(b"dead:").await?;
@@ -209,6 +243,10 @@ pub(crate) async fn sweep_dead(db: &Db, retention: Duration) -> Result<()> {
         let Some(failed_at) = job.failed_at else {
             continue;
         };
+        let Some(retention) = dead_retention_for(&job.queue) else {
+            continue;
+        };
+        let cutoff = now.saturating_sub(retention.as_millis() as u64);
         if failed_at < cutoff {
             victims.push((kv.key.to_vec(), job.queue.clone(), job.id.clone()));
         }
