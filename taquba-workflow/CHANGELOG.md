@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Error::is_permanent()` is now public (previously `pub(crate)`) and
+  classifies every variant. `Queue(_)` delegates by pattern-matching on
+  `taquba::Error`: data-shape and wrong-state variants return `true`;
+  `Storage(_)` returns `false` (transient) since the dominant cases are
+  retriable object-store I/O and transaction conflicts.
+
 ### Changed
 
 - **Breaking:** `WorkflowRuntime::submit` now returns `SubmitOutcome`
