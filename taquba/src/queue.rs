@@ -12,7 +12,7 @@ use ulid::Ulid;
 
 use crate::error::{Error, Result};
 use crate::job::{JobRecord, JobStatus};
-use crate::reaper::{reap_expired, sweep_dead, sweep_done};
+use crate::reaper::reap_expired;
 use crate::scheduler::{promote_due_jobs, schedule_loop};
 use crate::stats::{CounterMergeOperator, QueueStats, read_stats, update_stats};
 
@@ -1533,22 +1533,6 @@ impl Queue {
         Ok(())
     }
 
-    /// Trigger an immediate done-job retention sweep (primarily useful in tests
-    /// and tooling). Deletes any `done:` entries whose retention window has
-    /// expired. The `retention` argument is applied uniformly to every record,
-    /// overriding per-queue [`QueueConfig::keep_done_jobs`] so callers can run
-    /// a one-off purge.
-    pub async fn sweep_done_now(&self, retention: Duration) -> Result<()> {
-        sweep_done(&self.db, &|_| Some(retention)).await
-    }
-
-    /// Trigger an immediate dead-job retention sweep. The `retention` argument
-    /// is applied uniformly to every record, overriding per-queue
-    /// [`QueueConfig::dead_retention`].
-    pub async fn sweep_dead_now(&self, retention: Duration) -> Result<()> {
-        sweep_dead(&self.db, &|_| Some(retention)).await
-    }
-
     /// Shut down the background reaper and scheduler, then close the underlying database.
     pub async fn close(self) -> Result<()> {
         let _ = self.reaper_shutdown.send(true);
@@ -2610,12 +2594,19 @@ mod tests {
         q.close().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_done_retention_sweeps_old_jobs() {
-        // Open with a tight retention so the sweep clears the entry quickly.
+        // Open with a tight retention so the reaper clears the entry
+        // quickly. See `test_retention_is_per_queue_on_ack_and_sweep` for
+        // why this mixes `std::thread::sleep` (wall clock; retention
+        // cutoff uses `SystemTime::now()`) and `tokio::time::sleep`
+        // (virtual; fires the reaper tick).
+        let reaper_interval = Duration::from_millis(10);
+        let retention = Duration::from_millis(20);
         let opts = OpenOptions {
+            reaper_interval,
             default_queue_config: QueueConfig {
-                keep_done_jobs: Some(Duration::from_millis(20)),
+                keep_done_jobs: Some(retention),
                 ..QueueConfig::default()
             },
             ..OpenOptions::default()
@@ -2634,8 +2625,8 @@ mod tests {
         // Visible immediately after ack.
         assert!(q.get_job(&id).await.unwrap().is_some());
 
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        q.sweep_done_now(Duration::from_millis(20)).await.unwrap();
+        std::thread::sleep(retention + Duration::from_millis(10));
+        tokio::time::sleep(reaper_interval * 2).await;
 
         assert!(
             q.get_job(&id).await.unwrap().is_none(),
@@ -2799,11 +2790,20 @@ mod tests {
         q.close().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_done_retention_uses_completion_time_not_enqueue_time() {
+        // Two wall-clock waits are required here: one to advance past the
+        // schedule (so `promote_scheduled_now` sees the job as due against
+        // `SystemTime::now()`), and one to advance past the retention
+        // window (retention checks against `SystemTime::now()`
+        // too). The reaper tick is virtual.
+        let reaper_interval = Duration::from_millis(10);
+        let retention = Duration::from_millis(50);
+        let schedule_delay = Duration::from_millis(220);
         let opts = OpenOptions {
+            reaper_interval,
             default_queue_config: QueueConfig {
-                keep_done_jobs: Some(Duration::from_millis(500)),
+                keep_done_jobs: Some(retention),
                 ..QueueConfig::default()
             },
             ..OpenOptions::default()
@@ -2817,15 +2817,15 @@ mod tests {
                 "work",
                 b"weekly".to_vec(),
                 EnqueueOptions {
-                    run_at: Some(std::time::SystemTime::now() + Duration::from_millis(200)),
+                    run_at: Some(std::time::SystemTime::now() + schedule_delay),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
 
-        // Wait past the schedule, promote, claim, ack.
-        tokio::time::sleep(Duration::from_millis(220)).await;
+        // Wait past the schedule (wall clock), promote, claim, ack.
+        std::thread::sleep(schedule_delay + Duration::from_millis(20));
         q.promote_scheduled_now().await.unwrap();
         let job = q
             .claim("work", Duration::from_secs(30))
@@ -2835,13 +2835,16 @@ mod tests {
 
         let elapsed_since_enqueue = now_ms().saturating_sub(job.enqueued_at);
         assert!(
-            elapsed_since_enqueue > 200,
-            "enqueued_at should be well over 200ms old (was {elapsed_since_enqueue}ms)"
+            elapsed_since_enqueue > schedule_delay.as_millis() as u64,
+            "enqueued_at should be well over {}ms old (was {elapsed_since_enqueue}ms)",
+            schedule_delay.as_millis(),
         );
         q.ack(&job).await.unwrap();
 
-        // Sweep right after ack: completion is fresh, so the record survives.
-        q.sweep_done_now(Duration::from_millis(500)).await.unwrap();
+        // Fire a reaper tick right after ack: completion is fresh
+        // relative to the retention window, so the record survives even
+        // though `enqueued_at` is now far older than the retention.
+        tokio::time::sleep(reaper_interval * 2).await;
         let kept = q.get_job(&id).await.unwrap().expect(
             "fresh completion must survive the sweep regardless of how long ago the job was enqueued",
         );
@@ -2850,21 +2853,35 @@ mod tests {
             "ack must stamp completed_at when keep_done_jobs is set"
         );
 
-        // After the retention window elapses the record is purged as expected.
-        tokio::time::sleep(Duration::from_millis(550)).await;
-        q.sweep_done_now(Duration::from_millis(500)).await.unwrap();
+        // After the retention window elapses (wall clock), the next
+        // reaper tick purges it.
+        std::thread::sleep(retention + Duration::from_millis(10));
+        tokio::time::sleep(reaper_interval * 2).await;
         assert!(q.get_job(&id).await.unwrap().is_none());
 
         q.close().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_dead_retention_sweep_boundary() {
         // Drive a job to dead-letter, then exercise both sides of the
-        // retention cutoff: a long-retention sweep must leave it alone, and a
-        // sweep with a tighter window must purge it (along with its index
-        // pointer and the `dead` counter).
-        let q = Queue::open(make_store(), "test").await.unwrap();
+        // retention cutoff with a single configured window: a reaper tick
+        // before the cutoff has elapsed must leave the job alone; one
+        // after it elapses must purge it (along with its index pointer
+        // and the `dead` counter).
+        let reaper_interval = Duration::from_millis(10);
+        let retention = Duration::from_millis(50);
+        let opts = OpenOptions {
+            reaper_interval,
+            default_queue_config: QueueConfig {
+                dead_retention: Some(retention),
+                ..QueueConfig::default()
+            },
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
 
         q.enqueue_with(
             "work",
@@ -2889,14 +2906,15 @@ mod tests {
         assert!(dead[0].failed_at.is_some(), "failed_at must be stamped");
         assert_eq!(q.stats("work").await.unwrap().dead, 1);
 
-        // Above the cutoff: long retention keeps the job.
-        q.sweep_dead_now(Duration::from_secs(3600)).await.unwrap();
+        // Fire a reaper tick before the wall-clock cutoff has elapsed:
+        // the dead record must survive.
+        tokio::time::sleep(reaper_interval * 2).await;
         assert_eq!(q.dead_jobs("work", None, 100).await.unwrap().len(), 1);
 
-        // Below the cutoff: tight retention purges it. Counter and index
-        // pointer must both be cleaned up too.
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        q.sweep_dead_now(Duration::from_millis(20)).await.unwrap();
+        // Advance wall clock past the cutoff. The next reaper tick purges
+        // the record; the counter and index pointer must also be cleaned up.
+        std::thread::sleep(retention + Duration::from_millis(10));
+        tokio::time::sleep(reaper_interval * 2).await;
         assert!(q.dead_jobs("work", None, 100).await.unwrap().is_empty());
         assert_eq!(
             q.stats("work").await.unwrap().dead,

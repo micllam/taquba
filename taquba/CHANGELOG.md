@@ -28,11 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`None` for `keep_done_jobs`, `Some(7 days)` for `dead_retention`)
   now live on `QueueConfig::default()` and apply unchanged when
   unspecified.
-- `Queue::sweep_done_now(retention)` / `Queue::sweep_dead_now(retention)`
-  now apply the argument uniformly to every record, overriding per-queue
-  `QueueConfig::keep_done_jobs` / `QueueConfig::dead_retention`. Use
-  `Queue::sweep_retention_now()` for a sweep that honours each queue's
-  configured window.
+### Removed
+
+- **Breaking:** `Queue::sweep_done_now(retention)` and
+  `Queue::sweep_dead_now(retention)` removed.
 
 ### Fixed
 

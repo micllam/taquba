@@ -180,7 +180,7 @@ async fn reap_job(db: &Db, claimed_key_bytes: &[u8], completion_notify: &Notify)
 /// Delete done jobs whose retention window has expired. The window is
 /// resolved per-record by looking up the job's queue via `keep_done_for`.
 /// Records on queues with `keep_done_jobs = None` are skipped.
-pub(crate) async fn sweep_done(
+async fn sweep_done(
     db: &Db,
     keep_done_for: &(dyn Fn(&str) -> Option<Duration> + Sync),
 ) -> Result<()> {
@@ -226,7 +226,7 @@ pub(crate) async fn sweep_done(
 /// is resolved per-record by looking up the job's queue via
 /// `dead_retention_for`. Records on queues with `dead_retention = None`
 /// are skipped.
-pub(crate) async fn sweep_dead(
+async fn sweep_dead(
     db: &Db,
     dead_retention_for: &(dyn Fn(&str) -> Option<Duration> + Sync),
 ) -> Result<()> {
