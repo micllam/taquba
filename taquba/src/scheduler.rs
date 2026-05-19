@@ -11,26 +11,35 @@ use crate::job::{JobRecord, JobStatus};
 use crate::queue::{job_index_key, pending_key};
 use crate::stats::update_stats;
 
-pub(crate) async fn schedule_loop(
-    db: Arc<Db>,
-    interval: Duration,
-    clock: Arc<dyn Clock>,
-    job_available: Arc<Notify>,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep(interval) => {
-                match promote_due_jobs(&db, clock.as_ref()).await {
-                    Ok(0) => {}
-                    Ok(_) => job_available.notify_waiters(),
-                    Err(e) => warn!("scheduled job promoter error: {e}"),
+pub(crate) struct Scheduler {
+    pub(crate) db: Arc<Db>,
+    pub(crate) interval: Duration,
+    pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) job_available: Arc<Notify>,
+}
+
+impl Scheduler {
+    pub(crate) async fn run(self, mut shutdown: watch::Receiver<bool>) {
+        let Scheduler {
+            db,
+            interval,
+            clock,
+            job_available,
+        } = self;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {
+                    match promote_due_jobs(&db, clock.as_ref()).await {
+                        Ok(0) => {}
+                        Ok(_) => job_available.notify_waiters(),
+                        Err(e) => warn!("scheduled job promoter error: {e}"),
+                    }
                 }
+                _ = shutdown.changed() => break,
             }
-            _ = shutdown.changed() => break,
         }
+        debug!("scheduled job promoter stopped");
     }
-    debug!("scheduled job promoter stopped");
 }
 
 /// Scan the `scheduled:` key space and move any job whose `run_at` has passed

@@ -12,58 +12,70 @@ use crate::job::{JobRecord, JobStatus};
 use crate::queue::{QueueConfig, dead_key, job_index_key, pending_key};
 use crate::stats::update_stats;
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn reap_loop(
-    db: Arc<Db>,
-    interval: Duration,
-    default_queue_config: QueueConfig,
-    queue_configs: HashMap<String, QueueConfig>,
-    clock: Arc<dyn Clock>,
-    job_available: Arc<Notify>,
-    completion_notify: Arc<Notify>,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    let any_keep_done = default_queue_config.keep_done_jobs.is_some()
-        || queue_configs.values().any(|c| c.keep_done_jobs.is_some());
-    let any_dead_retention = default_queue_config.dead_retention.is_some()
-        || queue_configs.values().any(|c| c.dead_retention.is_some());
+pub(crate) struct Reaper {
+    pub(crate) db: Arc<Db>,
+    pub(crate) interval: Duration,
+    pub(crate) default_queue_config: QueueConfig,
+    pub(crate) queue_configs: HashMap<String, QueueConfig>,
+    pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) job_available: Arc<Notify>,
+    pub(crate) completion_notify: Arc<Notify>,
+}
 
-    let keep_done_for = |queue: &str| -> Option<Duration> {
-        queue_configs
-            .get(queue)
-            .unwrap_or(&default_queue_config)
-            .keep_done_jobs
-    };
-    let dead_retention_for = |queue: &str| -> Option<Duration> {
-        queue_configs
-            .get(queue)
-            .unwrap_or(&default_queue_config)
-            .dead_retention
-    };
+impl Reaper {
+    pub(crate) async fn run(self, mut shutdown: watch::Receiver<bool>) {
+        let Reaper {
+            db,
+            interval,
+            default_queue_config,
+            queue_configs,
+            clock,
+            job_available,
+            completion_notify,
+        } = self;
 
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep(interval) => {
-                match reap_expired(&db, clock.as_ref(), &completion_notify).await {
-                    Ok(0) => {}
-                    Ok(_) => job_available.notify_waiters(),
-                    Err(e) => warn!("lease reaper error: {e}"),
-                }
-                if any_keep_done {
-                    if let Err(e) = sweep_done(&db, clock.as_ref(), &keep_done_for).await {
-                        warn!("done retention sweep error: {e}");
+        let any_keep_done = default_queue_config.keep_done_jobs.is_some()
+            || queue_configs.values().any(|c| c.keep_done_jobs.is_some());
+        let any_dead_retention = default_queue_config.dead_retention.is_some()
+            || queue_configs.values().any(|c| c.dead_retention.is_some());
+
+        let keep_done_for = |queue: &str| -> Option<Duration> {
+            queue_configs
+                .get(queue)
+                .unwrap_or(&default_queue_config)
+                .keep_done_jobs
+        };
+        let dead_retention_for = |queue: &str| -> Option<Duration> {
+            queue_configs
+                .get(queue)
+                .unwrap_or(&default_queue_config)
+                .dead_retention
+        };
+
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {
+                    match reap_expired(&db, clock.as_ref(), &completion_notify).await {
+                        Ok(0) => {}
+                        Ok(_) => job_available.notify_waiters(),
+                        Err(e) => warn!("lease reaper error: {e}"),
+                    }
+                    if any_keep_done {
+                        if let Err(e) = sweep_done(&db, clock.as_ref(), &keep_done_for).await {
+                            warn!("done retention sweep error: {e}");
+                        }
+                    }
+                    if any_dead_retention {
+                        if let Err(e) = sweep_dead(&db, clock.as_ref(), &dead_retention_for).await {
+                            warn!("dead retention sweep error: {e}");
+                        }
                     }
                 }
-                if any_dead_retention {
-                    if let Err(e) = sweep_dead(&db, clock.as_ref(), &dead_retention_for).await {
-                        warn!("dead retention sweep error: {e}");
-                    }
-                }
+                _ = shutdown.changed() => break,
             }
-            _ = shutdown.changed() => break,
         }
+        debug!("lease reaper stopped");
     }
-    debug!("lease reaper stopped");
 }
 
 /// Returns the number of expired claims that were processed. Callers can use

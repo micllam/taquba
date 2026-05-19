@@ -13,8 +13,8 @@ use ulid::Ulid;
 use crate::clock::{Clock, default_clock};
 use crate::error::{Error, Result};
 use crate::job::{JobRecord, JobStatus};
-use crate::reaper::reap_expired;
-use crate::scheduler::{promote_due_jobs, schedule_loop};
+use crate::reaper::{Reaper, reap_expired};
+use crate::scheduler::{Scheduler, promote_due_jobs};
 use crate::stats::{CounterMergeOperator, QueueStats, read_stats, update_stats};
 
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
@@ -392,24 +392,24 @@ impl Queue {
         let job_available = Arc::new(tokio::sync::Notify::new());
         let completion_notify = Arc::new(tokio::sync::Notify::new());
         let (reaper_shutdown, reaper_rx) = watch::channel(false);
-        let reaper_handle = tokio::spawn(crate::reaper::reap_loop(
-            db.clone(),
-            opts.reaper_interval,
-            opts.default_queue_config.clone(),
-            opts.queue_configs.clone(),
-            opts.clock.clone(),
-            job_available.clone(),
-            completion_notify.clone(),
-            reaper_rx,
-        ));
+        let reaper = Reaper {
+            db: db.clone(),
+            interval: opts.reaper_interval,
+            default_queue_config: opts.default_queue_config.clone(),
+            queue_configs: opts.queue_configs.clone(),
+            clock: opts.clock.clone(),
+            job_available: job_available.clone(),
+            completion_notify: completion_notify.clone(),
+        };
+        let reaper_handle = tokio::spawn(reaper.run(reaper_rx));
         let (scheduler_shutdown, scheduler_rx) = watch::channel(false);
-        let scheduler_handle = tokio::spawn(schedule_loop(
-            db.clone(),
-            opts.scheduler_interval,
-            opts.clock.clone(),
-            job_available.clone(),
-            scheduler_rx,
-        ));
+        let scheduler = Scheduler {
+            db: db.clone(),
+            interval: opts.scheduler_interval,
+            clock: opts.clock.clone(),
+            job_available: job_available.clone(),
+        };
+        let scheduler_handle = tokio::spawn(scheduler.run(scheduler_rx));
         Ok(Self {
             db,
             reaper_shutdown,
