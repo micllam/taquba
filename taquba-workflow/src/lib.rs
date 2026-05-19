@@ -97,11 +97,11 @@
 //!     runtime_for_worker.run(std::future::pending::<()>()).await
 //! });
 //!
-//! let handle = runtime.submit(RunSpec {
+//! let outcome = runtime.submit(RunSpec {
 //!     input: b"hello".to_vec(),
 //!     ..Default::default()
 //! }).await?;
-//! println!("submitted run {}", handle.run_id);
+//! println!("submitted run {}", outcome.run_id);
 //! # Ok(()) }
 //! ```
 //!
@@ -185,7 +185,7 @@ mod terminal;
 pub use error::{Error, Result};
 pub use runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner};
 pub use runtime::{
-    HEADER_RUN_ID, HEADER_STEP, RESERVED_HEADER_PREFIX, RunHandle, RunSpec, RunState, RunStatus,
+    HEADER_RUN_ID, HEADER_STEP, RESERVED_HEADER_PREFIX, RunSpec, RunState, RunStatus,
     SubmitOutcome, WorkflowRuntime, WorkflowRuntimeBuilder,
 };
 #[cfg(feature = "webhooks")]

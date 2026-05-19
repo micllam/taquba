@@ -87,15 +87,6 @@ pub struct RunSpec {
     pub max_attempts_per_step: Option<u32>,
 }
 
-/// Handle to a freshly submitted run, returned inside [`SubmitOutcome`].
-#[derive(Debug, Clone)]
-pub struct RunHandle {
-    /// The run's identifier (generated if the spec didn't carry one).
-    pub run_id: String,
-    /// Taquba job ID of the first enqueued step.
-    pub first_job_id: String,
-}
-
 /// Outcome of [`WorkflowRuntime::submit`].
 ///
 /// `submit` is idempotent on `run_id`: re-submitting an active run is a

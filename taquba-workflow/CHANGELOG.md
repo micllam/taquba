@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Breaking:** `Error::DuplicateRun` removed. The duplicate-run case is
   no longer modelled as an error; see `SubmitOutcome` above.
+- **Breaking:** `RunHandle` removed. It carried `run_id` (now on
+  `SubmitOutcome`) and `first_job_id`, which had no consumers in the
+  workspace or examples.
 
 ## [0.3.0] - 2026-05-15
 
