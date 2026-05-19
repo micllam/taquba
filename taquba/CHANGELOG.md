@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- New `Clock` trait + `SystemClock` (default) + `MockClock` types for
+  virtualising taquba's time source. Every state-transition timestamp
+  (`enqueued_at`, `completed_at`, `failed_at`, `lease_expires_at`) and
+  every time-based comparison (retention cutoffs, scheduled-job
+  promotion, lease-expiry detection) reads through
+  `OpenOptions::clock`. Production callers leave the default; tests can
+  pass a `MockClock` and call `MockClock::advance(Duration)` to move
+  time deterministically without `std::thread::sleep`.
 - Per-queue retention via new `QueueConfig::keep_done_jobs` and
   `QueueConfig::dead_retention` fields. Different queues sharing one
   `Queue` instance can now pick different retention windows (e.g.
@@ -21,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Updated `slatedb` dependency from 0.12 to 0.13. `taquba`'s public API is
   unchanged.
+- **Breaking:** `OpenOptions` gained a `clock: Arc<dyn Clock>` field.
+  Code using `..OpenOptions::default()` is unaffected; explicit struct
+  literals must set it (`clock: Arc::new(SystemClock)` reproduces the
+  prior behaviour).
 - **Breaking:** `keep_done_jobs` and `dead_retention` have moved from
   `OpenOptions` to `QueueConfig`. Migration: set them on
   `OpenOptions::default_queue_config` for an instance-wide default, or

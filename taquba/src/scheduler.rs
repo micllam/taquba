@@ -5,21 +5,23 @@ use slatedb::{Db, IsolationLevel};
 use tokio::sync::{Notify, watch};
 use tracing::{debug, warn};
 
+use crate::clock::Clock;
 use crate::error::Result;
 use crate::job::{JobRecord, JobStatus};
-use crate::queue::{job_index_key, now_ms, pending_key};
+use crate::queue::{job_index_key, pending_key};
 use crate::stats::update_stats;
 
 pub(crate) async fn schedule_loop(
     db: Arc<Db>,
     interval: Duration,
+    clock: Arc<dyn Clock>,
     job_available: Arc<Notify>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
         tokio::select! {
             _ = tokio::time::sleep(interval) => {
-                match promote_due_jobs(&db).await {
+                match promote_due_jobs(&db, clock.as_ref()).await {
                     Ok(0) => {}
                     Ok(_) => job_available.notify_waiters(),
                     Err(e) => warn!("scheduled job promoter error: {e}"),
@@ -34,8 +36,8 @@ pub(crate) async fn schedule_loop(
 /// Scan the `scheduled:` key space and move any job whose `run_at` has passed
 /// into the `pending:` key space so workers can claim it. Returns the number
 /// of jobs that were promoted.
-pub(crate) async fn promote_due_jobs(db: &Db) -> Result<usize> {
-    let now = now_ms();
+pub(crate) async fn promote_due_jobs(db: &Db, clock: &dyn Clock) -> Result<usize> {
+    let now = clock.now_ms();
     let mut due_keys = Vec::new();
 
     let mut iter = db.scan_prefix(b"scheduled:").await?;

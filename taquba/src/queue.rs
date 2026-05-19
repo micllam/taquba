@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use bytes::Bytes;
 use slatedb::object_store::ObjectStore;
@@ -10,6 +10,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, instrument, warn};
 use ulid::Ulid;
 
+use crate::clock::{Clock, default_clock};
 use crate::error::{Error, Result};
 use crate::job::{JobRecord, JobStatus};
 use crate::reaper::reap_expired;
@@ -50,13 +51,6 @@ pub const PRIORITY_HIGH: u32 = 100;
 pub const PRIORITY_NORMAL: u32 = 1_000;
 /// Low-priority bucket. Jobs at this priority are dequeued after high and normal.
 pub const PRIORITY_LOW: u32 = 10_000;
-
-pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before epoch")
-        .as_millis() as u64
-}
 
 pub(crate) fn pending_key(queue: &str, priority: u32, id: &str) -> String {
     format!("pending:{}:{:010}:{}", queue, priority, id)
@@ -223,6 +217,12 @@ pub struct OpenOptions {
     pub default_queue_config: QueueConfig,
     /// Per-queue overrides. Keys are queue names.
     pub queue_configs: HashMap<String, QueueConfig>,
+    /// Time source for every state-transition timestamp and every
+    /// time-based comparison (retention cutoffs, scheduled-job
+    /// promotion). Defaults to [`SystemClock`](crate::SystemClock).
+    /// Substitute [`MockClock`](crate::MockClock) in tests to advance
+    /// time deterministically.
+    pub clock: Arc<dyn Clock>,
 }
 
 impl Default for OpenOptions {
@@ -232,6 +232,7 @@ impl Default for OpenOptions {
             scheduler_interval: Duration::from_secs(1),
             default_queue_config: QueueConfig::default(),
             queue_configs: HashMap::new(),
+            clock: default_clock(),
         }
     }
 }
@@ -307,6 +308,7 @@ pub struct Queue {
     scheduler_handle: JoinHandle<()>,
     default_queue_config: QueueConfig,
     queue_configs: HashMap<String, QueueConfig>,
+    clock: Arc<dyn Clock>,
     /// In-process wakeup signal so workers blocked on an empty queue can resume
     /// the moment a job becomes claimable, without waiting out their poll
     /// interval.
@@ -395,6 +397,7 @@ impl Queue {
             opts.reaper_interval,
             opts.default_queue_config.clone(),
             opts.queue_configs.clone(),
+            opts.clock.clone(),
             job_available.clone(),
             completion_notify.clone(),
             reaper_rx,
@@ -403,6 +406,7 @@ impl Queue {
         let scheduler_handle = tokio::spawn(schedule_loop(
             db.clone(),
             opts.scheduler_interval,
+            opts.clock.clone(),
             job_available.clone(),
             scheduler_rx,
         ));
@@ -414,10 +418,17 @@ impl Queue {
             scheduler_handle,
             default_queue_config: opts.default_queue_config,
             queue_configs: opts.queue_configs,
+            clock: opts.clock,
             job_available,
             claimed_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             completion_notify,
         })
+    }
+
+    /// Current time in milliseconds since the UNIX epoch, as read
+    /// from this queue's configured [`Clock`].
+    pub(crate) fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
     }
 
     /// Register a freshly-claimed job's cancellation token. Called from
@@ -518,7 +529,7 @@ impl Queue {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
-            (ms > now_ms()).then_some(ms)
+            (ms > self.now_ms()).then_some(ms)
         });
 
         let id = Ulid::new().to_string();
@@ -534,7 +545,7 @@ impl Queue {
             status,
             attempts: 0,
             max_attempts,
-            enqueued_at: now_ms(),
+            enqueued_at: self.now_ms(),
             claimed_at: None,
             lease_expires_at: None,
             run_at,
@@ -643,7 +654,7 @@ impl Queue {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
-            (ms > now_ms()).then_some(ms)
+            (ms > self.now_ms()).then_some(ms)
         });
 
         let id = Ulid::new().to_string();
@@ -659,7 +670,7 @@ impl Queue {
             status,
             attempts: 0,
             max_attempts,
-            enqueued_at: now_ms(),
+            enqueued_at: self.now_ms(),
             claimed_at: None,
             lease_expires_at: None,
             run_at,
@@ -843,7 +854,7 @@ impl Queue {
             let pending_key_bytes = kv.key.clone();
             let mut job: JobRecord = rmp_serde::from_slice(&kv.value)?;
 
-            let now = now_ms();
+            let now = self.now_ms();
             let lease_expires_at = now + lease_duration.as_millis() as u64;
             job.status = JobStatus::Claimed;
             job.claimed_at = Some(now);
@@ -916,7 +927,7 @@ impl Queue {
         let done_record = if keep_done {
             let mut done_job = job.clone();
             done_job.status = JobStatus::Done;
-            done_job.completed_at = Some(now_ms());
+            done_job.completed_at = Some(self.now_ms());
             Some((
                 done_key(&job.queue, &job.id),
                 rmp_serde::to_vec_named(&done_job)?,
@@ -971,7 +982,7 @@ impl Queue {
 
         if job.attempts >= job.max_attempts {
             job.status = JobStatus::Dead;
-            job.failed_at = Some(now_ms());
+            job.failed_at = Some(self.now_ms());
             let dead = dead_key(&job.queue, &job.id);
             let value = rmp_serde::to_vec_named(&job)?;
             txn.put(dead.as_bytes(), &value)?;
@@ -1013,7 +1024,7 @@ impl Queue {
                     "job re-queued"
                 );
             } else {
-                let run_at = now_ms() + backoff.as_millis() as u64;
+                let run_at = self.now_ms() + backoff.as_millis() as u64;
                 job.status = JobStatus::Scheduled;
                 job.run_at = Some(run_at);
                 let scheduled = scheduled_key(&job.queue, run_at, &job.id);
@@ -1068,7 +1079,7 @@ impl Queue {
         let claimed = claimed_key(&job.queue, lease_expires_at, &job.id);
         job.last_error = Some(reason.to_string());
         job.status = JobStatus::Dead;
-        job.failed_at = Some(now_ms());
+        job.failed_at = Some(self.now_ms());
         job.claimed_at = None;
         job.lease_expires_at = None;
         let dead = dead_key(&job.queue, &job.id);
@@ -1215,7 +1226,7 @@ impl Queue {
         let old_expiry = job.lease_expires_at.ok_or(Error::InvalidState)?;
         let old_claimed = claimed_key(&job.queue, old_expiry, &job.id);
 
-        let new_expiry = now_ms() + extension.as_millis() as u64;
+        let new_expiry = self.now_ms() + extension.as_millis() as u64;
         job.lease_expires_at = Some(new_expiry);
         let new_claimed = claimed_key(&job.queue, new_expiry, &job.id);
         let value = rmp_serde::to_vec_named(job)?;
@@ -1465,7 +1476,7 @@ impl Queue {
         let cfg = self.queue_config(queue);
         let max_attempts = cfg.max_attempts;
         let priority = cfg.default_priority;
-        let now = now_ms();
+        let now = self.now_ms();
 
         let mut ids = Vec::with_capacity(payloads.len());
         let txn = self.db.begin(IsolationLevel::Snapshot).await?;
@@ -1517,7 +1528,7 @@ impl Queue {
 
     /// Trigger an immediate reap sweep (primarily useful in tests and tooling).
     pub async fn reap_now(&self) -> Result<()> {
-        let count = reap_expired(&self.db, &self.completion_notify).await?;
+        let count = reap_expired(&self.db, self.clock.as_ref(), &self.completion_notify).await?;
         if count > 0 {
             self.job_available.notify_waiters();
         }
@@ -1526,7 +1537,7 @@ impl Queue {
 
     /// Trigger an immediate scheduled-job promotion sweep (primarily useful in tests).
     pub async fn promote_scheduled_now(&self) -> Result<()> {
-        let count = promote_due_jobs(&self.db).await?;
+        let count = promote_due_jobs(&self.db, self.clock.as_ref()).await?;
         if count > 0 {
             self.job_available.notify_waiters();
         }
@@ -1547,6 +1558,7 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::MockClock;
     use slatedb::object_store::memory::InMemory;
 
     fn make_store() -> Arc<dyn ObjectStore> {
@@ -2596,11 +2608,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_done_retention_sweeps_old_jobs() {
-        // Open with a tight retention so the reaper clears the entry
-        // quickly. See `test_retention_is_per_queue_on_ack_and_sweep` for
-        // why this mixes `std::thread::sleep` (wall clock; retention
-        // cutoff uses `SystemTime::now()`) and `tokio::time::sleep`
-        // (virtual; fires the reaper tick).
+        // `MockClock` virtualises the retention cutoff (`now_ms` reads
+        // the clock instead of `SystemTime::now()`); `start_paused`
+        // virtualises the reaper's `tokio::time::sleep` tick. Together,
+        // the test runs in zero wall-clock time.
+        let clock = MockClock::new(1_700_000_000_000);
         let reaper_interval = Duration::from_millis(10);
         let retention = Duration::from_millis(20);
         let opts = OpenOptions {
@@ -2609,6 +2621,7 @@ mod tests {
                 keep_done_jobs: Some(retention),
                 ..QueueConfig::default()
             },
+            clock: Arc::new(clock.clone()),
             ..OpenOptions::default()
         };
         let q = Queue::open_with_options(make_store(), "test", opts)
@@ -2625,7 +2638,7 @@ mod tests {
         // Visible immediately after ack.
         assert!(q.get_job(&id).await.unwrap().is_some());
 
-        std::thread::sleep(retention + Duration::from_millis(10));
+        clock.advance(retention + Duration::from_millis(10));
         tokio::time::sleep(reaper_interval * 2).await;
 
         assert!(
@@ -2642,12 +2655,7 @@ mod tests {
         // retention policies. The default-config queue ("transient") drops
         // jobs on ack; the per-queue override ("kept") retains them. Then
         // the same background reaper sweep must respect each queue's window.
-        //
-        // The retention cutoff is wall-clock (`SystemTime::now()`), so the
-        // 60 ms `std::thread::sleep` below is the only real-time wait in
-        // this test. The reaper tick is driven through tokio's paused
-        // virtual clock so the test does not depend on the reaper waking
-        // up by real-time scheduling luck.
+        let clock = MockClock::new(1_700_000_000_000);
         let reaper_interval = Duration::from_millis(10);
         let kept_retention = Duration::from_millis(50);
 
@@ -2664,6 +2672,7 @@ mod tests {
                     ..QueueConfig::default()
                 },
             )]),
+            clock: Arc::new(clock.clone()),
             ..OpenOptions::default()
         };
         let q = Queue::open_with_options(make_store(), "test", opts)
@@ -2697,21 +2706,17 @@ mod tests {
             "queues with keep_done_jobs must retain on ack"
         );
 
-        // Fire a reaper tick (virtual time) before the wall-clock retention
-        // window has elapsed: the kept record must survive.
+        // Fire a reaper tick before the retention window has elapsed:
+        // the kept record must survive.
         tokio::time::sleep(reaper_interval * 2).await;
         assert!(
             q.get_job(&kept_id).await.unwrap().is_some(),
             "reaper sweep before retention elapses must not purge"
         );
 
-        // Advance wall clock past the retention window. `std::thread::sleep`
-        // is used because the retention check reads `SystemTime::now()`,
-        // which tokio's paused clock does not virtualise.
-        std::thread::sleep(kept_retention + Duration::from_millis(10));
-
-        // Fire another reaper tick: now the kept record's `completed_at`
-        // is past the cutoff, so the sweep purges it.
+        // Advance the test clock past the retention window; the next
+        // reaper tick purges the record.
+        clock.advance(kept_retention + Duration::from_millis(10));
         tokio::time::sleep(reaper_interval * 2).await;
         assert!(
             q.get_job(&kept_id).await.unwrap().is_none(),
@@ -2725,10 +2730,8 @@ mod tests {
     async fn test_dead_retention_is_per_queue() {
         // Two queues with different dead-letter retention windows. The
         // same reaper sweep purges the short-window queue's record while
-        // leaving the long-window one intact. See
-        // `test_retention_is_per_queue_on_ack_and_sweep` for why this
-        // test mixes `std::thread::sleep` (wall clock) and
-        // `tokio::time::sleep` (virtual clock).
+        // leaving the long-window one intact.
+        let clock = MockClock::new(1_700_000_000_000);
         let reaper_interval = Duration::from_millis(10);
         let ephemeral_retention = Duration::from_millis(50);
 
@@ -2745,6 +2748,7 @@ mod tests {
                     ..QueueConfig::default()
                 },
             )]),
+            clock: Arc::new(clock.clone()),
             ..OpenOptions::default()
         };
         let q = Queue::open_with_options(make_store(), "test", opts)
@@ -2773,7 +2777,7 @@ mod tests {
         assert_eq!(q.dead_jobs("ephemeral", None, 100).await.unwrap().len(), 1);
         assert_eq!(q.dead_jobs("durable", None, 100).await.unwrap().len(), 1);
 
-        std::thread::sleep(ephemeral_retention + Duration::from_millis(10));
+        clock.advance(ephemeral_retention + Duration::from_millis(10));
         tokio::time::sleep(reaper_interval * 2).await;
 
         assert_eq!(
@@ -2792,11 +2796,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_done_retention_uses_completion_time_not_enqueue_time() {
-        // Two wall-clock waits are required here: one to advance past the
-        // schedule (so `promote_scheduled_now` sees the job as due against
-        // `SystemTime::now()`), and one to advance past the retention
-        // window (retention checks against `SystemTime::now()`
-        // too). The reaper tick is virtual.
+        // Both the scheduler (`run_at < now_ms`) and the retention sweep
+        // (`completed_at < now_ms - retention`) compare against the queue's
+        // clock, so virtualising it via `MockClock` is enough to drive
+        // both deterministically.
+        let initial = 1_700_000_000_000_u64;
+        let clock = MockClock::new(initial);
         let reaper_interval = Duration::from_millis(10);
         let retention = Duration::from_millis(50);
         let schedule_delay = Duration::from_millis(220);
@@ -2806,26 +2811,30 @@ mod tests {
                 keep_done_jobs: Some(retention),
                 ..QueueConfig::default()
             },
+            clock: Arc::new(clock.clone()),
             ..OpenOptions::default()
         };
         let q = Queue::open_with_options(make_store(), "test", opts)
             .await
             .unwrap();
 
+        // Construct `run_at` from the mock clock so it is comparable to
+        // the queue's `now_ms` without relying on the system clock.
+        let run_at = std::time::UNIX_EPOCH + Duration::from_millis(initial) + schedule_delay;
         let id = q
             .enqueue_with(
                 "work",
                 b"weekly".to_vec(),
                 EnqueueOptions {
-                    run_at: Some(std::time::SystemTime::now() + schedule_delay),
+                    run_at: Some(run_at),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
 
-        // Wait past the schedule (wall clock), promote, claim, ack.
-        std::thread::sleep(schedule_delay + Duration::from_millis(20));
+        // Advance past the schedule, promote, claim, ack.
+        clock.advance(schedule_delay + Duration::from_millis(20));
         q.promote_scheduled_now().await.unwrap();
         let job = q
             .claim("work", Duration::from_secs(30))
@@ -2833,7 +2842,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let elapsed_since_enqueue = now_ms().saturating_sub(job.enqueued_at);
+        let elapsed_since_enqueue = q.now_ms().saturating_sub(job.enqueued_at);
         assert!(
             elapsed_since_enqueue > schedule_delay.as_millis() as u64,
             "enqueued_at should be well over {}ms old (was {elapsed_since_enqueue}ms)",
@@ -2853,9 +2862,9 @@ mod tests {
             "ack must stamp completed_at when keep_done_jobs is set"
         );
 
-        // After the retention window elapses (wall clock), the next
-        // reaper tick purges it.
-        std::thread::sleep(retention + Duration::from_millis(10));
+        // Advance past the retention window; the next reaper tick purges
+        // the record.
+        clock.advance(retention + Duration::from_millis(10));
         tokio::time::sleep(reaper_interval * 2).await;
         assert!(q.get_job(&id).await.unwrap().is_none());
 
@@ -2869,6 +2878,7 @@ mod tests {
         // before the cutoff has elapsed must leave the job alone; one
         // after it elapses must purge it (along with its index pointer
         // and the `dead` counter).
+        let clock = MockClock::new(1_700_000_000_000);
         let reaper_interval = Duration::from_millis(10);
         let retention = Duration::from_millis(50);
         let opts = OpenOptions {
@@ -2877,6 +2887,7 @@ mod tests {
                 dead_retention: Some(retention),
                 ..QueueConfig::default()
             },
+            clock: Arc::new(clock.clone()),
             ..OpenOptions::default()
         };
         let q = Queue::open_with_options(make_store(), "test", opts)
@@ -2906,14 +2917,15 @@ mod tests {
         assert!(dead[0].failed_at.is_some(), "failed_at must be stamped");
         assert_eq!(q.stats("work").await.unwrap().dead, 1);
 
-        // Fire a reaper tick before the wall-clock cutoff has elapsed:
+        // Fire a reaper tick before the retention cutoff has elapsed:
         // the dead record must survive.
         tokio::time::sleep(reaper_interval * 2).await;
         assert_eq!(q.dead_jobs("work", None, 100).await.unwrap().len(), 1);
 
-        // Advance wall clock past the cutoff. The next reaper tick purges
-        // the record; the counter and index pointer must also be cleaned up.
-        std::thread::sleep(retention + Duration::from_millis(10));
+        // Advance the test clock past the cutoff. The next reaper tick
+        // purges the record; the counter and index pointer must also be
+        // cleaned up.
+        clock.advance(retention + Duration::from_millis(10));
         tokio::time::sleep(reaper_interval * 2).await;
         assert!(q.dead_jobs("work", None, 100).await.unwrap().is_empty());
         assert_eq!(

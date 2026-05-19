@@ -103,6 +103,7 @@
 
 #![warn(missing_docs)]
 
+mod clock;
 mod error;
 mod job;
 mod queue;
@@ -114,6 +115,7 @@ mod stats;
 /// own the claim -> process -> ack/nack lifecycle and graceful shutdown.
 pub mod worker;
 
+pub use clock::{Clock, MockClock, SystemClock};
 pub use error::{Error, Result};
 pub use job::{JobRecord, JobStatus};
 pub use queue::{

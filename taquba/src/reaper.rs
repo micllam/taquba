@@ -6,16 +6,19 @@ use slatedb::{Db, IsolationLevel};
 use tokio::sync::{Notify, watch};
 use tracing::{debug, warn};
 
+use crate::clock::Clock;
 use crate::error::Result;
 use crate::job::{JobRecord, JobStatus};
-use crate::queue::{QueueConfig, dead_key, job_index_key, now_ms, pending_key};
+use crate::queue::{QueueConfig, dead_key, job_index_key, pending_key};
 use crate::stats::update_stats;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn reap_loop(
     db: Arc<Db>,
     interval: Duration,
     default_queue_config: QueueConfig,
     queue_configs: HashMap<String, QueueConfig>,
+    clock: Arc<dyn Clock>,
     job_available: Arc<Notify>,
     completion_notify: Arc<Notify>,
     mut shutdown: watch::Receiver<bool>,
@@ -41,18 +44,18 @@ pub(crate) async fn reap_loop(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(interval) => {
-                match reap_expired(&db, &completion_notify).await {
+                match reap_expired(&db, clock.as_ref(), &completion_notify).await {
                     Ok(0) => {}
                     Ok(_) => job_available.notify_waiters(),
                     Err(e) => warn!("lease reaper error: {e}"),
                 }
                 if any_keep_done {
-                    if let Err(e) = sweep_done(&db, &keep_done_for).await {
+                    if let Err(e) = sweep_done(&db, clock.as_ref(), &keep_done_for).await {
                         warn!("done retention sweep error: {e}");
                     }
                 }
                 if any_dead_retention {
-                    if let Err(e) = sweep_dead(&db, &dead_retention_for).await {
+                    if let Err(e) = sweep_dead(&db, clock.as_ref(), &dead_retention_for).await {
                         warn!("dead retention sweep error: {e}");
                     }
                 }
@@ -65,8 +68,12 @@ pub(crate) async fn reap_loop(
 
 /// Returns the number of expired claims that were processed. Callers can use
 /// this to decide whether to wake any waiting workers.
-pub(crate) async fn reap_expired(db: &Db, completion_notify: &Notify) -> Result<usize> {
-    let now = now_ms();
+pub(crate) async fn reap_expired(
+    db: &Db,
+    clock: &dyn Clock,
+    completion_notify: &Notify,
+) -> Result<usize> {
+    let now = clock.now_ms();
     let mut expired_keys = Vec::new();
 
     let mut iter = db.scan_prefix(b"claimed:").await?;
@@ -99,13 +106,18 @@ pub(crate) async fn reap_expired(db: &Db, completion_notify: &Notify) -> Result<
 
     let count = expired_keys.len();
     for key_bytes in expired_keys {
-        reap_job(db, &key_bytes, completion_notify).await?;
+        reap_job(db, clock, &key_bytes, completion_notify).await?;
     }
 
     Ok(count)
 }
 
-async fn reap_job(db: &Db, claimed_key_bytes: &[u8], completion_notify: &Notify) -> Result<()> {
+async fn reap_job(
+    db: &Db,
+    clock: &dyn Clock,
+    claimed_key_bytes: &[u8],
+    completion_notify: &Notify,
+) -> Result<()> {
     loop {
         let txn = db.begin(IsolationLevel::Snapshot).await?;
 
@@ -124,7 +136,7 @@ async fn reap_job(db: &Db, claimed_key_bytes: &[u8], completion_notify: &Notify)
         if job.attempts >= job.max_attempts {
             job.status = JobStatus::Dead;
             job.last_error = Some("lease expired".to_string());
-            job.failed_at = Some(now_ms());
+            job.failed_at = Some(clock.now_ms());
             let dead = dead_key(&job.queue, &job.id);
             let value = rmp_serde::to_vec_named(&job)?;
             txn.put(dead.as_bytes(), &value)?;
@@ -182,9 +194,10 @@ async fn reap_job(db: &Db, claimed_key_bytes: &[u8], completion_notify: &Notify)
 /// Records on queues with `keep_done_jobs = None` are skipped.
 async fn sweep_done(
     db: &Db,
+    clock: &dyn Clock,
     keep_done_for: &(dyn Fn(&str) -> Option<Duration> + Sync),
 ) -> Result<()> {
-    let now = now_ms();
+    let now = clock.now_ms();
 
     let mut victims: Vec<(Vec<u8>, String)> = Vec::new();
     let mut iter = db.scan_prefix(b"done:").await?;
@@ -228,9 +241,10 @@ async fn sweep_done(
 /// are skipped.
 async fn sweep_dead(
     db: &Db,
+    clock: &dyn Clock,
     dead_retention_for: &(dyn Fn(&str) -> Option<Duration> + Sync),
 ) -> Result<()> {
-    let now = now_ms();
+    let now = clock.now_ms();
 
     let mut victims: Vec<(Vec<u8>, String, String)> = Vec::new();
     let mut iter = db.scan_prefix(b"dead:").await?;
