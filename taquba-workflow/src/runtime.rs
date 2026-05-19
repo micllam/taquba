@@ -87,13 +87,30 @@ pub struct RunSpec {
     pub max_attempts_per_step: Option<u32>,
 }
 
-/// Returned by [`WorkflowRuntime::submit`].
+/// Handle to a freshly submitted run, returned inside [`SubmitOutcome`].
 #[derive(Debug, Clone)]
 pub struct RunHandle {
     /// The run's identifier (generated if the spec didn't carry one).
     pub run_id: String,
     /// Taquba job ID of the first enqueued step.
     pub first_job_id: String,
+}
+
+/// Outcome of [`WorkflowRuntime::submit`].
+///
+/// `submit` is idempotent on `run_id`: re-submitting an active run is a
+/// no-op and the returned `SubmitOutcome` carries `newly_submitted = false`.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct SubmitOutcome {
+    /// The run's identifier (generated if the spec didn't carry one).
+    pub run_id: String,
+    /// `true` if this call enqueued a new run; `false` if a run with this
+    /// id was already active (in this runtime's registry or in the
+    /// durable cross-restart record) and this call was a no-op. Call
+    /// [`WorkflowRuntime::status`] for the run's current state when
+    /// needed.
+    pub newly_submitted: bool,
 }
 
 /// In-memory status snapshot for an active run. Returned by
@@ -245,14 +262,15 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         }
     }
 
-    /// Submit a new run. Enqueues step 0 with payload `spec.input`. Idempotent
-    /// against in-process duplicates: if a run with the same `run_id` is
-    /// already active in this runtime, returns [`Error::DuplicateRun`].
-    /// Cross-restart duplicate-prevention is enforced by a durable
-    /// per-run record written to Taquba's user KV namespace atomically
-    /// with the step-0 enqueue.
+    /// Submit a new run. Enqueues step 0 with payload `spec.input`.
+    ///
+    /// Idempotent on `run_id`: if a run with the same id is already active
+    /// (either in this runtime's in-memory registry or in the durable
+    /// cross-restart record written to Taquba's user KV namespace), this
+    /// call is a no-op and the returned [`SubmitOutcome`] has
+    /// `newly_submitted = false`.
     #[instrument(skip(self, spec), fields(run_id))]
-    pub async fn submit(&self, spec: RunSpec) -> Result<RunHandle> {
+    pub async fn submit(&self, spec: RunSpec) -> Result<SubmitOutcome> {
         let run_id = spec.run_id.unwrap_or_else(|| ulid::Ulid::new().to_string());
         tracing::Span::current().record("run_id", run_id.as_str());
 
@@ -268,7 +286,10 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         // latency here is acceptable.
         let mut registry = self.inner.registry.lock().await;
         if registry.contains_key(&run_id) {
-            return Err(Error::DuplicateRun(run_id));
+            return Ok(SubmitOutcome {
+                run_id,
+                newly_submitted: false,
+            });
         }
 
         // Cross-restart duplicate check. The registry lock above closes
@@ -281,7 +302,10 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             .await?
             .is_some()
         {
-            return Err(Error::DuplicateRun(run_id));
+            return Ok(SubmitOutcome {
+                run_id,
+                newly_submitted: false,
+            });
         }
 
         let mut headers = spec.headers.clone();
@@ -318,7 +342,12 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             // is missing, which only happens if the run terminated
             // without going through `terminate`. Either way the safe
             // verdict is duplicate.
-            EnqueueResult::AlreadyEnqueued(_) => return Err(Error::DuplicateRun(run_id)),
+            EnqueueResult::AlreadyEnqueued(_) => {
+                return Ok(SubmitOutcome {
+                    run_id,
+                    newly_submitted: false,
+                });
+            }
         };
 
         registry.insert(
@@ -338,9 +367,9 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         drop(registry);
 
         debug!(run_id = %run_id, job_id = %job_id, "run submitted");
-        Ok(RunHandle {
+        Ok(SubmitOutcome {
             run_id,
-            first_job_id: job_id,
+            newly_submitted: true,
         })
     }
 
@@ -1054,15 +1083,16 @@ mod tests {
         }
         assert!(runtime.status(&handle.run_id).await.is_some());
 
-        let err = runtime
+        let outcome = runtime
             .submit(RunSpec {
                 run_id: Some("fixed-id".to_string()),
                 input: b"y".to_vec(),
                 ..Default::default()
             })
             .await
-            .unwrap_err();
-        assert!(matches!(err, Error::DuplicateRun(id) if id == "fixed-id"));
+            .unwrap();
+        assert_eq!(outcome.run_id, "fixed-id");
+        assert!(!outcome.newly_submitted);
 
         let _ = shutdown.send(());
     }
@@ -1113,15 +1143,16 @@ mod tests {
         // duplicate verdict can only come from the durable KV record.
         let runtime2 =
             WorkflowRuntime::builder(queue.clone(), PauseRunner, NoopTerminalHook).build();
-        let err = runtime2
+        let outcome = runtime2
             .submit(RunSpec {
                 run_id: Some("durable-id".to_string()),
                 input: b"y".to_vec(),
                 ..Default::default()
             })
             .await
-            .unwrap_err();
-        assert!(matches!(err, Error::DuplicateRun(id) if id == "durable-id"));
+            .unwrap();
+        assert_eq!(outcome.run_id, "durable-id");
+        assert!(!outcome.newly_submitted);
     }
 
     #[tokio::test(start_paused = true)]

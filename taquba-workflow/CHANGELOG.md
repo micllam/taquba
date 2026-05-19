@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `WorkflowRuntime::submit` now returns `SubmitOutcome`
+  (struct with `run_id: String` and `newly_submitted: bool`) instead of
+  `RunHandle`. Idempotent re-submissions of an active `run_id` are now
+  surfaced as `Ok(SubmitOutcome { newly_submitted: false, .. })` rather
+  than `Err(Error::DuplicateRun(_))`; they are no-ops, not failures.
+  Callers that distinguish first-time submits from retries should branch
+  on `outcome.newly_submitted`.
+
+### Removed
+
+- **Breaking:** `Error::DuplicateRun` removed. The duplicate-run case is
+  no longer modelled as an error; see `SubmitOutcome` above.
+
 ## [0.3.0] - 2026-05-15
 
 ### Added

@@ -200,8 +200,10 @@ step can be claimed and executed twice if its lease expires before ack.
 
 ## Duplicate submissions
 
-`WorkflowRuntime::submit` rejects re-submissions of an active `run_id`
-from two sources, in order:
+`WorkflowRuntime::submit` is idempotent on `run_id`. A re-submission of an
+active run is a no-op and the returned `SubmitOutcome` carries
+`newly_submitted = false`. Duplicates are caught from two sources, in
+order:
 
 1. An in-process registry catches duplicates within the same runtime.
 2. A **durable per-run record** written atomically with the step-0
@@ -209,8 +211,6 @@ from two sources, in order:
    process restarts, even after step 0 has been claimed and its dedup
    key released. The record is cleaned up when the run reaches a
    terminal state.
-
-Both paths surface as `Error::DuplicateRun`.
 
 ## Terminal hook
 

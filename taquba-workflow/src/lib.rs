@@ -153,8 +153,10 @@
 //!
 //! # Duplicate submissions
 //!
-//! [`WorkflowRuntime::submit`] rejects re-submissions of an active
-//! `run_id` from two sources, in order:
+//! [`WorkflowRuntime::submit`] is idempotent on `run_id`. A re-submission
+//! of an active run is a no-op and the returned [`SubmitOutcome`] carries
+//! `newly_submitted = false`. Duplicates are caught from two sources,
+//! in order:
 //!
 //! 1. An in-process registry catches duplicates within the same runtime.
 //! 2. A **durable per-run record** written atomically with the step-0
@@ -162,8 +164,6 @@
 //!    duplicates across process restarts, even after step 0 has been
 //!    claimed and its dedup key released. The record is cleaned up
 //!    when the run reaches a terminal state.
-//!
-//! Both paths surface as [`Error::DuplicateRun`].
 //!
 //! # Reserved headers
 //!
@@ -186,7 +186,7 @@ pub use error::{Error, Result};
 pub use runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner};
 pub use runtime::{
     HEADER_RUN_ID, HEADER_STEP, RESERVED_HEADER_PREFIX, RunHandle, RunSpec, RunState, RunStatus,
-    WorkflowRuntime, WorkflowRuntimeBuilder,
+    SubmitOutcome, WorkflowRuntime, WorkflowRuntimeBuilder,
 };
 #[cfg(feature = "webhooks")]
 pub use terminal::WebhookTerminalHook;
