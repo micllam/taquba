@@ -111,16 +111,20 @@ pub enum Error {
 
 impl Error {
     /// True if this error should dead-letter the job rather than retry.
-    /// Permanent errors include configuration mistakes and HTTP client
-    /// errors.
+    /// Permanent errors include configuration mistakes, HTTP client
+    /// errors, and permanent variants of the underlying Taquba queue
+    /// error.
+    ///
+    /// [`Self::Queue`] delegates to [`taquba::Error::is_permanent`].
     pub fn is_permanent(&self) -> bool {
-        matches!(
-            self,
-            Error::MissingUrl
-                | Error::InvalidMethod(_)
-                | Error::InvalidTimeout(_)
-                | Error::PermanentDelivery(_)
-        )
+        match self {
+            Self::MissingUrl
+            | Self::InvalidMethod(_)
+            | Self::InvalidTimeout(_)
+            | Self::PermanentDelivery(_) => true,
+            Self::Delivery(_) => false,
+            Self::Queue(e) => e.is_permanent(),
+        }
     }
 }
 
@@ -271,5 +275,17 @@ mod tests {
 
         assert_eq!(job.headers.get(HEADER_METHOD).unwrap(), "POST");
         assert!(!job.headers.contains_key(HEADER_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn is_permanent_classifies_each_arm() {
+        assert!(Error::MissingUrl.is_permanent());
+        assert!(Error::InvalidMethod("nope".into()).is_permanent());
+        assert!(Error::InvalidTimeout("nope".into()).is_permanent());
+        assert!(Error::PermanentDelivery("403".into()).is_permanent());
+        assert!(!Error::Delivery("connection reset".into()).is_permanent());
+        // Queue(_) delegates to taquba::Error.
+        assert!(Error::Queue(taquba::Error::JobNotFound("j".into())).is_permanent());
+        assert!(Error::Queue(taquba::Error::InvalidState).is_permanent());
     }
 }
