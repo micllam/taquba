@@ -42,23 +42,14 @@ impl Error {
     /// should fast-fail (e.g. dead-letter a step, mark a submission as
     /// failed) rather than back off and try again.
     ///
-    /// For [`Self::Queue`], classification is decided locally by
-    /// pattern-matching on [`taquba::Error`]; [`taquba::Error::Storage`]
-    /// (object-store I/O, transaction conflicts) is treated as transient.
+    /// [`Self::Queue`] delegates to [`taquba::Error::is_permanent`].
     pub fn is_permanent(&self) -> bool {
         match self {
             Self::MissingHeader(_)
             | Self::InvalidStepHeader { .. }
             | Self::ReservedHeaderInSubmit(_)
             | Self::InputMismatch(_) => true,
-            Self::Queue(e) => match e {
-                taquba::Error::Serialization(_)
-                | taquba::Error::Deserialization(_)
-                | taquba::Error::JobNotFound(_)
-                | taquba::Error::InvalidState
-                | taquba::Error::KvValueTooLarge { .. } => true,
-                taquba::Error::Storage(_) => false,
-            },
+            Self::Queue(e) => e.is_permanent(),
         }
     }
 }

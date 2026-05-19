@@ -10,10 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `Error::is_permanent()` is now public (previously `pub(crate)`) and
-  classifies every variant. `Queue(_)` delegates by pattern-matching on
-  `taquba::Error`: data-shape and wrong-state variants return `true`;
-  `Storage(_)` returns `false` (transient) since the dominant cases are
-  retriable object-store I/O and transaction conflicts.
+  classifies every variant. `Queue(_)` delegates to
+  `taquba::Error::is_permanent` so classification stays consistent
+  across crates that wrap the underlying taquba error.
 - `Error::InputMismatch(run_id)`: returned when a re-submission of an
   active `run_id` carries `spec.input` bytes that differ from the
   original submission's. Classified `is_permanent() == true`.
