@@ -858,7 +858,7 @@ mod tests {
         tx
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn single_step_succeeds_and_fires_hook() {
         let queue = fresh_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -893,7 +893,7 @@ mod tests {
         let _ = shutdown.send(());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn multi_step_run_advances_through_continue() {
         let queue = fresh_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -935,7 +935,7 @@ mod tests {
         let _ = shutdown.send(());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn permanent_failure_dead_letters_and_fires_hook() {
         struct FailingRunner;
         impl StepRunner for FailingRunner {
@@ -974,7 +974,7 @@ mod tests {
         let _ = shutdown.send(());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn fail_outcome_terminates_run_without_dead_letter() {
         // StepOutcome::Fail is the runner's *verdict* path, not an
         // infrastructure error: the hook fires with Failed, the registry
@@ -1021,7 +1021,7 @@ mod tests {
         let _ = shutdown.send(());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn duplicate_submit_in_process_is_rejected() {
         // Pause forever on the first step so the run stays active in the
         // registry while we attempt the duplicate submit.
@@ -1067,7 +1067,7 @@ mod tests {
         let _ = shutdown.send(());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn duplicate_submit_across_runtime_restart_is_rejected() {
         // Build a runtime, submit a run, then drop the runtime entirely
         // (simulating a process restart of the workflow layer) while
@@ -1124,7 +1124,7 @@ mod tests {
         assert!(matches!(err, Error::DuplicateRun(id) if id == "durable-id"));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reserved_header_on_submit_is_rejected() {
         let queue = fresh_queue().await;
         let runtime: WorkflowRuntime<ScriptedRunner, NoopTerminalHook> =
@@ -1146,7 +1146,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn user_headers_thread_through_to_terminal_hook() {
         let queue = fresh_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1187,7 +1187,7 @@ mod tests {
         let _ = shutdown.send(());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn restart_resumes_at_next_step() {
         // Headline durability test: after step 0 has acked and step 1 is in
         // the queue, kill runtime A entirely and spawn runtime B on the same
@@ -1359,7 +1359,7 @@ mod tests {
         let _ = shutdown.send(());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancel_outcome_terminates_run_without_dead_letter() {
         // `StepOutcome::Cancel` is the runner's cancellation verdict path:
         // the hook fires with Cancelled, the registry is cleaned up, the
@@ -1403,7 +1403,7 @@ mod tests {
         let _ = shutdown.send(());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancel_pending_run_fires_cancelled_hook() {
         // Pending case: a run sits in the queue, we call `cancel()` before
         // any worker claims it. The hook fires from `cancel` itself.
@@ -1454,7 +1454,7 @@ mod tests {
         assert_eq!(stats.pending, 0, "cancelled job must be removed");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancel_during_running_step_overrides_outcome() {
         // Running case: the step is in-flight when cancel is called. The
         // runner's eventual outcome is discarded; the worker fires Cancelled.
@@ -1621,7 +1621,7 @@ mod tests {
         let _ = shutdown.send(());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancel_suppresses_permanent_runner_error() {
         // Without cancellation, `StepError::permanent` dead-letters the
         // step and causes the worker to return `PermanentFailure`. With
@@ -1630,7 +1630,7 @@ mod tests {
         assert_cancel_suppresses_runner_error(StepError::permanent("would-dead-letter")).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancel_suppresses_transient_runner_error() {
         // Without cancellation, `StepError::transient` nacks for retry
         // (and eventually dead-letters). With an external cancel in
@@ -1639,7 +1639,7 @@ mod tests {
         assert_cancel_suppresses_runner_error(StepError::transient("would-retry")).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancel_signals_step_token_for_cooperative_short_circuit() {
         // A runner that watches `step.cancel_token` should short-circuit
         // long after-claim work as soon as `WorkflowRuntime::cancel` is
@@ -1715,7 +1715,7 @@ mod tests {
         let _ = shutdown.send(());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn double_cancel_fires_hook_once_and_second_call_returns_false() {
         // Submit a run and cancel twice while it sits pending. The first
         // call removes the queued step, fires the hook, and drops the
@@ -1765,7 +1765,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancel_after_run_already_terminated_returns_false() {
         // Submit a run that succeeds normally, wait for the terminal
         // hook, then call `cancel`. The registry entry was removed when
@@ -1813,7 +1813,7 @@ mod tests {
         let _ = shutdown.send(());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn status_reports_cancelling_while_termination_in_flight() {
         // Once `cancel()` has been called but the terminal hook hasn't
         // fired yet, `status()` should report `RunState::Cancelling` so
@@ -1890,7 +1890,7 @@ mod tests {
         let _ = shutdown.send(());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancel_unknown_run_returns_false() {
         let queue = fresh_queue().await;
         let runtime: WorkflowRuntime<ScriptedRunner, NoopTerminalHook> =
@@ -1900,12 +1900,12 @@ mod tests {
         assert!(!was_cancelled);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn transient_fires_once_on_single_attempt() {
         assert_transient_retries_until_max(1).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn transient_retries_up_to_max_attempts() {
         assert_transient_retries_until_max(3).await;
     }
