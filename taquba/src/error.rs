@@ -44,5 +44,36 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// True if retrying the operation will not change the outcome; callers
+    /// should fast-fail rather than back off.
+    ///
+    /// [`Self::Storage`] is conservatively treated as transient.
+    /// The remaining variants are programmer / data-shape errors
+    /// where retrying cannot help.
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            Self::Serialization(_)
+            | Self::Deserialization(_)
+            | Self::JobNotFound(_)
+            | Self::InvalidState
+            | Self::KvValueTooLarge { .. } => true,
+            Self::Storage(_) => false,
+        }
+    }
+}
+
 /// Convenience alias for `Result<T, Error>` returned throughout the crate.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_shape_and_state_variants_are_permanent() {
+        assert!(Error::JobNotFound("job-1".into()).is_permanent());
+        assert!(Error::InvalidState.is_permanent());
+        assert!(Error::KvValueTooLarge { size: 10, max: 5 }.is_permanent());
+    }
+}

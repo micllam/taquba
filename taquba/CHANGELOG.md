@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Error::is_permanent()`: classifies each variant as transient or
+  permanent so downstream crates can decide whether to retry or
+  fast-fail. `Serialization`, `Deserialization`, `JobNotFound`,
+  `InvalidState`, and `KvValueTooLarge` are permanent; `Storage(_)` is
+  conservatively treated as transient.
 - New `Clock` trait + `SystemClock` (default) + `MockClock` types for
   virtualising taquba's time source. Every state-transition timestamp
   (`enqueued_at`, `completed_at`, `failed_at`, `lease_expires_at`) and
