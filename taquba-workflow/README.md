@@ -200,16 +200,22 @@ step can be claimed and executed twice if its lease expires before ack.
 
 ## Duplicate submissions
 
-`WorkflowRuntime::submit` is idempotent on `run_id`. A re-submission of an
-active run is a no-op and the returned `SubmitOutcome` carries
-`newly_submitted = false`. Duplicates are caught from two sources, in
-order:
+`WorkflowRuntime::submit` is idempotent on `(run_id, spec.input)`. A
+re-submission of an active run that carries the same input is a no-op
+and the returned `SubmitOutcome` has `newly_submitted = false`. A
+re-submission that carries a *different* input is rejected with
+`Error::InputMismatch`: reusing a `run_id` with new content is a
+programmer error; pick a fresh `run_id` for a new run.
+
+Duplicates are caught from two sources, in order:
 
 1. An in-process registry catches duplicates within the same runtime.
 2. A **durable per-run record** written atomically with the step-0
    enqueue (via Taquba's `enqueue_with_kv`) catches duplicates across
    process restarts, even after step 0 has been claimed and its dedup
-   key released. The record is cleaned up when the run reaches a
+   key released. The record carries a SHA-256 of the original input so
+   the cross-restart mismatch check works even when the in-memory
+   registry is empty. The record is cleaned up when the run reaches a
    terminal state.
 
 ## Terminal hook

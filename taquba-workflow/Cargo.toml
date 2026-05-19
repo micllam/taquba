@@ -28,6 +28,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 rmp-serde = "1"
+sha2 = "0.10"
 
 # Used only for `CancellationToken`, which is re-exported on `Step` so
 # runners can opt in to cooperative mid-step cancellation.

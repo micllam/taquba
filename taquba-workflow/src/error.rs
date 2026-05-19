@@ -25,6 +25,13 @@ pub enum Error {
     #[error("submission header `{0}` uses the reserved `workflow.*` prefix")]
     ReservedHeaderInSubmit(String),
 
+    /// A re-submission of an active `run_id` carried `spec.input` bytes
+    /// that differ from the original submission's. Reusing a `run_id`
+    /// with new input is treated as a programmer error: pick a fresh
+    /// `run_id` for a new run, or wait for the active one to terminate.
+    #[error("run `{0}` is active with a different input; pick a fresh run_id")]
+    InputMismatch(String),
+
     /// Underlying error from a Taquba queue operation.
     #[error(transparent)]
     Queue(#[from] taquba::Error),
@@ -42,7 +49,8 @@ impl Error {
         match self {
             Self::MissingHeader(_)
             | Self::InvalidStepHeader { .. }
-            | Self::ReservedHeaderInSubmit(_) => true,
+            | Self::ReservedHeaderInSubmit(_)
+            | Self::InputMismatch(_) => true,
             Self::Queue(e) => match e {
                 taquba::Error::Serialization(_)
                 | taquba::Error::Deserialization(_)
@@ -73,6 +81,7 @@ mod tests {
             .is_permanent()
         );
         assert!(Error::ReservedHeaderInSubmit("workflow.foo".into()).is_permanent());
+        assert!(Error::InputMismatch("run-1".into()).is_permanent());
     }
 
     #[test]

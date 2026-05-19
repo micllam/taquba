@@ -2797,6 +2797,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "serde_json",
+ "sha2",
  "taquba",
  "taquba-webhooks",
  "thiserror 1.0.69",

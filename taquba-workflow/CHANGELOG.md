@@ -14,6 +14,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `taquba::Error`: data-shape and wrong-state variants return `true`;
   `Storage(_)` returns `false` (transient) since the dominant cases are
   retriable object-store I/O and transaction conflicts.
+- `Error::InputMismatch(run_id)`: returned when a re-submission of an
+  active `run_id` carries `spec.input` bytes that differ from the
+  original submission's. Classified `is_permanent() == true`.
+  `WorkflowRuntime::submit` is now idempotent on `(run_id, spec.input)`
+  rather than `run_id` alone; reusing a `run_id` with new content is
+  surfaced as a programmer error instead of silently no-op-ing.
+
+### Changed
+
+- **Breaking on-disk layout:** the durable per-run record
+  (`usr:workflow/runs/{run_id}`) now carries a `SHA-256` of the original
+  `spec.input` to power the `InputMismatch` check. In-flight runs from
+  prior versions must be drained before upgrading; records written by
+  older versions will fail to deserialize.
 
 ### Changed
 

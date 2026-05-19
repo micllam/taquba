@@ -39,18 +39,27 @@ fn run_kv_key(run_id: &str) -> Vec<u8> {
 /// Durable per-run record written atomically with the step-0 enqueue in
 /// [`WorkflowRuntime::submit`] via [`Queue::enqueue_with_kv`]. Carries
 /// just enough state to detect duplicate submissions across runtime
-/// restarts; the in-memory registry remains the source of truth for
-/// active-run status and cancellation while a runtime is up. Cleaned up
-/// in [`RuntimeInner::terminate`] when the run reaches a terminal state.
+/// restarts and to reject re-submissions that change the input;
+/// the in-memory registry remains the source of truth for active-run
+/// status and cancellation while a runtime is up. Cleaned up in
+/// [`RuntimeInner::terminate`] when the run reaches a terminal state.
 ///
-/// The cross-restart dedup property only requires the *existence* of
-/// this key, so the body is intentionally minimal: `run_id` keeps the
-/// record self-describing for ad hoc operator inspection, and
-/// `submitted_at_ms` is useful for ordering and stale-record auditing.
+/// `run_id` keeps the record self-describing for ad hoc operator
+/// inspection; `submitted_at_ms` is useful for ordering and stale-record
+/// auditing; `input_hash` is the SHA-256 of the original `spec.input` and
+/// powers the `Error::InputMismatch` check on duplicate submissions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DurableRunRecord {
     run_id: String,
     submitted_at_ms: u64,
+    input_hash: [u8; 32],
+}
+
+fn hash_input(input: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(input);
+    hasher.finalize().into()
 }
 
 /// Per-step enqueue options the runtime forwards through to Taquba. The
@@ -232,6 +241,13 @@ struct RegistryEntry {
     user_headers: HashMap<String, String>,
     cancel_requested: bool,
     cancel_token: CancellationToken,
+    /// SHA-256 of the original `spec.input`. `Some` for entries created
+    /// by [`WorkflowRuntime::submit`]; `None` for entries created by a
+    /// worker resuming a step after restart, which doesn't have access
+    /// to the original input. The duplicate-submit check falls through
+    /// to the durable record (which always carries the hash) when this
+    /// is `None`.
+    input_hash: Option<[u8; 32]>,
 }
 
 impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
@@ -255,11 +271,14 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
 
     /// Submit a new run. Enqueues step 0 with payload `spec.input`.
     ///
-    /// Idempotent on `run_id`: if a run with the same id is already active
-    /// (either in this runtime's in-memory registry or in the durable
-    /// cross-restart record written to Taquba's user KV namespace), this
+    /// Idempotent on `(run_id, spec.input)`: if a run with the same id is
+    /// already active (either in this runtime's in-memory registry or in
+    /// the durable cross-restart record written to Taquba's user KV
+    /// namespace) and `spec.input` matches the original submission, this
     /// call is a no-op and the returned [`SubmitOutcome`] has
-    /// `newly_submitted = false`.
+    /// `newly_submitted = false`. A re-submission of an active `run_id`
+    /// with a *different* input is rejected with [`Error::InputMismatch`];
+    /// pick a fresh `run_id` for a new run.
     #[instrument(skip(self, spec), fields(run_id))]
     pub async fn submit(&self, spec: RunSpec) -> Result<SubmitOutcome> {
         let run_id = spec.run_id.unwrap_or_else(|| ulid::Ulid::new().to_string());
@@ -271,28 +290,36 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             }
         }
 
+        let input_hash = hash_input(&spec.input);
+
         // Hold the registry lock across enqueue so two concurrent submits
         // with the same `run_id` can't both pass the duplicate check before
         // either commits. Submission is not on a hot path; queue I/O
         // latency here is acceptable.
         let mut registry = self.inner.registry.lock().await;
-        if registry.contains_key(&run_id) {
-            return Ok(SubmitOutcome {
-                run_id,
-                newly_submitted: false,
-            });
+        if let Some(entry) = registry.get(&run_id) {
+            // Worker-resumed entries have no stored hash; fall through to
+            // the durable-record check below, which always carries it.
+            if let Some(existing) = entry.input_hash {
+                if existing != input_hash {
+                    return Err(Error::InputMismatch(run_id));
+                }
+                return Ok(SubmitOutcome {
+                    run_id,
+                    newly_submitted: false,
+                });
+            }
         }
 
         // Cross-restart duplicate check. The registry lock above closes
         // the in-process race window; this read closes the across-restart
         // one (same queue, fresh runtime).
-        if self
-            .inner
-            .queue
-            .kv_get(&run_kv_key(&run_id))
-            .await?
-            .is_some()
-        {
+        if let Some(bytes) = self.inner.queue.kv_get(&run_kv_key(&run_id)).await? {
+            let existing: DurableRunRecord =
+                rmp_serde::from_slice(&bytes).map_err(taquba::Error::from)?;
+            if existing.input_hash != input_hash {
+                return Err(Error::InputMismatch(run_id));
+            }
             return Ok(SubmitOutcome {
                 run_id,
                 newly_submitted: false,
@@ -316,6 +343,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64,
+            input_hash,
         })
         .map_err(taquba::Error::from)?;
         let kv = HashMap::from([(run_kv_key(&run_id), record_bytes)]);
@@ -353,6 +381,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
                 user_headers: spec.headers.clone(),
                 cancel_requested: false,
                 cancel_token: CancellationToken::new(),
+                input_hash: Some(input_hash),
             },
         );
         drop(registry);
@@ -599,6 +628,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                         user_headers: user_headers.clone(),
                         cancel_requested: false,
                         cancel_token: cancel_token.clone(),
+                        input_hash: None,
                     },
                 );
                 cancel_token
@@ -1042,7 +1072,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn duplicate_submit_in_process_is_rejected() {
+    async fn duplicate_submit_in_process_with_same_input_is_idempotent() {
         // Pause forever on the first step so the run stays active in the
         // registry while we attempt the duplicate submit.
         struct PauseRunner;
@@ -1077,7 +1107,7 @@ mod tests {
         let outcome = runtime
             .submit(RunSpec {
                 run_id: Some("fixed-id".to_string()),
-                input: b"y".to_vec(),
+                input: b"x".to_vec(),
                 ..Default::default()
             })
             .await
@@ -1089,12 +1119,48 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn duplicate_submit_across_runtime_restart_is_rejected() {
+    async fn duplicate_submit_in_process_with_different_input_errors() {
+        struct PauseRunner;
+        impl StepRunner for PauseRunner {
+            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                std::future::pending().await
+            }
+        }
+
+        let queue = fresh_queue().await;
+        let runtime = WorkflowRuntime::builder(queue, PauseRunner, NoopTerminalHook).build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                run_id: Some("fixed-id".to_string()),
+                input: b"x".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let err = runtime
+            .submit(RunSpec {
+                run_id: Some("fixed-id".to_string()),
+                input: b"y".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::InputMismatch(id) if id == "fixed-id"));
+        assert!(err.is_permanent());
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn duplicate_submit_across_runtime_restart_with_same_input_is_idempotent() {
         // Build a runtime, submit a run, then drop the runtime entirely
         // (simulating a process restart of the workflow layer) while
         // keeping the underlying Queue alive. The next runtime instance
-        // sees a fresh in-memory registry but must still reject a
-        // duplicate `run_id` because the durable run record persists
+        // sees a fresh in-memory registry but must still treat a
+        // re-submit as idempotent because the durable run record persists
         // through the enqueue_with_kv path.
         struct PauseRunner;
         impl StepRunner for PauseRunner {
@@ -1137,13 +1203,53 @@ mod tests {
         let outcome = runtime2
             .submit(RunSpec {
                 run_id: Some("durable-id".to_string()),
-                input: b"y".to_vec(),
+                input: b"x".to_vec(),
                 ..Default::default()
             })
             .await
             .unwrap();
         assert_eq!(outcome.run_id, "durable-id");
         assert!(!outcome.newly_submitted);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn duplicate_submit_across_runtime_restart_with_different_input_errors() {
+        // Like the same-input idempotency test, but the re-submit carries
+        // a different input. The check is sourced exclusively from the
+        // durable KV record since the fresh runtime's registry is empty.
+        struct PauseRunner;
+        impl StepRunner for PauseRunner {
+            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                std::future::pending().await
+            }
+        }
+
+        let queue = fresh_queue().await;
+
+        {
+            let runtime =
+                WorkflowRuntime::builder(queue.clone(), PauseRunner, NoopTerminalHook).build();
+            runtime
+                .submit(RunSpec {
+                    run_id: Some("durable-id".to_string()),
+                    input: b"x".to_vec(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+
+        let runtime2 =
+            WorkflowRuntime::builder(queue.clone(), PauseRunner, NoopTerminalHook).build();
+        let err = runtime2
+            .submit(RunSpec {
+                run_id: Some("durable-id".to_string()),
+                input: b"y".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::InputMismatch(id) if id == "durable-id"));
     }
 
     #[tokio::test(start_paused = true)]
