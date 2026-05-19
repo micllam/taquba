@@ -661,7 +661,7 @@ mod tests {
         (queue, store)
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn submit_run_and_join_success() {
         let (queue, store) = open_queue("test-success").await;
         let mut runner = JobRunner::builder()
@@ -680,7 +680,7 @@ mod tests {
         handle.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn await_handle_directly_yields_output() {
         let (queue, store) = open_queue("test-await").await;
         let mut runner = JobRunner::builder()
@@ -699,7 +699,7 @@ mod tests {
         handle.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn permanent_failure_is_dead_lettered_with_recorded_outcome() {
         let (queue, store) = open_queue("test-failure").await;
         let mut runner = JobRunner::builder()
@@ -720,7 +720,7 @@ mod tests {
         handle.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn idempotency_key_collapses_duplicate_submissions() {
         let (queue, store) = open_queue("test-idempotency").await;
         // No spawn: jobs stay pending so the dedup key is still held.
@@ -738,7 +738,7 @@ mod tests {
         assert_ne!(first.id(), different.id());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn unknown_job_type_is_dead_lettered() {
         let (queue, store) = open_queue("test-unknown").await;
         // Register nothing; submit a job whose type has no handler.
@@ -760,7 +760,7 @@ mod tests {
         handle.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reserved_header_in_submit_options_is_rejected() {
         let (queue, store) = open_queue("test-reserved-header").await;
         let runner = JobRunner::builder()
@@ -779,7 +779,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn transient_failure_exhausts_retries_and_dead_letters() {
         let cfg = QueueConfig {
             max_attempts: 2,
@@ -808,7 +808,7 @@ mod tests {
         handle.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn awaiting_failed_handle_returns_join_error_job() {
         let (queue, store) = open_queue("test-join-error-job").await;
         let mut runner = JobRunner::builder()
@@ -832,7 +832,7 @@ mod tests {
         handle.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn await_after_queue_record_reaped_falls_back_to_result_blob() {
         // Test the WaitOutcome::NotFound -> fetch_result
         // fallback in JobHandle::join_timeout. Under default retention
@@ -889,7 +889,7 @@ mod tests {
         assert!(hex_part.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn fan_out_from_handler_runs_children() {
         // Long lease + single attempt.
         let cfg = QueueConfig {
