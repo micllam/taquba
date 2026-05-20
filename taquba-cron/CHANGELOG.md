@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Error::is_permanent()`: classifies `InvalidExpression` and
+  `DuplicateName` as permanent and delegates the `Queue` variant to
+  [`taquba::Error::is_permanent`].
+
 ## [0.2.0] - 2026-05-06
 
 ### Added

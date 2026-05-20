@@ -102,6 +102,16 @@ pub enum Error {
     Queue(#[from] taquba::Error),
 }
 
+impl Error {
+    /// True if this error has no chance of succeeding on retry.
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            Self::InvalidExpression { .. } | Self::DuplicateName(_) => true,
+            Self::Queue(e) => e.is_permanent(),
+        }
+    }
+}
+
 /// Result alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -379,6 +389,21 @@ mod tests {
         let entry = &s.entries[0];
         assert_eq!(entry.priority, Some(taquba::PRIORITY_HIGH));
         assert_eq!(entry.max_attempts, Some(7));
+    }
+
+    #[test]
+    fn is_permanent_classifies_each_arm() {
+        assert!(
+            Error::InvalidExpression {
+                expression: "x".into(),
+                message: "y".into(),
+            }
+            .is_permanent()
+        );
+        assert!(Error::DuplicateName("n".into()).is_permanent());
+
+        assert!(Error::Queue(taquba::Error::JobNotFound("j".into())).is_permanent());
+        assert!(Error::Queue(taquba::Error::InvalidState).is_permanent());
     }
 
     #[tokio::test]
