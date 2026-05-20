@@ -44,6 +44,14 @@ pub enum Error {
     /// as the job-type routing header).
     #[error("header key `{0}` is reserved by taquba-jobs and must not be set on submission")]
     ReservedHeader(String),
+
+    /// A re-submission used the same `idempotency_key` as a previous
+    /// submission but with a different payload. The string carries the
+    /// conflicting key. Returned both on the in-process race window and
+    /// across restarts (the input hash is durably recorded in the user
+    /// KV namespace alongside the enqueue).
+    #[error("submission for idempotency key `{0}` already exists with a different payload")]
+    InputMismatch(String),
 }
 
 impl Error {
@@ -62,7 +70,8 @@ impl Error {
             | Self::Encode(_)
             | Self::Decode(_)
             | Self::JobNotFound(_)
-            | Self::ReservedHeader(_) => true,
+            | Self::ReservedHeader(_)
+            | Self::InputMismatch(_) => true,
             Self::Store(_) => false,
             Self::Queue(e) => e.is_permanent(),
         }
@@ -82,6 +91,7 @@ mod tests {
         assert!(Error::MissingObjectStore.is_permanent());
         assert!(Error::JobNotFound("job-1".into()).is_permanent());
         assert!(Error::ReservedHeader("jobs.type".into()).is_permanent());
+        assert!(Error::InputMismatch("idem-key".into()).is_permanent());
     }
 
     #[test]

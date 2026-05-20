@@ -61,6 +61,7 @@ pub enum JoinError {
 pub struct JobHandle<J: Job> {
     id: String,
     submitter: Submitter,
+    newly_submitted: bool,
     _marker: PhantomData<fn() -> J>,
 }
 
@@ -69,16 +70,18 @@ impl<J: Job> Clone for JobHandle<J> {
         Self {
             id: self.id.clone(),
             submitter: self.submitter.clone(),
+            newly_submitted: self.newly_submitted,
             _marker: PhantomData,
         }
     }
 }
 
 impl<J: Job> JobHandle<J> {
-    pub(crate) fn new(id: String, submitter: Submitter) -> Self {
+    pub(crate) fn new(id: String, submitter: Submitter, newly_submitted: bool) -> Self {
         Self {
             id,
             submitter,
+            newly_submitted,
             _marker: PhantomData,
         }
     }
@@ -89,6 +92,21 @@ impl<J: Job> JobHandle<J> {
     /// existing pending job, this is the *existing* job's ID.
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// True if the call that produced this handle freshly enqueued the
+    /// job; false if the call dedup-hit against a pending submission
+    /// with the same [`Job::idempotency_key`](crate::Job::idempotency_key)
+    /// and a matching payload.
+    ///
+    /// For submissions without an `idempotency_key`, the value is
+    /// always `true` (every submit produces a new job).
+    ///
+    /// The value reflects the *call* that returned this handle: it
+    /// does not update as the job progresses. Handles produced by
+    /// [`Clone`] preserve the original value.
+    pub fn newly_submitted(&self) -> bool {
+        self.newly_submitted
     }
 
     /// The job's current lifecycle status, or `None` if no record exists

@@ -6,9 +6,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use serde::{Deserialize, Serialize};
 use taquba::object_store::ObjectStore;
 use taquba::{
-    EnqueueOptions, JobRecord, PermanentFailure, Queue, Worker, WorkerError, run_worker_concurrent,
+    EnqueueOptions, EnqueueResult, JobRecord, PermanentFailure, Queue, Worker, WorkerError,
+    run_worker_concurrent,
 };
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -26,6 +28,34 @@ pub(crate) const JOB_TYPE_HEADER: &str = "taquba_jobs.type";
 const DEFAULT_QUEUE_NAME: &str = "jobs";
 const DEFAULT_CONCURRENCY: usize = 16;
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Prefix for the durable per-submission dedup record in Taquba's user
+/// KV namespace. The full stored key is
+/// `{JOBS_KV_PREFIX}{idempotency_key}`.
+const JOBS_KV_PREFIX: &[u8] = b"jobs/dedup/";
+
+fn dedup_kv_key(idempotency_key: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(JOBS_KV_PREFIX.len() + idempotency_key.len());
+    k.extend_from_slice(JOBS_KV_PREFIX);
+    k.extend_from_slice(idempotency_key.as_bytes());
+    k
+}
+
+/// Persisted alongside a submission via [`Queue::enqueue_with_kv`] so a
+/// later submission with the same `idempotency_key` can detect that
+/// the payload has changed. `input_hash` is the SHA-256 of the
+/// serialized payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobSubmissionRecord {
+    input_hash: [u8; 32],
+}
+
+fn hash_payload(payload: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    hasher.finalize().into()
+}
 
 /// The shared, cheaply-cloneable core that knows how to enqueue a job and
 /// where its results live. Held by the runner, every [`JobHandle`], and
@@ -66,21 +96,92 @@ impl Submitter {
         }
         headers.insert(JOB_TYPE_HEADER.to_string(), J::NAME.to_string());
 
+        let dedup_key = job.idempotency_key();
         let enqueue_opts = EnqueueOptions {
             max_attempts: opts.max_attempts.or_else(|| job.max_attempts()),
             priority: opts.priority,
             run_at: opts.run_at,
-            dedup_key: job.idempotency_key(),
+            dedup_key: dedup_key.clone(),
             headers,
         };
 
-        let id = self
+        let (id, newly_submitted) = match dedup_key {
+            Some(idem_key) => {
+                self.submit_idempotent(idem_key, payload, enqueue_opts)
+                    .await?
+            }
+            None => {
+                let id = self
+                    .queue
+                    .enqueue_with(&self.queue_name, payload, enqueue_opts)
+                    .await?;
+                (id, true)
+            }
+        };
+
+        tracing::debug!(
+            job_id = %id,
+            job_type = J::NAME,
+            newly_submitted,
+            "job submitted",
+        );
+        Ok(JobHandle::new(id, self.clone(), newly_submitted))
+    }
+
+    /// Submit a job whose `idempotency_key` is known. Detects mismatched
+    /// re-submissions (same key, different payload) via a SHA-256 hash
+    /// of the payload persisted in the user KV namespace atomically
+    /// with the enqueue.
+    ///
+    /// Returns `(job_id, newly_submitted)`: `newly_submitted` is `true`
+    /// when this call enqueued a new job, and `false` when it
+    /// dedup-hit against a pending submission with a matching payload.
+    /// On a duplicate with a different payload (in-process or
+    /// across restart) returns [`Error::InputMismatch`].
+    async fn submit_idempotent(
+        &self,
+        idem_key: String,
+        payload: Vec<u8>,
+        enqueue_opts: EnqueueOptions,
+    ) -> Result<(String, bool)> {
+        let kv_key = dedup_kv_key(&idem_key);
+        let input_hash = hash_payload(&payload);
+
+        // Pre-check: if a record already exists, verify the hash matches
+        // before issuing the enqueue. Fast-fails the mismatch case
+        // without a needless enqueue round-trip.
+        if let Some(bytes) = self.queue.kv_get(&kv_key).await? {
+            let existing: JobSubmissionRecord = rmp_serde::from_slice(&bytes)?;
+            if existing.input_hash != input_hash {
+                return Err(Error::InputMismatch(idem_key));
+            }
+        }
+
+        let record_bytes = rmp_serde::to_vec_named(&JobSubmissionRecord { input_hash })?;
+        let kv_writes = HashMap::from([(kv_key.clone(), record_bytes)]);
+
+        let result = self
             .queue
-            .enqueue_with(&self.queue_name, payload, enqueue_opts)
+            .enqueue_with_kv(&self.queue_name, payload, enqueue_opts, kv_writes)
             .await?;
 
-        tracing::debug!(job_id = %id, job_type = J::NAME, "job submitted");
-        Ok(JobHandle::new(id, self.clone()))
+        match result {
+            EnqueueResult::New(id) => Ok((id, true)),
+            EnqueueResult::AlreadyEnqueued(id) => {
+                // A concurrent submit beat us between our pre-check and
+                // the enqueue transaction. Re-read the KV record (now
+                // populated by the winner) and verify its hash matches
+                // ours; if not, the winner's payload differs from ours
+                // and the apparent dedup-hit is actually a mismatch.
+                if let Some(bytes) = self.queue.kv_get(&kv_key).await? {
+                    let existing: JobSubmissionRecord = rmp_serde::from_slice(&bytes)?;
+                    if existing.input_hash != input_hash {
+                        return Err(Error::InputMismatch(idem_key));
+                    }
+                }
+                Ok((id, false))
+            }
+        }
     }
 }
 
@@ -638,6 +739,27 @@ mod tests {
         }
     }
 
+    /// A job whose `idempotency_key` is fixed regardless of payload, so
+    /// two submissions can share a key but disagree on input.
+    #[derive(Debug, Serialize, Deserialize)]
+    struct FixedKey {
+        content: String,
+    }
+
+    impl Job for FixedKey {
+        const NAME: &'static str = "test.fixed-key";
+        type Output = ();
+        type Error = TestError;
+
+        async fn run(&self, _ctx: JobContext<'_>) -> std::result::Result<(), TestError> {
+            Ok(())
+        }
+
+        fn idempotency_key(&self) -> Option<String> {
+            Some("fixed".to_string())
+        }
+    }
+
     async fn open_queue(name: &str) -> (Arc<Queue>, Arc<dyn ObjectStore>) {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let queue = Arc::new(Queue::open(store.clone(), name).await.unwrap());
@@ -659,6 +781,23 @@ mod tests {
                 .unwrap(),
         );
         (queue, store)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn submit_without_idempotency_key_is_always_newly_submitted() {
+        let (queue, store) = open_queue("test-no-idem").await;
+        let runner = JobRunner::builder()
+            .queue(queue)
+            .object_store(store)
+            .state("ok")
+            .build()
+            .unwrap();
+
+        let first = runner.submit(Adder { a: 1, b: 2 }).await.unwrap();
+        let second = runner.submit(Adder { a: 1, b: 2 }).await.unwrap();
+        assert!(first.newly_submitted());
+        assert!(second.newly_submitted());
+        assert_ne!(first.id(), second.id());
     }
 
     #[tokio::test(start_paused = true)]
@@ -731,11 +870,83 @@ mod tests {
             .unwrap();
 
         let first = runner.submit(Keyed { n: 1 }).await.unwrap();
+        assert!(first.newly_submitted());
         let second = runner.submit(Keyed { n: 1 }).await.unwrap();
         assert_eq!(first.id(), second.id());
+        assert!(!second.newly_submitted());
 
         let different = runner.submit(Keyed { n: 2 }).await.unwrap();
         assert_ne!(first.id(), different.id());
+        assert!(different.newly_submitted());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn input_mismatch_on_same_key_different_payload() {
+        let (queue, store) = open_queue("test-mismatch").await;
+        let runner = JobRunner::builder()
+            .queue(queue)
+            .object_store(store)
+            .build()
+            .unwrap();
+
+        runner
+            .submit(FixedKey {
+                content: "alpha".into(),
+            })
+            .await
+            .unwrap();
+        let result = runner
+            .submit(FixedKey {
+                content: "beta".into(),
+            })
+            .await;
+        match result {
+            Err(Error::InputMismatch(key)) => assert_eq!(key, "fixed"),
+            Err(other) => panic!("expected InputMismatch, got Err({other:?})"),
+            Ok(_) => panic!("expected InputMismatch, got Ok(_)"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn input_mismatch_survives_restart() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let queue_name = "test-mismatch-restart";
+
+        // Round 1: register the submission record. The runner / queue
+        // are dropped when this scope exits, releasing their
+        // background tasks before the next round opens the same store.
+        {
+            let queue = Arc::new(Queue::open(store.clone(), queue_name).await.unwrap());
+            let runner = JobRunner::builder()
+                .queue(queue.clone())
+                .object_store(store.clone())
+                .build()
+                .unwrap();
+            runner
+                .submit(FixedKey {
+                    content: "alpha".into(),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Round 2: fresh queue against the same store, differing payload.
+        let queue = Arc::new(Queue::open(store.clone(), queue_name).await.unwrap());
+        let runner = JobRunner::builder()
+            .queue(queue)
+            .object_store(store)
+            .build()
+            .unwrap();
+        let result = runner
+            .submit(FixedKey {
+                content: "beta".into(),
+            })
+            .await;
+        match result {
+            Err(Error::InputMismatch(_)) => {}
+            Err(other) => panic!("expected InputMismatch across restart, got Err({other:?})"),
+            Ok(_) => panic!("expected InputMismatch across restart, got Ok(_)"),
+        }
     }
 
     #[tokio::test(start_paused = true)]

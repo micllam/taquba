@@ -13,6 +13,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`MissingQueue`, `MissingObjectStore`), `Encode`/`Decode`,
   `JobNotFound`, and `ReservedHeader` as permanent; `Store(_)` as
   transient. `Queue(_)` delegates to [`taquba::Error::is_permanent`].
+- `Error::InputMismatch(String)`: returned by `submit` when a job's
+  `idempotency_key` matches a previous submission but the payload
+  differs. Classified as permanent.
+- Cross-restart input verification on `submit`: when a job has an
+  `idempotency_key`, the SHA-256 of the serialized payload is persisted
+  in the user KV namespace (`jobs/dedup/{key}`) atomically with the
+  enqueue via [`taquba::Queue::enqueue_with_kv`]. A later submission
+  with the same key but a different payload returns
+  `Error::InputMismatch` instead of silently dedup-hitting to a job
+  whose payload is something else. Submissions without an
+  `idempotency_key` continue to take the plain `enqueue_with` path.
+- `JobHandle::newly_submitted()`: returns `true` when the submission
+  that produced the handle freshly enqueued the job, `false` when it
+  dedup-hit a pending submission with a matching payload. Always
+  `true` for submissions without an `idempotency_key`. Useful for
+  logging or metrics that distinguish new-vs-attached submissions.
 
 ## [0.1.0] - 2026-05-15
 
