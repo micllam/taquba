@@ -152,6 +152,10 @@ struct ScheduleEntry {
     headers: HashMap<String, String>,
     priority: Option<u32>,
     max_attempts: Option<u32>,
+    /// The next firing we plan to enqueue. Initialized on cold
+    /// start in `step` (via `find_next_occurrence`), cleared on
+    /// fire, refreshed afterwards.
+    next_fire: Option<DateTime<Utc>>,
 }
 
 /// A single-process cron scheduler that enqueues jobs onto a [`Queue`] when
@@ -223,6 +227,7 @@ impl CronScheduler {
             headers: opts.headers,
             priority: opts.priority,
             max_attempts: opts.max_attempts,
+            next_fire: None,
         });
         Ok(self)
     }
@@ -231,45 +236,27 @@ impl CronScheduler {
     ///
     /// Sleeps until the soonest next firing across all entries, enqueues
     /// everything that's now due, then recomputes. No fixed-quantum polling.
-    pub async fn run<F>(self, shutdown: F) -> Result<()>
+    pub async fn run<F>(mut self, shutdown: F) -> Result<()>
     where
         F: std::future::Future<Output = ()>,
     {
-        let CronScheduler { queue, entries } = self;
         tokio::pin!(shutdown);
 
         // Nothing to fire: just wait for shutdown rather than spin a no-op
         // loop with a fallback sleep.
-        if entries.is_empty() {
+        if self.entries.is_empty() {
             shutdown.await;
             return Ok(());
         }
 
-        let mut last_fired: Vec<Option<DateTime<Utc>>> = vec![None; entries.len()];
-
         loop {
             let now = Utc::now();
-            // Compute the next firing per entry. `last_fired.max(now)` enforces
-            // the no-backfill rule: if we drifted behind real time, jump
-            // forward to "next firing after now" instead of replaying the
-            // missed window.
-            let next_per_entry: Vec<Option<DateTime<Utc>>> = entries
-                .iter()
-                .enumerate()
-                .map(|(i, e)| {
-                    let after = match last_fired[i] {
-                        Some(t) => t.max(now),
-                        None => now,
-                    };
-                    e.expression.find_next_occurrence(&after, false).ok()
-                })
-                .collect();
-
-            // All registered expressions are unsatisfiable (e.g. `0 0 30 2 *`)
-            // — cron expressions are static, so this state can't change. Wait
-            // for shutdown rather than spin a no-op loop.
-            let Some(soonest) = next_per_entry.iter().filter_map(|x| *x).min() else {
-                let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+            let Some(soonest) = self.step(now).await else {
+                // All registered expressions are unsatisfiable (e.g.
+                // `0 0 30 2 *`); cron expressions are static, so this
+                // state can't change. Wait for shutdown rather than spin
+                // a no-op loop.
+                let names: Vec<&str> = self.entries.iter().map(|e| e.name.as_str()).collect();
                 warn!(
                     schedules = ?names,
                     "all registered cron expressions are unsatisfiable; scheduler will not fire any jobs"
@@ -277,24 +264,32 @@ impl CronScheduler {
                 shutdown.await;
                 return Ok(());
             };
+
             let sleep_for = (soonest - Utc::now()).to_std().unwrap_or(Duration::ZERO);
 
             tokio::select! {
                 _ = sleep(sleep_for) => {}
                 _ = &mut shutdown => return Ok(()),
             }
+        }
+    }
 
-            for (i, entry) in entries.iter().enumerate() {
-                let Some(fire_at) = next_per_entry[i] else {
-                    continue;
-                };
-                // Re-read the wall-clock per entry: a slow enqueue earlier in
-                // the loop can push real time past a later entry's `fire_at`,
-                // and a stale `now` snapshot would cause that firing to be
-                // silently skipped.
-                if fire_at > Utc::now() {
-                    continue;
-                }
+    /// One scheduling tick: enqueue every entry whose next firing is at
+    /// or before `now`, then return the soonest *future* firing across
+    /// all entries (or `None` if every expression is unsatisfiable).
+    ///
+    /// On any enqueue error (transient or permanent) the failed firing
+    /// is dropped and the next future firing is scheduled, preserving
+    /// the no-backfill rule across both clean ticks and oversleep gaps.
+    async fn step(&mut self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let mut soonest: Option<DateTime<Utc>> = None;
+
+        for i in 0..self.entries.len() {
+            // Fire if the previously-scheduled firing has arrived.
+            if let Some(fire_at) = self.entries[i].next_fire
+                && fire_at <= now
+            {
+                let entry = &self.entries[i];
                 let fire_ms = fire_at.timestamp_millis() as u64;
                 let opts = EnqueueOptions {
                     dedup_key: Some(format!("cron:{}:{}", entry.name, fire_ms)),
@@ -303,21 +298,34 @@ impl CronScheduler {
                     max_attempts: entry.max_attempts,
                     ..Default::default()
                 };
-                match queue
+                match self
+                    .queue
                     .enqueue_with(&entry.target_queue, entry.payload.clone(), opts)
                     .await
                 {
-                    Ok(_) => {
-                        debug!(name = %entry.name, fire_ms, "enqueued cron job");
-                        last_fired[i] = Some(fire_at);
-                    }
-                    Err(e) => {
-                        // Leave `last_fired` untouched so the next loop retries.
-                        error!(name = %entry.name, error = %e, "failed to enqueue cron job");
-                    }
+                    Ok(_) => debug!(name = %entry.name, fire_ms, "enqueued cron job"),
+                    Err(e) => error!(name = %entry.name, error = %e, "failed to enqueue cron job"),
                 }
+                self.entries[i].next_fire = None;
+            }
+
+            // Cold start, or refresh after firing: pick the next future
+            // occurrence strictly after `now`. Any occurrences between
+            // the previous firing and `now` are skipped (no-backfill).
+            let entry = &mut self.entries[i];
+            if entry.next_fire.is_none() {
+                entry.next_fire = entry.expression.find_next_occurrence(&now, false).ok();
+            }
+
+            if let Some(p) = entry.next_fire {
+                soonest = match soonest {
+                    Some(s) => Some(s.min(p)),
+                    None => Some(p),
+                };
             }
         }
+
+        soonest
     }
 }
 
