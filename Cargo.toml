@@ -10,6 +10,7 @@ repository = "https://github.com/micllam/taquba"
 
 [workspace.dependencies]
 taquba = { path = "taquba", version = "0.5.0" }
+taquba-webhooks = { path = "taquba-webhooks", version = "0.1.0" }
 
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-util = "0.7"

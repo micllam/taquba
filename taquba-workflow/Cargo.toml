@@ -23,6 +23,7 @@ all-features = true
 
 [dependencies]
 taquba = { workspace = true }
+taquba-webhooks = { workspace = true, optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
@@ -35,8 +36,6 @@ sha2 = "0.10"
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 
 ulid = "1"
-
-taquba-webhooks = { path = "../taquba-webhooks", version = "0.1.0", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }
