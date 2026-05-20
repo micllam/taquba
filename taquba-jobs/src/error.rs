@@ -46,5 +46,56 @@ pub enum Error {
     ReservedHeader(String),
 }
 
+impl Error {
+    /// True if this error has no chance of succeeding on retry.
+    ///
+    /// Builder misconfiguration (`MissingQueue`, `MissingObjectStore`),
+    /// `(De)serialization` failures, `JobNotFound`, and
+    /// `ReservedHeader` are all permanent: the caller's input would
+    /// have to change for the operation to succeed. `Store(_)` is
+    /// conservatively treated as transient (object-store I/O can
+    /// blip). `Queue(_)` delegates to [`taquba::Error::is_permanent`].
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            Self::MissingQueue
+            | Self::MissingObjectStore
+            | Self::Encode(_)
+            | Self::Decode(_)
+            | Self::JobNotFound(_)
+            | Self::ReservedHeader(_) => true,
+            Self::Store(_) => false,
+            Self::Queue(e) => e.is_permanent(),
+        }
+    }
+}
+
 /// Convenience alias for `Result<T, Error>` used throughout the crate.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jobs_variants_are_permanent() {
+        assert!(Error::MissingQueue.is_permanent());
+        assert!(Error::MissingObjectStore.is_permanent());
+        assert!(Error::JobNotFound("job-1".into()).is_permanent());
+        assert!(Error::ReservedHeader("jobs.type".into()).is_permanent());
+    }
+
+    #[test]
+    fn store_is_transient() {
+        let store_err = taquba::object_store::Error::NotFound {
+            path: "x".into(),
+            source: "missing".into(),
+        };
+        assert!(!Error::Store(store_err).is_permanent());
+    }
+
+    #[test]
+    fn queue_classifies_per_inner_variant() {
+        assert!(Error::Queue(taquba::Error::JobNotFound("job-1".into())).is_permanent());
+        assert!(Error::Queue(taquba::Error::InvalidState).is_permanent());
+    }
+}

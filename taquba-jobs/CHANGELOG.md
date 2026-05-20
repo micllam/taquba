@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Error::is_permanent()`: classifies builder-misconfiguration variants
+  (`MissingQueue`, `MissingObjectStore`), `Encode`/`Decode`,
+  `JobNotFound`, and `ReservedHeader` as permanent; `Store(_)` as
+  transient. `Queue(_)` delegates to [`taquba::Error::is_permanent`].
+
 ## [0.1.0] - 2026-05-15
 
 Initial release. Durable, typed async function execution on top of `taquba`.
