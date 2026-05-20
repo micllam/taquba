@@ -62,7 +62,7 @@
 //!   `"cron:{name}:{fire_time_ms}"`, so retries or duplicate attempts at
 //!   the same firing instant cannot produce more than one job.
 //! - **No backfill.** If the scheduler is offline when a firing should have
-//!   happened, the missed firing is dropped — the next firing is the next
+//!   happened, the missed firing is dropped; the next firing is the next
 //!   *future* occurrence, not a replay of the missed ones.
 //! - **Single-instance schedules.** A given schedule (identified by `name`)
 //!   must be owned by at most one [`CronScheduler`] at a time.
