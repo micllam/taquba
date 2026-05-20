@@ -615,7 +615,7 @@ mod tests {
 
     use serde::{Deserialize, Serialize};
     use taquba::object_store::{ObjectStore, memory::InMemory};
-    use taquba::{JobStatus, OpenOptions, Queue, QueueConfig};
+    use taquba::{JobStatus, MockClock, OpenOptions, Queue, QueueConfig};
 
     use crate::handle::JoinError;
     use crate::job::{ErrorKind, payload_idempotency_key};
@@ -739,6 +739,29 @@ mod tests {
         }
     }
 
+    /// First claim sleeps past the lease so the reaper requeues it;
+    /// subsequent claims succeed. The shared counter records every
+    /// claim so the test can observe the requeue.
+    #[derive(Serialize, Deserialize)]
+    struct Reclaimable;
+
+    impl Job for Reclaimable {
+        const NAME: &'static str = "test.reclaimable";
+        type Output = u32;
+        type Error = TestError;
+
+        async fn run(&self, ctx: JobContext<'_>) -> std::result::Result<u32, TestError> {
+            ctx.state::<Arc<AtomicU32>>().fetch_add(1, Ordering::SeqCst);
+            let attempt = ctx.attempt();
+            if attempt == 1 {
+                // Wait long enough for the lease to expire under
+                // virtual time. Subsequent attempts return immediately.
+                tokio::time::sleep(Duration::from_secs(300)).await;
+            }
+            Ok(attempt)
+        }
+    }
+
     /// A job whose `idempotency_key` is fixed regardless of payload, so
     /// two submissions can share a key but disagree on input.
     #[derive(Debug, Serialize, Deserialize)]
@@ -772,6 +795,30 @@ mod tests {
     ) -> (Arc<Queue>, Arc<dyn ObjectStore>) {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let opts = OpenOptions {
+            default_queue_config: cfg,
+            ..OpenOptions::default()
+        };
+        let queue = Arc::new(
+            Queue::open_with_options(store.clone(), name, opts)
+                .await
+                .unwrap(),
+        );
+        (queue, store)
+    }
+
+    /// Open a queue whose internal `now_ms` reads from `clock`, with
+    /// tight scheduler / reaper intervals so background sweeps observe
+    /// clock advances promptly under `tokio::test(start_paused = true)`.
+    async fn open_queue_with_clock(
+        name: &str,
+        clock: MockClock,
+        cfg: QueueConfig,
+    ) -> (Arc<Queue>, Arc<dyn ObjectStore>) {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let opts = OpenOptions {
+            clock: Arc::new(clock),
+            scheduler_interval: Duration::from_millis(10),
+            reaper_interval: Duration::from_millis(10),
             default_queue_config: cfg,
             ..OpenOptions::default()
         };
@@ -1132,18 +1179,113 @@ mod tests {
 
         // Poll for all 3 children to complete (they're not awaited by the
         // parent, so they can lag its terminal state).
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while counter.load(Ordering::SeqCst) < 3 {
-            if std::time::Instant::now() > deadline {
-                panic!(
-                    "expected counter to reach 3, got {}",
-                    counter.load(Ordering::SeqCst)
-                );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while counter.load(Ordering::SeqCst) < 3 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "expected counter to reach 3, got {}",
+                counter.load(Ordering::SeqCst)
+            )
+        });
         assert_eq!(counter.load(Ordering::SeqCst), 3);
 
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scheduled_job_runs_when_clock_passes_run_at() {
+        let t0_ms = 1_700_000_000_000_u64;
+        let clock = MockClock::new(t0_ms);
+        let (queue, store) =
+            open_queue_with_clock("test-scheduled", clock.clone(), QueueConfig::default()).await;
+        let mut runner = JobRunner::builder()
+            .queue(queue)
+            .object_store(store)
+            .state("ok")
+            .build()
+            .unwrap();
+        runner.register::<Adder>();
+        let handle = runner.spawn(std::future::pending::<()>());
+
+        // Schedule the job 60s past the clock's current value.
+        let run_at = SystemTime::UNIX_EPOCH + Duration::from_millis(t0_ms + 60_000);
+        let job = runner
+            .submit_with(
+                Adder { a: 5, b: 7 },
+                SubmitOptions {
+                    run_at: Some(run_at),
+                    ..SubmitOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Initially scheduled: the scheduler hasn't promoted it yet
+        // because the clock is still at T0 < run_at.
+        assert_eq!(job.status().await.unwrap(), Some(JobStatus::Scheduled));
+
+        // Advance past run_at. The scheduler observes it on its next
+        // tick, promotes the job to Pending, and the worker claims +
+        // runs it.
+        clock.advance(Duration::from_secs(120));
+
+        let sum = job.await.unwrap();
+        assert_eq!(sum, 12);
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lease_expiry_triggers_reaper_requeue() {
+        let t0_ms = 1_700_000_000_000_u64;
+        let clock = MockClock::new(t0_ms);
+        let cfg = QueueConfig {
+            lease_duration: Duration::from_secs(10),
+            max_attempts: 5,
+            retry_backoff_base: Duration::ZERO,
+            ..QueueConfig::default()
+        };
+        let (queue, store) = open_queue_with_clock("test-lease", clock.clone(), cfg).await;
+        let attempts = Arc::new(AtomicU32::new(0));
+        let mut runner = JobRunner::builder()
+            .queue(queue)
+            .object_store(store)
+            .state(attempts.clone())
+            .build()
+            .unwrap();
+        runner.register::<Reclaimable>();
+        let handle = runner.spawn(std::future::pending::<()>());
+
+        let job = runner.submit(Reclaimable).await.unwrap();
+
+        // Let the first claim land (worker increments `attempts` and
+        // enters its long sleep). The 200ms sleep just has to exceed
+        // the worker's `poll_interval` so the worker's
+        // `wait_for_jobs` returns.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        // Advance past the lease (10s). On its next tick the reaper
+        // observes the expired claim and requeues the job; the worker
+        // reclaims it in a fresh handler invocation (the first is
+        // still in its 300s virtual sleep).
+        clock.advance(Duration::from_secs(30));
+
+        // The second attempt returns immediately with its attempt
+        // number, which is taquba's `attempts` after re-claim.
+        let attempt = job.await.unwrap();
+        assert_eq!(attempt, 2);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        // Don't shutdown: the first handler is still in its 300s
+        // virtual sleep, and a graceful shutdown would drain the
+        // JoinSet (waiting for that task to drop). Tokio's test
+        // runtime will abort the spawned worker when the test
+        // function returns.
+        drop(handle);
     }
 }
