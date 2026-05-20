@@ -427,4 +427,34 @@ mod tests {
         s.run(async {}).await.unwrap();
         assert!(start.elapsed() < Duration::from_secs(1));
     }
+
+    #[tokio::test]
+    async fn step_fires_one_missed_firing_after_clock_jump() {
+        let q = test_queue().await;
+        let mut s = CronScheduler::new(q.clone());
+        s.schedule("minutely", "* * * * *", "out", b"x".to_vec())
+            .unwrap();
+
+        // T0 is a whole number of minutes past epoch, so it lands
+        // on a `* * * * *` occurrence.
+        let t0 = DateTime::from_timestamp_millis(10 * 60_000).unwrap();
+
+        // Phase 1: at T0 (cold start), next firing is T0+1m;
+        // nothing enqueued yet.
+        let soonest0 = s.step(t0).await.expect("satisfiable");
+        assert_eq!(soonest0, t0 + Duration::from_secs(60));
+        assert_eq!(q.stats("out").await.unwrap().pending, 0);
+
+        // Phase 2: at T0+5m30s, the recorded T0+1m firing
+        // enqueues; the missed T0+2m/3m/4m/5m firings are dropped
+        // (no-backfill); the next firing advances to T0+6m.
+        let now1 = t0 + Duration::from_secs(5 * 60 + 30);
+        let soonest1 = s.step(now1).await.expect("satisfiable");
+        assert_eq!(
+            soonest1,
+            t0 + Duration::from_secs(6 * 60),
+            "next firing must skip past missed occurrences"
+        );
+        assert_eq!(q.stats("out").await.unwrap().pending, 1);
+    }
 }
