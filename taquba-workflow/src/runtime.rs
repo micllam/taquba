@@ -335,6 +335,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             priority: spec.priority,
             max_attempts: spec.max_attempts_per_step,
             dedup_key: Some(format!("{DEDUP_PREFIX}{run_id}:0")),
+            ..EnqueueOptions::default()
         };
 
         let record_bytes = rmp_serde::to_vec_named(&DurableRunRecord {
@@ -540,6 +541,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             priority: opts.priority,
             max_attempts: opts.max_attempts,
             dedup_key: Some(format!("{DEDUP_PREFIX}{run_id}:{step_number}")),
+            ..EnqueueOptions::default()
         };
         Ok(self
             .queue

@@ -112,6 +112,41 @@ fn user_scoped_key(key: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Maximum byte length of a caller-supplied
+/// [`EnqueueOptions::id_override`]. Enforces a sane cap on key sizes
+/// independently of the underlying object store's path limits.
+const MAX_ID_OVERRIDE_LEN: usize = 128;
+
+/// Validate a caller-supplied job id. Caller-supplied ids must be
+/// 1-[`MAX_ID_OVERRIDE_LEN`] bytes of `[A-Za-z0-9_-]`. `:` is reserved
+/// as the key delimiter in `pending:`/`scheduled:`/`claimed:` keys, and
+/// other non-alphanumeric bytes are rejected up front to keep ids safe
+/// for object-store paths and log lines downstream.
+fn validate_id_override(id: &str) -> Result<()> {
+    if id.is_empty() {
+        return Err(Error::InvalidId {
+            id: id.to_string(),
+            reason: "id must not be empty",
+        });
+    }
+    if id.len() > MAX_ID_OVERRIDE_LEN {
+        return Err(Error::InvalidId {
+            id: id.to_string(),
+            reason: "id exceeds maximum length of 128 bytes",
+        });
+    }
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(Error::InvalidId {
+            id: id.to_string(),
+            reason: "id must contain only `[A-Za-z0-9_-]`",
+        });
+    }
+    Ok(())
+}
+
 /// Outcome of [`Queue::enqueue_with_kv`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnqueueResult {
@@ -275,6 +310,28 @@ pub struct EnqueueOptions {
     /// delivery metadata (URL, HTTP headers, signing key id) or cron-style
     /// metadata (schedule name, nominal fire time). Defaults to empty.
     pub headers: HashMap<String, String>,
+    /// Override the job id that the queue would otherwise generate.
+    ///
+    /// When `None` (the default), the queue assigns a monotonic ULID.
+    /// When `Some`, the supplied id is used as the job's id.
+    ///
+    /// Useful when callers need the id to be known *before* the enqueue
+    /// returns.
+    ///
+    /// Uniqueness is the caller's responsibility: a duplicate id silently
+    /// overwrites the prior job's record. ULID generation guarantees
+    /// uniqueness for the `None` path; caller-supplied ids must be
+    /// globally unique within the queue's lifetime.
+    ///
+    /// Constraints (enforced; violations return [`Error::InvalidId`]):
+    ///
+    /// - 1-128 bytes long.
+    /// - Characters limited to `[A-Za-z0-9_-]`.
+    ///
+    /// Prefer ULID-shaped ids when FIFO-within-priority claim ordering
+    /// matters: `pending` and `scheduled` keys end with the id, so claim
+    /// order follows id sort.
+    pub id_override: Option<String>,
 }
 
 /// A durable task queue backed by object storage.
@@ -532,7 +589,13 @@ impl Queue {
             (ms > self.now_ms()).then_some(ms)
         });
 
-        let id = Ulid::new().to_string();
+        let id = match opts.id_override {
+            Some(supplied) => {
+                validate_id_override(&supplied)?;
+                supplied
+            }
+            None => Ulid::new().to_string(),
+        };
         let (status, key) = match run_at {
             Some(ms) => (JobStatus::Scheduled, scheduled_key(queue, ms, &id)),
             None => (JobStatus::Pending, pending_key(queue, priority, &id)),
@@ -657,7 +720,13 @@ impl Queue {
             (ms > self.now_ms()).then_some(ms)
         });
 
-        let id = Ulid::new().to_string();
+        let id = match opts.id_override {
+            Some(supplied) => {
+                validate_id_override(&supplied)?;
+                supplied
+            }
+            None => Ulid::new().to_string(),
+        };
         let (status, key) = match run_at {
             Some(ms) => (JobStatus::Scheduled, scheduled_key(queue, ms, &id)),
             None => (JobStatus::Pending, pending_key(queue, priority, &id)),
@@ -1597,6 +1666,124 @@ mod tests {
         assert_eq!(job.attempts, 1);
         assert!(job.claimed_at.is_some());
         assert!(job.lease_expires_at.is_some());
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_with_id_override_uses_supplied_id() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+
+        let returned = q
+            .enqueue_with(
+                "email",
+                b"hello".to_vec(),
+                EnqueueOptions {
+                    id_override: Some("user-42-welcome".to_string()),
+                    ..EnqueueOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(returned, "user-42-welcome");
+
+        let job = q
+            .claim("email", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.id, "user-42-welcome");
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_with_kv_id_override_uses_supplied_id() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+
+        let kv = HashMap::from([(b"meta/key".to_vec(), b"value".to_vec())]);
+        let outcome = q
+            .enqueue_with_kv(
+                "email",
+                b"hello".to_vec(),
+                EnqueueOptions {
+                    id_override: Some("custom-id-01HXYZ".to_string()),
+                    ..EnqueueOptions::default()
+                },
+                kv,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, EnqueueResult::New("custom-id-01HXYZ".to_string()));
+
+        let job = q.get_job("custom-id-01HXYZ").await.unwrap().unwrap();
+        assert_eq!(job.id, "custom-id-01HXYZ");
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_with_invalid_id_override_rejected() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+
+        let bad_ids: &[(&str, &str)] = &[
+            ("", "empty"),
+            ("has:colon", "delimiter"),
+            ("has space", "space"),
+            ("has/slash", "slash"),
+        ];
+        for (bad, label) in bad_ids {
+            let err = q
+                .enqueue_with(
+                    "email",
+                    b"x".to_vec(),
+                    EnqueueOptions {
+                        id_override: Some((*bad).to_string()),
+                        ..EnqueueOptions::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidId { .. }),
+                "expected InvalidId for {label} (id={bad:?}), got {err:?}"
+            );
+        }
+
+        let too_long = "a".repeat(MAX_ID_OVERRIDE_LEN + 1);
+        let err = q
+            .enqueue_with(
+                "email",
+                b"x".to_vec(),
+                EnqueueOptions {
+                    id_override: Some(too_long),
+                    ..EnqueueOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidId { .. }));
+
+        // No job should have been written for any of the rejected ids.
+        assert!(
+            q.claim("email", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_without_id_override_generates_ulid() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+
+        let id = q
+            .enqueue_with("email", b"hello".to_vec(), EnqueueOptions::default())
+            .await
+            .unwrap();
+        Ulid::from_string(&id).expect("default enqueue should produce a parseable ULID");
 
         q.close().await.unwrap();
     }

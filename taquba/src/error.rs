@@ -42,6 +42,18 @@ pub enum Error {
         /// The configured maximum.
         max: usize,
     },
+
+    /// A caller-supplied [`crate::EnqueueOptions::id_override`] failed
+    /// validation. Caller-supplied ids must be 1-128 bytes of
+    /// `[A-Za-z0-9_-]`; ids that violate either bound are rejected at the
+    /// API boundary before any state is written.
+    #[error("invalid job id `{id}`: {reason}")]
+    InvalidId {
+        /// The id that was rejected.
+        id: String,
+        /// Why it was rejected.
+        reason: &'static str,
+    },
 }
 
 impl Error {
@@ -57,7 +69,8 @@ impl Error {
             | Self::Deserialization(_)
             | Self::JobNotFound(_)
             | Self::InvalidState
-            | Self::KvValueTooLarge { .. } => true,
+            | Self::KvValueTooLarge { .. }
+            | Self::InvalidId { .. } => true,
             Self::Storage(_) => false,
         }
     }
@@ -75,5 +88,12 @@ mod tests {
         assert!(Error::JobNotFound("job-1".into()).is_permanent());
         assert!(Error::InvalidState.is_permanent());
         assert!(Error::KvValueTooLarge { size: 10, max: 5 }.is_permanent());
+        assert!(
+            Error::InvalidId {
+                id: "bad:id".into(),
+                reason: "invalid char",
+            }
+            .is_permanent()
+        );
     }
 }

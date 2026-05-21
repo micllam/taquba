@@ -103,6 +103,7 @@ impl Submitter {
             run_at: opts.run_at,
             dedup_key: dedup_key.clone(),
             headers,
+            ..EnqueueOptions::default()
         };
 
         let (id, newly_submitted) = match dedup_key {

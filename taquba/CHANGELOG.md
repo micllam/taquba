@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `EnqueueOptions::id_override` lets callers supply the job id instead
+  of receiving a generated ULID. Useful when the id must be known before
+  the enqueue returns. Ids are validated at the API boundary (1-128 bytes
+  of `[A-Za-z0-9_-]`) and bad inputs return the new
+  `Error::InvalidId { id, reason }` variant. Callers should prefer
+  ULID-shaped ids when FIFO-within-priority claim order matters:
+  `pending`/`scheduled` keys end with the id, so claim order follows
+  id sort.
+
 ## [0.6.0] - 2026-05-20
 
 ### Added
