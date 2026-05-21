@@ -628,7 +628,7 @@ impl Queue {
     }
 
     /// Persist and announce a brand-new job. Used by the non-dedup path of
-    /// [`Self::enqueue_with`].
+    /// [`Self::enqueue_with`]. Retries on transaction conflict.
     async fn write_new(&self, job: JobRecord, key: String) -> Result<String> {
         let value = rmp_serde::to_vec_named(&job)?;
         let JobRecord {
@@ -640,20 +640,27 @@ impl Queue {
             ..
         } = job;
 
-        let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-        txn.put(key.as_bytes(), &value)?;
-        txn.put(job_index_key(&id).as_bytes(), key.as_bytes())?;
-        update_stats(&txn, &queue, &[(status, 1)])?;
-        txn.commit().await?;
+        loop {
+            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+            txn.put(key.as_bytes(), &value)?;
+            txn.put(job_index_key(&id).as_bytes(), key.as_bytes())?;
+            update_stats(&txn, &queue, &[(status, 1)])?;
 
-        // Workers can claim a Pending job immediately; a Scheduled job becomes
-        // claimable later via the scheduler loop, which fires its own notify.
-        if matches!(status, JobStatus::Pending) {
-            self.job_available.notify_waiters();
+            match txn.commit().await {
+                Ok(_) => {
+                    // Workers can claim a Pending job immediately; a Scheduled
+                    // job becomes claimable later via the scheduler loop,
+                    // which fires its own notify.
+                    if matches!(status, JobStatus::Pending) {
+                        self.job_available.notify_waiters();
+                    }
+                    debug!(queue = %queue, job_id = %id, priority, ?run_at, "job enqueued");
+                    return Ok(id);
+                }
+                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
+                Err(e) => return Err(e.into()),
+            }
         }
-
-        debug!(queue = %queue, job_id = %id, priority, ?run_at, "job enqueued");
-        Ok(id)
     }
 
     /// Enqueue a job AND apply a set of writes to the user KV namespace

@@ -18,6 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pending`/`scheduled` keys end with the id, so claim order follows
   id sort.
 
+### Fixed
+
+- `enqueue_with`'s non-dedup path (`write_new`) now retries on
+  transaction conflict, matching the dedup path (`write_unique`),
+  `enqueue_with_kv`, `ack`, `dead_letter`, and every other write path
+  in the crate. Previously a conflict during a non-dedup enqueue would
+  surface as `Error::Storage` to the caller; under normal contention
+  this would have manifested as spurious enqueue failures that a retry
+  could resolve.
+
 ## [0.6.0] - 2026-05-20
 
 ### Added
