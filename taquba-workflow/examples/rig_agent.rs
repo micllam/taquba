@@ -15,8 +15,7 @@
 //! payload is used only for between-step state (the research findings as
 //! UTF-8 bytes after step 0).
 //!
-//! Pinned to `rig-core = "0.36"`. Picks the LLM provider from the
-//! environment:
+//! Picks the LLM provider from the environment:
 //!
 //! - `LLM_PROVIDER=anthropic` (default if `ANTHROPIC_API_KEY` is set):
 //!   uses `claude-haiku-4-5`.
@@ -34,10 +33,10 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use rig::client::{CompletionClient, ProviderClient};
-use rig::completion::{Prompt, ToolDefinition};
-use rig::providers::{anthropic, openai};
-use rig::tool::Tool;
+use rig_core::client::{CompletionClient, ProviderClient};
+use rig_core::completion::{Prompt, ToolDefinition};
+use rig_core::providers::{anthropic, openai};
+use rig_core::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use taquba::Queue;

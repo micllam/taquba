@@ -40,8 +40,7 @@ ulid = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
-# Used only by the `rig_agent` example. Pinned because rig-core is pre-1.0
-# and moves quickly; written against 0.36.
-rig-core = "0.36"
+# Used only by the `rig_agent` example.
+rig-core = "0.37"
 anyhow = "1"
 serde_json = "1"
