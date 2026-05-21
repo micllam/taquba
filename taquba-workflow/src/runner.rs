@@ -56,11 +56,24 @@ pub struct Step {
     /// subsequent step of the run (including any retry of this one)
     /// observes `is_cancelled() == true` immediately.
     pub cancel_token: CancellationToken,
-    /// Per-step durable key-value store, scoped to
+    /// Per-step durable key-value store, scoped to this step's
     /// `(run_id, step_number)`. Use to memoize expensive within-step
     /// side effects (LLM calls, paid APIs) so an at-least-once retry
     /// of this step doesn't re-pay for work the prior attempt already
-    /// did. See [`Memo`] for the API and the keying conventions.
+    /// did:
+    ///
+    /// ```ignore
+    /// let response = match step.memo.get("llm").await? {
+    ///     Some(cached) => deserialize(&cached),
+    ///     None => {
+    ///         let fresh = llm.complete(&prompt).await?;
+    ///         step.memo.put("llm", &serialize(&fresh)).await?;
+    ///         fresh
+    ///     }
+    /// };
+    /// ```
+    ///
+    /// See [`Memo`] for the full API.
     pub memo: Memo,
 }
 

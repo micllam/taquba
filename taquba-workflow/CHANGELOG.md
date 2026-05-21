@@ -10,18 +10,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `Memo`: per-step durable key-value store for memoizing within-step
-  side effects, backed by object storage. Entries are keyed by
-  `(run_id, step_number, user_key)` and user keys are SHA-256-hashed
-  before becoming object-store path segments.
-- `Step::memo`: every step now receives a `Memo` scoped to the
-  workflow's configured object store and prefix. Runners use it to
-  cache results of expensive within-step side effects (LLM calls, paid
-  APIs) so at-least-once retries don't re-pay for work the prior
-  attempt already did.
+  side effects, backed by object storage. Bound to a specific
+  `(run_id, step_number)`; `get(key)` / `put(key, value)` take only
+  the user key. Strictly per-step; the durable channel between steps
+  is `StepOutcome::Continue`'s payload, not memo.
+- `MemoStore`: the backing store `Memo` views are derived from
+  (`Arc<dyn ObjectStore>` + path prefix). Used internally by the
+  runtime builder; users construct one directly mainly in tests.
+- `Step::memo`: every step receives a `Memo` scoped to its own
+  `(run_id, step_number)`. Runners use it to cache results of
+  expensive within-step side effects (LLM calls, paid APIs) so
+  at-least-once retries don't re-pay for work the prior attempt
+  already did.
 - `WorkflowRuntimeBuilder::memo_prefix`: configures the object-store
   prefix `Step::memo` entries live under. Defaults to `"workflow-memo"`;
   set a distinct prefix when multiple runtimes share one store.
-- `Error::Store(taquba::object_store::Error)`: surfaced from `Memo`
+- `Error::Store(taquba::object_store::Error)`: surfaced from memo
   read/write failures. Classified as transient by `is_permanent`.
 
 ### Changed

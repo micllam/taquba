@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 
 use crate::error::{Error, Result};
-use crate::memo::Memo;
+use crate::memo::MemoStore;
 use crate::runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner};
 use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
 
@@ -200,7 +200,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
 
     /// Finalize the builder.
     pub fn build(self) -> WorkflowRuntime<R, H> {
-        let memo = Memo::new(self.object_store, self.memo_prefix);
+        let memo_store = MemoStore::new(self.object_store, self.memo_prefix);
         let inner = RuntimeInner {
             queue: self.queue,
             queue_name: self.queue_name,
@@ -209,7 +209,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
             max_concurrent_steps: self.max_concurrent_steps,
             poll_interval: self.poll_interval,
             registry: Mutex::new(HashMap::new()),
-            memo,
+            memo_store,
         };
         WorkflowRuntime {
             inner: Arc::new(inner),
@@ -238,7 +238,7 @@ struct RuntimeInner<R, H> {
     max_concurrent_steps: usize,
     poll_interval: Duration,
     registry: Mutex<HashMap<String, RegistryEntry>>,
-    memo: Memo,
+    memo_store: MemoStore,
 }
 
 /// Per-active-run state retained by the runtime. Combines the publicly
@@ -692,7 +692,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             job_id: job.id.clone(),
             attempts: job.attempts,
             cancel_token,
-            memo: self.memo.clone(),
+            memo: self.memo_store.new_memo(&run_id, step_number),
         };
 
         // Preserve the run's per-step priority and max_attempts across the
@@ -2126,55 +2126,57 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn step_memo_is_accessible_across_steps_of_a_run() {
-        struct MemoRunner;
-        impl StepRunner for MemoRunner {
+    async fn step_memo_survives_across_attempts_of_the_same_step() {
+        // First attempt writes the memo entry and returns a transient
+        // error so the runtime retries the step. The second attempt
+        // reads the same key back and succeeds. This exercises the
+        // central use case: at-least-once retries of one step should
+        // short-circuit work the prior attempt already did.
+        struct MemoRetryRunner;
+        impl StepRunner for MemoRetryRunner {
             async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                match step.step_number {
-                    0 => {
-                        step.memo
-                            .put(&step.run_id, 0, "k", b"cached-value")
-                            .await
-                            .map_err(|e| StepError::transient(e.to_string()))?;
-                        Ok(StepOutcome::Continue {
-                            payload: b"go".to_vec(),
-                        })
-                    }
-                    1 => {
-                        let got = step
-                            .memo
-                            .get(&step.run_id, 0, "k")
-                            .await
-                            .map_err(|e| StepError::transient(e.to_string()))?;
-                        assert_eq!(got, Some(b"cached-value".to_vec()));
-                        Ok(StepOutcome::Succeed {
-                            result: got.unwrap_or_default(),
-                        })
-                    }
-                    _ => unreachable!(),
+                if step.attempts == 1 {
+                    step.memo
+                        .put("cached", b"first-attempt-value")
+                        .await
+                        .map_err(|e| StepError::transient(e.to_string()))?;
+                    return Err(StepError::transient("force a retry"));
                 }
+                let got = step
+                    .memo
+                    .get("cached")
+                    .await
+                    .map_err(|e| StepError::transient(e.to_string()))?;
+                assert_eq!(got, Some(b"first-attempt-value".to_vec()));
+                Ok(StepOutcome::Succeed {
+                    result: got.unwrap_or_default(),
+                })
             }
         }
 
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = fresh_queue_fast_retry().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime =
-            WorkflowRuntime::builder(queue, store, MemoRunner, ChannelHook { tx }).build();
+            WorkflowRuntime::builder(queue, store, MemoRetryRunner, ChannelHook { tx }).build();
         let shutdown = spawn_runtime(runtime.clone());
 
         runtime
             .submit(RunSpec {
                 input: b"start".to_vec(),
+                max_attempts_per_step: Some(3),
                 ..Default::default()
             })
             .await
             .unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let outcome = tokio::time::timeout(Duration::from_secs(3), rx.recv())
             .await
-            .unwrap()
-            .unwrap();
+            .expect("hook fired in time")
+            .expect("hook channel open");
         assert_eq!(outcome.status, TerminalStatus::Succeeded);
-        assert_eq!(outcome.result.as_deref(), Some(b"cached-value".as_slice()));
+        assert_eq!(
+            outcome.result.as_deref(),
+            Some(b"first-attempt-value".as_slice())
+        );
 
         let _ = shutdown.send(());
     }
