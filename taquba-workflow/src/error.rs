@@ -35,6 +35,10 @@ pub enum Error {
     /// Underlying error from a Taquba queue operation.
     #[error(transparent)]
     Queue(#[from] taquba::Error),
+
+    /// Reading or writing a blob in object storage failed.
+    #[error("object store error: {0}")]
+    Store(#[from] taquba::object_store::Error),
 }
 
 impl Error {
@@ -50,6 +54,7 @@ impl Error {
             | Self::ReservedHeaderInSubmit(_)
             | Self::InputMismatch(_) => true,
             Self::Queue(e) => e.is_permanent(),
+            Self::Store(_) => false,
         }
     }
 }
@@ -80,5 +85,14 @@ mod tests {
         assert!(Error::Queue(taquba::Error::JobNotFound("job-1".into())).is_permanent());
         assert!(Error::Queue(taquba::Error::InvalidState).is_permanent());
         assert!(Error::Queue(taquba::Error::KvValueTooLarge { size: 10, max: 5 }).is_permanent());
+    }
+
+    #[test]
+    fn store_is_transient() {
+        let store_err = taquba::object_store::Error::NotFound {
+            path: "x".into(),
+            source: "missing".into(),
+        };
+        assert!(!Error::Store(store_err).is_permanent());
     }
 }

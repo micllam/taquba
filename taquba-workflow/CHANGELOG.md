@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Memo`: per-step durable key-value store for memoizing within-step
+  side effects, backed by object storage. Entries are keyed by
+  `(run_id, step_number, user_key)` and user keys are SHA-256-hashed
+  before becoming object-store path segments. Constructor takes an
+  `Arc<dyn ObjectStore>` and a path prefix. Not part of `Step` yet;
+  callers build their own `Memo` instance and pass it through.
+- `Error::Store(taquba::object_store::Error)`: surfaced from `Memo`
+  read/write failures. Classified as transient by `is_permanent`.
+
 ## [0.4.0] - 2026-05-20
 
 ### Added
