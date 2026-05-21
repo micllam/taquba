@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Idempotent submissions now short-circuit to a prior submission's
+  persisted outcome. Previously, `Job::idempotency_key` only deduped
+  against jobs that were still pending or scheduled: a re-submission
+  after the original acked would create a new job (re-paying for the
+  work). The dedup record now carries the assigned `job_id` (written
+  atomically with the enqueue via the new
+  `EnqueueOptions::id_override`) so a re-submission with a matching
+  payload returns a handle pointing at the cached result blob (with
+  `newly_submitted = false`).
+- **Breaking (on-disk):** `JobSubmissionRecord` (the durable per-idem-key
+  dedup record) gained a `job_id` field. Records written by earlier
+  versions of `taquba-jobs` will fail to deserialize and need to be
+  cleared; the simplest path is to delete the queue's user KV prefix
+  (`usr:jobs/dedup/...`) when upgrading.
+
 ## [0.2.0] - 2026-05-20
 
 ### Added

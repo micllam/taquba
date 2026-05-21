@@ -42,12 +42,20 @@ fn dedup_kv_key(idempotency_key: &str) -> Vec<u8> {
 }
 
 /// Persisted alongside a submission via [`Queue::enqueue_with_kv`] so a
-/// later submission with the same `idempotency_key` can detect that
-/// the payload has changed. `input_hash` is the SHA-256 of the
-/// serialized payload.
+/// later submission with the same `idempotency_key` can both detect a
+/// payload change *and* short-circuit to a cached result once the
+/// original job has completed.
+///
+/// - `input_hash`: SHA-256 of the serialized payload. Lets a
+///   re-submission catch the "same key, different payload" case (see
+///   [`Error::InputMismatch`]).
+/// - `job_id`: the id assigned to the submitted job. Lets a
+///   re-submission look up the result blob even after the queue's
+///   dedup window has closed (i.e. after the job acked).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JobSubmissionRecord {
     input_hash: [u8; 32],
+    job_id: String,
 }
 
 fn hash_payload(payload: &[u8]) -> [u8; 32] {
@@ -132,13 +140,15 @@ impl Submitter {
     /// Submit a job whose `idempotency_key` is known. Detects mismatched
     /// re-submissions (same key, different payload) via a SHA-256 hash
     /// of the payload persisted in the user KV namespace atomically
-    /// with the enqueue.
+    /// with the enqueue, and short-circuits to a cached result when a
+    /// prior submission with the same key has already completed.
     ///
     /// Returns `(job_id, newly_submitted)`: `newly_submitted` is `true`
-    /// when this call enqueued a new job, and `false` when it
-    /// dedup-hit against a pending submission with a matching payload.
-    /// On a duplicate with a different payload (in-process or
-    /// across restart) returns [`Error::InputMismatch`].
+    /// when this call enqueued a new job, and `false` when it either
+    /// dedup-hit against a pending submission or short-circuited to a
+    /// prior completed submission's persisted outcome. On a duplicate
+    /// with a different payload (in-process or across restart) returns
+    /// [`Error::InputMismatch`].
     async fn submit_idempotent(
         &self,
         idem_key: String,
@@ -148,18 +158,42 @@ impl Submitter {
         let kv_key = dedup_kv_key(&idem_key);
         let input_hash = hash_payload(&payload);
 
-        // Pre-check: if a record already exists, verify the hash matches
-        // before issuing the enqueue. Fast-fails the mismatch case
-        // without a needless enqueue round-trip.
+        // Pre-check the submission record. Three outcomes:
+        //   1. Hash mismatch -> InputMismatch, fast-fail.
+        //   2. Hash match + record has job_id + result blob exists ->
+        //      short-circuit to the cached outcome. Avoids creating
+        //      a new job after the queue's dedup window has closed.
+        //   3. Hash match but no cached result -> fall through to the
+        //      normal enqueue path (dedups against any pending job).
         if let Some(bytes) = self.queue.kv_get(&kv_key).await? {
             let existing: JobSubmissionRecord = rmp_serde::from_slice(&bytes)?;
             if existing.input_hash != input_hash {
                 return Err(Error::InputMismatch(idem_key));
             }
+            if self.results.get(&existing.job_id).await?.is_some() {
+                tracing::debug!(
+                    idem_key = %idem_key,
+                    job_id = %existing.job_id,
+                    "idempotent submit short-circuited to cached result",
+                );
+                return Ok((existing.job_id, false));
+            }
         }
 
-        let record_bytes = rmp_serde::to_vec_named(&JobSubmissionRecord { input_hash })?;
+        // Pre-allocate the id so the submission record can carry it
+        // atomically with the enqueue. After the job acks (releasing
+        // the queue dedup key), the recorded id remains the pointer
+        // back to the result blob.
+        let id = ulid::Ulid::new().to_string();
+        let record_bytes = rmp_serde::to_vec_named(&JobSubmissionRecord {
+            input_hash,
+            job_id: id.clone(),
+        })?;
         let kv_writes = HashMap::from([(kv_key.clone(), record_bytes)]);
+        let enqueue_opts = EnqueueOptions {
+            id_override: Some(id.clone()),
+            ..enqueue_opts
+        };
 
         let result = self
             .queue
@@ -167,20 +201,23 @@ impl Submitter {
             .await?;
 
         match result {
-            EnqueueResult::New(id) => Ok((id, true)),
-            EnqueueResult::AlreadyEnqueued(id) => {
+            EnqueueResult::New(returned) => {
+                debug_assert_eq!(returned, id);
+                Ok((returned, true))
+            }
+            EnqueueResult::AlreadyEnqueued(other_id) => {
                 // A concurrent submit beat us between our pre-check and
-                // the enqueue transaction. Re-read the KV record (now
-                // populated by the winner) and verify its hash matches
-                // ours; if not, the winner's payload differs from ours
-                // and the apparent dedup-hit is actually a mismatch.
+                // the enqueue transaction. Our kv_writes were not
+                // applied; re-read the KV record (the winner's) and
+                // verify its hash matches ours; if not, the apparent
+                // dedup-hit is actually a mismatch.
                 if let Some(bytes) = self.queue.kv_get(&kv_key).await? {
                     let existing: JobSubmissionRecord = rmp_serde::from_slice(&bytes)?;
                     if existing.input_hash != input_hash {
                         return Err(Error::InputMismatch(idem_key));
                     }
                 }
-                Ok((id, false))
+                Ok((other_id, false))
             }
         }
     }
@@ -763,6 +800,31 @@ mod tests {
         }
     }
 
+    /// Like [`Keyed`] but always fails permanently. Used to test that a
+    /// cached *failure* outcome is also short-circuited on re-submission.
+    #[derive(Serialize, Deserialize)]
+    struct KeyedFailure {
+        n: i64,
+    }
+
+    impl Job for KeyedFailure {
+        const NAME: &'static str = "test.keyed-failure";
+        type Output = ();
+        type Error = TestError;
+
+        async fn run(&self, _ctx: JobContext<'_>) -> std::result::Result<(), TestError> {
+            Err(TestError(format!("permanent failure for n={}", self.n)))
+        }
+
+        fn idempotency_key(&self) -> Option<String> {
+            Some(format!("keyed-failure:{}", self.n))
+        }
+
+        fn classify(&self, _error: &TestError) -> ErrorKind {
+            ErrorKind::Permanent
+        }
+    }
+
     /// A job whose `idempotency_key` is fixed regardless of payload, so
     /// two submissions can share a key but disagree on input.
     #[derive(Debug, Serialize, Deserialize)]
@@ -995,6 +1057,121 @@ mod tests {
             Err(other) => panic!("expected InputMismatch across restart, got Err({other:?})"),
             Ok(_) => panic!("expected InputMismatch across restart, got Ok(_)"),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idempotency_key_short_circuits_to_cached_success_after_completion() {
+        let (queue, store) = open_queue("test-cached-success").await;
+        let mut runner = JobRunner::builder()
+            .queue(queue)
+            .object_store(store)
+            .build()
+            .unwrap();
+        runner.register::<Keyed>();
+        let handle = runner.spawn(std::future::pending::<()>());
+
+        // First submission runs to completion and writes a result blob.
+        // Awaiting the job under default retention also acks it, releasing
+        // the queue dedup key.
+        let first = runner.submit(Keyed { n: 42 }).await.unwrap();
+        assert!(first.newly_submitted());
+        let first_id = first.id().to_string();
+        let first_value = first.await.unwrap();
+        assert_eq!(first_value, 42);
+
+        // Second submission with the same payload short-circuits: no new
+        // job is created, the returned handle points at the original id,
+        // and awaiting it yields the cached outcome.
+        let second = runner.submit(Keyed { n: 42 }).await.unwrap();
+        assert!(!second.newly_submitted());
+        assert_eq!(second.id(), first_id);
+        assert_eq!(second.await.unwrap(), 42);
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idempotency_key_short_circuits_to_cached_failure_after_completion() {
+        // `max_attempts = 1` keeps the test deterministic: the Permanent
+        // failure writes its outcome blob on the first (and only) attempt.
+        let (queue, store) = open_queue_with_config(
+            "test-cached-failure",
+            QueueConfig {
+                max_attempts: 1,
+                ..QueueConfig::default()
+            },
+        )
+        .await;
+        let mut runner = JobRunner::builder()
+            .queue(queue)
+            .object_store(store)
+            .build()
+            .unwrap();
+        runner.register::<KeyedFailure>();
+        let handle = runner.spawn(std::future::pending::<()>());
+
+        let first = runner.submit(KeyedFailure { n: 7 }).await.unwrap();
+        assert!(first.newly_submitted());
+        let first_id = first.id().to_string();
+        match first.await {
+            Err(JoinError::Job(job_err)) => assert_eq!(job_err.kind, ErrorKind::Permanent),
+            other => panic!("expected Permanent JobError, got {other:?}"),
+        }
+
+        let second = runner.submit(KeyedFailure { n: 7 }).await.unwrap();
+        assert!(!second.newly_submitted());
+        assert_eq!(second.id(), first_id);
+        match second.await {
+            Err(JoinError::Job(job_err)) => assert_eq!(job_err.kind, ErrorKind::Permanent),
+            other => panic!("expected cached Permanent JobError, got {other:?}"),
+        }
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idempotency_key_short_circuits_after_restart() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let queue_name = "test-cached-restart";
+
+        // Round 1: run a keyed job to completion against this store.
+        let first_id = {
+            let queue = Arc::new(Queue::open(store.clone(), queue_name).await.unwrap());
+            let mut runner = JobRunner::builder()
+                .queue(queue.clone())
+                .object_store(store.clone())
+                .build()
+                .unwrap();
+            runner.register::<Keyed>();
+            let handle = runner.spawn(std::future::pending::<()>());
+
+            let job = runner.submit(Keyed { n: 99 }).await.unwrap();
+            let id = job.id().to_string();
+            assert_eq!(job.await.unwrap(), 99);
+
+            handle.shutdown().await.unwrap();
+            id
+        };
+
+        // Round 2: fresh runner against the same store. The submission
+        // record from round 1 + its result blob are still on disk, so
+        // re-submitting the same payload should short-circuit.
+        let queue = Arc::new(Queue::open(store.clone(), queue_name).await.unwrap());
+        let runner = JobRunner::builder()
+            .queue(queue)
+            .object_store(store)
+            .build()
+            .unwrap();
+        let second = runner.submit(Keyed { n: 99 }).await.unwrap();
+        assert!(!second.newly_submitted());
+        assert_eq!(second.id(), first_id);
+        // fetch_result reads the persisted blob directly.
+        let outcome = second
+            .fetch_result()
+            .await
+            .unwrap()
+            .expect("cached result should be reachable across restart");
+        assert_eq!(outcome.unwrap(), 99);
     }
 
     #[tokio::test(start_paused = true)]
