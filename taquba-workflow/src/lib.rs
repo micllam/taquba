@@ -62,8 +62,8 @@
 //!     )]),
 //!     ..OpenOptions::default()
 //! };
-//! let queue = Arc::new(Queue::open_with_options(store, "db", opts).await?);
-//! let runtime = WorkflowRuntime::builder(queue, EchoRunner, NoopTerminalHook)
+//! let queue = Arc::new(Queue::open_with_options(store.clone(), "db", opts).await?);
+//! let runtime = WorkflowRuntime::builder(queue, store, EchoRunner, NoopTerminalHook)
 //!     .queue_name("agent-runs") // same string as in queue_configs
 //!     .build();
 //! # let _ = runtime;
@@ -88,9 +88,10 @@
 //! }
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let queue = Arc::new(Queue::open(Arc::new(InMemory::new()), "demo").await?);
+//! let store = Arc::new(InMemory::new());
+//! let queue = Arc::new(Queue::open(store.clone(), "demo").await?);
 //!
-//! let runtime = WorkflowRuntime::builder(queue, EchoRunner, NoopTerminalHook).build();
+//! let runtime = WorkflowRuntime::builder(queue, store, EchoRunner, NoopTerminalHook).build();
 //!
 //! let runtime_for_worker = runtime.clone();
 //! tokio::spawn(async move {

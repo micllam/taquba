@@ -49,6 +49,16 @@ pub struct Memo {
     prefix: String,
 }
 
+impl std::fmt::Debug for Memo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The object store doesn't implement Debug; show the prefix
+        // (the operationally interesting part) and elide the rest.
+        f.debug_struct("Memo")
+            .field("prefix", &self.prefix)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Memo {
     /// Build a `Memo` over the given object store and path prefix. All
     /// keys written through this `Memo` live under `<prefix>/...` in the

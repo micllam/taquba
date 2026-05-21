@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::memo::Memo;
+
 /// A single step within a workflow run, handed to [`StepRunner::run_step`].
 ///
 /// Mirrors [`taquba::JobRecord`]: the `payload` is opaque application bytes
@@ -54,6 +56,12 @@ pub struct Step {
     /// subsequent step of the run (including any retry of this one)
     /// observes `is_cancelled() == true` immediately.
     pub cancel_token: CancellationToken,
+    /// Per-step durable key-value store, scoped to
+    /// `(run_id, step_number)`. Use to memoize expensive within-step
+    /// side effects (LLM calls, paid APIs) so an at-least-once retry
+    /// of this step doesn't re-pay for work the prior attempt already
+    /// did. See [`Memo`] for the API and the keying conventions.
+    pub memo: Memo,
 }
 
 /// What the runner wants the runtime to do after this step.

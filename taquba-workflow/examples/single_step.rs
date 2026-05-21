@@ -46,11 +46,13 @@ impl TerminalHook for PrintAndExit {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let queue = Arc::new(Queue::open(Arc::new(InMemory::new()), "agent-demo").await?);
+    let store = Arc::new(InMemory::new());
+    let queue = Arc::new(Queue::open(store.clone(), "agent-demo").await?);
 
     let (tx, rx) = oneshot::channel::<()>();
     let runtime = WorkflowRuntime::builder(
         queue,
+        store,
         Echo,
         PrintAndExit {
             shutdown: tokio::sync::Mutex::new(Some(tx)),

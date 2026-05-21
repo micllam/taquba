@@ -12,11 +12,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Memo`: per-step durable key-value store for memoizing within-step
   side effects, backed by object storage. Entries are keyed by
   `(run_id, step_number, user_key)` and user keys are SHA-256-hashed
-  before becoming object-store path segments. Constructor takes an
-  `Arc<dyn ObjectStore>` and a path prefix. Not part of `Step` yet;
-  callers build their own `Memo` instance and pass it through.
+  before becoming object-store path segments.
+- `Step::memo`: every step now receives a `Memo` scoped to the
+  workflow's configured object store and prefix. Runners use it to
+  cache results of expensive within-step side effects (LLM calls, paid
+  APIs) so at-least-once retries don't re-pay for work the prior
+  attempt already did.
+- `WorkflowRuntimeBuilder::memo_prefix`: configures the object-store
+  prefix `Step::memo` entries live under. Defaults to `"workflow-memo"`;
+  set a distinct prefix when multiple runtimes share one store.
 - `Error::Store(taquba::object_store::Error)`: surfaced from `Memo`
   read/write failures. Classified as transient by `is_permanent`.
+
+### Changed
+
+- **Breaking:** `WorkflowRuntime::builder` now takes an additional
+  required `object_store: Arc<dyn ObjectStore>` argument between the
+  queue and the runner. The store backs `Step::memo` and need not be
+  the same store the queue was opened with, though sharing one (just
+  cloning the `Arc`) is the common case. Existing call sites must add
+  the store argument:
+
+  ```rust,ignore
+  // Before:
+  let runtime = WorkflowRuntime::builder(queue, runner, hook).build();
+  // After:
+  let runtime = WorkflowRuntime::builder(queue, store, runner, hook).build();
+  ```
 
 ## [0.4.0] - 2026-05-20
 

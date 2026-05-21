@@ -302,12 +302,14 @@ async fn main() -> Result<()> {
     let provider = select_provider()?;
     println!("using provider: {}", provider.label());
 
-    let queue = Arc::new(Queue::open(Arc::new(InMemory::new()), "rig-demo").await?);
+    let store = Arc::new(InMemory::new());
+    let queue = Arc::new(Queue::open(store.clone(), "rig-demo").await?);
 
     let (tx, rx) = oneshot::channel::<()>();
 
     let runtime = WorkflowRuntime::builder(
         queue,
+        store,
         RigRunner { provider },
         ShutdownOnComplete {
             shutdown: tokio::sync::Mutex::new(Some(tx)),
