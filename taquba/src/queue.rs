@@ -576,90 +576,9 @@ impl Queue {
         payload: Vec<u8>,
         opts: EnqueueOptions,
     ) -> Result<String> {
-        let cfg = self.queue_config(queue);
-        let max_attempts = opts.max_attempts.unwrap_or(cfg.max_attempts);
-        let priority = opts.priority.unwrap_or(cfg.default_priority);
-
-        // A `run_at` that is at-or-before now is just an immediate enqueue.
-        let run_at = opts.run_at.and_then(|when| {
-            let ms = when
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            (ms > self.now_ms()).then_some(ms)
-        });
-
-        let id = match opts.id_override {
-            Some(supplied) => {
-                validate_id_override(&supplied)?;
-                supplied
-            }
-            None => Ulid::new().to_string(),
-        };
-        let (status, key) = match run_at {
-            Some(ms) => (JobStatus::Scheduled, scheduled_key(queue, ms, &id)),
-            None => (JobStatus::Pending, pending_key(queue, priority, &id)),
-        };
-        let job = JobRecord {
-            id,
-            queue: queue.to_string(),
-            payload,
-            headers: opts.headers,
-            status,
-            attempts: 0,
-            max_attempts,
-            enqueued_at: self.now_ms(),
-            claimed_at: None,
-            lease_expires_at: None,
-            run_at,
-            priority,
-            last_error: None,
-            dedup_key: opts.dedup_key.clone(),
-            completed_at: None,
-            failed_at: None,
-            cancel_requested: false,
-            cancel_token: None,
-        };
-
-        match opts.dedup_key {
-            Some(dk) => self.write_unique(job, key, dk).await,
-            None => self.write_new(job, key).await,
-        }
-    }
-
-    /// Persist and announce a brand-new job. Used by the non-dedup path of
-    /// [`Self::enqueue_with`]. Retries on transaction conflict.
-    async fn write_new(&self, job: JobRecord, key: String) -> Result<String> {
-        let value = rmp_serde::to_vec_named(&job)?;
-        let JobRecord {
-            id,
-            queue,
-            status,
-            priority,
-            run_at,
-            ..
-        } = job;
-
-        loop {
-            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            txn.put(key.as_bytes(), &value)?;
-            txn.put(job_index_key(&id).as_bytes(), key.as_bytes())?;
-            update_stats(&txn, &queue, &[(status, 1)])?;
-
-            match txn.commit().await {
-                Ok(_) => {
-                    // Workers can claim a Pending job immediately; a Scheduled
-                    // job becomes claimable later via the scheduler loop,
-                    // which fires its own notify.
-                    if matches!(status, JobStatus::Pending) {
-                        self.job_available.notify_waiters();
-                    }
-                    debug!(queue = %queue, job_id = %id, priority, ?run_at, "job enqueued");
-                    return Ok(id);
-                }
-                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
-                Err(e) => return Err(e.into()),
-            }
+        let (job, key) = self.prepare_job_record(queue, payload, opts)?;
+        match self.write_job(job, key, HashMap::new()).await? {
+            EnqueueResult::New(id) | EnqueueResult::AlreadyEnqueued(id) => Ok(id),
         }
     }
 
@@ -715,87 +634,8 @@ impl Queue {
             }
         }
 
-        let cfg = self.queue_config(queue);
-        let max_attempts = opts.max_attempts.unwrap_or(cfg.max_attempts);
-        let priority = opts.priority.unwrap_or(cfg.default_priority);
-
-        let run_at = opts.run_at.and_then(|when| {
-            let ms = when
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            (ms > self.now_ms()).then_some(ms)
-        });
-
-        let id = match opts.id_override {
-            Some(supplied) => {
-                validate_id_override(&supplied)?;
-                supplied
-            }
-            None => Ulid::new().to_string(),
-        };
-        let (status, key) = match run_at {
-            Some(ms) => (JobStatus::Scheduled, scheduled_key(queue, ms, &id)),
-            None => (JobStatus::Pending, pending_key(queue, priority, &id)),
-        };
-        let job = JobRecord {
-            id: id.clone(),
-            queue: queue.to_string(),
-            payload,
-            headers: opts.headers,
-            status,
-            attempts: 0,
-            max_attempts,
-            enqueued_at: self.now_ms(),
-            claimed_at: None,
-            lease_expires_at: None,
-            run_at,
-            priority,
-            last_error: None,
-            dedup_key: opts.dedup_key.clone(),
-            completed_at: None,
-            failed_at: None,
-            cancel_requested: false,
-            cancel_token: None,
-        };
-        let value = rmp_serde::to_vec_named(&job)?;
-        let dkey = opts.dedup_key.as_ref().map(|dk| dedup_index_key(queue, dk));
-
-        loop {
-            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-
-            if let Some(ref dkey) = dkey {
-                if let Some(bytes) = txn.get(dkey.as_bytes()).await? {
-                    txn.rollback();
-                    let existing =
-                        String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidState)?;
-                    return Ok(EnqueueResult::AlreadyEnqueued(existing));
-                }
-            }
-
-            txn.put(key.as_bytes(), &value)?;
-            txn.put(job_index_key(&id).as_bytes(), key.as_bytes())?;
-            if let Some(ref dkey) = dkey {
-                txn.put(dkey.as_bytes(), id.as_bytes())?;
-            }
-            update_stats(&txn, queue, &[(status, 1)])?;
-
-            for (k, v) in &kv_writes {
-                txn.put(user_scoped_key(k), v)?;
-            }
-
-            match txn.commit().await {
-                Ok(_) => {
-                    if matches!(status, JobStatus::Pending) {
-                        self.job_available.notify_waiters();
-                    }
-                    debug!(queue = %queue, job_id = %id, "job enqueued with kv");
-                    return Ok(EnqueueResult::New(id));
-                }
-                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
+        let (job, key) = self.prepare_job_record(queue, payload, opts)?;
+        self.write_job(job, key, kv_writes).await
     }
 
     /// Read a value from the user KV namespace.
@@ -815,11 +655,85 @@ impl Queue {
         Ok(())
     }
 
-    /// Dedup-aware variant: writes a pending or scheduled job behind a
-    /// `dedup:` index entry, or returns the existing ID if the index already
-    /// points somewhere. Retries on transaction conflict.
-    async fn write_unique(&self, job: JobRecord, key: String, dedup_key: String) -> Result<String> {
-        let dkey = dedup_index_key(&job.queue, &dedup_key);
+    /// Resolve [`EnqueueOptions`] against the queue's defaults and build
+    /// the [`JobRecord`] + its primary key. Shared by [`Self::enqueue_with`]
+    /// and [`Self::enqueue_with_kv`]; the two methods only diverge in how
+    /// they persist the prepared record.
+    fn prepare_job_record(
+        &self,
+        queue: &str,
+        payload: Vec<u8>,
+        opts: EnqueueOptions,
+    ) -> Result<(JobRecord, String)> {
+        let cfg = self.queue_config(queue);
+        let max_attempts = opts.max_attempts.unwrap_or(cfg.max_attempts);
+        let priority = opts.priority.unwrap_or(cfg.default_priority);
+
+        // A `run_at` that is at or before now is just an immediate enqueue.
+        let run_at = opts.run_at.and_then(|when| {
+            let ms = when
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            (ms > self.now_ms()).then_some(ms)
+        });
+
+        let id = match opts.id_override {
+            Some(supplied) => {
+                validate_id_override(&supplied)?;
+                supplied
+            }
+            None => Ulid::new().to_string(),
+        };
+
+        let (status, key) = match run_at {
+            Some(ms) => (JobStatus::Scheduled, scheduled_key(queue, ms, &id)),
+            None => (JobStatus::Pending, pending_key(queue, priority, &id)),
+        };
+
+        let job = JobRecord {
+            id,
+            queue: queue.to_string(),
+            payload,
+            headers: opts.headers,
+            status,
+            attempts: 0,
+            max_attempts,
+            enqueued_at: self.now_ms(),
+            claimed_at: None,
+            lease_expires_at: None,
+            run_at,
+            priority,
+            last_error: None,
+            dedup_key: opts.dedup_key,
+            completed_at: None,
+            failed_at: None,
+            cancel_requested: false,
+            cancel_token: None,
+        };
+
+        Ok((job, key))
+    }
+
+    /// Persist a prepared [`JobRecord`], optionally checking a dedup index
+    /// and optionally applying additional KV writes, all in a single
+    /// transaction. Retries on transaction conflict.
+    ///
+    /// Returns [`EnqueueResult::AlreadyEnqueued`] (with **no** KV writes
+    /// applied) if `job.dedup_key` is set and a pending or scheduled job
+    /// with the same dedup key already exists. Otherwise writes the
+    /// record + job index + (when set) dedup index + every entry in
+    /// `kv_writes`, and returns [`EnqueueResult::New`].
+    async fn write_job(
+        &self,
+        job: JobRecord,
+        key: String,
+        kv_writes: HashMap<Vec<u8>, Vec<u8>>,
+    ) -> Result<EnqueueResult> {
+        let dkey = job
+            .dedup_key
+            .as_ref()
+            .map(|dk| dedup_index_key(&job.queue, dk));
         let value = rmp_serde::to_vec_named(&job)?;
         let JobRecord {
             id, queue, status, ..
@@ -828,24 +742,36 @@ impl Queue {
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
 
-            if let Some(bytes) = txn.get(dkey.as_bytes()).await? {
-                // A pending or scheduled job with this key already exists.
-                txn.rollback();
-                return String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidState);
+            if let Some(ref dkey) = dkey {
+                if let Some(bytes) = txn.get(dkey.as_bytes()).await? {
+                    txn.rollback();
+                    let existing =
+                        String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidState)?;
+                    return Ok(EnqueueResult::AlreadyEnqueued(existing));
+                }
             }
 
             txn.put(key.as_bytes(), &value)?;
             txn.put(job_index_key(&id).as_bytes(), key.as_bytes())?;
-            txn.put(dkey.as_bytes(), id.as_bytes())?;
+            if let Some(ref dkey) = dkey {
+                txn.put(dkey.as_bytes(), id.as_bytes())?;
+            }
             update_stats(&txn, &queue, &[(status, 1)])?;
+
+            for (k, v) in &kv_writes {
+                txn.put(user_scoped_key(k), v)?;
+            }
 
             match txn.commit().await {
                 Ok(_) => {
+                    // Workers can claim a Pending job immediately; a Scheduled
+                    // job becomes claimable later via the scheduler loop,
+                    // which fires its own notify.
                     if matches!(status, JobStatus::Pending) {
                         self.job_available.notify_waiters();
                     }
-                    debug!(queue = %queue, job_id = %id, dedup_key, "unique job enqueued");
-                    return Ok(id);
+                    debug!(queue = %queue, job_id = %id, "job enqueued");
+                    return Ok(EnqueueResult::New(id));
                 }
                 Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
                 Err(e) => return Err(e.into()),
