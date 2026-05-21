@@ -173,6 +173,18 @@ impl std::fmt::Display for StepError {
 
 impl std::error::Error for StepError {}
 
+impl From<crate::Error> for StepError {
+    fn from(err: crate::Error) -> Self {
+        let permanent = err.is_permanent();
+        let message = err.to_string();
+        if permanent {
+            Self::permanent(message)
+        } else {
+            Self::transient(message)
+        }
+    }
+}
+
 /// Whether a [`StepError`] should retry or fail the run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -200,4 +212,22 @@ pub trait StepRunner: Send + Sync {
         &self,
         step: &Step,
     ) -> impl Future<Output = std::result::Result<StepOutcome, StepError>> + Send;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_workflow_error_maps_via_is_permanent() {
+        let permanent: StepError = crate::Error::InputMismatch("run-1".into()).into();
+        assert_eq!(permanent.kind, StepErrorKind::Permanent);
+
+        let store_err = taquba::object_store::Error::NotFound {
+            path: "x".into(),
+            source: "missing".into(),
+        };
+        let transient: StepError = crate::Error::Store(store_err).into();
+        assert_eq!(transient.kind, StepErrorKind::Transient);
+    }
 }
