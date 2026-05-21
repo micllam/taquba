@@ -26,7 +26,7 @@ all-features = true
 [dependencies]
 # We always pull in SlateDB's `foyer` cache feature.
 slatedb = { version = "0.13", default-features = false, features = ["foyer"] }
-ulid = { version = "1", features = ["serde"] }
+ulid = { workspace = true, features = ["serde"] }
 rmp-serde = "1"
 bytes = "1"
 
