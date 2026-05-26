@@ -2901,6 +2901,7 @@ name = "taquba-workflow"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "futures-util",
  "rig-core",
  "rmp-serde",
  "serde",

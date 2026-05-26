@@ -191,7 +191,7 @@ mod runtime;
 mod terminal;
 
 pub use error::{Error, Result};
-pub use memo::{Memo, MemoStore};
+pub use memo::{Memo, MemoStore, TerminalMarker};
 pub use runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner};
 pub use runtime::{
     HEADER_RUN_ID, HEADER_STEP, RESERVED_HEADER_PREFIX, RunSpec, RunState, RunStatus,
