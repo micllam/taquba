@@ -27,6 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   set a distinct prefix when multiple runtimes share one store.
 - `Error::Store(taquba::object_store::Error)`: surfaced from memo
   read/write failures. Classified as transient by `is_permanent`.
+- `WorkflowRuntimeBuilder::memo_retention(Duration)`: opts the runtime
+  into writing a terminal marker via `MemoStore::write_terminal_marker`
+  on every terminal state (Succeeded, Failed, Cancelled). Markers
+  outlive the run record and provide the input a memo-retention sweep
+  consumes to decide when a run's memo entries are eligible for
+  deletion. Without this setter no marker is written and memo entries
+  are retained indefinitely (appropriate for short-lived runs or
+  external cleanup).
 
 ### Changed
 

@@ -163,6 +163,7 @@ pub struct WorkflowRuntimeBuilder<R, H> {
     terminal_hook: H,
     max_concurrent_steps: usize,
     poll_interval: Duration,
+    memo_retention: Option<Duration>,
 }
 
 impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
@@ -198,6 +199,16 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
         self
     }
 
+    /// Enable memo retention with the given window. When set, the
+    /// runtime writes a terminal marker for every run that reaches a
+    /// terminal state, and the in-process sweeper will clear that run's
+    /// memo entries `retention` after termination. When unset (default),
+    /// no marker is written and memo entries are retained indefinitely.
+    pub fn memo_retention(mut self, retention: Duration) -> Self {
+        self.memo_retention = Some(retention);
+        self
+    }
+
     /// Finalize the builder.
     pub fn build(self) -> WorkflowRuntime<R, H> {
         let memo_store = MemoStore::new(self.object_store, self.memo_prefix);
@@ -210,6 +221,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
             poll_interval: self.poll_interval,
             registry: Mutex::new(HashMap::new()),
             memo_store,
+            memo_retention: self.memo_retention,
         };
         WorkflowRuntime {
             inner: Arc::new(inner),
@@ -239,6 +251,10 @@ struct RuntimeInner<R, H> {
     poll_interval: Duration,
     registry: Mutex<HashMap<String, RegistryEntry>>,
     memo_store: MemoStore,
+    /// Window after a run reaches a terminal state during which its
+    /// memo entries are retained for replay. `None` disables retention
+    /// entirely (no terminal marker is written and no sweeper runs).
+    memo_retention: Option<Duration>,
 }
 
 /// Per-active-run state retained by the runtime. Combines the publicly
@@ -294,6 +310,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             terminal_hook,
             max_concurrent_steps: 16,
             poll_interval: Duration::from_millis(250),
+            memo_retention: None,
         }
     }
 
@@ -603,16 +620,36 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     }
 
     /// Settle a run into its terminal state: drop its registry entry,
-    /// delete the durable run record from Taquba's KV namespace, and
-    /// fire the terminal hook. Registry removal happens first so that
+    /// write a terminal marker (if memo retention is enabled), delete
+    /// the durable run record from Taquba's KV namespace, and fire the
+    /// terminal hook. Registry removal happens first so that
     /// [`WorkflowRuntime::status`] doesn't briefly report an
     /// already-terminated run as active while a slow hook (e.g. a webhook
-    /// delivery) is in flight. KV cleanup is best-effort: a transient
-    /// failure here leaves a stale durable record that will block a
-    /// future submit with the same `run_id`, but does not affect the
-    /// already-running cleanup of *this* run.
+    /// delivery) is in flight. The marker is written *before* the
+    /// durable record delete so a crash between the two writes leaves
+    /// the marker around to drive memo cleanup; losing the marker is
+    /// worse than leaving a stale run record (which only blocks one
+    /// future submit). Both writes are best-effort: a transient
+    /// failure here is logged but does not affect the already-running
+    /// cleanup of *this* run.
     async fn terminate(&self, outcome: RunOutcome) {
         self.registry.lock().await.remove(&outcome.run_id);
+        if self.memo_retention.is_some() {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            if let Err(err) = self
+                .memo_store
+                .write_terminal_marker(&outcome.run_id, now_ms)
+                .await
+            {
+                warn!(
+                    run_id = %outcome.run_id,
+                    "failed to write terminal marker: {err}"
+                );
+            }
+        }
         if let Err(err) = self.queue.kv_delete(&run_kv_key(&outcome.run_id)).await {
             warn!(
                 run_id = %outcome.run_id,
@@ -2177,6 +2214,114 @@ mod tests {
             outcome.result.as_deref(),
             Some(b"first-attempt-value".as_slice())
         );
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_marker_is_written_when_memo_retention_is_set() {
+        let (queue, store) = fresh_queue().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue,
+            store.clone(),
+            ScriptedRunner::new(vec![StepOutcome::Succeed {
+                result: b"done".to_vec(),
+            }]),
+            ChannelHook { tx },
+        )
+        .memo_retention(Duration::from_secs(60))
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        let handle = runtime
+            .submit(RunSpec {
+                input: b"in".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let memos = MemoStore::new(store, "workflow-memo");
+        let markers = memos.list_terminal_markers().await.unwrap();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].run_id, handle.run_id);
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_terminal_marker_when_memo_retention_is_unset() {
+        let (queue, store) = fresh_queue().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue,
+            store.clone(),
+            ScriptedRunner::new(vec![StepOutcome::Succeed {
+                result: b"done".to_vec(),
+            }]),
+            ChannelHook { tx },
+        )
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                input: b"in".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let memos = MemoStore::new(store, "workflow-memo");
+        assert!(memos.list_terminal_markers().await.unwrap().is_empty());
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_marker_is_written_for_failed_runs_too() {
+        // Retention isn't just for successful runs: replay-from-cached-state
+        // is precisely the failed-run use case.
+        let (queue, store) = fresh_queue().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue,
+            store.clone(),
+            ScriptedRunner::new(vec![StepOutcome::Fail {
+                reason: "boom".into(),
+            }]),
+            ChannelHook { tx },
+        )
+        .memo_retention(Duration::from_secs(60))
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        let handle = runtime
+            .submit(RunSpec {
+                input: b"in".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.status, TerminalStatus::Failed);
+
+        let memos = MemoStore::new(store, "workflow-memo");
+        let markers = memos.list_terminal_markers().await.unwrap();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].run_id, handle.run_id);
 
         let _ = shutdown.send(());
     }
