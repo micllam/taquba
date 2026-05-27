@@ -35,6 +35,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deletion. Without this setter no marker is written and memo entries
   are retained indefinitely (appropriate for short-lived runs or
   external cleanup).
+- `WorkflowRuntime` now reads every timestamp it writes
+  (`DurableRunRecord::submitted_at_ms`, the `ContinueAfter` `run_at`,
+  and the terminal-marker timestamp) through a `taquba::Clock`. By
+  default the runtime shares the clock its `Queue` was opened with
+  (via `Queue::clock`), so passing a `MockClock` to `OpenOptions`
+  virtualises time for the queue and the workflow runtime together.
+- `WorkflowRuntimeBuilder::clock(Arc<dyn Clock>)` overrides the
+  defaulted-from-queue clock when a test or specialised setup needs a
+  separate time source.
 
 ### Changed
 

@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use taquba::object_store::ObjectStore;
 use taquba::{
-    EnqueueOptions, EnqueueResult, JobRecord, PermanentFailure, Queue, Worker, WorkerError,
+    Clock, EnqueueOptions, EnqueueResult, JobRecord, PermanentFailure, Queue, Worker, WorkerError,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -164,6 +164,7 @@ pub struct WorkflowRuntimeBuilder<R, H> {
     max_concurrent_steps: usize,
     poll_interval: Duration,
     memo_retention: Option<Duration>,
+    clock: Arc<dyn Clock>,
 }
 
 impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
@@ -209,6 +210,14 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
         self
     }
 
+    /// Override the [`Clock`] the runtime reads its timestamps from.
+    /// Defaults to the same clock the [`Queue`] was opened with (via
+    /// [`Queue::clock`]).
+    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
     /// Finalize the builder.
     pub fn build(self) -> WorkflowRuntime<R, H> {
         let memo_store = MemoStore::new(self.object_store, self.memo_prefix);
@@ -222,6 +231,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
             registry: Mutex::new(HashMap::new()),
             memo_store,
             memo_retention: self.memo_retention,
+            clock: self.clock,
         };
         WorkflowRuntime {
             inner: Arc::new(inner),
@@ -255,6 +265,9 @@ struct RuntimeInner<R, H> {
     /// memo entries are retained for replay. `None` disables retention
     /// entirely (no terminal marker is written and no sweeper runs).
     memo_retention: Option<Duration>,
+    /// Time source. Defaults to the queue's clock; tests can substitute
+    /// a [`MockClock`](taquba::MockClock) to virtualise time.
+    clock: Arc<dyn Clock>,
 }
 
 /// Per-active-run state retained by the runtime. Combines the publicly
@@ -301,6 +314,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         runner: R,
         terminal_hook: H,
     ) -> WorkflowRuntimeBuilder<R, H> {
+        let clock = queue.clock();
         WorkflowRuntimeBuilder {
             queue,
             object_store,
@@ -311,6 +325,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             max_concurrent_steps: 16,
             poll_interval: Duration::from_millis(250),
             memo_retention: None,
+            clock,
         }
     }
 
@@ -385,10 +400,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
 
         let record_bytes = rmp_serde::to_vec_named(&DurableRunRecord {
             run_id: run_id.clone(),
-            submitted_at_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
+            submitted_at_ms: self.inner.clock.now_ms(),
             input_hash,
         })
         .map_err(taquba::Error::from)?;
@@ -635,13 +647,9 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     async fn terminate(&self, outcome: RunOutcome) {
         self.registry.lock().await.remove(&outcome.run_id);
         if self.memo_retention.is_some() {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
             if let Err(err) = self
                 .memo_store
-                .write_terminal_marker(&outcome.run_id, now_ms)
+                .write_terminal_marker(&outcome.run_id, self.clock.now_ms())
                 .await
             {
                 warn!(
@@ -791,8 +799,9 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 .await
             }
             Ok(StepOutcome::ContinueAfter { payload, delay }) => {
+                let now = UNIX_EPOCH + Duration::from_millis(self.clock.now_ms());
                 let opts = StepEnqueueOpts {
-                    run_at: Some(SystemTime::now() + delay),
+                    run_at: Some(now + delay),
                     ..inherit_opts()
                 };
                 self.advance(&run_id, step_number + 1, payload, &user_headers, opts)
@@ -899,7 +908,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicU32, Ordering};
     use taquba::object_store::memory::InMemory;
-    use taquba::{OpenOptions, QueueConfig};
+    use taquba::{MockClock, OpenOptions, QueueConfig};
     use tokio::sync::oneshot;
 
     /// Recording terminal hook backed by an mpsc channel.
@@ -937,6 +946,38 @@ mod tests {
         let store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
         let queue = Arc::new(Queue::open(store.clone(), "test").await.unwrap());
         (queue, store)
+    }
+
+    /// Queue + object store + a [`MockClock`] wired into the queue. Use
+    /// [`advance`] to move both the mock clock and tokio's paused time
+    /// in lockstep.
+    async fn fresh_queue_with_mock_clock(
+        initial_ms: u64,
+    ) -> (
+        Arc<Queue>,
+        Arc<dyn taquba::object_store::ObjectStore>,
+        MockClock,
+    ) {
+        let clock = MockClock::new(initial_ms);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
+        let queue = Arc::new(
+            Queue::open_with_options(store.clone(), "test", opts)
+                .await
+                .unwrap(),
+        );
+        (queue, store, clock)
+    }
+
+    /// Advance both a [`MockClock`] and tokio's paused time by `by`, so
+    /// timestamp reads and `tokio::time::sleep` / `interval` move
+    /// together in tests.
+    async fn advance(clock: &MockClock, by: Duration) {
+        clock.advance(by);
+        tokio::time::advance(by).await;
     }
 
     /// Queue with zero retry backoff and a tight reaper, so multi-attempt
@@ -2322,6 +2363,48 @@ mod tests {
         let markers = memos.list_terminal_markers().await.unwrap();
         assert_eq!(markers.len(), 1);
         assert_eq!(markers[0].run_id, handle.run_id);
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_marker_timestamp_reflects_runtime_clock() {
+        // The queue's MockClock is shared into the runtime by default
+        // (via Queue::clock()), so a `clock.advance` between submit and
+        // terminate is visible in the marker's terminal_at_ms.
+        let (queue, store, clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue,
+            store.clone(),
+            ScriptedRunner::new(vec![StepOutcome::Succeed {
+                result: b"done".to_vec(),
+            }]),
+            ChannelHook { tx },
+        )
+        .memo_retention(Duration::from_secs(60))
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                input: b"in".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        advance(&clock, Duration::from_secs(30)).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let memos = MemoStore::new(store, "workflow-memo");
+        let markers = memos.list_terminal_markers().await.unwrap();
+        assert_eq!(markers.len(), 1);
+        // MockClock only moves on explicit advance/set, so the value
+        // terminate() reads is exactly the post-advance clock.
+        assert_eq!(markers[0].terminal_at_ms, 10_000 + 30_000);
 
         let _ = shutdown.send(());
     }
