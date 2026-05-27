@@ -537,6 +537,13 @@ impl Queue {
         self.queue_config(queue).dead_retention
     }
 
+    /// The [`Clock`] this queue was opened with. Returned as a cheap
+    /// `Arc` clone so downstream crates can share the same time
+    /// source for their own timestamp work.
+    pub fn clock(&self) -> Arc<dyn Clock> {
+        self.clock.clone()
+    }
+
     /// Enqueue a job using the queue's configured defaults for everything
     /// (max_attempts, priority, no schedule, no dedup). Equivalent to
     /// [`Self::enqueue_with`] with [`EnqueueOptions::default`].
@@ -1579,6 +1586,24 @@ mod tests {
             },
             ..OpenOptions::default()
         }
+    }
+
+    #[tokio::test]
+    async fn clock_accessor_returns_the_configured_clock() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        assert_eq!(q.clock().now_ms(), 1_700_000_000_000);
+        clock.advance(Duration::from_secs(60));
+        assert_eq!(q.clock().now_ms(), 1_700_000_060_000);
+
+        q.close().await.unwrap();
     }
 
     #[tokio::test]

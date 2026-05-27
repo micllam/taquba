@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ULID-shaped ids when FIFO-within-priority claim order matters:
   `pending`/`scheduled` keys end with the id, so claim order follows
   id sort.
+- `Queue::clock()` accessor returns the `Arc<dyn Clock>` the queue
+  was opened with (or the default `SystemClock`). Lets downstream
+  crates share the queue's time source for their own timestamp work
+  so virtualising time with `MockClock` advances the whole stack
+  in lockstep.
 
 ### Fixed
 
