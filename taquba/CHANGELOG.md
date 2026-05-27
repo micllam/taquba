@@ -23,6 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so virtualising time with `MockClock` advances the whole stack
   in lockstep.
 
+### Changed
+
+- **Breaking on-disk layout:** the `done:` keyspace is reordered from
+  `done:{queue}:{id}` to `done:{completed_at:020}:{queue}:{id}`,
+  mirroring the existing time-first layout of `claimed:` and
+  `scheduled:`. The retention sweep can now early-exit on the first
+  unexpired record instead of walking the full prefix. Public API is
+  unchanged; in-flight runs from prior versions must be drained
+  before upgrading because the old keys will not be observed by the
+  reaper.
+
 ### Fixed
 
 - `enqueue_with`'s non-dedup path (`write_new`) now retries on

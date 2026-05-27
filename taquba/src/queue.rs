@@ -71,8 +71,11 @@ pub(crate) fn claimed_key(queue: &str, lease_expires_at: u64, id: &str) -> Strin
     format!("claimed:{:020}:{}:{}", lease_expires_at, queue, id)
 }
 
-pub(crate) fn done_key(queue: &str, id: &str) -> String {
-    format!("done:{}:{}", queue, id)
+pub(crate) fn done_key(completed_at: u64, queue: &str, id: &str) -> String {
+    // Timestamp comes before queue so the prefix scan in the reaper is sorted
+    // globally by completion time, letting the retention sweep stop at the
+    // first unexpired record instead of walking the whole prefix.
+    format!("done:{:020}:{}:{}", completed_at, queue, id)
 }
 
 pub(crate) fn scheduled_key(queue: &str, run_at: u64, id: &str) -> String {
@@ -934,11 +937,12 @@ impl Queue {
         let claimed = claimed_key(&job.queue, lease_expires_at, &job.id);
         let keep_done = self.queue_keep_done_jobs(&job.queue).is_some();
         let done_record = if keep_done {
+            let completed_at = self.now_ms();
             let mut done_job = job.clone();
             done_job.status = JobStatus::Done;
-            done_job.completed_at = Some(self.now_ms());
+            done_job.completed_at = Some(completed_at);
             Some((
-                done_key(&job.queue, &job.id),
+                done_key(completed_at, &job.queue, &job.id),
                 rmp_serde::to_vec_named(&done_job)?,
             ))
         } else {
