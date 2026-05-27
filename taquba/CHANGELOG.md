@@ -39,6 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged; in-flight runs from prior versions must be drained
   before upgrading because the old keys will not be observed by the
   reaper.
+- `Queue::claim` (and therefore `claim_next` / `claim_with_wait`)
+  serialises same-queue claim attempts through an in-process
+  `tokio::sync::Mutex`. Same-queue attempts no longer rely on
+  SlateDB's transaction-conflict retry to resolve which worker
+  takes the head of `pending:`. The lock is per-queue, so different
+  queues' claims still run in parallel. Per-claim wall-clock latency
+  under high single-queue concurrency drops from seconds to roughly
+  one commit interval. Public API unchanged.
 
 ### Fixed
 

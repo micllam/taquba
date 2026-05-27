@@ -408,6 +408,13 @@ pub struct Queue {
     /// persisted `cancel_requested` flag carries the request across
     /// reaper-driven requeues and re-claims.
     claimed_tokens: Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    /// Per-queue async mutex held across the claim transaction.
+    /// Same-queue claim attempts serialise on this mutex rather than
+    /// resolving via SlateDB's transaction-conflict retry. The lock
+    /// is per-queue, so different queues' claim paths still run in
+    /// parallel. In-process coordination is sufficient because all
+    /// writers to a SlateDB store share one process.
+    claim_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Wakeup fired whenever any job reaches a terminal state: `Done`
     /// (acked, kept or not), `Dead` (dead-lettered by worker, exhausted
     /// retry, or reaper), or `Pending` / `Scheduled` jobs removed via
@@ -515,6 +522,7 @@ impl Queue {
             clock: opts.clock,
             job_available,
             claimed_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            claim_locks: std::sync::Mutex::new(HashMap::new()),
             completion_notify,
         })
     }
@@ -829,6 +837,15 @@ impl Queue {
         self.claim(queue, lease_duration).await
     }
 
+    /// Returns the per-queue async mutex guarding [`Self::claim`] for
+    /// `queue`, creating it on first access.
+    fn claim_lock_for(&self, queue: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.claim_locks.lock().unwrap();
+        map.entry(queue.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     /// Block up to `max_wait` for a job to become claimable on any queue.
     ///
     /// Returns when either an in-process enqueue / promotion / requeue fires
@@ -884,8 +901,17 @@ impl Queue {
 
     /// Claim the next pending job with an explicit lease duration.
     /// Returns `None` if the queue is empty.
+    ///
+    /// Same-queue claim attempts serialise through an in-process
+    /// `tokio::sync::Mutex`, avoiding the transaction-conflict
+    /// retry that would otherwise resolve which worker takes the
+    /// head of `pending:`. The lock is per-queue, so different
+    /// queues' claim paths still run in parallel.
     #[instrument(skip(self), fields(queue))]
     pub async fn claim(&self, queue: &str, lease_duration: Duration) -> Result<Option<JobRecord>> {
+        let lock = self.claim_lock_for(queue);
+        let _guard = lock.lock().await;
+
         let prefix = pending_prefix(queue);
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
