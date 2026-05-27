@@ -199,6 +199,55 @@ step can be claimed and executed twice if its lease expires before ack.
 **`StepRunner` impls must be idempotent for the same
 `(run_id, step_number)`.**
 
+## Memoizing within-step side effects
+
+Because retries can re-execute a step, expensive non-idempotent side
+effects (LLM calls, paid APIs, multi-stage processing) need a place to
+record their result so retries observe the cached value instead of
+paying twice. `Step::memo` is a per-step durable key-value store
+scoped to `(run_id, step_number)`:
+
+```rust,ignore
+// Inside StepRunner::run_step:
+if let Some(cached) = step.memo.get("draft").await? {
+    return Ok(StepOutcome::Succeed { result: cached });
+}
+let draft = expensive_call(&step.payload).await?;
+step.memo.put("draft", &draft).await?;
+Ok(StepOutcome::Succeed { result: draft })
+```
+
+Memo entries live in the object store passed to
+`WorkflowRuntime::builder` under the path prefix configured by
+`WorkflowRuntimeBuilder::memo_prefix` (default `"workflow-memo"`).
+`Memo` is strictly per-step; the durable channel between steps is
+`StepOutcome::Continue`'s payload, not memo.
+
+## Memo retention
+
+By default memo entries are retained indefinitely (appropriate for
+short-lived runs or workloads that manage cleanup externally). To
+enable automatic cleanup, configure a retention window via
+`WorkflowRuntimeBuilder::memo_retention`:
+
+```rust,ignore
+let runtime = WorkflowRuntime::builder(queue, store, runner, hook)
+    .memo_retention(Duration::from_secs(24 * 60 * 60))
+    .build();
+```
+
+When retention is set, the runtime writes a small terminal marker for
+every terminal state (Succeeded, Failed, Cancelled) and
+`WorkflowRuntime::run` spawns a background sweeper that lists those
+markers and clears the memos plus marker for any run whose marker is
+older than the retention window. The first sweep fires on startup so
+a restarted process catches markers left behind by an earlier one.
+
+Advanced cleanup policies (selective retention, externally-driven
+sweeps) can be built directly on `MemoStore::list_terminal_markers`,
+`MemoStore::clear_memos_for_run`, and `MemoStore::delete_terminal_marker`
+without configuring `WorkflowRuntimeBuilder::memo_retention`.
+
 ## Duplicate submissions
 
 `WorkflowRuntime::submit` is idempotent on `(run_id, spec.input)`. A
