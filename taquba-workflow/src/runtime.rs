@@ -205,7 +205,14 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     /// terminal state, and the in-process sweeper will clear that run's
     /// memo entries `retention` after termination. When unset (default),
     /// no marker is written and memo entries are retained indefinitely.
+    ///
+    /// Panics if `retention < 1ms`: smaller values would turn the sweep
+    /// loop into a hot spin.
     pub fn memo_retention(mut self, retention: Duration) -> Self {
+        assert!(
+            retention >= Duration::from_millis(1),
+            "memo_retention must be at least 1ms",
+        );
         self.memo_retention = Some(retention);
         self
     }
@@ -545,26 +552,64 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         Ok(true)
     }
 
-    /// Drive the step worker loop until `shutdown` resolves. Spawns up to
-    /// `max_concurrent_steps` step processors and drains them on shutdown.
+    /// Drive the step worker loop until `shutdown` resolves. Spawns up
+    /// to `max_concurrent_steps` step processors and, when
+    /// [`WorkflowRuntimeBuilder::memo_retention`] is set, an additional
+    /// memo-retention sweeper running in parallel. Both halt cleanly
+    /// when `shutdown` resolves or the worker errors.
     pub async fn run<F>(&self, shutdown: F) -> Result<()>
     where
         F: Future<Output = ()>,
         R: 'static,
         H: 'static,
     {
+        // One cancellation token fans the "stop now" signal out to the
+        // worker (via `cancelled_owned`) and to the sweeper (which
+        // selects on its own clone). The signal is raised either when
+        // the caller's `shutdown` future fires or when the worker
+        // returns on its own (typically with an error).
+        let stop = CancellationToken::new();
+
+        let sweep_handle = if self.inner.memo_retention.is_some() {
+            let inner = self.inner.clone();
+            let token = stop.clone();
+            Some(tokio::spawn(async move {
+                inner.run_memo_sweep(token).await;
+            }))
+        } else {
+            None
+        };
+
         let worker = Arc::new(StepWorker {
             inner: self.inner.clone(),
         });
-        taquba::run_worker_concurrent(
+        let worker_fut = taquba::run_worker_concurrent(
             &self.inner.queue,
             &self.inner.queue_name,
             worker,
             self.inner.max_concurrent_steps,
             self.inner.poll_interval,
-            shutdown,
-        )
-        .await?;
+            stop.clone().cancelled_owned(),
+        );
+
+        let mut shutdown = std::pin::pin!(shutdown);
+        let mut worker_fut = std::pin::pin!(worker_fut);
+        let result = tokio::select! {
+            _ = shutdown.as_mut() => {
+                stop.cancel();
+                worker_fut.await
+            }
+            res = worker_fut.as_mut() => {
+                stop.cancel();
+                res
+            }
+        };
+
+        if let Some(h) = sweep_handle {
+            let _ = h.await;
+        }
+
+        result?;
         Ok(())
     }
 }
@@ -665,6 +710,67 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             );
         }
         self.terminal_hook.on_termination(&outcome).await;
+    }
+
+    /// Memo-retention sweep loop. Runs only when
+    /// [`WorkflowRuntimeBuilder::memo_retention`] was set; the first
+    /// tick fires immediately so a fresh runtime catches markers left
+    /// behind by an earlier process, then ticks every `retention` until
+    /// `shutdown` is cancelled.
+    async fn run_memo_sweep(&self, shutdown: CancellationToken) {
+        let Some(retention) = self.memo_retention else {
+            return;
+        };
+        let mut ticker = tokio::time::interval(retention);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = ticker.tick() => {
+                    if let Err(err) = self.sweep_expired_memos(retention).await {
+                        warn!("memo retention sweep failed: {err}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// One pass of memo retention: list every terminal marker and, for
+    /// each marker older than `retention`, delete the run's memo
+    /// entries and then the marker. Returns the number of runs whose
+    /// memos were cleared. Errors on individual entries are logged and
+    /// skipped (the next pass retries) so a transient failure on one
+    /// marker doesn't stall the rest of the sweep.
+    async fn sweep_expired_memos(&self, retention: Duration) -> Result<usize> {
+        let now_ms = self.clock.now_ms();
+        let retention_ms = retention.as_millis() as u64;
+        let cutoff = now_ms.saturating_sub(retention_ms);
+        let markers = self.memo_store.list_terminal_markers().await?;
+        let mut cleared = 0usize;
+        for marker in markers {
+            if marker.terminal_at_ms >= cutoff {
+                continue;
+            }
+            if let Err(err) = self.memo_store.clear_memos_for_run(&marker.run_id).await {
+                warn!(
+                    run_id = %marker.run_id,
+                    "clear_memos_for_run failed during sweep: {err}",
+                );
+                continue;
+            }
+            if let Err(err) = self.memo_store.delete_terminal_marker(&marker).await {
+                warn!(
+                    run_id = %marker.run_id,
+                    "delete_terminal_marker failed during sweep: {err}",
+                );
+                // Memos are gone but the marker remains; the next pass
+                // will retry the marker delete (clear_memos_for_run is
+                // a no-op on the now-empty run prefix).
+                continue;
+            }
+            cleared += 1;
+        }
+        Ok(cleared)
     }
 
     /// Transition the entry for `run_id` into [`RunState::Running`] for
@@ -2405,6 +2511,125 @@ mod tests {
         // MockClock only moves on explicit advance/set, so the value
         // terminate() reads is exactly the post-advance clock.
         assert_eq!(markers[0].terminal_at_ms, 10_000 + 30_000);
+
+        let _ = shutdown.send(());
+    }
+
+    /// Yield up to `iters` times waiting for `cond` to become true.
+    /// Used in sweeper tests to let the spawned sweep task make
+    /// progress between `tokio::time::advance` and the assertion;
+    /// returns true if the condition held within the budget.
+    async fn yield_until<F, Fut>(iters: usize, mut cond: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        for _ in 0..iters {
+            if cond().await {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        false
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sweeper_keeps_markers_younger_than_retention() {
+        // Retention 200ms (sweep interval also 200ms). Advancing 200ms
+        // after the marker is written fires the next sweep tick at the
+        // exact retention boundary; strict `<` means the marker isn't
+        // yet expired, so the sweep must skip it.
+        let (queue, store, clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue,
+            store.clone(),
+            ScriptedRunner::new(vec![StepOutcome::Succeed {
+                result: b"done".to_vec(),
+            }]),
+            ChannelHook { tx },
+        )
+        .memo_retention(Duration::from_millis(200))
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                input: b"in".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        advance(&clock, Duration::from_millis(200)).await;
+        // Let the sweeper finish its tick.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        let memos = MemoStore::new(store, "workflow-memo");
+        let markers = memos.list_terminal_markers().await.unwrap();
+        assert_eq!(markers.len(), 1, "boundary marker must not be swept");
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sweeper_removes_expired_markers_and_their_memos() {
+        // Retention 100ms (sweep interval 50ms). After the marker is
+        // written we drop a synthetic memo entry for the run and then
+        // advance well past retention; the sweeper must clear both.
+        let (queue, store, clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue,
+            store.clone(),
+            ScriptedRunner::new(vec![StepOutcome::Succeed {
+                result: b"done".to_vec(),
+            }]),
+            ChannelHook { tx },
+        )
+        .memo_retention(Duration::from_millis(100))
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        let handle = runtime
+            .submit(RunSpec {
+                input: b"in".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Write a memo entry for the run so we can confirm sweep
+        // clears it along with the marker.
+        let memos = MemoStore::new(store.clone(), "workflow-memo");
+        memos
+            .new_memo(&handle.run_id, 0)
+            .put("k", b"cached")
+            .await
+            .unwrap();
+
+        advance(&clock, Duration::from_millis(300)).await;
+
+        let cleared = yield_until(50, || async {
+            memos.list_terminal_markers().await.unwrap().is_empty()
+        })
+        .await;
+        assert!(cleared, "sweeper did not clear the expired marker");
+        assert_eq!(
+            memos.new_memo(&handle.run_id, 0).get("k").await.unwrap(),
+            None,
+            "sweeper did not clear the run's memo entries",
+        );
 
         let _ = shutdown.send(());
     }

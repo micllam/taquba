@@ -35,6 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deletion. Without this setter no marker is written and memo entries
   are retained indefinitely (appropriate for short-lived runs or
   external cleanup).
+- Memo-retention sweeper: when `memo_retention` is set,
+  `WorkflowRuntime::run` spawns a background task that periodically
+  scans terminal markers and, for each marker older than the
+  configured window, deletes the run's memo entries and then the
+  marker itself. The first sweep fires on startup so a fresh process
+  catches markers left behind by an earlier one. The sweeper shuts
+  down with the caller-supplied shutdown future.
 - `WorkflowRuntime` now reads every timestamp it writes
   (`DurableRunRecord::submitted_at_ms`, the `ContinueAfter` `run_at`,
   and the terminal-marker timestamp) through a `taquba::Clock`. By
