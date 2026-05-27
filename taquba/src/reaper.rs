@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::job::{JobRecord, JobStatus};
-use crate::queue::{QueueConfig, dead_key, job_index_key, pending_key};
+use crate::queue::{QueueConfig, dead_key, job_index_key, parse_leading_timestamp, pending_key};
 use crate::stats::update_stats;
 
 pub(crate) struct Reaper {
@@ -104,24 +104,11 @@ pub(crate) async fn reap_expired(
 
     let mut iter = db.scan_prefix(b"claimed:").await?;
     while let Some(kv) = iter.next().await? {
-        let key_str = match std::str::from_utf8(&kv.key) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
         // Key format: "claimed:{ts:020}:{queue}:{ulid}".
         // Sorted globally by `ts`, so the first key whose timestamp is in the
         // future ends the scan; everything after it is also in the future.
-        let after = match key_str.strip_prefix("claimed:") {
-            Some(s) => s,
-            None => continue,
-        };
-        let ts_str = match after.split(':').next() {
-            Some(s) => s,
-            None => continue,
-        };
-        let lease_expiry = match ts_str.parse::<u64>() {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Some(lease_expiry) = parse_leading_timestamp(&kv.key, "claimed:") else {
+            continue;
         };
         if lease_expiry > now {
             break;
@@ -239,21 +226,8 @@ async fn sweep_done(
     while let Some(kv) = iter.next().await? {
         // Key format: "done:{completed_at:020}:{queue}:{id}".
         if let Some(min_cutoff) = min_cutoff {
-            let key_str = match std::str::from_utf8(&kv.key) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let after = match key_str.strip_prefix("done:") {
-                Some(s) => s,
-                None => continue,
-            };
-            let ts_str = match after.split(':').next() {
-                Some(s) => s,
-                None => continue,
-            };
-            let completed_at_in_key = match ts_str.parse::<u64>() {
-                Ok(v) => v,
-                Err(_) => continue,
+            let Some(completed_at_in_key) = parse_leading_timestamp(&kv.key, "done:") else {
+                continue;
             };
             if completed_at_in_key >= min_cutoff {
                 break;

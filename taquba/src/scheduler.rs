@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::job::{JobRecord, JobStatus};
-use crate::queue::{job_index_key, pending_key};
+use crate::queue::{job_index_key, parse_leading_timestamp, pending_key};
 use crate::stats::update_stats;
 
 pub(crate) struct Scheduler {
@@ -51,24 +51,11 @@ pub(crate) async fn promote_due_jobs(db: &Db, clock: &dyn Clock) -> Result<usize
 
     let mut iter = db.scan_prefix(b"scheduled:").await?;
     while let Some(kv) = iter.next().await? {
-        let key_str = match std::str::from_utf8(&kv.key) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
         // Key format: "scheduled:{run_at:020}:{queue}:{ulid}".
         // Sorted globally by `run_at`, so the first key with a timestamp in the
         // future ends the scan.
-        let after = match key_str.strip_prefix("scheduled:") {
-            Some(s) => s,
-            None => continue,
-        };
-        let ts_str = match after.split(':').next() {
-            Some(s) => s,
-            None => continue,
-        };
-        let run_at = match ts_str.parse::<u64>() {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Some(run_at) = parse_leading_timestamp(&kv.key, "scheduled:") else {
+            continue;
         };
         if run_at > now {
             break;

@@ -83,6 +83,21 @@ pub(crate) fn scheduled_key(queue: &str, run_at: u64, id: &str) -> String {
     format!("scheduled:{:020}:{}:{}", run_at, queue, id)
 }
 
+/// Parse the zero-padded leading timestamp from a time-first taquba
+/// key of the shape `{prefix}{ts:020}:{...}`. Returns `None` when
+/// `key` is not valid UTF-8, doesn't start with `prefix`, or has a
+/// malformed timestamp segment.
+///
+/// Used by the reaper / scheduler / retention sweeps to early-exit a
+/// prefix scan once they reach a key whose timestamp is past the
+/// relevant cutoff.
+pub(crate) fn parse_leading_timestamp(key: &[u8], prefix: &str) -> Option<u64> {
+    let key_str = std::str::from_utf8(key).ok()?;
+    let after = key_str.strip_prefix(prefix)?;
+    let ts_str = after.split(':').next()?;
+    ts_str.parse::<u64>().ok()
+}
+
 pub(crate) fn job_index_key(id: &str) -> String {
     format!("jobindex:{}", id)
 }
@@ -1576,6 +1591,40 @@ mod tests {
 
     fn make_store() -> Arc<dyn ObjectStore> {
         Arc::new(InMemory::new())
+    }
+
+    #[test]
+    fn parse_leading_timestamp_round_trips_a_well_formed_key() {
+        let key = done_key(1_700_000_000_000, "work", "abc");
+        assert_eq!(
+            parse_leading_timestamp(key.as_bytes(), "done:"),
+            Some(1_700_000_000_000),
+        );
+    }
+
+    #[test]
+    fn parse_leading_timestamp_rejects_wrong_prefix() {
+        let key = b"claimed:00000000001700000000000:work:abc";
+        assert_eq!(parse_leading_timestamp(key, "done:"), None);
+    }
+
+    #[test]
+    fn parse_leading_timestamp_rejects_malformed_timestamp() {
+        let key = b"done:not-a-number:work:abc";
+        assert_eq!(parse_leading_timestamp(key, "done:"), None);
+    }
+
+    #[test]
+    fn parse_leading_timestamp_rejects_missing_separator() {
+        // Bare prefix with no following colon-delimited timestamp.
+        let key = b"done:";
+        assert_eq!(parse_leading_timestamp(key, "done:"), None);
+    }
+
+    #[test]
+    fn parse_leading_timestamp_rejects_non_utf8() {
+        let key = &[b'd', b'o', b'n', b'e', b':', 0xff, 0xff];
+        assert_eq!(parse_leading_timestamp(key, "done:"), None);
     }
 
     /// OpenOptions that disable retry backoff so nack tests can re-claim
