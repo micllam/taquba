@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use slatedb::config::Settings;
 use slatedb::object_store::ObjectStore;
 use slatedb::{Db, IsolationLevel};
 use tokio::sync::watch;
@@ -276,6 +277,18 @@ pub struct OpenOptions {
     /// Substitute [`MockClock`](crate::MockClock) in tests to advance
     /// time deterministically.
     pub clock: Arc<dyn Clock>,
+    /// Override SlateDB's WAL flush interval. `None` keeps SlateDB's
+    /// own default.
+    ///
+    /// `txn.commit()` blocks until the next flush tick, so this value
+    /// is the lower bound on per-operation latency for every taquba
+    /// state transition (`enqueue`, `claim`, `ack`, `nack`,
+    /// `dead_letter`).
+    ///
+    /// Does not affect durability semantics: commits still wait for
+    /// the flush before returning, so at-least-once delivery is
+    /// preserved regardless of the interval chosen.
+    pub flush_interval: Option<Duration>,
 }
 
 impl Default for OpenOptions {
@@ -286,6 +299,7 @@ impl Default for OpenOptions {
             default_queue_config: QueueConfig::default(),
             queue_configs: HashMap::new(),
             clock: default_clock(),
+            flush_interval: None,
         }
     }
 }
@@ -458,9 +472,14 @@ impl Queue {
         path: &str,
         opts: OpenOptions,
     ) -> Result<Self> {
+        let mut settings = Settings::default();
+        if let Some(flush_interval) = opts.flush_interval {
+            settings.flush_interval = Some(flush_interval);
+        }
         let db = Arc::new(
             Db::builder(path, object_store)
                 .with_merge_operator(Arc::new(CounterMergeOperator))
+                .with_settings(settings)
                 .build()
                 .await?,
         );

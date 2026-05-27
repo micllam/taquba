@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   crates share the queue's time source for their own timestamp work
   so virtualising time with `MockClock` advances the whole stack
   in lockstep.
+- `OpenOptions::flush_interval: Option<Duration>` exposes SlateDB's
+  WAL flush interval. `None` keeps SlateDB's own default (100ms).
+  Every taquba state transition (`enqueue`, `claim`, `ack`, `nack`,
+  `dead_letter`) blocks on `txn.commit()` which waits for the next
+  flush tick, so this value is the lower bound on per-operation
+  latency.
 
 ### Changed
 
