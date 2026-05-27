@@ -39,6 +39,17 @@ impl Reaper {
         let any_dead_retention = default_queue_config.dead_retention.is_some()
             || queue_configs.values().any(|c| c.dead_retention.is_some());
 
+        // Largest configured `keep_done_jobs` across every queue (named
+        // and default). Any `done:` record whose `completed_at` is
+        // newer than `now - max_keep_done` cannot be expired for any
+        // queue, so the time-ordered `done:` scan can stop the first
+        // time it sees a key past that threshold.
+        let max_keep_done: Option<Duration> = default_queue_config
+            .keep_done_jobs
+            .into_iter()
+            .chain(queue_configs.values().filter_map(|c| c.keep_done_jobs))
+            .max();
+
         let keep_done_for = |queue: &str| -> Option<Duration> {
             queue_configs
                 .get(queue)
@@ -61,7 +72,10 @@ impl Reaper {
                         Err(e) => warn!("lease reaper error: {e}"),
                     }
                     if any_keep_done {
-                        if let Err(e) = sweep_done(&db, clock.as_ref(), &keep_done_for).await {
+                        if let Err(e) =
+                            sweep_done(&db, clock.as_ref(), &keep_done_for, max_keep_done)
+                                .await
+                        {
                             warn!("done retention sweep error: {e}");
                         }
                     }
@@ -204,16 +218,48 @@ async fn reap_job(
 /// Delete done jobs whose retention window has expired. The window is
 /// resolved per-record by looking up the job's queue via `keep_done_for`.
 /// Records on queues with `keep_done_jobs = None` are skipped.
+///
+/// `done:` keys are sorted globally by `completed_at` (see
+/// [`crate::queue::done_key`]), so once the scan hits a key whose
+/// timestamp is newer than `now - max_keep_done`, no remaining record
+/// can be expired for any queue and the loop breaks. The per-record
+/// queue-specific retention check still runs below the threshold to
+/// honour mixed retention values across queues.
 async fn sweep_done(
     db: &Db,
     clock: &dyn Clock,
     keep_done_for: &(dyn Fn(&str) -> Option<Duration> + Sync),
+    max_keep_done: Option<Duration>,
 ) -> Result<()> {
     let now = clock.now_ms();
+    let min_cutoff = max_keep_done.map(|r| now.saturating_sub(r.as_millis() as u64));
 
     let mut victims: Vec<(Vec<u8>, String)> = Vec::new();
     let mut iter = db.scan_prefix(b"done:").await?;
     while let Some(kv) = iter.next().await? {
+        // Key format: "done:{completed_at:020}:{queue}:{id}".
+        if let Some(min_cutoff) = min_cutoff {
+            let key_str = match std::str::from_utf8(&kv.key) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let after = match key_str.strip_prefix("done:") {
+                Some(s) => s,
+                None => continue,
+            };
+            let ts_str = match after.split(':').next() {
+                Some(s) => s,
+                None => continue,
+            };
+            let completed_at_in_key = match ts_str.parse::<u64>() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if completed_at_in_key >= min_cutoff {
+                break;
+            }
+        }
+
         let job: JobRecord = match rmp_serde::from_slice(&kv.value) {
             Ok(j) => j,
             Err(_) => continue,
