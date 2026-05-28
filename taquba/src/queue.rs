@@ -2580,12 +2580,19 @@ mod tests {
         q.close().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_promote_scheduled_now() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
+        let initial = 1_700_000_000_000u64;
+        let clock = MockClock::new(initial);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
 
-        // Enqueue a job with a 1ms run_at (already in the past by the time we promote).
-        let run_at = std::time::SystemTime::now() + Duration::from_millis(1);
+        let run_at = std::time::UNIX_EPOCH + Duration::from_millis(initial + 100);
         let id = q
             .enqueue_with(
                 "jobs",
@@ -2606,8 +2613,8 @@ mod tests {
                 .is_none()
         );
 
-        // Small sleep to ensure run_at has passed, then trigger a manual promotion.
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        // Advance past `run_at` and trigger a manual promotion.
+        clock.advance(Duration::from_millis(200));
         q.promote_scheduled_now().await.unwrap();
 
         let s = q.stats("jobs").await.unwrap();
