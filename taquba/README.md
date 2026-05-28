@@ -1,18 +1,18 @@
 # Taquba
 
-A durable, single-process task queue for Rust, backed by object storage. Built
-on [SlateDB](https://github.com/slatedb/slatedb).
+A durable, single-process task queue for Rust with **no stateful service to
+operate**. Queue state lives directly in your object storage; compute is
+stateless and replaceable.
 
 > The foundation of the [Taquba ecosystem](https://github.com/micllam/taquba);
 > see the workspace README for the workflow runtime, cron, jobs, and webhooks
 > crates that build on this queue.
 
-Taquba uses SlateDB's single-writer model: all producers and workers for a
-given store **must run inside one process**.
-
-Taquba is the right fit when you want durable background jobs whose state
-survives node loss, ephemeral disks, and region failures - without operating a
-queue server.
+Built on [SlateDB](https://github.com/slatedb/slatedb). All producers and
+workers for a given store run inside one process and share an `Arc<Queue>`.
+Use Taquba when you want durable background jobs whose state survives node
+loss, ephemeral disks, and region failures, without operating a queue
+server or a separate state layer (typically Postgres).
 
 ## Features
 

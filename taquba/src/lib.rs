@@ -1,8 +1,13 @@
-//! A durable, single-process task queue for Rust, backed by object storage.
+//! A durable, single-process task queue for Rust with **no stateful service
+//! to operate**. Queue state lives directly in your object storage; compute
+//! is stateless and replaceable.
 //!
-//! Taquba persists every job-state transition through [SlateDB] to an
-//! [`object_store`] backend (local disk, S3, GCS, Azure Blob, MinIO, etc.) so the
-//! queue survives process restarts, node loss and ephemeral disks.
+//! Built on [SlateDB] and the [`object_store`] crate (local disk, S3, GCS,
+//! Azure Blob, MinIO, etc.). All producers and workers for a given store run
+//! inside one process and share an `Arc<Queue>`. Use Taquba when you want
+//! durable background jobs whose state survives node loss, ephemeral disks,
+//! and region failures, without operating a queue server or a separate
+//! state layer (typically Postgres).
 //!
 //! # When Taquba fits
 //!
