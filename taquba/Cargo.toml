@@ -35,3 +35,9 @@ tokio-util = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+
+[[bench]]
+name = "claim_drain"
+# Disable libtest's bench harness so the file runs as a plain `#[tokio::main]`
+# binary. We use `cargo bench` for discovery only, not for the harness.
+harness = false
