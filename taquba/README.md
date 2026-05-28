@@ -3,6 +3,10 @@
 A durable, single-process task queue for Rust, backed by object storage. Built
 on [SlateDB](https://github.com/slatedb/slatedb).
 
+> The foundation of the [Taquba ecosystem](https://github.com/micllam/taquba);
+> see the workspace README for the workflow runtime, cron, jobs, and webhooks
+> crates that build on this queue.
+
 Taquba uses SlateDB's single-writer model: all producers and workers for a
 given store **must run inside one process**.
 

@@ -2,6 +2,10 @@
 
 HTTP webhook delivery on top of the [Taquba](../taquba) durable task queue.
 
+> Part of the [Taquba ecosystem](https://github.com/micllam/taquba); see the
+> workspace README for the queue core and the other crates that compose with
+> this one.
+
 Aimed at workloads where a webhook is the announcement of an event
 (alerting on a timeseries DB, event relays, push notifications).
 

@@ -3,6 +3,10 @@
 Durable, at-least-once workflow runtime on top of the
 [Taquba](../taquba) durable task queue.
 
+> Part of the [Taquba ecosystem](https://github.com/micllam/taquba); see the
+> workspace README for the queue core and the other crates that compose with
+> this one.
+
 `taquba-workflow` is the plumbing for any multi-step process that
 benefits from durable state between steps: idempotent step execution,
 retries with backoff, graceful restart, and terminal-state notifications.

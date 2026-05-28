@@ -2,6 +2,10 @@
 
 POSIX cron-style scheduling on top of the [Taquba](../taquba) durable task queue.
 
+> Part of the [Taquba ecosystem](https://github.com/micllam/taquba); see the
+> workspace README for the queue core and the other crates that compose with
+> this one.
+
 Register named cron expressions paired with a payload; when each expression's
 firing time arrives, the corresponding payload is enqueued onto a Taquba
 queue. The scheduler is single-process and event-driven (sleeps until the

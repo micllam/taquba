@@ -2,6 +2,10 @@
 
 Durable, typed async function execution on top of the [Taquba](https://docs.rs/taquba) durable task queue.
 
+> Part of the [Taquba ecosystem](https://github.com/micllam/taquba); see the
+> workspace README for the queue core and the other crates that compose with
+> this one.
+
 `taquba-jobs` is a primitive for running functions reliably in the background:
 define a typed `Job`, submit instances of it, get the typed result back.
 Durability, retries, idempotency and result persistence are handled for you;
