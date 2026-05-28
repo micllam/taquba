@@ -31,10 +31,7 @@ impl ClaimCursor {
     }
 
     pub(crate) fn set(&self, queue: &str, cursor: Bytes) {
-        self.inner
-            .lock()
-            .unwrap()
-            .insert(queue.to_string(), cursor);
+        self.inner.lock().unwrap().insert(queue.to_string(), cursor);
     }
 
     pub(crate) fn clear(&self, queue: &str) {

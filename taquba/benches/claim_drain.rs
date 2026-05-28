@@ -179,8 +179,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{i},{n},{p50},{p95},{p99}");
     }
 
-    let queue = Arc::try_unwrap(queue)
-        .map_err(|_| "queue still has outstanding references at shutdown")?;
+    let queue =
+        Arc::try_unwrap(queue).map_err(|_| "queue still has outstanding references at shutdown")?;
     queue.close().await?;
     Ok(())
 }
