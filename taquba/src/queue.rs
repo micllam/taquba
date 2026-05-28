@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,6 +12,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, instrument, warn};
 use ulid::Ulid;
 
+use crate::claim_cursor::ClaimCursor;
 use crate::clock::{Clock, default_clock};
 use crate::error::{Error, Result};
 use crate::job::{JobRecord, JobStatus};
@@ -415,6 +417,8 @@ pub struct Queue {
     /// parallel. In-process coordination is sufficient because all
     /// writers to a SlateDB store share one process.
     claim_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-queue resume point for the next claim scan.
+    claim_cursor: ClaimCursor,
     /// Wakeup fired whenever any job reaches a terminal state: `Done`
     /// (acked, kept or not), `Dead` (dead-lettered by worker, exhausted
     /// retry, or reaper), or `Pending` / `Scheduled` jobs removed via
@@ -492,6 +496,7 @@ impl Queue {
         );
         let job_available = Arc::new(tokio::sync::Notify::new());
         let completion_notify = Arc::new(tokio::sync::Notify::new());
+        let claim_cursor = ClaimCursor::new();
         let (reaper_shutdown, reaper_rx) = watch::channel(false);
         let reaper = Reaper {
             db: db.clone(),
@@ -501,6 +506,7 @@ impl Queue {
             clock: opts.clock.clone(),
             job_available: job_available.clone(),
             completion_notify: completion_notify.clone(),
+            claim_cursor: claim_cursor.clone(),
         };
         let reaper_handle = tokio::spawn(reaper.run(reaper_rx));
         let (scheduler_shutdown, scheduler_rx) = watch::channel(false);
@@ -509,6 +515,7 @@ impl Queue {
             interval: opts.scheduler_interval,
             clock: opts.clock.clone(),
             job_available: job_available.clone(),
+            claim_cursor: claim_cursor.clone(),
         };
         let scheduler_handle = tokio::spawn(scheduler.run(scheduler_rx));
         Ok(Self {
@@ -523,6 +530,7 @@ impl Queue {
             job_available,
             claimed_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             claim_locks: std::sync::Mutex::new(HashMap::new()),
+            claim_cursor,
             completion_notify,
         })
     }
@@ -820,6 +828,7 @@ impl Queue {
                     // job becomes claimable later via the scheduler loop,
                     // which fires its own notify.
                     if matches!(status, JobStatus::Pending) {
+                        self.claim_cursor.invalidate_if_at_or_before(&queue, &key);
                         self.job_available.notify_waiters();
                     }
                     debug!(queue = %queue, job_id = %id, "job enqueued");
@@ -907,21 +916,56 @@ impl Queue {
     /// retry that would otherwise resolve which worker takes the
     /// head of `pending:`. The lock is per-queue, so different
     /// queues' claim paths still run in parallel.
+    ///
+    /// A per-queue in-memory cursor records the most recently
+    /// claimed key and is used as the start bound on the next
+    /// scan. This lets steady-state claims skip over the
+    /// tombstones left by previously claimed (and deleted)
+    /// `pending:` entries. When the cursor scan yields nothing
+    /// inside the queue's prefix (cursor exhausted, or an older
+    /// job has been requeued by `nack` behind the cursor), the
+    /// claim falls back to a front prefix scan and resets the
+    /// cursor.
     #[instrument(skip(self), fields(queue))]
     pub async fn claim(&self, queue: &str, lease_duration: Duration) -> Result<Option<JobRecord>> {
         let lock = self.claim_lock_for(queue);
         let _guard = lock.lock().await;
 
         let prefix = pending_prefix(queue);
+        let prefix_bytes = prefix.as_bytes();
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
 
-            let mut iter = txn.scan_prefix(prefix.as_bytes()).await?;
-            let kv = match iter.next().await? {
+            // Cursor-resumed scan: start strictly after the most
+            // recently claimed key. A yielded key outside the
+            // queue's prefix means the cursor is past the queue's
+            // tail; fall through to the front-scan branch.
+            let mut kv = None;
+            if let Some(cursor) = self.claim_cursor.get(queue) {
+                let mut iter = txn
+                    .scan((Bound::Excluded(cursor), Bound::Unbounded))
+                    .await?;
+                if let Some(candidate) = iter.next().await? {
+                    if candidate.key.starts_with(prefix_bytes) {
+                        kv = Some(candidate);
+                    }
+                }
+            }
+            // Front scan: cold start, cursor exhausted, or an older
+            // requeued job sits behind the cursor.
+            let kv = match kv {
                 Some(kv) => kv,
-                None => return Ok(None),
+                None => {
+                    let mut iter = txn.scan_prefix(prefix_bytes).await?;
+                    match iter.next().await? {
+                        Some(kv) => kv,
+                        None => {
+                            self.claim_cursor.clear(queue);
+                            return Ok(None);
+                        }
+                    }
+                }
             };
-            drop(iter);
 
             let pending_key_bytes = kv.key.clone();
             let mut job: JobRecord = rmp_serde::from_slice(&kv.value)?;
@@ -967,6 +1011,7 @@ impl Queue {
             self.install_cancel_token(&mut job);
             match txn.commit().await {
                 Ok(_) => {
+                    self.claim_cursor.set(queue, pending_key_bytes);
                     debug!(queue = queue, job_id = %job.id, attempt = job.attempts, "job claimed");
                     return Ok(Some(job));
                 }
@@ -1090,6 +1135,8 @@ impl Queue {
                     &job.queue,
                     &[(JobStatus::Pending, 1), (JobStatus::Claimed, -1)],
                 )?;
+                self.claim_cursor
+                    .invalidate_if_at_or_before(&job.queue, &pending);
                 debug!(
                     queue = %job.queue,
                     job_id = %job.id,
@@ -1284,6 +1331,8 @@ impl Queue {
             &[(JobStatus::Pending, 1), (JobStatus::Dead, -1)],
         )?;
         txn.commit().await?;
+        self.claim_cursor
+            .invalidate_if_at_or_before(&job.queue, &pending);
         self.job_available.notify_waiters();
 
         debug!(queue = %job.queue, job_id = %job.id, "dead job re-queued");
@@ -1601,7 +1650,13 @@ impl Queue {
 
     /// Trigger an immediate reap sweep (primarily useful in tests and tooling).
     pub async fn reap_now(&self) -> Result<()> {
-        let count = reap_expired(&self.db, self.clock.as_ref(), &self.completion_notify).await?;
+        let count = reap_expired(
+            &self.db,
+            self.clock.as_ref(),
+            &self.completion_notify,
+            &self.claim_cursor,
+        )
+        .await?;
         if count > 0 {
             self.job_available.notify_waiters();
         }
@@ -1610,7 +1665,7 @@ impl Queue {
 
     /// Trigger an immediate scheduled-job promotion sweep (primarily useful in tests).
     pub async fn promote_scheduled_now(&self) -> Result<()> {
-        let count = promote_due_jobs(&self.db, self.clock.as_ref()).await?;
+        let count = promote_due_jobs(&self.db, self.clock.as_ref(), &self.claim_cursor).await?;
         if count > 0 {
             self.job_available.notify_waiters();
         }

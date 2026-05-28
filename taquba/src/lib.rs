@@ -103,6 +103,7 @@
 
 #![warn(missing_docs)]
 
+mod claim_cursor;
 mod clock;
 mod error;
 mod job;

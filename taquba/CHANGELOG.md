@@ -47,6 +47,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   queues' claims still run in parallel. Per-claim wall-clock latency
   under high single-queue concurrency drops from seconds to roughly
   one commit interval. Public API unchanged.
+- `Queue::claim` now maintains an in-memory per-queue cursor that
+  records the most recently claimed `pending:` key, and starts the
+  next claim's scan from immediately after it. This skips the
+  tombstone band left by previously claimed (and deleted) `pending:`
+  entries that the SlateDB iterator would otherwise walk. The
+  cursor is invalidated whenever a `pending:` key is written at or
+  before it (nack-requeue, dead-job requeue, reaper-requeue,
+  scheduler promotion, and any enqueue at a lower-numbered
+  priority); when this happens the next claim falls back to a full
+  prefix scan. The cursor is not persisted: on process restart the
+  first claim falls back to the prefix scan and re-warms naturally.
+  Public API unchanged.
 
 ### Fixed
 

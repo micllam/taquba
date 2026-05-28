@@ -6,6 +6,7 @@ use slatedb::{Db, IsolationLevel};
 use tokio::sync::{Notify, watch};
 use tracing::{debug, warn};
 
+use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::job::{JobRecord, JobStatus};
@@ -20,6 +21,7 @@ pub(crate) struct Reaper {
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) job_available: Arc<Notify>,
     pub(crate) completion_notify: Arc<Notify>,
+    pub(crate) claim_cursor: ClaimCursor,
 }
 
 impl Reaper {
@@ -32,6 +34,7 @@ impl Reaper {
             clock,
             job_available,
             completion_notify,
+            claim_cursor,
         } = self;
 
         let any_keep_done = default_queue_config.keep_done_jobs.is_some()
@@ -66,7 +69,7 @@ impl Reaper {
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {
-                    match reap_expired(&db, clock.as_ref(), &completion_notify).await {
+                    match reap_expired(&db, clock.as_ref(), &completion_notify, &claim_cursor).await {
                         Ok(0) => {}
                         Ok(_) => job_available.notify_waiters(),
                         Err(e) => warn!("lease reaper error: {e}"),
@@ -98,6 +101,7 @@ pub(crate) async fn reap_expired(
     db: &Db,
     clock: &dyn Clock,
     completion_notify: &Notify,
+    claim_cursor: &ClaimCursor,
 ) -> Result<usize> {
     let now = clock.now_ms();
     let mut expired_keys = Vec::new();
@@ -119,7 +123,7 @@ pub(crate) async fn reap_expired(
 
     let count = expired_keys.len();
     for key_bytes in expired_keys {
-        reap_job(db, clock, &key_bytes, completion_notify).await?;
+        reap_job(db, clock, &key_bytes, completion_notify, claim_cursor).await?;
     }
 
     Ok(count)
@@ -130,6 +134,7 @@ async fn reap_job(
     clock: &dyn Clock,
     claimed_key_bytes: &[u8],
     completion_notify: &Notify,
+    claim_cursor: &ClaimCursor,
 ) -> Result<()> {
     loop {
         let txn = db.begin(IsolationLevel::Snapshot).await?;
@@ -188,8 +193,13 @@ async fn reap_job(
         }
 
         let became_dead = matches!(job.status, JobStatus::Dead);
+        let requeued_pending_key =
+            (!became_dead).then(|| pending_key(&job.queue, job.priority, &job.id));
         match txn.commit().await {
             Ok(_) => {
+                if let Some(key) = requeued_pending_key {
+                    claim_cursor.invalidate_if_at_or_before(&job.queue, &key);
+                }
                 if became_dead {
                     completion_notify.notify_waiters();
                 }

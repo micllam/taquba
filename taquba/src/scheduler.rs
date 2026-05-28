@@ -5,6 +5,7 @@ use slatedb::{Db, IsolationLevel};
 use tokio::sync::{Notify, watch};
 use tracing::{debug, warn};
 
+use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::job::{JobRecord, JobStatus};
@@ -16,6 +17,7 @@ pub(crate) struct Scheduler {
     pub(crate) interval: Duration,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) job_available: Arc<Notify>,
+    pub(crate) claim_cursor: ClaimCursor,
 }
 
 impl Scheduler {
@@ -25,11 +27,12 @@ impl Scheduler {
             interval,
             clock,
             job_available,
+            claim_cursor,
         } = self;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {
-                    match promote_due_jobs(&db, clock.as_ref()).await {
+                    match promote_due_jobs(&db, clock.as_ref(), &claim_cursor).await {
                         Ok(0) => {}
                         Ok(_) => job_available.notify_waiters(),
                         Err(e) => warn!("scheduled job promoter error: {e}"),
@@ -45,7 +48,11 @@ impl Scheduler {
 /// Scan the `scheduled:` key space and move any job whose `run_at` has passed
 /// into the `pending:` key space so workers can claim it. Returns the number
 /// of jobs that were promoted.
-pub(crate) async fn promote_due_jobs(db: &Db, clock: &dyn Clock) -> Result<usize> {
+pub(crate) async fn promote_due_jobs(
+    db: &Db,
+    clock: &dyn Clock,
+    claim_cursor: &ClaimCursor,
+) -> Result<usize> {
     let now = clock.now_ms();
     let mut due_keys = Vec::new();
 
@@ -66,13 +73,17 @@ pub(crate) async fn promote_due_jobs(db: &Db, clock: &dyn Clock) -> Result<usize
 
     let count = due_keys.len();
     for key_bytes in due_keys {
-        promote_job(db, &key_bytes).await?;
+        promote_job(db, &key_bytes, claim_cursor).await?;
     }
 
     Ok(count)
 }
 
-async fn promote_job(db: &Db, scheduled_key_bytes: &[u8]) -> Result<()> {
+async fn promote_job(
+    db: &Db,
+    scheduled_key_bytes: &[u8],
+    claim_cursor: &ClaimCursor,
+) -> Result<()> {
     loop {
         let txn = db.begin(IsolationLevel::Snapshot).await?;
 
@@ -103,6 +114,7 @@ async fn promote_job(db: &Db, scheduled_key_bytes: &[u8]) -> Result<()> {
 
         match txn.commit().await {
             Ok(_) => {
+                claim_cursor.invalidate_if_at_or_before(&job.queue, &pending);
                 debug!(
                     queue = %job.queue,
                     job_id = %job.id,
