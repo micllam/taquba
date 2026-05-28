@@ -59,6 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefix scan. The cursor is not persisted: on process restart the
   first claim falls back to the prefix scan and re-warms naturally.
   Public API unchanged.
+- Bumped minimum `slatedb` version from 0.13 to 0.13.1.
 
 ### Fixed
 
