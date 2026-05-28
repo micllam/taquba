@@ -248,6 +248,40 @@ sweeps) can be built directly on `MemoStore::list_terminal_markers`,
 `MemoStore::clear_memos_for_run`, and `MemoStore::delete_terminal_marker`
 without configuring `WorkflowRuntimeBuilder::memo_retention`.
 
+## Time injection
+
+Every timestamp the runtime writes (the `submitted_at_ms` on the
+durable per-run record, the `run_at` it computes when a step
+returns `ContinueAfter`, and the terminal-marker timestamps the
+memo-retention sweep consumes) is read through a `taquba::Clock`
+rather than `SystemTime::now()`. By default the runtime inherits
+the clock its `Queue` was opened with, so passing a `MockClock`
+to `OpenOptions::clock` virtualises both the queue and the
+workflow runtime in lockstep:
+
+```rust,ignore
+let clock = MockClock::new(1_700_000_000_000);
+let opts = OpenOptions {
+    clock: Arc::new(clock.clone()),
+    ..OpenOptions::default()
+};
+let queue = Queue::open_with_options(store.clone(), "db", opts).await?;
+let runtime = WorkflowRuntime::builder(queue, store, runner, hook).build();
+// `runtime` reads the same clock as `queue`; `clock.advance(...)`
+// moves every time-based decision the runtime makes.
+```
+
+Override the inherited default via `WorkflowRuntimeBuilder::clock`
+when a test or specialised setup needs the runtime on a different
+time source than the queue. The common case for production callers
+is to leave the default and let the queue's `SystemClock` flow
+through.
+
+This makes downstream tests deterministic: `ContinueAfter` delays,
+memo-retention sweep eligibility, and terminal-marker ages all
+advance under explicit `MockClock::advance` calls rather than
+wall-clock waits.
+
 ## Duplicate submissions
 
 `WorkflowRuntime::submit` is idempotent on `(run_id, spec.input)`. A
