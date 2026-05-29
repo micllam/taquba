@@ -200,15 +200,13 @@ impl MemoStore {
         Path::from(format!("{}/memos/{}", self.prefix, run_id))
     }
 
-    fn terminal_marker_path(&self, run_id: &str, terminal_at_ms: u64) -> Path {
-        Path::from(format!(
-            "{}/terminals/{:020}_{}",
-            self.prefix, terminal_at_ms, run_id
-        ))
-    }
-
     fn terminals_prefix(&self) -> Path {
         Path::from(format!("{}/terminals", self.prefix))
+    }
+
+    fn terminal_marker_path(&self, run_id: &str, terminal_at_ms: u64) -> Path {
+        self.terminals_prefix()
+            .child(format!("{terminal_at_ms:020}_{run_id}"))
     }
 }
 
