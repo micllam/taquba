@@ -41,6 +41,38 @@ to clear them on a schedule, or plan a lifecycle policy on the
 object-store prefix (S3 lifecycle rules, GCS object-lifecycle management,
 etc.) if you prefer to manage retention out-of-band.
 
+## Idempotent submissions
+
+`Job::idempotency_key` collapses duplicate submissions to a single
+job. Two phases:
+
+- **Before the original completes** (pending, scheduled, or in
+  flight): a second submission with the same key returns a
+  `JobHandle` pointing at the in-flight job, with
+  `newly_submitted() == false`. If the payload differs from the
+  original, the submission fails with `Error::InputMismatch` instead
+  of silently dedup-hitting a job whose input was something else.
+  The payload check survives process restarts: the SHA-256 of the
+  serialized payload is persisted in Taquba's user KV namespace
+  atomically with the enqueue.
+- **After the original completes**: the same dedup record carries
+  the original job's id, so a re-submission with a matching payload
+  returns a handle pointing at the cached result blob. Awaiting it
+  (or calling `JobHandle::fetch_result`) yields the cached outcome
+  (success or terminal failure) without re-running the work.
+
+If `result_retention` is configured and the cached blob has been
+swept, the dedup record still points to a missing blob; the
+re-submission then falls through to the normal enqueue path and
+re-runs the job. Size the retention window so it covers the longest
+gap callers need between the original submission and an idempotent
+re-submit.
+
+For jobs where "same input means same key" is the right semantics,
+the `payload_idempotency_key` helper hashes the serialized payload
+directly. Custom keys are appropriate when the dedup identity is
+narrower than the full payload (e.g. `"email:{recipient}:{date}"`).
+
 ## Result retention
 
 `JobRunnerBuilder::result_retention(Duration)` enables an in-process
@@ -80,8 +112,9 @@ retention window, and exits cleanly when the runner shuts down.
 Once a blob is swept, `JobHandle::fetch_result` for that job returns
 `Ok(None)` and an idempotent re-submission of the same payload falls
 through to re-running the job instead of short-circuiting to a cached
-result. Size the window so it covers the longest gap callers need
-between the original submission and an idempotent re-submit.
+result (see [Idempotent submissions](#idempotent-submissions)). Size
+the window so it covers the longest gap callers need between the
+original submission and an idempotent re-submit.
 
 ## Time injection
 
