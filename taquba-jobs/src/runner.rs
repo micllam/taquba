@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use taquba::object_store::ObjectStore;
 use taquba::{
-    EnqueueOptions, EnqueueResult, JobRecord, PermanentFailure, Queue, Worker, WorkerError,
+    Clock, EnqueueOptions, EnqueueResult, JobRecord, PermanentFailure, Queue, Worker, WorkerError,
     run_worker_concurrent,
 };
 use tokio::task::JoinHandle;
@@ -76,6 +76,11 @@ pub(crate) struct Submitter {
     queue_name: Arc<str>,
     results: ResultStore,
     state: Arc<State>,
+    clock: Arc<dyn Clock>,
+    /// Window after a job reaches a terminal state during which its
+    /// outcome blob is retained. `None` disables retention entirely (no
+    /// terminal marker is written and no sweeper runs).
+    result_retention: Option<Duration>,
 }
 
 impl Submitter {
@@ -93,6 +98,88 @@ impl Submitter {
 
     pub(crate) fn state(&self) -> &State {
         &self.state
+    }
+
+    /// Record that `job_id` has reached a terminal state. When result
+    /// retention is enabled, writes a terminal marker the sweeper will
+    /// use to schedule the blob's deletion. A failure here is logged
+    /// but not propagated: the job has already acked, and leaving the
+    /// blob un-marked just means it gets retained instead of swept.
+    async fn note_terminal(&self, job_id: &str) {
+        if self.result_retention.is_none() {
+            return;
+        }
+        if let Err(err) = self
+            .results
+            .write_terminal_marker(job_id, self.clock.now_ms())
+            .await
+        {
+            tracing::warn!(
+                job_id = %job_id,
+                "failed to write terminal marker: {err}"
+            );
+        }
+    }
+
+    /// Result-retention sweep loop. Runs only when
+    /// [`JobRunnerBuilder::result_retention`] was set; the first tick
+    /// fires immediately so a fresh runner catches markers left behind
+    /// by an earlier process, then ticks every `retention` until
+    /// `shutdown` is cancelled.
+    async fn run_sweep(&self, shutdown: CancellationToken) {
+        let Some(retention) = self.result_retention else {
+            return;
+        };
+        let mut ticker = tokio::time::interval(retention);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = ticker.tick() => {
+                    if let Err(err) = self.sweep_expired_results(retention).await {
+                        tracing::warn!("result retention sweep failed: {err}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// One pass of result retention: list every terminal marker and,
+    /// for each marker older than `retention`, delete the job's result
+    /// blob and then the marker. Returns the number of blobs cleared.
+    /// Errors on individual entries are logged and skipped so a
+    /// transient failure on one marker doesn't stall the rest of the
+    /// sweep.
+    async fn sweep_expired_results(&self, retention: Duration) -> Result<usize> {
+        let now_ms = self.clock.now_ms();
+        let retention_ms = retention.as_millis() as u64;
+        let cutoff = now_ms.saturating_sub(retention_ms);
+        let markers = self.results.list_terminal_markers().await?;
+        let mut cleared = 0usize;
+        for marker in markers {
+            if marker.terminal_at_ms >= cutoff {
+                continue;
+            }
+            if let Err(err) = self.results.delete(&marker.job_id).await {
+                tracing::warn!(
+                    job_id = %marker.job_id,
+                    "result delete failed during sweep: {err}",
+                );
+                continue;
+            }
+            if let Err(err) = self.results.delete_terminal_marker(&marker).await {
+                tracing::warn!(
+                    job_id = %marker.job_id,
+                    "delete_terminal_marker failed during sweep: {err}",
+                );
+                // Result blob is gone but the marker remains; the next
+                // pass will retry the marker delete (the result delete
+                // is a no-op on the now-missing blob).
+                continue;
+            }
+            cleared += 1;
+        }
+        Ok(cleared)
     }
 
     pub(crate) async fn submit<J: Job>(&self, job: J, opts: SubmitOptions) -> Result<JobHandle<J>> {
@@ -304,6 +391,7 @@ async fn run_typed<J: Job>(
                 .put(&job.id, &StoredOutcome::Success { output: bytes })
                 .await
                 .map_err(WorkerError::from)?;
+            submitter.note_terminal(&job.id).await;
             tracing::info!(job_id = %job.id, job_type = J::NAME, "job completed");
             Ok(())
         }
@@ -326,6 +414,7 @@ async fn run_typed<J: Job>(
                         "failed to persist job failure outcome: {err}"
                     );
                 }
+                submitter.note_terminal(&job.id).await;
             }
 
             match kind {
@@ -468,16 +557,34 @@ impl JobRunner {
         let concurrency = self.concurrency;
         let poll_interval = self.poll_interval;
 
+        // One token fans the "stop now" signal out to the worker and
+        // to the sweeper. It's raised either when the caller's
+        // `shutdown` future fires, when [`RunnerHandle`] cancels it,
+        // or when the worker returns on its own (claim error, etc.).
         let token = CancellationToken::new();
-        let child = token.clone();
+        let outer = token.clone();
+        let submitter = self.submitter.clone();
+        let needs_sweeper = submitter.result_retention.is_some();
+
         let join = tokio::spawn(async move {
+            let sweep_handle = if needs_sweeper {
+                let submitter = submitter.clone();
+                let sweep_token = token.clone();
+                Some(tokio::spawn(async move {
+                    submitter.run_sweep(sweep_token).await;
+                }))
+            } else {
+                None
+            };
+
+            let worker_token = token.clone();
             let combined_shutdown = async move {
                 tokio::select! {
                     _ = shutdown => {}
-                    _ = child.cancelled() => {}
+                    _ = worker_token.cancelled() => {}
                 }
             };
-            run_worker_concurrent(
+            let result = run_worker_concurrent(
                 &queue,
                 &queue_name,
                 dispatcher,
@@ -485,10 +592,17 @@ impl JobRunner {
                 poll_interval,
                 combined_shutdown,
             )
-            .await
+            .await;
+            // Always cancel so the sweeper exits even when the worker
+            // returned on its own rather than via external shutdown.
+            token.cancel();
+            if let Some(h) = sweep_handle {
+                let _ = h.await;
+            }
+            result
         });
 
-        RunnerHandle { token, join }
+        RunnerHandle { token: outer, join }
     }
 }
 
@@ -533,6 +647,8 @@ pub struct JobRunnerBuilder {
     state: State,
     concurrency: usize,
     poll_interval: Duration,
+    result_retention: Option<Duration>,
+    clock: Option<Arc<dyn Clock>>,
 }
 
 impl JobRunnerBuilder {
@@ -545,6 +661,8 @@ impl JobRunnerBuilder {
             state: State::default(),
             concurrency: DEFAULT_CONCURRENCY,
             poll_interval: DEFAULT_POLL_INTERVAL,
+            result_retention: None,
+            clock: None,
         }
     }
 
@@ -613,6 +731,48 @@ impl JobRunnerBuilder {
         self
     }
 
+    /// Enable result-blob retention with the given window. When set,
+    /// the runner writes a terminal marker every time a job reaches a
+    /// terminal state (success or terminal failure) and the in-process
+    /// sweeper deletes that job's result blob `retention` after
+    /// termination. When unset (default), no marker is written and
+    /// result blobs are retained indefinitely; plan your own
+    /// object-store lifecycle policy in that case.
+    ///
+    /// Once a blob is swept, any subsequent
+    /// [`JobHandle::fetch_result`] for that job returns `Ok(None)`,
+    /// and an idempotent re-submission of the same payload falls
+    /// through to re-running the job rather than short-circuiting.
+    /// Set the window long enough to cover the longest gap your
+    /// callers need between the original submission and an
+    /// idempotent re-submit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `retention < 1ms`: the sweep interval equals the
+    /// retention window, and a sub-millisecond interval would issue
+    /// list+delete calls against the object store far faster than
+    /// the store can usefully serve them.
+    ///
+    /// [`JobHandle::fetch_result`]: crate::JobHandle::fetch_result
+    pub fn result_retention(mut self, retention: Duration) -> Self {
+        assert!(
+            retention >= Duration::from_millis(1),
+            "result_retention must be at least 1ms",
+        );
+        self.result_retention = Some(retention);
+        self
+    }
+
+    /// Override the [`Clock`] the runner reads its timestamps from
+    /// (for terminal-marker timestamps and the retention sweep's
+    /// cutoff). Defaults to the same clock the [`Queue`] was opened
+    /// with (via [`Queue::clock`]).
+    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
     /// Build the runner.
     ///
     /// # Errors
@@ -626,12 +786,15 @@ impl JobRunnerBuilder {
             .result_prefix
             .unwrap_or_else(|| format!("{}-results", self.queue_name));
         let results = ResultStore::new(object_store, prefix);
+        let clock = self.clock.unwrap_or_else(|| queue.clock());
 
         let submitter = Submitter {
             queue,
             queue_name: Arc::from(self.queue_name),
             results,
             state: Arc::new(self.state),
+            clock,
+            result_retention: self.result_retention,
         };
 
         Ok(JobRunner {
@@ -1465,5 +1628,199 @@ mod tests {
         // runtime will abort the spawned worker when the test
         // function returns.
         drop(handle);
+    }
+
+    /// Build a [`ResultStore`] pointing at the prefix
+    /// [`JobRunnerBuilder::build`] derives by default
+    /// (`"{queue_name}-results"`), so tests can inspect markers and
+    /// blobs the runner wrote.
+    fn inspect_results(store: Arc<dyn ObjectStore>, queue_name: &str) -> ResultStore {
+        ResultStore::new(store, format!("{queue_name}-results"))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_marker_written_when_retention_is_set() {
+        let queue_name = "test-retention-marker";
+        let (queue, store) = open_queue(queue_name).await;
+        let mut runner = JobRunner::builder()
+            .queue(queue)
+            .object_store(store.clone())
+            .queue_name(queue_name)
+            .state("ok")
+            .result_retention(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        runner.register::<Adder>();
+        let handle = runner.spawn(std::future::pending::<()>());
+
+        let job = runner.submit(Adder { a: 1, b: 2 }).await.unwrap();
+        let job_id = job.id().to_string();
+        assert_eq!(job.await.unwrap(), 3);
+
+        let markers = inspect_results(store, queue_name)
+            .list_terminal_markers()
+            .await
+            .unwrap();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].job_id, job_id);
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_terminal_marker_when_retention_is_unset() {
+        let queue_name = "test-retention-off";
+        let (queue, store) = open_queue(queue_name).await;
+        let mut runner = JobRunner::builder()
+            .queue(queue)
+            .object_store(store.clone())
+            .queue_name(queue_name)
+            .state("ok")
+            .build()
+            .unwrap();
+        runner.register::<Adder>();
+        let handle = runner.spawn(std::future::pending::<()>());
+
+        runner
+            .submit(Adder { a: 1, b: 2 })
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+
+        assert!(
+            inspect_results(store, queue_name)
+                .list_terminal_markers()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_marker_written_for_terminal_failures_too() {
+        let queue_name = "test-retention-failure";
+        let (queue, store) = open_queue_with_config(
+            queue_name,
+            QueueConfig {
+                max_attempts: 1,
+                ..QueueConfig::default()
+            },
+        )
+        .await;
+        let mut runner = JobRunner::builder()
+            .queue(queue)
+            .object_store(store.clone())
+            .queue_name(queue_name)
+            .result_retention(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        runner.register::<AlwaysFails>();
+        let handle = runner.spawn(std::future::pending::<()>());
+
+        let job = runner.submit(AlwaysFails).await.unwrap();
+        let job_id = job.id().to_string();
+        let _ = job.join().await.unwrap();
+
+        let markers = inspect_results(store, queue_name)
+            .list_terminal_markers()
+            .await
+            .unwrap();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].job_id, job_id);
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sweeper_keeps_markers_younger_than_retention() {
+        // Retention 200ms (sweep interval also 200ms). Advancing 200ms
+        // after the marker is written fires the next sweep tick at the
+        // exact retention boundary; strict `<` means the marker isn't
+        // yet expired, so the sweep must skip it.
+        let queue_name = "test-retention-young";
+        let t0_ms = 1_700_000_000_000_u64;
+        let clock = MockClock::new(t0_ms);
+        let (queue, store) =
+            open_queue_with_clock(queue_name, clock.clone(), QueueConfig::default()).await;
+        let mut runner = JobRunner::builder()
+            .queue(queue)
+            .object_store(store.clone())
+            .queue_name(queue_name)
+            .state("ok")
+            .result_retention(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        runner.register::<Adder>();
+        let handle = runner.spawn(std::future::pending::<()>());
+
+        let job = runner.submit(Adder { a: 1, b: 2 }).await.unwrap();
+        let job_id = job.id().to_string();
+        assert_eq!(job.await.unwrap(), 3);
+
+        // Advance to the boundary; the sweep at this point must NOT
+        // drop the marker (strict `<` in the cutoff comparison).
+        clock.advance(Duration::from_millis(200));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let markers = inspect_results(store, queue_name)
+            .list_terminal_markers()
+            .await
+            .unwrap();
+        assert_eq!(markers.len(), 1, "marker at boundary must be retained");
+        assert_eq!(markers[0].job_id, job_id);
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sweeper_removes_expired_markers_and_result_blobs() {
+        let queue_name = "test-retention-expired";
+        let t0_ms = 1_700_000_000_000_u64;
+        let clock = MockClock::new(t0_ms);
+        let (queue, store) =
+            open_queue_with_clock(queue_name, clock.clone(), QueueConfig::default()).await;
+        let mut runner = JobRunner::builder()
+            .queue(queue)
+            .object_store(store.clone())
+            .queue_name(queue_name)
+            .state("ok")
+            .result_retention(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        runner.register::<Adder>();
+        let handle = runner.spawn(std::future::pending::<()>());
+
+        let job = runner.submit(Adder { a: 1, b: 2 }).await.unwrap();
+        let job_id = job.id().to_string();
+        assert_eq!(job.await.unwrap(), 3);
+
+        // Both the result blob and the marker exist before the sweep.
+        let results = inspect_results(store.clone(), queue_name);
+        assert!(results.get(&job_id).await.unwrap().is_some());
+        assert_eq!(results.list_terminal_markers().await.unwrap().len(), 1);
+
+        // Advance well past retention so the next sweep tick clears
+        // both the result blob and the marker.
+        clock.advance(Duration::from_millis(300));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let cleared = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let markers = results.list_terminal_markers().await.unwrap();
+                let blob = results.get(&job_id).await.unwrap();
+                if markers.is_empty() && blob.is_none() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(cleared, "sweeper did not clear the expired marker + blob");
+
+        handle.shutdown().await.unwrap();
     }
 }

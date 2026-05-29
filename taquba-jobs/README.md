@@ -35,11 +35,61 @@ idempotent.** A retried attempt that re-runs after a prior attempt already
 wrote a result blob will overwrite that blob with the new attempt's outcome,
 so a non-idempotent handler can have its earlier "successful" result replaced.
 
-Result blobs accumulate indefinitely in this version: there is no automatic
-retention or cleanup. Long-running deployments should plan their own
-lifecycle policy on the object-store prefix (S3 lifecycle rules, GCS
-object-lifecycle management, etc.); a built-in retention option is planned
-for a later release.
+Result blobs accumulate indefinitely by default; enable
+`JobRunnerBuilder::result_retention(...)` (see [Result retention](#result-retention))
+to clear them on a schedule, or plan a lifecycle policy on the
+object-store prefix (S3 lifecycle rules, GCS object-lifecycle management,
+etc.) if you prefer to manage retention out-of-band.
+
+## Result retention
+
+`JobRunnerBuilder::result_retention(Duration)` enables an in-process
+sweeper that deletes a job's persisted outcome blob `Duration` after the
+job reaches a terminal state. When the option is unset (default), blobs
+are retained indefinitely.
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+use taquba::{Queue, object_store::memory::InMemory};
+use taquba_jobs::JobRunner;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let store = Arc::new(InMemory::new());
+    let queue = Arc::new(Queue::open(store.clone(), "background-jobs").await?);
+
+    let runner = JobRunner::builder()
+        .queue(queue)
+        .object_store(store)
+        .result_retention(Duration::from_secs(24 * 60 * 60))
+        .build()?;
+
+    // ... register and spawn as usual ...
+    drop(runner);
+    Ok(())
+}
+```
+
+The runner writes a small terminal marker every time a job reaches a
+terminal state (success or terminal failure); a background sweeper
+spawned alongside the dispatch worker periodically lists markers,
+deletes the result blob and marker for each marker older than the
+retention window, and exits cleanly when the runner shuts down.
+
+Once a blob is swept, `JobHandle::fetch_result` for that job returns
+`Ok(None)` and an idempotent re-submission of the same payload falls
+through to re-running the job instead of short-circuiting to a cached
+result. Size the window so it covers the longest gap callers need
+between the original submission and an idempotent re-submit.
+
+## Time injection
+
+The runner inherits its clock from the queue (`Queue::clock`), so a
+`MockClock` passed to `Queue::open_with_options` virtualises time for
+the runner's terminal-marker timestamps and retention-sweep cutoff as
+well. `JobRunnerBuilder::clock` overrides it for the rarer case where
+the runner needs a different clock than the queue.
 
 ## Configuring the queue
 

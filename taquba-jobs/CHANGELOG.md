@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `JobRunnerBuilder::result_retention(Duration)`: opt-in retention
+  window for persisted result blobs. When set, the runner writes a
+  terminal marker every time a job reaches a terminal state and an
+  in-process sweeper deletes that job's result blob `retention` after
+  termination. When unset (default), result blobs are retained
+  indefinitely (the previous behaviour). Once a blob is swept,
+  `JobHandle::fetch_result` for that job returns `Ok(None)` and an
+  idempotent re-submission of the same payload falls through to
+  re-running the job rather than short-circuiting; size the window
+  so it covers the longest gap callers need between submission and
+  idempotent re-submit.
+- `JobRunnerBuilder::clock(Arc<dyn Clock>)`: override the time source
+  the runner reads its timestamps from (terminal-marker timestamps
+  and the retention sweep cutoff). Defaults to the queue's clock
+  (`Queue::clock`), so passing a `MockClock` to
+  `Queue::open_with_options` is enough for tests; this override is
+  for the rarer case where the runner needs a different clock than
+  the queue.
+
 ### Changed
 
 - Idempotent submissions now short-circuit to a prior submission's
@@ -18,6 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `EnqueueOptions::id_override`) so a re-submission with a matching
   payload returns a handle pointing at the cached result blob (with
   `newly_submitted = false`).
+- The result-store prefix now reserves a sibling `terminals/` segment
+  for retention markers (`<prefix>/terminals/<terminal_at_ms:020>_<job_id>`).
+  Existing result blobs (`<prefix>/<job_id>`) are unaffected: ULID
+  job ids cannot collide with the literal `terminals` segment. Markers
+  are only written when `result_retention` is configured.
 - **Breaking (on-disk):** `JobSubmissionRecord` (the durable per-idem-key
   dedup record) gained a `job_id` field. Records written by earlier
   versions of `taquba-jobs` will fail to deserialize and need to be

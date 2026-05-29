@@ -22,5 +22,7 @@ rmp-serde = "1"
 sha2 = "0.10"
 ulid = { workspace = true }
 
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }
