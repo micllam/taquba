@@ -30,9 +30,41 @@ rather than an optimisation.
 |---|---|---|
 | [`taquba`](./taquba) | Core durable task queue | Background jobs, dead-letter, scheduled work, parallel in-process workers |
 | [`taquba-workflow`](./taquba-workflow) | Multi-step orchestration with per-step memoization | LLM agent runs, payment flows, document pipelines |
+| [`taquba-bulk`](./taquba-bulk) | Runs one pipeline over many inputs in parallel, with per-item memoization and cost rollup | Bulk LLM workloads, document/OCR pipelines, data enrichment, parameter sweeps |
 | [`taquba-jobs`](./taquba-jobs) | Typed async function execution with awaitable results | Typed background tasks where you await the return value |
 | [`taquba-cron`](./taquba-cron) | POSIX cron scheduling onto a Taquba queue | Periodic enqueues (reports, sweeps, reminders) |
 | [`taquba-webhooks`](./taquba-webhooks) | HTTP webhook delivery with retries and dead-letter | Outbound webhook fan-out with durable retries |
+
+## How the crates relate
+
+`taquba` is the base; every other crate is a consumer of one `Arc<Queue>`.
+Above it sit two independent execution layers, plus a batch orchestrator:
+
+- **`taquba-jobs`** runs one typed async function and lets you await its
+  result. Single-shot, with idempotent submission and per-job result
+  retention.
+- **`taquba-workflow`** runs one durable multi-step process: a sequence of
+  steps with per-step memoization, retries, and a terminal hook.
+- **`taquba-bulk`** runs one pipeline (a workflow run) over many inputs in
+  parallel, adding batch-level progress, cost rollup, streamed output, and
+  replay. It is built on `taquba-workflow`, not on `taquba-jobs`.
+
+`jobs` and `workflow` are siblings, not layers: neither depends on the other.
+Reach for `jobs` when you dispatch a typed task and await its return value;
+for `workflow` when you have one multi-step run; for `bulk` to run a
+multi-step pipeline across a whole dataset.
+
+### Composing workflow + jobs
+
+The two compose for **fan-out inside a single run**: a workflow step submits
+N typed jobs to a shared `JobRunner`, joins their results, and memoizes the
+aggregate so a step retry does not re-submit. The reference agent
+[`taquba-research`](https://github.com/micllam/taquba-research) uses this for
+its parallel page-fetch phase, cancelling
+in-flight jobs when the surrounding run is cancelled. This is the inner
+counterpart to bulk's outer fan-out: `bulk` parallelizes whole runs, while the
+composition parallelizes sub-tasks within one run. Today it is a manual
+composition pattern, not a separate crate.
 
 ## Quick taste
 

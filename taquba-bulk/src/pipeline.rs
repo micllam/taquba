@@ -1,0 +1,282 @@
+//! The [`Pipeline`] contract and the per-item [`BulkCtx`] handed to it.
+
+use std::collections::HashMap;
+use std::future::Future;
+
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use taquba_workflow::{Memo, StepError};
+use tokio_util::sync::CancellationToken;
+
+use crate::cost::CostReport;
+
+/// Defines a per-item processing pipeline. Each bulk run executes one
+/// `Pipeline` for every input item independently, materialised internally
+/// as a [`taquba_workflow`] run.
+///
+/// A `Pipeline` is a single async [`run`](Pipeline::run) method: the bulk
+/// runner deserializes one input item, builds a [`BulkCtx`] around it, and
+/// awaits `run`. The expensive logical steps inside `run` (LLM calls, paid
+/// APIs, CPU-bound work) are wrapped in [`BulkCtx::memoized`] so an
+/// at-least-once retry of the item replays cached step results instead of
+/// paying for them twice.
+///
+/// # Error classification
+///
+/// [`Self::Error`] must convert into a [`StepError`], which is what decides
+/// retry behaviour: a [`StepError::transient`] error nacks and retries with
+/// the queue's backoff up to `max_attempts` (then dead-letters and the item
+/// terminates failed); a [`StepError::permanent`] error dead-letters the
+/// item immediately. The simplest choice is to use `StepError` directly as
+/// `type Error` (as the example below does); otherwise implement
+/// `From<YourError> for StepError`.
+///
+/// # Example
+///
+/// ```no_run
+/// use serde::{Deserialize, Serialize};
+/// use taquba_bulk::{BulkCtx, Pipeline, StepError};
+///
+/// #[derive(Serialize, Deserialize)]
+/// struct Ticket { id: String, body: String }
+///
+/// #[derive(Serialize, Deserialize)]
+/// struct Processed { id: String, classification: String }
+///
+/// struct TicketPipeline;
+///
+/// impl Pipeline for TicketPipeline {
+///     type Input = Ticket;
+///     type Output = Processed;
+///     type Error = StepError;
+///
+///     async fn run(&self, ctx: &BulkCtx<Ticket>) -> Result<Processed, StepError> {
+///         let classification = ctx
+///             .memoized("classify", async {
+///                 // one expensive call; cached on retry
+///                 ctx.record_cost("llm_calls", 1.0);
+///                 Ok::<_, StepError>("billing".to_string())
+///             })
+///             .await?;
+///         Ok(Processed { id: ctx.input.id.clone(), classification })
+///     }
+/// }
+/// ```
+pub trait Pipeline: Send + Sync + 'static {
+    /// One input item. Deserialized from the bulk input source and handed to
+    /// [`run`](Pipeline::run) via [`BulkCtx::input`].
+    type Input: Serialize + DeserializeOwned + Send + 'static;
+    /// The per-item result. Serialized into the bulk output stream once the
+    /// item completes.
+    type Output: Serialize + DeserializeOwned + Send + 'static;
+    /// Failure type. Must convert into a [`StepError`] so the runner can
+    /// decide transient vs. permanent handling. Use `StepError` directly for
+    /// the common case.
+    type Error: Into<StepError> + Send + 'static;
+
+    /// Process one input item. Wrap expensive logical steps in
+    /// [`BulkCtx::memoized`] to make retries cheap.
+    fn run(
+        &self,
+        ctx: &BulkCtx<Self::Input>,
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send;
+}
+
+/// Per-item execution context handed to [`Pipeline::run`].
+///
+/// Wraps the typed input together with the durable per-item
+/// [memo](taquba_workflow::Memo), a [cost accumulator](CostReport), and the
+/// run's cooperative [cancellation token](CancellationToken).
+pub struct BulkCtx<T> {
+    /// The deserialized input item for this run.
+    pub input: T,
+    /// The run identifier for this item (the value the bulk runner derived
+    /// from the input, or a positional `item-{i}` default).
+    pub run_id: String,
+    /// Submitter-supplied metadata threaded through from the bulk run.
+    pub headers: HashMap<String, String>,
+    memo: Memo,
+    cost: CostReport,
+    cancel_token: CancellationToken,
+}
+
+impl<T> BulkCtx<T> {
+    pub(crate) fn new(
+        input: T,
+        run_id: String,
+        headers: HashMap<String, String>,
+        memo: Memo,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        Self {
+            input,
+            run_id,
+            headers,
+            memo,
+            cost: CostReport::new(),
+            cancel_token,
+        }
+    }
+
+    /// Run `f` once and cache its result durably under `key`, or return the
+    /// previously cached result on a retry.
+    ///
+    /// On the first execution of a step, `f` runs and its `Ok` value is
+    /// rmp-serialized into the item's [`Memo`] under `key` before being
+    /// returned. If the step is later re-executed (at-least-once retry after
+    /// a lease expiry), the cached bytes are returned without running `f`
+    /// again, so a paid call inside `f` bills once, not once per attempt.
+    /// An `Err` from `f` is never cached and propagates unchanged.
+    ///
+    /// `key` namespaces the cache within this item; use a distinct key per
+    /// logical step. A cached entry that fails to deserialize (e.g. an
+    /// output type changed shape between runs) is treated as a miss and `f`
+    /// re-runs, overwriting it. Memo I/O and serialization failures surface
+    /// as a transient [`StepError`] converted into the caller's error type.
+    pub async fn memoized<R, F, E>(&self, key: &str, f: F) -> Result<R, E>
+    where
+        R: Serialize + DeserializeOwned,
+        F: Future<Output = Result<R, E>>,
+        E: From<StepError>,
+    {
+        match self.memo.get(key).await {
+            Ok(Some(bytes)) => match rmp_serde::from_slice::<R>(&bytes) {
+                Ok(value) => return Ok(value),
+                Err(err) => {
+                    // Self-healing: a cached entry we can't decode is treated
+                    // as a miss so `f` recomputes and overwrites it.
+                    tracing::warn!(
+                        run_id = %self.run_id,
+                        key = %key,
+                        error = %err,
+                        "memoized cache entry failed to deserialize; recomputing",
+                    );
+                }
+            },
+            Ok(None) => {}
+            Err(err) => return Err(E::from(memo_error(err))),
+        }
+
+        let value = f.await?;
+        // A serialization failure is deterministic, so a retry produces the
+        // same error; fail permanently.
+        let bytes = rmp_serde::to_vec_named(&value)
+            .map_err(|e| E::from(StepError::permanent(format!("memo serialize failed: {e}"))))?;
+        self.memo
+            .put(key, &bytes)
+            .await
+            .map_err(|e| E::from(memo_error(e)))?;
+        Ok(value)
+    }
+
+    /// Add `amount` to the cost counter named `metric` for this item. The
+    /// per-item totals roll up into the batch-level
+    /// [`ProgressSnapshot`](crate::ProgressSnapshot) and
+    /// [`BulkReport`](crate::BulkReport).
+    pub fn record_cost(&self, metric: &str, amount: f64) {
+        self.cost.record(metric, amount);
+    }
+
+    /// The run's cooperative cancellation token. Watch it to short-circuit a
+    /// long-running step when the bulk run is draining (e.g. on spot
+    /// preemption); see [`taquba_workflow::Step::cancel_token`].
+    pub fn cancel_token(&self) -> &CancellationToken {
+        &self.cancel_token
+    }
+
+    /// Snapshot of the cost accumulated so far for this item.
+    pub(crate) fn cost(&self) -> CostReport {
+        self.cost.clone()
+    }
+}
+
+/// Map a workflow/object-store memo error to a [`StepError`], preserving the
+/// transient/permanent classification.
+fn memo_error(err: taquba_workflow::Error) -> StepError {
+    err.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use taquba::object_store::memory::InMemory;
+    use taquba_workflow::MemoStore;
+
+    fn ctx_for_tests() -> BulkCtx<()> {
+        let memo = MemoStore::new(Arc::new(InMemory::new()), "memo").new_memo("run-1", 0);
+        BulkCtx::new(
+            (),
+            "run-1".into(),
+            HashMap::new(),
+            memo,
+            CancellationToken::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn memoized_runs_once_then_serves_cache() {
+        let ctx = ctx_for_tests();
+        let calls = AtomicU32::new(0);
+        let compute = || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, StepError>(7u32)
+        };
+
+        let first = ctx.memoized("k", compute()).await.unwrap();
+        let second = ctx.memoized("k", compute()).await.unwrap();
+        assert_eq!(first, 7);
+        assert_eq!(second, 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "closure ran exactly once");
+    }
+
+    #[tokio::test]
+    async fn memoized_does_not_cache_errors() {
+        let ctx = ctx_for_tests();
+        let calls = AtomicU32::new(0);
+
+        let err = ctx
+            .memoized::<u32, _, StepError>("k", async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(StepError::transient("boom"))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, "boom");
+
+        // A second attempt re-runs because the error was not cached.
+        let ok = ctx
+            .memoized::<u32, _, StepError>("k", async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(99)
+            })
+            .await
+            .unwrap();
+        assert_eq!(ok, 99);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn distinct_keys_cache_independently() {
+        let ctx = ctx_for_tests();
+        let a = ctx
+            .memoized::<String, _, StepError>("a", async { Ok("first".to_string()) })
+            .await
+            .unwrap();
+        let b = ctx
+            .memoized::<String, _, StepError>("b", async { Ok("second".to_string()) })
+            .await
+            .unwrap();
+        assert_eq!(a, "first");
+        assert_eq!(b, "second");
+    }
+
+    #[tokio::test]
+    async fn record_cost_accumulates_into_snapshot() {
+        let ctx = ctx_for_tests();
+        ctx.record_cost("tokens", 100.0);
+        ctx.record_cost("tokens", 50.0);
+        assert_eq!(ctx.cost().get("tokens"), 150.0);
+    }
+}

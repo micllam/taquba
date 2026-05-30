@@ -1,0 +1,29 @@
+[package]
+name = "taquba-bulk"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bulk multi-step processing on the Taquba durable task queue: run one pipeline over many inputs in parallel, with per-item memoization and cost rollup."
+homepage = "https://github.com/micllam/taquba"
+readme = "README.md"
+keywords = ["queue", "bulk", "batch", "pipeline", "taquba"]
+
+[dependencies]
+taquba = { workspace = true }
+taquba-workflow = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+rmp-serde = "1"
+serde_json = "1"
+ulid = { workspace = true }
+
+[dev-dependencies]
+# Examples and end-to-end tests need a multi-thread runtime on top of the
+# workspace tokio defaults.
+tokio = { workspace = true, features = ["rt-multi-thread"] }
