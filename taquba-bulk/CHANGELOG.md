@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-05-30
+
 Initial release. Per-batch orchestrator that runs one pipeline over many
 inputs in a single process on top of `taquba-workflow`.
 
