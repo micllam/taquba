@@ -1098,85 +1098,91 @@ impl Queue {
         let claimed = claimed_key(&job.queue, lease_expires_at, &job.id);
         job.last_error = Some(error.to_string());
 
-        let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-        txn.get(claimed.as_bytes())
-            .await?
-            .ok_or(Error::InvalidState)?;
-        txn.delete(claimed.as_bytes())?;
+        loop {
+            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+            txn.get(claimed.as_bytes())
+                .await?
+                .ok_or(Error::InvalidState)?;
+            txn.delete(claimed.as_bytes())?;
 
-        if job.attempts >= job.max_attempts {
-            job.status = JobStatus::Dead;
-            job.failed_at = Some(self.now_ms());
-            let dead = dead_key(&job.queue, &job.id);
-            let value = rmp_serde::to_vec_named(&job)?;
-            txn.put(dead.as_bytes(), &value)?;
-            txn.put(job_index_key(&job.id).as_bytes(), dead.as_bytes())?;
-            update_stats(
-                &txn,
-                &job.queue,
-                &[(JobStatus::Claimed, -1), (JobStatus::Dead, 1)],
-            )?;
-            warn!(
-                queue = %job.queue,
-                job_id = %job.id,
-                attempts = job.attempts,
-                "job dead-lettered"
-            );
-        } else {
-            let cfg = self.queue_config(&job.queue);
-            let backoff =
-                backoff_delay(job.attempts, cfg.retry_backoff_base, cfg.retry_backoff_max);
-            job.claimed_at = None;
-            job.lease_expires_at = None;
-
-            if backoff.is_zero() {
-                job.status = JobStatus::Pending;
-                let priority = job.priority;
-                let pending = pending_key(&job.queue, priority, &job.id);
+            if job.attempts >= job.max_attempts {
+                job.status = JobStatus::Dead;
+                job.failed_at = Some(self.now_ms());
+                let dead = dead_key(&job.queue, &job.id);
                 let value = rmp_serde::to_vec_named(&job)?;
-                txn.put(pending.as_bytes(), &value)?;
-                txn.put(job_index_key(&job.id).as_bytes(), pending.as_bytes())?;
+                txn.put(dead.as_bytes(), &value)?;
+                txn.put(job_index_key(&job.id).as_bytes(), dead.as_bytes())?;
                 update_stats(
                     &txn,
                     &job.queue,
-                    &[(JobStatus::Pending, 1), (JobStatus::Claimed, -1)],
+                    &[(JobStatus::Claimed, -1), (JobStatus::Dead, 1)],
                 )?;
-                self.claim_cursor
-                    .invalidate_if_at_or_before(&job.queue, &pending);
-                debug!(
+                warn!(
                     queue = %job.queue,
                     job_id = %job.id,
                     attempts = job.attempts,
-                    "job re-queued"
+                    "job dead-lettered"
                 );
             } else {
-                let run_at = self.now_ms() + backoff.as_millis() as u64;
-                job.status = JobStatus::Scheduled;
-                job.run_at = Some(run_at);
-                let scheduled = scheduled_key(&job.queue, run_at, &job.id);
-                let value = rmp_serde::to_vec_named(&job)?;
-                txn.put(scheduled.as_bytes(), &value)?;
-                txn.put(job_index_key(&job.id).as_bytes(), scheduled.as_bytes())?;
-                update_stats(
-                    &txn,
-                    &job.queue,
-                    &[(JobStatus::Claimed, -1), (JobStatus::Scheduled, 1)],
-                )?;
-                debug!(
-                    queue = %job.queue,
-                    job_id = %job.id,
-                    attempts = job.attempts,
-                    backoff_ms = backoff.as_millis() as u64,
-                    "job scheduled for retry"
-                );
+                let cfg = self.queue_config(&job.queue);
+                let backoff =
+                    backoff_delay(job.attempts, cfg.retry_backoff_base, cfg.retry_backoff_max);
+                job.claimed_at = None;
+                job.lease_expires_at = None;
+
+                if backoff.is_zero() {
+                    job.status = JobStatus::Pending;
+                    let priority = job.priority;
+                    let pending = pending_key(&job.queue, priority, &job.id);
+                    let value = rmp_serde::to_vec_named(&job)?;
+                    txn.put(pending.as_bytes(), &value)?;
+                    txn.put(job_index_key(&job.id).as_bytes(), pending.as_bytes())?;
+                    update_stats(
+                        &txn,
+                        &job.queue,
+                        &[(JobStatus::Pending, 1), (JobStatus::Claimed, -1)],
+                    )?;
+                    self.claim_cursor
+                        .invalidate_if_at_or_before(&job.queue, &pending);
+                    debug!(
+                        queue = %job.queue,
+                        job_id = %job.id,
+                        attempts = job.attempts,
+                        "job re-queued"
+                    );
+                } else {
+                    let run_at = self.now_ms() + backoff.as_millis() as u64;
+                    job.status = JobStatus::Scheduled;
+                    job.run_at = Some(run_at);
+                    let scheduled = scheduled_key(&job.queue, run_at, &job.id);
+                    let value = rmp_serde::to_vec_named(&job)?;
+                    txn.put(scheduled.as_bytes(), &value)?;
+                    txn.put(job_index_key(&job.id).as_bytes(), scheduled.as_bytes())?;
+                    update_stats(
+                        &txn,
+                        &job.queue,
+                        &[(JobStatus::Claimed, -1), (JobStatus::Scheduled, 1)],
+                    )?;
+                    debug!(
+                        queue = %job.queue,
+                        job_id = %job.id,
+                        attempts = job.attempts,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "job scheduled for retry"
+                    );
+                }
+            }
+
+            match txn.commit().await {
+                Ok(_) => break,
+                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
+                Err(e) => return Err(e.into()),
             }
         }
 
         let immediate_retry = matches!(job.status, JobStatus::Pending);
         let became_dead = matches!(job.status, JobStatus::Dead);
-        let job_id = job.id.clone();
-        txn.commit().await?;
-        self.clear_cancel_token(&job_id);
+        self.clear_cancel_token(&job.id);
         if immediate_retry {
             // Backoff path doesn't need a wake: the scheduler loop will fire
             // notify_waiters() when it promotes the job.
@@ -1362,14 +1368,20 @@ impl Queue {
         let new_claimed = claimed_key(&job.queue, new_expiry, &job.id);
         let value = rmp_serde::to_vec_named(job)?;
 
-        let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-        txn.get(old_claimed.as_bytes())
-            .await?
-            .ok_or(Error::InvalidState)?;
-        txn.delete(old_claimed.as_bytes())?;
-        txn.put(new_claimed.as_bytes(), &value)?;
-        txn.put(job_index_key(&job.id).as_bytes(), new_claimed.as_bytes())?;
-        txn.commit().await?;
+        loop {
+            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+            txn.get(old_claimed.as_bytes())
+                .await?
+                .ok_or(Error::InvalidState)?;
+            txn.delete(old_claimed.as_bytes())?;
+            txn.put(new_claimed.as_bytes(), &value)?;
+            txn.put(job_index_key(&job.id).as_bytes(), new_claimed.as_bytes())?;
+            match txn.commit().await {
+                Ok(_) => break,
+                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
 
         debug!(queue = %job.queue, job_id = %job.id, new_expiry, "lease renewed");
         Ok(())

@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lease was reaped now gets `Error::InvalidState` instead of being
   able to ack, retry, dead-letter, renew, or corrupt stats from a
   stale `JobRecord`.
+- `Queue::nack` and `Queue::renew_lease` now retry on transaction
+  conflict like `Queue::ack` and `Queue::dead_letter` already did.
+  A reaper committing the expired-lease delete concurrently with a
+  late settlement is now retried (and resolves to `Error::InvalidState`
+  on the next attempt) instead of surfacing a raw SlateDB transaction
+  error to the caller.
 
 ## [0.7.0] - 2026-05-28
 
