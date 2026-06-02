@@ -30,7 +30,7 @@ rather than an optimisation.
 |---|---|---|
 | [`taquba`](./taquba) | Core durable task queue | Background jobs, dead-letter, scheduled work, parallel in-process workers |
 | [`taquba-workflow`](./taquba-workflow) | Multi-step orchestration with per-step memoization | LLM agent runs, payment flows, document pipelines |
-| [`taquba-bulk`](./taquba-bulk) | Runs one pipeline over many inputs in parallel, with per-item memoization and cost rollup | Bulk LLM workloads, document/OCR pipelines, data enrichment, parameter sweeps |
+| [`taquba-bulk`](./taquba-bulk) | Applies one pipeline definition to many inputs in parallel, with one workflow run per input, per-item memoization, and cost rollup | Bulk LLM workloads, document/OCR pipelines, data enrichment, parameter sweeps |
 | [`taquba-jobs`](./taquba-jobs) | Typed async function execution with awaitable results | Typed background tasks where you await the return value |
 | [`taquba-cron`](./taquba-cron) | POSIX cron scheduling onto a Taquba queue | Periodic enqueues (reports, sweeps, reminders) |
 | [`taquba-webhooks`](./taquba-webhooks) | HTTP webhook delivery with retries and dead-letter | Outbound webhook fan-out with durable retries |
@@ -45,9 +45,10 @@ Above it sit two independent execution layers, plus a batch orchestrator:
   retention.
 - **`taquba-workflow`** runs one durable multi-step process: a sequence of
   steps with per-step memoization, retries, and a terminal hook.
-- **`taquba-bulk`** runs one pipeline (a workflow run) over many inputs in
-  parallel, adding batch-level progress, cost rollup, streamed output, and
-  replay. It is built on `taquba-workflow`, not on `taquba-jobs`.
+- **`taquba-bulk`** applies one `Pipeline` definition to many inputs in
+  parallel. Each input becomes its own workflow run; bulk adds batch-level
+  progress, cost rollup, streamed output, and replay. It is built on
+  `taquba-workflow`, not on `taquba-jobs`.
 
 `jobs` and `workflow` are siblings, not layers: neither depends on the other.
 Reach for `jobs` when you dispatch a typed task and await its return value;
