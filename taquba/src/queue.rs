@@ -352,10 +352,9 @@ pub struct EnqueueOptions {
     /// Useful when callers need the id to be known *before* the enqueue
     /// returns.
     ///
-    /// Uniqueness is the caller's responsibility: a duplicate id silently
-    /// overwrites the prior job's record. ULID generation guarantees
-    /// uniqueness for the `None` path; caller-supplied ids must be
-    /// globally unique within the queue's lifetime.
+    /// Duplicate caller-supplied ids are rejected with
+    /// [`Error::DuplicateJobId`] while the existing job is still indexed.
+    /// ULID generation guarantees uniqueness for the `None` path.
     ///
     /// Constraints (enforced; violations return [`Error::InvalidId`]):
     ///
@@ -636,8 +635,11 @@ impl Queue {
         payload: Vec<u8>,
         opts: EnqueueOptions,
     ) -> Result<String> {
-        let (job, key) = self.prepare_job_record(queue, payload, opts)?;
-        match self.write_job(job, key, HashMap::new()).await? {
+        let (job, key, id_override_used) = self.prepare_job_record(queue, payload, opts)?;
+        match self
+            .write_job(job, key, id_override_used, HashMap::new())
+            .await?
+        {
             EnqueueResult::New(id) | EnqueueResult::AlreadyEnqueued(id) => Ok(id),
         }
     }
@@ -694,8 +696,8 @@ impl Queue {
             }
         }
 
-        let (job, key) = self.prepare_job_record(queue, payload, opts)?;
-        self.write_job(job, key, kv_writes).await
+        let (job, key, id_override_used) = self.prepare_job_record(queue, payload, opts)?;
+        self.write_job(job, key, id_override_used, kv_writes).await
     }
 
     /// Read a value from the user KV namespace.
@@ -724,7 +726,7 @@ impl Queue {
         queue: &str,
         payload: Vec<u8>,
         opts: EnqueueOptions,
-    ) -> Result<(JobRecord, String)> {
+    ) -> Result<(JobRecord, String, bool)> {
         let cfg = self.queue_config(queue);
         let max_attempts = opts.max_attempts.unwrap_or(cfg.max_attempts);
         let priority = opts.priority.unwrap_or(cfg.default_priority);
@@ -738,12 +740,12 @@ impl Queue {
             (ms > self.now_ms()).then_some(ms)
         });
 
-        let id = match opts.id_override {
+        let (id, id_override_used) = match opts.id_override {
             Some(supplied) => {
                 validate_id_override(&supplied)?;
-                supplied
+                (supplied, true)
             }
-            None => Ulid::new().to_string(),
+            None => (Ulid::new().to_string(), false),
         };
 
         let (status, key) = match run_at {
@@ -772,22 +774,26 @@ impl Queue {
             cancel_token: None,
         };
 
-        Ok((job, key))
+        Ok((job, key, id_override_used))
     }
 
     /// Persist a prepared [`JobRecord`], optionally checking a dedup index
-    /// and optionally applying additional KV writes, all in a single
-    /// transaction. Retries on transaction conflict.
+    /// and caller-supplied id uniqueness, and optionally applying
+    /// additional KV writes, all in a single transaction. Retries on
+    /// transaction conflict.
     ///
     /// Returns [`EnqueueResult::AlreadyEnqueued`] (with **no** KV writes
     /// applied) if `job.dedup_key` is set and a pending or scheduled job
-    /// with the same dedup key already exists. Otherwise writes the
-    /// record + job index + (when set) dedup index + every entry in
-    /// `kv_writes`, and returns [`EnqueueResult::New`].
+    /// with the same dedup key already exists. Returns
+    /// [`Error::DuplicateJobId`] if `id_override` was used and the id is
+    /// already indexed. Otherwise writes the record + job index + (when set)
+    /// dedup index + every entry in `kv_writes`, and returns
+    /// [`EnqueueResult::New`].
     async fn write_job(
         &self,
         job: JobRecord,
         key: String,
+        id_override_used: bool,
         kv_writes: HashMap<Vec<u8>, Vec<u8>>,
     ) -> Result<EnqueueResult> {
         let dkey = job
@@ -809,6 +815,11 @@ impl Queue {
                         String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidState)?;
                     return Ok(EnqueueResult::AlreadyEnqueued(existing));
                 }
+            }
+
+            if id_override_used && txn.get(job_index_key(&id).as_bytes()).await?.is_some() {
+                txn.rollback();
+                return Err(Error::DuplicateJobId { id });
             }
 
             txn.put(key.as_bytes(), &value)?;
@@ -1906,6 +1917,94 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_with_duplicate_id_override_rejected() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+
+        let id = q
+            .enqueue_with(
+                "email",
+                b"first".to_vec(),
+                EnqueueOptions {
+                    id_override: Some("duplicate-id".to_string()),
+                    ..EnqueueOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(id, "duplicate-id");
+
+        let err = q
+            .enqueue_with(
+                "email",
+                b"second".to_vec(),
+                EnqueueOptions {
+                    id_override: Some("duplicate-id".to_string()),
+                    ..EnqueueOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::DuplicateJobId { id } if id == "duplicate-id"));
+
+        let job = q
+            .claim("email", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.id, "duplicate-id");
+        assert_eq!(job.payload, b"first");
+        assert!(
+            q.claim("email", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_with_kv_duplicate_id_override_rejects_kv_writes() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+
+        q.enqueue_with(
+            "email",
+            b"first".to_vec(),
+            EnqueueOptions {
+                id_override: Some("duplicate-kv-id".to_string()),
+                ..EnqueueOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = q
+            .enqueue_with_kv(
+                "email",
+                b"second".to_vec(),
+                EnqueueOptions {
+                    id_override: Some("duplicate-kv-id".to_string()),
+                    ..EnqueueOptions::default()
+                },
+                HashMap::from([(b"meta/duplicate".to_vec(), b"written".to_vec())]),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::DuplicateJobId { id } if id == "duplicate-kv-id"));
+        assert!(q.kv_get(b"meta/duplicate").await.unwrap().is_none());
+
+        let job = q
+            .claim("email", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.id, "duplicate-kv-id");
+        assert_eq!(job.payload, b"first");
 
         q.close().await.unwrap();
     }

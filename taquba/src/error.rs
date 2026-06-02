@@ -54,6 +54,15 @@ pub enum Error {
         /// Why it was rejected.
         reason: &'static str,
     },
+
+    /// A caller-supplied [`crate::EnqueueOptions::id_override`] matched an
+    /// existing indexed job id. Duplicate caller-supplied ids are rejected
+    /// before any queue state or user KV writes are applied.
+    #[error("duplicate job id `{id}`")]
+    DuplicateJobId {
+        /// The duplicate id that was rejected.
+        id: String,
+    },
 }
 
 impl Error {
@@ -70,7 +79,8 @@ impl Error {
             | Self::JobNotFound(_)
             | Self::InvalidState
             | Self::KvValueTooLarge { .. }
-            | Self::InvalidId { .. } => true,
+            | Self::InvalidId { .. }
+            | Self::DuplicateJobId { .. } => true,
             Self::Storage(_) => false,
         }
     }
@@ -95,5 +105,6 @@ mod tests {
             }
             .is_permanent()
         );
+        assert!(Error::DuplicateJobId { id: "job-1".into() }.is_permanent());
     }
 }

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Duplicate `EnqueueOptions::id_override` values are now rejected
+  transactionally with `Error::DuplicateJobId` instead of overwriting
+  `jobindex:{id}` and leaving older queue-state records behind.
 - `Queue::ack`, `Queue::nack`, `Queue::dead_letter`, and
   `Queue::renew_lease` now check that the expected `claimed:` record
   still exists before settling a job. A worker finishing after its
