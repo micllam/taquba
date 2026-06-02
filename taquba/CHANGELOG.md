@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `Queue::ack`, `Queue::nack`, `Queue::dead_letter`, and
+  `Queue::renew_lease` now check that the expected `claimed:` record
+  still exists before settling a job. A worker finishing after its
+  lease was reaped now gets `Error::InvalidState` instead of being
+  able to ack, retry, dead-letter, renew, or corrupt stats from a
+  stale `JobRecord`.
+
 ## [0.7.0] - 2026-05-28
 
 ### Added

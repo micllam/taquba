@@ -1056,6 +1056,9 @@ impl Queue {
 
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+            txn.get(claimed.as_bytes())
+                .await?
+                .ok_or(Error::InvalidState)?;
             txn.delete(claimed.as_bytes())?;
             if let Some((ref done_k, ref done_v)) = done_record {
                 txn.put(done_k.as_bytes(), done_v)?;
@@ -1096,6 +1099,9 @@ impl Queue {
         job.last_error = Some(error.to_string());
 
         let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+        txn.get(claimed.as_bytes())
+            .await?
+            .ok_or(Error::InvalidState)?;
         txn.delete(claimed.as_bytes())?;
 
         if job.attempts >= job.max_attempts {
@@ -1207,6 +1213,9 @@ impl Queue {
 
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+            txn.get(claimed.as_bytes())
+                .await?
+                .ok_or(Error::InvalidState)?;
             txn.delete(claimed.as_bytes())?;
             txn.put(dead.as_bytes(), &value)?;
             txn.put(job_index_key(&job.id).as_bytes(), dead.as_bytes())?;
@@ -1354,6 +1363,9 @@ impl Queue {
         let value = rmp_serde::to_vec_named(job)?;
 
         let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+        txn.get(old_claimed.as_bytes())
+            .await?
+            .ok_or(Error::InvalidState)?;
         txn.delete(old_claimed.as_bytes())?;
         txn.put(new_claimed.as_bytes(), &value)?;
         txn.put(job_index_key(&job.id).as_bytes(), new_claimed.as_bytes())?;
@@ -3352,6 +3364,183 @@ mod tests {
         let fetched = q.get_job(&job.id).await.unwrap().unwrap();
         assert_eq!(fetched.status, JobStatus::Claimed);
         assert_eq!(fetched.lease_expires_at.unwrap(), new_expiry);
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_settlement_after_reaper_requeue_is_rejected() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let stale = q
+            .claim("work", Duration::from_millis(1))
+            .await
+            .unwrap()
+            .unwrap();
+
+        clock.advance(Duration::from_millis(2));
+        q.reap_now().await.unwrap();
+
+        let stats = q.stats("work").await.unwrap();
+        assert_eq!(stats.pending, 1);
+        assert_eq!(stats.claimed, 0);
+
+        assert!(matches!(q.ack(&stale).await, Err(Error::InvalidState)));
+        assert!(matches!(
+            q.nack(stale.clone(), "late failure").await,
+            Err(Error::InvalidState)
+        ));
+        assert!(matches!(
+            q.dead_letter(stale.clone(), "late permanent failure").await,
+            Err(Error::InvalidState)
+        ));
+
+        let mut stale_for_renew = stale.clone();
+        assert!(matches!(
+            q.renew_lease(&mut stale_for_renew, Duration::from_secs(30))
+                .await,
+            Err(Error::InvalidState)
+        ));
+
+        let stats = q.stats("work").await.unwrap();
+        assert_eq!(stats.pending, 1);
+        assert_eq!(stats.claimed, 0);
+        assert_eq!(stats.done, 0);
+        assert_eq!(stats.dead, 0);
+
+        let fresh = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.id, id);
+        assert_eq!(fresh.attempts, 2);
+        q.ack(&fresh).await.unwrap();
+
+        let stats = q.stats("work").await.unwrap();
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.claimed, 0);
+        assert_eq!(stats.done, 1);
+        assert_eq!(stats.dead, 0);
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_settlement_after_reaper_dead_letter_is_rejected() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        let id = q
+            .enqueue_with(
+                "work",
+                b"payload".to_vec(),
+                EnqueueOptions {
+                    max_attempts: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let stale = q
+            .claim("work", Duration::from_millis(1))
+            .await
+            .unwrap()
+            .unwrap();
+
+        clock.advance(Duration::from_millis(2));
+        q.reap_now().await.unwrap();
+
+        let dead = q.get_job(&id).await.unwrap().unwrap();
+        assert_eq!(dead.status, JobStatus::Dead);
+        let stats = q.stats("work").await.unwrap();
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.claimed, 0);
+        assert_eq!(stats.dead, 1);
+
+        assert!(matches!(q.ack(&stale).await, Err(Error::InvalidState)));
+        assert!(matches!(
+            q.nack(stale.clone(), "late failure").await,
+            Err(Error::InvalidState)
+        ));
+        assert!(matches!(
+            q.dead_letter(stale.clone(), "late permanent failure").await,
+            Err(Error::InvalidState)
+        ));
+
+        let mut stale_for_renew = stale.clone();
+        assert!(matches!(
+            q.renew_lease(&mut stale_for_renew, Duration::from_secs(30))
+                .await,
+            Err(Error::InvalidState)
+        ));
+
+        let stats = q.stats("work").await.unwrap();
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.claimed, 0);
+        assert_eq!(stats.done, 0);
+        assert_eq!(stats.dead, 1);
+        assert!(
+            q.claim("work", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ack_succeeds_on_expired_lease_before_reaper_runs() {
+        // The settlement guard keys on whether the claimed: record still
+        // exists, not on whether the lease has expired. A worker that
+        // finishes after its lease lapsed but before the reaper has
+        // requeued the job still owns the record, so the settlement lands.
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_millis(1))
+            .await
+            .unwrap()
+            .unwrap();
+
+        clock.advance(Duration::from_secs(5));
+
+        q.ack(&job).await.unwrap();
+
+        let stats = q.stats("work").await.unwrap();
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.claimed, 0);
+        assert_eq!(stats.done, 1);
+        assert_eq!(stats.dead, 0);
+        assert!(
+            q.claim("work", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         q.close().await.unwrap();
     }
