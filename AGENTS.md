@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to agents when working with code in this repository.
 
 Workspace: `taquba` core, plus `taquba-jobs`, `taquba-cron`, `taquba-webhooks`, and `taquba-workflow` built on it, and `taquba-bulk` built on `taquba-workflow`. See each crate's README for surface-level usage.
 
