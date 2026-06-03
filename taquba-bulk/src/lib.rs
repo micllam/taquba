@@ -35,7 +35,7 @@
 //! use std::sync::Arc;
 //! use serde::{Deserialize, Serialize};
 //! use taquba::{Queue, object_store::memory::InMemory};
-//! use taquba_bulk::{Bulk, BulkCtx, Pipeline, StepError};
+//! use taquba_bulk::{Bulk, BulkCtx, CostReport, Pipeline, StepError};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Ticket { id: String, body: String }
@@ -52,10 +52,10 @@
 //!
 //!     async fn run(&self, ctx: &BulkCtx<Ticket>) -> Result<Processed, StepError> {
 //!         let classification = ctx
-//!             .memoized("classify", async {
-//!                 ctx.record_cost("llm_calls", 1.0);
-//!                 // one paid call, cached on retry
-//!                 Ok::<_, StepError>("billing".to_string())
+//!             .memoized_with_cached_cost("classify", async {
+//!                 let cost = CostReport::new();
+//!                 cost.record("llm_calls", 1.0);
+//!                 Ok::<_, StepError>(("billing".to_string(), cost))
 //!             })
 //!             .await?;
 //!         Ok(Processed { id: ctx.input.id.clone(), classification })
@@ -86,6 +86,9 @@
 //! (token counts, paid-API units, compute-seconds, dollars). Per-item totals
 //! roll up into [`ProgressSnapshot::cost`] and [`BulkReport::cost`], so the
 //! batch cost is visible live and in the final report. See [`CostReport`].
+//! When counters are produced inside a memoized closure, return `(value,
+//! cost)` from [`BulkCtx::memoized_with_cached_cost`] so the same counters
+//! are recorded on a cache hit.
 //!
 //! # Failure policy
 //!

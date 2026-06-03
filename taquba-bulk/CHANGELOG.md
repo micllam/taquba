@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `BulkCtx::memoized_with_cached_cost` for memoized steps whose cost counters
+  should be recorded both on fresh compute and on memo hits.
+
 ## [0.1.0] - 2026-05-30
 
 Initial release. Per-batch orchestrator that runs one pipeline over many

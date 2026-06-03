@@ -6,6 +6,8 @@
 //! [`crate::BulkCtx::record_cost`], and the bulk runner rolls the per-item
 //! reports up into a batch-level total surfaced on
 //! [`crate::ProgressSnapshot`] and [`crate::BulkReport`].
+//! [`crate::BulkCtx::memoized_with_cached_cost`] stores value/cost pairs
+//! when counters should be replayed on memo hits.
 //!
 //! The same type plays two roles: an interior-mutable accumulator while a
 //! step runs (so `record_cost` takes `&self`), and a serializable value

@@ -35,7 +35,7 @@ use crate::cost::CostReport;
 ///
 /// ```no_run
 /// use serde::{Deserialize, Serialize};
-/// use taquba_bulk::{BulkCtx, Pipeline, StepError};
+/// use taquba_bulk::{BulkCtx, CostReport, Pipeline, StepError};
 ///
 /// #[derive(Serialize, Deserialize)]
 /// struct Ticket { id: String, body: String }
@@ -52,10 +52,10 @@ use crate::cost::CostReport;
 ///
 ///     async fn run(&self, ctx: &BulkCtx<Ticket>) -> Result<Processed, StepError> {
 ///         let classification = ctx
-///             .memoized("classify", async {
-///                 // one expensive call; cached on retry
-///                 ctx.record_cost("llm_calls", 1.0);
-///                 Ok::<_, StepError>("billing".to_string())
+///             .memoized_with_cached_cost("classify", async {
+///                 let cost = CostReport::new();
+///                 cost.record("llm_calls", 1.0);
+///                 Ok::<_, StepError>(("billing".to_string(), cost))
 ///             })
 ///             .await?;
 ///         Ok(Processed { id: ctx.input.id.clone(), classification })
@@ -133,6 +133,10 @@ impl<T> BulkCtx<T> {
     /// output type changed shape between runs) is treated as a miss and `f`
     /// re-runs, overwriting it. Memo I/O and serialization failures surface
     /// as a transient [`StepError`] converted into the caller's error type.
+    ///
+    /// Calls to [`record_cost`](Self::record_cost) inside `f` run only on a
+    /// cache miss. Use [`memoized_with_cached_cost`](Self::memoized_with_cached_cost)
+    /// when cached results should also contribute to the final cost report.
     pub async fn memoized<R, F, E>(&self, key: &str, f: F) -> Result<R, E>
     where
         R: Serialize + DeserializeOwned,
@@ -166,6 +170,24 @@ impl<T> BulkCtx<T> {
             .put(key, &bytes)
             .await
             .map_err(|e| E::from(memo_error(e)))?;
+        Ok(value)
+    }
+
+    /// Run `f` once and cache both its value and counters under `key`,
+    /// or return the cached value and replay its counters on a retry.
+    ///
+    /// Use this when cost counters are known only inside a memoized step.
+    /// The closure returns `(value, cost)`, and the helper records the
+    /// `CostReport` after memoization returns, so counters are included
+    /// whether the step computes freshly or hits memo state.
+    pub async fn memoized_with_cached_cost<R, F, E>(&self, key: &str, f: F) -> Result<R, E>
+    where
+        R: Serialize + DeserializeOwned,
+        F: Future<Output = Result<(R, CostReport), E>>,
+        E: From<StepError>,
+    {
+        let (value, cost) = self.memoized(key, f).await?;
+        self.cost.merge(&cost);
         Ok(value)
     }
 
@@ -270,6 +292,53 @@ mod tests {
             .unwrap();
         assert_eq!(a, "first");
         assert_eq!(b, "second");
+    }
+
+    #[tokio::test]
+    async fn memoized_with_cached_cost_records_cost_on_compute_and_memo_hit() {
+        let memo = MemoStore::new(Arc::new(InMemory::new()), "memo").new_memo("run-1", 0);
+        let first_ctx = BulkCtx::new(
+            (),
+            "run-1".into(),
+            HashMap::new(),
+            memo.clone(),
+            CancellationToken::new(),
+        );
+        let replay_ctx = BulkCtx::new(
+            (),
+            "run-1".into(),
+            HashMap::new(),
+            memo,
+            CancellationToken::new(),
+        );
+        let calls = AtomicU32::new(0);
+
+        let first = first_ctx
+            .memoized_with_cached_cost("k", async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let cost = CostReport::new();
+                cost.record("tokens", 42.0);
+                Ok::<_, StepError>(("value".to_string(), cost))
+            })
+            .await
+            .unwrap();
+        let second = replay_ctx
+            .memoized_with_cached_cost("k", async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, StepError>(("other".to_string(), CostReport::new()))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(first, "value");
+        assert_eq!(second, "value");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "memo hit did not run closure"
+        );
+        assert_eq!(first_ctx.cost().get("tokens"), 42.0);
+        assert_eq!(replay_ctx.cost().get("tokens"), 42.0);
     }
 
     #[tokio::test]
