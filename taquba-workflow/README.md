@@ -221,6 +221,34 @@ step.memo.put("draft", &draft).await?;
 Ok(StepOutcome::Succeed { result: draft })
 ```
 
+When the natural memo key is the content of an input value,
+`Memo::content_get` and `Memo::content_put` serialize that input as
+MessagePack, hash it with SHA-256, and use the digest as the memo key:
+
+```rust,ignore
+#[derive(serde::Serialize)]
+struct DraftInput<'a> {
+    operation: &'static str,
+    payload: &'a [u8],
+}
+
+let input = DraftInput {
+    operation: "draft",
+    payload: &step.payload,
+};
+if let Some(cached) = step.memo.content_get(&input).await? {
+    return Ok(StepOutcome::Succeed { result: cached });
+}
+let draft = expensive_call(&step.payload).await?;
+step.memo.content_put(&input, &draft).await?;
+Ok(StepOutcome::Succeed { result: draft })
+```
+
+Content-addressed memo keys remain scoped to `(run_id, step_number)`;
+they are not a cross-run cache. If multiple logical operations may
+receive the same input shape, include an operation name in the
+serialized input.
+
 Memo entries live in the object store passed to
 `WorkflowRuntime::builder` under the path prefix configured by
 `WorkflowRuntimeBuilder::memo_prefix` (default `"workflow-memo"`).

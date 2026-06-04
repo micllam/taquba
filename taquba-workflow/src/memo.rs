@@ -38,6 +38,7 @@
 use std::sync::Arc;
 
 use futures_util::StreamExt;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use taquba::object_store::{Error as ObjectStoreError, ObjectStore, path::Path};
 
@@ -265,6 +266,34 @@ impl Memo {
             .put(&self.run_id, self.step_number, key, value)
             .await
     }
+
+    /// Read a memo entry whose key is derived from serialized `input`.
+    ///
+    /// The input is encoded as MessagePack and hashed with SHA-256 to
+    /// derive the memo key.
+    ///
+    /// The derived key is stable only when `input` serializes
+    /// deterministically. If several logical operations may receive the
+    /// same input shape, include an operation name in the serialized input.
+    pub async fn content_get<T>(&self, input: &T) -> Result<Option<Vec<u8>>>
+    where
+        T: Serialize + ?Sized,
+    {
+        let key = content_key(input)?;
+        self.get(&key).await
+    }
+
+    /// Store `value` under a memo key derived from serialized `input`.
+    ///
+    /// See [`Self::content_get`] for the key derivation and namespace
+    /// semantics.
+    pub async fn content_put<T>(&self, input: &T, value: &[u8]) -> Result<()>
+    where
+        T: Serialize + ?Sized,
+    {
+        let key = content_key(input)?;
+        self.put(&key, value).await
+    }
 }
 
 impl std::fmt::Debug for Memo {
@@ -288,6 +317,14 @@ fn hex_sha256(bytes: &[u8]) -> String {
     hex
 }
 
+fn content_key<T>(input: &T) -> Result<String>
+where
+    T: Serialize + ?Sized,
+{
+    let bytes = rmp_serde::to_vec_named(input)?;
+    Ok(format!("content:{}", hex_sha256(&bytes)))
+}
+
 /// Parse a terminal marker filename in the form `<ts:020>_<run_id>`.
 /// Returns `None` if the leading 20 characters are not a base-10
 /// integer or the underscore separator is missing.
@@ -301,7 +338,14 @@ fn parse_terminal_marker_name(name: &str) -> Option<(u64, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Serialize;
     use taquba::object_store::memory::InMemory;
+
+    #[derive(Serialize)]
+    struct ContentInput<'a> {
+        operation: &'static str,
+        payload: &'a [u8],
+    }
 
     fn make_memo() -> Memo {
         MemoStore::new(Arc::new(InMemory::new()), "memo").new_memo("run-1", 0)
@@ -383,6 +427,82 @@ mod tests {
         let memo = make_memo();
         memo.put("k", b"").await.unwrap();
         assert_eq!(memo.get("k").await.unwrap(), Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn content_put_then_content_get_round_trips() {
+        let memo = make_memo();
+        let input = ContentInput {
+            operation: "draft",
+            payload: b"hello",
+        };
+
+        memo.content_put(&input, b"value").await.unwrap();
+
+        assert_eq!(
+            memo.content_get(&input).await.unwrap(),
+            Some(b"value".to_vec()),
+        );
+    }
+
+    #[tokio::test]
+    async fn content_key_distinguishes_serialized_inputs() {
+        let memo = make_memo();
+        let first = ContentInput {
+            operation: "draft",
+            payload: b"hello",
+        };
+        let second = ContentInput {
+            operation: "review",
+            payload: b"hello",
+        };
+
+        memo.content_put(&first, b"first").await.unwrap();
+
+        assert_eq!(
+            memo.content_get(&first).await.unwrap(),
+            Some(b"first".to_vec()),
+        );
+        assert!(memo.content_get(&second).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn content_entries_remain_step_scoped() {
+        let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
+        let at_step_0 = store.new_memo("run-1", 0);
+        let at_step_1 = store.new_memo("run-1", 1);
+        let input = ContentInput {
+            operation: "draft",
+            payload: b"hello",
+        };
+
+        at_step_0.content_put(&input, b"step-0").await.unwrap();
+
+        assert_eq!(
+            at_step_0.content_get(&input).await.unwrap(),
+            Some(b"step-0".to_vec()),
+        );
+        assert!(at_step_1.content_get(&input).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn content_key_reports_serialization_errors() {
+        struct BadSerialize;
+
+        impl Serialize for BadSerialize {
+            fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("serialization failed"))
+            }
+        }
+
+        let memo = make_memo();
+        assert!(matches!(
+            memo.content_get(&BadSerialize).await,
+            Err(Error::Serialization(_)),
+        ));
     }
 
     #[tokio::test]

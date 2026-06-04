@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Memo::content_get` and `Memo::content_put` derive per-step memo keys
+  from a MessagePack serialization of caller-supplied input hashed with
+  SHA-256.
+
 ## [0.5.0] - 2026-05-28
 
 ### Added

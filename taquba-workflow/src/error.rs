@@ -39,6 +39,10 @@ pub enum Error {
     /// Reading or writing a blob in object storage failed.
     #[error("object store error: {0}")]
     Store(#[from] taquba::object_store::Error),
+
+    /// Serializing a value for workflow storage failed.
+    #[error("serialization error: {0}")]
+    Serialization(#[from] rmp_serde::encode::Error),
 }
 
 impl Error {
@@ -52,7 +56,8 @@ impl Error {
             Self::MissingHeader(_)
             | Self::InvalidStepHeader { .. }
             | Self::ReservedHeaderInSubmit(_)
-            | Self::InputMismatch(_) => true,
+            | Self::InputMismatch(_)
+            | Self::Serialization(_) => true,
             Self::Queue(e) => e.is_permanent(),
             Self::Store(_) => false,
         }
@@ -94,5 +99,22 @@ mod tests {
             source: "missing".into(),
         };
         assert!(!Error::Store(store_err).is_permanent());
+    }
+
+    #[test]
+    fn serialization_is_permanent() {
+        struct BadSerialize;
+
+        impl serde::Serialize for BadSerialize {
+            fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("serialization failed"))
+            }
+        }
+
+        let err = rmp_serde::to_vec_named(&BadSerialize).unwrap_err();
+        assert!(Error::Serialization(err).is_permanent());
     }
 }
