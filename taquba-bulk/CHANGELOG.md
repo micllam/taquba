@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `BulkCtx::memoized_by_content` and
+  `BulkCtx::memoized_by_content_with_cached_cost` for memoized steps
+  whose keys should be derived from serialized input content rather
+  than caller-supplied strings.
 - `BulkCtx::memoized_with_cached_cost` for memoized steps whose cost counters
   should be recorded both on fresh compute and on memo hits.
 

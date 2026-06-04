@@ -12,12 +12,42 @@
 //!
 //! Each input item becomes one [`taquba_workflow`] run whose single step
 //! invokes [`Pipeline::run`]. The pipeline's own logical steps live inside
-//! that method as [`BulkCtx::memoized`] calls. Taquba delivers at-least-once,
-//! so a step may run again if its lease expires before it acks; memoization
-//! makes that replay cheap, because each completed logical step returns its
-//! cached result instead of repeating a paid call. A pipeline error retries
-//! with backoff and then dead-letters the item (terminating it failed); the
-//! rest of the batch is unaffected.
+//! that method as [`BulkCtx::memoized`] or
+//! [`BulkCtx::memoized_by_content`] calls. Taquba delivers at-least-once, so
+//! a step may run again if its lease expires before it acks; memoization makes
+//! that replay cheap, because each completed logical step returns its cached
+//! result instead of repeating a paid call. A pipeline error retries with
+//! backoff and then dead-letters the item (terminating it failed); the rest of
+//! the batch is unaffected.
+//!
+//! # Content-addressed memoization
+//!
+//! Use [`BulkCtx::memoized_by_content`] when the natural memo key is a
+//! serialized input value rather than a caller-supplied string:
+//!
+//! ```ignore
+//! #[derive(serde::Serialize)]
+//! struct LookupKey<'a> {
+//!     operation: &'static str,
+//!     query: &'a str,
+//! }
+//!
+//! let key = LookupKey {
+//!     operation: "lookup",
+//!     query: &ctx.input.body,
+//! };
+//! let response = ctx
+//!     .memoized_by_content(&key, async {
+//!         Ok::<_, StepError>(lookup(&ctx.input.body).await?)
+//!     })
+//!     .await?;
+//! ```
+//!
+//! The helper serializes the key as MessagePack, hashes it with SHA-256,
+//! and uses the digest inside the item's existing workflow memo namespace.
+//! The entry remains scoped to one item run; this is not a cross-item cache.
+//! Include an operation name in the serialized key when multiple logical
+//! operations may receive the same input shape.
 //!
 //! # Single process, remote work per step
 //!
@@ -87,8 +117,9 @@
 //! roll up into [`ProgressSnapshot::cost`] and [`BulkReport::cost`], so the
 //! batch cost is visible live and in the final report. See [`CostReport`].
 //! When counters are produced inside a memoized closure, return `(value,
-//! cost)` from [`BulkCtx::memoized_with_cached_cost`] so the same counters
-//! are recorded on a cache hit.
+//! cost)` from [`BulkCtx::memoized_with_cached_cost`] or
+//! [`BulkCtx::memoized_by_content_with_cached_cost`] so the same counters are
+//! recorded on a cache hit.
 //!
 //! # Failure policy
 //!

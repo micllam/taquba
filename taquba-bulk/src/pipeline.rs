@@ -17,9 +17,9 @@ use crate::cost::CostReport;
 /// A `Pipeline` is a single async [`run`](Pipeline::run) method: the bulk
 /// runner deserializes one input item, builds a [`BulkCtx`] around it, and
 /// awaits `run`. The expensive logical steps inside `run` (LLM calls, paid
-/// APIs, CPU-bound work) are wrapped in [`BulkCtx::memoized`] so an
-/// at-least-once retry of the item replays cached step results instead of
-/// paying for them twice.
+/// APIs, CPU-bound work) are wrapped in [`BulkCtx::memoized`] or
+/// [`BulkCtx::memoized_by_content`] so an at-least-once retry of the item
+/// replays cached step results instead of paying for them twice.
 ///
 /// # Error classification
 ///
@@ -75,7 +75,8 @@ pub trait Pipeline: Send + Sync + 'static {
     type Error: Into<StepError> + Send + 'static;
 
     /// Process one input item. Wrap expensive logical steps in
-    /// [`BulkCtx::memoized`] to make retries cheap.
+    /// [`BulkCtx::memoized`] or [`BulkCtx::memoized_by_content`] to make
+    /// retries cheap.
     fn run(
         &self,
         ctx: &BulkCtx<Self::Input>,
@@ -173,6 +174,53 @@ impl<T> BulkCtx<T> {
         Ok(value)
     }
 
+    /// Run `f` once and cache its result under a key derived from
+    /// serialized `input`, or return the previously cached result on a
+    /// retry.
+    ///
+    /// This has the same typed compute-on-miss behaviour as
+    /// [`memoized`](Self::memoized), but the memo key is derived by
+    /// serializing `input` as MessagePack and hashing it with SHA-256 via
+    /// [`taquba_workflow::Memo::content_get`] and
+    /// [`taquba_workflow::Memo::content_put`]. The entry remains scoped to
+    /// this item's workflow run and step; this method does not create a
+    /// cross-item cache.
+    ///
+    /// The derived key is stable only when `input` serializes
+    /// deterministically. If several logical operations may receive the
+    /// same input shape, include an operation name in the serialized input.
+    pub async fn memoized_by_content<K, R, F, E>(&self, input: &K, f: F) -> Result<R, E>
+    where
+        K: Serialize + ?Sized,
+        R: Serialize + DeserializeOwned,
+        F: Future<Output = Result<R, E>>,
+        E: From<StepError>,
+    {
+        match self.memo.content_get(input).await {
+            Ok(Some(bytes)) => match rmp_serde::from_slice::<R>(&bytes) {
+                Ok(value) => return Ok(value),
+                Err(err) => {
+                    tracing::warn!(
+                        run_id = %self.run_id,
+                        error = %err,
+                        "content-addressed memoized cache entry failed to deserialize; recomputing",
+                    );
+                }
+            },
+            Ok(None) => {}
+            Err(err) => return Err(E::from(memo_error(err))),
+        }
+
+        let value = f.await?;
+        let bytes = rmp_serde::to_vec_named(&value)
+            .map_err(|e| E::from(StepError::permanent(format!("memo serialize failed: {e}"))))?;
+        self.memo
+            .content_put(input, &bytes)
+            .await
+            .map_err(|e| E::from(memo_error(e)))?;
+        Ok(value)
+    }
+
     /// Run `f` once and cache both its value and counters under `key`,
     /// or return the cached value and replay its counters on a retry.
     ///
@@ -187,6 +235,31 @@ impl<T> BulkCtx<T> {
         E: From<StepError>,
     {
         let (value, cost) = self.memoized(key, f).await?;
+        self.cost.merge(&cost);
+        Ok(value)
+    }
+
+    /// Run `f` once and cache both its value and counters under a key
+    /// derived from serialized `input`, or return the cached value and
+    /// replay its counters on a retry.
+    ///
+    /// Use this when the memo key should be content-derived and cost
+    /// counters are known only inside the memoized step. The closure
+    /// returns `(value, cost)`, and the helper records the `CostReport`
+    /// after memoization returns, so counters are included whether the
+    /// step computes freshly or hits memo state.
+    pub async fn memoized_by_content_with_cached_cost<K, R, F, E>(
+        &self,
+        input: &K,
+        f: F,
+    ) -> Result<R, E>
+    where
+        K: Serialize + ?Sized,
+        R: Serialize + DeserializeOwned,
+        F: Future<Output = Result<(R, CostReport), E>>,
+        E: From<StepError>,
+    {
+        let (value, cost) = self.memoized_by_content(input, f).await?;
         self.cost.merge(&cost);
         Ok(value)
     }
@@ -225,6 +298,12 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use taquba::object_store::memory::InMemory;
     use taquba_workflow::MemoStore;
+
+    #[derive(Serialize)]
+    struct ContentInput<'a> {
+        operation: &'static str,
+        payload: &'a [u8],
+    }
 
     fn ctx_for_tests() -> BulkCtx<()> {
         let memo = MemoStore::new(Arc::new(InMemory::new()), "memo").new_memo("run-1", 0);
@@ -295,6 +374,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memoized_by_content_runs_once_then_serves_cache() {
+        let ctx = ctx_for_tests();
+        let calls = AtomicU32::new(0);
+        let input = ContentInput {
+            operation: "classify",
+            payload: b"ticket",
+        };
+        let compute = || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, StepError>("billing".to_string())
+        };
+
+        let first = ctx.memoized_by_content(&input, compute()).await.unwrap();
+        let second = ctx.memoized_by_content(&input, compute()).await.unwrap();
+
+        assert_eq!(first, "billing");
+        assert_eq!(second, "billing");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "closure ran exactly once");
+    }
+
+    #[tokio::test]
+    async fn memoized_by_content_distinguishes_serialized_inputs() {
+        let ctx = ctx_for_tests();
+        let classify = ContentInput {
+            operation: "classify",
+            payload: b"ticket",
+        };
+        let summarize = ContentInput {
+            operation: "summarize",
+            payload: b"ticket",
+        };
+
+        let first = ctx
+            .memoized_by_content::<_, String, _, StepError>(&classify, async {
+                Ok("class-a".to_string())
+            })
+            .await
+            .unwrap();
+        let second = ctx
+            .memoized_by_content::<_, String, _, StepError>(&summarize, async {
+                Ok("summary".to_string())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(first, "class-a");
+        assert_eq!(second, "summary");
+    }
+
+    #[tokio::test]
     async fn memoized_with_cached_cost_records_cost_on_compute_and_memo_hit() {
         let memo = MemoStore::new(Arc::new(InMemory::new()), "memo").new_memo("run-1", 0);
         let first_ctx = BulkCtx::new(
@@ -324,6 +453,57 @@ mod tests {
             .unwrap();
         let second = replay_ctx
             .memoized_with_cached_cost("k", async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, StepError>(("other".to_string(), CostReport::new()))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(first, "value");
+        assert_eq!(second, "value");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "memo hit did not run closure"
+        );
+        assert_eq!(first_ctx.cost().get("tokens"), 42.0);
+        assert_eq!(replay_ctx.cost().get("tokens"), 42.0);
+    }
+
+    #[tokio::test]
+    async fn memoized_by_content_with_cached_cost_records_cost_on_compute_and_memo_hit() {
+        let memo = MemoStore::new(Arc::new(InMemory::new()), "memo").new_memo("run-1", 0);
+        let first_ctx = BulkCtx::new(
+            (),
+            "run-1".into(),
+            HashMap::new(),
+            memo.clone(),
+            CancellationToken::new(),
+        );
+        let replay_ctx = BulkCtx::new(
+            (),
+            "run-1".into(),
+            HashMap::new(),
+            memo,
+            CancellationToken::new(),
+        );
+        let calls = AtomicU32::new(0);
+        let input = ContentInput {
+            operation: "classify",
+            payload: b"ticket",
+        };
+
+        let first = first_ctx
+            .memoized_by_content_with_cached_cost(&input, async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let cost = CostReport::new();
+                cost.record("tokens", 42.0);
+                Ok::<_, StepError>(("value".to_string(), cost))
+            })
+            .await
+            .unwrap();
+        let second = replay_ctx
+            .memoized_by_content_with_cached_cost(&input, async {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, StepError>(("other".to_string(), CostReport::new()))
             })
