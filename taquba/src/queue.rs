@@ -2779,11 +2779,19 @@ mod tests {
         q.close().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_scheduled_job_preserves_priority() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
+        let initial = 1_700_000_000_000u64;
+        let clock = MockClock::new(initial);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
 
-        let run_at = std::time::SystemTime::now() + Duration::from_millis(1);
+        let run_at = std::time::UNIX_EPOCH + Duration::from_millis(initial + 1);
         q.enqueue_with(
             "jobs",
             b"normal".to_vec(),
@@ -2806,7 +2814,7 @@ mod tests {
         .await
         .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        clock.advance(Duration::from_millis(5));
         q.promote_scheduled_now().await.unwrap();
 
         // High-priority should come first even though scheduled was enqueued first.
@@ -3806,7 +3814,9 @@ mod tests {
         //
         // Disable the auto-reaper so the cancel definitely happens while
         // the job is Claimed; trigger the requeue manually with reap_now.
+        let clock = MockClock::new(1_700_000_000_000);
         let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
             reaper_interval: Duration::from_secs(3600),
             ..no_backoff_opts()
         };
@@ -3829,7 +3839,7 @@ mod tests {
         );
 
         // Force lease expiry, then trigger the reaper.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        clock.advance(Duration::from_millis(100));
         q.reap_now().await.unwrap();
 
         let job2 = q
@@ -4439,8 +4449,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_nack_backoff_promoted_after_run_at() {
-        // Use a tiny backoff so the test doesn't sleep for long.
+        let clock = MockClock::new(1_700_000_000_000);
         let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
             default_queue_config: QueueConfig {
                 retry_backoff_base: Duration::from_millis(10),
                 retry_backoff_max: Duration::from_millis(10),
@@ -4470,8 +4481,8 @@ mod tests {
         let id = job.id.clone();
         q.nack(job, "boom").await.unwrap();
 
-        // Wait past the backoff and trigger promotion.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Advance past the backoff and trigger promotion.
+        clock.advance(Duration::from_millis(20));
         q.promote_scheduled_now().await.unwrap();
 
         let retried = q
