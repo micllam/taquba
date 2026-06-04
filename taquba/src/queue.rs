@@ -1348,6 +1348,9 @@ impl Queue {
         let value = rmp_serde::to_vec_named(&job)?;
 
         let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+        txn.get(dead.as_bytes())
+            .await?
+            .ok_or_else(|| Error::JobNotFound(job.id.clone()))?;
         txn.delete(dead.as_bytes())?;
         txn.put(pending.as_bytes(), &value)?;
         txn.put(job_index_key(&job.id).as_bytes(), pending.as_bytes())?;
@@ -3400,6 +3403,57 @@ mod tests {
             pending.failed_at.is_none(),
             "requeue must clear failed_at so a re-fail starts a fresh retention window"
         );
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_requeue_dead_rejects_stale_record_after_retention_sweep() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let reaper_interval = Duration::from_millis(10);
+        let retention = Duration::from_millis(50);
+        let q = Queue::open_with_options(
+            make_store(),
+            "test",
+            OpenOptions {
+                reaper_interval,
+                default_queue_config: QueueConfig {
+                    dead_retention: Some(retention),
+                    ..Default::default()
+                },
+                clock: Arc::new(clock.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        q.enqueue_with(
+            "work",
+            b"payload".to_vec(),
+            EnqueueOptions {
+                max_attempts: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.nack(job, "fatal").await.unwrap();
+
+        let dead = q.dead_jobs("work", None, 100).await.unwrap().pop().unwrap();
+        clock.advance(retention + Duration::from_millis(10));
+        tokio::time::sleep(reaper_interval * 2).await;
+
+        assert!(q.dead_jobs("work", None, 100).await.unwrap().is_empty());
+        let err = q.requeue_dead_job(dead).await.unwrap_err();
+        assert!(matches!(err, Error::JobNotFound(_)));
+        assert_eq!(q.stats("work").await.unwrap().pending, 0);
+        assert_eq!(q.stats("work").await.unwrap().dead, 0);
 
         q.close().await.unwrap();
     }

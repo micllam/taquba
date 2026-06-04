@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   late settlement is now retried (and resolves to `Error::InvalidState`
   on the next attempt) instead of surfacing a raw SlateDB transaction
   error to the caller.
+- `Queue::requeue_dead_job` now checks that the dead-letter record
+  still exists before reviving it. Requeueing a stale record after
+  dead-letter retention swept it now returns `Error::JobNotFound`
+  instead of recreating the job and corrupting queue stats.
 
 ## [0.7.0] - 2026-05-28
 
