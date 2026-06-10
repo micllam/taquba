@@ -132,8 +132,10 @@ impl<T> BulkCtx<T> {
     /// `key` namespaces the cache within this item; use a distinct key per
     /// logical step. A cached entry that fails to deserialize (e.g. an
     /// output type changed shape between runs) is treated as a miss and `f`
-    /// re-runs, overwriting it. Memo I/O and serialization failures surface
-    /// as a transient [`StepError`] converted into the caller's error type.
+    /// re-runs, overwriting it. Memo I/O failures surface as a transient
+    /// [`StepError`]; serializing the computed value fails
+    /// deterministically, so that surfaces as a permanent [`StepError`].
+    /// Both are converted into the caller's error type.
     ///
     /// Calls to [`record_cost`](Self::record_cost) inside `f` run only on a
     /// cache miss. Use [`memoized_with_cached_cost`](Self::memoized_with_cached_cost)
