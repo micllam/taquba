@@ -189,8 +189,11 @@ impl<T> BulkCtx<T> {
     /// cross-item cache.
     ///
     /// The derived key is stable only when `input` serializes
-    /// deterministically. If several logical operations may receive the
-    /// same input shape, include an operation name in the serialized input.
+    /// deterministically; types with unordered iteration, such as
+    /// `HashMap`, can serialize the same logical content into different
+    /// bytes and therefore different keys. If several
+    /// logical operations may receive the same input shape, include an
+    /// operation name in the serialized input.
     pub async fn memoized_by_content<K, R, F, E>(&self, input: &K, f: F) -> Result<R, E>
     where
         K: Serialize + ?Sized,

@@ -323,8 +323,11 @@ impl Memo {
     /// derive the memo key.
     ///
     /// The derived key is stable only when `input` serializes
-    /// deterministically. If several logical operations may receive the
-    /// same input shape, include an operation name in the serialized input.
+    /// deterministically; types with unordered iteration, such as
+    /// `HashMap`, can serialize the same logical content into different
+    /// bytes and therefore different keys. If several
+    /// logical operations may receive the same input shape, include an
+    /// operation name in the serialized input.
     pub async fn content_get<T>(&self, input: &T) -> Result<Option<Vec<u8>>>
     where
         T: Serialize + ?Sized,
