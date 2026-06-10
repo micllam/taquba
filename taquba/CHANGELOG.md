@@ -57,15 +57,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   such inserts, and a claim drops its bound advance when the bound
   moved while it ran.
 - A `pending:` key could be hidden from claims indefinitely when its
-  enqueue committed while a claim was in flight and the key sorted
-  below the keys that claim advanced the scan bound past. Job ids are
-  generated before the enqueue transaction commits, so commit order
-  can invert key order under concurrent producers. The next claim
-  then recorded emptiness at a valid epoch and the queue answered
-  `None` while live jobs were pending. Bound advances now clamp to
-  the smallest key inserted ahead of the bound since the previous
-  advance.
-
+  insert committed while a claim was in flight and the key sorted at
+  or below the keys that claim advanced the scan bound past. Job ids
+  are generated before the enqueue transaction commits, so commit
+  order can invert key order under concurrent producers, and a
+  requeue (reaper or nack) restores a job at its original key. The
+  next claim then recorded emptiness at a valid epoch and the queue
+  answered `None` while live jobs were pending. Bound advances now
+  clamp to the smallest key recorded since the bound was observed,
+  including when no bound exists yet (the first claim after a
+  process restart) and when the key equals the claimed one (the
+  claimed job requeued after its lease expired within the claim).
 - Duplicate `EnqueueOptions::id_override` values are now rejected
   transactionally with `Error::DuplicateJobId` instead of overwriting
   `jobindex:{id}` and leaving older queue-state records behind.

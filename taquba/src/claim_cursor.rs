@@ -111,8 +111,10 @@ impl ClaimCursor {
     /// claim was in flight (the next claim scans from the moved bound
     /// instead), and it is clamped to the smallest key inserted ahead
     /// of the bound since the previous advance, because such a key may
-    /// have committed after the claim's snapshot yet sort below
-    /// `claimed`.
+    /// have committed after the claim's snapshot yet sort at or below
+    /// `claimed` (a key equal to `claimed` is a reinsert of the job
+    /// the claim took, requeued after its lease expired within the
+    /// claim).
     pub(crate) fn advance(&self, queue: &str, claimed: Bytes, observed: &ClaimScanStart) {
         let mut map = self.inner.lock().unwrap();
         let s = map.entry(queue.to_string()).or_default();
@@ -120,7 +122,7 @@ impl ClaimCursor {
             return;
         }
         s.scan_from = match s.min_insert_ahead.take() {
-            Some(min) if min.as_ref() < claimed.as_ref() => Some(ScanFrom {
+            Some(min) if min.as_ref() <= claimed.as_ref() => Some(ScanFrom {
                 key: min,
                 inclusive: true,
             }),
@@ -152,22 +154,25 @@ impl ClaimCursor {
 
     /// Record `count` committed `pending:` inserts whose smallest key
     /// is `min_key`: bump the epoch, revoking any emptiness recorded
-    /// against an earlier one, move the scan-start bound back to
-    /// include `min_key` if it would otherwise be skipped, and issue
-    /// one queue-scoped wakeup per insert (capped) so waiting workers
-    /// wake one per job. When the queue was known empty at the time
-    /// this insert is recorded (a prior claim's scan found nothing and
-    /// no insert has been recorded since), no key from before that
-    /// scan is live, so the bound moves directly to `min_key` even
-    /// when no bound existed; a concurrent insert whose key sorts
-    /// below `min_key` moves the bound back when it is itself
-    /// recorded. Every site that writes `pending:`
-    /// keys (enqueue, batch enqueue, nack-requeue, dead-job requeue,
-    /// reaper-requeue, scheduler promotion) calls this *after* its
-    /// transaction commits. Calling it before the commit would let a
-    /// concurrent claim scan miss the job, record emptiness at the
-    /// already-bumped epoch, and strand the job until the next
-    /// insert.
+    /// against an earlier one, update the scan state so no claim can
+    /// miss the key, and issue one queue-scoped wakeup per insert
+    /// (capped) so waiting workers wake one per job.
+    ///
+    /// The scan-start bound moves back to include `min_key` when a
+    /// scan from it would otherwise skip the key. When no bound
+    /// exists, one is set only if a prior scan proved the queue empty
+    /// (no insert recorded since); otherwise keys from before this
+    /// process may be live and claims must keep falling back to the
+    /// front scan. A key a scan would already yield is recorded for
+    /// [`Self::advance`] to clamp to, because an in-flight claim may
+    /// otherwise advance the bound past it.
+    ///
+    /// Every site that writes `pending:` keys (enqueue, batch
+    /// enqueue, nack-requeue, dead-job requeue, reaper-requeue,
+    /// scheduler promotion) calls this *after* its transaction
+    /// commits. Calling it before the commit would let a concurrent
+    /// claim scan miss the job, record emptiness at the already-bumped
+    /// epoch, and strand the job until the next insert.
     pub(crate) fn note_pending_inserts(&self, queue: &str, min_key: &str, count: usize) {
         let wakeup = {
             let mut map = self.inner.lock().unwrap();
@@ -175,15 +180,17 @@ impl ClaimCursor {
             let was_known_empty = s.empty_as_of == Some(s.epoch);
             s.epoch += 1;
             let include_min_key = match &s.scan_from {
-                _ if was_known_empty => true,
+                // Move the bound back when a scan from it would skip
+                // the key.
                 Some(sf) => {
                     min_key.as_bytes() < sf.key.as_ref()
                         || (min_key.as_bytes() == sf.key.as_ref() && !sf.inclusive)
                 }
-                // Bound unknown (cold start or restart): pre-existing keys
-                // may be live, so the front-scan fallback must stay in
-                // charge.
-                None => false,
+                // Bound unknown (cold start or restart): a bound may be
+                // set only when a scan has proven the queue empty;
+                // otherwise keys from before this process may be live
+                // and claims must keep falling back to the front scan.
+                None => was_known_empty,
             };
             if include_min_key {
                 s.scan_from = Some(ScanFrom {
@@ -191,11 +198,11 @@ impl ClaimCursor {
                     inclusive: true,
                 });
                 s.min_insert_ahead = None;
-            } else if s.scan_from.is_some() {
-                // The key is ahead of the current bound, but an in-flight
-                // claim may be about to advance the bound past it; record
-                // it so that advance clamps. Keys behind the bound moved
-                // the bound itself above, which subsumes the clamp.
+            } else {
+                // A scan would already yield the key (or no bound is
+                // set yet), but an in-flight claim may be about to
+                // advance the bound past it; record it so that advance
+                // clamps.
                 let key = Bytes::copy_from_slice(min_key.as_bytes());
                 let is_new_min = s
                     .min_insert_ahead
@@ -328,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_with_unknown_bound_leaves_front_scan_in_charge() {
+    fn insert_with_unknown_bound_keeps_the_front_scan_fallback() {
         let state = ClaimCursor::new();
         state.note_pending_insert("q", "pending:q:00000000:job-1");
         assert!(state.begin_claim("q").scan_from.is_none());
@@ -385,7 +392,30 @@ mod tests {
     }
 
     #[test]
-    fn advance_ignores_clamp_keys_at_or_past_the_claimed_key() {
+    fn advance_clamps_to_a_reinsert_of_the_claimed_key() {
+        let state = ClaimCursor::new();
+        let scan = state.begin_claim("q");
+        state.advance("q", Bytes::from_static(b"pending:q:00000000:job-2"), &scan);
+
+        // The claim takes job-5, whose lease expires within the claim,
+        // and the reaper requeues it at its original key before the
+        // claim's bound update runs.
+        let observed = state.begin_claim("q");
+        state.note_pending_insert("q", "pending:q:00000000:job-5");
+        state.advance(
+            "q",
+            Bytes::from_static(b"pending:q:00000000:job-5"),
+            &observed,
+        );
+
+        assert_eq!(
+            state.begin_claim("q").scan_from,
+            scan_from(b"pending:q:00000000:job-5", true),
+        );
+    }
+
+    #[test]
+    fn advance_ignores_clamp_keys_past_the_claimed_key() {
         let state = ClaimCursor::new();
         let scan = state.begin_claim("q");
         state.advance("q", Bytes::from_static(b"pending:q:00000000:job-2"), &scan);
@@ -401,6 +431,27 @@ mod tests {
         assert_eq!(
             state.begin_claim("q").scan_from,
             scan_from(b"pending:q:00000000:job-5", false),
+        );
+    }
+
+    #[test]
+    fn advance_clamps_to_key_inserted_during_a_cold_start_claim() {
+        let state = ClaimCursor::new();
+
+        // A cold-start claim observes no bound and front-scans. While
+        // it runs, a reaper requeue inserts a key that sorts below the
+        // keys the claim will advance past.
+        let observed = state.begin_claim("q");
+        state.note_pending_insert("q", "pending:q:00000000:job-1");
+        state.advance(
+            "q",
+            Bytes::from_static(b"pending:q:00000000:job-5"),
+            &observed,
+        );
+
+        assert_eq!(
+            state.begin_claim("q").scan_from,
+            scan_from(b"pending:q:00000000:job-1", true),
         );
     }
 
