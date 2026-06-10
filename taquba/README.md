@@ -82,30 +82,61 @@ Implement `Worker` and let `run_worker` handle the claim / ack / nack
 loop, retries, and graceful shutdown:
 
 ```rust
-use taquba::{run_worker, JobRecord, Worker, WorkerError};
+use std::sync::Arc;
+use std::time::Duration;
+
+use taquba::object_store::memory::InMemory;
+use taquba::{JobRecord, Queue, Worker, WorkerError, run_worker};
 
 struct EmailWorker;
 
 impl Worker for EmailWorker {
     async fn process(&self, job: &JobRecord) -> Result<(), WorkerError> {
         let to = std::str::from_utf8(&job.payload)?;
-        send_email(to).await?;
-        Ok(())
+        send_email(to).await
     }
+}
+
+async fn send_email(to: &str) -> Result<(), WorkerError> {
+    println!("sending email to {to}");
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> taquba::Result<()> {
+    let queue = Queue::open(Arc::new(InMemory::new()), "demo").await?;
+    queue
+        .enqueue("emails", b"alice@example.com".to_vec())
+        .await?;
+
+    // Runs until the shutdown future resolves; pass e.g. a Ctrl-C
+    // handler or a oneshot instead to stop it.
+    run_worker(
+        &queue,
+        "emails",
+        &EmailWorker,
+        Duration::from_millis(250),
+        std::future::pending::<()>(),
+    )
+    .await?;
+
+    queue.close().await
 }
 ```
 
 Pass any future as the shutdown signal: `tokio::signal::ctrl_c()`,
 a oneshot, etc. Shutdown is honoured at safe points: between jobs and during
 idle waits. In-flight jobs always finish, so leases are never abandoned to the
-reaper. See [`examples/worker.rs`](examples/worker.rs) for a full setup.
+reaper. See [`examples/worker.rs`](examples/worker.rs) for a full setup
+including retries and dead-letter inspection.
 
 `run_worker_concurrent` is the same loop processing up to `concurrency`
 jobs in parallel:
 
 ```rust
+let queue = Arc::new(queue);
 run_worker_concurrent(&queue, "emails", Arc::new(EmailWorker), 8,
-    Duration::from_millis(250), async { tokio::signal::ctrl_c().await.ok(); })
+    Duration::from_millis(250), std::future::pending::<()>())
     .await?;
 ```
 
