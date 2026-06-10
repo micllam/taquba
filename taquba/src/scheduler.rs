@@ -114,7 +114,7 @@ async fn promote_job(
 
         match txn.commit().await {
             Ok(_) => {
-                claim_cursor.invalidate_if_at_or_before(&job.queue, &pending);
+                claim_cursor.note_pending_insert(&job.queue, &pending);
                 debug!(
                     queue = %job.queue,
                     job_id = %job.id,

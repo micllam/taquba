@@ -198,7 +198,7 @@ async fn reap_job(
         match txn.commit().await {
             Ok(_) => {
                 if let Some(key) = requeued_pending_key {
-                    claim_cursor.invalidate_if_at_or_before(&job.queue, &key);
+                    claim_cursor.note_pending_insert(&job.queue, &key);
                 }
                 if became_dead {
                     completion_notify.notify_waiters();

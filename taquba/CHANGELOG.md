@@ -19,8 +19,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expires; at-least-once delivery is unaffected, and a settled job's
   claim is always durable because later durable commits flush
   preceding WAL entries.
+- `Queue::claim` tracks per-queue emptiness and a scan bound in
+  process memory. Polling an empty queue answers without a storage
+  scan or the claim lock, and the pending tombstone band is never
+  re-walked from the front while the process stays up; a full prefix
+  scan now happens only on cold start or process restart.
 
 ### Fixed
+
+- A `pending:` insert landing behind the claim cursor while a claim
+  was in flight could have its cursor invalidation overwritten by
+  that claim's cursor update, hiding the job from cursor scans until
+  the queue next drained. The scan bound now moves back to include
+  such inserts, and a claim drops its bound advance when the bound
+  moved while it ran.
+- A `pending:` key could be hidden from claims indefinitely when its
+  enqueue committed while a claim was in flight and the key sorted
+  below the keys that claim advanced the scan bound past. Job ids are
+  generated before the enqueue transaction commits, so commit order
+  can invert key order under concurrent producers. The next claim
+  then recorded emptiness at a valid epoch and the queue answered
+  `None` while live jobs were pending. Bound advances now clamp to
+  the smallest key inserted ahead of the bound since the previous
+  advance.
 
 - Duplicate `EnqueueOptions::id_override` values are now rejected
   transactionally with `Error::DuplicateJobId` instead of overwriting

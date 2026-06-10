@@ -839,7 +839,7 @@ impl Queue {
                     // job becomes claimable later via the scheduler loop,
                     // which fires its own notify.
                     if matches!(status, JobStatus::Pending) {
-                        self.claim_cursor.invalidate_if_at_or_before(&queue, &key);
+                        self.claim_cursor.note_pending_insert(&queue, &key);
                         self.job_available.notify_waiters();
                     }
                     debug!(queue = %queue, job_id = %id, "job enqueued");
@@ -943,42 +943,75 @@ impl Queue {
     /// inside the queue's prefix (cursor exhausted, or an older
     /// job has been requeued by `nack` behind the cursor), the
     /// claim falls back to a front prefix scan and resets the
-    /// cursor.
+    /// cursor. When the front scan also finds nothing, the queue is
+    /// marked empty in memory and subsequent claims return `None`
+    /// without scanning until the next `pending:` insert, so polling
+    /// an empty queue does not re-walk the tombstone band left by
+    /// previously claimed jobs.
     #[instrument(skip(self), fields(queue))]
     pub async fn claim(&self, queue: &str, lease_duration: Duration) -> Result<Option<JobRecord>> {
+        // Empty check before taking the claim lock: a queue known to be
+        // empty answers from in-process state without contending with
+        // claims that have work to do. A stale answer here is safe in
+        // both directions; emptiness is only ever revoked by an insert,
+        // and a stale "not empty" just falls through to the locked scan.
+        if self.claim_cursor.begin_claim(queue).known_empty {
+            return Ok(None);
+        }
         let lock = self.claim_lock_for(queue);
         let _guard = lock.lock().await;
 
         let prefix = pending_prefix(queue);
         let prefix_bytes = prefix.as_bytes();
         loop {
+            // The scan state (and its pending-insert epoch) is read
+            // before the transaction begins, so any insert the snapshot
+            // could miss bumps the epoch after this read and revokes the
+            // emptiness recorded below.
+            let scan = self.claim_cursor.begin_claim(queue);
+            if scan.known_empty {
+                return Ok(None);
+            }
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
 
-            // Cursor-resumed scan: start strictly after the most
-            // recently claimed key. A yielded key outside the
-            // queue's prefix means the cursor is past the queue's
-            // tail; fall through to the front-scan branch.
+            // Bound-resumed scan: start at the recorded bound (after
+            // the last claimed key, or at a key inserted behind it). A
+            // yielded key outside the queue's prefix means the bound is
+            // past the queue's tail; fall through to the front-scan
+            // branch.
             let mut kv = None;
-            if let Some(cursor) = self.claim_cursor.get(queue) {
-                let mut iter = txn
-                    .scan((Bound::Excluded(cursor), Bound::Unbounded))
-                    .await?;
+            if let Some(sf) = scan.scan_from.clone() {
+                let start = if sf.inclusive {
+                    Bound::Included(sf.key)
+                } else {
+                    Bound::Excluded(sf.key)
+                };
+                let mut iter = txn.scan((start, Bound::Unbounded)).await?;
                 if let Some(candidate) = iter.next().await? {
                     if candidate.key.starts_with(prefix_bytes) {
                         kv = Some(candidate);
                     }
                 }
             }
-            // Front scan: cold start, cursor exhausted, or an older
-            // requeued job sits behind the cursor.
             let kv = match kv {
                 Some(kv) => kv,
+                // Every live pending key sorts at or after a known
+                // bound (inserts landing behind it move it back), so an
+                // empty bound scan proves the queue is empty without
+                // re-walking the tombstone band from the front.
+                None if scan.scan_from.is_some() => {
+                    self.claim_cursor.mark_empty(queue, scan.epoch);
+                    return Ok(None);
+                }
+                // Front scan: bound unknown (cold start or process
+                // restart), so pre-existing keys may be live anywhere
+                // in the prefix.
                 None => {
                     let mut iter = txn.scan_prefix(prefix_bytes).await?;
                     match iter.next().await? {
                         Some(kv) => kv,
                         None => {
-                            self.claim_cursor.clear(queue);
+                            self.claim_cursor.mark_empty(queue, scan.epoch);
                             return Ok(None);
                         }
                     }
@@ -1042,7 +1075,7 @@ impl Queue {
             };
             match txn.commit_with_options(&write_opts).await {
                 Ok(_) => {
-                    self.claim_cursor.set(queue, pending_key_bytes);
+                    self.claim_cursor.advance(queue, pending_key_bytes, &scan);
                     debug!(queue = queue, job_id = %job.id, attempt = job.attempts, "job claimed");
                     return Ok(Some(job));
                 }
@@ -1173,8 +1206,6 @@ impl Queue {
                         &job.queue,
                         &[(JobStatus::Pending, 1), (JobStatus::Claimed, -1)],
                     )?;
-                    self.claim_cursor
-                        .invalidate_if_at_or_before(&job.queue, &pending);
                     debug!(
                         queue = %job.queue,
                         job_id = %job.id,
@@ -1215,6 +1246,8 @@ impl Queue {
         let became_dead = matches!(job.status, JobStatus::Dead);
         self.clear_cancel_token(&job.id);
         if immediate_retry {
+            let pending = pending_key(&job.queue, job.priority, &job.id);
+            self.claim_cursor.note_pending_insert(&job.queue, &pending);
             // Backoff path doesn't need a wake: the scheduler loop will fire
             // notify_waiters() when it promotes the job.
             self.job_available.notify_waiters();
@@ -1380,8 +1413,7 @@ impl Queue {
             &[(JobStatus::Pending, 1), (JobStatus::Dead, -1)],
         )?;
         txn.commit().await?;
-        self.claim_cursor
-            .invalidate_if_at_or_before(&job.queue, &pending);
+        self.claim_cursor.note_pending_insert(&job.queue, &pending);
         self.job_available.notify_waiters();
 
         debug!(queue = %job.queue, job_id = %job.id, "dead job re-queued");
@@ -1700,6 +1732,12 @@ impl Queue {
 
         update_stats(&txn, queue, &[(JobStatus::Pending, ids.len() as i64)])?;
         txn.commit().await?;
+        // Batch ids are monotonic ULIDs at one priority, so the first id
+        // yields the batch's smallest pending key for the cursor check.
+        if let Some(first_id) = ids.first() {
+            let key = pending_key(queue, priority, first_id);
+            self.claim_cursor.note_pending_insert(queue, &key);
+        }
         self.job_available.notify_waiters();
 
         debug!(queue = queue, count = ids.len(), "batch enqueued");
@@ -1797,6 +1835,60 @@ mod tests {
             },
             ..OpenOptions::default()
         }
+    }
+
+    #[tokio::test]
+    async fn claim_finds_job_enqueued_after_empty_polls() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        assert!(q.claim("work", lease).await.unwrap().is_none());
+        assert!(q.claim("work", lease).await.unwrap().is_none());
+
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        assert_eq!(job.payload, b"job");
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn claim_finds_batch_enqueued_after_queue_drained() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        q.enqueue("work", b"first".to_vec()).await.unwrap();
+        let first = q.claim("work", lease).await.unwrap().unwrap();
+        q.ack(&first).await.unwrap();
+        assert!(q.claim("work", lease).await.unwrap().is_none());
+        assert!(q.claim("work", lease).await.unwrap().is_none());
+
+        q.enqueue_batch("work", vec![b"second".to_vec()])
+            .await
+            .unwrap();
+
+        let second = q.claim("work", lease).await.unwrap().unwrap();
+        assert_eq!(second.payload, b"second");
+        q.ack(&second).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn claim_finds_job_requeued_by_nack_after_empty_poll() {
+        let q = Queue::open_with_options(make_store(), "test", no_backoff_opts())
+            .await
+            .unwrap();
+        let lease = Duration::from_secs(5);
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        assert!(q.claim("work", lease).await.unwrap().is_none());
+
+        q.nack(job, "retry").await.unwrap();
+
+        let retried = q.claim("work", lease).await.unwrap().unwrap();
+        assert_eq!(retried.payload, b"job");
+        assert_eq!(retried.attempts, 2);
+        q.ack(&retried).await.unwrap();
+        q.close().await.unwrap();
     }
 
     #[tokio::test]
