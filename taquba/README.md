@@ -100,6 +100,23 @@ a oneshot, etc. Shutdown is honoured at safe points: between jobs and during
 idle waits. In-flight jobs always finish, so leases are never abandoned to the
 reaper. See [`examples/worker.rs`](examples/worker.rs) for a full setup.
 
+`run_worker_concurrent` is the same loop processing up to `concurrency`
+jobs in parallel:
+
+```rust
+run_worker_concurrent(&queue, "emails", Arc::new(EmailWorker), 8,
+    Duration::from_millis(250), async { tokio::signal::ctrl_c().await.ok(); })
+    .await?;
+```
+
+It claims jobs in batches sized to its free capacity (one claim
+transaction per batch via `Queue::claim_batch`), spawns each job onto a
+task set, and acks each individually. On shutdown it stops claiming and
+drains the in-flight set before returning. Idle workers of both loops
+wait on a queue-scoped notification that wakes one waiting worker per
+inserted job, so `poll_interval` only bounds the latency of out-of-band
+events such as a scheduled job becoming due.
+
 ## Coordinating with caller state
 
 `Queue::enqueue_with_kv` enqueues a job *and* applies a set of writes to a

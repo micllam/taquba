@@ -57,6 +57,42 @@
 //!   queue, see [`QueueConfig`]).
 //! - Bounded dead-letter retention with paginated inspection.
 //!
+//! # Worker loop
+//!
+//! Production workers rarely call [`Queue::claim`] and [`Queue::ack`]
+//! directly: implement [`Worker`] and let [`run_worker`] handle the
+//! claim / ack / nack loop, retries, and graceful shutdown:
+//!
+//! ```no_run
+//! use taquba::{JobRecord, Worker, WorkerError};
+//!
+//! struct EmailWorker;
+//!
+//! impl Worker for EmailWorker {
+//!     async fn process(&self, job: &JobRecord) -> Result<(), WorkerError> {
+//!         let to = std::str::from_utf8(&job.payload)?;
+//!         # async fn send_email(_to: &str) -> Result<(), WorkerError> { Ok(()) }
+//!         send_email(to).await?;
+//!         Ok(())
+//!     }
+//! }
+//! ```
+//!
+//! Pass any future as the shutdown signal: `tokio::signal::ctrl_c()`, a
+//! oneshot, etc. Shutdown is honoured at safe points: between jobs and
+//! during idle waits. In-flight jobs always finish, so leases are never
+//! abandoned to the reaper.
+//!
+//! [`run_worker_concurrent`] is the same loop processing up to
+//! `concurrency` jobs in parallel. It claims jobs in batches sized to
+//! its free capacity (one claim transaction per batch via
+//! [`Queue::claim_batch`]), spawns each job onto a task set, and acks
+//! each job individually. On shutdown it stops claiming and drains the
+//! in-flight set before returning. Idle workers of both loops wait on a
+//! queue-scoped notification that wakes one waiting worker per inserted
+//! job, so the poll interval only bounds the latency of out-of-band
+//! events such as a scheduled job becoming due.
+//!
 //! # Coordinating with caller state
 //!
 //! [`Queue::enqueue_with_kv`] enqueues a job *and* applies a set of writes
