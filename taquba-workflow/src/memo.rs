@@ -232,11 +232,9 @@ impl MemoStore {
     }
 
     fn memo_path(&self, run_id: &str, step_number: u32, key: &str) -> Path {
-        let key_hash = hex_sha256(key.as_bytes());
-        Path::from(format!(
-            "{}/memos/{}/{}/{}",
-            self.prefix, run_id, step_number, key_hash
-        ))
+        self.memos_run_prefix(run_id)
+            .child(step_number.to_string())
+            .child(hex_sha256(key.as_bytes()))
     }
 
     fn memos_run_prefix(&self, run_id: &str) -> Path {
