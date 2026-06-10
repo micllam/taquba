@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Batch submission runs with bounded concurrency instead of one
+  awaited submit at a time. Each submission blocks on a durable
+  enqueue commit and concurrent commits share WAL flushes, so serial
+  submission capped at one item per flush interval (one item per
+  100ms at the SlateDB default). Enqueue order across in-flight
+  submissions is not defined; batch items are independent.
+
 ### Added
 
 - `BulkCtx::memoized_by_content` and

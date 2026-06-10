@@ -352,10 +352,42 @@ impl<P: Pipeline> Bulk<P> {
     /// duplicate run id that was already active (or already recorded) is not
     /// counted, so the expected total matches the number of terminal hooks
     /// that will fire.
+    ///
+    /// Submissions run with bounded concurrency. Each submission blocks
+    /// on a durable enqueue commit, and concurrent commits share WAL
+    /// flushes, so at flush-bound latencies (for example the SlateDB
+    /// default 100ms flush interval) serial submission would cap at one
+    /// item per flush. Enqueue order across in-flight submissions is not
+    /// defined; batch items are independent. The first submission error
+    /// aborts the remaining in-flight submissions and is returned.
     async fn submit_all<I>(&self, inputs: I) -> Result<usize>
     where
         I: IntoIterator<Item = P::Input>,
     {
+        const SUBMIT_CONCURRENCY: usize = 32;
+
+        fn tally(
+            joined: std::result::Result<
+                taquba_workflow::Result<taquba_workflow::SubmitOutcome>,
+                tokio::task::JoinError,
+            >,
+            expected: &mut usize,
+        ) -> Result<()> {
+            match joined {
+                Ok(Ok(outcome)) => {
+                    if outcome.newly_submitted {
+                        *expected += 1;
+                    }
+                    Ok(())
+                }
+                Ok(Err(err)) => Err(err.into()),
+                // The set is never aborted while joining, so a join error
+                // is a panic in a submission task; propagate it.
+                Err(join_err) => std::panic::resume_unwind(join_err.into_panic()),
+            }
+        }
+
+        let mut set = tokio::task::JoinSet::new();
         let mut expected = 0usize;
         for (i, input) in inputs.into_iter().enumerate() {
             let run_id = match &self.key_fn {
@@ -363,18 +395,25 @@ impl<P: Pipeline> Bulk<P> {
                 None => format!("item-{i}"),
             };
             let payload = rmp_serde::to_vec_named(&input)?;
-            let outcome = self
-                .runtime
-                .submit(RunSpec {
-                    run_id: Some(run_id),
-                    input: payload,
-                    headers: self.headers.clone(),
-                    ..RunSpec::default()
-                })
-                .await?;
-            if outcome.newly_submitted {
-                expected += 1;
+            if set.len() >= SUBMIT_CONCURRENCY {
+                let joined = set.join_next().await.expect("set is non-empty");
+                tally(joined, &mut expected)?;
             }
+            let runtime = self.runtime.clone();
+            let headers = self.headers.clone();
+            set.spawn(async move {
+                runtime
+                    .submit(RunSpec {
+                        run_id: Some(run_id),
+                        input: payload,
+                        headers,
+                        ..RunSpec::default()
+                    })
+                    .await
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            tally(joined, &mut expected)?;
         }
         Ok(expected)
     }
@@ -466,6 +505,31 @@ mod tests {
         assert!(records.iter().all(|(_, status, _)| status == "succeeded"));
         let outputs: Vec<u32> = records.iter().filter_map(|(_, _, o)| *o).collect();
         assert!(outputs.contains(&2) && outputs.contains(&4) && outputs.contains(&6));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn large_batch_submits_with_bounded_concurrency() {
+        let (queue, store) = fresh().await;
+        let sink = Arc::new(Collect::default());
+        let bulk = Bulk::builder(queue, store, Doubler)
+            .output(sink.clone())
+            .poll_interval(Duration::from_millis(10))
+            .build();
+
+        // More items than the submission concurrency window, so the
+        // join-at-capacity path and the final drain both run. The range
+        // includes n = 13, which Doubler fails permanently.
+        let inputs: Vec<Item> = (0..80).map(|n| Item { n }).collect();
+        let report = tokio::time::timeout(Duration::from_secs(30), bulk.run(inputs))
+            .await
+            .expect("run finished in time")
+            .unwrap();
+
+        assert_eq!(report.total, 80);
+        assert_eq!(report.succeeded, 79);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.failed_run_ids, vec!["item-13".to_string()]);
+        assert_eq!(sink.records.lock().unwrap().len(), 80);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
