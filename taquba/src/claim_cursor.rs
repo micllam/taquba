@@ -2,6 +2,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use tokio::sync::Notify;
+
+/// Upper bound on wakeups issued for one batch of inserts. Beyond the
+/// cap, woken workers drain the backlog by looping on claim, and
+/// `Notify::notify_one` stores at most one permit when no task is
+/// waiting, so extra calls would be wasted work.
+const MAX_INSERT_WAKEUPS: usize = 64;
 
 /// Per-queue in-memory claim-scan state: a scan-start bound and a
 /// pending-insert epoch.
@@ -58,6 +65,11 @@ struct QueueClaimState {
     /// `advance` clamps to this key so the bound never jumps over an
     /// insert it could not have observed.
     min_insert_ahead: Option<Bytes>,
+    /// Queue-scoped wakeup for tasks waiting in `claim_with_wait` or
+    /// `wait_for_jobs_on`. Each recorded insert issues one
+    /// `notify_one`, waking one waiting worker per job instead of the
+    /// whole pool.
+    wakeup: Arc<Notify>,
 }
 
 /// Snapshot of one queue's claim-scan state, taken at the start of a
@@ -131,54 +143,87 @@ impl ClaimCursor {
         s.empty_as_of = Some(epoch);
     }
 
-    /// Record a committed `pending:` insert: bump the epoch, revoking
-    /// any emptiness recorded against an earlier one, and move the
-    /// scan-start bound back to include `new_key` if it would
-    /// otherwise be skipped. When the queue was known empty,
-    /// `new_key` is provably the only live key, so the bound is set
-    /// even if none existed. Every site that writes a `pending:` key
-    /// (enqueue, batch enqueue, nack-requeue, dead-job requeue,
+    /// Record one committed `pending:` insert. See
+    /// [`Self::note_pending_inserts`] for the semantics, including why
+    /// this must be called after the insert's transaction commits.
+    pub(crate) fn note_pending_insert(&self, queue: &str, new_key: &str) {
+        self.note_pending_inserts(queue, new_key, 1);
+    }
+
+    /// Record `count` committed `pending:` inserts whose smallest key
+    /// is `min_key`: bump the epoch, revoking any emptiness recorded
+    /// against an earlier one, move the scan-start bound back to
+    /// include `min_key` if it would otherwise be skipped, and issue
+    /// one queue-scoped wakeup per insert (capped) so waiting workers
+    /// wake one per job. When the queue was known empty at the time
+    /// this insert is recorded (a prior claim's scan found nothing and
+    /// no insert has been recorded since), no key from before that
+    /// scan is live, so the bound moves directly to `min_key` even
+    /// when no bound existed; a concurrent insert whose key sorts
+    /// below `min_key` moves the bound back when it is itself
+    /// recorded. Every site that writes `pending:`
+    /// keys (enqueue, batch enqueue, nack-requeue, dead-job requeue,
     /// reaper-requeue, scheduler promotion) calls this *after* its
     /// transaction commits. Calling it before the commit would let a
     /// concurrent claim scan miss the job, record emptiness at the
     /// already-bumped epoch, and strand the job until the next
     /// insert.
-    pub(crate) fn note_pending_insert(&self, queue: &str, new_key: &str) {
-        let mut map = self.inner.lock().unwrap();
-        let s = map.entry(queue.to_string()).or_default();
-        let was_known_empty = s.empty_as_of == Some(s.epoch);
-        s.epoch += 1;
-        let include_new_key = match &s.scan_from {
-            _ if was_known_empty => true,
-            Some(sf) => {
-                new_key.as_bytes() < sf.key.as_ref()
-                    || (new_key.as_bytes() == sf.key.as_ref() && !sf.inclusive)
+    pub(crate) fn note_pending_inserts(&self, queue: &str, min_key: &str, count: usize) {
+        let wakeup = {
+            let mut map = self.inner.lock().unwrap();
+            let s = map.entry(queue.to_string()).or_default();
+            let was_known_empty = s.empty_as_of == Some(s.epoch);
+            s.epoch += 1;
+            let include_min_key = match &s.scan_from {
+                _ if was_known_empty => true,
+                Some(sf) => {
+                    min_key.as_bytes() < sf.key.as_ref()
+                        || (min_key.as_bytes() == sf.key.as_ref() && !sf.inclusive)
+                }
+                // Bound unknown (cold start or restart): pre-existing keys
+                // may be live, so the front-scan fallback must stay in
+                // charge.
+                None => false,
+            };
+            if include_min_key {
+                s.scan_from = Some(ScanFrom {
+                    key: Bytes::copy_from_slice(min_key.as_bytes()),
+                    inclusive: true,
+                });
+                s.min_insert_ahead = None;
+            } else if s.scan_from.is_some() {
+                // The key is ahead of the current bound, but an in-flight
+                // claim may be about to advance the bound past it; record
+                // it so that advance clamps. Keys behind the bound moved
+                // the bound itself above, which subsumes the clamp.
+                let key = Bytes::copy_from_slice(min_key.as_bytes());
+                let is_new_min = s
+                    .min_insert_ahead
+                    .as_ref()
+                    .is_none_or(|min| key.as_ref() < min.as_ref());
+                if is_new_min {
+                    s.min_insert_ahead = Some(key);
+                }
             }
-            // Bound unknown (cold start or restart): pre-existing keys
-            // may be live, so the front-scan fallback must stay in
-            // charge.
-            None => false,
+            s.wakeup.clone()
         };
-        if include_new_key {
-            s.scan_from = Some(ScanFrom {
-                key: Bytes::copy_from_slice(new_key.as_bytes()),
-                inclusive: true,
-            });
-            s.min_insert_ahead = None;
-        } else if s.scan_from.is_some() {
-            // The key is ahead of the current bound, but an in-flight
-            // claim may be about to advance the bound past it; record
-            // it so that advance clamps. Keys behind the bound moved
-            // the bound itself above, which subsumes the clamp.
-            let key = Bytes::copy_from_slice(new_key.as_bytes());
-            let is_new_min = s
-                .min_insert_ahead
-                .as_ref()
-                .is_none_or(|min| key.as_ref() < min.as_ref());
-            if is_new_min {
-                s.min_insert_ahead = Some(key);
-            }
+        for _ in 0..count.min(MAX_INSERT_WAKEUPS) {
+            wakeup.notify_one();
         }
+    }
+
+    /// The queue-scoped wakeup that [`Self::note_pending_inserts`]
+    /// notifies, one `notify_one` per recorded insert. `notify_one`
+    /// leaves a permit when no task is waiting, so a waiter that
+    /// subscribes after an insert still wakes immediately.
+    pub(crate) fn wakeup_for(&self, queue: &str) -> Arc<Notify> {
+        self.inner
+            .lock()
+            .unwrap()
+            .entry(queue.to_string())
+            .or_default()
+            .wakeup
+            .clone()
     }
 }
 

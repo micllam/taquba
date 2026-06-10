@@ -97,9 +97,10 @@ pub trait Worker: Send + Sync {
 /// every graceful restart).
 ///
 /// `poll_interval` is the maximum time the loop will wait on an empty queue
-/// before re-checking. In-process enqueues wake the loop immediately via the
-/// shared notify, so this only bounds the latency of out-of-band events
-/// (e.g. a scheduled job becoming due).
+/// before re-checking. In-process inserts wake the loop immediately via the
+/// queue-scoped notify (one waiting worker per inserted job), so this only
+/// bounds the latency of out-of-band events (e.g. a scheduled job becoming
+/// due).
 pub async fn run_worker<W, F>(
     queue_handle: &Queue,
     queue: &str,
@@ -140,7 +141,7 @@ where
                         debug!(queue = queue, "worker shutdown requested");
                         return Ok(());
                     }
-                    _ = queue_handle.wait_for_jobs(poll_interval) => {}
+                    _ = queue_handle.wait_for_jobs_on(queue, poll_interval) => {}
                 }
             }
         }
@@ -230,7 +231,7 @@ where
                 tokio::select! {
                     biased;
                     _ = &mut shutdown => break 'main,
-                    _ = queue_handle.wait_for_jobs(poll_interval) => {}
+                    _ = queue_handle.wait_for_jobs_on(queue, poll_interval) => {}
                 }
             }
         }

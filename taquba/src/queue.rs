@@ -870,8 +870,11 @@ impl Queue {
     ///
     /// Returns when either an in-process enqueue / promotion / requeue fires
     /// the wakeup notification, or the timeout elapses. The wakeup is
-    /// queue-agnostic: callers must follow up with a [`Self::claim`] call to
-    /// see if anything is actually available on their queue.
+    /// queue-agnostic and wakes every waiter; a pool of workers serving
+    /// one queue should prefer [`Self::wait_for_jobs_on`], which wakes
+    /// one waiter per inserted job. Callers must follow up with a
+    /// [`Self::claim`] call to see if anything is actually available on
+    /// their queue.
     pub async fn wait_for_jobs(&self, max_wait: Duration) {
         let notified = self.job_available.notified();
         tokio::pin!(notified);
@@ -881,14 +884,40 @@ impl Queue {
         }
     }
 
+    /// Block up to `max_wait` for a job to become claimable on `queue`.
+    ///
+    /// Unlike [`Self::wait_for_jobs`], the wakeup is queue-scoped and
+    /// delivered to one waiter per inserted job, so a pool of waiting
+    /// workers does not contend on the claim path when a single job
+    /// arrives. Returning does not guarantee a job is still available
+    /// (another worker may claim it first); follow up with a claim
+    /// call and wait again if it returns `None`.
+    pub async fn wait_for_jobs_on(&self, queue: &str, max_wait: Duration) {
+        let wakeup = self.claim_cursor.wakeup_for(queue);
+        let notified = wakeup.notified();
+        tokio::pin!(notified);
+        // `enable` consumes a permit left by an insert that landed
+        // before this waiter subscribed, so the wait returns
+        // immediately instead of sleeping past an already-available
+        // job.
+        notified.as_mut().enable();
+        tokio::select! {
+            _ = &mut notified => {}
+            _ = tokio::time::sleep(max_wait) => {}
+        }
+    }
+
     /// Claim the next pending job, waiting up to `max_wait` for one to appear.
     ///
     /// Workers should prefer this over a polling [`Self::claim_next`] +
-    /// [`tokio::time::sleep`] loop: when an enqueue or scheduled-job promotion
-    /// happens in the same process, the wakeup is delivered via an in-memory
-    /// notify so the worker resumes immediately, without waiting out the poll
-    /// interval. Only when nothing is available does the call fall back to
-    /// the timeout, returning `None`.
+    /// [`tokio::time::sleep`] loop: when a job lands on `queue` (enqueue,
+    /// retry requeue, dead-job requeue, scheduled-job promotion, lease
+    /// reap), the wakeup is delivered via an in-memory notify so the
+    /// worker resumes immediately, without waiting out the poll interval.
+    /// Wakeups are queue-scoped and delivered to one waiter per inserted
+    /// job, so a pool of waiting workers does not contend on the claim path
+    /// when a single job arrives. Only when nothing is available within
+    /// `max_wait` does the call return `None`.
     ///
     /// The `lease_duration` controls how long the resulting claim is held.
     pub async fn claim_with_wait(
@@ -897,26 +926,35 @@ impl Queue {
         lease_duration: Duration,
         max_wait: Duration,
     ) -> Result<Option<JobRecord>> {
-        // Subscribe to the wakeup *before* the first claim attempt so we don't
-        // miss a notification published between the empty-scan and the wait.
-        // `enable()` registers the future as a waiter right away;
-        // `notify_waiters()` only wakes already-registered waiters, so a
-        // merely-constructed `Notified` would not catch a notification
-        // published during the `claim` await below.
-        let notified = self.job_available.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
+        let wakeup = self.claim_cursor.wakeup_for(queue);
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            // Subscribe to the wakeup *before* the claim attempt so an
+            // insert landing between the empty scan and the wait is not
+            // missed: its `notify_one` either wakes this registered
+            // waiter or leaves a permit that `enable` consumes.
+            let notified = wakeup.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
 
-        if let Some(job) = self.claim(queue, lease_duration).await? {
-            return Ok(Some(job));
+            if let Some(job) = self.claim(queue, lease_duration).await? {
+                // Pass the wakeup on: this call may have consumed a
+                // permit another waiter needs, and when a backlog
+                // remains each delivered job should wake one more
+                // worker.
+                wakeup.notify_one();
+                return Ok(Some(job));
+            }
+            tokio::select! {
+                _ = &mut notified => {}
+                _ = tokio::time::sleep_until(deadline) => return Ok(None),
+            }
+            // Woken: a job landed on this queue, but another worker may
+            // take it first; loop to claim, and if the queue is empty
+            // again keep waiting out the remaining deadline. A stale
+            // permit (a passed-on wakeup that found no backlog) costs
+            // one extra pass before waiting again.
         }
-        tokio::select! {
-            _ = &mut notified => {}
-            _ = tokio::time::sleep(max_wait) => return Ok(None),
-        }
-        // Wakeup might have been for a different queue, or another worker may
-        // have stolen the job; return whatever a fresh claim sees.
-        self.claim(queue, lease_duration).await
     }
 
     /// Claim the next pending job with an explicit lease duration.
@@ -1789,7 +1827,8 @@ impl Queue {
         // yields the batch's smallest pending key for the cursor check.
         if let Some(first_id) = ids.first() {
             let key = pending_key(queue, priority, first_id);
-            self.claim_cursor.note_pending_insert(queue, &key);
+            self.claim_cursor
+                .note_pending_inserts(queue, &key, ids.len());
         }
         self.job_available.notify_waiters();
 
@@ -1922,6 +1961,107 @@ mod tests {
         let second = q.claim("work", lease).await.unwrap().unwrap();
         assert_eq!(second.payload, b"second");
         q.ack(&second).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn enqueue_wakes_one_waiting_worker_per_job() {
+        let q = Arc::new(Queue::open(make_store(), "test").await.unwrap());
+        let lease = Duration::from_secs(5);
+        let max_wait = Duration::from_secs(60);
+
+        let mut waiters = Vec::new();
+        for _ in 0..3 {
+            let q = q.clone();
+            waiters.push(tokio::spawn(async move {
+                q.claim_with_wait("work", lease, max_wait).await.unwrap()
+            }));
+        }
+        tokio::task::yield_now().await;
+
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+
+        let mut claimed = 0;
+        for handle in waiters {
+            if let Some(job) = handle.await.unwrap() {
+                claimed += 1;
+                q.ack(&job).await.unwrap();
+            }
+        }
+        assert_eq!(claimed, 1, "exactly one waiter wakes with the job");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batch_enqueue_wakes_one_waiting_worker_per_job() {
+        let q = Arc::new(Queue::open(make_store(), "test").await.unwrap());
+        let lease = Duration::from_secs(5);
+        let max_wait = Duration::from_secs(60);
+
+        let mut waiters = Vec::new();
+        for _ in 0..3 {
+            let q = q.clone();
+            waiters.push(tokio::spawn(async move {
+                q.claim_with_wait("work", lease, max_wait).await.unwrap()
+            }));
+        }
+        tokio::task::yield_now().await;
+
+        q.enqueue_batch("work", vec![b"a".to_vec(), b"b".to_vec()])
+            .await
+            .unwrap();
+
+        let mut claimed = 0;
+        for handle in waiters {
+            if let Some(job) = handle.await.unwrap() {
+                claimed += 1;
+                q.ack(&job).await.unwrap();
+            }
+        }
+        assert_eq!(claimed, 2, "one waiter wakes per inserted job");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn claim_with_wait_waits_full_deadline_despite_stale_permit() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+
+        // A successful claim_with_wait passes the wakeup on, leaving a
+        // stale permit behind when no task is waiting.
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q
+            .claim_with_wait("work", lease, Duration::from_secs(1))
+            .await
+            .unwrap()
+            .unwrap();
+        q.ack(&job).await.unwrap();
+
+        let start = tokio::time::Instant::now();
+        let next = q
+            .claim_with_wait("work", lease, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(next.is_none());
+        assert!(
+            start.elapsed() >= Duration::from_secs(5),
+            "stale permit must not end the wait early",
+        );
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_jobs_on_consumes_permit_from_earlier_insert() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+
+        let start = tokio::time::Instant::now();
+        q.wait_for_jobs_on("work", Duration::from_secs(60)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "insert before the wait must wake it via the stored permit",
+        );
+
+        let job = q.claim("work", Duration::from_secs(5)).await.unwrap();
+        q.ack(&job.unwrap()).await.unwrap();
         q.close().await.unwrap();
     }
 

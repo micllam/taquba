@@ -13,9 +13,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transaction, sharing one claim-lock hold and one commit across the
   batch. Jobs are returned in claim order and share one lease.
   `Queue::claim` is now a batch of one.
+- `Queue::wait_for_jobs_on` blocks until a job becomes claimable on
+  one queue. Unlike `Queue::wait_for_jobs`, the wakeup is queue-scoped
+  and delivered to one waiter per inserted job.
 
 ### Changed
 
+- `Queue::claim_with_wait` and the `run_worker` / `run_worker_concurrent`
+  loops wait on a queue-scoped wakeup that wakes one waiter per
+  inserted job, instead of the process-wide notification that woke
+  every waiting worker on every insert. A pool of idle workers no
+  longer contends on the claim path when a single job arrives, and a
+  worker claiming a job passes one wakeup on so a backlog keeps waking
+  further workers. `Queue::claim_with_wait` now also keeps waiting out
+  its full `max_wait` after losing a claim race instead of returning
+  `None` early.
 - `Queue::claim` commits without awaiting WAL durability. Claims
   serialise per queue through the claim lock, which excluded them from
   WAL group commit: the lock holder awaited its flush before the next
