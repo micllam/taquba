@@ -152,8 +152,11 @@ where
 /// simultaneously.
 ///
 /// Behaves like [`run_worker`] but spawns each job onto a [`tokio::task::JoinSet`]
-/// so up to `concurrency` jobs run in parallel. On shutdown the loop stops
-/// claiming new work and waits for the in-flight set to drain before returning.
+/// so up to `concurrency` jobs run in parallel. Jobs are claimed in batches
+/// sized to the free capacity via [`Queue::claim_batch`], so a backlog costs
+/// one claim transaction per batch instead of per job; each job is still
+/// processed and acked individually. On shutdown the loop stops claiming new
+/// work and waits for the in-flight set to drain before returning.
 ///
 /// Claim errors propagate and terminate the loop. Ack / nack errors and panics
 /// inside spawned tasks are logged but do not terminate the loop.
@@ -197,43 +200,46 @@ where
             continue;
         }
 
-        // Try a non-blocking claim. If the queue is non-empty, spawn the job
-        // and loop. If empty, wait for new work or shutdown.
-        match queue_handle.claim_next(queue).await? {
-            Some(job) => {
-                let q = queue_handle.clone();
-                let w = worker.clone();
-                let queue_owned = queue.to_string();
-                set.spawn(async move {
-                    match w.process(&job).await {
-                        Ok(()) => {
-                            if let Err(e) = q.ack(&job).await {
-                                warn!(queue = %queue_owned, job_id = %job.id, "ack failed: {e}");
-                            }
-                        }
-                        Err(e) if e.downcast_ref::<PermanentFailure>().is_some() => {
-                            if let Err(se) = q.dead_letter(job, &e.to_string()).await {
-                                warn!(queue = %queue_owned, "dead_letter failed: {se}");
-                            }
-                        }
-                        Err(e) => {
-                            if let Err(se) = q.nack(job, &e.to_string()).await {
-                                warn!(queue = %queue_owned, "nack failed: {se}");
-                            }
+        // Claim up to the free capacity in one transaction. If the queue
+        // is non-empty, spawn each claimed job and loop. If empty, wait
+        // for new work or shutdown.
+        let free = concurrency - set.len();
+        let lease = queue_handle.queue_config(queue).lease_duration;
+        let jobs = queue_handle.claim_batch(queue, free, lease).await?;
+        if jobs.is_empty() {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown => break 'main,
+                _ = queue_handle.wait_for_jobs_on(queue, poll_interval) => {}
+            }
+            continue;
+        }
+        for job in jobs {
+            let q = queue_handle.clone();
+            let w = worker.clone();
+            let queue_owned = queue.to_string();
+            set.spawn(async move {
+                match w.process(&job).await {
+                    Ok(()) => {
+                        if let Err(e) = q.ack(&job).await {
+                            warn!(queue = %queue_owned, job_id = %job.id, "ack failed: {e}");
                         }
                     }
-                });
-                if check_shutdown(shutdown.as_mut()) {
-                    break 'main;
+                    Err(e) if e.downcast_ref::<PermanentFailure>().is_some() => {
+                        if let Err(se) = q.dead_letter(job, &e.to_string()).await {
+                            warn!(queue = %queue_owned, "dead_letter failed: {se}");
+                        }
+                    }
+                    Err(e) => {
+                        if let Err(se) = q.nack(job, &e.to_string()).await {
+                            warn!(queue = %queue_owned, "nack failed: {se}");
+                        }
+                    }
                 }
-            }
-            None => {
-                tokio::select! {
-                    biased;
-                    _ = &mut shutdown => break 'main,
-                    _ = queue_handle.wait_for_jobs_on(queue, poll_interval) => {}
-                }
-            }
+            });
+        }
+        if check_shutdown(shutdown.as_mut()) {
+            break 'main;
         }
     }
 
@@ -259,4 +265,76 @@ fn check_shutdown<F: Future<Output = ()>>(shutdown: std::pin::Pin<&mut F>) -> bo
     let waker = std::task::Waker::noop();
     let mut cx = Context::from_waker(waker);
     matches!(shutdown.poll(&mut cx), Poll::Ready(()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::queue::Queue;
+    use slatedb::object_store::memory::InMemory;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingWorker {
+        processed: Arc<AtomicUsize>,
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+    }
+
+    impl Worker for CountingWorker {
+        async fn process(&self, _job: &JobRecord) -> std::result::Result<(), WorkerError> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            self.processed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_worker_fills_capacity_from_a_backlog() {
+        let queue = Arc::new(
+            Queue::open(Arc::new(InMemory::new()), "test")
+                .await
+                .unwrap(),
+        );
+        queue
+            .enqueue_batch("work", vec![vec![0u8; 8]; 10])
+            .await
+            .unwrap();
+
+        let processed = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let worker = Arc::new(CountingWorker {
+            processed: processed.clone(),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            max_in_flight: max_in_flight.clone(),
+        });
+
+        let all_processed = {
+            let processed = processed.clone();
+            async move {
+                while processed.load(Ordering::SeqCst) < 10 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        };
+        run_worker_concurrent(
+            &queue,
+            "work",
+            worker,
+            4,
+            Duration::from_millis(50),
+            all_processed,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(processed.load(Ordering::SeqCst), 10);
+        assert_eq!(
+            max_in_flight.load(Ordering::SeqCst),
+            4,
+            "a batch claim fills the free capacity without exceeding it",
+        );
+    }
 }

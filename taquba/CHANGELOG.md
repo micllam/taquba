@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `run_worker_concurrent` claims jobs in batches sized to its free
+  capacity via `Queue::claim_batch`, costing one claim transaction
+  per batch instead of per job under a backlog. Jobs are still
+  processed concurrently and acked individually.
 - `Queue::claim_with_wait` and the `run_worker` / `run_worker_concurrent`
   loops wait on a queue-scoped wakeup that wakes one waiter per
   inserted job, instead of the process-wide notification that woke

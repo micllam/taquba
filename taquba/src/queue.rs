@@ -566,7 +566,7 @@ impl Queue {
             .remove(job_id);
     }
 
-    fn queue_config(&self, queue: &str) -> &QueueConfig {
+    pub(crate) fn queue_config(&self, queue: &str) -> &QueueConfig {
         self.queue_configs
             .get(queue)
             .unwrap_or(&self.default_queue_config)
@@ -1002,8 +1002,10 @@ impl Queue {
     /// One batch costs one claim-lock hold, one transaction, and one
     /// commit regardless of size, so a fetcher that claims batches and
     /// dispatches jobs to local workers contends far less on a busy
-    /// queue than one [`Self::claim`] call per job. Durability,
-    /// serialisation, and cursor semantics are those of
+    /// queue than one [`Self::claim`] call per job.
+    /// [`run_worker_concurrent`](crate::run_worker_concurrent) is that
+    /// pattern built in: it claims batches sized to its free capacity.
+    /// Durability, serialisation, and cursor semantics are those of
     /// [`Self::claim`].
     #[instrument(skip(self), fields(queue, max_jobs))]
     pub async fn claim_batch(
