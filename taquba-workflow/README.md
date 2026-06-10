@@ -255,6 +255,25 @@ Memo entries live in the object store passed to
 `Memo` is strictly per-step; the durable channel between steps is
 `StepOutcome::Continue`'s payload, not memo.
 
+## Step-output replay
+
+`WorkflowRuntimeBuilder::step_output_replay` enables an additional
+runtime-managed replay record for every outcome the runner returns,
+including `Fail` and `Cancel`. Step errors (`StepError`) are not recorded,
+so retries still invoke the runner. The record is keyed by
+`(run_id, step_number, SHA-256(step payload))` and is written before the
+runtime applies the outcome. If the same step is delivered again after a
+crash before ack, the stored outcome is replayed without invoking the
+runner again. A replayed `ContinueAfter` reduces its delay by the time
+already elapsed since the outcome was stored, preserving the original
+schedule.
+
+This is disabled by default because it adds one object-store read per step
+delivery (the replay lookup) plus one write per recorded outcome, and makes
+that write part of step settlement. The replay records are scoped to one
+run and step; they are not a cross-run cache. They are cleared with the
+run's memo entries when memo retention is configured.
+
 ## Memo retention
 
 By default memo entries are retained indefinitely (appropriate for
@@ -271,9 +290,10 @@ let runtime = WorkflowRuntime::builder(queue, store, runner, hook)
 When retention is set, the runtime writes a small terminal marker for
 every terminal state (Succeeded, Failed, Cancelled) and
 `WorkflowRuntime::run` spawns a background sweeper that lists those
-markers and clears the memos plus marker for any run whose marker is
-older than the retention window. The first sweep fires on startup so
-a restarted process catches markers left behind by an earlier one.
+markers and clears the memo entries, step-output replay entries, and
+marker for any run whose marker is older than the retention window. The
+first sweep fires on startup so a restarted process catches markers left
+behind by an earlier one.
 
 Advanced cleanup policies (selective retention, externally-driven
 sweeps) can be built directly on `MemoStore::list_terminal_markers`,

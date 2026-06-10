@@ -15,10 +15,13 @@
 //! # Layout
 //!
 //! [`MemoStore`] owns a single object-store prefix and partitions it into
-//! two sub-prefixes:
+//! three sub-prefixes:
 //!
 //! - `<prefix>/memos/<run_id>/<step_number>/<sha256(user_key)>`: memo
 //!   entries written by [`Memo::put`].
+//! - `<prefix>/step-outputs/<run_id>/<step_number>/<sha256(step_payload)>`:
+//!   step-output replay entries written by the workflow runtime when
+//!   enabled.
 //! - `<prefix>/terminals/<terminal_at_ms:020>_<run_id>`: terminal
 //!   markers written by [`MemoStore::write_terminal_marker`]. The leading
 //!   zero-padded millisecond timestamp orders markers chronologically,
@@ -28,8 +31,8 @@
 //! # Cleanup
 //!
 //! The [`Memo`] primitive has no lifecycle management of its own.
-//! [`MemoStore::clear_memos_for_run`] removes every memo entry for a
-//! given run. [`MemoStore::write_terminal_marker`],
+//! [`MemoStore::clear_memos_for_run`] removes every memo entry and
+//! step-output replay entry for a given run. [`MemoStore::write_terminal_marker`],
 //! [`MemoStore::list_terminal_markers`], and
 //! [`MemoStore::delete_terminal_marker`] are the building blocks a
 //! caller (typically the workflow runtime) composes into a retention
@@ -48,8 +51,8 @@ use crate::error::{Error, Result};
 /// [`ObjectStore`] and a path prefix. Builds per-step [`Memo`]
 /// views via [`MemoStore::new_memo`].
 ///
-/// Owns both the memo and terminal-marker sub-prefixes; see the module
-/// docs for the path layout.
+/// Owns the memo, step-output, and terminal-marker sub-prefixes; see
+/// the module docs for the path layout.
 #[derive(Clone)]
 pub struct MemoStore {
     store: Arc<dyn ObjectStore>,
@@ -108,12 +111,22 @@ impl MemoStore {
         Memo::new(self.clone(), run_id, step_number)
     }
 
-    /// Delete every memo entry for `run_id`. Returns the number of
-    /// entries removed. Errors during individual deletes are logged
-    /// (best-effort cleanup) but do not stop the sweep; an aggregated
-    /// error is returned only if the list itself fails.
+    /// Delete every memo entry and runtime step-output replay entry for
+    /// `run_id`. Returns the number of entries removed. Errors during
+    /// individual deletes are logged (best-effort cleanup) but do not
+    /// stop the sweep; an aggregated error is returned only if a list
+    /// operation fails.
     pub async fn clear_memos_for_run(&self, run_id: &str) -> Result<usize> {
-        let prefix = self.memos_run_prefix(run_id);
+        let memo_deleted = self
+            .clear_prefix(run_id, self.memos_run_prefix(run_id), "memo")
+            .await?;
+        let step_output_deleted = self
+            .clear_prefix(run_id, self.step_outputs_run_prefix(run_id), "step output")
+            .await?;
+        Ok(memo_deleted + step_output_deleted)
+    }
+
+    async fn clear_prefix(&self, run_id: &str, prefix: Path, kind: &'static str) -> Result<usize> {
         let mut stream = self.store.list(Some(&prefix));
         let mut deleted = 0usize;
         while let Some(item) = stream.next().await {
@@ -126,12 +139,41 @@ impl MemoStore {
                         run_id = %run_id,
                         path = %meta.location,
                         error = %err,
-                        "failed to delete memo entry",
+                        "failed to delete {kind} entry",
                     );
                 }
             }
         }
         Ok(deleted)
+    }
+
+    pub(crate) async fn get_step_output(
+        &self,
+        run_id: &str,
+        step_number: u32,
+        step_payload: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let path = self.step_output_path(run_id, step_number, step_payload);
+        match self.store.get(&path).await {
+            Ok(result) => {
+                let bytes = result.bytes().await?;
+                Ok(Some(bytes.to_vec()))
+            }
+            Err(ObjectStoreError::NotFound { .. }) => Ok(None),
+            Err(err) => Err(Error::Store(err)),
+        }
+    }
+
+    pub(crate) async fn put_step_output(
+        &self,
+        run_id: &str,
+        step_number: u32,
+        step_payload: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        let path = self.step_output_path(run_id, step_number, step_payload);
+        self.store.put(&path, value.to_vec().into()).await?;
+        Ok(())
     }
 
     /// Write a terminal marker for `run_id` at `terminal_at_ms`. The
@@ -199,6 +241,16 @@ impl MemoStore {
 
     fn memos_run_prefix(&self, run_id: &str) -> Path {
         Path::from(format!("{}/memos/{}", self.prefix, run_id))
+    }
+
+    fn step_outputs_run_prefix(&self, run_id: &str) -> Path {
+        Path::from(format!("{}/step-outputs/{}", self.prefix, run_id))
+    }
+
+    fn step_output_path(&self, run_id: &str, step_number: u32, step_payload: &[u8]) -> Path {
+        self.step_outputs_run_prefix(run_id)
+            .child(step_number.to_string())
+            .child(hex_sha256(step_payload))
     }
 
     fn terminals_prefix(&self) -> Path {
@@ -483,6 +535,53 @@ mod tests {
             Some(b"step-0".to_vec()),
         );
         assert!(at_step_1.content_get(&input).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn step_output_entries_are_scoped_by_payload_hash() {
+        let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
+
+        store
+            .put_step_output("run-1", 0, b"payload-a", b"out-a")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_step_output("run-1", 0, b"payload-a")
+                .await
+                .unwrap(),
+            Some(b"out-a".to_vec()),
+        );
+        assert!(
+            store
+                .get_step_output("run-1", 0, b"payload-b")
+                .await
+                .unwrap()
+                .is_none(),
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_memos_for_run_removes_step_output_entries() {
+        let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
+        store.new_memo("run-1", 0).put("k", b"memo").await.unwrap();
+        store
+            .put_step_output("run-1", 0, b"payload", b"out")
+            .await
+            .unwrap();
+
+        let deleted = store.clear_memos_for_run("run-1").await.unwrap();
+
+        assert_eq!(deleted, 2);
+        assert!(store.new_memo("run-1", 0).get("k").await.unwrap().is_none());
+        assert!(
+            store
+                .get_step_output("run-1", 0, b"payload")
+                .await
+                .unwrap()
+                .is_none(),
+        );
     }
 
     #[tokio::test]

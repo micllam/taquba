@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `WorkflowRuntimeBuilder::step_output_replay`: opt-in
+  content-addressed replay of runner-returned step outcomes, keyed by
+  `(run_id, step_number, SHA-256(step payload))`. When enabled, the
+  runtime persists every `StepOutcome` the runner returns (including
+  `Fail` and `Cancel`) before applying it; if the same step is delivered
+  again after a crash before ack, the stored outcome is replayed without
+  invoking the runner again. Step errors are not recorded, so retries
+  still invoke the runner. A replayed `ContinueAfter` reduces its delay
+  by the time already elapsed since the outcome was stored, preserving
+  the original schedule.
 - `Memo::content_get` and `Memo::content_put` derive per-step memo keys
   from a MessagePack serialization of caller-supplied input hashed with
   SHA-256.

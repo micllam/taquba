@@ -57,6 +57,103 @@ struct DurableRunRecord {
     input_hash: [u8; 32],
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct DurableDuration {
+    secs: u64,
+    nanos: u32,
+}
+
+impl From<Duration> for DurableDuration {
+    fn from(duration: Duration) -> Self {
+        Self {
+            secs: duration.as_secs(),
+            nanos: duration.subsec_nanos(),
+        }
+    }
+}
+
+impl From<DurableDuration> for Duration {
+    fn from(duration: DurableDuration) -> Self {
+        Duration::new(duration.secs, duration.nanos)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum DurableStepOutcome {
+    Continue {
+        payload: Vec<u8>,
+    },
+    ContinueAfter {
+        payload: Vec<u8>,
+        delay: DurableDuration,
+    },
+    Succeed {
+        result: Vec<u8>,
+    },
+    Fail {
+        reason: String,
+    },
+    Cancel {
+        reason: String,
+    },
+}
+
+impl From<&StepOutcome> for DurableStepOutcome {
+    fn from(outcome: &StepOutcome) -> Self {
+        match outcome {
+            StepOutcome::Continue { payload } => Self::Continue {
+                payload: payload.clone(),
+            },
+            StepOutcome::ContinueAfter { payload, delay } => Self::ContinueAfter {
+                payload: payload.clone(),
+                delay: (*delay).into(),
+            },
+            StepOutcome::Succeed { result } => Self::Succeed {
+                result: result.clone(),
+            },
+            StepOutcome::Fail { reason } => Self::Fail {
+                reason: reason.clone(),
+            },
+            StepOutcome::Cancel { reason } => Self::Cancel {
+                reason: reason.clone(),
+            },
+        }
+    }
+}
+
+impl From<DurableStepOutcome> for StepOutcome {
+    fn from(outcome: DurableStepOutcome) -> Self {
+        match outcome {
+            DurableStepOutcome::Continue { payload } => Self::Continue { payload },
+            DurableStepOutcome::ContinueAfter { payload, delay } => Self::ContinueAfter {
+                payload,
+                delay: delay.into(),
+            },
+            DurableStepOutcome::Succeed { result } => Self::Succeed { result },
+            DurableStepOutcome::Fail { reason } => Self::Fail { reason },
+            DurableStepOutcome::Cancel { reason } => Self::Cancel { reason },
+        }
+    }
+}
+
+/// Storage envelope for a step-output replay entry. `stored_at_ms`
+/// records when the outcome was persisted so a replayed `ContinueAfter`
+/// can schedule the next step relative to the original settlement
+/// rather than the replay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableStepOutcomeRecord {
+    stored_at_ms: u64,
+    outcome: DurableStepOutcome,
+}
+
+/// The portion of `delay` still ahead of `now_ms`, measured from
+/// `stored_at_ms`. Saturates to the full delay if the clock reads
+/// earlier than the stored timestamp.
+fn remaining_delay(stored_at_ms: u64, now_ms: u64, delay: Duration) -> Duration {
+    let elapsed = Duration::from_millis(now_ms.saturating_sub(stored_at_ms));
+    delay.saturating_sub(elapsed)
+}
+
 fn hash_input(input: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -164,6 +261,7 @@ pub struct WorkflowRuntimeBuilder<R, H> {
     max_concurrent_steps: usize,
     poll_interval: Duration,
     memo_retention: Option<Duration>,
+    step_output_replay: bool,
     clock: Arc<dyn Clock>,
 }
 
@@ -217,6 +315,27 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
         self
     }
 
+    /// Enable content-addressed replay of runner-returned step outcomes.
+    ///
+    /// When enabled, the runtime writes every [`StepOutcome`] the runner
+    /// returns, including `Fail` and `Cancel`, to object storage before
+    /// applying it. Step errors ([`StepError`](crate::StepError)) are not
+    /// recorded, so retries still invoke the runner. The replay key is
+    /// scoped to `(run_id, step_number, SHA-256(step payload))`. If the
+    /// same step is delivered again after a crash before ack, the stored
+    /// outcome is replayed without invoking the runner again. A replayed
+    /// [`StepOutcome::ContinueAfter`] reduces its delay by the time
+    /// already elapsed since the outcome was stored, preserving the
+    /// original schedule.
+    ///
+    /// This is disabled by default because it adds one object-store read
+    /// per step delivery (the replay lookup) plus one write per recorded
+    /// outcome, and makes that write part of step settlement.
+    pub fn step_output_replay(mut self) -> Self {
+        self.step_output_replay = true;
+        self
+    }
+
     /// Override the [`Clock`] the runtime reads its timestamps from.
     /// Defaults to the same clock the [`Queue`] was opened with (via
     /// [`Queue::clock`]).
@@ -238,6 +357,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
             registry: Mutex::new(HashMap::new()),
             memo_store,
             memo_retention: self.memo_retention,
+            step_output_replay: self.step_output_replay,
             clock: self.clock,
         };
         WorkflowRuntime {
@@ -272,6 +392,9 @@ struct RuntimeInner<R, H> {
     /// memo entries are retained for replay. `None` disables retention
     /// entirely (no terminal marker is written and no sweeper runs).
     memo_retention: Option<Duration>,
+    /// Whether runner-returned step outcomes are persisted and replayed
+    /// by `(run_id, step_number, SHA-256(step payload))`.
+    step_output_replay: bool,
     /// Time source. Defaults to the queue's clock; tests can substitute
     /// a [`MockClock`](taquba::MockClock) to virtualise time.
     clock: Arc<dyn Clock>,
@@ -332,6 +455,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             max_concurrent_steps: 16,
             poll_interval: Duration::from_millis(250),
             memo_retention: None,
+            step_output_replay: false,
             clock,
         }
     }
@@ -817,6 +941,56 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         }
     }
 
+    async fn load_step_output(
+        &self,
+        run_id: &str,
+        step_number: u32,
+        step_payload: &[u8],
+    ) -> Result<Option<StepOutcome>> {
+        let Some(bytes) = self
+            .memo_store
+            .get_step_output(run_id, step_number, step_payload)
+            .await?
+        else {
+            return Ok(None);
+        };
+        match rmp_serde::from_slice::<DurableStepOutcomeRecord>(&bytes) {
+            Ok(record) => {
+                let mut outcome = StepOutcome::from(record.outcome);
+                if let StepOutcome::ContinueAfter { delay, .. } = &mut outcome {
+                    *delay = remaining_delay(record.stored_at_ms, self.clock.now_ms(), *delay);
+                }
+                Ok(Some(outcome))
+            }
+            Err(err) => {
+                warn!(
+                    run_id = %run_id,
+                    step_number,
+                    error = %err,
+                    "step-output replay entry failed to deserialize; recomputing",
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    async fn store_step_output(
+        &self,
+        run_id: &str,
+        step_number: u32,
+        step_payload: &[u8],
+        outcome: &StepOutcome,
+    ) -> Result<()> {
+        let record = DurableStepOutcomeRecord {
+            stored_at_ms: self.clock.now_ms(),
+            outcome: DurableStepOutcome::from(outcome),
+        };
+        let bytes = rmp_serde::to_vec_named(&record)?;
+        self.memo_store
+            .put_step_output(run_id, step_number, step_payload, &bytes)
+            .await
+    }
+
     async fn process_step(&self, job: &JobRecord) -> std::result::Result<(), WorkerError> {
         let (run_id, step_number) = match Self::parse_step_headers(job) {
             Ok(v) => v,
@@ -854,13 +1028,48 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             max_attempts: Some(job.max_attempts),
         };
 
-        let outcome = self.runner.run_step(&step).await;
+        let mut replayed_step_output = false;
+        let outcome = if self.step_output_replay {
+            match self
+                .load_step_output(&run_id, step_number, &job.payload)
+                .await
+            {
+                Ok(Some(outcome)) => {
+                    replayed_step_output = true;
+                    debug!(
+                        run_id = %run_id,
+                        step_number,
+                        "replaying stored step outcome",
+                    );
+                    Ok(outcome)
+                }
+                Ok(None) => self.runner.run_step(&step).await,
+                Err(err) => return Err(err.to_string().into()),
+            }
+        } else {
+            self.runner.run_step(&step).await
+        };
+
         let external_cancel = self
             .registry
             .lock()
             .await
             .get(&run_id)
             .is_some_and(|e| e.cancel_requested);
+
+        if self.step_output_replay && !replayed_step_output && !external_cancel {
+            if let Ok(ref outcome) = outcome {
+                if let Err(err) = self
+                    .store_step_output(&run_id, step_number, &job.payload, outcome)
+                    .await
+                {
+                    if err.is_permanent() {
+                        return Err(PermanentFailure::new(err.to_string()).into());
+                    }
+                    return Err(err.to_string().into());
+                }
+            }
+        }
 
         // Cancellation precedence:
         // 1. A runner-issued `StepOutcome::Cancel` wins (it carries an
@@ -1676,6 +1885,206 @@ mod tests {
         assert_eq!(outcome.final_step, 1);
 
         let _ = shutdown_b.send(());
+    }
+
+    #[test]
+    fn remaining_delay_measures_from_stored_timestamp() {
+        let delay = Duration::from_secs(10);
+        assert_eq!(remaining_delay(1_000, 4_000, delay), Duration::from_secs(7));
+        assert_eq!(remaining_delay(1_000, 20_000, delay), Duration::ZERO);
+        assert_eq!(remaining_delay(5_000, 1_000, delay), delay);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn step_output_replay_skips_runner_after_crash_before_ack() {
+        struct ContinueRunner {
+            calls: Arc<AtomicU32>,
+        }
+
+        impl StepRunner for ContinueRunner {
+            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(StepOutcome::Continue {
+                    payload: b"step1-payload".to_vec(),
+                })
+            }
+        }
+
+        let (queue, store) = fresh_queue().await;
+        let calls = Arc::new(AtomicU32::new(0));
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store.clone(),
+            ContinueRunner {
+                calls: calls.clone(),
+            },
+            NoopTerminalHook,
+        )
+        .step_output_replay()
+        .build();
+
+        runtime
+            .submit(RunSpec {
+                run_id: Some("replay-run".to_string()),
+                input: b"input".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let job = queue
+            .claim("workflow-steps", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+
+        runtime.inner.process_step(&job).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Simulate a process crash after step 1 was enqueued but before
+        // the worker acked step 0. Re-processing the same claimed record
+        // should replay the stored step outcome and avoid invoking the
+        // runner a second time.
+        runtime.inner.process_step(&job).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let next = queue
+            .claim("workflow-steps", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.payload.as_slice(), b"step1-payload");
+        assert_eq!(next.headers.get(HEADER_RUN_ID).unwrap(), "replay-run");
+        assert_eq!(next.headers.get(HEADER_STEP).unwrap(), "1");
+        assert!(
+            queue
+                .claim("workflow-steps", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_none(),
+            "replayed continue must not enqueue duplicate step 1",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn corrupt_step_output_replay_entry_falls_back_to_runner() {
+        struct ContinueRunner {
+            calls: Arc<AtomicU32>,
+        }
+
+        impl StepRunner for ContinueRunner {
+            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(StepOutcome::Continue {
+                    payload: b"step1-payload".to_vec(),
+                })
+            }
+        }
+
+        let (queue, store) = fresh_queue().await;
+        let calls = Arc::new(AtomicU32::new(0));
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store.clone(),
+            ContinueRunner {
+                calls: calls.clone(),
+            },
+            NoopTerminalHook,
+        )
+        .step_output_replay()
+        .build();
+
+        runtime
+            .submit(RunSpec {
+                run_id: Some("corrupt-run".to_string()),
+                input: b"input".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let job = queue
+            .claim("workflow-steps", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        runtime
+            .inner
+            .memo_store
+            .put_step_output("corrupt-run", 0, &job.payload, b"not msgpack")
+            .await
+            .unwrap();
+
+        runtime.inner.process_step(&job).await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "corrupt entry is treated as a miss",
+        );
+
+        // The recomputed outcome overwrites the corrupt entry, so a
+        // second delivery replays it without invoking the runner again.
+        runtime.inner.process_step(&job).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn step_output_replay_of_terminal_outcome_skips_runner() {
+        struct SucceedRunner {
+            calls: Arc<AtomicU32>,
+        }
+
+        impl StepRunner for SucceedRunner {
+            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(StepOutcome::Succeed {
+                    result: b"final".to_vec(),
+                })
+            }
+        }
+
+        let (queue, store) = fresh_queue().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let calls = Arc::new(AtomicU32::new(0));
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store.clone(),
+            SucceedRunner {
+                calls: calls.clone(),
+            },
+            ChannelHook { tx },
+        )
+        .step_output_replay()
+        .build();
+
+        runtime
+            .submit(RunSpec {
+                run_id: Some("terminal-replay".to_string()),
+                input: b"input".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let job = queue
+            .claim("workflow-steps", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+
+        runtime.inner.process_step(&job).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.status, TerminalStatus::Succeeded);
+        assert_eq!(first.result.as_deref(), Some(b"final".as_slice()));
+
+        // Simulate redelivery after a crash before ack. The stored
+        // outcome settles the run again (the terminal hook is
+        // at-least-once) without invoking the runner.
+        runtime.inner.process_step(&job).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let second = rx.recv().await.unwrap();
+        assert_eq!(second.status, TerminalStatus::Succeeded);
+        assert_eq!(second.result.as_deref(), Some(b"final".as_slice()));
     }
 
     /// Submits a run whose runner always returns
