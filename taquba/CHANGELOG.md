@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scan or the claim lock, and the pending tombstone band is never
   re-walked from the front while the process stays up; a full prefix
   scan now happens only on cold start or process restart.
+- Queue stats counter merges are excluded from transaction conflict
+  detection. The merges are commutative, so concurrent job-state
+  transitions on the same queue no longer abort and retry each other
+  over the shared stats keys.
 
 ### Fixed
 

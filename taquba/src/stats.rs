@@ -68,10 +68,15 @@ pub(crate) fn update_stats(
 ) -> Result<()> {
     for (status, delta) in deltas {
         if *delta != 0 {
-            txn.merge(
-                stats_key(queue, metric_name(*status)).as_bytes(),
-                (*delta).to_le_bytes(),
-            )?;
+            let key = stats_key(queue, metric_name(*status));
+            txn.merge(key.as_bytes(), (*delta).to_le_bytes())?;
+            // Counter merges are commutative, so two transactions
+            // merging the same stats key do not actually conflict.
+            // Without this, every job-state transition on a queue
+            // contends on the same handful of stats keys and
+            // transaction-conflict retries dominate claim latency
+            // under concurrency.
+            txn.unmark_write([key.as_bytes()])?;
         }
     }
     Ok(())
