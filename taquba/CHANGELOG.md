@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `Queue::claim` commits without awaiting WAL durability. Claims
+  serialise per queue through the claim lock, which excluded them from
+  WAL group commit: the lock holder awaited its flush before the next
+  claim could start, making the flush round trip the queue's claim
+  throughput ceiling.
+  Losing an unflushed claim in a crash leaves the job pending, so it
+  is redelivered immediately on recovery instead of after its lease
+  expires; at-least-once delivery is unaffected, and a settled job's
+  claim is always durable because later durable commits flush
+  preceding WAL entries.
+
 ### Fixed
 
 - Duplicate `EnqueueOptions::id_override` values are now rejected

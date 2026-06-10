@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use slatedb::config::Settings;
+use slatedb::config::{Settings, WriteOptions};
 use slatedb::object_store::ObjectStore;
 use slatedb::{Db, IsolationLevel};
 use tokio::sync::watch;
@@ -922,6 +922,13 @@ impl Queue {
     /// Claim the next pending job with an explicit lease duration.
     /// Returns `None` if the queue is empty.
     ///
+    /// The claim commit does not await WAL durability. If the process
+    /// crashes before the claim is flushed, the job is still pending on
+    /// recovery and is redelivered immediately rather than after its
+    /// lease expires; at-least-once delivery is unaffected. Any later
+    /// durable commit (ack, nack, enqueue) flushes preceding WAL
+    /// entries, so a settled job's claim is always durable.
+    ///
     /// Same-queue claim attempts serialise through an in-process
     /// `tokio::sync::Mutex`, avoiding the transaction-conflict
     /// retry that would otherwise resolve which worker takes the
@@ -1020,7 +1027,20 @@ impl Queue {
             // first closes that window; on a commit conflict we unregister
             // and retry.
             self.install_cancel_token(&mut job);
-            match txn.commit().await {
+            // Claims commit without awaiting WAL durability. The claimed
+            // state only matters across a restart, and this queue is
+            // single-process: a crash kills the worker holding the job, so
+            // losing the unflushed claim leaves the job pending and it is
+            // redelivered immediately on recovery, instead of waiting out
+            // a durably-recorded lease. Conflict detection is unaffected,
+            // and any later durable commit (ack, nack, enqueue) flushes
+            // the WAL entries ahead of it, so a settled job's claim is
+            // durable by ordering.
+            let write_opts = WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            };
+            match txn.commit_with_options(&write_opts).await {
                 Ok(_) => {
                     self.claim_cursor.set(queue, pending_key_bytes);
                     debug!(queue = queue, job_id = %job.id, attempt = job.attempts, "job claimed");
