@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Queue::claim_batch` claims up to `max_jobs` pending jobs in one
+  transaction, sharing one claim-lock hold and one commit across the
+  batch. Jobs are returned in claim order and share one lease.
+  `Queue::claim` is now a batch of one.
+
 ### Changed
 
 - `Queue::claim` commits without awaiting WAL durability. Claims

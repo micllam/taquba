@@ -950,13 +950,40 @@ impl Queue {
     /// previously claimed jobs.
     #[instrument(skip(self), fields(queue))]
     pub async fn claim(&self, queue: &str, lease_duration: Duration) -> Result<Option<JobRecord>> {
+        Ok(self.claim_batch(queue, 1, lease_duration).await?.pop())
+    }
+
+    /// Claim up to `max_jobs` pending jobs in one transaction.
+    ///
+    /// Jobs are returned in claim order (priority, then enqueue order)
+    /// and share one lease started at the same instant: size batches so
+    /// the lease covers processing the whole batch, or renew leases as
+    /// the batch progresses. Returns an empty `Vec` when the queue is
+    /// empty and fewer than `max_jobs` jobs when the queue runs out.
+    ///
+    /// One batch costs one claim-lock hold, one transaction, and one
+    /// commit regardless of size, so a fetcher that claims batches and
+    /// dispatches jobs to local workers contends far less on a busy
+    /// queue than one [`Self::claim`] call per job. Durability,
+    /// serialisation, and cursor semantics are those of
+    /// [`Self::claim`].
+    #[instrument(skip(self), fields(queue, max_jobs))]
+    pub async fn claim_batch(
+        &self,
+        queue: &str,
+        max_jobs: usize,
+        lease_duration: Duration,
+    ) -> Result<Vec<JobRecord>> {
+        if max_jobs == 0 {
+            return Ok(Vec::new());
+        }
         // Empty check before taking the claim lock: a queue known to be
         // empty answers from in-process state without contending with
         // claims that have work to do. A stale answer here is safe in
         // both directions; emptiness is only ever revoked by an insert,
         // and a stale "not empty" just falls through to the locked scan.
         if self.claim_cursor.begin_claim(queue).known_empty {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let lock = self.claim_lock_for(queue);
         let _guard = lock.lock().await;
@@ -970,87 +997,100 @@ impl Queue {
             // emptiness recorded below.
             let scan = self.claim_cursor.begin_claim(queue);
             if scan.known_empty {
-                return Ok(None);
+                return Ok(Vec::new());
             }
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
 
-            // Bound-resumed scan: start at the recorded bound (after
-            // the last claimed key, or at a key inserted behind it). A
-            // yielded key outside the queue's prefix means the bound is
-            // past the queue's tail; fall through to the front-scan
-            // branch.
-            let mut kv = None;
+            let mut candidates = Vec::new();
+            // Set when the scan ran out of pending keys before filling
+            // the batch, proving nothing is live beyond the candidates.
+            let mut drained = false;
             if let Some(sf) = scan.scan_from.clone() {
+                // Bound-resumed scan: start at the recorded bound (after
+                // the last claimed key, or at a key inserted behind it).
+                // A yielded key outside the queue's prefix means the
+                // bound is past the queue's tail.
                 let start = if sf.inclusive {
                     Bound::Included(sf.key)
                 } else {
                     Bound::Excluded(sf.key)
                 };
                 let mut iter = txn.scan((start, Bound::Unbounded)).await?;
-                if let Some(candidate) = iter.next().await? {
-                    if candidate.key.starts_with(prefix_bytes) {
-                        kv = Some(candidate);
-                    }
-                }
-            }
-            let kv = match kv {
-                Some(kv) => kv,
-                // Every live pending key sorts at or after a known
-                // bound (inserts landing behind it move it back), so an
-                // empty bound scan proves the queue is empty without
-                // re-walking the tombstone band from the front.
-                None if scan.scan_from.is_some() => {
-                    self.claim_cursor.mark_empty(queue, scan.epoch);
-                    return Ok(None);
-                }
-                // Front scan: bound unknown (cold start or process
-                // restart), so pre-existing keys may be live anywhere
-                // in the prefix.
-                None => {
-                    let mut iter = txn.scan_prefix(prefix_bytes).await?;
+                while candidates.len() < max_jobs {
                     match iter.next().await? {
-                        Some(kv) => kv,
-                        None => {
-                            self.claim_cursor.mark_empty(queue, scan.epoch);
-                            return Ok(None);
+                        Some(c) if c.key.starts_with(prefix_bytes) => candidates.push(c),
+                        _ => {
+                            drained = true;
+                            break;
                         }
                     }
                 }
-            };
-
-            let pending_key_bytes = kv.key.clone();
-            let mut job: JobRecord = rmp_serde::from_slice(&kv.value)?;
+            } else {
+                // Front scan: bound unknown (cold start or process
+                // restart), so pre-existing keys may be live anywhere
+                // in the prefix.
+                let mut iter = txn.scan_prefix(prefix_bytes).await?;
+                while candidates.len() < max_jobs {
+                    match iter.next().await? {
+                        Some(c) => candidates.push(c),
+                        None => {
+                            drained = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if candidates.is_empty() {
+                // Every live pending key sorts at or after a known bound
+                // (inserts landing behind it move it back), so an empty
+                // bound scan proves the queue is empty without re-walking
+                // the tombstone band from the front.
+                self.claim_cursor.mark_empty(queue, scan.epoch);
+                return Ok(Vec::new());
+            }
 
             let now = self.now_ms();
             let lease_expires_at = now + lease_duration.as_millis() as u64;
-            job.status = JobStatus::Claimed;
-            job.claimed_at = Some(now);
-            job.lease_expires_at = Some(lease_expires_at);
-            job.attempts += 1;
+            let last_pending_key = candidates
+                .last()
+                .expect("candidates checked non-empty above")
+                .key
+                .clone();
 
-            // Take the dedup_key off the record BEFORE serializing the
-            // claimed-state copy. If we left it on, a later nack would put a
-            // record back into pending still carrying the key, and the next
-            // claim would try to delete a `dedup:` index that may by now
-            // belong to a *different* job, corrupting the dedup invariant.
-            let dedup_key_to_release = job.dedup_key.take();
-            let claimed = claimed_key(&job.queue, lease_expires_at, &job.id);
-            let value = rmp_serde::to_vec_named(&job)?;
+            let mut jobs = Vec::with_capacity(candidates.len());
+            for kv in &candidates {
+                let mut job: JobRecord = rmp_serde::from_slice(&kv.value)?;
+                job.status = JobStatus::Claimed;
+                job.claimed_at = Some(now);
+                job.lease_expires_at = Some(lease_expires_at);
+                job.attempts += 1;
 
-            txn.delete(&pending_key_bytes)?;
-            txn.put(claimed.as_bytes(), &value)?;
-            txn.put(job_index_key(&job.id).as_bytes(), claimed.as_bytes())?;
-            if let Some(dk) = dedup_key_to_release.as_deref() {
-                txn.delete(dedup_index_key(&job.queue, dk).as_bytes())?;
+                // Take the dedup_key off the record BEFORE serializing the
+                // claimed-state copy. If we left it on, a later nack would put a
+                // record back into pending still carrying the key, and the next
+                // claim would try to delete a `dedup:` index that may by now
+                // belong to a *different* job, corrupting the dedup invariant.
+                let dedup_key_to_release = job.dedup_key.take();
+                let claimed = claimed_key(&job.queue, lease_expires_at, &job.id);
+                let value = rmp_serde::to_vec_named(&job)?;
+
+                txn.delete(&kv.key)?;
+                txn.put(claimed.as_bytes(), &value)?;
+                txn.put(job_index_key(&job.id).as_bytes(), claimed.as_bytes())?;
+                if let Some(dk) = dedup_key_to_release.as_deref() {
+                    txn.delete(dedup_index_key(&job.queue, dk).as_bytes())?;
+                }
+                jobs.push(job);
             }
+            let count = jobs.len() as i64;
             update_stats(
                 &txn,
                 queue,
-                &[(JobStatus::Pending, -1), (JobStatus::Claimed, 1)],
+                &[(JobStatus::Pending, -count), (JobStatus::Claimed, count)],
             )?;
 
-            // Register the cancellation token *before* committing. Once the
-            // commit lands, the job is observable as `Claimed` and a
+            // Register cancellation tokens *before* committing. Once the
+            // commit lands, the jobs are observable as `Claimed` and a
             // concurrent `request_cancel` will look up its token in
             // `claimed_tokens` to fire it. If we registered the token only
             // *after* the commit, a `request_cancel` racing that window
@@ -1059,7 +1099,9 @@ impl Queue {
             // would be silently lost until the lease expired. Registering
             // first closes that window; on a commit conflict we unregister
             // and retry.
-            self.install_cancel_token(&mut job);
+            for job in &mut jobs {
+                self.install_cancel_token(job);
+            }
             // Claims commit without awaiting WAL durability. The claimed
             // state only matters across a restart, and this queue is
             // single-process: a crash kills the worker holding the job, so
@@ -1075,17 +1117,28 @@ impl Queue {
             };
             match txn.commit_with_options(&write_opts).await {
                 Ok(_) => {
-                    self.claim_cursor.advance(queue, pending_key_bytes, &scan);
-                    debug!(queue = queue, job_id = %job.id, attempt = job.attempts, "job claimed");
-                    return Ok(Some(job));
+                    self.claim_cursor.advance(queue, last_pending_key, &scan);
+                    if drained {
+                        // The scan ran dry inside this snapshot, so
+                        // nothing is left after taking these jobs; record
+                        // emptiness so the next poll short-circuits. Any
+                        // insert since the epoch read revokes it.
+                        self.claim_cursor.mark_empty(queue, scan.epoch);
+                    }
+                    debug!(queue = queue, count = jobs.len(), "jobs claimed");
+                    return Ok(jobs);
                 }
                 Err(e) if e.kind() == slatedb::ErrorKind::Transaction => {
                     warn!(queue = queue, "claim transaction conflict, retrying");
-                    self.clear_cancel_token(&job.id);
+                    for job in &jobs {
+                        self.clear_cancel_token(&job.id);
+                    }
                     continue;
                 }
                 Err(e) => {
-                    self.clear_cancel_token(&job.id);
+                    for job in &jobs {
+                        self.clear_cancel_token(&job.id);
+                    }
                     return Err(e.into());
                 }
             }
@@ -1869,6 +1922,82 @@ mod tests {
         let second = q.claim("work", lease).await.unwrap().unwrap();
         assert_eq!(second.payload, b"second");
         q.ack(&second).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn claim_batch_claims_in_order_up_to_max() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        for payload in [b"a", b"b", b"c", b"d", b"e"] {
+            q.enqueue("work", payload.to_vec()).await.unwrap();
+        }
+
+        let first = q.claim_batch("work", 3, lease).await.unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|j| j.payload.as_slice())
+                .collect::<Vec<_>>(),
+            [b"a", b"b", b"c"],
+        );
+        for job in &first {
+            assert_eq!(job.status, JobStatus::Claimed);
+            assert_eq!(job.attempts, 1);
+            assert!(job.lease_expires_at.is_some());
+        }
+
+        let rest = q.claim_batch("work", 3, lease).await.unwrap();
+        assert_eq!(
+            rest.iter()
+                .map(|j| j.payload.as_slice())
+                .collect::<Vec<_>>(),
+            [b"d", b"e"],
+        );
+
+        for job in first.iter().chain(rest.iter()) {
+            q.ack(job).await.unwrap();
+        }
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn claim_batch_zero_max_claims_nothing() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+
+        assert!(
+            q.claim_batch("work", 0, Duration::from_secs(5))
+                .await
+                .unwrap()
+                .is_empty(),
+        );
+
+        let job = q
+            .claim("work", Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_claim_batch_marks_empty_until_next_enqueue() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        q.enqueue("work", b"only".to_vec()).await.unwrap();
+
+        let batch = q.claim_batch("work", 8, lease).await.unwrap();
+        assert_eq!(batch.len(), 1);
+        assert!(q.claim("work", lease).await.unwrap().is_none());
+
+        q.enqueue("work", b"next".to_vec()).await.unwrap();
+        let next = q.claim("work", lease).await.unwrap().unwrap();
+        assert_eq!(next.payload, b"next");
+
+        q.ack(&batch[0]).await.unwrap();
+        q.ack(&next).await.unwrap();
         q.close().await.unwrap();
     }
 
