@@ -6,7 +6,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use slatedb::config::{Settings, WriteOptions};
 use slatedb::object_store::ObjectStore;
-use slatedb::{Db, IsolationLevel};
+use slatedb::{Db, DbTransaction, IsolationLevel};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, instrument, warn};
@@ -392,6 +392,34 @@ pub struct EnqueueOptions {
     pub id_override: Option<String>,
 }
 
+/// One enqueue carried by [`AckEffects`].
+#[derive(Debug, Clone)]
+pub struct EnqueueRequest {
+    /// Queue the job is enqueued on.
+    pub queue: String,
+    /// Job payload.
+    pub payload: Vec<u8>,
+    /// Per-job options; `run_at`, `dedup_key`, `priority`, and
+    /// `id_override` are all honoured exactly as in
+    /// [`Queue::enqueue_with`].
+    pub options: EnqueueOptions,
+}
+
+/// Effects applied in the same transaction as an acknowledgement via
+/// [`Queue::ack_with`]. Either everything lands (the ack, every
+/// enqueue, every KV change) or nothing does.
+#[derive(Debug, Clone, Default)]
+pub struct AckEffects {
+    /// Jobs enqueued atomically with the ack.
+    pub enqueues: Vec<EnqueueRequest>,
+    /// Writes applied to the caller KV namespace, as in
+    /// [`Queue::enqueue_with_kv`]. Values are size-capped at
+    /// [`MAX_KV_VALUE_SIZE`].
+    pub kv_writes: HashMap<Vec<u8>, Vec<u8>>,
+    /// Keys deleted from the caller KV namespace.
+    pub kv_deletes: Vec<Vec<u8>>,
+}
+
 /// A durable task queue backed by object storage.
 ///
 /// `Queue` persists all job state to an object store via SlateDB.
@@ -493,6 +521,24 @@ pub enum WaitOutcome {
     TimedOut,
     /// No job with this ID was present at the start of the call.
     NotFound,
+}
+
+/// A job record prepared by [`Queue::prepare_job_record`], paired with
+/// its primary key, awaiting staging into a transaction.
+struct PreparedJob {
+    job: JobRecord,
+    key: String,
+    id_override_used: bool,
+}
+
+/// Identity of a job staged by [`Queue::stage_job_writes`], retained
+/// for post-commit bookkeeping.
+struct StagedJob {
+    id: String,
+    queue: String,
+    /// `Some` when the job landed in the pending key space, in which
+    /// case the commit must be followed by a cursor note and a wakeup.
+    pending_key: Option<String>,
 }
 
 impl Queue {
@@ -822,38 +868,21 @@ impl Queue {
         id_override_used: bool,
         kv_writes: HashMap<Vec<u8>, Vec<u8>>,
     ) -> Result<EnqueueResult> {
-        let dkey = job
-            .dedup_key
-            .as_ref()
-            .map(|dk| dedup_index_key(&job.queue, dk));
-        let value = rmp_serde::to_vec_named(&job)?;
-        let JobRecord {
-            id, queue, status, ..
-        } = job;
-
+        let prepared = PreparedJob {
+            job,
+            key,
+            id_override_used,
+        };
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
 
-            if let Some(ref dkey) = dkey {
-                if let Some(bytes) = txn.get(dkey.as_bytes()).await? {
+            let staged = match self.stage_job_writes(&txn, &prepared).await? {
+                Ok(staged) => staged,
+                Err(already_enqueued) => {
                     txn.rollback();
-                    let existing =
-                        String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidState)?;
-                    return Ok(EnqueueResult::AlreadyEnqueued(existing));
+                    return Ok(EnqueueResult::AlreadyEnqueued(already_enqueued));
                 }
-            }
-
-            if id_override_used && txn.get(job_index_key(&id).as_bytes()).await?.is_some() {
-                txn.rollback();
-                return Err(Error::DuplicateJobId { id });
-            }
-
-            txn.put(key.as_bytes(), &value)?;
-            txn.put(job_index_key(&id).as_bytes(), key.as_bytes())?;
-            if let Some(ref dkey) = dkey {
-                txn.put(dkey.as_bytes(), id.as_bytes())?;
-            }
-            update_stats(&txn, &queue, &[(status, 1)])?;
+            };
 
             for (k, v) in &kv_writes {
                 txn.put(user_scoped_key(k), v)?;
@@ -861,20 +890,75 @@ impl Queue {
 
             match txn.commit().await {
                 Ok(_) => {
-                    // Workers can claim a Pending job immediately; a Scheduled
-                    // job becomes claimable later via the scheduler loop,
-                    // which fires its own notify.
-                    if matches!(status, JobStatus::Pending) {
-                        self.claim_cursor.note_pending_insert(&queue, &key);
-                        self.job_available.notify_waiters();
-                    }
-                    debug!(queue = %queue, job_id = %id, "job enqueued");
-                    return Ok(EnqueueResult::New(id));
+                    self.note_staged_job(&staged);
+                    return Ok(EnqueueResult::New(staged.id));
                 }
                 Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+
+    /// Add one prepared job's writes (record, job index, dedup index,
+    /// stats delta) to a caller-owned transaction. Returns
+    /// `Ok(Err(existing_id))` on a dedup hit, in which case no writes
+    /// were added and the caller decides whether to roll back; the
+    /// outer `Err` is reserved for real failures. After the
+    /// transaction commits, the caller must pass the staged value to
+    /// [`Self::note_staged_job`].
+    async fn stage_job_writes(
+        &self,
+        txn: &DbTransaction,
+        prepared: &PreparedJob,
+    ) -> Result<std::result::Result<StagedJob, String>> {
+        let PreparedJob {
+            job,
+            key,
+            id_override_used,
+        } = prepared;
+        let dkey = job
+            .dedup_key
+            .as_ref()
+            .map(|dk| dedup_index_key(&job.queue, dk));
+
+        if let Some(ref dkey) = dkey {
+            if let Some(bytes) = txn.get(dkey.as_bytes()).await? {
+                let existing =
+                    String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidState)?;
+                return Ok(Err(existing));
+            }
+        }
+
+        if *id_override_used && txn.get(job_index_key(&job.id).as_bytes()).await?.is_some() {
+            return Err(Error::DuplicateJobId { id: job.id.clone() });
+        }
+
+        let value = rmp_serde::to_vec_named(job)?;
+        txn.put(key.as_bytes(), &value)?;
+        txn.put(job_index_key(&job.id).as_bytes(), key.as_bytes())?;
+        if let Some(ref dkey) = dkey {
+            txn.put(dkey.as_bytes(), job.id.as_bytes())?;
+        }
+        update_stats(txn, &job.queue, &[(job.status, 1)])?;
+
+        Ok(Ok(StagedJob {
+            id: job.id.clone(),
+            queue: job.queue.clone(),
+            pending_key: matches!(job.status, JobStatus::Pending).then(|| key.clone()),
+        }))
+    }
+
+    /// Post-commit bookkeeping for one staged job: a Pending job is
+    /// recorded on the claim cursor and wakes a waiting worker; a
+    /// Scheduled job becomes claimable later via the scheduler loop,
+    /// which fires its own notify.
+    fn note_staged_job(&self, staged: &StagedJob) {
+        if let Some(ref pending_key) = staged.pending_key {
+            self.claim_cursor
+                .note_pending_insert(&staged.queue, pending_key);
+            self.job_available.notify_waiters();
+        }
+        debug!(queue = %staged.queue, job_id = %staged.id, "job enqueued");
     }
 
     /// Claim the next pending job using the configured default lease duration.
@@ -1219,8 +1303,41 @@ impl Queue {
     /// Set [`QueueConfig::keep_done_jobs`] (per-queue, or on
     /// [`OpenOptions::default_queue_config`] for an instance-wide default)
     /// to retain completed jobs for a bounded duration.
-    #[instrument(skip(self, job), fields(queue = %job.queue, job_id = %job.id))]
     pub async fn ack(&self, job: &JobRecord) -> Result<()> {
+        self.ack_with(job, AckEffects::default()).await.map(|_| ())
+    }
+
+    /// Acknowledge successful completion and apply `effects` in the
+    /// same transaction.
+    ///
+    /// Either the acknowledgement and every effect land together or
+    /// nothing does. In particular, if the job's claim is no longer
+    /// present (its lease expired and the reaper requeued it), the call
+    /// fails with [`Error::InvalidState`] and no effect is applied, so
+    /// a follow-up job exists only if this settlement won.
+    ///
+    /// Each enqueue in [`AckEffects::enqueues`] behaves exactly like
+    /// [`Self::enqueue_with`]: a `dedup_key` hit downgrades that
+    /// request to [`EnqueueResult::AlreadyEnqueued`] without affecting
+    /// the ack or the other effects, and a future `run_at` lands the
+    /// job in the scheduled key space. The returned results align
+    /// index-wise with `effects.enqueues`. KV writes and deletes
+    /// behave like [`Self::enqueue_with_kv`] and [`Self::kv_delete`].
+    #[instrument(skip(self, job, effects), fields(queue = %job.queue, job_id = %job.id))]
+    pub async fn ack_with(
+        &self,
+        job: &JobRecord,
+        effects: AckEffects,
+    ) -> Result<Vec<EnqueueResult>> {
+        for value in effects.kv_writes.values() {
+            if value.len() > MAX_KV_VALUE_SIZE {
+                return Err(Error::KvValueTooLarge {
+                    size: value.len(),
+                    max: MAX_KV_VALUE_SIZE,
+                });
+            }
+        }
+
         let lease_expires_at = job.lease_expires_at.ok_or(Error::InvalidState)?;
         let claimed = claimed_key(&job.queue, lease_expires_at, &job.id);
         let keep_done = self.queue_keep_done_jobs(&job.queue).is_some();
@@ -1237,7 +1354,20 @@ impl Queue {
             None
         };
 
-        loop {
+        // Prepare the effect jobs once; their ids stay stable across
+        // transaction-conflict retries, as in the plain enqueue path.
+        let mut prepared_jobs = Vec::with_capacity(effects.enqueues.len());
+        for request in effects.enqueues {
+            let (effect_job, key, id_override_used) =
+                self.prepare_job_record(&request.queue, request.payload, request.options)?;
+            prepared_jobs.push(PreparedJob {
+                job: effect_job,
+                key,
+                id_override_used,
+            });
+        }
+
+        let results = loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
             txn.get(claimed.as_bytes())
                 .await?
@@ -1256,17 +1386,41 @@ impl Queue {
                 &job.queue,
                 &[(JobStatus::Claimed, -1), (JobStatus::Done, 1)],
             )?;
+
+            let mut staged = Vec::with_capacity(prepared_jobs.len());
+            let mut results = Vec::with_capacity(prepared_jobs.len());
+            for prepared in &prepared_jobs {
+                match self.stage_job_writes(&txn, prepared).await? {
+                    Ok(staged_job) => {
+                        results.push(EnqueueResult::New(staged_job.id.clone()));
+                        staged.push(staged_job);
+                    }
+                    Err(existing) => results.push(EnqueueResult::AlreadyEnqueued(existing)),
+                }
+            }
+            for (k, v) in &effects.kv_writes {
+                txn.put(user_scoped_key(k), v)?;
+            }
+            for k in &effects.kv_deletes {
+                txn.delete(user_scoped_key(k))?;
+            }
+
             match txn.commit().await {
-                Ok(_) => break,
+                Ok(_) => {
+                    for staged_job in &staged {
+                        self.note_staged_job(staged_job);
+                    }
+                    break results;
+                }
                 Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
                 Err(e) => return Err(e.into()),
             }
-        }
+        };
 
         self.clear_cancel_token(&job.id);
         self.completion_notify.notify_waiters();
         debug!(queue = %job.queue, job_id = %job.id, "job acked");
-        Ok(())
+        Ok(results)
     }
 
     /// Report failure. Re-queues if attempts < max_attempts, otherwise dead-letters.
@@ -5367,6 +5521,157 @@ mod tests {
         q.kv_delete(b"runs/xyz").await.unwrap();
         assert!(q.kv_get(b"runs/xyz").await.unwrap().is_none());
 
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ack_with_applies_enqueue_and_kv_effects_atomically() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        q.enqueue_with_kv(
+            "work",
+            b"first".to_vec(),
+            EnqueueOptions::default(),
+            HashMap::from([(b"runs/1".to_vec(), b"active".to_vec())]),
+        )
+        .await
+        .unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+
+        let results = q
+            .ack_with(
+                &job,
+                AckEffects {
+                    enqueues: vec![EnqueueRequest {
+                        queue: "next".to_string(),
+                        payload: b"second".to_vec(),
+                        options: EnqueueOptions::default(),
+                    }],
+                    kv_writes: HashMap::from([(b"runs/2".to_vec(), b"done".to_vec())]),
+                    kv_deletes: vec![b"runs/1".to_vec()],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], EnqueueResult::New(_)));
+
+        let follow_up = q.claim("next", lease).await.unwrap().unwrap();
+        assert_eq!(follow_up.payload, b"second");
+        q.ack(&follow_up).await.unwrap();
+        assert!(q.kv_get(b"runs/1").await.unwrap().is_none());
+        assert_eq!(
+            q.kv_get(b"runs/2").await.unwrap().as_deref(),
+            Some(b"done".as_slice()),
+        );
+        assert_eq!(q.stats("work").await.unwrap().done, 1);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ack_with_applies_no_effects_when_the_claim_is_gone() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.ack(&job).await.unwrap();
+
+        let err = q
+            .ack_with(
+                &job,
+                AckEffects {
+                    enqueues: vec![EnqueueRequest {
+                        queue: "next".to_string(),
+                        payload: b"x".to_vec(),
+                        options: EnqueueOptions::default(),
+                    }],
+                    kv_writes: HashMap::from([(b"k".to_vec(), b"v".to_vec())]),
+                    kv_deletes: Vec::new(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidState));
+        assert!(q.claim("next", lease).await.unwrap().is_none());
+        assert!(q.kv_get(b"k").await.unwrap().is_none());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ack_with_dedup_hit_downgrades_one_request() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        let existing_id = q
+            .enqueue_with(
+                "next",
+                b"existing".to_vec(),
+                EnqueueOptions {
+                    dedup_key: Some("dk".to_string()),
+                    ..EnqueueOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+
+        let results = q
+            .ack_with(
+                &job,
+                AckEffects {
+                    enqueues: vec![
+                        EnqueueRequest {
+                            queue: "next".to_string(),
+                            payload: b"dup".to_vec(),
+                            options: EnqueueOptions {
+                                dedup_key: Some("dk".to_string()),
+                                ..EnqueueOptions::default()
+                            },
+                        },
+                        EnqueueRequest {
+                            queue: "next".to_string(),
+                            payload: b"fresh".to_vec(),
+                            options: EnqueueOptions::default(),
+                        },
+                    ],
+                    ..AckEffects::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(&results[0], EnqueueResult::AlreadyEnqueued(id) if *id == existing_id));
+        assert!(matches!(&results[1], EnqueueResult::New(_)));
+        assert_eq!(q.stats("next").await.unwrap().pending, 2);
+        assert_eq!(q.stats("work").await.unwrap().done, 1);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ack_with_schedules_a_future_effect() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+
+        q.ack_with(
+            &job,
+            AckEffects {
+                enqueues: vec![EnqueueRequest {
+                    queue: "next".to_string(),
+                    payload: b"later".to_vec(),
+                    options: EnqueueOptions {
+                        run_at: Some(std::time::SystemTime::now() + Duration::from_secs(300)),
+                        ..EnqueueOptions::default()
+                    },
+                }],
+                ..AckEffects::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(q.stats("next").await.unwrap().scheduled, 1);
+        assert!(q.claim("next", lease).await.unwrap().is_none());
         q.close().await.unwrap();
     }
 

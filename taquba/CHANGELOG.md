@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Queue::wait_for_jobs_on` blocks until a job becomes claimable on
   one queue. Unlike `Queue::wait_for_jobs`, the wakeup is queue-scoped
   and delivered to one waiter per inserted job.
+- `Queue::ack_with` acknowledges a job and applies a set of effects in
+  the same transaction: follow-up enqueues (`AckEffects::enqueues`,
+  honouring `run_at`, `dedup_key`, `priority`, and `id_override` per
+  request) and caller KV writes and deletes. Either the ack and every
+  effect land together or nothing does; when the claim is gone the
+  call fails with `InvalidState` and applies nothing, so a chained job
+  exists only if the settlement that created it won. `Queue::ack` is
+  now `ack_with` with empty effects.
 - `Queue::close` persists each queue's claim-scan state (scan bound
   and emptiness marker) under a new `cursor:` key prefix; the next
   open restores the in-memory state from it and deletes the record. The

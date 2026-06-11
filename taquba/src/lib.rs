@@ -111,10 +111,17 @@
 //! The namespace is mutated **only** as a side effect of queue
 //! operations; there is no standalone `kv_put`. To create or update
 //! an entry, include it in the `kv_writes` map of an
-//! [`Queue::enqueue_with_kv`] call (which makes the write atomic with
-//! the enqueue). [`Queue::kv_delete`] is the one standalone primitive,
-//! for terminal cleanup of entries whose related queue op has already
-//! completed.
+//! [`Queue::enqueue_with_kv`] or [`Queue::ack_with`] call (which makes
+//! the write atomic with the enqueue or acknowledgement).
+//! [`Queue::kv_delete`] is the one standalone primitive, for terminal
+//! cleanup of entries whose related queue op has already completed.
+//!
+//! [`Queue::ack_with`] extends the same atomicity to settlement: it
+//! acknowledges a claimed job and, in the same transaction, enqueues
+//! follow-up jobs and applies caller KV writes and deletes. If the
+//! job's lease expired and the claim is gone, the call fails and
+//! nothing is applied, so a chained job exists only if the settlement
+//! that created it won.
 //!
 //! # Background tasks
 //!
@@ -161,8 +168,8 @@ pub use clock::{Clock, MockClock, SystemClock};
 pub use error::{Error, Result};
 pub use job::{JobRecord, JobStatus};
 pub use queue::{
-    CancelOutcome, EnqueueOptions, EnqueueResult, MAX_KV_VALUE_SIZE, OpenOptions, PRIORITY_HIGH,
-    PRIORITY_LOW, PRIORITY_NORMAL, Queue, QueueConfig, WaitOutcome,
+    AckEffects, CancelOutcome, EnqueueOptions, EnqueueRequest, EnqueueResult, MAX_KV_VALUE_SIZE,
+    OpenOptions, PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_NORMAL, Queue, QueueConfig, WaitOutcome,
 };
 pub use stats::QueueStats;
 pub use worker::{PermanentFailure, Worker, WorkerError, run_worker, run_worker_concurrent};

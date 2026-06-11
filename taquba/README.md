@@ -23,6 +23,8 @@ server or a separate state layer (typically Postgres).
 - Exponential retry backoff on `nack`.
 - Bounded dead-letter retention with paginated inspection.
 - Atomic batch enqueue.
+- Atomic settlement effects: ack a job and enqueue follow-ups or update
+  caller KV in one transaction.
 - Worker loop with graceful shutdown and notify-based wakeups (no busy polling).
 
 ## Stability
@@ -164,9 +166,16 @@ content-addressed key and put only the pointer in KV.
 
 The namespace is mutated **only** as a side effect of queue operations so there
 is no standalone `kv_put`. To create or update an entry, include it in the
-`kv_writes` map of an `enqueue_with_kv` call (which makes the write atomic
-with the enqueue). `kv_delete` is the one standalone primitive, for terminal
-cleanup of entries whose related queue op has already completed.
+`kv_writes` map of an `enqueue_with_kv` or `ack_with` call (which makes the
+write atomic with the enqueue or acknowledgement). `kv_delete` is the one
+standalone primitive, for terminal cleanup of entries whose related queue op
+has already completed.
+
+`Queue::ack_with` extends the same atomicity to settlement: it acknowledges a
+claimed job and, in the same transaction, enqueues follow-up jobs and applies
+caller KV writes and deletes. If the job's lease expired and the claim is
+gone, the call fails and nothing is applied, so a chained job exists only if
+the settlement that created it won.
 
 ## License
 
