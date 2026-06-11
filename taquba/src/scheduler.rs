@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use slatedb::config::WriteOptions;
 use slatedb::{Db, IsolationLevel};
 use tokio::sync::{Notify, watch};
 use tracing::{debug, warn};
@@ -112,7 +113,19 @@ async fn promote_job(
             &[(JobStatus::Pending, 1), (JobStatus::Scheduled, -1)],
         )?;
 
-        match txn.commit().await {
+        // Promotion commits do not await WAL durability. Each due job
+        // is promoted in its own transaction, so awaiting the flush
+        // serialises the sweep at one job per flush interval. A commit
+        // lost in a crash leaves the scheduled key in place with its
+        // `run_at` still in the past, and the next tick re-promotes
+        // it: the rewrite is idempotent. Any later durable commit
+        // flushes preceding WAL entries, so a job's post-promotion
+        // history is never durable without the promotion itself.
+        let write_opts = WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        };
+        match txn.commit_with_options(&write_opts).await {
             Ok(_) => {
                 claim_cursor.note_pending_insert(&job.queue, &pending);
                 debug!(

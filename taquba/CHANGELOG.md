@@ -50,6 +50,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expires; at-least-once delivery is unaffected, and a settled job's
   claim is always durable because later durable commits flush
   preceding WAL entries.
+- The scheduler promotes due jobs without awaiting WAL durability,
+  for the same reasons and with the same crash behaviour as the
+  reaper change below: a lost promotion leaves the scheduled key in
+  place with its `run_at` in the past, and the next tick re-promotes
+  it. A backlog of due jobs (a retry-backoff wave, or scheduled jobs
+  accumulated during downtime) no longer promotes at one job per
+  flush interval.
 - The reaper requeues and dead-letters expired claims without awaiting
   WAL durability. Each expired claim is processed in its own
   transaction, and awaiting the flush serialised the sweep at one job
