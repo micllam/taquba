@@ -6,7 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use taquba::object_store::ObjectStore;
 use taquba::{
-    Clock, EnqueueOptions, EnqueueResult, JobRecord, PermanentFailure, Queue, Worker, WorkerError,
+    AckEffects, Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, JobRecord, PermanentFailure,
+    Queue, Worker, WorkerError,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -769,7 +770,10 @@ struct StepWorker<R, H> {
 }
 
 impl<R: StepRunner + 'static, H: TerminalHook + 'static> Worker for StepWorker<R, H> {
-    async fn process(&self, job: &JobRecord) -> std::result::Result<(), WorkerError> {
+    async fn process_with_effects(
+        &self,
+        job: &JobRecord,
+    ) -> std::result::Result<AckEffects, WorkerError> {
         self.inner.process_step(job).await
     }
 }
@@ -795,30 +799,36 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         }
     }
 
-    async fn enqueue_step(
+    /// Build the enqueue request for one step of a run, with a
+    /// pre-assigned job id so the registry can reference the step
+    /// before the enqueue commits. Returns the request and the
+    /// assigned id.
+    fn step_enqueue_request(
         &self,
         run_id: &str,
         step_number: u32,
         payload: Vec<u8>,
         user_headers: &HashMap<String, String>,
         opts: StepEnqueueOpts,
-    ) -> Result<String> {
+    ) -> (EnqueueRequest, String) {
+        let job_id = ulid::Ulid::new().to_string();
         let mut headers = user_headers.clone();
         headers.insert(HEADER_RUN_ID.to_string(), run_id.to_string());
         headers.insert(HEADER_STEP.to_string(), step_number.to_string());
 
-        let enqueue_opts = EnqueueOptions {
-            headers,
-            run_at: opts.run_at,
-            priority: opts.priority,
-            max_attempts: opts.max_attempts,
-            dedup_key: Some(format!("{DEDUP_PREFIX}{run_id}:{step_number}")),
-            ..EnqueueOptions::default()
+        let request = EnqueueRequest {
+            queue: self.queue_name.clone(),
+            payload,
+            options: EnqueueOptions {
+                headers,
+                run_at: opts.run_at,
+                priority: opts.priority,
+                max_attempts: opts.max_attempts,
+                dedup_key: Some(format!("{DEDUP_PREFIX}{run_id}:{step_number}")),
+                id_override: Some(job_id.clone()),
+            },
         };
-        Ok(self
-            .queue
-            .enqueue_with(&self.queue_name, payload, enqueue_opts)
-            .await?)
+        (request, job_id)
     }
 
     fn split_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
@@ -846,20 +856,40 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         Ok((run_id, step_number))
     }
 
+    /// Settle a run into its terminal state where no acknowledgement
+    /// transaction exists to carry the durable record delete (the
+    /// pending-step path of [`WorkflowRuntime::cancel`], and worker
+    /// paths that dead-letter or nack instead of acking). Performs the
+    /// delete of [`Self::terminate_collecting_effects`] directly,
+    /// best-effort: a transient failure is logged but does not affect
+    /// the already-running cleanup of *this* run.
+    async fn terminate(&self, outcome: RunOutcome) {
+        let run_id = outcome.run_id.clone();
+        let effects = self.terminate_collecting_effects(outcome).await;
+        for key in &effects.kv_deletes {
+            if let Err(err) = self.queue.kv_delete(key).await {
+                warn!(
+                    run_id = %run_id,
+                    "failed to clear durable run record: {err}"
+                );
+            }
+        }
+    }
+
     /// Settle a run into its terminal state: drop its registry entry,
-    /// write a terminal marker (if memo retention is enabled), delete
-    /// the durable run record from Taquba's KV namespace, and fire the
-    /// terminal hook. Registry removal happens first so that
+    /// write a terminal marker (if memo retention is enabled), fire
+    /// the terminal hook, and return the durable run record's delete
+    /// as [`AckEffects`] for the step's acknowledgement transaction.
+    /// Registry removal happens first so that
     /// [`WorkflowRuntime::status`] doesn't briefly report an
-    /// already-terminated run as active while a slow hook (e.g. a webhook
-    /// delivery) is in flight. The marker is written *before* the
-    /// durable record delete so a crash between the two writes leaves
+    /// already-terminated run as active while a slow hook (e.g. a
+    /// webhook delivery) is in flight. The marker is written *before*
+    /// the record delete can commit, so a crash between the two leaves
     /// the marker around to drive memo cleanup; losing the marker is
     /// worse than leaving a stale run record (which only blocks one
-    /// future submit). Both writes are best-effort: a transient
-    /// failure here is logged but does not affect the already-running
-    /// cleanup of *this* run.
-    async fn terminate(&self, outcome: RunOutcome) {
+    /// future submit). A settlement that fails redelivers the step,
+    /// which re-terminates and retries the delete.
+    async fn terminate_collecting_effects(&self, outcome: RunOutcome) -> AckEffects {
         self.registry.lock().await.remove(&outcome.run_id);
         if self.memo_retention.is_some() {
             if let Err(err) = self
@@ -873,13 +903,12 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 );
             }
         }
-        if let Err(err) = self.queue.kv_delete(&run_kv_key(&outcome.run_id)).await {
-            warn!(
-                run_id = %outcome.run_id,
-                "failed to clear durable run record: {err}"
-            );
-        }
+        let kv_deletes = vec![run_kv_key(&outcome.run_id)];
         self.terminal_hook.on_termination(&outcome).await;
+        AckEffects {
+            kv_deletes,
+            ..AckEffects::default()
+        }
     }
 
     /// Memo-retention sweep loop. Runs only when
@@ -1037,7 +1066,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .await
     }
 
-    async fn process_step(&self, job: &JobRecord) -> std::result::Result<(), WorkerError> {
+    async fn process_step(&self, job: &JobRecord) -> std::result::Result<AckEffects, WorkerError> {
         let (run_id, step_number) = match Self::parse_step_headers(job) {
             Ok(v) => v,
             Err(e) => {
@@ -1125,8 +1154,8 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         //    retries and permanent dead-letters), with `error: None` so
         //    consumers can distinguish external vs. runner-issued cancel.
         match outcome {
-            Ok(StepOutcome::Cancel { reason }) => {
-                self.terminate(RunOutcome {
+            Ok(StepOutcome::Cancel { reason }) => Ok(self
+                .terminate_collecting_effects(RunOutcome {
                     run_id: run_id.clone(),
                     status: TerminalStatus::Cancelled,
                     result: None,
@@ -1134,11 +1163,9 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     headers: user_headers,
                     final_step: step_number,
                 })
-                .await;
-                Ok(())
-            }
-            _ if external_cancel => {
-                self.terminate(RunOutcome {
+                .await),
+            _ if external_cancel => Ok(self
+                .terminate_collecting_effects(RunOutcome {
                     run_id: run_id.clone(),
                     status: TerminalStatus::Cancelled,
                     result: None,
@@ -1146,30 +1173,28 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     headers: user_headers,
                     final_step: step_number,
                 })
-                .await;
-                Ok(())
-            }
-            Ok(StepOutcome::Continue { payload }) => {
-                self.advance(
+                .await),
+            Ok(StepOutcome::Continue { payload }) => Ok(self
+                .advance(
                     &run_id,
                     step_number + 1,
                     payload,
                     &user_headers,
                     inherit_opts(),
                 )
-                .await
-            }
+                .await),
             Ok(StepOutcome::ContinueAfter { payload, delay }) => {
                 let now = UNIX_EPOCH + Duration::from_millis(self.clock.now_ms());
                 let opts = StepEnqueueOpts {
                     run_at: Some(now + delay),
                     ..inherit_opts()
                 };
-                self.advance(&run_id, step_number + 1, payload, &user_headers, opts)
-                    .await
+                Ok(self
+                    .advance(&run_id, step_number + 1, payload, &user_headers, opts)
+                    .await)
             }
-            Ok(StepOutcome::Succeed { result }) => {
-                self.terminate(RunOutcome {
+            Ok(StepOutcome::Succeed { result }) => Ok(self
+                .terminate_collecting_effects(RunOutcome {
                     run_id: run_id.clone(),
                     status: TerminalStatus::Succeeded,
                     result: Some(result),
@@ -1177,23 +1202,21 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     headers: user_headers,
                     final_step: step_number,
                 })
-                .await;
-                Ok(())
-            }
+                .await),
             Ok(StepOutcome::Fail { reason }) => {
                 // Runner verdict: workflow failed but the step itself ran
                 // cleanly. Ack the step (no dead-letter) and fire the hook
                 // with `Failed`.
-                self.terminate(RunOutcome {
-                    run_id: run_id.clone(),
-                    status: TerminalStatus::Failed,
-                    result: None,
-                    error: Some(reason),
-                    headers: user_headers,
-                    final_step: step_number,
-                })
-                .await;
-                Ok(())
+                Ok(self
+                    .terminate_collecting_effects(RunOutcome {
+                        run_id: run_id.clone(),
+                        status: TerminalStatus::Failed,
+                        result: None,
+                        error: Some(reason),
+                        headers: user_headers,
+                        final_step: step_number,
+                    })
+                    .await)
             }
             Err(StepError {
                 message,
@@ -1233,6 +1256,14 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         }
     }
 
+    /// Build the effects that advance the run to `next_step`: the next
+    /// step's enqueue joins the current step's acknowledgement
+    /// transaction, so the transition is atomic. The pre-assigned job
+    /// id is recorded on the registry before the settlement commits;
+    /// if the settlement fails because the claim was lost to the
+    /// reaper, the redelivered step's [`Self::registry_mark_running`]
+    /// rewinds the entry, and a cancel issued in the window falls back
+    /// to the registry's `cancel_requested` flag.
     async fn advance(
         &self,
         run_id: &str,
@@ -1240,24 +1271,18 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         payload: Vec<u8>,
         user_headers: &HashMap<String, String>,
         opts: StepEnqueueOpts,
-    ) -> std::result::Result<(), WorkerError> {
-        match self
-            .enqueue_step(run_id, next_step, payload, user_headers, opts)
-            .await
-        {
-            Ok(new_job_id) => {
-                // Make sure to preserve `cancel_requested`.
-                if let Some(entry) = self.registry.lock().await.get_mut(run_id) {
-                    entry.status.state = RunState::Pending;
-                    entry.status.current_step = next_step;
-                    entry.current_job_id = new_job_id;
-                }
-                Ok(())
-            }
-            // Transient: the runner already executed for this step; failing
-            // the worker triggers a retry of the same step. The runner must be
-            // idempotent for `(run_id, step_number)`.
-            Err(e) => Err(e.to_string().into()),
+    ) -> AckEffects {
+        let (request, next_job_id) =
+            self.step_enqueue_request(run_id, next_step, payload, user_headers, opts);
+        // Make sure to preserve `cancel_requested`.
+        if let Some(entry) = self.registry.lock().await.get_mut(run_id) {
+            entry.status.state = RunState::Pending;
+            entry.status.current_step = next_step;
+            entry.current_job_id = next_job_id;
+        }
+        AckEffects {
+            enqueues: vec![request],
+            ..AckEffects::default()
         }
     }
 }
@@ -1494,9 +1519,21 @@ mod tests {
         assert_eq!(outcome.error.as_deref(), Some("nope"));
         assert!(runtime.status(&handle.run_id).await.is_none());
 
-        // Permanent runner errors *do* dead-letter the step.
-        let stats = queue.stats("workflow-steps").await.unwrap();
-        assert_eq!(stats.dead, 1, "permanent error should dead-letter");
+        // Permanent runner errors *do* dead-letter the step. The hook
+        // fires before the loop's dead_letter call lands, so wait for
+        // the record rather than asserting immediately.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let stats = queue.stats("workflow-steps").await.unwrap();
+            if stats.dead == 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "permanent error should dead-letter",
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         let _ = shutdown.send(());
     }
@@ -2015,15 +2052,17 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        runtime.inner.process_step(&job).await.unwrap();
+        // Simulate a crash after the step output was stored but before
+        // the settlement committed: discard the effects of the first
+        // delivery so nothing is enqueued.
+        let _ = runtime.inner.process_step(&job).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        // Simulate a process crash after step 1 was enqueued but before
-        // the worker acked step 0. Re-processing the same claimed record
-        // should replay the stored step outcome and avoid invoking the
-        // runner a second time.
-        runtime.inner.process_step(&job).await.unwrap();
+        // Re-processing the same claimed record replays the stored step
+        // outcome without invoking the runner a second time.
+        let effects = runtime.inner.process_step(&job).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        queue.ack_with(&job, effects).await.unwrap();
 
         let next = queue
             .claim("workflow-steps", Duration::from_secs(30))
@@ -2039,7 +2078,7 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none(),
-            "replayed continue must not enqueue duplicate step 1",
+            "the replayed continue must enqueue step 1 exactly once",
         );
     }
 

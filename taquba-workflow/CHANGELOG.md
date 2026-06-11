@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Step transitions settle atomically. The next step's enqueue (for
+  `Continue` / `ContinueAfter`) and the terminal run-record delete
+  (for terminal outcomes) now join the current step's acknowledgement
+  transaction via Taquba's `ack_with`, halving the durable commits
+  per transition and removing the crash window between enqueuing the
+  next step and acking the current one: a step's successor exists if
+  and only if the step's settlement committed. The terminal hook now
+  fires before the settlement commits rather than after the run-record
+  delete; hooks remain at-least-once as before.
+
 ### Fixed
 
 - `WorkflowRuntime::submit` no longer serialises every submission on a
