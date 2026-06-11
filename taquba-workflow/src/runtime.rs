@@ -355,6 +355,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
             max_concurrent_steps: self.max_concurrent_steps,
             poll_interval: self.poll_interval,
             registry: Mutex::new(HashMap::new()),
+            submit_locks: std::sync::Mutex::new(HashMap::new()),
             memo_store,
             memo_retention: self.memo_retention,
             step_output_replay: self.step_output_replay,
@@ -387,6 +388,13 @@ struct RuntimeInner<R, H> {
     max_concurrent_steps: usize,
     poll_interval: Duration,
     registry: Mutex<HashMap<String, RegistryEntry>>,
+    /// Per-run-id submission locks. Each lock is held across the
+    /// duplicate checks and the step-0 enqueue of its run, so two
+    /// concurrent submits of the same run cannot both pass the checks
+    /// before either commits, while submits of distinct runs proceed
+    /// concurrently. Run ids are unbounded, so entries are removed
+    /// once no submit references them.
+    submit_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
     memo_store: MemoStore,
     /// Window after a run reaches a terminal state during which its
     /// memo entries are retained for replay. `None` disables retention
@@ -472,7 +480,10 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// pick a fresh `run_id` for a new run.
     #[instrument(skip(self, spec), fields(run_id))]
     pub async fn submit(&self, spec: RunSpec) -> Result<SubmitOutcome> {
-        let run_id = spec.run_id.unwrap_or_else(|| ulid::Ulid::new().to_string());
+        let run_id = spec
+            .run_id
+            .clone()
+            .unwrap_or_else(|| ulid::Ulid::new().to_string());
         tracing::Span::current().record("run_id", run_id.as_str());
 
         for k in spec.headers.keys() {
@@ -481,44 +492,60 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             }
         }
 
+        // Hold this run's submit lock across the duplicate checks and
+        // the enqueue, so two concurrent submits with the same `run_id`
+        // cannot both pass the checks before either commits. The lock
+        // is per run id: submits of distinct runs (e.g. a bulk batch)
+        // proceed concurrently and share WAL group commits instead of
+        // serialising at one durable enqueue per flush interval.
+        let lock = self.inner.submit_lock_for(&run_id);
+        let result = {
+            let _guard = lock.lock().await;
+            self.submit_under_lock(&run_id, spec).await
+        };
+        drop(lock);
+        self.inner.release_submit_lock(&run_id);
+        result
+    }
+
+    async fn submit_under_lock(&self, run_id: &str, spec: RunSpec) -> Result<SubmitOutcome> {
         let input_hash = hash_input(&spec.input);
 
-        // Hold the registry lock across enqueue so two concurrent submits
-        // with the same `run_id` can't both pass the duplicate check before
-        // either commits. Submission is not on a hot path; queue I/O
-        // latency here is acceptable.
-        let mut registry = self.inner.registry.lock().await;
-        if let Some(entry) = registry.get(&run_id) {
-            // Worker-resumed entries have no stored hash; fall through to
-            // the durable-record check below, which always carries it.
-            if let Some(existing) = entry.input_hash {
-                if existing != input_hash {
-                    return Err(Error::InputMismatch(run_id));
+        {
+            let registry = self.inner.registry.lock().await;
+            if let Some(entry) = registry.get(run_id) {
+                // Worker-resumed entries have no stored hash; fall through
+                // to the durable-record check below, which always carries
+                // it.
+                if let Some(existing) = entry.input_hash {
+                    if existing != input_hash {
+                        return Err(Error::InputMismatch(run_id.to_string()));
+                    }
+                    return Ok(SubmitOutcome {
+                        run_id: run_id.to_string(),
+                        newly_submitted: false,
+                    });
                 }
-                return Ok(SubmitOutcome {
-                    run_id,
-                    newly_submitted: false,
-                });
             }
         }
 
-        // Cross-restart duplicate check. The registry lock above closes
+        // Cross-restart duplicate check. The submit lock above closes
         // the in-process race window; this read closes the across-restart
         // one (same queue, fresh runtime).
-        if let Some(bytes) = self.inner.queue.kv_get(&run_kv_key(&run_id)).await? {
+        if let Some(bytes) = self.inner.queue.kv_get(&run_kv_key(run_id)).await? {
             let existing: DurableRunRecord =
                 rmp_serde::from_slice(&bytes).map_err(taquba::Error::from)?;
             if existing.input_hash != input_hash {
-                return Err(Error::InputMismatch(run_id));
+                return Err(Error::InputMismatch(run_id.to_string()));
             }
             return Ok(SubmitOutcome {
-                run_id,
+                run_id: run_id.to_string(),
                 newly_submitted: false,
             });
         }
 
         let mut headers = spec.headers.clone();
-        headers.insert(HEADER_RUN_ID.to_string(), run_id.clone());
+        headers.insert(HEADER_RUN_ID.to_string(), run_id.to_string());
         headers.insert(HEADER_STEP.to_string(), "0".to_string());
         let enqueue_opts = EnqueueOptions {
             headers,
@@ -530,12 +557,12 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         };
 
         let record_bytes = rmp_serde::to_vec_named(&DurableRunRecord {
-            run_id: run_id.clone(),
+            run_id: run_id.to_string(),
             submitted_at_ms: self.inner.clock.now_ms(),
             input_hash,
         })
         .map_err(taquba::Error::from)?;
-        let kv = HashMap::from([(run_kv_key(&run_id), record_bytes)]);
+        let kv = HashMap::from([(run_kv_key(run_id), record_bytes)]);
 
         let job_id = match self
             .inner
@@ -552,17 +579,17 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             // verdict is duplicate.
             EnqueueResult::AlreadyEnqueued(_) => {
                 return Ok(SubmitOutcome {
-                    run_id,
+                    run_id: run_id.to_string(),
                     newly_submitted: false,
                 });
             }
         };
 
-        registry.insert(
-            run_id.clone(),
+        self.inner.registry.lock().await.insert(
+            run_id.to_string(),
             RegistryEntry {
                 status: RunStatus {
-                    run_id: run_id.clone(),
+                    run_id: run_id.to_string(),
                     state: RunState::Pending,
                     current_step: 0,
                 },
@@ -573,11 +600,10 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
                 input_hash: Some(input_hash),
             },
         );
-        drop(registry);
 
         debug!(run_id = %run_id, job_id = %job_id, "run submitted");
         Ok(SubmitOutcome {
-            run_id,
+            run_id: run_id.to_string(),
             newly_submitted: true,
         })
     }
@@ -749,6 +775,26 @@ impl<R: StepRunner + 'static, H: TerminalHook + 'static> Worker for StepWorker<R
 }
 
 impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
+    /// Returns the per-run-id submit lock for `run_id`, creating it on
+    /// first access.
+    fn submit_lock_for(&self, run_id: &str) -> Arc<Mutex<()>> {
+        let mut map = self.submit_locks.lock().unwrap();
+        map.entry(run_id.to_string()).or_default().clone()
+    }
+
+    /// Drop `run_id`'s submit lock entry once no submit references it.
+    /// Callers drop their clone of the lock first; a concurrent submit
+    /// that has already cloned the entry keeps it alive and removes it
+    /// when it finishes.
+    fn release_submit_lock(&self, run_id: &str) {
+        let mut map = self.submit_locks.lock().unwrap();
+        if let Some(lock) = map.get(run_id) {
+            if Arc::strong_count(lock) == 1 {
+                map.remove(run_id);
+            }
+        }
+    }
+
     async fn enqueue_step(
         &self,
         run_id: &str,
@@ -1590,6 +1636,37 @@ mod tests {
         assert!(err.is_permanent());
 
         let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn submit_releases_its_per_run_lock_entry() {
+        struct PauseRunner;
+        impl StepRunner for PauseRunner {
+            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                std::future::pending().await
+            }
+        }
+
+        let (queue, store) = fresh_queue().await;
+        let runtime =
+            WorkflowRuntime::builder(queue, store.clone(), PauseRunner, NoopTerminalHook).build();
+
+        runtime
+            .submit(RunSpec {
+                input: b"x".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        runtime
+            .submit(RunSpec {
+                input: b"y".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(runtime.inner.submit_locks.lock().unwrap().is_empty());
     }
 
     #[tokio::test(start_paused = true)]

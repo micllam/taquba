@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `WorkflowRuntime::submit` no longer serialises every submission on a
+  process-wide lock held across queue I/O. The duplicate-check lock is
+  now per run id, so concurrent submissions of distinct runs proceed in
+  parallel and share WAL group commits. Previously a batch of
+  submissions completed at one run per flush interval regardless of
+  submission concurrency (about ten runs per second at SlateDB's
+  default 100 ms flush); same-run-id submissions keep their existing
+  duplicate and input-mismatch semantics.
+
 ### Added
 
 - `WorkflowRuntimeBuilder::step_output_replay`: opt-in
