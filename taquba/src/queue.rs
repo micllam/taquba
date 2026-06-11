@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, instrument, warn};
 use ulid::Ulid;
 
-use crate::claim_cursor::ClaimCursor;
+use crate::claim_cursor::{ClaimCursor, CursorState, ScanFrom};
 use crate::clock::{Clock, default_clock};
 use crate::error::{Error, Result};
 use crate::job::{JobRecord, JobStatus};
@@ -105,6 +105,30 @@ pub(crate) fn job_index_key(id: &str) -> String {
     format!("jobindex:{}", id)
 }
 
+/// Per-queue claim-scan state persisted by a clean [`Queue::close`]
+/// and consumed (loaded into the in-memory cursor, then durably
+/// deleted) by the next open.
+pub(crate) fn cursor_key(queue: &str) -> String {
+    format!("cursor:{}", queue)
+}
+
+/// On-disk form of one queue's claim-scan state, stored under
+/// [`cursor_key`]. Written only by a clean [`Queue::close`]; the next
+/// open deletes the record before serving traffic, so a record is
+/// never observed after the state it describes could have changed.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedCursor {
+    /// Queue the state belongs to; carried in the record so the
+    /// reader does not parse it out of the key.
+    queue: String,
+    /// Scan bound key, when one was established.
+    bound_key: Option<Vec<u8>>,
+    /// Whether the bound key itself may be live.
+    bound_inclusive: bool,
+    /// Whether a full scan had proven the queue empty at close.
+    known_empty: bool,
+}
+
 pub(crate) fn dedup_index_key(queue: &str, key: &str) -> String {
     format!("dedup:{}:{}", queue, key)
 }
@@ -113,7 +137,8 @@ pub(crate) fn dedup_index_key(queue: &str, key: &str) -> String {
 ///
 /// Caller-supplied keys are internally scoped under this prefix so they
 /// cannot collide with Taquba's own key layout (`pending:`, `claimed:`,
-/// `dead:`, `done:`, `scheduled:`, `jobindex:`, `dedup:`, `stats:`).
+/// `dead:`, `done:`, `scheduled:`, `jobindex:`, `dedup:`, `stats:`,
+/// `cursor:`).
 const USR_PREFIX: &[u8] = b"usr:";
 
 /// Maximum size of a single value in the user KV namespace.
@@ -496,6 +521,7 @@ impl Queue {
         let job_available = Arc::new(tokio::sync::Notify::new());
         let completion_notify = Arc::new(tokio::sync::Notify::new());
         let claim_cursor = ClaimCursor::new();
+        restore_cursor_state(&db, &claim_cursor).await?;
         let (reaper_shutdown, reaper_rx) = watch::channel(false);
         let reaper = Reaper {
             db: db.clone(),
@@ -1868,15 +1894,84 @@ impl Queue {
         Ok(())
     }
 
-    /// Shut down the background reaper and scheduler, then close the underlying database.
+    /// Shut down the background reaper and scheduler, persist each
+    /// queue's claim-scan state, then close the underlying database.
+    ///
+    /// The persisted state lets the next open resume claims at the
+    /// recorded bound instead of re-scanning the tombstone band left
+    /// by previously claimed jobs, so the first claim after a clean
+    /// restart costs the same as a warm one.
     pub async fn close(self) -> Result<()> {
         let _ = self.reaper_shutdown.send(true);
         let _ = self.reaper_handle.await;
         let _ = self.scheduler_shutdown.send(true);
         let _ = self.scheduler_handle.await;
+        persist_cursor_state(&self.db, &self.claim_cursor).await?;
         self.db.close().await?;
         Ok(())
     }
+}
+
+/// Write each queue's claim-scan state under its `cursor:` key. Runs
+/// after the background tasks have stopped; `close` consumes the
+/// handle, so the exported state cannot change between the export and
+/// the database closing.
+async fn persist_cursor_state(db: &Db, claim_cursor: &ClaimCursor) -> Result<()> {
+    let states = claim_cursor.export();
+    if states.is_empty() {
+        return Ok(());
+    }
+    let txn = db.begin(IsolationLevel::Snapshot).await?;
+    for (queue, state) in states {
+        let record = PersistedCursor {
+            queue: queue.clone(),
+            bound_key: state.scan_from.as_ref().map(|sf| sf.key.to_vec()),
+            bound_inclusive: state.scan_from.is_some_and(|sf| sf.inclusive),
+            known_empty: state.known_empty,
+        };
+        txn.put(
+            cursor_key(&queue).as_bytes(),
+            &rmp_serde::to_vec_named(&record)?,
+        )?;
+    }
+    txn.commit().await?;
+    Ok(())
+}
+
+/// Restore the claim cursor from `cursor:` records persisted by the
+/// previous clean close, then durably delete them before the queue
+/// serves traffic. A record is valid only as of the close that wrote
+/// it: once inserts resume the live bound can move behind the
+/// persisted one, so a crash before the delete is durable would leave
+/// a record whose stale bound lets a later open strand jobs behind it.
+async fn restore_cursor_state(db: &Db, claim_cursor: &ClaimCursor) -> Result<()> {
+    let txn = db.begin(IsolationLevel::Snapshot).await?;
+    let mut records = Vec::new();
+    {
+        let mut iter = txn.scan_prefix(b"cursor:").await?;
+        while let Some(kv) = iter.next().await? {
+            let record: PersistedCursor = rmp_serde::from_slice(&kv.value)?;
+            records.push((kv.key, record));
+        }
+    }
+    if records.is_empty() {
+        return Ok(());
+    }
+    for (key, record) in records {
+        claim_cursor.restore(
+            &record.queue,
+            CursorState {
+                scan_from: record.bound_key.map(|key| ScanFrom {
+                    key: Bytes::from(key),
+                    inclusive: record.bound_inclusive,
+                }),
+                known_empty: record.known_empty,
+            },
+        );
+        txn.delete(&key)?;
+    }
+    txn.commit().await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -5272,6 +5367,87 @@ mod tests {
         q.kv_delete(b"runs/xyz").await.unwrap();
         assert!(q.kv_get(b"runs/xyz").await.unwrap().is_none());
 
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cursor_bound_persists_across_a_clean_close() {
+        let store = make_store();
+        let lease = Duration::from_secs(5);
+        let q = Queue::open(store.clone(), "test").await.unwrap();
+        q.enqueue("work", b"first".to_vec()).await.unwrap();
+        q.enqueue("work", b"second".to_vec()).await.unwrap();
+        let first = q.claim("work", lease).await.unwrap().unwrap();
+        q.ack(&first).await.unwrap();
+        q.close().await.unwrap();
+
+        let q = Queue::open(store, "test").await.unwrap();
+        let scan = q.claim_cursor.begin_claim("work");
+        assert!(scan.scan_from.is_some());
+        assert!(!scan.known_empty);
+        assert!(
+            q.db.get(cursor_key("work").as_bytes())
+                .await
+                .unwrap()
+                .is_none(),
+            "the cursor record is consumed at open",
+        );
+
+        let second = q.claim("work", lease).await.unwrap().unwrap();
+        assert_eq!(second.payload, b"second");
+        q.ack(&second).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cursor_emptiness_persists_across_a_clean_close() {
+        let store = make_store();
+        let lease = Duration::from_secs(5);
+        let q = Queue::open(store.clone(), "test").await.unwrap();
+        q.enqueue("work", b"only".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.ack(&job).await.unwrap();
+        assert!(q.claim("work", lease).await.unwrap().is_none());
+        q.close().await.unwrap();
+
+        let q = Queue::open(store, "test").await.unwrap();
+        assert!(q.claim_cursor.begin_claim("work").known_empty);
+
+        q.enqueue("work", b"revives".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        assert_eq!(job.payload, b"revives");
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restored_bound_moves_back_for_an_insert_behind_it() {
+        let store = make_store();
+        let lease = Duration::from_secs(5);
+        let q = Queue::open(store.clone(), "test").await.unwrap();
+        q.enqueue("work", b"normal-1".to_vec()).await.unwrap();
+        q.enqueue("work", b"normal-2".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+
+        // A high-priority job sorts before the restored bound, which
+        // sits in the normal-priority band.
+        let q = Queue::open(store, "test").await.unwrap();
+        q.enqueue_with(
+            "work",
+            b"urgent".to_vec(),
+            EnqueueOptions {
+                priority: Some(PRIORITY_HIGH),
+                ..EnqueueOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        assert_eq!(job.payload, b"urgent");
+        q.ack(&job).await.unwrap();
         q.close().await.unwrap();
     }
 }

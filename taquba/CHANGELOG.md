@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Queue::wait_for_jobs_on` blocks until a job becomes claimable on
   one queue. Unlike `Queue::wait_for_jobs`, the wakeup is queue-scoped
   and delivered to one waiter per inserted job.
+- `Queue::close` persists each queue's claim-scan state (scan bound
+  and emptiness marker) under a new `cursor:` key prefix; the next
+  open restores the in-memory state from it and deletes the record. The
+  first claim after a clean restart resumes at the recorded bound
+  instead of re-scanning the tombstone band left by previously claimed
+  jobs, whose cost grows with the band and the store's latency. After
+  a crash the record is absent and the first claim falls back to the
+  front prefix scan as before.
 
 ### Changed
 

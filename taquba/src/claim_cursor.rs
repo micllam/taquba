@@ -31,8 +31,9 @@ const MAX_INSERT_WAKEUPS: usize = 64;
 /// compaction.
 ///
 /// Shared across the queue, reaper, and scheduler via `Clone`; all
-/// clones reference the same in-memory map. Not persisted: on
-/// process restart the first claim falls back to a prefix scan and
+/// clones reference the same in-memory map. The bound and emptiness
+/// marker survive a clean close ([`Self::export`] / [`Self::restore`]);
+/// after a crash the first claim falls back to a prefix scan and
 /// re-warms the state naturally.
 #[derive(Clone, Default)]
 pub(crate) struct ClaimCursor {
@@ -77,6 +78,14 @@ struct QueueClaimState {
 pub(crate) struct ClaimScanStart {
     pub(crate) scan_from: Option<ScanFrom>,
     pub(crate) epoch: u64,
+    pub(crate) known_empty: bool,
+}
+
+/// One queue's persistable claim-scan state: the scan bound and
+/// whether a full scan has proven the queue empty. Exported at clean
+/// close and restored at the next open.
+pub(crate) struct CursorState {
+    pub(crate) scan_from: Option<ScanFrom>,
     pub(crate) known_empty: bool,
 }
 
@@ -216,6 +225,42 @@ impl ClaimCursor {
         };
         for _ in 0..count.min(MAX_INSERT_WAKEUPS) {
             wakeup.notify_one();
+        }
+    }
+
+    /// Export every queue's persistable state. Queues with neither a
+    /// bound nor recorded emptiness are omitted; their next claim
+    /// falls back to the front prefix scan regardless.
+    pub(crate) fn export(&self) -> Vec<(String, CursorState)> {
+        let map = self.inner.lock().unwrap();
+        map.iter()
+            .filter_map(|(queue, s)| {
+                let known_empty = s.empty_as_of == Some(s.epoch);
+                if s.scan_from.is_none() && !known_empty {
+                    return None;
+                }
+                Some((
+                    queue.clone(),
+                    CursorState {
+                        scan_from: s.scan_from.clone(),
+                        known_empty,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Restore one queue's state from a record persisted at the
+    /// previous clean close. Must be called before the queue serves
+    /// traffic: the persisted state is valid because nothing mutates
+    /// the store while it is closed, and any insert after this call
+    /// updates the restored state through the normal paths.
+    pub(crate) fn restore(&self, queue: &str, state: CursorState) {
+        let mut map = self.inner.lock().unwrap();
+        let s = map.entry(queue.to_string()).or_default();
+        s.scan_from = state.scan_from;
+        if state.known_empty {
+            s.empty_as_of = Some(s.epoch);
         }
     }
 
@@ -453,6 +498,64 @@ mod tests {
             state.begin_claim("q").scan_from,
             scan_from(b"pending:q:00000000:job-1", true),
         );
+    }
+
+    #[test]
+    fn restore_sets_bound_and_emptiness() {
+        let state = ClaimCursor::new();
+        state.restore(
+            "q",
+            CursorState {
+                scan_from: scan_from(b"pending:q:00000000:job-5", false),
+                known_empty: true,
+            },
+        );
+
+        let scan = state.begin_claim("q");
+        assert_eq!(
+            scan.scan_from,
+            scan_from(b"pending:q:00000000:job-5", false)
+        );
+        assert!(scan.known_empty);
+    }
+
+    #[test]
+    fn restored_emptiness_is_revoked_by_an_insert() {
+        let state = ClaimCursor::new();
+        state.restore(
+            "q",
+            CursorState {
+                scan_from: None,
+                known_empty: true,
+            },
+        );
+
+        state.note_pending_insert("q", "pending:q:00000000:job-1");
+        let scan = state.begin_claim("q");
+        assert!(!scan.known_empty);
+        assert_eq!(scan.scan_from, scan_from(b"pending:q:00000000:job-1", true));
+    }
+
+    #[test]
+    fn export_skips_queues_without_persistable_state() {
+        let state = ClaimCursor::new();
+        let scan = state.begin_claim("q1");
+        state.advance(
+            "q1",
+            Bytes::from_static(b"pending:q1:00000000:job-1"),
+            &scan,
+        );
+        let _ = state.wakeup_for("q2");
+
+        let mut exported = state.export();
+        assert_eq!(exported.len(), 1);
+        let (queue, cursor) = exported.pop().unwrap();
+        assert_eq!(queue, "q1");
+        assert_eq!(
+            cursor.scan_from,
+            scan_from(b"pending:q1:00000000:job-1", false),
+        );
+        assert!(!cursor.known_empty);
     }
 
     #[test]
