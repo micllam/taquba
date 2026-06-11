@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   call fails with `InvalidState` and applies nothing, so a chained job
   exists only if the settlement that created it won. `Queue::ack` is
   now `ack_with` with empty effects.
+- `Worker::process_with_effects`: workers can return `AckEffects`
+  from processing, which `run_worker` and `run_worker_concurrent`
+  apply atomically with the job's acknowledgement via
+  `Queue::ack_with`. `process` and `process_with_effects` default to
+  each other; implement exactly one. Existing `Worker`
+  implementations are unaffected.
 - `Queue::close` persists each queue's claim-scan state (scan bound
   and emptiness marker) under a new `cursor:` key prefix; the next
   open restores the in-memory state from it and deletes the record. The

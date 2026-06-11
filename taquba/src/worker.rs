@@ -6,7 +6,7 @@ use tracing::{debug, warn};
 
 use crate::error::Result;
 use crate::job::JobRecord;
-use crate::queue::Queue;
+use crate::queue::{AckEffects, Queue};
 
 /// Boxed error type returned from [`Worker::process`].
 pub type WorkerError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -64,6 +64,11 @@ impl std::error::Error for PermanentFailure {}
 ///     }
 /// }
 /// ```
+/// Implement exactly one of [`Worker::process`] and
+/// [`Worker::process_with_effects`]: each default delegates to the
+/// other, so a type implementing neither fails to compile at its
+/// first use (the two default futures embed each other, which rustc
+/// rejects as a layout cycle).
 pub trait Worker: Send + Sync {
     /// Process a single claimed job.
     ///
@@ -72,14 +77,31 @@ pub trait Worker: Send + Sync {
     /// `max_attempts`). The returned error is converted to a string via
     /// `Display` and stored on the job's `last_error` field.
     ///
-    /// `process` is called sequentially for each job in [`run_worker`], or
+    /// Processing is called sequentially for each job in [`run_worker`], or
     /// concurrently up to the configured limit in [`run_worker_concurrent`].
     /// Implementations must be idempotent: Taquba guarantees at-least-once
     /// delivery, not exactly-once.
     fn process(
         &self,
         job: &JobRecord,
-    ) -> impl Future<Output = std::result::Result<(), WorkerError>> + Send;
+    ) -> impl Future<Output = std::result::Result<(), WorkerError>> + Send {
+        async move { self.process_with_effects(job).await.map(|_| ()) }
+    }
+
+    /// Process a single claimed job and return effects to apply
+    /// atomically with its acknowledgement.
+    ///
+    /// Like [`Self::process`], but an `Ok` return carries
+    /// [`AckEffects`] that the worker loop passes to
+    /// [`crate::Queue::ack_with`], so follow-up enqueues and caller KV
+    /// changes land in the same transaction as the ack. Errors behave
+    /// exactly as in [`Self::process`].
+    fn process_with_effects(
+        &self,
+        job: &JobRecord,
+    ) -> impl Future<Output = std::result::Result<AckEffects, WorkerError>> + Send {
+        async move { self.process(job).await.map(|()| AckEffects::default()) }
+    }
 }
 
 /// Run a polling worker loop: claim the next job, call [`Worker::process`],
@@ -119,8 +141,10 @@ where
                 // Process is uncancellable: no select around it. Even if
                 // shutdown was signalled while we were claiming, we finish
                 // the job we just took the lease on.
-                match worker.process(&job).await {
-                    Ok(()) => queue_handle.ack(&job).await?,
+                match worker.process_with_effects(&job).await {
+                    Ok(effects) => {
+                        queue_handle.ack_with(&job, effects).await?;
+                    }
                     Err(e) if e.downcast_ref::<PermanentFailure>().is_some() => {
                         queue_handle.dead_letter(job, &e.to_string()).await?
                     }
@@ -219,9 +243,9 @@ where
             let w = worker.clone();
             let queue_owned = queue.to_string();
             set.spawn(async move {
-                match w.process(&job).await {
-                    Ok(()) => {
-                        if let Err(e) = q.ack(&job).await {
+                match w.process_with_effects(&job).await {
+                    Ok(effects) => {
+                        if let Err(e) = q.ack_with(&job, effects).await {
                             warn!(queue = %queue_owned, job_id = %job.id, "ack failed: {e}");
                         }
                     }
@@ -289,6 +313,67 @@ mod tests {
             self.processed.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    struct ChainingWorker {
+        processed: Arc<AtomicUsize>,
+    }
+
+    impl Worker for ChainingWorker {
+        async fn process_with_effects(
+            &self,
+            job: &JobRecord,
+        ) -> std::result::Result<AckEffects, WorkerError> {
+            self.processed.fetch_add(1, Ordering::SeqCst);
+            if job.payload == b"first" {
+                Ok(AckEffects {
+                    enqueues: vec![crate::queue::EnqueueRequest {
+                        queue: job.queue.clone(),
+                        payload: b"second".to_vec(),
+                        options: crate::queue::EnqueueOptions::default(),
+                    }],
+                    ..AckEffects::default()
+                })
+            } else {
+                Ok(AckEffects::default())
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn worker_effects_chain_a_follow_up_job() {
+        let queue = Queue::open(Arc::new(InMemory::new()), "test")
+            .await
+            .unwrap();
+        queue.enqueue("work", b"first".to_vec()).await.unwrap();
+
+        let processed = Arc::new(AtomicUsize::new(0));
+        let worker = ChainingWorker {
+            processed: processed.clone(),
+        };
+        let all_processed = {
+            let processed = processed.clone();
+            async move {
+                while processed.load(Ordering::SeqCst) < 2 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        };
+        run_worker(
+            &queue,
+            "work",
+            &worker,
+            Duration::from_millis(50),
+            all_processed,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(processed.load(Ordering::SeqCst), 2);
+        let stats = queue.stats("work").await.unwrap();
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.done, 2);
+        queue.close().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

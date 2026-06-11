@@ -132,6 +132,11 @@ idle waits. In-flight jobs always finish, so leases are never abandoned to the
 reaper. See [`examples/worker.rs`](examples/worker.rs) for a full setup
 including retries and dead-letter inspection.
 
+A worker can implement `Worker::process_with_effects` instead of
+`Worker::process` to return `AckEffects`: follow-up enqueues and caller KV
+changes the loop applies atomically with the job's acknowledgement via
+`Queue::ack_with`.
+
 `run_worker_concurrent` is the same loop processing up to `concurrency`
 jobs in parallel:
 
