@@ -934,22 +934,22 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         }
     }
 
-    /// One pass of memo retention: list every terminal marker and, for
-    /// each marker older than `retention`, delete the run's memo
-    /// entries and then the marker. Returns the number of runs whose
-    /// memos were cleared. Errors on individual entries are logged and
+    /// One pass of memo retention: list the terminal markers older
+    /// than `retention` and, for each, delete the run's memo entries
+    /// and then the marker. Returns the number of runs whose memos
+    /// were cleared. Errors on individual entries are logged and
     /// skipped (the next pass retries) so a transient failure on one
     /// marker doesn't stall the rest of the sweep.
     async fn sweep_expired_memos(&self, retention: Duration) -> Result<usize> {
         let now_ms = self.clock.now_ms();
         let retention_ms = retention.as_millis() as u64;
         let cutoff = now_ms.saturating_sub(retention_ms);
-        let markers = self.memo_store.list_terminal_markers().await?;
+        let markers = self
+            .memo_store
+            .list_expired_terminal_markers(cutoff)
+            .await?;
         let mut cleared = 0usize;
         for marker in markers {
-            if marker.terminal_at_ms >= cutoff {
-                continue;
-            }
             if let Err(err) = self.memo_store.clear_memos_for_run(&marker.run_id).await {
                 warn!(
                     run_id = %marker.run_id,

@@ -22,21 +22,27 @@
 //! - `<prefix>/step-outputs/<run_id>/<step_number>/<sha256(step_payload)>`:
 //!   step-output replay entries written by the workflow runtime when
 //!   enabled.
-//! - `<prefix>/terminals/<terminal_at_ms:020>_<run_id>`: terminal
-//!   markers written by [`MemoStore::write_terminal_marker`]. The leading
-//!   zero-padded millisecond timestamp orders markers chronologically,
-//!   so a retention sweeper can early-exit a prefix scan once it
-//!   reaches markers younger than the retention window.
+//! - `<prefix>/terminals/<(u64::MAX - terminal_at_ms):020>_<run_id>`:
+//!   terminal markers written by [`MemoStore::write_terminal_marker`].
+//!   The leading zero-padded *inverted* millisecond timestamp sorts
+//!   markers newest-first, so every marker older than a cutoff sorts
+//!   after the cutoff's key and
+//!   [`MemoStore::list_expired_terminal_markers`] can reach the
+//!   expired set through `list_with_offset`, whose key-greater-than
+//!   filter is part of the object-store contract (list *order* is
+//!   not). The sweep's listing cost is therefore proportional to the
+//!   number of expired markers, not the total retained.
 //!
 //! # Cleanup
 //!
 //! The [`Memo`] primitive has no lifecycle management of its own.
 //! [`MemoStore::clear_memos_for_run`] removes every memo entry and
 //! step-output replay entry for a given run. [`MemoStore::write_terminal_marker`],
-//! [`MemoStore::list_terminal_markers`], and
+//! [`MemoStore::list_expired_terminal_markers`], and
 //! [`MemoStore::delete_terminal_marker`] are the building blocks a
 //! caller (typically the workflow runtime) composes into a retention
-//! sweeper.
+//! sweeper; [`MemoStore::list_terminal_markers`] lists every marker
+//! for inspection.
 
 use std::sync::Arc;
 
@@ -219,6 +225,52 @@ impl MemoStore {
         Ok(out)
     }
 
+    /// List the terminal markers whose `terminal_at_ms` is strictly
+    /// before `cutoff_ms`.
+    ///
+    /// Marker filenames lead with the inverted timestamp, so every
+    /// expired marker's key is greater than the cutoff's key and the
+    /// listing goes through `list_with_offset`: its key-greater-than
+    /// filter is part of the object-store contract, and stores such as
+    /// S3 and GCS push the offset down, so the cost is proportional to
+    /// the number of expired markers rather than the total retained.
+    /// Markers are returned in arbitrary order; unparseable filenames
+    /// are skipped with a warning.
+    pub async fn list_expired_terminal_markers(
+        &self,
+        cutoff_ms: u64,
+    ) -> Result<Vec<TerminalMarker>> {
+        let prefix = self.terminals_prefix();
+        // A marker at exactly `cutoff_ms` shares the offset's leading
+        // segment and is therefore listed; the parse-side filter below
+        // keeps the predicate strict.
+        let offset = prefix.child(format!("{:020}", invert_ts(cutoff_ms)));
+        let mut stream = self.store.list_with_offset(Some(&prefix), &offset);
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            let meta = item.map_err(Error::Store)?;
+            let Some(name) = meta.location.filename() else {
+                continue;
+            };
+            match parse_terminal_marker_name(name) {
+                Some((terminal_at_ms, run_id)) if terminal_at_ms < cutoff_ms => {
+                    out.push(TerminalMarker {
+                        run_id,
+                        terminal_at_ms,
+                    })
+                }
+                Some(_) => {}
+                None => {
+                    tracing::warn!(
+                        path = %meta.location,
+                        "unparseable terminal marker; skipping",
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Delete the terminal marker identified by `marker`.
     ///
     /// A missing marker (already swept by another pass) is treated as
@@ -257,8 +309,16 @@ impl MemoStore {
 
     fn terminal_marker_path(&self, run_id: &str, terminal_at_ms: u64) -> Path {
         self.terminals_prefix()
-            .child(format!("{terminal_at_ms:020}_{run_id}"))
+            .child(format!("{:020}_{run_id}", invert_ts(terminal_at_ms)))
     }
+}
+
+/// Invert a millisecond timestamp so newer values sort first in the
+/// zero-padded marker filenames. `u64::MAX` is 20 decimal digits, so
+/// every inverted value fits the fixed-width segment and lexicographic
+/// order equals numeric order.
+fn invert_ts(ms: u64) -> u64 {
+    u64::MAX - ms
 }
 
 /// A terminal marker as returned by [`MemoStore::list_terminal_markers`].
@@ -383,9 +443,9 @@ where
 /// integer or the underscore separator is missing.
 fn parse_terminal_marker_name(name: &str) -> Option<(u64, String)> {
     let (ts_str, rest) = name.split_at_checked(20)?;
-    let ts: u64 = ts_str.parse().ok()?;
+    let inverted: u64 = ts_str.parse().ok()?;
     let run_id = rest.strip_prefix('_')?;
-    Some((ts, run_id.to_string()))
+    Some((invert_ts(inverted), run_id.to_string()))
 }
 
 #[cfg(test)]
@@ -676,6 +736,38 @@ mod tests {
         assert_eq!(terminals.len(), 1);
         assert_eq!(terminals[0].run_id, "run-1");
         assert_eq!(terminals[0].terminal_at_ms, 1_700_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn list_expired_terminal_markers_honours_a_strict_cutoff() {
+        let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
+        store.write_terminal_marker("run-old", 1_000).await.unwrap();
+        store
+            .write_terminal_marker("run-edge", 2_000)
+            .await
+            .unwrap();
+        store.write_terminal_marker("run-new", 3_000).await.unwrap();
+
+        let expired = store.list_expired_terminal_markers(2_000).await.unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].run_id, "run-old");
+        assert_eq!(expired[0].terminal_at_ms, 1_000);
+
+        assert!(
+            store
+                .list_expired_terminal_markers(1_000)
+                .await
+                .unwrap()
+                .is_empty(),
+        );
+        assert_eq!(
+            store
+                .list_expired_terminal_markers(3_001)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     #[tokio::test]

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Terminal marker filenames lead with an inverted timestamp, and the
+  memo-retention sweep lists only expired markers (via the
+  object-store `list_with_offset` contract) instead of every retained
+  marker on every tick, so a sweep's listing cost is proportional to
+  the expired set. `MemoStore::list_expired_terminal_markers` is the
+  new sweeper building block; `list_terminal_markers` remains for
+  inspection. Markers written by earlier versions are not recognised
+  by the sweeper: when upgrading a store that ran with
+  `memo_retention` enabled, clear the `<memo_prefix>/terminals/`
+  prefix out-of-band.
 - Step transitions settle atomically. The next step's enqueue (for
   `Continue` / `ContinueAfter`) and the terminal run-record delete
   (for terminal outcomes) now join the current step's acknowledgement
