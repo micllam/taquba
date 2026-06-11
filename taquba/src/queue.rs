@@ -1517,6 +1517,12 @@ impl Queue {
     ///
     /// Call this periodically for long-running jobs to prevent the reaper from
     /// treating them as abandoned and re-queuing them.
+    ///
+    /// Renewal rotates the job's claimed key, which embeds the lease expiry.
+    /// A copy of the record taken before a renewal therefore no longer
+    /// identifies the claim: [`Self::ack`], [`Self::nack`], and further
+    /// renewals fail with [`Error::InvalidState`] unless they receive the
+    /// record updated by the most recent renewal.
     #[instrument(skip(self, job), fields(queue = %job.queue, job_id = %job.id))]
     pub async fn renew_lease(&self, job: &mut JobRecord, extension: Duration) -> Result<()> {
         let old_expiry = job.lease_expires_at.ok_or(Error::InvalidState)?;
