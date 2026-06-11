@@ -281,7 +281,14 @@ async fn sweep_done(
             txn.delete(&key)?;
             txn.delete(job_index_key(&id).as_bytes())?;
         }
-        match txn.commit().await {
+        // Retention deletes do not await WAL durability: a commit lost
+        // in a crash leaves the record in place for the next sweep,
+        // and the existence re-check above keeps the rerun idempotent.
+        let write_opts = WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        };
+        match txn.commit_with_options(&write_opts).await {
             Ok(_) => {}
             Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
             Err(e) => return Err(e.into()),
@@ -332,7 +339,15 @@ async fn sweep_dead(
             // already adjusts it.
             update_stats(&txn, &queue, &[(JobStatus::Dead, -1)])?;
         }
-        match txn.commit().await {
+        // Retention deletes do not await WAL durability: a commit lost
+        // in a crash leaves the record in place for the next sweep,
+        // and the existence re-check above keeps the rerun idempotent,
+        // including the dead counter decrement.
+        let write_opts = WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        };
+        match txn.commit_with_options(&write_opts).await {
             Ok(_) => {}
             Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
             Err(e) => return Err(e.into()),

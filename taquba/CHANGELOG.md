@@ -65,6 +65,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for the next sweep, which re-processes it without consuming an
   attempt, and later durable commits flush preceding WAL entries, so
   a settled job's requeue is durable by ordering.
+- The done and dead-letter retention sweeps delete expired records
+  without awaiting WAL durability, for the same reasons as the reaper
+  and scheduler changes above: a delete lost in a crash leaves the
+  record in place for the next sweep, whose existence re-check keeps
+  the rerun idempotent. With this, no background sweep awaits the
+  flush; only caller-driven operations do. A retention backlog no
+  longer delays the lease reaping that shares its tick.
 - `Queue::claim` tracks per-queue emptiness and a scan bound in
   process memory. Polling an empty queue answers without a storage
   scan or the claim lock, and the pending tombstone band is never
