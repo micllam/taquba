@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use slatedb::config::WriteOptions;
 use slatedb::{Db, IsolationLevel};
 use tokio::sync::{Notify, watch};
 use tracing::{debug, warn};
@@ -195,7 +196,19 @@ async fn reap_job(
         let became_dead = matches!(job.status, JobStatus::Dead);
         let requeued_pending_key =
             (!became_dead).then(|| pending_key(&job.queue, job.priority, &job.id));
-        match txn.commit().await {
+        // Reap commits do not await WAL durability. Each expired claim
+        // is processed in its own transaction, so awaiting the flush
+        // serialises the sweep at one job per flush interval. A commit
+        // lost in a crash leaves the expired claimed key in place and
+        // the next sweep re-processes it: the rewrite is idempotent and
+        // requeues do not consume an attempt. Any later durable commit
+        // flushes preceding WAL entries, so a job's post-requeue
+        // history is never durable without the requeue itself.
+        let write_opts = WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        };
+        match txn.commit_with_options(&write_opts).await {
             Ok(_) => {
                 if let Some(key) = requeued_pending_key {
                     claim_cursor.note_pending_insert(&job.queue, &key);

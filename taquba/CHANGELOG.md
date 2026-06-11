@@ -50,6 +50,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expires; at-least-once delivery is unaffected, and a settled job's
   claim is always durable because later durable commits flush
   preceding WAL entries.
+- The reaper requeues and dead-letters expired claims without awaiting
+  WAL durability. Each expired claim is processed in its own
+  transaction, and awaiting the flush serialised the sweep at one job
+  per flush interval (about ten per second at the default 100 ms
+  flush). A commit lost in a crash leaves the expired claim in place
+  for the next sweep, which re-processes it without consuming an
+  attempt, and later durable commits flush preceding WAL entries, so
+  a settled job's requeue is durable by ordering.
 - `Queue::claim` tracks per-queue emptiness and a scan bound in
   process memory. Polling an empty queue answers without a storage
   scan or the claim lock, and the pending tombstone band is never
