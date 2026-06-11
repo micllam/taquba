@@ -144,9 +144,9 @@ impl Submitter {
         }
     }
 
-    /// One pass of result retention: list every terminal marker and,
-    /// for each marker older than `retention`, delete the job's result
-    /// blob and then the marker. Returns the number of blobs cleared.
+    /// One pass of result retention: list the terminal markers older
+    /// than `retention` and, for each, delete the job's result blob
+    /// and then the marker. Returns the number of blobs cleared.
     /// Errors on individual entries are logged and skipped so a
     /// transient failure on one marker doesn't stall the rest of the
     /// sweep.
@@ -154,12 +154,9 @@ impl Submitter {
         let now_ms = self.clock.now_ms();
         let retention_ms = retention.as_millis() as u64;
         let cutoff = now_ms.saturating_sub(retention_ms);
-        let markers = self.results.list_terminal_markers().await?;
+        let markers = self.results.list_expired_terminal_markers(cutoff).await?;
         let mut cleared = 0usize;
         for marker in markers {
-            if marker.terminal_at_ms >= cutoff {
-                continue;
-            }
             if let Err(err) = self.results.delete(&marker.job_id).await {
                 tracing::warn!(
                     job_id = %marker.job_id,
@@ -1658,7 +1655,7 @@ mod tests {
         assert_eq!(job.await.unwrap(), 3);
 
         let markers = inspect_results(store, queue_name)
-            .list_terminal_markers()
+            .list_expired_terminal_markers(u64::MAX)
             .await
             .unwrap();
         assert_eq!(markers.len(), 1);
@@ -1690,7 +1687,7 @@ mod tests {
 
         assert!(
             inspect_results(store, queue_name)
-                .list_terminal_markers()
+                .list_expired_terminal_markers(u64::MAX)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1725,7 +1722,7 @@ mod tests {
         let _ = job.join().await.unwrap();
 
         let markers = inspect_results(store, queue_name)
-            .list_terminal_markers()
+            .list_expired_terminal_markers(u64::MAX)
             .await
             .unwrap();
         assert_eq!(markers.len(), 1);
@@ -1766,7 +1763,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let markers = inspect_results(store, queue_name)
-            .list_terminal_markers()
+            .list_expired_terminal_markers(u64::MAX)
             .await
             .unwrap();
         assert_eq!(markers.len(), 1, "marker at boundary must be retained");
@@ -1800,7 +1797,14 @@ mod tests {
         // Both the result blob and the marker exist before the sweep.
         let results = inspect_results(store.clone(), queue_name);
         assert!(results.get(&job_id).await.unwrap().is_some());
-        assert_eq!(results.list_terminal_markers().await.unwrap().len(), 1);
+        assert_eq!(
+            results
+                .list_expired_terminal_markers(u64::MAX)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         // Advance well past retention so the next sweep tick clears
         // both the result blob and the marker.
@@ -1809,7 +1813,10 @@ mod tests {
 
         let cleared = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let markers = results.list_terminal_markers().await.unwrap();
+                let markers = results
+                    .list_expired_terminal_markers(u64::MAX)
+                    .await
+                    .unwrap();
                 let blob = results.get(&job_id).await.unwrap();
                 if markers.is_empty() && blob.is_none() {
                     return true;

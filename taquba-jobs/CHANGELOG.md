@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Terminal marker filenames lead with an inverted timestamp, and the
+  result-retention sweep lists only expired markers (via the
+  object-store `list_with_offset` contract) instead of every retained
+  marker on every tick, so a sweep's listing cost is proportional to
+  the expired set. Markers written by earlier versions are not
+  recognised by the sweeper: when upgrading a store that ran with
+  `result_retention` enabled, clear the `<result_prefix>/terminals/`
+  prefix out-of-band.
+
 ## [0.3.0] - 2026-05-29
 
 ### Added

@@ -63,18 +63,24 @@ impl From<StoredErrorKind> for ErrorKind {
 /// - `<prefix>/<job_id>`: outcome blobs written by [`ResultStore::put`].
 ///   Job ids are ULIDs, so they cannot collide with the reserved
 ///   `terminals` segment below.
-/// - `<prefix>/terminals/<terminal_at_ms:020>_<job_id>`: zero-byte
-///   markers written by [`ResultStore::write_terminal_marker`]. The
-///   leading zero-padded millisecond timestamp orders markers
-///   chronologically so a retention sweeper can early-exit once it
-///   reaches markers younger than the retention window.
+/// - `<prefix>/terminals/<(u64::MAX - terminal_at_ms):020>_<job_id>`:
+///   zero-byte markers written by
+///   [`ResultStore::write_terminal_marker`]. The leading zero-padded
+///   *inverted* millisecond timestamp sorts markers newest-first, so
+///   every marker older than a cutoff sorts after the cutoff's key and
+///   [`ResultStore::list_expired_terminal_markers`] can reach the
+///   expired set through `list_with_offset`, whose key-greater-than
+///   filter is part of the object-store contract (list *order* is
+///   not). The sweep's listing cost is therefore proportional to the
+///   number of expired markers, not the total retained.
 #[derive(Clone)]
 pub(crate) struct ResultStore {
     store: Arc<dyn ObjectStore>,
     prefix: String,
 }
 
-/// A terminal marker as returned by [`ResultStore::list_terminal_markers`].
+/// A terminal marker as returned by
+/// [`ResultStore::list_expired_terminal_markers`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TerminalMarker {
     pub(crate) job_id: String,
@@ -96,7 +102,7 @@ impl ResultStore {
 
     fn terminal_marker_path(&self, job_id: &str, terminal_at_ms: u64) -> Path {
         self.terminals_prefix()
-            .child(format!("{terminal_at_ms:020}_{job_id}"))
+            .child(format!("{:020}_{job_id}", invert_ts(terminal_at_ms)))
     }
 
     /// Persist a job's terminal outcome. Overwrites any prior outcome for the
@@ -148,16 +154,27 @@ impl ResultStore {
         Ok(())
     }
 
-    /// List every terminal marker currently in the store.
+    /// List the terminal markers whose `terminal_at_ms` is strictly
+    /// before `cutoff_ms`. A cutoff of `u64::MAX` lists every marker.
     ///
-    /// Markers are returned in arbitrary order (object-store list order
-    /// is not guaranteed by the trait); callers that care about
-    /// chronological order should sort by [`TerminalMarker::terminal_at_ms`].
-    /// Markers whose filenames cannot be parsed are skipped with a
-    /// warning rather than failing the whole listing.
-    pub(crate) async fn list_terminal_markers(&self) -> Result<Vec<TerminalMarker>> {
+    /// Marker filenames lead with the inverted timestamp, so every
+    /// expired marker's key is greater than the cutoff's key and the
+    /// listing goes through `list_with_offset`: its key-greater-than
+    /// filter is part of the object-store contract, and stores such as
+    /// S3 and GCS push the offset down, so the cost is proportional to
+    /// the number of expired markers rather than the total retained.
+    /// Markers are returned in arbitrary order; unparseable filenames
+    /// are skipped with a warning.
+    pub(crate) async fn list_expired_terminal_markers(
+        &self,
+        cutoff_ms: u64,
+    ) -> Result<Vec<TerminalMarker>> {
         let prefix = self.terminals_prefix();
-        let mut stream = self.store.list(Some(&prefix));
+        // A marker at exactly `cutoff_ms` shares the offset's leading
+        // segment and is therefore listed; the parse-side filter below
+        // keeps the predicate strict.
+        let offset = prefix.child(format!("{:020}", invert_ts(cutoff_ms)));
+        let mut stream = self.store.list_with_offset(Some(&prefix), &offset);
         let mut out = Vec::new();
         while let Some(item) = stream.next().await {
             let meta = item.map_err(Error::Store)?;
@@ -165,10 +182,13 @@ impl ResultStore {
                 continue;
             };
             match parse_terminal_marker_name(name) {
-                Some((terminal_at_ms, job_id)) => out.push(TerminalMarker {
-                    job_id,
-                    terminal_at_ms,
-                }),
+                Some((terminal_at_ms, job_id)) if terminal_at_ms < cutoff_ms => {
+                    out.push(TerminalMarker {
+                        job_id,
+                        terminal_at_ms,
+                    })
+                }
+                Some(_) => {}
                 None => {
                     tracing::warn!(
                         path = %meta.location,
@@ -193,14 +213,23 @@ impl ResultStore {
     }
 }
 
-/// Parse a terminal marker filename in the form `<ts:020>_<job_id>`.
+/// Invert a millisecond timestamp so newer values sort first in the
+/// zero-padded marker filenames. `u64::MAX` is 20 decimal digits, so
+/// every inverted value fits the fixed-width segment and lexicographic
+/// order equals numeric order.
+fn invert_ts(ms: u64) -> u64 {
+    u64::MAX - ms
+}
+
+/// Parse a terminal marker filename in the form
+/// `<inverted_ts:020>_<job_id>`, returning the original timestamp.
 /// Returns `None` if the leading 20 characters are not a base-10
 /// integer or the underscore separator is missing.
 fn parse_terminal_marker_name(name: &str) -> Option<(u64, String)> {
     let (ts_str, rest) = name.split_at_checked(20)?;
-    let ts: u64 = ts_str.parse().ok()?;
+    let inverted: u64 = ts_str.parse().ok()?;
     let job_id = rest.strip_prefix('_')?;
-    Some((ts, job_id.to_string()))
+    Some((invert_ts(inverted), job_id.to_string()))
 }
 
 #[cfg(test)]
@@ -250,16 +279,54 @@ mod tests {
             .write_terminal_marker("job-1", 1_700_000_000_000)
             .await
             .unwrap();
-        let markers = store.list_terminal_markers().await.unwrap();
+        let markers = store.list_expired_terminal_markers(u64::MAX).await.unwrap();
         assert_eq!(markers.len(), 1);
         assert_eq!(markers[0].job_id, "job-1");
         assert_eq!(markers[0].terminal_at_ms, 1_700_000_000_000);
     }
 
     #[tokio::test]
-    async fn list_terminal_markers_is_empty_when_none_written() {
+    async fn list_expired_terminal_markers_is_empty_when_none_written() {
         let store = make_store();
-        assert!(store.list_terminal_markers().await.unwrap().is_empty());
+        assert!(
+            store
+                .list_expired_terminal_markers(u64::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_expired_terminal_markers_honours_a_strict_cutoff() {
+        let store = make_store();
+        store.write_terminal_marker("job-old", 1_000).await.unwrap();
+        store
+            .write_terminal_marker("job-edge", 2_000)
+            .await
+            .unwrap();
+        store.write_terminal_marker("job-new", 3_000).await.unwrap();
+
+        let expired = store.list_expired_terminal_markers(2_000).await.unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].job_id, "job-old");
+        assert_eq!(expired[0].terminal_at_ms, 1_000);
+
+        assert!(
+            store
+                .list_expired_terminal_markers(1_000)
+                .await
+                .unwrap()
+                .is_empty(),
+        );
+        assert_eq!(
+            store
+                .list_expired_terminal_markers(3_001)
+                .await
+                .unwrap()
+                .len(),
+            3,
+        );
     }
 
     #[tokio::test]
@@ -274,7 +341,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let remaining = store.list_terminal_markers().await.unwrap();
+        let remaining = store.list_expired_terminal_markers(u64::MAX).await.unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].job_id, "b");
     }
