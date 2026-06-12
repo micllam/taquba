@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tracing::{debug, warn};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::job::JobRecord;
 use crate::queue::{AckEffects, Queue};
 
@@ -123,6 +123,14 @@ pub trait Worker: Send + Sync {
 /// queue-scoped notify (one waiting worker per inserted job), so this only
 /// bounds the latency of out-of-band events (e.g. a scheduled job becoming
 /// due).
+///
+/// Errors from the claim path terminate the loop and propagate.
+/// Settlement failures do not: they affect one job, not the loop. In
+/// particular, when a job outlives its lease and the reaper requeues it,
+/// the late settlement fails with [`Error::ClaimLost`]; the loop logs it
+/// and continues, and the redelivered attempt settles the job instead.
+/// Size leases to cover processing time, or extend them from within
+/// `process` via [`Queue::renew_lease`], so this stays rare.
 pub async fn run_worker<W, F>(
     queue_handle: &Queue,
     queue: &str,
@@ -141,15 +149,7 @@ where
                 // Process is uncancellable: no select around it. Even if
                 // shutdown was signalled while we were claiming, we finish
                 // the job we just took the lease on.
-                match worker.process_with_effects(&job).await {
-                    Ok(effects) => {
-                        queue_handle.ack_with(&job, effects).await?;
-                    }
-                    Err(e) if e.downcast_ref::<PermanentFailure>().is_some() => {
-                        queue_handle.dead_letter(job, &e.to_string()).await?
-                    }
-                    Err(e) => queue_handle.nack(job, &e.to_string()).await?,
-                }
+                process_and_settle(queue_handle, queue, worker, job).await;
                 if check_shutdown(shutdown.as_mut()) {
                     debug!(queue = queue, "worker shutdown requested");
                     return Ok(());
@@ -182,8 +182,9 @@ where
 /// processed and acked individually. On shutdown the loop stops claiming new
 /// work and waits for the in-flight set to drain before returning.
 ///
-/// Claim errors propagate and terminate the loop. Ack / nack errors and panics
-/// inside spawned tasks are logged but do not terminate the loop.
+/// Claim errors propagate and terminate the loop. Settlement failures and
+/// panics inside spawned tasks are logged but do not terminate the loop;
+/// see [`run_worker`] for the [`Error::ClaimLost`] case.
 pub async fn run_worker_concurrent<W, F>(
     queue_handle: &Arc<Queue>,
     queue: &str,
@@ -243,23 +244,7 @@ where
             let w = worker.clone();
             let queue_owned = queue.to_string();
             set.spawn(async move {
-                match w.process_with_effects(&job).await {
-                    Ok(effects) => {
-                        if let Err(e) = q.ack_with(&job, effects).await {
-                            warn!(queue = %queue_owned, job_id = %job.id, "ack failed: {e}");
-                        }
-                    }
-                    Err(e) if e.downcast_ref::<PermanentFailure>().is_some() => {
-                        if let Err(se) = q.dead_letter(job, &e.to_string()).await {
-                            warn!(queue = %queue_owned, "dead_letter failed: {se}");
-                        }
-                    }
-                    Err(e) => {
-                        if let Err(se) = q.nack(job, &e.to_string()).await {
-                            warn!(queue = %queue_owned, "nack failed: {se}");
-                        }
-                    }
-                }
+                process_and_settle(&q, &queue_owned, w.as_ref(), job).await;
             });
         }
         if check_shutdown(shutdown.as_mut()) {
@@ -280,6 +265,37 @@ where
     Ok(())
 }
 
+/// Process one claimed job and apply its settlement (ack with effects,
+/// nack, or dead-letter). Settlement failures are absorbed: they affect
+/// one job, not the loop. A [`Error::ClaimLost`] means the job outlived
+/// its lease and the reaper requeued it, so the redelivered attempt
+/// settles it instead; any other settlement failure leaves the claim to
+/// the reaper.
+async fn process_and_settle<W: Worker>(
+    queue_handle: &Queue,
+    queue: &str,
+    worker: &W,
+    job: JobRecord,
+) {
+    let job_id = job.id.clone();
+    let settlement = match worker.process_with_effects(&job).await {
+        Ok(effects) => queue_handle.ack_with(&job, effects).await.map(|_| ()),
+        Err(e) if e.downcast_ref::<PermanentFailure>().is_some() => {
+            queue_handle.dead_letter(job, &e.to_string()).await
+        }
+        Err(e) => queue_handle.nack(job, &e.to_string()).await,
+    };
+    match settlement {
+        Ok(()) => {}
+        Err(Error::ClaimLost) => warn!(
+            queue = queue,
+            job_id = %job_id,
+            "job lost its claim during processing; the redelivered attempt settles it"
+        ),
+        Err(e) => warn!(queue = queue, job_id = %job_id, "settlement failed: {e}"),
+    }
+}
+
 /// Non-blocking peek at a pinned shutdown future. Returns true if the future
 /// has already resolved, false otherwise. Used to honour shutdown between jobs
 /// without putting `process` inside a `select!` (which would cancel it if the
@@ -294,7 +310,8 @@ fn check_shutdown<F: Future<Output = ()>>(shutdown: std::pin::Pin<&mut F>) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::queue::Queue;
+    use crate::clock::MockClock;
+    use crate::queue::{OpenOptions, Queue, QueueConfig};
     use slatedb::object_store::memory::InMemory;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -374,6 +391,79 @@ mod tests {
         assert_eq!(stats.pending, 0);
         assert_eq!(stats.done, 2);
         queue.close().await.unwrap();
+    }
+
+    struct LeaseLosingWorker {
+        queue: Arc<Queue>,
+        clock: MockClock,
+        lease: Duration,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Worker for LeaseLosingWorker {
+        async fn process(&self, _job: &JobRecord) -> std::result::Result<(), WorkerError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                // First attempt: outlive the lease and let the reaper
+                // requeue the job, so the loop's ack finds the claim
+                // gone and fails with ClaimLost.
+                self.clock.advance(self.lease + Duration::from_millis(1));
+                self.queue.reap_now().await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn worker_loop_survives_settlement_on_a_lost_claim() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let lease = Duration::from_secs(30);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            default_queue_config: QueueConfig {
+                lease_duration: lease,
+                ..QueueConfig::default()
+            },
+            ..OpenOptions::default()
+        };
+        let queue = Arc::new(
+            Queue::open_with_options(Arc::new(InMemory::new()), "test", opts)
+                .await
+                .unwrap(),
+        );
+        queue.enqueue("work", b"job".to_vec()).await.unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker = LeaseLosingWorker {
+            queue: queue.clone(),
+            clock,
+            lease,
+            calls: calls.clone(),
+        };
+        let second_attempt_done = {
+            let calls = calls.clone();
+            async move {
+                while calls.load(Ordering::SeqCst) < 2 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        };
+        run_worker(
+            &queue,
+            "work",
+            &worker,
+            Duration::from_millis(50),
+            second_attempt_done,
+        )
+        .await
+        .unwrap();
+
+        // The first attempt's settlement lost the claim; the loop kept
+        // running and the redelivered attempt settled the job.
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let stats = queue.stats("work").await.unwrap();
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.claimed, 0);
+        assert_eq!(stats.done, 1);
     }
 
     #[tokio::test(start_paused = true)]

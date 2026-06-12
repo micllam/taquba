@@ -134,6 +134,11 @@ idle waits. In-flight jobs always finish, so leases are never abandoned to the
 reaper. See [`examples/worker.rs`](examples/worker.rs) for a full setup
 including retries and dead-letter inspection.
 
+Settlement failures do not stop the loop: when a job outlives its lease
+and the reaper requeues it, the late acknowledgement fails with
+`ClaimLost`, the loop logs it and continues, and the redelivered attempt
+settles the job instead. Errors on the claim path still stop the loop.
+
 A worker can implement `Worker::process_with_effects` instead of
 `Worker::process` to return `AckEffects`: follow-up enqueues and caller KV
 changes the loop applies atomically with the job's acknowledgement via

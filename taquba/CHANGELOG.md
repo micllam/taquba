@@ -49,6 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `run_worker` no longer exits when settling a job fails. Settlement
+  failures (including `ClaimLost` when a job outlives its lease and
+  the reaper requeues it) are logged and the loop continues, matching
+  `run_worker_concurrent`; the redelivered attempt settles the job.
+  Claim-path errors still terminate both loops. Both loops log a lost
+  claim distinctly from other settlement failures.
 - `run_worker_concurrent` claims jobs in batches sized to its free
   capacity via `Queue::claim_batch`, costing one claim transaction
   per batch instead of per job under a backlog. Jobs are still
