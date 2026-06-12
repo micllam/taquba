@@ -6,8 +6,8 @@ to `stdout`; status and progress prints go to `stderr` so the data
 stream stays clean. The `[[bench]]` entries in
 `taquba-bulk/Cargo.toml` set `harness = false`, so each file runs as a
 plain binary. Conventions (env-var parameters, `STORE_LATENCY_MS`
-throttling, CSV output) match the `taquba` crate's benches; see
-`taquba/benches/README.md`.
+throttling, `STORE_URL` for real object-storage backends, CSV output)
+match the `taquba` crate's benches; see `taquba/benches/README.md`.
 
 ## Available benchmarks
 
@@ -31,6 +31,11 @@ FLUSH_INTERVAL_MS=100 STORE_LATENCY_MS=20 \
 # execution count against the same run with MEMO=0.
 cargo bench -p taquba-bulk --bench resume_replay > resume.csv
 MEMO=0 cargo bench -p taquba-bulk --bench resume_replay > resume_bare.csv
+
+# Real object storage (see taquba/benches/README.md).
+STORE_URL=s3://my-bench-bucket/taquba \
+    cargo bench -p taquba-bulk --features taquba/aws \
+    --bench bulk_throughput > bulk.csv
 ```
 
 The full parameter lists (`N_ITEMS`, `N_PHASES`, `MAX_CONCURRENT`,

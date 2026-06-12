@@ -28,6 +28,9 @@ ulid = { workspace = true }
 # workspace tokio defaults.
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
+# Used only by the benches' STORE_URL parsing.
+url = { workspace = true }
+
 [[bench]]
 name = "bulk_throughput"
 # Disable libtest's bench harness so the file runs as a plain

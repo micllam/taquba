@@ -5,8 +5,9 @@ a self-contained `#[tokio::main]` binary that emits CSV to `stdout`;
 status and progress prints go to `stderr` so the data stream stays
 clean. The `[[bench]]` entries in `taquba-jobs/Cargo.toml` set
 `harness = false`, so each file runs as a plain binary. Conventions
-(env-var parameters, `STORE_LATENCY_MS` throttling, CSV output) match the
-`taquba` crate's benches; see `taquba/benches/README.md`.
+(env-var parameters, `STORE_LATENCY_MS` throttling, `STORE_URL` for
+real object-storage backends, CSV output) match the `taquba` crate's
+benches; see `taquba/benches/README.md`.
 
 ## Available benchmarks
 
@@ -28,6 +29,11 @@ FLUSH_INTERVAL_MS=100 STORE_LATENCY_MS=20 \
 # Larger fan-out with simulated per-job work.
 N_JOBS=2000 JOB_WORK_MS=50 MAX_CONCURRENT=200 \
     cargo bench -p taquba-jobs --bench fanout > fanout.csv
+
+# Real object storage (see taquba/benches/README.md).
+STORE_URL=s3://my-bench-bucket/taquba \
+    cargo bench -p taquba-jobs --features taquba/aws \
+    --bench fanout > fanout.csv
 ```
 
 The full parameter list (`N_JOBS`, `JOB_WORK_MS`, `MAX_CONCURRENT`,

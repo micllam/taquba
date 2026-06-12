@@ -2915,6 +2915,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
+ "url",
 ]
 
 [[package]]
@@ -2931,6 +2932,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "ulid",
+ "url",
 ]
 
 [[package]]
@@ -2959,6 +2961,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "ulid",
+ "url",
 ]
 
 [[package]]
@@ -2991,6 +2994,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "ulid",
+ "url",
 ]
 
 [[package]]

@@ -39,6 +39,11 @@
 //                       object_store's ThrottledStore so every get, put,
 //                       list, and delete sleeps this long before running,
 //                       approximating an S3-class backend.
+//   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
+//                       az://..., file:///abs/path) to run against
+//                       instead of the in-memory store; see
+//                       benches/README.md. Incompatible with
+//                       STORE_LATENCY_MS.
 //
 // Output (stdout): CSV with header
 // `window_sec,n_enq,enq_p99_us,n_done,e2e_p50_us,e2e_p95_us,e2e_p99_us,claim_p99_us,ack_p99_us,pending`.
@@ -56,7 +61,7 @@ use std::time::{Duration, Instant};
 
 use taquba::{OpenOptions, Queue, QueueConfig};
 
-use common::{env_var, init_tracing, pct, store_with_latency};
+use common::{env_var, init_tracing, pct, store_from_env};
 
 /// Lease held while a worker has a job claimed. Long enough that an
 /// idle scheduler tick during the bench never lets a lease expire.
@@ -98,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let queue_names: Arc<Vec<String>> =
         Arc::new((0..n_queues).map(|i| format!("bench-{i}")).collect());
 
-    let store = store_with_latency(store_latency_ms);
+    let store = store_from_env(store_latency_ms)?;
     let queue = Arc::new(
         Queue::open_with_options(
             store,

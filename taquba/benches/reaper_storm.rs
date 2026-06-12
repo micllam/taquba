@@ -29,6 +29,11 @@
 //                       object_store's ThrottledStore so every get, put,
 //                       list, and delete sleeps this long before running,
 //                       approximating an S3-class backend.
+//   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
+//                       az://..., file:///abs/path) to run against
+//                       instead of the in-memory store; see
+//                       benches/README.md. Incompatible with
+//                       STORE_LATENCY_MS.
 //   DURATION_CAP_SEC    abort threshold for the measured phase
 //                       (default 600)
 //
@@ -48,7 +53,7 @@ use std::time::{Duration, Instant};
 
 use taquba::{OpenOptions, Queue, QueueConfig};
 
-use common::{env_var, init_tracing, pct, store_with_latency};
+use common::{env_var, init_tracing, pct, store_from_env};
 
 const LIVE_QUEUE: &str = "live";
 const STORM_QUEUE: &str = "storm";
@@ -103,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
          flush_interval={flush_interval_ms}ms, store_latency={store_latency_ms}ms",
     );
 
-    let store = store_with_latency(store_latency_ms);
+    let store = store_from_env(store_latency_ms)?;
 
     // Phase one: build the storm of abandoned claims.
     let queue = Queue::open_with_options(

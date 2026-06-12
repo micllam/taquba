@@ -6,8 +6,8 @@ series to `stdout`; status and progress prints go to `stderr` so the
 data stream stays clean. The `[[bench]]` entries in
 `taquba-workflow/Cargo.toml` set `harness = false`, so each file runs
 as a plain binary. Conventions (env-var parameters, `STORE_LATENCY_MS`
-throttling, CSV output) match the `taquba` crate's benches; see
-`taquba/benches/README.md`.
+throttling, `STORE_URL` for real object-storage backends, CSV output)
+match the `taquba` crate's benches; see `taquba/benches/README.md`.
 
 ## Available benchmarks
 
@@ -29,6 +29,11 @@ FLUSH_INTERVAL_MS=100 STORE_LATENCY_MS=20 \
 # Longer chains at higher worker concurrency.
 N_RUNS=200 N_STEPS=20 MAX_CONCURRENT_STEPS=32 \
     cargo bench -p taquba-workflow --bench step_transitions > steps.csv
+
+# Real object storage (see taquba/benches/README.md).
+STORE_URL=s3://my-bench-bucket/taquba \
+    cargo bench -p taquba-workflow --features taquba/aws \
+    --bench step_transitions > steps.csv
 ```
 
 The full parameter list (`N_RUNS`, `N_STEPS`, `MAX_CONCURRENT_STEPS`,

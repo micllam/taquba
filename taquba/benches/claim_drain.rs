@@ -17,6 +17,11 @@
 //                       object_store's ThrottledStore so every get, put,
 //                       list, and delete sleeps this long before running,
 //                       approximating an S3-class backend.
+//   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
+//                       az://..., file:///abs/path) to run against
+//                       instead of the in-memory store; see
+//                       benches/README.md. Incompatible with
+//                       STORE_LATENCY_MS.
 //
 // Output (stdout): CSV with header `window_sec,n_claims,p50_us,p95_us,p99_us`.
 // Status / progress prints go to stderr so stdout stays a clean data stream.
@@ -28,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use taquba::{OpenOptions, Queue, QueueConfig};
 
-use common::{env_var, init_tracing, pct, store_with_latency};
+use common::{env_var, init_tracing, pct, store_from_env};
 
 const QUEUE_NAME: &str = "bench";
 
@@ -55,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
          store_latency={store_latency_ms}ms",
     );
 
-    let store = store_with_latency(store_latency_ms);
+    let store = store_from_env(store_latency_ms)?;
     let queue = Arc::new(
         Queue::open_with_options(
             store,

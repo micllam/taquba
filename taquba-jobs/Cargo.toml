@@ -30,6 +30,9 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 # Used only by the fanout bench.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
+# Used only by the benches' STORE_URL parsing.
+url = { workspace = true }
+
 [[bench]]
 name = "fanout"
 # Disable libtest's bench harness so the file runs as a plain

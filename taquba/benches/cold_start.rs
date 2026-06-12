@@ -24,6 +24,11 @@
 //                       list, and delete sleeps this long before running,
 //                       approximating an S3-class backend. Applies to the
 //                       history build as well as the measured phase.
+//   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
+//                       az://..., file:///abs/path) to run against
+//                       instead of the in-memory store; see
+//                       benches/README.md. Incompatible with
+//                       STORE_LATENCY_MS.
 //
 // Output (stdout): CSV with header `claim_idx,claim_us`, one row per
 // post-restart claim in claim order. Reopen time and a summary go to
@@ -36,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use taquba::{OpenOptions, Queue, QueueConfig};
 
-use common::{env_var, init_tracing, pct, store_with_latency};
+use common::{env_var, init_tracing, pct, store_from_env};
 
 const QUEUE_NAME: &str = "bench";
 
@@ -81,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
          store_latency={store_latency_ms}ms",
     );
 
-    let store = store_with_latency(store_latency_ms);
+    let store = store_from_env(store_latency_ms)?;
     let payload = vec![0u8; payload_bytes];
 
     // Phase one: build the on-disk history the restart will see.

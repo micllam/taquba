@@ -27,6 +27,11 @@
 //                       list, and delete sleeps this long before running,
 //                       approximating an S3-class backend. Applies to
 //                       memo reads and writes as well as the queue.
+//   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
+//                       az://..., file:///abs/path) to run against
+//                       instead of the in-memory store; see
+//                       benches/README.md. Incompatible with
+//                       STORE_LATENCY_MS.
 //
 // Output (stdout): CSV with header `window_sec,completed`, one row per
 // second with the cumulative number of terminal items. A summary
@@ -38,9 +43,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use taquba::object_store::ObjectStore;
 use taquba::object_store::memory::InMemory;
+use taquba::object_store::prefix::PrefixStore;
 use taquba::object_store::throttle::{ThrottleConfig, ThrottledStore};
+use taquba::object_store::{ObjectStore, parse_url_opts};
 use taquba::{OpenOptions, Queue, QueueConfig};
 use taquba_bulk::{Bulk, BulkCtx, Pipeline};
 use taquba_workflow::StepError;
@@ -50,6 +56,47 @@ fn env_var<T: std::str::FromStr>(key: &str, default: T) -> T {
         .ok()
         .and_then(|v| v.parse::<T>().ok())
         .unwrap_or(default)
+}
+
+/// Object store for a bench run, selected by env vars.
+///
+/// With `STORE_URL` set (`s3://bucket/prefix`, `gs://...`, `az://...`,
+/// `file:///abs/path`), opens that store and roots the run under a
+/// fresh `bench-<unix-millis>` prefix so a rerun never observes a
+/// previous run's state; the prefix is printed to stderr. Cloud
+/// schemes require the matching cargo feature on `taquba` and read
+/// provider configuration from the `AWS_*` / `GOOGLE_*` / `AZURE_*`
+/// env vars. `STORE_LATENCY_MS` throttles the in-memory store only,
+/// so combining it with `STORE_URL` is an error.
+///
+/// Without `STORE_URL`, the in-memory store from `store_with_latency`.
+fn store_from_env(latency_ms: u64) -> Result<Arc<dyn ObjectStore>, Box<dyn std::error::Error>> {
+    let Ok(raw) = std::env::var("STORE_URL") else {
+        return Ok(store_with_latency(latency_ms));
+    };
+    if latency_ms > 0 {
+        return Err(
+            "STORE_LATENCY_MS throttles the in-memory store only; unset it when STORE_URL is set"
+                .into(),
+        );
+    }
+    let url = url::Url::parse(&raw)?;
+    // object_store's config keys are lowercase versions of the provider
+    // env var names; the prefix filter keeps unrelated env vars whose
+    // lowercase form is also a valid config key (TOKEN, ENDPOINT) out
+    // of the store configuration.
+    let options = std::env::vars().filter_map(|(key, value)| {
+        let key = key.to_ascii_lowercase();
+        (key.starts_with("aws_") || key.starts_with("google_") || key.starts_with("azure_"))
+            .then_some((key, value))
+    });
+    let (store, path) = parse_url_opts(&url, options)?;
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    let run_prefix = path.child(format!("bench-{millis}"));
+    eprintln!("store: {raw}, run prefix: {run_prefix}");
+    Ok(Arc::new(PrefixStore::new(store, run_prefix)))
 }
 
 fn store_with_latency(latency_ms: u64) -> Arc<dyn ObjectStore> {
@@ -147,7 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
          store_latency={store_latency_ms}ms",
     );
 
-    let store = store_with_latency(store_latency_ms);
+    let store = store_from_env(store_latency_ms)?;
     let queue = Arc::new(
         Queue::open_with_options(
             store.clone(),

@@ -39,6 +39,8 @@ thiserror = { workspace = true }
 [dev-dependencies]
 # Benches install a stderr subscriber (RUST_LOG-driven).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Benches parse STORE_URL into an object store.
+url = { workspace = true }
 
 [[bench]]
 name = "claim_drain"

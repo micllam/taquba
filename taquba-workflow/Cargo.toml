@@ -47,6 +47,9 @@ rig-core = "0.37"
 anyhow = "1"
 serde_json = "1"
 
+# Used only by the benches' STORE_URL parsing.
+url = { workspace = true }
+
 [[bench]]
 name = "step_transitions"
 # Disable libtest's bench harness so the file runs as a plain

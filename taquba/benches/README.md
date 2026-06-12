@@ -59,6 +59,38 @@ N_QUEUES=100 N_WORKERS=100 RATE=1000 \
 `ThrottledStore`, so every get, put, list, and delete sleeps that long
 before running. It is available on every benchmark.
 
+## Running against real object storage
+
+By default every benchmark runs on an in-memory store. Set `STORE_URL`
+to run against a real backend instead:
+
+```bash
+# Local filesystem (no cargo feature needed).
+STORE_URL=file:///tmp/taquba-bench \
+    cargo bench -p taquba --bench steady_state > steady.csv
+
+# S3: requires the `aws` feature. Credentials, region, and endpoint
+# are read from the standard env vars (AWS_ACCESS_KEY_ID,
+# AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_ENDPOINT for S3-compatible
+# stores).
+STORE_URL=s3://my-bench-bucket/taquba \
+    cargo bench -p taquba --features aws --bench steady_state > steady.csv
+```
+
+`gs://` URLs (feature `gcp`, `GOOGLE_*` env vars) and `az://` URLs
+(feature `azure`, `AZURE_*` env vars) work the same way. For the
+satellite crates' benches, enable the feature on the dependency
+instead: `--features taquba/aws`.
+
+Each run is rooted under a fresh `bench-<unix-millis>` prefix inside
+the URL's path, printed to stderr at startup, so a rerun never
+observes a previous run's state. Bench data is left in place on exit;
+delete the run prefixes afterwards or configure an object-lifecycle
+rule on the parent prefix. `STORE_LATENCY_MS` applies only to the
+in-memory store and is rejected when `STORE_URL` is set. Run from
+compute in the bucket's region; over a longer network path the round
+trip to the store dominates every number.
+
 ## Output format
 
 Each benchmark prints CSV to `stdout`. The header tells you the
