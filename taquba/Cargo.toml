@@ -36,8 +36,24 @@ serde = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+# Benches install a stderr subscriber (RUST_LOG-driven).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 [[bench]]
 name = "claim_drain"
 # Disable libtest's bench harness so the file runs as a plain `#[tokio::main]`
 # binary. We use `cargo bench` for discovery only, not for the harness.
+harness = false
+
+[[bench]]
+name = "steady_state"
+harness = false
+
+[[bench]]
+name = "cold_start"
+harness = false
+
+[[bench]]
+name = "reaper_storm"
 harness = false

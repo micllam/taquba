@@ -12,14 +12,23 @@
 //   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1)
 //                       Lower than slatedb's 100ms default so the per-
 //                       commit floor doesn't mask tombstone-scan time.
+//   STORE_LATENCY_MS    injected object-store latency per call (default 0).
+//                       When set, the in-memory store is wrapped in
+//                       object_store's ThrottledStore so every get, put,
+//                       list, and delete sleeps this long before running,
+//                       approximating an S3-class backend.
 //
 // Output (stdout): CSV with header `window_sec,n_claims,p50_us,p95_us,p99_us`.
 // Status / progress prints go to stderr so stdout stays a clean data stream.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use taquba::{OpenOptions, Queue, QueueConfig, object_store::memory::InMemory};
+use taquba::{OpenOptions, Queue, QueueConfig};
+
+use common::{env_var, init_tracing, pct, store_with_latency};
 
 const QUEUE_NAME: &str = "bench";
 
@@ -30,26 +39,23 @@ const LEASE: Duration = Duration::from_secs(5);
 /// whether the drain has finished.
 const WATCHER_TICK: Duration = Duration::from_secs(1);
 
-fn env_var<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse::<T>().ok())
-        .unwrap_or(default)
-}
-
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
+
     let n_jobs: usize = env_var("N_JOBS", 5_000);
     let n_workers: usize = env_var("N_WORKERS", 50);
     let payload_bytes: usize = env_var("PAYLOAD_BYTES", 64);
     let flush_interval_ms: u64 = env_var("FLUSH_INTERVAL_MS", 1);
+    let store_latency_ms: u64 = env_var("STORE_LATENCY_MS", 0);
 
     eprintln!(
         "claim_drain: n_jobs={n_jobs}, workers={n_workers}, \
-         payload={payload_bytes}B, flush_interval={flush_interval_ms}ms",
+         payload={payload_bytes}B, flush_interval={flush_interval_ms}ms, \
+         store_latency={store_latency_ms}ms",
     );
 
-    let store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
+    let store = store_with_latency(store_latency_ms);
     let queue = Arc::new(
         Queue::open_with_options(
             store,
@@ -172,10 +178,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         window_samples.sort_unstable();
         let n = window_samples.len();
-        let last = n - 1;
-        let p50 = window_samples[(n * 50 / 100).min(last)];
-        let p95 = window_samples[(n * 95 / 100).min(last)];
-        let p99 = window_samples[(n * 99 / 100).min(last)];
+        let p50 = pct(&window_samples, 50);
+        let p95 = pct(&window_samples, 95);
+        let p99 = pct(&window_samples, 99);
         println!("{i},{n},{p50},{p95},{p99}");
     }
 
