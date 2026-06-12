@@ -43,6 +43,6 @@ ulid = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 # Used only by the `rig_agent` example.
-rig-core = "0.37"
+rig-core = "0.38"
 anyhow = "1"
 serde_json = "1"
