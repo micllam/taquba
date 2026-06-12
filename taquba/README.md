@@ -184,6 +184,9 @@ caller KV writes and deletes. If the job's lease expired and the claim is
 gone, the call fails and nothing is applied, so a chained job exists only if
 the settlement that created it won.
 
+See [`examples/atomic_settlement.rs`](examples/atomic_settlement.rs) for a
+runnable order pipeline built on these primitives.
+
 ## License
 
 Licensed under either of

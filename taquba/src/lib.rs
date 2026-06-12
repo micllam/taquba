@@ -131,6 +131,9 @@
 //! nothing is applied, so a chained job exists only if the settlement
 //! that created it won.
 //!
+//! See `examples/atomic_settlement.rs` for a runnable order pipeline
+//! built on these primitives.
+//!
 //! # Background tasks
 //!
 //! [`Queue::open`] spawns two background tokio tasks for the lifetime of the
