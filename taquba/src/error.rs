@@ -30,6 +30,14 @@ pub enum Error {
     #[error("job is not in the expected state")]
     InvalidState,
 
+    /// A settlement or lease operation found no claim under the record it
+    /// was given: the lease expired and the reaper requeued the job, or
+    /// the record is a stale copy from before a lease renewal rotated the
+    /// claimed key. Retrying with the same record cannot succeed; a
+    /// redelivered attempt settles the job instead.
+    #[error("job claim is no longer held")]
+    ClaimLost,
+
     /// A value passed to [`crate::Queue::enqueue_with_kv`] exceeded the
     /// configured maximum size for the user KV namespace. The cap is
     /// enforced at the API boundary to keep bulk payload out of the LSM
@@ -78,6 +86,7 @@ impl Error {
             | Self::Deserialization(_)
             | Self::JobNotFound(_)
             | Self::InvalidState
+            | Self::ClaimLost
             | Self::KvValueTooLarge { .. }
             | Self::InvalidId { .. }
             | Self::DuplicateJobId { .. } => true,
@@ -97,6 +106,7 @@ mod tests {
     fn data_shape_and_state_variants_are_permanent() {
         assert!(Error::JobNotFound("job-1".into()).is_permanent());
         assert!(Error::InvalidState.is_permanent());
+        assert!(Error::ClaimLost.is_permanent());
         assert!(Error::KvValueTooLarge { size: 10, max: 5 }.is_permanent());
         assert!(
             Error::InvalidId {

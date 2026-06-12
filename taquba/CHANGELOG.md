@@ -21,9 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   honouring `run_at`, `dedup_key`, `priority`, and `id_override` per
   request) and caller KV writes and deletes. Either the ack and every
   effect land together or nothing does; when the claim is gone the
-  call fails with `InvalidState` and applies nothing, so a chained job
+  call fails with `ClaimLost` and applies nothing, so a chained job
   exists only if the settlement that created it won. `Queue::ack` is
   now `ack_with` with empty effects.
+- `Error::ClaimLost`: returned by `ack`, `ack_with`, `nack`,
+  `dead_letter`, and `renew_lease` when the record's claim is no
+  longer present (the lease expired and the reaper requeued the job,
+  or the record is a stale copy from before a lease renewal rotated
+  the claimed key). These cases previously returned the catch-all
+  `Error::InvalidState`, which remains for genuine misuse (a record
+  missing `lease_expires_at`, `requeue_dead_job` on a non-dead
+  record).
 - `Worker::process_with_effects`: workers can return `AckEffects`
   from processing, which `run_worker` and `run_worker_concurrent`
   apply atomically with the job's acknowledgement via
@@ -122,13 +130,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Queue::ack`, `Queue::nack`, `Queue::dead_letter`, and
   `Queue::renew_lease` now check that the expected `claimed:` record
   still exists before settling a job. A worker finishing after its
-  lease was reaped now gets `Error::InvalidState` instead of being
+  lease was reaped now gets `Error::ClaimLost` instead of being
   able to ack, retry, dead-letter, renew, or corrupt stats from a
   stale `JobRecord`.
 - `Queue::nack` and `Queue::renew_lease` now retry on transaction
   conflict like `Queue::ack` and `Queue::dead_letter` already did.
   A reaper committing the expired-lease delete concurrently with a
-  late settlement is now retried (and resolves to `Error::InvalidState`
+  late settlement is now retried (and resolves to `Error::ClaimLost`
   on the next attempt) instead of surfacing a raw SlateDB transaction
   error to the caller.
 - `Queue::requeue_dead_job` now checks that the dead-letter record

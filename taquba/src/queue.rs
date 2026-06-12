@@ -1313,7 +1313,7 @@ impl Queue {
     /// Either the acknowledgement and every effect land together or
     /// nothing does. In particular, if the job's claim is no longer
     /// present (its lease expired and the reaper requeued it), the call
-    /// fails with [`Error::InvalidState`] and no effect is applied, so
+    /// fails with [`Error::ClaimLost`] and no effect is applied, so
     /// a follow-up job exists only if this settlement won.
     ///
     /// Each enqueue in [`AckEffects::enqueues`] behaves exactly like
@@ -1369,9 +1369,7 @@ impl Queue {
 
         let results = loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            txn.get(claimed.as_bytes())
-                .await?
-                .ok_or(Error::InvalidState)?;
+            txn.get(claimed.as_bytes()).await?.ok_or(Error::ClaimLost)?;
             txn.delete(claimed.as_bytes())?;
             if let Some((ref done_k, ref done_v)) = done_record {
                 txn.put(done_k.as_bytes(), done_v)?;
@@ -1437,9 +1435,7 @@ impl Queue {
 
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            txn.get(claimed.as_bytes())
-                .await?
-                .ok_or(Error::InvalidState)?;
+            txn.get(claimed.as_bytes()).await?.ok_or(Error::ClaimLost)?;
             txn.delete(claimed.as_bytes())?;
 
             if job.attempts >= job.max_attempts {
@@ -1556,9 +1552,7 @@ impl Queue {
 
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            txn.get(claimed.as_bytes())
-                .await?
-                .ok_or(Error::InvalidState)?;
+            txn.get(claimed.as_bytes()).await?.ok_or(Error::ClaimLost)?;
             txn.delete(claimed.as_bytes())?;
             txn.put(dead.as_bytes(), &value)?;
             txn.put(job_index_key(&job.id).as_bytes(), dead.as_bytes())?;
@@ -1701,7 +1695,7 @@ impl Queue {
     /// Renewal rotates the job's claimed key, which embeds the lease expiry.
     /// A copy of the record taken before a renewal therefore no longer
     /// identifies the claim: [`Self::ack`], [`Self::nack`], and further
-    /// renewals fail with [`Error::InvalidState`] unless they receive the
+    /// renewals fail with [`Error::ClaimLost`] unless they receive the
     /// record updated by the most recent renewal.
     #[instrument(skip(self, job), fields(queue = %job.queue, job_id = %job.id))]
     pub async fn renew_lease(&self, job: &mut JobRecord, extension: Duration) -> Result<()> {
@@ -1717,7 +1711,7 @@ impl Queue {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
             txn.get(old_claimed.as_bytes())
                 .await?
-                .ok_or(Error::InvalidState)?;
+                .ok_or(Error::ClaimLost)?;
             txn.delete(old_claimed.as_bytes())?;
             txn.put(new_claimed.as_bytes(), &value)?;
             txn.put(job_index_key(&job.id).as_bytes(), new_claimed.as_bytes())?;
@@ -4204,21 +4198,21 @@ mod tests {
         assert_eq!(stats.pending, 1);
         assert_eq!(stats.claimed, 0);
 
-        assert!(matches!(q.ack(&stale).await, Err(Error::InvalidState)));
+        assert!(matches!(q.ack(&stale).await, Err(Error::ClaimLost)));
         assert!(matches!(
             q.nack(stale.clone(), "late failure").await,
-            Err(Error::InvalidState)
+            Err(Error::ClaimLost)
         ));
         assert!(matches!(
             q.dead_letter(stale.clone(), "late permanent failure").await,
-            Err(Error::InvalidState)
+            Err(Error::ClaimLost)
         ));
 
         let mut stale_for_renew = stale.clone();
         assert!(matches!(
             q.renew_lease(&mut stale_for_renew, Duration::from_secs(30))
                 .await,
-            Err(Error::InvalidState)
+            Err(Error::ClaimLost)
         ));
 
         let stats = q.stats("work").await.unwrap();
@@ -4283,21 +4277,21 @@ mod tests {
         assert_eq!(stats.claimed, 0);
         assert_eq!(stats.dead, 1);
 
-        assert!(matches!(q.ack(&stale).await, Err(Error::InvalidState)));
+        assert!(matches!(q.ack(&stale).await, Err(Error::ClaimLost)));
         assert!(matches!(
             q.nack(stale.clone(), "late failure").await,
-            Err(Error::InvalidState)
+            Err(Error::ClaimLost)
         ));
         assert!(matches!(
             q.dead_letter(stale.clone(), "late permanent failure").await,
-            Err(Error::InvalidState)
+            Err(Error::ClaimLost)
         ));
 
         let mut stale_for_renew = stale.clone();
         assert!(matches!(
             q.renew_lease(&mut stale_for_renew, Duration::from_secs(30))
                 .await,
-            Err(Error::InvalidState)
+            Err(Error::ClaimLost)
         ));
 
         let stats = q.stats("work").await.unwrap();
@@ -5591,7 +5585,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::InvalidState));
+        assert!(matches!(err, Error::ClaimLost));
         assert!(q.claim("next", lease).await.unwrap().is_none());
         assert!(q.kv_get(b"k").await.unwrap().is_none());
         q.close().await.unwrap();
