@@ -2,7 +2,9 @@
 
 A durable, single-process task queue for Rust with **no stateful service to
 operate**. Queue state lives directly in your object storage; compute is
-stateless and replaceable.
+stateless and replaceable. Because all state shares one transactional store,
+queue operations compose atomically: a single transaction can acknowledge a
+job, enqueue its follow-ups, and update caller-owned KV state.
 
 > The foundation of the [Taquba ecosystem](https://github.com/micllam/taquba);
 > see the workspace README for the workflow runtime, cron, jobs, and webhooks

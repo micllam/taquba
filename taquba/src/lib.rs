@@ -1,6 +1,9 @@
 //! A durable, single-process task queue for Rust with **no stateful service
 //! to operate**. Queue state lives directly in your object storage; compute
-//! is stateless and replaceable.
+//! is stateless and replaceable. Because all state shares one transactional
+//! store, queue operations compose atomically: a single transaction can
+//! acknowledge a job, enqueue its follow-ups, and update caller-owned KV
+//! state.
 //!
 //! Built on [SlateDB] and the [`object_store`] crate (local disk, S3, GCS,
 //! Azure Blob, MinIO, etc.). All producers and workers for a given store run
