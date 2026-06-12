@@ -1,8 +1,9 @@
 # Taquba
 
-A durable task queue and workflow runtime for Rust, with **no stateful service
-to operate**. Workflow state lives directly in your object storage; every
-compute node is replaceable.
+A durable task queue and workflow runtime for Rust with **built-in
+transactional coordination on object storage**, and no stateful service to
+operate. Workflow state lives directly in your object storage; every compute
+node is replaceable.
 
 Taquba is a workspace of Rust crates that compose into a durable execution
 stack. There is no Postgres, Redis, or broker daemon to run alongside your
@@ -14,6 +15,11 @@ rather than an optimisation.
 
 ## Why this is different
 
+- **Transactional coordination, not just delivery.** A single atomic
+  transaction can acknowledge a job, enqueue its follow-up jobs, and update
+  caller-owned durable KV state (`ack_with`, `enqueue_with_kv`). State
+  machines built on the queue stay consistent across crashes without an
+  outbox pattern or a second datastore.
 - **No stateful service.** Most single-process durable queue libraries
   require a database (typically Postgres) to hold their state. Taquba uses
   the object storage you already have.
@@ -23,6 +29,39 @@ rather than an optimisation.
   crate. No control plane to deploy, scale, or upgrade.
 - **Spot-native by design.** Stateless compute plus durable state make
   preemption a recoverable event, not a disaster.
+
+## How it compares
+
+Durable execution today usually comes in one of three shapes:
+
+- **A workflow engine you operate.** A server cluster with its own database
+  that your workers connect to. Powerful, but you run a distributed system
+  to get durability.
+- **A hosted durable-execution service.** Durability as a managed service;
+  your run state lives in the vendor's control plane.
+- **A job queue over Redis or Postgres.** Embedded in your binary like
+  Taquba, but the durable state lives in a database or Redis server you
+  deploy alongside it.
+
+The most common alternative in practice is none of these: an in-house
+combination of tokio tasks, Redis, and custom retry loops. Taquba provides
+what that stack ends up rebuilding (leases, retries, exponential backoff, dead-letter
+retention, scheduling, fan-out) as one library, with the state on object
+storage instead of on a server you operate.
+
+Taquba is deliberately **embedded, not operated**. It advances within the
+single-process, single-writer envelope (transactional settlement, per-step
+memoization, correctness guarantees that are auditable end to end) rather
+than growing into a brokered multi-tenant service. If you need a worker
+fleet across machines or routing between services, you want an operated
+queue, not this workspace.
+
+For LLM agent stacks: composition libraries such as
+[Rig](https://github.com/0xPlaygrounds/rig) cover providers, tools, and
+prompts in process, and Taquba supplies the durable execution layer
+underneath. The reference agent
+[`taquba-research`](https://github.com/micllam/taquba-research) is built
+this way.
 
 ## Crates
 
