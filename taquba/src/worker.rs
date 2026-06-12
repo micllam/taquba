@@ -129,8 +129,12 @@ pub trait Worker: Send + Sync {
 /// particular, when a job outlives its lease and the reaper requeues it,
 /// the late settlement fails with [`Error::ClaimLost`]; the loop logs it
 /// and continues, and the redelivered attempt settles the job instead.
-/// Size leases to cover processing time, or extend them from within
-/// `process` via [`Queue::renew_lease`], so this stays rare.
+/// Size the queue's lease to cover processing time so this stays rare.
+/// [`Queue::renew_lease`] cannot be used from within [`Worker::process`]:
+/// renewal rotates the claimed key and updates the renewing record in
+/// place, but `process` receives a shared reference and the loop settles
+/// with its own copy, which would no longer identify the claim. Renewal
+/// is for callers that run their own claim / settle loop.
 pub async fn run_worker<W, F>(
     queue_handle: &Queue,
     queue: &str,

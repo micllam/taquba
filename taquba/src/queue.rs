@@ -1697,6 +1697,13 @@ impl Queue {
     /// identifies the claim: [`Self::ack`], [`Self::nack`], and further
     /// renewals fail with [`Error::ClaimLost`] unless they receive the
     /// record updated by the most recent renewal.
+    ///
+    /// For the same reason, renewal is for callers that run their own
+    /// claim / settle loop. It cannot be used from within the
+    /// [`run_worker`](crate::worker::run_worker) loops: their `process`
+    /// hook receives a shared reference, and the loop settles with its
+    /// own copy of the record, which no longer identifies the claim
+    /// once a renewal rotates the key.
     #[instrument(skip(self, job), fields(queue = %job.queue, job_id = %job.id))]
     pub async fn renew_lease(&self, job: &mut JobRecord, extension: Duration) -> Result<()> {
         let old_expiry = job.lease_expires_at.ok_or(Error::InvalidState)?;
