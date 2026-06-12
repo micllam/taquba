@@ -121,7 +121,8 @@ its parallel page-fetch phase, cancelling
 in-flight jobs when the surrounding run is cancelled. This is the inner
 counterpart to bulk's outer fan-out: `bulk` parallelizes whole runs, while the
 composition parallelizes sub-tasks within one run. Today it is a manual
-composition pattern, not a separate crate.
+composition pattern, not a separate crate; a runnable demonstration lives at
+[`taquba-workflow/examples/fanout_jobs.rs`](./taquba-workflow/examples/fanout_jobs.rs).
 
 ## Quick taste
 

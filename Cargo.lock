@@ -2994,6 +2994,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "taquba",
+ "taquba-jobs",
  "taquba-webhooks",
  "thiserror 1.0.69",
  "tokio",

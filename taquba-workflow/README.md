@@ -132,6 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```bash
 cargo run -p taquba-workflow --example single_step
 cargo run -p taquba-workflow --example multi_step
+cargo run -p taquba-workflow --example fanout_jobs
 ANTHROPIC_API_KEY=... cargo run -p taquba-workflow --example rig_agent
 OPENAI_API_KEY=...    cargo run -p taquba-workflow --example rig_agent
 ```
@@ -139,6 +140,11 @@ OPENAI_API_KEY=...    cargo run -p taquba-workflow --example rig_agent
 `rig_agent` is a two-stage AI agent (research, then write) that
 demonstrates between-step durability: kill the process after step 0 and
 a fresh process resumes at step 1.
+
+`fanout_jobs` composes the runtime with `taquba-jobs` for fan-out
+inside one run: a step submits one typed job per URL to a shared
+`JobRunner`, joins the typed results, and memoizes the aggregate so a
+step retry does not re-submit the fan-out.
 
 ## Step outcomes
 

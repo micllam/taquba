@@ -42,6 +42,9 @@ ulid = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
+# Used only by the `fanout_jobs` example.
+taquba-jobs = { workspace = true }
+
 # Used only by the `rig_agent` example.
 rig-core = "0.38"
 anyhow = "1"
