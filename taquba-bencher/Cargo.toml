@@ -1,0 +1,78 @@
+[package]
+name = "taquba-bencher"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Benchmark binaries for the taquba workspace."
+readme = "README.md"
+# Internal benchmarking crate; never published.
+publish = false
+
+[features]
+# Forward the cloud backends so STORE_URL can address them, e.g.
+# `STORE_URL=s3://... cargo bench -p taquba-bencher --features aws ...`.
+aws = ["taquba/aws"]
+gcp = ["taquba/gcp"]
+azure = ["taquba/azure"]
+
+[dependencies]
+taquba = { workspace = true }
+taquba-bulk = { workspace = true }
+taquba-jobs = { workspace = true }
+taquba-workflow = { workspace = true }
+
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+serde = { workspace = true }
+thiserror = { workspace = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Benches install a stderr subscriber (RUST_LOG-driven).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# STORE_URL parsing.
+url = { workspace = true }
+
+# Bench files are grouped under benches/<crate> by the crate they
+# exercise; `harness = false` disables libtest's bench harness so each
+# file runs as a plain `#[tokio::main]` binary. `cargo bench` is used
+# for discovery only, not for the harness.
+
+[[bench]]
+name = "claim_drain"
+path = "benches/taquba/claim_drain.rs"
+harness = false
+
+[[bench]]
+name = "steady_state"
+path = "benches/taquba/steady_state.rs"
+harness = false
+
+[[bench]]
+name = "cold_start"
+path = "benches/taquba/cold_start.rs"
+harness = false
+
+[[bench]]
+name = "reaper_storm"
+path = "benches/taquba/reaper_storm.rs"
+harness = false
+
+[[bench]]
+name = "step_transitions"
+path = "benches/taquba-workflow/step_transitions.rs"
+harness = false
+
+[[bench]]
+name = "bulk_throughput"
+path = "benches/taquba-bulk/bulk_throughput.rs"
+harness = false
+
+[[bench]]
+name = "resume_replay"
+path = "benches/taquba-bulk/resume_replay.rs"
+harness = false
+
+[[bench]]
+name = "fanout"
+path = "benches/taquba-jobs/fanout.rs"
+harness = false

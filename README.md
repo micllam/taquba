@@ -177,9 +177,10 @@ preserve both.
 
 ## Performance
 
-Reproducible benchmarks live under [`taquba/benches/`](./taquba/benches);
-see [`taquba/benches/README.md`](./taquba/benches/README.md) for what's
-there and how to run them.
+Reproducible benchmarks for every crate live in the internal
+[`taquba-bencher`](./taquba-bencher) crate; see its
+[README](./taquba-bencher/README.md) for what's there and how to run
+them.
 
 ## Links
 

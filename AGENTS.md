@@ -2,11 +2,11 @@
 
 This file provides guidance to agents when working with code in this repository.
 
-Workspace: `taquba` core, plus `taquba-jobs`, `taquba-cron`, `taquba-webhooks`, and `taquba-workflow` built on it, and `taquba-bulk` built on `taquba-workflow`. See each crate's README for surface-level usage.
+Workspace: `taquba` core, plus `taquba-jobs`, `taquba-cron`, `taquba-webhooks`, and `taquba-workflow` built on it, and `taquba-bulk` built on `taquba-workflow`. `taquba-bencher` is an internal, unpublished member holding every crate's benchmarks (the published crates carry no bench targets). See each crate's README for surface-level usage.
 
 ## Build / test
 
-Tests live inline in `mod tests`; there is no `tests/` directory.
+Tests live inline in `mod tests`; there is no `tests/` directory. Benchmarks live in `taquba-bencher/benches/` as `harness = false` binaries; shared bench setup is `taquba-bencher`'s lib.
 
 The `taquba` crate's `aws` / `gcp` / `azure` features are mutually exclusive; pick one for cloud builds.
 

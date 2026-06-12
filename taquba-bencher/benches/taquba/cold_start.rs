@@ -1,4 +1,4 @@
-// cargo bench -p taquba --bench cold_start > cold.csv
+// cargo bench -p taquba-bencher --bench cold_start > cold.csv
 //
 // Cold-start benchmark for the claim path after a process restart.
 // Phase one builds history: N_HISTORY jobs are enqueued, claimed, and
@@ -27,21 +27,18 @@
 //   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
 //                       az://..., file:///abs/path) to run against
 //                       instead of the in-memory store; see
-//                       benches/README.md. Incompatible with
+//                       the crate README. Incompatible with
 //                       STORE_LATENCY_MS.
 //
 // Output (stdout): CSV with header `claim_idx,claim_us`, one row per
 // post-restart claim in claim order. Reopen time and a summary go to
 // stderr so stdout stays a clean data stream.
 
-mod common;
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use taquba::{OpenOptions, Queue, QueueConfig};
-
-use common::{env_var, init_tracing, pct, store_from_env};
+use taquba_bencher::{env_var, init_tracing, pct, store_from_env};
 
 const QUEUE_NAME: &str = "bench";
 

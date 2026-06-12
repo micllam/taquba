@@ -2913,8 +2913,22 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
  "ulid",
+]
+
+[[package]]
+name = "taquba-bencher"
+version = "0.0.0"
+dependencies = [
+ "futures-util",
+ "serde",
+ "taquba",
+ "taquba-bulk",
+ "taquba-jobs",
+ "taquba-workflow",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing-subscriber",
  "url",
 ]
 
@@ -2932,7 +2946,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "ulid",
- "url",
 ]
 
 [[package]]
@@ -2961,7 +2974,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "ulid",
- "url",
 ]
 
 [[package]]
@@ -2994,7 +3006,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "ulid",
- "url",
 ]
 
 [[package]]

@@ -27,16 +27,3 @@ ulid = { workspace = true }
 # Examples and end-to-end tests need a multi-thread runtime on top of the
 # workspace tokio defaults.
 tokio = { workspace = true, features = ["rt-multi-thread"] }
-
-# Used only by the benches' STORE_URL parsing.
-url = { workspace = true }
-
-[[bench]]
-name = "bulk_throughput"
-# Disable libtest's bench harness so the file runs as a plain
-# `#[tokio::main]` binary, matching the taquba crate's benches.
-harness = false
-
-[[bench]]
-name = "resume_replay"
-harness = false

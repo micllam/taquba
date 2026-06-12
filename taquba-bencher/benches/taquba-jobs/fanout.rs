@@ -1,4 +1,4 @@
-// cargo bench -p taquba-jobs --bench fanout > fanout.csv
+// cargo bench -p taquba-bencher --bench fanout > fanout.csv
 //
 // Fan-out benchmark for typed jobs: submit N_JOBS concurrently with
 // idempotency keys, await every handle, then submit the identical
@@ -22,7 +22,7 @@
 //   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
 //                       az://..., file:///abs/path) to run against
 //                       instead of the in-memory store; see
-//                       benches/README.md. Incompatible with
+//                       the crate README. Incompatible with
 //                       STORE_LATENCY_MS.
 //
 // Output (stdout): CSV with header `phase,jobs,secs,jobs_per_sec`,
@@ -33,76 +33,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use taquba::object_store::memory::InMemory;
-use taquba::object_store::prefix::PrefixStore;
-use taquba::object_store::throttle::{ThrottleConfig, ThrottledStore};
-use taquba::object_store::{ObjectStore, parse_url_opts};
 use taquba::{OpenOptions, Queue, QueueConfig};
+use taquba_bencher::{env_var, init_tracing, store_from_env};
 use taquba_jobs::{Job, JobContext, JobRunner};
-
-fn env_var<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse::<T>().ok())
-        .unwrap_or(default)
-}
-
-/// Object store for a bench run, selected by env vars.
-///
-/// With `STORE_URL` set (`s3://bucket/prefix`, `gs://...`, `az://...`,
-/// `file:///abs/path`), opens that store and roots the run under a
-/// fresh `bench-<unix-millis>` prefix so a rerun never observes a
-/// previous run's state; the prefix is printed to stderr. Cloud
-/// schemes require the matching cargo feature on `taquba` and read
-/// provider configuration from the `AWS_*` / `GOOGLE_*` / `AZURE_*`
-/// env vars. `STORE_LATENCY_MS` throttles the in-memory store only,
-/// so combining it with `STORE_URL` is an error.
-///
-/// Without `STORE_URL`, the in-memory store from `store_with_latency`.
-fn store_from_env(latency_ms: u64) -> Result<Arc<dyn ObjectStore>, Box<dyn std::error::Error>> {
-    let Ok(raw) = std::env::var("STORE_URL") else {
-        return Ok(store_with_latency(latency_ms));
-    };
-    if latency_ms > 0 {
-        return Err(
-            "STORE_LATENCY_MS throttles the in-memory store only; unset it when STORE_URL is set"
-                .into(),
-        );
-    }
-    let url = url::Url::parse(&raw)?;
-    // object_store's config keys are lowercase versions of the provider
-    // env var names; the prefix filter keeps unrelated env vars whose
-    // lowercase form is also a valid config key (TOKEN, ENDPOINT) out
-    // of the store configuration.
-    let options = std::env::vars().filter_map(|(key, value)| {
-        let key = key.to_ascii_lowercase();
-        (key.starts_with("aws_") || key.starts_with("google_") || key.starts_with("azure_"))
-            .then_some((key, value))
-    });
-    let (store, path) = parse_url_opts(&url, options)?;
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis();
-    let run_prefix = path.child(format!("bench-{millis}"));
-    eprintln!("store: {raw}, run prefix: {run_prefix}");
-    Ok(Arc::new(PrefixStore::new(store, run_prefix)))
-}
-
-fn store_with_latency(latency_ms: u64) -> Arc<dyn ObjectStore> {
-    if latency_ms > 0 {
-        let wait = Duration::from_millis(latency_ms);
-        let config = ThrottleConfig {
-            wait_delete_per_call: wait,
-            wait_get_per_call: wait,
-            wait_list_per_call: wait,
-            wait_put_per_call: wait,
-            ..ThrottleConfig::default()
-        };
-        Arc::new(ThrottledStore::new(InMemory::new(), config))
-    } else {
-        Arc::new(InMemory::new())
-    }
-}
 
 #[derive(Debug, thiserror::Error)]
 #[error("bench job error: {0}")]
@@ -158,6 +91,8 @@ async fn run_phase(
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
+
     let n_jobs: u32 = env_var("N_JOBS", 500);
     let job_work_ms: u64 = env_var("JOB_WORK_MS", 0);
     let max_concurrent: usize = env_var("MAX_CONCURRENT", 50).max(1);

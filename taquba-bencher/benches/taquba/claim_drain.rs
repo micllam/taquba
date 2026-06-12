@@ -1,4 +1,4 @@
-// cargo bench -p taquba --bench claim_drain > drain.csv
+// cargo bench -p taquba-bencher --bench claim_drain > drain.csv
 //
 // Drain-shape benchmark for the claim path. Pre-fills the queue with
 // N_JOBS jobs, then spawns N_WORKERS workers that drain it. Measures
@@ -20,20 +20,17 @@
 //   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
 //                       az://..., file:///abs/path) to run against
 //                       instead of the in-memory store; see
-//                       benches/README.md. Incompatible with
+//                       the crate README. Incompatible with
 //                       STORE_LATENCY_MS.
 //
 // Output (stdout): CSV with header `window_sec,n_claims,p50_us,p95_us,p99_us`.
 // Status / progress prints go to stderr so stdout stays a clean data stream.
 
-mod common;
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use taquba::{OpenOptions, Queue, QueueConfig};
-
-use common::{env_var, init_tracing, pct, store_from_env};
+use taquba_bencher::{env_var, init_tracing, pct, store_from_env};
 
 const QUEUE_NAME: &str = "bench";
 

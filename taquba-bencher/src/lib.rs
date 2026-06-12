@@ -1,6 +1,7 @@
-// Setup shared by the bench binaries. Stored in a subdirectory so cargo
-// does not discover it as a bench target; each bench declares
-// `mod common;`.
+//! Shared setup for the taquba workspace's benchmark binaries, which
+//! live under `benches/`. This crate is an internal workspace member
+//! and is never published; see `README.md` for the benchmark
+//! catalogue and conventions.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,7 +31,7 @@ pub fn pct(sorted: &[u64], p: usize) -> u64 {
 /// `file:///abs/path`), opens that store and roots the run under a
 /// fresh `bench-<unix-millis>` prefix so a rerun never observes a
 /// previous run's state; the prefix is printed to stderr. Cloud
-/// schemes require the matching cargo feature on `taquba` and read
+/// schemes require the matching cargo feature on this crate and read
 /// provider configuration from the `AWS_*` / `GOOGLE_*` / `AZURE_*`
 /// env vars. `STORE_LATENCY_MS` throttles the in-memory store only,
 /// so combining it with `STORE_URL` is an error.

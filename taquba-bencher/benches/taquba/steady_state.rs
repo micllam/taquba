@@ -1,4 +1,4 @@
-// cargo bench -p taquba --bench steady_state > steady.csv
+// cargo bench -p taquba-bencher --bench steady_state > steady.csv
 //
 // Steady-state benchmark for concurrent produce and consume. Producers
 // sustain a fixed offered enqueue rate for DURATION_SEC while workers
@@ -42,7 +42,7 @@
 //   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
 //                       az://..., file:///abs/path) to run against
 //                       instead of the in-memory store; see
-//                       benches/README.md. Incompatible with
+//                       the crate README. Incompatible with
 //                       STORE_LATENCY_MS.
 //
 // Output (stdout): CSV with header
@@ -53,15 +53,12 @@
 // offered rate exceeds what the queue sustains. Status and progress
 // prints go to stderr so stdout stays a clean data stream.
 
-mod common;
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use taquba::{OpenOptions, Queue, QueueConfig};
-
-use common::{env_var, init_tracing, pct, store_from_env};
+use taquba_bencher::{env_var, init_tracing, pct, store_from_env};
 
 /// Lease held while a worker has a job claimed. Long enough that an
 /// idle scheduler tick during the bench never lets a lease expire.

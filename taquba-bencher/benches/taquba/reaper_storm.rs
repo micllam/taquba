@@ -1,4 +1,4 @@
-// cargo bench -p taquba --bench reaper_storm > storm.csv
+// cargo bench -p taquba-bencher --bench reaper_storm > storm.csv
 //
 // Mass lease-expiry benchmark for the reaper. Phase one builds the
 // storm: N_EXPIRED jobs are enqueued on one queue and claimed with a
@@ -32,7 +32,7 @@
 //   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
 //                       az://..., file:///abs/path) to run against
 //                       instead of the in-memory store; see
-//                       benches/README.md. Incompatible with
+//                       the crate README. Incompatible with
 //                       STORE_LATENCY_MS.
 //   DURATION_CAP_SEC    abort threshold for the measured phase
 //                       (default 600)
@@ -45,15 +45,12 @@
 // enqueue-to-ack latency, and per-claim latency. Status and progress
 // prints go to stderr so stdout stays a clean data stream.
 
-mod common;
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use taquba::{OpenOptions, Queue, QueueConfig};
-
-use common::{env_var, init_tracing, pct, store_from_env};
+use taquba_bencher::{env_var, init_tracing, pct, store_from_env};
 
 const LIVE_QUEUE: &str = "live";
 const STORM_QUEUE: &str = "storm";
