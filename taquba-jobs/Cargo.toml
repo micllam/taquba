@@ -26,3 +26,12 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+# Used only by the fanout bench.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+[[bench]]
+name = "fanout"
+# Disable libtest's bench harness so the file runs as a plain
+# `#[tokio::main]` binary, matching the taquba crate's benches.
+harness = false
