@@ -17,6 +17,15 @@ durable queue (opaque byte payloads, lease-based claims, dead-letter queue)
 and `taquba-jobs` adds the function-shaped abstraction (typed inputs, typed
 outputs, a type registry, and durable result delivery).
 
+Within the ecosystem, [`taquba-workflow`](https://docs.rs/taquba-workflow)
+is the sibling crate for multi-step processes: use `taquba-jobs` when the
+caller awaits a typed return value, and `taquba-workflow` when one entity
+moves through durable steps with cancellation and a terminal hook. Chaining
+jobs through `JobContext::submit` to model a multi-step process is a sign
+the work belongs in a workflow. To run one pipeline over many inputs with
+batch progress and cost rollup, use
+[`taquba-bulk`](https://docs.rs/taquba-bulk).
+
 ## Architecture
 
 Like all of the Taquba ecosystem, `taquba-jobs` is **single-process**: one

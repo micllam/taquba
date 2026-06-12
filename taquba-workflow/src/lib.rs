@@ -25,6 +25,14 @@
 //! - **An event-sourced workflow engine.** There's no event-history
 //!   replay, no per-side-effect recording.
 //!
+//! Within the ecosystem, `taquba-jobs` is the sibling crate for
+//! single-shot typed tasks: use it when the caller awaits a typed return
+//! value and there are no intermediate steps to persist; use a workflow
+//! (even a single-step one) when the caller observes the run through
+//! cancellation and a terminal hook rather than awaiting a returned
+//! value. `taquba-bulk` builds on this crate to run one pipeline over
+//! many inputs with batch progress and cost rollup.
+//!
 //! # Single-process by design
 //!
 //! The submission API and worker pool live in the same binary and share one

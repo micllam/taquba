@@ -25,6 +25,11 @@ returns its cached result instead of repeating a paid call. A pipeline error
 retries with backoff and then dead-letters the item (terminating it failed);
 the rest of the batch is unaffected.
 
+`BulkCtx::memoized` is `taquba-workflow`'s per-step memo store applied at a
+finer granularity: the item's single step holds one memo entry per logical
+phase, so the phases of `Pipeline::run` resume individually even though the
+workflow sees one step.
+
 ## Content-addressed memoization
 
 Use `BulkCtx::memoized_by_content` when the natural memo key is a serialized

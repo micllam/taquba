@@ -94,6 +94,23 @@ Reach for `jobs` when you dispatch a typed task and await its return value;
 for `workflow` when you have one multi-step run; for `bulk` to run a
 multi-step pipeline across a whole dataset.
 
+### Boundary cases
+
+Three recurring choices, and how to decide:
+
+- **A single-step workflow or a job?** Both run one task durably. Use
+  `jobs` when the caller awaits a typed return value in process; use
+  `workflow` when the caller observes the run instead, through
+  cancellation, headers, and a terminal hook.
+- **Chained jobs or a workflow?** `JobContext::submit` lets job A submit
+  job B, so a pipeline can be approximated by chaining. If you are
+  chaining jobs to model one process, use `workflow`: chained jobs share
+  no run identity, no end-to-end terminal status, and no resume point.
+- **Job fan-out or bulk?** Submitting N jobs and awaiting their handles
+  yields N independent typed results. Use `bulk` when each item is itself
+  a multi-phase pipeline whose completed phases should survive a retry,
+  and the batch needs progress, cost rollup, and a failure threshold.
+
 ### Composing workflow + jobs
 
 The two compose for **fan-out inside a single run**: a workflow step submits

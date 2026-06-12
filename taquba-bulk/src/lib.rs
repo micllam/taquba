@@ -20,6 +20,11 @@
 //! backoff and then dead-letters the item (terminating it failed); the rest of
 //! the batch is unaffected.
 //!
+//! [`BulkCtx::memoized`] is [`taquba_workflow`]'s per-step memo store
+//! applied at a finer granularity: the item's single step holds one memo
+//! entry per logical phase, so the phases of [`Pipeline::run`] resume
+//! individually even though the workflow sees one step.
+//!
 //! # Content-addressed memoization
 //!
 //! Use [`BulkCtx::memoized_by_content`] when the natural memo key is a
