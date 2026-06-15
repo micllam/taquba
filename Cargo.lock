@@ -2897,7 +2897,7 @@ dependencies = [
 
 [[package]]
 name = "taquba"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "bytes",
  "rmp-serde",
@@ -2928,7 +2928,7 @@ dependencies = [
 
 [[package]]
 name = "taquba-bulk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rmp-serde",
  "serde",
@@ -2944,7 +2944,7 @@ dependencies = [
 
 [[package]]
 name = "taquba-cron"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "croner",
@@ -2956,7 +2956,7 @@ dependencies = [
 
 [[package]]
 name = "taquba-jobs"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "futures-util",
  "rmp-serde",
@@ -2972,7 +2972,7 @@ dependencies = [
 
 [[package]]
 name = "taquba-webhooks"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "reqwest 0.12.28",
@@ -2984,7 +2984,7 @@ dependencies = [
 
 [[package]]
 name = "taquba-workflow"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "futures-util",

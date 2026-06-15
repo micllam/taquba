@@ -17,11 +17,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/micllam/taquba"
 
 [workspace.dependencies]
-taquba = { path = "taquba", version = "0.7.0" }
-taquba-bulk = { path = "taquba-bulk", version = "0.1.0" }
-taquba-jobs = { path = "taquba-jobs", version = "0.3.0" }
-taquba-webhooks = { path = "taquba-webhooks", version = "0.2.0" }
-taquba-workflow = { path = "taquba-workflow", version = "0.5.0" }
+taquba = { path = "taquba", version = "0.8.0" }
+taquba-bulk = { path = "taquba-bulk", version = "0.2.0" }
+taquba-jobs = { path = "taquba-jobs", version = "0.4.0" }
+taquba-webhooks = { path = "taquba-webhooks", version = "0.3.0" }
+taquba-workflow = { path = "taquba-workflow", version = "0.6.0" }
 
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-util = "0.7"
