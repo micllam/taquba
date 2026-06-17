@@ -126,6 +126,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let inputs = (0..n_items as u32).map(|idx| Item { idx });
     let report = bulk.run(inputs).await?;
     watcher.abort();
+    // Await the aborted watcher so its `bulk` clone is dropped before the
+    // queue refcount check below. `abort()` only requests cancellation, so
+    // without this the task can still hold a `bulk` clone (and through it a
+    // `queue` clone) when `Arc::try_unwrap` runs.
+    let _ = watcher.await;
 
     println!("window_sec,completed");
     for (sec, completed) in progress_rows.lock().unwrap().iter() {
