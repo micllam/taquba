@@ -3158,4 +3158,46 @@ mod tests {
 
         let _ = shutdown.send(());
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn sweeper_keeps_memos_of_runs_without_a_terminal_marker() {
+        // A run gets a terminal marker only once it terminates, and a
+        // terminated run never resumes. The sweep is keyed on those
+        // markers, so an in-flight run's memo entries are never deleted
+        // out from under a resume, even past the retention window. Here
+        // a memo entry exists for a run with no terminal marker;
+        // advancing well past retention must leave it in place.
+        let (queue, store, clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue,
+            store.clone(),
+            ScriptedRunner::new(vec![]),
+            ChannelHook { tx },
+        )
+        .memo_retention(Duration::from_millis(100))
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        let memos = MemoStore::new(store.clone(), "workflow-memo");
+        memos
+            .new_memo("in-flight-run", 0)
+            .put("k", b"cached")
+            .await
+            .unwrap();
+
+        advance(&clock, Duration::from_millis(500)).await;
+        // Give the sweeper several ticks to run against the advanced clock.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            memos.new_memo("in-flight-run", 0).get("k").await.unwrap(),
+            Some(b"cached".to_vec()),
+            "sweep must not remove memos of a run with no terminal marker",
+        );
+
+        let _ = shutdown.send(());
+    }
 }

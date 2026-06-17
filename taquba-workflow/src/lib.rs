@@ -253,6 +253,14 @@
 //! retention window. The first sweep fires on startup so a restarted
 //! process catches markers left behind by an earlier one.
 //!
+//! Because the sweep is keyed on those terminal markers, and a
+//! terminated run never resumes, it never deletes the memo or replay
+//! entries of an in-flight run out from under a resume. A resuming
+//! step that finds an entry absent re-executes the work (delivery is
+//! at-least-once regardless), so a missing entry is always safe to
+//! observe rather than a dangling reference: deletion is left
+//! unguarded precisely because every reader tolerates absence.
+//!
 //! Advanced cleanup policies (selective retention, externally-driven
 //! sweeps) can be built directly on [`MemoStore::list_terminal_markers`],
 //! [`MemoStore::clear_memos_for_run`], and

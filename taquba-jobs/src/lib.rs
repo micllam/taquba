@@ -74,7 +74,10 @@
 //! If [`JobRunnerBuilder::result_retention`] is configured and the
 //! cached blob has been swept, the dedup record still points to a
 //! missing blob; the re-submission then falls through to the normal
-//! enqueue path and re-runs the job. Size the retention window so it
+//! enqueue path and re-runs the job. This is deliberate: rather than
+//! guard each blob deletion against a delayed reader, the submit path
+//! re-verifies that the blob is present before trusting the cached
+//! result and re-runs when it is gone. Size the retention window so it
 //! covers the longest gap callers need between the original
 //! submission and an idempotent re-submit.
 //!

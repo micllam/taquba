@@ -937,6 +937,29 @@ mod tests {
         }
     }
 
+    /// Like [`Keyed`] but bumps a shared counter on every run, so a test
+    /// can distinguish a short-circuit (handler not invoked) from a
+    /// genuine re-run (handler invoked again).
+    #[derive(Serialize, Deserialize)]
+    struct CountedKeyed {
+        n: i64,
+    }
+
+    impl Job for CountedKeyed {
+        const NAME: &'static str = "test.counted-keyed";
+        type Output = i64;
+        type Error = TestError;
+
+        async fn run(&self, ctx: JobContext<'_>) -> std::result::Result<i64, TestError> {
+            ctx.state::<Arc<AtomicU32>>().fetch_add(1, Ordering::SeqCst);
+            Ok(self.n)
+        }
+
+        fn idempotency_key(&self) -> Option<String> {
+            Some(format!("counted-keyed:{}", self.n))
+        }
+    }
+
     /// First claim sleeps past the lease so the reaper requeues it;
     /// subsequent claims succeed. The shared counter records every
     /// claim so the test can observe the requeue.
@@ -1332,6 +1355,58 @@ mod tests {
             .unwrap()
             .expect("cached result should be reachable across restart");
         assert_eq!(outcome.unwrap(), 99);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idempotent_resubmit_after_result_swept_reruns() {
+        let queue_name = "test-resubmit-after-sweep";
+        let (queue, store) = open_queue(queue_name).await;
+        let runs = Arc::new(AtomicU32::new(0));
+        let mut runner = JobRunner::builder()
+            .queue(queue)
+            .object_store(store.clone())
+            .queue_name(queue_name)
+            .state(runs.clone())
+            .build()
+            .unwrap();
+        runner.register::<CountedKeyed>();
+        let handle = runner.spawn(std::future::pending::<()>());
+
+        // First submission runs to completion and writes a result blob.
+        // Awaiting under default retention acks the job, releasing the
+        // queue dedup key; the submission record in the KV namespace
+        // remains as the durable pointer back to the blob.
+        let first = runner.submit(CountedKeyed { n: 5 }).await.unwrap();
+        assert!(first.newly_submitted());
+        let first_id = first.id().to_string();
+        assert_eq!(first.await.unwrap(), 5);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        // Simulate the retention sweep removing the result blob while the
+        // submission record (the pointer) outlives it.
+        inspect_results(store.clone(), queue_name)
+            .delete(&first_id)
+            .await
+            .unwrap();
+        assert!(
+            inspect_results(store.clone(), queue_name)
+                .get(&first_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Re-submitting the same key and payload must not short-circuit
+        // to the now-missing result: the submit path verifies the blob
+        // still exists and, finding it gone, re-enqueues and re-runs the
+        // job rather than returning a dangling reference.
+        let second = runner.submit(CountedKeyed { n: 5 }).await.unwrap();
+        assert!(second.newly_submitted());
+        assert_ne!(second.id(), first_id);
+        assert_eq!(second.await.unwrap(), 5);
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
