@@ -59,6 +59,25 @@ windows, backlog behaviour, deviations from defaults>.
 
 ## Log
 
+### 2026-06-18 - steady_state 700/s shallow queue after the claim-scan prefix bound on real S3
+
+- **taquba:** 0.8.0, post-fix (`8a67119`)
+- **Benchmark:** steady_state (`benches/taquba/steady_state.rs`)
+- **Host:** m7i.xlarge, 4 vCPU / 16 GiB, us-east-1
+- **Store:** real S3, Standard storage class, us-east-1 (same region as host)
+- **Parameters:** `RATE=700 N_PRODUCERS=50 N_WORKERS=50 CLAIM_BATCH=16 FLUSH_INTERVAL_MS=1 DURATION_SEC=300` payload 64 B, `STORE_LATENCY_MS=0`
+- **Command:** `cargo bench -p taquba-bencher --features aws --bench steady_state`
+
+| Metric | Value |
+|---|---|
+| Achieved throughput | ~695/s (sustained) |
+| e2e p50 | ~428 ms |
+| e2e p99 | ~928 ms |
+| pending peak | ~260 |
+| claim p99 (mean / peak across windows) | 1.6 ms / 22.3 ms |
+
+Notes: this re-runs the 700/s x 300 s shallow-queue operating point from the `19888b0` steady_state entry below, after the claim-scan prefix-bound fix (`8a67119`). **The claim-latency sawtooth is eliminated:** claim p99 is flat at ~1.6 ms mean / 22.3 ms peak, with zero of the 300 windows above 50 ms, versus the prior run's sawtooth between ~1-5 ms and ~200-470 ms. **This corrects the prior entry's attribution.** That entry attributed the sawtooth to "periodic compaction reclaiming the tombstone band"; claim-path instrumentation showed the actual cause was the cursor-resumed claim scan running with an unbounded end, so the step that detects a drained queue continued past the last live `pending:` key into the remainder of the keyspace, a traversal nearly every claim on a shallow queue incurred. Bounding the scan to the `pending:` prefix removed it. Per the append-only convention the `19888b0` entry is left as recorded; this entry supersedes its claim-latency line only. e2e (floored by S3 PUT latency) and throughput (single-writer ceiling) are unchanged, as the fix touches only the claim path. The periodic e2e and backlog spikes the prior entry described persist (pending peak ~260, e2e p99 ~928 ms), so those are independent of the claim sawtooth rather than a shared compaction cause as previously inferred.
+
 ### 2026-06-18 - cold_start (restart with sparse live jobs) on real S3
 
 - **taquba:** 0.8.0 (`19888b0`)
