@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `Queue::claim` and `Queue::claim_batch` now bound the cursor-resumed
+  scan to the queue's `pending:` prefix instead of scanning unbounded to
+  the end of the keyspace. When a claim resumed from the recorded cursor
+  bound, the step that detects a drained queue continued past the last
+  live `pending:` key into the remainder of the keyspace before
+  terminating, so on a shallow or near-empty queue nearly every claim
+  incurred that traversal and claim latency increased as tombstones
+  accumulated between compactions. The scan now ends at the prefix upper
+  bound, within which every live pending key sorts. The front prefix scan
+  taken on cold start or restart was already bounded and is unchanged. No
+  API or on-disk change.
+
 ## [0.8.0] - 2026-06-15
 
 ### Added
