@@ -40,6 +40,13 @@ drain your queue first, or be prepared to start the bucket fresh.
 Patch releases (`0.1.0` -> `0.1.1`) preserve both the Rust API and the on-disk
 format.
 
+## Performance
+
+Taquba is built for durability and operational simplicity rather than raw
+speed. Measured numbers, with the environment and commit that produced them,
+are recorded in
+[`taquba-bencher/RESULTS.md`](https://github.com/micllam/taquba/blob/master/taquba-bencher/RESULTS.md).
+
 ## Install
 
 The in-memory and local-disk stores work with no feature flag, handy for

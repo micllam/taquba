@@ -23,7 +23,11 @@
 //!
 //! # When Taquba does not fit
 //!
-//! If you need a worker fleet spread across multiple machines.
+//! - If you need a worker fleet spread across multiple machines.
+//! - Sustained high-throughput pipelines or low-latency request paths.
+//!
+//! Measured performance numbers, with the environment and commit that
+//! produced them, are recorded in `RESULTS.md` in the source repository.
 //!
 //! # Quick start
 //!
