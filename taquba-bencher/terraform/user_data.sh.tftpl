@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Provisions the bench host: installs a Rust toolchain, clones taquba,
+# and builds taquba-bencher with the aws feature so the binaries are
+# ready to run against S3. Connect with SSM and run a bench by hand;
+# see ../README.md for invocations and ../RESULTS.md for recording
+# output.
+set -euxo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y build-essential git pkg-config
+
+# Install the toolchain system-wide so interactive SSM shells share it.
+export RUSTUP_HOME=/opt/rust/rustup
+export CARGO_HOME=/opt/rust/cargo
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+  | sh -s -- -y --no-modify-path --profile minimal
+export PATH="$CARGO_HOME/bin:$PATH"
+
+git clone "${repo_url}" /opt/taquba
+cd /opt/taquba
+git checkout "${git_ref}"
+
+# Pre-build the bench binaries. `cargo build` does not compile [[bench]]
+# targets, and the bench profile differs from release, so use
+# `cargo bench --no-run` to build exactly what `cargo bench` will run.
+# This warms the dependency and bench-binary cache so the first real run
+# does not pay compile time mid-session.
+cargo bench --no-run -p taquba-bencher --features aws
+
+cat > /etc/profile.d/rust.sh <<'EOF'
+export RUSTUP_HOME=/opt/rust/rustup
+export CARGO_HOME=/opt/rust/cargo
+export PATH="/opt/rust/cargo/bin:$PATH"
+EOF

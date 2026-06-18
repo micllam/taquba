@@ -1,0 +1,6 @@
+# Copy to terraform.tfvars and edit. bucket_name is required; everything
+# else has a default in variables.tf.
+
+bucket_name = "my-unique-taquba-bench-bucket"
+region      = "us-east-1"
+git_ref     = "master"

@@ -1,0 +1,21 @@
+# Local state is disposable and not shared; never commit it. For shared
+# use, configure a remote backend in versions.tf instead.
+*.tfstate
+*.tfstate.*
+
+# Provider plugins and crash logs.
+.terraform/
+crash.log
+crash.*.log
+
+# Local override files.
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Variable files may carry environment specifics; commit only the
+# example. The provider lock file (.terraform.lock.hcl) is intentionally
+# committed.
+*.tfvars
+!*.tfvars.example
