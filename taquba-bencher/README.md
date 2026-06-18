@@ -132,7 +132,7 @@ STORE_URL=s3://my-bench-bucket/taquba \
 `gs://` URLs (feature `gcp`, `GOOGLE_*` env vars) and `az://` URLs
 (feature `azure`, `AZURE_*` env vars) work the same way.
 
-Each run is rooted under a fresh `bench-<unix-millis>` prefix inside
+Each run is placed under a fresh `bench-<unix-millis>` prefix inside
 the URL's path, printed to stderr at startup, so a rerun never
 observes a previous run's state. Bench data is left in place on exit;
 delete the run prefixes afterwards or configure an object-lifecycle

@@ -28,7 +28,7 @@ pub fn pct(sorted: &[u64], p: usize) -> u64 {
 /// Object store for a bench run, selected by env vars.
 ///
 /// With `STORE_URL` set (`s3://bucket/prefix`, `gs://...`, `az://...`,
-/// `file:///abs/path`), opens that store and roots the run under a
+/// `file:///abs/path`), opens that store and places each run under a
 /// fresh `bench-<unix-millis>` prefix so a rerun never observes a
 /// previous run's state; the prefix is printed to stderr. Cloud
 /// schemes require the matching cargo feature on this crate and read
