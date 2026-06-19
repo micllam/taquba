@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recorder (for example Prometheus or an OTLP bridge), and emission is a
   no-op until one is installed. With the feature off, all emission compiles
   to nothing.
+- `OpenOptions::metrics_sample_interval` (defaults to `None`): when set and
+  the `metrics` feature is on, a background sampler periodically emits the
+  depth gauges `taquba_pending_jobs` / `taquba_claimed_jobs` and
+  `taquba_oldest_pending_age_seconds` (age of the job at the front of the
+  claim order), per queue.
 
 ### Fixed
 

@@ -69,7 +69,9 @@ The optional `metrics` feature emits queue health metrics (throughput, dead
 rate, and claim/ack/enqueue latency histograms) through the
 [`metrics`](https://docs.rs/metrics) facade. No exporter is pulled in; the
 host process installs a recorder (for example Prometheus or an OTLP bridge),
-and the metrics are no-ops until one is installed.
+and the metrics are no-ops until one is installed. Setting
+`OpenOptions::metrics_sample_interval` additionally runs a background sampler
+that emits per-queue depth and oldest-pending-age gauges.
 
 ## Quick start
 

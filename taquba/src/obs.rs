@@ -21,6 +21,10 @@
 //! - `taquba_jobs_reaped_total{queue}`: expired claims requeued by the reaper.
 //! - `taquba_enqueue_duration_seconds{queue}` / `taquba_claim_duration_seconds{queue}`
 //!   / `taquba_ack_duration_seconds{queue}`: per-operation latency histograms.
+//! - `taquba_pending_jobs{queue}` / `taquba_claimed_jobs{queue}`: current
+//!   queue depth gauges, sampled by the background metrics sampler.
+//! - `taquba_oldest_pending_age_seconds{queue}`: age of the pending job at the
+//!   front of the claim order, also sampled.
 
 #[cfg(feature = "metrics")]
 mod imp {
@@ -67,6 +71,15 @@ mod imp {
             "taquba_ack_duration_seconds",
             "Time for an ack to commit durably"
         );
+        metrics::describe_gauge!(
+            "taquba_pending_jobs",
+            "Jobs currently waiting to be claimed"
+        );
+        metrics::describe_gauge!("taquba_claimed_jobs", "Jobs currently held under a lease");
+        metrics::describe_gauge!(
+            "taquba_oldest_pending_age_seconds",
+            "Age of the pending job at the front of the claim order"
+        );
     }
 
     pub(crate) fn enqueued(queue: &str, n: u64, t: Timer) {
@@ -95,6 +108,15 @@ mod imp {
 
     pub(crate) fn reaped(queue: &str, n: u64) {
         metrics::counter!("taquba_jobs_reaped_total", "queue" => queue.to_owned()).increment(n);
+    }
+
+    pub(crate) fn set_depth(queue: &str, pending: i64, claimed: i64) {
+        metrics::gauge!("taquba_pending_jobs", "queue" => queue.to_owned()).set(pending as f64);
+        metrics::gauge!("taquba_claimed_jobs", "queue" => queue.to_owned()).set(claimed as f64);
+    }
+
+    pub(crate) fn set_oldest_pending_age_seconds(queue: &str, secs: f64) {
+        metrics::gauge!("taquba_oldest_pending_age_seconds", "queue" => queue.to_owned()).set(secs);
     }
 
     fn record(t: Timer, name: &'static str, queue: &str) {

@@ -172,7 +172,9 @@
 //! dead rate, and claim/ack/enqueue latency histograms) through the
 //! [`metrics`](https://docs.rs/metrics) facade. No exporter is pulled in;
 //! the host process installs a recorder (for example Prometheus or an OTLP
-//! bridge). Metrics are no-ops until a recorder is installed.
+//! bridge). Metrics are no-ops until a recorder is installed. Setting
+//! [`OpenOptions::metrics_sample_interval`] additionally runs a background
+//! sampler that emits per-queue depth and oldest-pending-age gauges.
 //!
 //! [SlateDB]: https://github.com/slatedb/slatedb
 
@@ -182,6 +184,8 @@ mod claim_cursor;
 mod clock;
 mod error;
 mod job;
+#[cfg(feature = "metrics")]
+mod metrics_sampler;
 mod obs;
 mod queue;
 mod reaper;

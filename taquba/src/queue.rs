@@ -316,6 +316,12 @@ pub struct OpenOptions {
     /// the flush before returning, so at-least-once delivery is
     /// preserved regardless of the interval chosen.
     pub flush_interval: Option<Duration>,
+    /// How often the background metrics sampler reads per-queue depth and
+    /// the oldest-pending age and emits them as gauges. `None` (the default)
+    /// disables the sampler. Has no effect unless the crate is built with the
+    /// `metrics` feature; event counters and latency histograms are emitted
+    /// inline regardless of this setting.
+    pub metrics_sample_interval: Option<Duration>,
 }
 
 impl Default for OpenOptions {
@@ -327,6 +333,7 @@ impl Default for OpenOptions {
             queue_configs: HashMap::new(),
             clock: default_clock(),
             flush_interval: None,
+            metrics_sample_interval: None,
         }
     }
 }
@@ -449,6 +456,10 @@ pub struct Queue {
     reaper_handle: JoinHandle<()>,
     scheduler_shutdown: watch::Sender<bool>,
     scheduler_handle: JoinHandle<()>,
+    /// Shutdown sender and join handle for the optional metrics sampler.
+    /// `Some` only when built with the `metrics` feature and
+    /// `OpenOptions::metrics_sample_interval` was set.
+    metrics_sampler: Option<(watch::Sender<bool>, JoinHandle<()>)>,
     default_queue_config: QueueConfig,
     queue_configs: HashMap<String, QueueConfig>,
     clock: Arc<dyn Clock>,
@@ -590,12 +601,27 @@ impl Queue {
             claim_cursor: claim_cursor.clone(),
         };
         let scheduler_handle = tokio::spawn(scheduler.run(scheduler_rx));
+
+        #[cfg(feature = "metrics")]
+        let metrics_sampler = opts.metrics_sample_interval.map(|interval| {
+            let (tx, rx) = watch::channel(false);
+            let sampler = crate::metrics_sampler::MetricsSampler {
+                db: db.clone(),
+                clock: opts.clock.clone(),
+                interval,
+            };
+            (tx, tokio::spawn(sampler.run(rx)))
+        });
+        #[cfg(not(feature = "metrics"))]
+        let metrics_sampler: Option<(watch::Sender<bool>, JoinHandle<()>)> = None;
+
         Ok(Self {
             db,
             reaper_shutdown,
             reaper_handle,
             scheduler_shutdown,
             scheduler_handle,
+            metrics_sampler,
             default_queue_config: opts.default_queue_config,
             queue_configs: opts.queue_configs,
             clock: opts.clock,
@@ -2085,6 +2111,10 @@ impl Queue {
         let _ = self.reaper_handle.await;
         let _ = self.scheduler_shutdown.send(true);
         let _ = self.scheduler_handle.await;
+        if let Some((shutdown, handle)) = self.metrics_sampler {
+            let _ = shutdown.send(true);
+            let _ = handle.await;
+        }
         persist_cursor_state(&self.db, &self.claim_cursor).await?;
         self.db.close().await?;
         Ok(())
@@ -2161,6 +2191,55 @@ mod tests {
 
     fn make_store() -> Arc<dyn ObjectStore> {
         Arc::new(InMemory::new())
+    }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn metrics_sampler_emits_pending_depth_gauge() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // Only this test installs a global recorder (the obs unit test uses a
+        // local one), so the install succeeds and the snapshotter observes the
+        // sampler running in its spawned task.
+        let _ = recorder.install();
+
+        let q = Queue::open_with_options(
+            make_store(),
+            "test",
+            OpenOptions {
+                metrics_sample_interval: Some(Duration::from_millis(25)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for _ in 0..3 {
+            q.enqueue("gsamp", vec![0u8; 8]).await.unwrap();
+        }
+
+        let mut gauge = None;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            for (composite, _unit, _desc, value) in snapshotter.snapshot().into_vec() {
+                let key = composite.key();
+                let ours = key.name() == "taquba_pending_jobs"
+                    && key
+                        .labels()
+                        .any(|l| l.key() == "queue" && l.value() == "gsamp");
+                if ours {
+                    if let DebugValue::Gauge(g) = value {
+                        gauge = Some(g.into_inner());
+                    }
+                }
+            }
+            if gauge == Some(3.0) {
+                break;
+            }
+        }
+        assert_eq!(gauge, Some(3.0), "sampler should report 3 pending jobs");
+        q.close().await.unwrap();
     }
 
     #[test]
