@@ -1,6 +1,6 @@
 # Benchmark infrastructure
 
-Terraform that stands up a single EC2 host and an S3 bucket in one
+Terraform that provisions a single EC2 host and an S3 bucket in one
 region for running the `taquba-bencher` benchmarks against real object
 storage, which allows published numbers (recorded in `../RESULTS.md`) to
 come from a reproducible environment.
@@ -31,9 +31,10 @@ terraform apply
 $(terraform output -raw ssm_connect)
 
 # Become root. cloud-init builds under /opt/taquba as root, but SSM logs
-# in as the unprivileged ssm-user, which cannot write there; sudo -i also
-# loads the Rust toolchain onto PATH.
+# in as the unprivileged ssm-user, which cannot write there. If `cargo`
+# is not found, export the toolchain paths explicitly:
 sudo -i
+export RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo PATH=/opt/rust/cargo/bin:$PATH
 cloud-init status --wait   # block until the first-boot build finishes
 
 # On the host, run a bench and capture the CSV. terraform output

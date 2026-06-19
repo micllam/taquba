@@ -141,6 +141,12 @@ in-memory store and is rejected when `STORE_URL` is set. Run from
 compute in the bucket's region; over a longer network path the round
 trip to the store dominates every number.
 
+Summarized numbers from cloud runs, each tied to the commit and
+environment that produced it, are recorded in [`RESULTS.md`](RESULTS.md),
+the single source of truth for published taquba performance figures. The
+Terraform under [`terraform/`](terraform/) provisions a reproducible
+host and bucket for those runs.
+
 ## Output format
 
 Each benchmark prints CSV to `stdout`. The header tells you the
