@@ -3012,6 +3012,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "slatedb",
+ "slatedb-common",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",

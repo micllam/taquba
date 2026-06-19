@@ -569,13 +569,15 @@ impl Queue {
         if let Some(flush_interval) = opts.flush_interval {
             settings.flush_interval = Some(flush_interval);
         }
-        let db = Arc::new(
-            Db::builder(path, object_store)
-                .with_merge_operator(Arc::new(CounterMergeOperator))
-                .with_settings(settings)
-                .build()
-                .await?,
-        );
+        #[cfg_attr(not(feature = "metrics"), allow(unused_mut))]
+        let mut builder = Db::builder(path, object_store)
+            .with_merge_operator(Arc::new(CounterMergeOperator))
+            .with_settings(settings);
+        #[cfg(feature = "metrics")]
+        {
+            builder = builder.with_metrics_recorder(crate::obs::slatedb_recorder());
+        }
+        let db = Arc::new(builder.build().await?);
         let job_available = Arc::new(tokio::sync::Notify::new());
         let completion_notify = Arc::new(tokio::sync::Notify::new());
         let claim_cursor = ClaimCursor::new();

@@ -28,7 +28,12 @@
 
 #[cfg(feature = "metrics")]
 mod imp {
+    use std::sync::Arc;
     use std::time::Instant;
+
+    use slatedb_common::metrics::{
+        CounterFn, GaugeFn, HistogramFn, MetricsRecorder, UpDownCounterFn,
+    };
 
     /// A start instant captured when metrics are enabled, threaded into the
     /// emitting call so it can record the operation's latency.
@@ -125,6 +130,107 @@ mod imp {
                 .record(start.elapsed().as_secs_f64());
         }
     }
+
+    /// A SlateDB [`MetricsRecorder`] that forwards SlateDB's storage metrics
+    /// (write/flush/compaction/cache, dot-separated names such as
+    /// `slatedb.db.write_ops`) into the `metrics` facade, so they share the
+    /// host's recorder with taquba's queue metrics. Installed on the
+    /// `DbBuilder` when the `metrics` feature is on.
+    pub(crate) fn slatedb_recorder() -> Arc<dyn MetricsRecorder> {
+        Arc::new(SlateDbRecorder)
+    }
+
+    struct SlateDbRecorder;
+
+    impl MetricsRecorder for SlateDbRecorder {
+        fn register_counter(
+            &self,
+            name: &str,
+            description: &str,
+            labels: &[(&str, &str)],
+        ) -> Arc<dyn CounterFn> {
+            let name = name.to_string();
+            metrics::describe_counter!(name.clone(), description.to_string());
+            Arc::new(CounterHandle(metrics::counter!(name, to_labels(labels))))
+        }
+
+        fn register_gauge(
+            &self,
+            name: &str,
+            description: &str,
+            labels: &[(&str, &str)],
+        ) -> Arc<dyn GaugeFn> {
+            let name = name.to_string();
+            metrics::describe_gauge!(name.clone(), description.to_string());
+            Arc::new(GaugeHandle(metrics::gauge!(name, to_labels(labels))))
+        }
+
+        fn register_up_down_counter(
+            &self,
+            name: &str,
+            description: &str,
+            labels: &[(&str, &str)],
+        ) -> Arc<dyn UpDownCounterFn> {
+            // `metrics` has no up-down counter; map it onto a gauge.
+            let name = name.to_string();
+            metrics::describe_gauge!(name.clone(), description.to_string());
+            Arc::new(UpDownCounterHandle(metrics::gauge!(
+                name,
+                to_labels(labels)
+            )))
+        }
+
+        fn register_histogram(
+            &self,
+            name: &str,
+            description: &str,
+            labels: &[(&str, &str)],
+            _boundaries: &[f64],
+        ) -> Arc<dyn HistogramFn> {
+            // Bucket boundaries are configured on the exporter, not here.
+            let name = name.to_string();
+            metrics::describe_histogram!(name.clone(), description.to_string());
+            Arc::new(HistogramHandle(metrics::histogram!(
+                name,
+                to_labels(labels)
+            )))
+        }
+    }
+
+    fn to_labels(labels: &[(&str, &str)]) -> Vec<metrics::Label> {
+        labels
+            .iter()
+            .map(|(k, v)| metrics::Label::new(k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    struct CounterHandle(metrics::Counter);
+    impl CounterFn for CounterHandle {
+        fn increment(&self, value: u64) {
+            self.0.increment(value);
+        }
+    }
+
+    struct GaugeHandle(metrics::Gauge);
+    impl GaugeFn for GaugeHandle {
+        fn set(&self, value: i64) {
+            self.0.set(value as f64);
+        }
+    }
+
+    struct UpDownCounterHandle(metrics::Gauge);
+    impl UpDownCounterFn for UpDownCounterHandle {
+        fn increment(&self, value: i64) {
+            self.0.increment(value as f64);
+        }
+    }
+
+    struct HistogramHandle(metrics::Histogram);
+    impl HistogramFn for HistogramHandle {
+        fn record(&self, value: f64) {
+            self.0.record(value);
+        }
+    }
 }
 
 #[cfg(not(feature = "metrics"))]
@@ -195,6 +301,42 @@ mod tests {
             assert!(
                 emitted.iter().any(|name| name == expected),
                 "expected metric {expected} was not emitted; got {emitted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn slatedb_recorder_forwards_to_the_metrics_facade() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let r = super::slatedb_recorder();
+            r.register_counter("slatedb.db.write_ops", "writes", &[("kind", "wal")])
+                .increment(2);
+            r.register_gauge("slatedb.db.l0_sst_count", "l0", &[])
+                .set(3);
+            r.register_up_down_counter("slatedb.db.inflight", "inflight", &[])
+                .increment(1);
+            r.register_histogram("slatedb.db.flush_seconds", "flush", &[], &[])
+                .record(0.1);
+        });
+
+        let emitted: Vec<String> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(composite, _unit, _desc, _value)| composite.key().name().to_string())
+            .collect();
+
+        for expected in [
+            "slatedb.db.write_ops",
+            "slatedb.db.l0_sst_count",
+            "slatedb.db.inflight",
+            "slatedb.db.flush_seconds",
+        ] {
+            assert!(
+                emitted.iter().any(|name| name == expected),
+                "expected forwarded metric {expected}; got {emitted:?}"
             );
         }
     }

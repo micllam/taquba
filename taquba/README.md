@@ -71,7 +71,8 @@ rate, and claim/ack/enqueue latency histograms) through the
 host process installs a recorder (for example Prometheus or an OTLP bridge),
 and the metrics are no-ops until one is installed. Setting
 `OpenOptions::metrics_sample_interval` additionally runs a background sampler
-that emits per-queue depth and oldest-pending-age gauges.
+that emits per-queue depth and oldest-pending-age gauges, and SlateDB's own
+storage metrics are forwarded into the same recorder.
 
 ## Quick start
 

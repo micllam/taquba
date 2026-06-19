@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depth gauges `taquba_pending_jobs` / `taquba_claimed_jobs` and
   `taquba_oldest_pending_age_seconds` (age of the job at the front of the
   claim order), per queue.
+- With the `metrics` feature, SlateDB's own storage metrics (write, flush,
+  compaction, and cache, with dot-separated names such as
+  `slatedb.db.write_ops`) are forwarded into the same `metrics` recorder, so
+  storage and queue metrics appear together in one scrape.
 
 ### Fixed
 

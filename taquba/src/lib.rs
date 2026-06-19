@@ -174,7 +174,8 @@
 //! the host process installs a recorder (for example Prometheus or an OTLP
 //! bridge). Metrics are no-ops until a recorder is installed. Setting
 //! [`OpenOptions::metrics_sample_interval`] additionally runs a background
-//! sampler that emits per-queue depth and oldest-pending-age gauges.
+//! sampler that emits per-queue depth and oldest-pending-age gauges, and
+//! SlateDB's own storage metrics are forwarded into the same recorder.
 //!
 //! [SlateDB]: https://github.com/slatedb/slatedb
 
