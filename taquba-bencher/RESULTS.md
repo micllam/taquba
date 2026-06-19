@@ -59,6 +59,37 @@ windows, backlog behaviour, deviations from defaults>.
 
 ## Log
 
+### 2026-06-19 - throughput ceiling and flush_interval sweep on real S3
+
+- **taquba:** 0.8.0, post-fix (`f05acc0`, master)
+- **Benchmark:** steady_state (`benches/taquba/steady_state.rs`)
+- **Host:** m7i.xlarge, 4 vCPU / 16 GiB, us-east-1
+- **Store:** real S3, Standard storage class, us-east-1 (same region as host)
+- **Common parameters:** payload 64 B, `CLAIM_BATCH=16`; per-run rate / producers / workers / flush as noted
+
+Saturating ceiling probe (`RATE=20000` flat-out, `DURATION_SEC=90`); commits = enqueues + acks, both durable; WAL PUTs = WAL SSTs over the run / 90 s:
+
+| producers | workers | flush | commits/s | WAL PUTs/s | commits/PUT |
+|---|---|---|---|---|---|
+| 100 | 50 | 1 ms | 2,386 | 45 | 53 |
+| 300 | 50 | 1 ms | 3,966 | 92 | 43 |
+| 300 | 50 | 100 ms | 2,900 | 35 | 82 |
+
+Sustained 700/s, flush comparison (`DURATION_SEC=300`); e2e_p99 is the mean of per-window p99:
+
+| producers | workers | flush | done/s | e2e_p99 | pending peak |
+|---|---|---|---|---|---|
+| 50 | 50 | 1 ms | 695 | 928 ms | 260 |
+| 100 | 100 | 100 ms | 693 | 1,798 ms | 121 |
+
+(The 1 ms / 700 s row is the prior `8a67119` steady_state entry, repeated for comparison.)
+
+Notes:
+- **The single-writer throughput ceiling is PUT/IO-throughput-bound and scales with concurrency, not transaction-count-bound.** Commits/s tracks WAL PUTs/s; raising producers 100 to 300 doubled PUTs/s (45 to 92) and lifted commits/s ~66%, while commits-per-PUT stayed flat (53 to 43), so the gain is more PUTs/s (more IO), not bigger batches. A transaction/CPU-bound ceiling would not have moved with concurrency. The real ceiling is ~2,400-4,000+ commits/s (still climbing at 300 producers), well above the ~1,000/s figure quoted earlier, which was only 700-offered / 50-worker `done/s`.
+- **Group commit already amortizes the durable write.** Each WAL PUT carried 43-82 committed operations across these runs, so the per-operation transaction cost is not what bounds throughput; the durable-write IO rate is.
+- **`flush_interval` is a latency, throughput, and PUT-cost tradeoff, not a way to reduce spikes.** A larger interval *lowers* throughput (fewer PUTs/s) and, at matched 700/s, roughly doubled e2e_p99 (928 to 1,798 ms) while requiring twice the concurrency to sustain the rate (each durable operation waits up to one flush interval, halving per-actor enqueue/ack throughput; under-provisioned 100 ms runs sustained only ~480/s). It did not reduce the e2e tail. A smaller interval is the better default for latency and throughput; a larger interval reduces only PUT request count and object count. The periodic e2e and backlog spikes are better addressed in the object-store layer (request retry or hedging) or by provisioning throughput above the offered load.
+- **The claim-scan prefix-bound fix holds under saturation:** zero windows with claim p99 > 50 ms across every run.
+
 ### 2026-06-18 - steady_state 700/s shallow queue after the claim-scan prefix bound on real S3
 
 - **taquba:** 0.8.0, post-fix (`8a67119`)
