@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Optional `metrics` feature emitting queue health metrics through the
+  [`metrics`](https://docs.rs/metrics) facade: counters
+  `taquba_jobs_{enqueued,claimed,completed,nacked,dead_lettered,reaped}_total`
+  and latency histograms `taquba_{enqueue,claim,ack}_duration_seconds`, all
+  labelled by queue. No exporter is pulled in; the host process installs a
+  recorder (for example Prometheus or an OTLP bridge), and emission is a
+  no-op until one is installed. With the feature off, all emission compiles
+  to nothing.
+
 ### Fixed
 
 - `Queue::claim` and `Queue::claim_batch` now bound the cursor-resumed

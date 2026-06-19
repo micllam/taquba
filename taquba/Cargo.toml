@@ -17,6 +17,8 @@ default = []
 aws = ["slatedb/aws"]
 gcp = ["slatedb/gcp"]
 azure = ["slatedb/azure"]
+# Emit queue health metrics through the `metrics` facade.
+metrics = ["dep:metrics"]
 
 [package.metadata.docs.rs]
 # Build docs with every feature on so each backend's docs are visible on
@@ -35,4 +37,9 @@ tokio-util = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+metrics = { version = "0.24", optional = true }
+
+[dev-dependencies]
+# Used only by the `#[cfg(feature = "metrics")]` tests.
+metrics-util = "0.18"
 

@@ -168,6 +168,12 @@
 //! cargo add taquba --features azure  # Azure Blob
 //! ```
 //!
+//! The optional `metrics` feature emits queue health metrics (throughput,
+//! dead rate, and claim/ack/enqueue latency histograms) through the
+//! [`metrics`](https://docs.rs/metrics) facade. No exporter is pulled in;
+//! the host process installs a recorder (for example Prometheus or an OTLP
+//! bridge). Metrics are no-ops until a recorder is installed.
+//!
 //! [SlateDB]: https://github.com/slatedb/slatedb
 
 #![warn(missing_docs)]
@@ -176,6 +182,7 @@ mod claim_cursor;
 mod clock;
 mod error;
 mod job;
+mod obs;
 mod queue;
 mod reaper;
 mod scheduler;

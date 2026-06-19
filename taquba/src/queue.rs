@@ -553,6 +553,7 @@ impl Queue {
         path: &str,
         opts: OpenOptions,
     ) -> Result<Self> {
+        crate::obs::describe();
         let mut settings = Settings::default();
         if let Some(flush_interval) = opts.flush_interval {
             settings.flush_interval = Some(flush_interval);
@@ -873,6 +874,7 @@ impl Queue {
             key,
             id_override_used,
         };
+        let timer = crate::obs::start();
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
 
@@ -890,6 +892,7 @@ impl Queue {
 
             match txn.commit().await {
                 Ok(_) => {
+                    crate::obs::enqueued(&staged.queue, 1, timer);
                     self.note_staged_job(&staged);
                     return Ok(EnqueueResult::New(staged.id));
                 }
@@ -1140,6 +1143,7 @@ impl Queue {
 
         let prefix = pending_prefix(queue);
         let prefix_bytes = prefix.as_bytes();
+        let timer = crate::obs::start();
         loop {
             // The scan state (and its pending-insert epoch) is read
             // before the transaction begins, so any insert the snapshot
@@ -1284,6 +1288,7 @@ impl Queue {
                         // insert since the epoch read revokes it.
                         self.claim_cursor.mark_empty(queue, scan.epoch);
                     }
+                    crate::obs::claimed(queue, jobs.len() as u64, timer);
                     debug!(queue = queue, count = jobs.len(), "jobs claimed");
                     return Ok(jobs);
                 }
@@ -1347,6 +1352,7 @@ impl Queue {
             }
         }
 
+        let timer = crate::obs::start();
         let lease_expires_at = job.lease_expires_at.ok_or(Error::InvalidState)?;
         let claimed = claimed_key(&job.queue, lease_expires_at, &job.id);
         let keep_done = self.queue_keep_done_jobs(&job.queue).is_some();
@@ -1424,6 +1430,7 @@ impl Queue {
             }
         };
 
+        crate::obs::completed(&job.queue, timer);
         self.clear_cancel_token(&job.id);
         self.completion_notify.notify_waiters();
         debug!(queue = %job.queue, job_id = %job.id, "job acked");
@@ -1522,6 +1529,11 @@ impl Queue {
 
         let immediate_retry = matches!(job.status, JobStatus::Pending);
         let became_dead = matches!(job.status, JobStatus::Dead);
+        if became_dead {
+            crate::obs::dead_lettered(&job.queue);
+        } else {
+            crate::obs::nacked(&job.queue);
+        }
         self.clear_cancel_token(&job.id);
         if immediate_retry {
             let pending = pending_key(&job.queue, job.priority, &job.id);
@@ -1577,6 +1589,7 @@ impl Queue {
             }
         }
 
+        crate::obs::dead_lettered(&job.queue);
         self.clear_cancel_token(&job.id);
         self.completion_notify.notify_waiters();
         warn!(
@@ -1979,6 +1992,7 @@ impl Queue {
         let priority = cfg.default_priority;
         let now = self.now_ms();
 
+        let timer = crate::obs::start();
         let mut ids = Vec::with_capacity(payloads.len());
         let txn = self.db.begin(IsolationLevel::Snapshot).await?;
 
@@ -2021,6 +2035,7 @@ impl Queue {
 
         update_stats(&txn, queue, &[(JobStatus::Pending, ids.len() as i64)])?;
         txn.commit().await?;
+        crate::obs::enqueued(queue, ids.len() as u64, timer);
         // Batch ids are monotonic ULIDs at one priority, so the first id
         // yields the batch's smallest pending key for the cursor check.
         if let Some(first_id) = ids.first() {

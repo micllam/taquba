@@ -65,6 +65,12 @@ cargo add taquba --features gcp    # Google Cloud Storage
 cargo add taquba --features azure  # Azure Blob
 ```
 
+The optional `metrics` feature emits queue health metrics (throughput, dead
+rate, and claim/ack/enqueue latency histograms) through the
+[`metrics`](https://docs.rs/metrics) facade. No exporter is pulled in; the
+host process installs a recorder (for example Prometheus or an OTLP bridge),
+and the metrics are no-ops until one is installed.
+
 ## Quick start
 
 ```rust

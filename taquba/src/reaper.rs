@@ -212,8 +212,10 @@ async fn reap_job(
             Ok(_) => {
                 if let Some(key) = requeued_pending_key {
                     claim_cursor.note_pending_insert(&job.queue, &key);
+                    crate::obs::reaped(&job.queue, 1);
                 }
                 if became_dead {
+                    crate::obs::dead_lettered(&job.queue);
                     completion_notify.notify_waiters();
                 }
                 return Ok(());
