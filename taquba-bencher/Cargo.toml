@@ -53,6 +53,11 @@ path = "benches/taquba/cold_start.rs"
 harness = false
 
 [[bench]]
+name = "sharding"
+path = "benches/taquba/sharding.rs"
+harness = false
+
+[[bench]]
 name = "reaper_storm"
 path = "benches/taquba/reaper_storm.rs"
 harness = false

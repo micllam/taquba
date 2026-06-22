@@ -28,6 +28,7 @@ documented in the header comment of its source file.
 | `steady_state` | Producers enqueue at `RATE` jobs/sec for `DURATION_SEC` while `N_WORKERS` claim and ack concurrently, then drain | Do throughput and end-to-end latency hold over a sustained run, or degrade as compaction and tombstones accumulate? Does the backlog stay bounded at the offered rate? |
 | `cold_start` | Build a history of `N_HISTORY` acked jobs plus `N_LIVE` pending jobs, close, reopen the same store, claim the live jobs serially | What does the first claim after a restart cost when the in-memory scan bound is gone and the claim falls back to a front prefix scan across the tombstone band, and how quickly do later claims recover? |
 | `reaper_storm` | Abandon `N_EXPIRED` claims with expired leases (a simulated crash), reopen, and let the reaper requeue them while a second queue carries live traffic | How long does a mass lease-expiry sweep take, and how much does it disturb claim and end-to-end latency on a concurrently active queue? |
+| `sharding` | Open `N_SHARDS` independent stores in one process and saturate each with `PRODUCERS_PER_SHARD` durable-enqueue producers | Does throughput scale with shard count? SlateDB serializes WAL flushes per store (one PUT in flight at a time), so each store is one PUT stream; N stores should give ~N independent streams, up to the object store's PUT capacity. |
 
 ### taquba-workflow
 
@@ -78,6 +79,12 @@ cargo bench -p taquba-bencher --bench cold_start > cold.csv
 # Crash recovery: 5K abandoned claims swept by the reaper while a
 # live queue sustains 500 jobs/sec.
 cargo bench -p taquba-bencher --bench reaper_storm > storm.csv
+
+# In-process sharding: sweep shard count with injected latency to see
+# the per-store flush serialization and the throughput multiplier (the
+# multiplier appears only with real PUT latency, here simulated).
+STORE_LATENCY_MS=10 N_SHARDS=4 DURATION_SEC=30 \
+    cargo bench -p taquba-bencher --bench sharding > sharding.csv
 
 # Spread the load across 100 queues (one worker each), exercising the
 # global reaper / scheduler prefix scans and per-queue claim state.
@@ -200,6 +207,17 @@ off those two columns. The remaining columns describe the live queue:
 acks completed in that second, enqueue-to-ack latency, and per-claim
 latency, all in microseconds. Rows before the first reaper tick give
 the undisturbed baseline to compare against.
+
+For `sharding`:
+
+```
+window_sec,enq_per_sec
+```
+
+One row per second with the aggregate enqueues completed across all
+shards; the final window may be partial. Per-shard totals and a summary
+(aggregate per second, per-shard mean, and shard min / max to show
+balance) print to stderr.
 
 For `step_transitions`:
 
