@@ -11,6 +11,15 @@
 //   DURATION_SEC        seconds producers sustain the offered rate (default 60)
 //   RATE                offered enqueue rate in jobs/sec across all
 //                       producers (default 500)
+//   RATE_SCHEDULE       optional comma-separated `seconds:rate` segments
+//                       describing a time-varying offered rate, e.g.
+//                       `60:0,300:500,120:2000` for 60s idle, then 300s at
+//                       500/s, then 120s at 2000/s. A rate of 0 is an idle
+//                       segment (producers sleep). Mutually exclusive with
+//                       RATE and DURATION_SEC; the total run length is the
+//                       sum of the segment seconds. Producers follow the
+//                       schedule independently; workers drain after the last
+//                       segment as usual.
 //   N_PRODUCERS         concurrent enqueue tasks (default 4). Each producer
 //                       enqueues serially, so the offered rate is capped at
 //                       roughly N_PRODUCERS / per-enqueue-latency.
@@ -70,6 +79,42 @@ const WATCHER_TICK: Duration = Duration::from_secs(1);
 /// are still running.
 const IDLE_BACKOFF: Duration = Duration::from_millis(2);
 
+/// Parse a `RATE_SCHEDULE` value: a comma-separated list of
+/// `seconds:rate` segments (e.g. `60:0,300:500,120:2000`). A rate of 0 is
+/// an idle segment. Empty segments are skipped; at least one valid segment
+/// is required.
+fn parse_schedule(spec: &str) -> Result<Vec<(u64, f64)>, String> {
+    let mut schedule = Vec::new();
+    for seg in spec.split(',') {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        let (secs, rate) = seg.split_once(':').ok_or_else(|| {
+            format!("invalid RATE_SCHEDULE segment '{seg}', expected 'seconds:rate'")
+        })?;
+        let secs: u64 = secs
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid seconds in RATE_SCHEDULE segment '{seg}'"))?;
+        let rate: f64 = rate
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid rate in RATE_SCHEDULE segment '{seg}'"))?;
+        if secs == 0 {
+            return Err(format!("RATE_SCHEDULE segment '{seg}' has zero seconds"));
+        }
+        if rate < 0.0 {
+            return Err(format!("RATE_SCHEDULE segment '{seg}' has negative rate"));
+        }
+        schedule.push((secs, rate));
+    }
+    if schedule.is_empty() {
+        return Err("RATE_SCHEDULE has no valid segments".into());
+    }
+    Ok(schedule)
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
@@ -85,12 +130,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flush_interval_ms: u64 = env_var("FLUSH_INTERVAL_MS", 1);
     let store_latency_ms: u64 = env_var("STORE_LATENCY_MS", 0);
 
+    // Offered-load schedule: either a time-varying RATE_SCHEDULE or a single
+    // fixed segment from RATE for DURATION_SEC. RATE_SCHEDULE is mutually
+    // exclusive with RATE and DURATION_SEC.
+    let schedule: Vec<(u64, f64)> = match std::env::var("RATE_SCHEDULE") {
+        Ok(spec) => {
+            if std::env::var("RATE").is_ok() || std::env::var("DURATION_SEC").is_ok() {
+                return Err(
+                    "RATE_SCHEDULE is mutually exclusive with RATE and DURATION_SEC".into(),
+                );
+            }
+            parse_schedule(&spec)?
+        }
+        Err(_) => vec![(duration_sec, rate)],
+    };
+    let total_sec: u64 = schedule.iter().map(|(secs, _)| secs).sum();
+    let schedule_desc = schedule
+        .iter()
+        .map(|(secs, seg_rate)| format!("{secs}s@{seg_rate}/s"))
+        .collect::<Vec<_>>()
+        .join(",");
+
     if n_workers < n_queues {
         return Err("N_WORKERS must be at least N_QUEUES so every queue has a worker".into());
     }
 
     eprintln!(
-        "steady_state: duration={duration_sec}s, rate={rate}/s, \
+        "steady_state: schedule=[{schedule_desc}] total={total_sec}s, \
          producers={n_producers}, workers={n_workers}, queues={n_queues}, \
          claim_batch={claim_batch}, wait_claim={wait_claim_ms}ms, \
          payload={payload_bytes}B, flush_interval={flush_interval_ms}ms, \
@@ -128,40 +194,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Each entry is (elapsed_us_at_completion, latency_us).
     type Sample = (u64, u64);
 
-    // Producers: each sustains rate / N_PRODUCERS via an interval whose
-    // default Burst missed-tick behaviour catches up after a slow
-    // enqueue, preserving the offered rate on average, enqueuing
-    // round-robin across the queues. The enqueue timestamp is stored in
-    // the payload's first 8 bytes so workers can compute end-to-end
-    // latency.
+    // Producers: each follows the offered-rate schedule independently.
+    // Within a non-idle segment a producer sustains seg_rate / N_PRODUCERS
+    // via an interval whose default Burst missed-tick behaviour catches up
+    // after a slow enqueue, preserving the offered rate on average,
+    // enqueuing round-robin across the queues. An idle (rate 0) segment
+    // sleeps until it ends. The enqueue timestamp is stored in the payload's
+    // first 8 bytes so workers can compute end-to-end latency.
+    let schedule = Arc::new(schedule);
     let mut producer_handles = Vec::with_capacity(n_producers);
     for producer_idx in 0..n_producers {
         let queue = queue.clone();
         let queue_names = queue_names.clone();
+        let schedule = schedule.clone();
         producer_handles.push(tokio::spawn(async move {
             let mut samples: Vec<Sample> = Vec::with_capacity(8192);
-            let period = Duration::from_secs_f64(n_producers as f64 / rate);
-            let mut tick = tokio::time::interval(period);
-            let deadline = Duration::from_secs(duration_sec);
             let mut seq = producer_idx;
-            loop {
-                tick.tick().await;
-                if bench_start.elapsed() >= deadline {
-                    break;
-                }
-                let enq_start_us = bench_start.elapsed().as_micros() as u64;
-                let mut payload = vec![0u8; payload_bytes];
-                payload[..8].copy_from_slice(&enq_start_us.to_le_bytes());
-                let queue_name = &queue_names[seq % queue_names.len()];
-                seq += 1;
-                match queue.enqueue(queue_name, payload).await {
-                    Ok(_) => {
-                        let done_us = bench_start.elapsed().as_micros() as u64;
-                        samples.push((done_us, done_us - enq_start_us));
+            let mut segment_start = Duration::ZERO;
+            for &(secs, seg_rate) in schedule.iter() {
+                let segment_end = segment_start + Duration::from_secs(secs);
+                segment_start = segment_end;
+                if seg_rate <= 0.0 {
+                    // Idle segment: sleep until it ends.
+                    if let Some(remaining) = segment_end.checked_sub(bench_start.elapsed()) {
+                        tokio::time::sleep(remaining).await;
                     }
-                    Err(e) => {
-                        eprintln!("producer {producer_idx}: enqueue error: {e}");
+                    continue;
+                }
+                let period = Duration::from_secs_f64(n_producers as f64 / seg_rate);
+                let mut tick = tokio::time::interval(period);
+                loop {
+                    tick.tick().await;
+                    if bench_start.elapsed() >= segment_end {
                         break;
+                    }
+                    let enq_start_us = bench_start.elapsed().as_micros() as u64;
+                    let mut payload = vec![0u8; payload_bytes];
+                    payload[..8].copy_from_slice(&enq_start_us.to_le_bytes());
+                    let queue_name = &queue_names[seq % queue_names.len()];
+                    seq += 1;
+                    match queue.enqueue(queue_name, payload).await {
+                        Ok(_) => {
+                            let done_us = bench_start.elapsed().as_micros() as u64;
+                            samples.push((done_us, done_us - enq_start_us));
+                        }
+                        Err(e) => {
+                            eprintln!("producer {producer_idx}: enqueue error: {e}");
+                            return samples;
+                        }
                     }
                 }
             }
