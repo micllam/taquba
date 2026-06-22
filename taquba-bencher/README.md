@@ -25,8 +25,8 @@ documented in the header comment of its source file.
 | Benchmark | Workload | Question it answers |
 |---|---|---|
 | `claim_drain` | Pre-fill `N_JOBS` jobs, drain with `N_WORKERS` workers, record per-claim latency | Does claim latency stay flat across a drain, or grow with `pending:` tombstone density? |
-| `steady_state` | Producers enqueue at `RATE` jobs/sec for `DURATION_SEC` while `N_WORKERS` claim and ack concurrently, then drain | Do throughput and end-to-end latency hold over a sustained run, or degrade as compaction and tombstones accumulate? Does the backlog stay bounded at the offered rate? |
-| `cold_start` | Build a history of `N_HISTORY` acked jobs plus `N_LIVE` pending jobs, close, reopen the same store, claim the live jobs serially | What does the first claim after a restart cost when the in-memory scan bound is gone and the claim falls back to a front prefix scan across the tombstone band, and how quickly do later claims recover? |
+| `steady_state` | Producers enqueue at `RATE` jobs/sec (or a time-varying `RATE_SCHEDULE`) for `DURATION_SEC` while `N_WORKERS` claim and ack concurrently, then drain | Do throughput and end-to-end latency hold over a sustained run, or degrade as compaction and tombstones accumulate? Does the backlog stay bounded at the offered rate? |
+| `cold_start` | Build a history of `N_HISTORY` acked jobs plus `N_LIVE` pending jobs, then reopen the same store and measure the reopen and the claims that follow. `PHASE=build`/`measure` split the build and reopen across processes; `GRACEFUL_CLOSE=0` crashes without a checkpoint for the expensive arm | What does the reopen (cold-open) cost, dominated by WAL replay since the last checkpoint, and what does the first claim cost once the in-memory scan bound is gone? Comparing the graceful and crash reopens quantifies the force-flush lever. |
 | `reaper_storm` | Abandon `N_EXPIRED` claims with expired leases (a simulated crash), reopen, and let the reaper requeue them while a second queue carries live traffic | How long does a mass lease-expiry sweep take, and how much does it disturb claim and end-to-end latency on a concurrently active queue? |
 | `sharding` | Open `N_SHARDS` independent stores in one process and saturate each with `PRODUCERS_PER_SHARD` durable-enqueue producers | Does throughput scale with shard count? SlateDB serializes WAL flushes per store (one PUT in flight at a time), so each store is one PUT stream; N stores should give ~N independent streams, up to the object store's PUT capacity. |
 
@@ -62,6 +62,12 @@ N_JOBS=100000 N_WORKERS=200 \
 # Sustain 500 jobs/sec for a minute.
 cargo bench -p taquba-bencher --bench steady_state > steady.csv
 
+# Varying offered load via seconds:rate segments (idle, then ramp, then
+# burst), e.g. a soak that mimics real traffic. Mutually exclusive with
+# RATE and DURATION_SEC.
+RATE_SCHEDULE=300:0,1800:500,600:2000 \
+    cargo bench -p taquba-bencher --bench steady_state > soak.csv
+
 # Same, with 20ms of injected object-store latency per call to
 # approximate an S3-class backend instead of the in-memory store.
 STORE_LATENCY_MS=20 RATE=200 \
@@ -73,8 +79,18 @@ CLAIM_BATCH=16 RATE=3000 N_PRODUCERS=12 \
     cargo bench -p taquba-bencher --bench steady_state > steady.csv
 
 # Restart cost: 20K acked jobs of history, then measure the reopen
-# and the first claims against the cold claim cursor.
+# and the first claims against the cold claim cursor (cheap arm: a
+# graceful close checkpoints the memtable, so the reopen replays little).
 cargo bench -p taquba-bencher --bench cold_start > cold.csv
+
+# Expensive cold-open arm: build then crash (no checkpoint), then
+# measure the reopen against the long unflushed WAL. Both phases need a
+# shared persistent store, so set STORE_URL and STORE_PREFIX.
+STORE_URL=file:///tmp/taquba-bench STORE_PREFIX=coldopen \
+    PHASE=build GRACEFUL_CLOSE=0 \
+    cargo bench -p taquba-bencher --bench cold_start
+STORE_URL=file:///tmp/taquba-bench STORE_PREFIX=coldopen PHASE=measure \
+    cargo bench -p taquba-bencher --bench cold_start > cold.csv
 
 # Crash recovery: 5K abandoned claims swept by the reaper while a
 # live queue sustains 500 jobs/sec.
@@ -141,9 +157,11 @@ STORE_URL=s3://my-bench-bucket/taquba \
 
 Each run is placed under a fresh `bench-<unix-millis>` prefix inside
 the URL's path, printed to stderr at startup, so a rerun never
-observes a previous run's state. Bench data is left in place on exit;
-delete the run prefixes afterwards or configure an object-lifecycle
-rule on the parent prefix. `STORE_LATENCY_MS` applies only to the
+observes a previous run's state. Set `STORE_PREFIX` to pin a fixed
+prefix instead, which several processes can share (the `cold_start`
+`build` and `measure` phases require this). Bench data is left in place
+on exit; delete the run prefixes afterwards or configure an
+object-lifecycle rule on the parent prefix. `STORE_LATENCY_MS` applies only to the
 in-memory store and is rejected when `STORE_URL` is set. Run from
 compute in the bucket's region; over a longer network path the round
 trip to the store dominates every number.
@@ -188,11 +206,12 @@ For `cold_start`:
 claim_idx,claim_us
 ```
 
-One row per post-restart claim, in claim order. Row 0 is the first
-claim after the reopen, which re-establishes the claim cursor's scan
-bound with a front prefix scan across the history's tombstone band;
-later rows show the warm path. Reopen time and a summary (first claim
-versus warm percentiles) print to stderr.
+One row per post-restart claim, in claim order (emitted by the `full`
+and `measure` phases; the `build` phase produces no CSV). Row 0 is the
+first claim after the reopen, which re-establishes the claim cursor's
+scan bound with a front prefix scan across the history's tombstone band;
+later rows show the warm path. The reopen time (`open_ms`) and a summary
+(first claim versus warm percentiles) print to stderr.
 
 For `reaper_storm`:
 
