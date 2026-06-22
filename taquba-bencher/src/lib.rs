@@ -58,10 +58,19 @@ pub fn store_from_env(latency_ms: u64) -> Result<Arc<dyn ObjectStore>, Box<dyn s
             .then_some((key, value))
     });
     let (store, path) = parse_url_opts(&url, options)?;
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis();
-    let run_prefix = path.child(format!("bench-{millis}"));
+    // Each run goes under a unique prefix so concurrent or repeated runs do
+    // not collide. STORE_PREFIX overrides it with a fixed value, which lets
+    // several processes (e.g. cold_start's build and measure phases) share
+    // one store.
+    let run_prefix = match std::env::var("STORE_PREFIX") {
+        Ok(prefix) => path.child(prefix),
+        Err(_) => {
+            let millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis();
+            path.child(format!("bench-{millis}"))
+        }
+    };
     eprintln!("store: {raw}, run prefix: {run_prefix}");
     Ok(Arc::new(PrefixStore::new(store, run_prefix)))
 }
