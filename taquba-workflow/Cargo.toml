@@ -46,6 +46,6 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 taquba-jobs = { workspace = true }
 
 # Used only by the `rig_agent` example.
-rig-core = "0.38"
+rig-core = "0.39"
 anyhow = "1"
 serde_json = "1"
