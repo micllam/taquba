@@ -117,3 +117,40 @@ pub fn init_tracing() {
         .with_writer(std::io::stderr)
         .init();
 }
+
+/// Metrics gauge-sampler interval from `METRICS_SAMPLE_MS` (default 1000 ms),
+/// or `None` when the `metrics` feature is off so the sampler stays disabled.
+/// Set it on `OpenOptions::metrics_sample_interval` unconditionally.
+pub fn metrics_sample_interval() -> Option<Duration> {
+    #[cfg(feature = "metrics")]
+    {
+        Some(Duration::from_millis(env_var("METRICS_SAMPLE_MS", 1000)))
+    }
+    #[cfg(not(feature = "metrics"))]
+    {
+        None
+    }
+}
+
+/// Install a Prometheus recorder (no HTTP server) so taquba's metric emission
+/// runs under load; the `metrics` facade macros are no-ops without a recorder.
+/// Returns the handle for a shutdown snapshot via [`report_metrics`]. Only the
+/// `metrics`-feature build exercises the emission path under load.
+#[cfg(feature = "metrics")]
+pub fn install_metrics_recorder() -> metrics_exporter_prometheus::PrometheusHandle {
+    metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .expect("install prometheus recorder")
+}
+
+/// Render `handle` and report how many `taquba_`/`slatedb_` metric series were
+/// captured, confirming the emission path produced data under load.
+#[cfg(feature = "metrics")]
+pub fn report_metrics(handle: &metrics_exporter_prometheus::PrometheusHandle) {
+    let series = handle
+        .render()
+        .lines()
+        .filter(|l| l.starts_with("taquba_") || l.starts_with("slatedb_"))
+        .count();
+    eprintln!("metrics: recorder captured {series} taquba_/slatedb_ series under load");
+}

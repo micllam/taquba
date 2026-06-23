@@ -16,6 +16,8 @@ publish = false
 aws = ["taquba/aws"]
 gcp = ["taquba/gcp"]
 azure = ["taquba/azure"]
+# Exercise taquba's metrics emission under load.
+metrics = ["taquba/metrics", "dep:metrics-exporter-prometheus"]
 
 [dependencies]
 taquba = { workspace = true }
@@ -29,6 +31,8 @@ thiserror = { workspace = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 async-trait = "0.1"
 rand = "0.9"
+# Recorder for the `metrics` feature's under-load validation (no HTTP server).
+metrics-exporter-prometheus = { version = "0.16", optional = true, default-features = false }
 # Benches install a stderr subscriber (RUST_LOG-driven).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # STORE_URL parsing.

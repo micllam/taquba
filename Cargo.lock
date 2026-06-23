@@ -1589,6 +1589,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "metrics-exporter-prometheus"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd7399781913e5393588a8d8c6a2867bf85fb38eaf2502fdce465aad2dc6f034"
+dependencies = [
+ "base64",
+ "indexmap",
+ "metrics",
+ "metrics-util 0.19.1",
+ "quanta",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "metrics-util"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1603,6 +1617,22 @@ dependencies = [
  "ordered-float 4.6.0",
  "quanta",
  "radix_trie",
+ "sketches-ddsketch",
+]
+
+[[package]]
+name = "metrics-util"
+version = "0.19.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8496cc523d1f94c1385dd8f0f0c2c480b2b8aeccb5b7e4485ad6365523ae376"
+dependencies = [
+ "crossbeam-epoch",
+ "crossbeam-utils",
+ "hashbrown 0.15.5",
+ "metrics",
+ "quanta",
+ "rand 0.9.4",
+ "rand_xoshiro",
  "sketches-ddsketch",
 ]
 
@@ -3008,7 +3038,7 @@ version = "0.8.0"
 dependencies = [
  "bytes",
  "metrics",
- "metrics-util",
+ "metrics-util 0.18.0",
  "rmp-serde",
  "serde",
  "slatedb",
@@ -3026,6 +3056,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "futures-util",
+ "metrics-exporter-prometheus",
  "rand 0.9.4",
  "serde",
  "taquba",

@@ -38,6 +38,11 @@
 //                       STORE_LATENCY_MS and STORE_JITTER_MS.
 //   DURATION_CAP_SEC    abort threshold for the measured phase
 //                       (default 600)
+//   METRICS_SAMPLE_MS   gauge sampler interval in ms (default 1000). Only
+//                       effective when built with `--features metrics`, which
+//                       installs a recorder so taquba's metric emission
+//                       (including the reaper's reaped counter) runs under
+//                       load; validates that path, not a measurement source.
 //
 // Output (stdout): CSV with header
 // `window_sec,storm_claimed,storm_pending,n_done,e2e_p50_us,e2e_p99_us,claim_p99_us`.
@@ -82,6 +87,7 @@ fn open_options(flush_interval_ms: u64, reaper_interval: Duration) -> OpenOption
         },
         flush_interval: Some(Duration::from_millis(flush_interval_ms)),
         reaper_interval,
+        metrics_sample_interval: taquba_bencher::metrics_sample_interval(),
         ..OpenOptions::default()
     }
 }
@@ -89,6 +95,12 @@ fn open_options(flush_interval_ms: u64, reaper_interval: Duration) -> OpenOption
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
+
+    // With `--features metrics`, install a recorder so the queue's metric
+    // emissions (including the reaper's reaped counter) run under load;
+    // rendered once at shutdown as a sanity check.
+    #[cfg(feature = "metrics")]
+    let prometheus = taquba_bencher::install_metrics_recorder();
 
     let n_expired: usize = env_var("N_EXPIRED", 5_000);
     let rate: f64 = env_var("RATE", 500.0);
@@ -362,5 +374,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let queue =
         Arc::try_unwrap(queue).map_err(|_| "queue still has outstanding references at shutdown")?;
     queue.close().await?;
+
+    #[cfg(feature = "metrics")]
+    taquba_bencher::report_metrics(&prometheus);
     Ok(())
 }

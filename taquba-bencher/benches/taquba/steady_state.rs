@@ -57,6 +57,12 @@
 //                       instead of the in-memory store; see
 //                       the crate README. Incompatible with
 //                       STORE_LATENCY_MS and STORE_JITTER_MS.
+//   METRICS_SAMPLE_MS   gauge sampler interval in ms (default 1000). Only
+//                       effective when built with `--features metrics`, which
+//                       installs a recorder so taquba's metric emission runs
+//                       under load; used to validate that path and its
+//                       overhead, not as a measurement source (the bench
+//                       still times operations directly).
 //
 // Output (stdout): CSV with header
 // `window_sec,n_enq,enq_p99_us,n_done,e2e_p50_us,e2e_p95_us,e2e_p99_us,claim_p99_us,ack_p99_us,pending`.
@@ -170,6 +176,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let queue_names: Arc<Vec<String>> =
         Arc::new((0..n_queues).map(|i| format!("bench-{i}")).collect());
 
+    // With `--features metrics`, install a recorder so the queue's metric
+    // emissions run under load (the facade macros are no-ops with no recorder);
+    // the gauge sampler is enabled via metrics_sample_interval below. Rendered
+    // once at shutdown as a sanity check.
+    #[cfg(feature = "metrics")]
+    let prometheus = taquba_bencher::install_metrics_recorder();
+
     let store = store_from_env(store_latency_ms)?;
     let queue = Arc::new(
         Queue::open_with_options(
@@ -181,6 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..QueueConfig::default()
                 },
                 flush_interval: Some(Duration::from_millis(flush_interval_ms)),
+                metrics_sample_interval: taquba_bencher::metrics_sample_interval(),
                 ..OpenOptions::default()
             },
         )
@@ -443,5 +457,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let queue =
         Arc::try_unwrap(queue).map_err(|_| "queue still has outstanding references at shutdown")?;
     queue.close().await?;
+
+    // Confirm the metrics path produced data under load (counters/histograms
+    // emitted inline, gauges from the sampler, SlateDB metrics via the bridge).
+    #[cfg(feature = "metrics")]
+    taquba_bencher::report_metrics(&prometheus);
     Ok(())
 }
