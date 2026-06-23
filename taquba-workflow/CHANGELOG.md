@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-23
+
+### Changed
+
+- Raised the minimum `taquba` requirement to 0.9.
+
 ## [0.6.0] - 2026-06-15
 
 ### Changed
