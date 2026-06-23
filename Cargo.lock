@@ -3024,7 +3024,9 @@ dependencies = [
 name = "taquba-bencher"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "futures-util",
+ "rand 0.9.4",
  "serde",
  "taquba",
  "taquba-bulk",

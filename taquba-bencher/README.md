@@ -73,6 +73,12 @@ RATE_SCHEDULE=300:0,1800:500,600:2000 \
 STORE_LATENCY_MS=20 RATE=200 \
     cargo bench -p taquba-bencher --bench steady_state > steady.csv
 
+# Study PUT tail latency locally: a 10ms latency floor plus up to 400ms of
+# random tail latency per write makes slow writes stall the WAL flush, so
+# backlog builds and e2e rises.
+STORE_LATENCY_MS=10 STORE_JITTER_MS=400 RATE=300 \
+    cargo bench -p taquba-bencher --bench steady_state > steady.csv
+
 # Workers claim in batches of 16 via Queue::claim_batch, amortizing
 # the per-claim lock hold and commit while draining a backlog.
 CLAIM_BATCH=16 RATE=3000 N_PRODUCERS=12 \
@@ -133,6 +139,14 @@ N_JOBS=2000 JOB_WORK_MS=50 MAX_CONCURRENT=200 \
 `ThrottledStore`, so every get, put, list, and delete sleeps that long
 before running. It is available on every benchmark.
 
+`STORE_JITTER_MS` adds, on top of any `STORE_LATENCY_MS` floor, a random
+tail latency in `[0, STORE_JITTER_MS]` (right-skewed, so most writes pay
+little and a few pay close to the maximum) to each write. It injects
+object-store PUT tail latency as a controllable variable: a slow write
+stalls SlateDB's serialized WAL flush, which can build backlog and raise
+e2e. Use it to study how PUT tail latency affects e2e and backlog locally
+with no cloud cost; it is available on every benchmark.
+
 ## Running against real object storage
 
 By default every benchmark runs on an in-memory store. Set `STORE_URL`
@@ -161,8 +175,9 @@ observes a previous run's state. Set `STORE_PREFIX` to pin a fixed
 prefix instead, which several processes can share (the `cold_start`
 `build` and `measure` phases require this). Bench data is left in place
 on exit; delete the run prefixes afterwards or configure an
-object-lifecycle rule on the parent prefix. `STORE_LATENCY_MS` applies only to the
-in-memory store and is rejected when `STORE_URL` is set. Run from
+object-lifecycle rule on the parent prefix. `STORE_LATENCY_MS` and
+`STORE_JITTER_MS` apply only to the in-memory store and are rejected when
+`STORE_URL` is set. Run from
 compute in the bucket's region; over a longer network path the round
 trip to the store dominates every number.
 

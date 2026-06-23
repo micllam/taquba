@@ -11,6 +11,9 @@ use taquba::object_store::prefix::PrefixStore;
 use taquba::object_store::throttle::{ThrottleConfig, ThrottledStore};
 use taquba::object_store::{ObjectStore, parse_url_opts};
 
+mod jitter;
+use jitter::JitterStore;
+
 /// Parse an env var, falling back to `default` when unset or unparsable.
 pub fn env_var<T: std::str::FromStr>(key: &str, default: T) -> T {
     std::env::var(key)
@@ -33,17 +36,20 @@ pub fn pct(sorted: &[u64], p: usize) -> u64 {
 /// previous run's state; the prefix is printed to stderr. Cloud
 /// schemes require the matching cargo feature on this crate and read
 /// provider configuration from the `AWS_*` / `GOOGLE_*` / `AZURE_*`
-/// env vars. `STORE_LATENCY_MS` throttles the in-memory store only,
-/// so combining it with `STORE_URL` is an error.
+/// env vars. `STORE_LATENCY_MS` (fixed per-call latency) and
+/// `STORE_JITTER_MS` (random tail latency added to writes) throttle the
+/// in-memory store only, so combining either with `STORE_URL` is an
+/// error.
 ///
 /// Without `STORE_URL`, the in-memory store from `store_with_latency`.
 pub fn store_from_env(latency_ms: u64) -> Result<Arc<dyn ObjectStore>, Box<dyn std::error::Error>> {
+    let jitter_ms: u64 = env_var("STORE_JITTER_MS", 0);
     let Ok(raw) = std::env::var("STORE_URL") else {
-        return Ok(store_with_latency(latency_ms));
+        return Ok(store_with_latency(latency_ms, jitter_ms));
     };
-    if latency_ms > 0 {
+    if latency_ms > 0 || jitter_ms > 0 {
         return Err(
-            "STORE_LATENCY_MS throttles the in-memory store only; unset it when STORE_URL is set"
+            "STORE_LATENCY_MS and STORE_JITTER_MS throttle the in-memory store only; unset them when STORE_URL is set"
                 .into(),
         );
     }
@@ -77,9 +83,12 @@ pub fn store_from_env(latency_ms: u64) -> Result<Arc<dyn ObjectStore>, Box<dyn s
 
 /// In-memory object store, wrapped in `object_store`'s `ThrottledStore`
 /// when `latency_ms` is above 0 so every get, put, list, and delete
-/// sleeps that long before running, approximating an S3-class backend.
-fn store_with_latency(latency_ms: u64) -> Arc<dyn ObjectStore> {
-    if latency_ms > 0 {
+/// sleeps that long before running, approximating an S3-class backend,
+/// and in a `JitterStore` when `jitter_ms` is above 0 so each write also
+/// pays a random tail latency in `[0, jitter_ms]` on top of the fixed
+/// floor, injecting object-store PUT tail latency.
+fn store_with_latency(latency_ms: u64, jitter_ms: u64) -> Arc<dyn ObjectStore> {
+    let base: Arc<dyn ObjectStore> = if latency_ms > 0 {
         let wait = Duration::from_millis(latency_ms);
         let config = ThrottleConfig {
             wait_delete_per_call: wait,
@@ -91,6 +100,11 @@ fn store_with_latency(latency_ms: u64) -> Arc<dyn ObjectStore> {
         Arc::new(ThrottledStore::new(InMemory::new(), config))
     } else {
         Arc::new(InMemory::new())
+    };
+    if jitter_ms > 0 {
+        Arc::new(JitterStore::new(base, Duration::from_millis(jitter_ms)))
+    } else {
+        base
     }
 }
 

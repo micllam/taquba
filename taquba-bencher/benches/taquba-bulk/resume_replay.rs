@@ -27,11 +27,13 @@
 //                       list, and delete sleeps this long before running,
 //                       approximating an S3-class backend. Applies to
 //                       memo reads and writes as well as the queue.
+//   STORE_JITTER_MS     random tail latency in [0, STORE_JITTER_MS] added to
+//                       each write on top of STORE_LATENCY_MS (default 0).
 //   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
 //                       az://..., file:///abs/path) to run against
 //                       instead of the in-memory store; see
 //                       the crate README. Incompatible with
-//                       STORE_LATENCY_MS.
+//                       STORE_LATENCY_MS and STORE_JITTER_MS.
 //
 // Output (stdout): CSV with header `window_sec,completed`, one row per
 // second with the cumulative number of terminal items. A summary

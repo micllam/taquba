@@ -48,11 +48,15 @@
 //                       object_store's ThrottledStore so every get, put,
 //                       list, and delete sleeps this long before running,
 //                       approximating an S3-class backend.
+//   STORE_JITTER_MS     random tail latency in [0, STORE_JITTER_MS] added
+//                       to each write on top of STORE_LATENCY_MS (default 0),
+//                       injecting object-store PUT tail latency to study its
+//                       effect on e2e and backlog without real S3.
 //   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
 //                       az://..., file:///abs/path) to run against
 //                       instead of the in-memory store; see
 //                       the crate README. Incompatible with
-//                       STORE_LATENCY_MS.
+//                       STORE_LATENCY_MS and STORE_JITTER_MS.
 //
 // Output (stdout): CSV with header
 // `window_sec,n_enq,enq_p99_us,n_done,e2e_p50_us,e2e_p95_us,e2e_p99_us,claim_p99_us,ack_p99_us,pending`.

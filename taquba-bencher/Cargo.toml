@@ -27,6 +27,8 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 serde = { workspace = true }
 thiserror = { workspace = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+async-trait = "0.1"
+rand = "0.9"
 # Benches install a stderr subscriber (RUST_LOG-driven).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # STORE_URL parsing.
