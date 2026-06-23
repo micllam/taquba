@@ -59,6 +59,28 @@ windows, backlog behaviour, deviations from defaults>.
 
 ## Log
 
+### 2026-06-23 - 8h time-varying soak on real S3
+
+- **taquba:** 0.8.0 (`8190136`)
+- **Benchmark:** steady_state (`benches/taquba/steady_state.rs`), RATE_SCHEDULE mode; plus cold_start measure phase
+- **Host:** m7i.xlarge, 4 vCPU / 16 GiB, us-east-1
+- **Store:** real S3, Standard storage class, us-east-1 (same region as host)
+- **Parameters:** `RATE_SCHEDULE` = 7200s cycle `600:0,2400:400,2400:800,600:1200,1200:300` x 4 (28800s total), `N_PRODUCERS=128 N_WORKERS=128 FLUSH_INTERVAL_MS=50 CLAIM_BATCH=1` payload 64 B, 1 queue
+- **Command:** `cargo bench -p taquba-bencher --features aws --bench steady_state` (soak); `STORE_PREFIX=bench-soak1 PHASE=measure cargo bench -p taquba-bencher --features aws --bench cold_start` (post-soak reopen of the same store)
+
+Per-segment metrics, one column per cycle (c1/c2/c3/c4). Terms: a window is one 1-second stats bucket; a segment is one constant-rate phase of the schedule; a cycle is one full pass of the schedule, repeated 4x. The five segments per cycle, in order, are idle (0/s, 600s; omitted below, no throughput to measure), low (400/s, 2400s), high (800/s, 2400s), peak (1200/s, 600s), and cool (300/s, 1200s). e2e p99 and claim p99 are each the mean of the per-window p99 over the segment; pending peak is the max pending in the segment:
+
+| segment | rate | e2e p99 c1/c2/c3/c4 | claim p99 c1/c2/c3/c4 | pending peak c1/c2/c3/c4 |
+|---|---|---|---|---|
+| low | 400/s | 200 / 199 / 197 / 206 ms | 13 / 15 / 15 / 17 ms | 372 / 375 / 372 / 373 |
+| high | 800/s | 253 / 239 / 407 / 251 ms | 17 / 17 / 19 / 19 ms | 1198 / 1628 / 4421 / 1016 |
+| peak | 1200/s | 516 / 312 / 2755 / 592 ms | 21 / 17 / 23 / 21 ms | 3381 / 1613 / 11451 / 2752 |
+| cool | 300/s | 201 / 195 / 213 / 209 ms | 16 / 16 / 16 / 15 ms | 1022 / 246 / 1467 / 249 |
+
+Idle storage (objects / MB) at the cycle 2/3/4 idle segments (cycle 1's idle precedes any load): 41/55.6, 75/111.5, 108/97.8. Peak storage (at heaviest load): 5517 objects / 780 MB. Cold reopen of the gracefully closed drained store: 1306 ms.
+
+Notes: Zero errors/warns/conflicts over 8h; graceful drain at end. (a) No leak: idle storage bytes stayed bounded (cycle 4 below cycle 3) even as object count rose across the three idle samples, at ~2% of peak storage, with queue `pending`=0 at every idle. (b) Per-operation cost is flat across all 4 cycles and segments (enq/ack/claim p99 unchanged; mean claim p99 13-23 ms throughout); all cross-cycle variation is in backlog and the e2e it induces. The peak segment runs at the commit-rate ceiling (1200 jobs/s = ~2400 commits/s, 1 enqueue + 1 ack each, near the single-writer saturation ceiling measured in the 2026-06-19 sweep at flush 1 ms, though this run used flush 50 ms where the ceiling was not directly measured), where the queue is only marginally stable, so its backlog and e2e are inherently variable across cycles, not an artifact of a single cycle: pending peak 3381/1613/11451/2752, mean e2e p99 516/312/2755/592 ms. Cycle 3 is the most severe: a small, sustained shortfall in achievable commit rate built backlog through its high segment (pending 4421, e2e p99 407 ms vs ~250 ms in the other cycles) and into its peak (11451), where the maximum per-window e2e p99 reached 9888 ms (against the 2755 ms segment mean). That is queueing delay, not slow writes: e2e tracks the backlog divided by the service rate (11451 / ~1200/s = ~9.5 s) while per-op durable-write latency (enq_p99/ack_p99 ~110-320 ms) stayed at its baseline throughout. With only 4 cycles the run does not establish how often this occurs, only that it can; the trigger is undetermined from these metrics (candidates: transient reduction in S3 accepted throughput for the prefix, background compaction, or host contention), and the flat per-op latencies rule out slow individual PUTs. (c) Backlog always recovers: every segment's backlog, including cycle 3's 11451, drained to ~0 by the following cool and idle segments, and throughput returned to the offered rate after each peak. flush_interval=50 ms (between the 1 ms and 100 ms points of the 2026-06-19 sweep).
+
 ### 2026-06-19 - throughput ceiling and flush_interval sweep on real S3
 
 - **taquba:** 0.8.0, post-fix (`f05acc0`, master)
