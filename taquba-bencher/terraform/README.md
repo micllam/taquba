@@ -50,6 +50,46 @@ terraform destroy
 Record the `git_ref` you built and the instance type in the
 `RESULTS.md` entry so the numbers stay tied to their environment.
 
+## Sampling storage during a run
+
+To track storage growth over a long run (leak and drift checks),
+`sample-storage.sh` appends `epoch,objects,bytes` rows to a CSV on a
+fixed interval. The AWS CLI is preinstalled by `user_data`, so run it
+from the cloned repo on the host:
+
+```bash
+# Sample the run's prefix every 5 minutes.
+/opt/taquba/taquba-bencher/terraform/sample-storage.sh \
+  s3://<bucket>/<store-prefix> storage.csv 300
+```
+
+On a missing CLI or an `aws s3 ls` error it appends an `ERR` row
+(and an `*.aws-err.log`). It loops until killed.
+
+## Running a long bench in the background
+
+An SSM shell dies with your connection, killing any foreground bench.
+For multi-hour runs, start the bench and the sampler as transient
+`systemd-run` units; they survive disconnects and are queryable with
+`systemctl` and `journalctl`:
+
+```bash
+# Bench. bash -c sets the toolchain env and redirects output to files.
+systemd-run --unit taquba-bench --working-directory /opt/taquba \
+  bash -c 'export RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo PATH=/opt/rust/cargo/bin:$PATH; \
+    STORE_URL=s3://<bucket> AWS_REGION=<region> \
+    cargo bench -p taquba-bencher --features aws --bench steady_state \
+    > /opt/taquba/bench.csv 2> /opt/taquba/bench.err'
+
+# Sampler (writes its own CSV).
+systemd-run --unit taquba-storage \
+  /opt/taquba/taquba-bencher/terraform/sample-storage.sh \
+    s3://<bucket>/<store-prefix> /opt/taquba/storage.csv 300
+
+systemctl status taquba-bench    # progress; reads inactive when done
+systemctl stop taquba-storage    # stop the sampler once the bench ends
+```
+
 ## Retrieving results before destroy
 
 `terraform destroy` deletes everything, including the instance and the
