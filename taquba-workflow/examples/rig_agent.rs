@@ -285,10 +285,10 @@ impl TerminalHook for ShutdownOnComplete {
             "\n=== run {} {} (final_step={}) ===",
             outcome.run_id, outcome.status, outcome.final_step
         );
-        if outcome.status == TerminalStatus::Failed {
-            if let Some(err) = &outcome.error {
-                eprintln!("error: {err}");
-            }
+        if outcome.status == TerminalStatus::Failed
+            && let Some(err) = &outcome.error
+        {
+            eprintln!("error: {err}");
         }
         if let Some(tx) = self.shutdown.lock().await.take() {
             let _ = tx.send(());

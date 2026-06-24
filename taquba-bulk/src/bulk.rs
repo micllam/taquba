@@ -333,16 +333,16 @@ impl<P: Pipeline> Bulk<P> {
         self.sink.flush()?;
 
         let report = self.shared.state.lock().unwrap().to_report();
-        if let Some(threshold) = self.fail_threshold {
-            if report.total > 0 {
-                let pct = report.failed as f64 / report.total as f64 * 100.0;
-                if pct > threshold {
-                    return Err(Error::FailureThresholdExceeded {
-                        failed: report.failed,
-                        total: report.total,
-                        threshold,
-                    });
-                }
+        if let Some(threshold) = self.fail_threshold
+            && report.total > 0
+        {
+            let pct = report.failed as f64 / report.total as f64 * 100.0;
+            if pct > threshold {
+                return Err(Error::FailureThresholdExceeded {
+                    failed: report.failed,
+                    total: report.total,
+                    threshold,
+                });
             }
         }
         Ok(report)

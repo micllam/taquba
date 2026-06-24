@@ -57,7 +57,7 @@ impl Worker for EmailWorker {
             + 1;
         let (to, subject) = decode(&job.payload);
 
-        if self.fail_every > 0 && n % self.fail_every == 0 {
+        if self.fail_every > 0 && n.is_multiple_of(self.fail_every) {
             eprintln!(
                 "  [attempt {}/{}] SMTP error sending '{}' to {}",
                 job.attempts, job.max_attempts, subject, to

@@ -34,7 +34,7 @@ impl Worker for PrintWorker {
             + 1;
         let payload = String::from_utf8_lossy(&job.payload);
 
-        if self.fail_every > 0 && n % self.fail_every == 0 {
+        if self.fail_every > 0 && n.is_multiple_of(self.fail_every) {
             println!(
                 "  [attempt {}/{}] FAIL  '{}'",
                 job.attempts, job.max_attempts, payload

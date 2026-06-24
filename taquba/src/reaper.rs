@@ -75,19 +75,17 @@ impl Reaper {
                         Ok(_) => job_available.notify_waiters(),
                         Err(e) => warn!("lease reaper error: {e}"),
                     }
-                    if any_keep_done {
-                        if let Err(e) =
+                    if any_keep_done
+                        && let Err(e) =
                             sweep_done(&db, clock.as_ref(), &keep_done_for, max_keep_done)
                                 .await
                         {
                             warn!("done retention sweep error: {e}");
                         }
-                    }
-                    if any_dead_retention {
-                        if let Err(e) = sweep_dead(&db, clock.as_ref(), &dead_retention_for).await {
+                    if any_dead_retention
+                        && let Err(e) = sweep_dead(&db, clock.as_ref(), &dead_retention_for).await {
                             warn!("dead retention sweep error: {e}");
                         }
-                    }
                 }
                 _ = shutdown.changed() => break,
             }

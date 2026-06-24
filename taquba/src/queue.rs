@@ -952,12 +952,11 @@ impl Queue {
             .as_ref()
             .map(|dk| dedup_index_key(&job.queue, dk));
 
-        if let Some(ref dkey) = dkey {
-            if let Some(bytes) = txn.get(dkey.as_bytes()).await? {
-                let existing =
-                    String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidState)?;
-                return Ok(Err(existing));
-            }
+        if let Some(ref dkey) = dkey
+            && let Some(bytes) = txn.get(dkey.as_bytes()).await?
+        {
+            let existing = String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidState)?;
+            return Ok(Err(existing));
         }
 
         if *id_override_used && txn.get(job_index_key(&job.id).as_bytes()).await?.is_some() {
@@ -2230,10 +2229,8 @@ mod tests {
                     && key
                         .labels()
                         .any(|l| l.key() == "queue" && l.value() == "gsamp");
-                if ours {
-                    if let DebugValue::Gauge(g) = value {
-                        gauge = Some(g.into_inner());
-                    }
+                if ours && let DebugValue::Gauge(g) = value {
+                    gauge = Some(g.into_inner());
                 }
             }
             if gauge == Some(3.0) {

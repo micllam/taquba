@@ -792,10 +792,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     /// when it finishes.
     fn release_submit_lock(&self, run_id: &str) {
         let mut map = self.submit_locks.lock().unwrap();
-        if let Some(lock) = map.get(run_id) {
-            if Arc::strong_count(lock) == 1 {
-                map.remove(run_id);
-            }
+        if let Some(lock) = map.get(run_id)
+            && Arc::strong_count(lock) == 1
+        {
+            map.remove(run_id);
         }
     }
 
@@ -891,17 +891,16 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     /// which re-terminates and retries the delete.
     async fn terminate_collecting_effects(&self, outcome: RunOutcome) -> AckEffects {
         self.registry.lock().await.remove(&outcome.run_id);
-        if self.memo_retention.is_some() {
-            if let Err(err) = self
+        if self.memo_retention.is_some()
+            && let Err(err) = self
                 .memo_store
                 .write_terminal_marker(&outcome.run_id, self.clock.now_ms())
                 .await
-            {
-                warn!(
-                    run_id = %outcome.run_id,
-                    "failed to write terminal marker: {err}"
-                );
-            }
+        {
+            warn!(
+                run_id = %outcome.run_id,
+                "failed to write terminal marker: {err}"
+            );
         }
         let kv_deletes = vec![run_kv_key(&outcome.run_id)];
         self.terminal_hook.on_termination(&outcome).await;
@@ -1132,18 +1131,18 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .get(&run_id)
             .is_some_and(|e| e.cancel_requested);
 
-        if self.step_output_replay && !replayed_step_output && !external_cancel {
-            if let Ok(ref outcome) = outcome {
-                if let Err(err) = self
-                    .store_step_output(&run_id, step_number, &job.payload, outcome)
-                    .await
-                {
-                    if err.is_permanent() {
-                        return Err(PermanentFailure::new(err.to_string()).into());
-                    }
-                    return Err(err.to_string().into());
-                }
+        if self.step_output_replay
+            && !replayed_step_output
+            && !external_cancel
+            && let Ok(ref outcome) = outcome
+            && let Err(err) = self
+                .store_step_output(&run_id, step_number, &job.payload, outcome)
+                .await
+        {
+            if err.is_permanent() {
+                return Err(PermanentFailure::new(err.to_string()).into());
             }
+            return Err(err.to_string().into());
         }
 
         // Cancellation precedence:
@@ -1961,10 +1960,11 @@ mod tests {
         // Wait for runtime A to claim step 0 and reach the gate (registry
         // shows Running for step 0).
         for _ in 0..80 {
-            if let Some(s) = runtime_a.status(&handle.run_id).await {
-                if s.state == RunState::Running && s.current_step == 0 {
-                    break;
-                }
+            if let Some(s) = runtime_a.status(&handle.run_id).await
+                && s.state == RunState::Running
+                && s.current_step == 0
+            {
+                break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
