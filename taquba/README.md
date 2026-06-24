@@ -100,6 +100,8 @@ async fn main() -> taquba::Result<()> {
 }
 ```
 
+See [`examples/quickstart.rs`](examples/quickstart.rs) for a runnable version.
+
 ## Worker loop
 
 Implement `Worker` and let `run_worker` handle the claim / ack / nack

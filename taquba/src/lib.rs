@@ -50,6 +50,8 @@
 //! # }
 //! ```
 //!
+//! See `examples/quickstart.rs` for a runnable version.
+//!
 //! # Job lifecycle
 //!
 //! ```text
