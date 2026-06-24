@@ -1,5 +1,9 @@
 # taquba-bulk
 
+[![crates.io](https://img.shields.io/crates/v/taquba-bulk.svg)](https://crates.io/crates/taquba-bulk)
+[![docs.rs](https://img.shields.io/docsrs/taquba-bulk)](https://docs.rs/taquba-bulk)
+[![license](https://img.shields.io/crates/l/taquba-bulk.svg)](#license)
+
 Bulk multi-step processing on top of [taquba-workflow](../taquba-workflow) and
 the [Taquba](../taquba) durable task queue.
 

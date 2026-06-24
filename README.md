@@ -1,5 +1,7 @@
 # Taquba
 
+[![license](https://img.shields.io/crates/l/taquba.svg)](#license)
+
 A durable task queue and durable-execution workflow runtime for Rust with
 **built-in transactional coordination on object storage**, and no stateful
 service to operate. Workflow state lives directly in your object storage; every compute

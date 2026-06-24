@@ -1,5 +1,9 @@
 # taquba-webhooks
 
+[![crates.io](https://img.shields.io/crates/v/taquba-webhooks.svg)](https://crates.io/crates/taquba-webhooks)
+[![docs.rs](https://img.shields.io/docsrs/taquba-webhooks)](https://docs.rs/taquba-webhooks)
+[![license](https://img.shields.io/crates/l/taquba-webhooks.svg)](#license)
+
 HTTP webhook delivery on top of the [Taquba](../taquba) durable task queue.
 
 > Part of the [Taquba ecosystem](https://github.com/micllam/taquba); see the

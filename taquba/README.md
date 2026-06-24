@@ -1,5 +1,9 @@
 # Taquba
 
+[![crates.io](https://img.shields.io/crates/v/taquba.svg)](https://crates.io/crates/taquba)
+[![docs.rs](https://img.shields.io/docsrs/taquba)](https://docs.rs/taquba)
+[![license](https://img.shields.io/crates/l/taquba.svg)](#license)
+
 A durable, single-process task queue for Rust with **no stateful service to
 operate**. Queue state lives directly in your object storage; compute is
 stateless and replaceable. Because all state shares one transactional store,

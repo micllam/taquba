@@ -1,5 +1,9 @@
 # taquba-workflow
 
+[![crates.io](https://img.shields.io/crates/v/taquba-workflow.svg)](https://crates.io/crates/taquba-workflow)
+[![docs.rs](https://img.shields.io/docsrs/taquba-workflow)](https://docs.rs/taquba-workflow)
+[![license](https://img.shields.io/crates/l/taquba-workflow.svg)](#license)
+
 Durable execution on object storage: an at-least-once workflow runtime on
 top of the [Taquba](../taquba) durable task queue.
 

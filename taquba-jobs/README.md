@@ -1,5 +1,9 @@
 # taquba-jobs
 
+[![crates.io](https://img.shields.io/crates/v/taquba-jobs.svg)](https://crates.io/crates/taquba-jobs)
+[![docs.rs](https://img.shields.io/docsrs/taquba-jobs)](https://docs.rs/taquba-jobs)
+[![license](https://img.shields.io/crates/l/taquba-jobs.svg)](#license)
+
 Durable, typed async function execution on top of the [Taquba](https://docs.rs/taquba) durable task queue.
 
 > Part of the [Taquba ecosystem](https://github.com/micllam/taquba); see the

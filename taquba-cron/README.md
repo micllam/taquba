@@ -1,5 +1,9 @@
 # taquba-cron
 
+[![crates.io](https://img.shields.io/crates/v/taquba-cron.svg)](https://crates.io/crates/taquba-cron)
+[![docs.rs](https://img.shields.io/docsrs/taquba-cron)](https://docs.rs/taquba-cron)
+[![license](https://img.shields.io/crates/l/taquba-cron.svg)](#license)
+
 POSIX cron-style scheduling on top of the [Taquba](../taquba) durable task queue.
 
 > Part of the [Taquba ecosystem](https://github.com/micllam/taquba); see the
