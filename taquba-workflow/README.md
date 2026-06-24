@@ -1,7 +1,7 @@
 # taquba-workflow
 
-Durable, at-least-once workflow runtime on top of the
-[Taquba](../taquba) durable task queue.
+Durable execution on object storage: an at-least-once workflow runtime on
+top of the [Taquba](../taquba) durable task queue.
 
 > Part of the [Taquba ecosystem](https://github.com/micllam/taquba); see the
 > workspace README for the queue core and the other crates that compose with

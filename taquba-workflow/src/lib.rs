@@ -1,4 +1,5 @@
-//! Durable, at-least-once workflow runtime on top of the [Taquba] task queue.
+//! Durable execution on object storage: an at-least-once workflow runtime on
+//! top of the [Taquba] task queue.
 //!
 //! `taquba-workflow` is the plumbing for any multi-step process that
 //! benefits from durable state between steps: idempotent step execution,

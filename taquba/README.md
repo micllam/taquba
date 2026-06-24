@@ -7,8 +7,8 @@ queue operations compose atomically: a single transaction can acknowledge a
 job, enqueue its follow-ups, and update caller-owned KV state.
 
 > The foundation of the [Taquba ecosystem](https://github.com/micllam/taquba);
-> see the workspace README for the workflow runtime, cron, jobs, and webhooks
-> crates that build on this queue.
+> see the workspace README for the durable-execution workflow runtime, cron,
+> jobs, and webhooks crates that build on this queue.
 
 Built on [SlateDB](https://github.com/slatedb/slatedb). All producers and
 workers for a given store run inside one process and share an `Arc<Queue>`.

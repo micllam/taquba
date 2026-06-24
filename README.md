@@ -1,8 +1,8 @@
 # Taquba
 
-A durable task queue and workflow runtime for Rust with **built-in
-transactional coordination on object storage**, and no stateful service to
-operate. Workflow state lives directly in your object storage; every compute
+A durable task queue and durable-execution workflow runtime for Rust with
+**built-in transactional coordination on object storage**, and no stateful
+service to operate. Workflow state lives directly in your object storage; every compute
 node is replaceable.
 
 Taquba is a workspace of Rust crates that compose into a durable execution
