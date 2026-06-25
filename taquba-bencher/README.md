@@ -114,7 +114,11 @@ STORE_LATENCY_MS=10 N_SHARDS=4 DURATION_SEC=30 \
 # CLAIM_BATCH (default 64) batches claims so the drain rate matches the
 # saturating enqueue rate; on a high-latency store single claims (CLAIM_BATCH=1)
 # would drain far more slowly than enqueue and build a large backlog.
-PAYLOAD_SIZES=64,1024,16384,262144 DURATION_SEC=20 CLAIM_BATCH=64 \
+# LEASE_SEC (default 60) must exceed the time a worker takes to ack a full
+# CLAIM_BATCH on the target store; if it does not, leases expire mid-batch, the
+# reaper reclaims jobs and acks fail with ClaimLost, double-processing jobs and
+# inflating the byte counts.
+PAYLOAD_SIZES=64,1024,16384,262144 DURATION_SEC=20 CLAIM_BATCH=64 LEASE_SEC=60 \
     cargo bench -p taquba-bencher --bench payload_sweep > payload_sweep.csv
 
 # Spread the load across 100 queues (one worker each), exercising the

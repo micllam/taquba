@@ -19,6 +19,7 @@
 //   N_PRODUCERS         concurrent enqueue tasks per size (default 4).
 //   N_WORKERS           concurrent claim/ack tasks per size (default 8).
 //   CLAIM_BATCH         jobs claimed per claim_batch call (default 64).
+//   LEASE_SEC           claim lease in seconds (default 60).
 //   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1).
 //   STORE_LATENCY_MS    injected per-call object-store latency (default 0;
 //                       in-memory store only).
@@ -51,9 +52,6 @@ use taquba::object_store::ObjectStore;
 use taquba::{OpenOptions, Queue, QueueConfig};
 use taquba_bencher::{CountingStore, env_var, init_tracing, pct, store_from_env};
 
-/// Lease held while a worker has a job claimed. Long enough that an idle
-/// scheduler tick during the run never lets a lease expire.
-const LEASE: Duration = Duration::from_secs(5);
 /// How often the watcher samples stats for the drain check.
 const WATCHER_TICK: Duration = Duration::from_secs(1);
 /// How long an idle worker sleeps before re-polling while producing.
@@ -82,6 +80,7 @@ struct RunCfg {
     n_producers: usize,
     n_workers: usize,
     claim_batch: usize,
+    lease: Duration,
     flush_ms: u64,
 }
 
@@ -99,6 +98,7 @@ async fn run_one(
         n_producers,
         n_workers,
         claim_batch,
+        lease,
         flush_ms,
     } = *cfg;
     let store: Arc<dyn ObjectStore> = counting.clone();
@@ -168,7 +168,7 @@ async fn run_one(
         worker_handles.push(tokio::spawn(async move {
             let mut samples: Vec<DoneSample> = Vec::with_capacity(8192);
             'poll: loop {
-                match queue.claim_batch(QUEUE, claim_batch, LEASE).await {
+                match queue.claim_batch(QUEUE, claim_batch, lease).await {
                     Ok(jobs) if jobs.is_empty() => {
                         if drain_complete.load(Ordering::Relaxed) {
                             break;
@@ -315,12 +315,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n_producers: usize = env_var("N_PRODUCERS", 4);
     let n_workers: usize = env_var("N_WORKERS", 8);
     let claim_batch: usize = env_var("CLAIM_BATCH", 64).max(1);
+    let lease_sec: u64 = env_var("LEASE_SEC", 60).max(1);
     let flush_ms: u64 = env_var("FLUSH_INTERVAL_MS", 1);
     let store_latency_ms: u64 = env_var("STORE_LATENCY_MS", 0);
 
     eprintln!(
         "payload_sweep: sizes={sizes:?}B, duration={duration_sec}s, producers={n_producers}, \
-         workers={n_workers}, claim_batch={claim_batch}, flush={flush_ms}ms, \
+         workers={n_workers}, claim_batch={claim_batch}, lease={lease_sec}s, flush={flush_ms}ms, \
          store_latency={store_latency_ms}ms",
     );
 
@@ -332,6 +333,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         n_producers,
         n_workers,
         claim_batch,
+        lease: Duration::from_secs(lease_sec),
         flush_ms,
     };
 
