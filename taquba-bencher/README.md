@@ -276,7 +276,9 @@ storage engine's LSM write amplification in isolation, and in short runs
 compaction may not have run, so large-payload values are a lower bound.
 Load is saturating, so the `e2e_*` columns reflect backlog under that load,
 not clean round-trip latency; use `steady_state` with `PAYLOAD_BYTES`
-for that.
+for that. Per size, a cumulative `store_amp` is logged to stderr each
+second so its convergence (compaction amortizing over a long run) is
+visible, not just the final per-size value.
 
 For `step_transitions`:
 

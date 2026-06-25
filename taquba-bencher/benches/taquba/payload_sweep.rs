@@ -38,10 +38,12 @@
 // bound. The `e2e_*` columns are enqueue-to-ack latency under saturating load,
 // so they reflect backlog rather than clean round-trip latency; use
 // steady_state with PAYLOAD_BYTES for round-trip latency versus payload.
-// Progress prints go to stderr so stdout stays a clean data stream.
+// Progress prints go to stderr (so stdout stays a clean data stream) and
+// include a per-second cumulative store_amp for each size, making its rise and
+// plateau as compaction amortizes visible during the run.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use taquba::object_store::ObjectStore;
@@ -76,7 +78,7 @@ struct RunResult {
 /// possible for `duration` while workers claim and ack, then the backlog
 /// drains.
 async fn run_one(
-    store: Arc<dyn ObjectStore>,
+    counting: Arc<CountingStore>,
     db_path: String,
     payload_bytes: usize,
     duration: Duration,
@@ -84,6 +86,7 @@ async fn run_one(
     n_workers: usize,
     flush_ms: u64,
 ) -> Result<RunResult, Box<dyn std::error::Error>> {
+    let store: Arc<dyn ObjectStore> = counting.clone();
     let queue = Arc::new(
         Queue::open_with_options(
             store,
@@ -101,6 +104,10 @@ async fn run_one(
     );
 
     let bench_start = Instant::now();
+    // PUT bytes counted before this size; subtracting it gives the per-size
+    // delta, so the watcher's cumulative store_amp excludes earlier sizes.
+    let bytes0 = counting.put_bytes();
+    let acked = Arc::new(AtomicU64::new(0));
     let producers_done = Arc::new(AtomicBool::new(false));
     let drain_complete = Arc::new(AtomicBool::new(false));
 
@@ -139,6 +146,7 @@ async fn run_one(
     for worker_idx in 0..n_workers {
         let queue = queue.clone();
         let drain_complete = drain_complete.clone();
+        let acked = acked.clone();
         worker_handles.push(tokio::spawn(async move {
             let mut samples: Vec<DoneSample> = Vec::with_capacity(8192);
             loop {
@@ -153,6 +161,7 @@ async fn run_one(
                         let ack_us = ack_start.elapsed().as_micros() as u64;
                         let done_us = bench_start.elapsed().as_micros() as u64;
                         samples.push((done_us - enq_start_us, ack_us));
+                        acked.fetch_add(1, Ordering::Relaxed);
                     }
                     Ok(None) => {
                         if drain_complete.load(Ordering::Relaxed) {
@@ -175,6 +184,8 @@ async fn run_one(
         let queue = queue.clone();
         let producers_done = producers_done.clone();
         let drain_complete = drain_complete.clone();
+        let counting = counting.clone();
+        let acked = acked.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(WATCHER_TICK);
             tick.tick().await; // skip immediate first tick
@@ -184,12 +195,20 @@ async fn run_one(
                     Ok(s) => s,
                     Err(_) => continue,
                 };
+                // Cumulative store_amp for this size so far, so its rise and
+                // plateau as compaction amortizes are visible during the run.
+                let done = acked.load(Ordering::Relaxed);
+                let bytes = counting.put_bytes().saturating_sub(bytes0);
+                let store_amp = if done > 0 {
+                    bytes as f64 / (done as f64 * payload_bytes as f64)
+                } else {
+                    0.0
+                };
                 eprintln!(
-                    "  [{payload_bytes}B] t={}s pending={} claimed={} done={}",
+                    "  [{payload_bytes}B] t={}s pending={} claimed={} acked={done} store_amp={store_amp:.2}",
                     bench_start.elapsed().as_secs(),
                     s.pending,
                     s.claimed,
-                    s.done
                 );
                 if producers_done.load(Ordering::Relaxed) && s.pending == 0 && s.claimed == 0 {
                     drain_complete.store(true, Ordering::Relaxed);
@@ -284,7 +303,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let base = store_from_env(store_latency_ms)?;
     let counting = Arc::new(CountingStore::new(base));
-    let store: Arc<dyn ObjectStore> = counting.clone();
 
     println!(
         "payload_bytes,enq_per_s,enq_mbps,enq_p50_us,enq_p99_us,done_per_s,e2e_p50_us,e2e_p99_us,ack_p99_us,bytes_per_job,puts_per_job,store_amp"
@@ -293,7 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let before_bytes = counting.put_bytes();
         let before_puts = counting.put_count();
         let r = run_one(
-            store.clone(),
+            counting.clone(),
             format!("bench-db-{size}"),
             size,
             Duration::from_secs(duration_sec),
