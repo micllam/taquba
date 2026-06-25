@@ -9,10 +9,10 @@
 // idempotent short-circuit that crash-resume relies on.
 //
 // Parameters (env vars, all optional).
-//   N_JOBS              jobs per phase (default 500)
-//   JOB_WORK_MS         simulated work per job execution (default 0)
-//   MAX_CONCURRENT      jobs processed in parallel (default 50)
-//   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1)
+//   N_JOBS              jobs per phase (default 500).
+//   JOB_WORK_MS         simulated work per job execution (default 0).
+//   MAX_CONCURRENT      jobs processed in parallel (default 50).
+//   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1).
 //   STORE_LATENCY_MS    injected object-store latency per call (default 0).
 //                       When set, the in-memory store is wrapped in
 //                       object_store's ThrottledStore so every get, put,

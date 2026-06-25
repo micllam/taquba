@@ -6,9 +6,9 @@
 // in microseconds.
 //
 // Parameters (env vars, all optional).
-//   N_JOBS              jobs enqueued before the drain starts (default 5_000)
-//   N_WORKERS           concurrent claim/ack tasks (default 50)
-//   PAYLOAD_BYTES       per-job payload size (default 64)
+//   N_JOBS              jobs enqueued before the drain starts (default 5_000).
+//   N_WORKERS           concurrent claim/ack tasks (default 50).
+//   PAYLOAD_BYTES       per-job payload size (default 64).
 //   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1)
 //                       Lower than slatedb's 100ms default so the per-
 //                       commit floor doesn't mask tombstone-scan time.

@@ -10,17 +10,17 @@
 // work that memoization saves a retried item.
 //
 // Parameters (env vars, all optional).
-//   N_ITEMS             input items in the batch (default 200)
-//   N_PHASES            memoized phases per item (default 4)
+//   N_ITEMS             input items in the batch (default 200).
+//   N_PHASES            memoized phases per item (default 4).
 //   FAIL_AT             phases each item completes before its injected
 //                       first-attempt transient failure; 0 disables
 //                       the injection (default 2). Must be at most
 //                       N_PHASES.
-//   PHASE_WORK_MS       simulated work per phase execution (default 20)
+//   PHASE_WORK_MS       simulated work per phase execution (default 20).
 //   MEMO                1 wraps phases in BulkCtx::memoized, 0 runs
-//                       them bare (default 1)
-//   MAX_CONCURRENT      items processed in parallel (default 16)
-//   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1)
+//                       them bare (default 1).
+//   MAX_CONCURRENT      items processed in parallel (default 16).
+//   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1).
 //   STORE_LATENCY_MS    injected object-store latency per call (default 0).
 //                       When set, the in-memory store is wrapped in
 //                       object_store's ThrottledStore so every get, put,

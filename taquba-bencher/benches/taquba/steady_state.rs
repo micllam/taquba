@@ -8,9 +8,9 @@
 // unlike a drain-shaped run that starts from a prefilled queue.
 //
 // Parameters (env vars, all optional).
-//   DURATION_SEC        seconds producers sustain the offered rate (default 60)
+//   DURATION_SEC        seconds producers sustain the offered rate (default 60).
 //   RATE                offered enqueue rate in jobs/sec across all
-//                       producers (default 500)
+//                       producers (default 500).
 //   RATE_SCHEDULE       optional comma-separated `seconds:rate` segments
 //                       describing a time-varying offered rate, e.g.
 //                       `60:0,300:500,120:2000` for 60s idle, then 300s at
@@ -41,8 +41,8 @@
 //                       reported as 0 in this mode: a successful call's
 //                       latency is dominated by time waiting for
 //                       a job to exist, which is not claim-path cost.
-//   PAYLOAD_BYTES       per-job payload size, min 8 (default 64)
-//   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1)
+//   PAYLOAD_BYTES       per-job payload size, min 8 (default 64).
+//   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1).
 //   STORE_LATENCY_MS    injected object-store latency per call (default 0).
 //                       When set, the in-memory store is wrapped in
 //                       object_store's ThrottledStore so every get, put,

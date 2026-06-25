@@ -14,16 +14,16 @@
 //
 // Parameters (env vars, all optional).
 //   N_EXPIRED           abandoned claims built before the restart
-//                       (default 5_000)
+//                       (default 5_000).
 //   RATE                offered enqueue rate in jobs/sec on the live
-//                       queue (default 500)
-//   N_PRODUCERS         concurrent enqueue tasks (default 4)
+//                       queue (default 500).
+//   N_PRODUCERS         concurrent enqueue tasks (default 4).
 //   N_WORKERS           concurrent claim/ack tasks on the live queue
-//                       (default 20)
+//                       (default 20).
 //   REAPER_INTERVAL_MS  reaper interval for the measured phase
-//                       (default 1_000; the library default is 5_000)
-//   PAYLOAD_BYTES       per-job payload size, min 8 (default 64)
-//   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1)
+//                       (default 1_000; the library default is 5_000).
+//   PAYLOAD_BYTES       per-job payload size, min 8 (default 64).
+//   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1).
 //   STORE_LATENCY_MS    injected object-store latency per call (default 0).
 //                       When set, the in-memory store is wrapped in
 //                       object_store's ThrottledStore so every get, put,
@@ -37,7 +37,7 @@
 //                       the crate README. Incompatible with
 //                       STORE_LATENCY_MS and STORE_JITTER_MS.
 //   DURATION_CAP_SEC    abort threshold for the measured phase
-//                       (default 600)
+//                       (default 600).
 //   METRICS_SAMPLE_MS   gauge sampler interval in ms (default 1000). Only
 //                       effective when built with `--features metrics`, which
 //                       installs a recorder so taquba's metric emission

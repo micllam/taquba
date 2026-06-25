@@ -146,8 +146,8 @@ N_JOBS=2000 JOB_WORK_MS=50 MAX_CONCURRENT=200 \
 before running. It is available on every benchmark.
 
 `STORE_JITTER_MS` adds, on top of any `STORE_LATENCY_MS` floor, a random
-tail latency in `[0, STORE_JITTER_MS]` (right-skewed, so most writes pay
-little and a few pay close to the maximum) to each write. It injects
+tail latency in `[0, STORE_JITTER_MS]` (right-skewed, so most writes are
+delayed little and a few by close to the maximum) to each write. It injects
 object-store PUT tail latency as a controllable variable: a slow write
 stalls SlateDB's serialized WAL flush, which can build backlog and raise
 e2e. Use it to study how PUT tail latency affects e2e and backlog locally

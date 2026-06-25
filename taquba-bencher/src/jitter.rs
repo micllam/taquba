@@ -16,8 +16,11 @@ use taquba::object_store::{
 
 /// Delays each write by a random duration in `[0, max_jitter]`,
 /// right-skewed so most delays are small and a few are close to the
-/// maximum, approximating object-store tail latency. Reads, lists, and
-/// deletes pass through unchanged.
+/// maximum, approximating object-store tail latency. Reads, lists and
+/// deletes pass through unchanged. Jitter is applied to single PUTs and to
+/// the start of a multipart upload, not to each multipart part, so the data
+/// streamed during a multipart upload is not delayed; the latency-sensitive
+/// single-PUT write path is covered.
 #[derive(Debug)]
 pub struct JitterStore {
     inner: Arc<dyn ObjectStore>,

@@ -9,14 +9,14 @@
 // of the same run completing.
 //
 // Parameters (env vars, all optional).
-//   N_RUNS                concurrent workflow runs (default 100)
+//   N_RUNS                concurrent workflow runs (default 100).
 //   N_STEPS               steps per run, including the terminal one
-//                         (default 10)
+//                         (default 10).
 //   MAX_CONCURRENT_STEPS  worker concurrency (default 8, the runtime
-//                         default)
-//   SUBMIT_CONCURRENCY    concurrent submit calls (default 32)
-//   PAYLOAD_BYTES         per-step payload size, min 8 (default 64)
-//   FLUSH_INTERVAL_MS     SlateDB WAL flush interval in ms (default 1)
+//                         default).
+//   SUBMIT_CONCURRENCY    concurrent submit calls (default 32).
+//   PAYLOAD_BYTES         per-step payload size, min 8 (default 64).
+//   FLUSH_INTERVAL_MS     SlateDB WAL flush interval in ms (default 1).
 //   STORE_LATENCY_MS      injected object-store latency per call (default 0).
 //                         When set, the in-memory store is wrapped in
 //                         object_store's ThrottledStore so every get, put,
@@ -29,7 +29,7 @@
 //                         instead of the in-memory store; see
 //                         the crate README. Incompatible with
 //                         STORE_LATENCY_MS and STORE_JITTER_MS.
-//   DURATION_CAP_SEC      abort threshold (default 600)
+//   DURATION_CAP_SEC      abort threshold (default 600).
 //
 // Output (stdout): CSV with header
 // `window_sec,n_steps,transition_p50_us,transition_p99_us`, one row per

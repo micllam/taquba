@@ -7,10 +7,10 @@
 // terminal accounting. A watcher samples progress once per second.
 //
 // Parameters (env vars, all optional).
-//   N_ITEMS             input items in the batch (default 500)
-//   N_PHASES            memoized phases per item (default 3)
-//   MAX_CONCURRENT      items processed in parallel (default 16)
-//   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1)
+//   N_ITEMS             input items in the batch (default 500).
+//   N_PHASES            memoized phases per item (default 3).
+//   MAX_CONCURRENT      items processed in parallel (default 16).
+//   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1).
 //   STORE_LATENCY_MS    injected object-store latency per call (default 0).
 //                       When set, the in-memory store is wrapped in
 //                       object_store's ThrottledStore so every get, put,

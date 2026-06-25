@@ -33,7 +33,7 @@
 //   STORE_URL=s3://bucket STORE_PREFIX=coldopen PHASE=measure ... <bin> > cold.csv
 //
 // Parameters (env vars, all optional).
-//   PHASE               full | build | measure (default full)
+//   PHASE               full | build | measure (default full).
 //   GRACEFUL_CLOSE      in PHASE=build, 1 (default) closes cleanly and
 //                       checkpoints the memtable; 0 crashes (process::exit
 //                       without close), leaving the WAL unflushed since the
@@ -41,9 +41,9 @@
 //   N_HISTORY           jobs enqueued and acked before the restart
 //                       (default 20_000). Sets the width of the
 //                       tombstone band the first claim scans across.
-//   N_LIVE              jobs left pending across the restart (default 100)
-//   PAYLOAD_BYTES       per-job payload size (default 64)
-//   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1)
+//   N_LIVE              jobs left pending across the restart (default 100).
+//   PAYLOAD_BYTES       per-job payload size (default 64).
+//   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1).
 //   STORE_LATENCY_MS    injected object-store latency per call (default 0).
 //                       When set, the in-memory store is wrapped in
 //                       object_store's ThrottledStore so every get, put,

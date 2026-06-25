@@ -22,13 +22,13 @@
 // the in-memory store.
 //
 // Parameters (env vars, all optional).
-//   N_SHARDS            independent stores opened in this process (default 1)
+//   N_SHARDS            independent stores opened in this process (default 1).
 //   PRODUCERS_PER_SHARD concurrent enqueue tasks per shard (default 16).
 //                       Held constant per shard so a sweep over N_SHARDS
 //                       keeps each store's offered concurrency fixed.
-//   DURATION_SEC        seconds producers run before stopping (default 30)
-//   PAYLOAD_BYTES       per-job payload size (default 64)
-//   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1)
+//   DURATION_SEC        seconds producers run before stopping (default 30).
+//   PAYLOAD_BYTES       per-job payload size (default 64).
+//   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1).
 //   STORE_LATENCY_MS    injected object-store latency per call (default 0).
 //                       When set, the in-memory store is wrapped in
 //                       object_store's ThrottledStore so every get, put,
