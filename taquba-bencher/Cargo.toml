@@ -2,7 +2,6 @@
 name = "taquba-bencher"
 version = "0.0.0"
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Benchmark binaries for the taquba workspace."

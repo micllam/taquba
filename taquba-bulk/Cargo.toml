@@ -2,7 +2,6 @@
 name = "taquba-bulk"
 version = "0.3.0"
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Bulk multi-step processing on the Taquba durable task queue: run one pipeline over many inputs in parallel, with per-item memoization and cost rollup."
