@@ -59,6 +59,80 @@ windows, backlog behaviour, deviations from defaults>.
 
 ## Log
 
+### 2026-06-25 - payload_sweep (write amplification vs payload size) on real S3
+
+- **taquba:** 0.9.0 (`5b22a80`)
+- **Benchmark:** payload_sweep (`benches/taquba/payload_sweep.rs`)
+- **Host:** m7i.xlarge, 4 vCPU / 16 GiB, us-east-1
+- **Store:** real S3, Standard storage class, us-east-1 (same region as host)
+- **Parameters:** `PAYLOAD_SIZES=64,1024,16384,262144 DURATION_SEC=60 N_PRODUCERS=100 N_WORKERS=100 CLAIM_BATCH=64 LEASE_SEC=60 FLUSH_INTERVAL_MS=1`
+- **Command:** `cargo bench -p taquba-bencher --features aws --bench payload_sweep`
+
+`store_amp` is end-to-end object-store PUT bytes per logical payload byte
+(`bytes_per_job / payload`), combining taquba's per-transition rewrites and the
+engine's WAL, flush and compaction. `bytes/job` is total PUT bytes per
+fully-processed job.
+
+| Payload | enq MB/s | done/s | bytes/job | store_amp | ack p99 |
+|---|---|---|---|---|---|
+| 64 B | 0.09 | 1,289 | 1,199 | 18.74 | 193 ms |
+| 1 KiB | 1.23 | 1,125 | 3,315 | 3.24 | 208 ms |
+| 16 KiB | 11.93 | 653 | 62,956 | 3.84 | 349 ms |
+| 256 KiB | 41.18 | 71 | 1,516,697 | 5.79 | 2.02 s |
+
+(Payloads are the exact byte sizes 64 / 1024 / 16384 / 262144.) No ClaimLost
+errors at any size, so no redelivery contaminated the counts.
+
+Notes:
+- **`store_amp` is not monotonic in payload size; it reaches its minimum near
+  1 KiB.** It decomposes as roughly `W * payload + F` per job, with a fixed
+  per-job overhead `F` of about 1 KiB (per-job fixed bytes: keys, state records
+  and WAL framing, estimated from the 64 B and 1 KiB points) and a per-byte write
+  multiple `W` that is itself not constant (it grows with payload, see the next
+  note). At 64 B the payload is much smaller than `F`, so amp is 18.7x. By 1 KiB
+  `F` is amortized and amp reaches its minimum (3.24x). Above that the
+  `W * payload` term dominates and amp rises again.
+- **The per-byte write multiple grows from about 3.9x (1 KiB to 16 KiB slope) to
+  5.79x at 256 KiB.** This is end-to-end PUT-byte accounting, not a direct
+  measurement of the engine's internal write amplification; the rise is
+  consistent with payload bytes passing through WAL, L0 flush and compaction.
+  Compaction streaming did occur (32 multipart uploads, counted cumulatively at
+  the end of the run), most plausibly in the large-payload phases since small
+  SSTs are written as single PUTs; the per-phase split was not measured.
+- **The 16 KiB 3.84x is likely a lower bound on steady-state amp.** A 60 s run at
+  that size may not have driven full compaction (the bench header notes short
+  runs can undercount), so the steady-state value is probably higher. The 256 KiB
+  run, whose volume did drive compaction, is the more steady-state-representative
+  large-payload figure at 5.79x.
+- **Payload/metadata separation is justified for large payloads.** At 256 KiB the
+  bytes per job (1.5 MB) are almost entirely payload (the ~1 KiB fixed overhead
+  is negligible at that size). Storing the payload as a separate object-store blob
+  with only a pointer in the LSM writes it about once and never compacts it,
+  reducing payload write volume by about the measured store_amp: roughly 3.8x at
+  16 KiB and 5.8x at 256 KiB, growing in absolute bytes with size. (An in-SlateDB
+  payload key, rather than an external blob, would still be compacted, so it would
+  save the cross-transition rewrite but not the full multiple.) At <= 1 KiB
+  separation is not worth it: amp is already near its minimum, and the extra
+  indirection would cost more than it saves. The design should be size-gated, with
+  the crossover in the low-KiB range that this sweep brackets but does not pin
+  (the separated regime was not benched).
+- **`e2e` is backlog-dominated under saturating load, not round-trip latency.**
+  e2e p99 ran from 5.4 s at 64 B to 70.8 s at 256 KiB because producers enqueue
+  faster than workers drain and a backlog accumulates; use steady_state with
+  `PAYLOAD_BYTES` for clean round-trip latency versus payload.
+- **A single `CLAIM_BATCH`/`LEASE_SEC` pair does not span the size range.** The
+  time a worker takes to drain a full batch is `CLAIM_BATCH` divided by its
+  per-worker completion rate, and that rate fell about 18x across the sweep (about
+  13/s per worker at 64 B to about 0.7/s at 256 KiB; ack p99 alone was about 2 s
+  at 256 KiB). A full batch of 64 at 256 KiB would therefore take well over the
+  60 s lease to drain; no ClaimLost occurred here only because `pending` stayed
+  low at that size, so `claim_batch` returned small batches rather than full ones.
+  A deep 256 KiB backlog would exceed the lease, so jobs would be reclaimed and
+  redelivered and the worker's ack would fail with ClaimLost. An earlier run with
+  the prior hardcoded
+  5 s lease produced repeated ClaimLost errors at 64 B. For wider or deeper
+  sweeps, lower `CLAIM_BATCH` or raise `LEASE_SEC` for the large sizes.
+
 ### 2026-06-23 - 8h time-varying soak on real S3
 
 - **taquba:** 0.8.0 (`8190136`)
