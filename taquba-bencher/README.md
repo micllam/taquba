@@ -111,7 +111,10 @@ STORE_LATENCY_MS=10 N_SHARDS=4 DURATION_SEC=30 \
 
 # Payload-size sweep: throughput and write amplification across sizes.
 # Run on real storage (STORE_URL) for meaningful PUT-byte and bytes/s numbers.
-PAYLOAD_SIZES=64,1024,16384,262144 DURATION_SEC=20 \
+# CLAIM_BATCH (default 64) batches claims so the drain rate matches the
+# saturating enqueue rate; on a high-latency store single claims (CLAIM_BATCH=1)
+# would drain far more slowly than enqueue and build a large backlog.
+PAYLOAD_SIZES=64,1024,16384,262144 DURATION_SEC=20 CLAIM_BATCH=64 \
     cargo bench -p taquba-bencher --bench payload_sweep > payload_sweep.csv
 
 # Spread the load across 100 queues (one worker each), exercising the

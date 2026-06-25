@@ -18,6 +18,7 @@
 //   DURATION_SEC        seconds of saturating load per size (default 20).
 //   N_PRODUCERS         concurrent enqueue tasks per size (default 4).
 //   N_WORKERS           concurrent claim/ack tasks per size (default 8).
+//   CLAIM_BATCH         jobs claimed per claim_batch call (default 64).
 //   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1).
 //   STORE_LATENCY_MS    injected per-call object-store latency (default 0;
 //                       in-memory store only).
@@ -74,6 +75,16 @@ struct RunResult {
     total_secs: f64,
 }
 
+/// Shared per-run parameters, identical for every payload size in a sweep.
+#[derive(Clone, Copy)]
+struct RunCfg {
+    duration: Duration,
+    n_producers: usize,
+    n_workers: usize,
+    claim_batch: usize,
+    flush_ms: u64,
+}
+
 /// Saturate one payload size on `db_path`: producers enqueue as fast as
 /// possible for `duration` while workers claim and ack, then the backlog
 /// drains.
@@ -81,11 +92,15 @@ async fn run_one(
     counting: Arc<CountingStore>,
     db_path: String,
     payload_bytes: usize,
-    duration: Duration,
-    n_producers: usize,
-    n_workers: usize,
-    flush_ms: u64,
+    cfg: &RunCfg,
 ) -> Result<RunResult, Box<dyn std::error::Error>> {
+    let RunCfg {
+        duration,
+        n_producers,
+        n_workers,
+        claim_batch,
+        flush_ms,
+    } = *cfg;
     let store: Arc<dyn ObjectStore> = counting.clone();
     let queue = Arc::new(
         Queue::open_with_options(
@@ -138,7 +153,10 @@ async fn run_one(
         }));
     }
 
-    // Workers: claim one, read its enqueue timestamp, ack it. An empty poll
+    // Workers: claim a batch, read each job's enqueue timestamp, ack each.
+    // claim_batch amortizes the per-claim lock hold and commit across the
+    // batch, so the drain rate matches the group-committed enqueue rate rather
+    // than serializing one claim per object-store round trip. An empty batch
     // is terminal only once producers have stopped and the watcher has
     // declared the backlog drained.
     type DoneSample = (u64, u64); // (e2e_us, ack_us)
@@ -149,25 +167,28 @@ async fn run_one(
         let acked = acked.clone();
         worker_handles.push(tokio::spawn(async move {
             let mut samples: Vec<DoneSample> = Vec::with_capacity(8192);
-            loop {
-                match queue.claim(QUEUE, LEASE).await {
-                    Ok(Some(job)) => {
-                        let enq_start_us = u64::from_le_bytes(job.payload[..8].try_into().unwrap());
-                        let ack_start = Instant::now();
-                        if let Err(e) = queue.ack(&job).await {
-                            eprintln!("worker {worker_idx}: ack error: {e}");
-                            break;
-                        }
-                        let ack_us = ack_start.elapsed().as_micros() as u64;
-                        let done_us = bench_start.elapsed().as_micros() as u64;
-                        samples.push((done_us - enq_start_us, ack_us));
-                        acked.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Ok(None) => {
+            'poll: loop {
+                match queue.claim_batch(QUEUE, claim_batch, LEASE).await {
+                    Ok(jobs) if jobs.is_empty() => {
                         if drain_complete.load(Ordering::Relaxed) {
                             break;
                         }
                         tokio::time::sleep(IDLE_BACKOFF).await;
+                    }
+                    Ok(jobs) => {
+                        for job in &jobs {
+                            let enq_start_us =
+                                u64::from_le_bytes(job.payload[..8].try_into().unwrap());
+                            let ack_start = Instant::now();
+                            if let Err(e) = queue.ack(job).await {
+                                eprintln!("worker {worker_idx}: ack error: {e}");
+                                break 'poll;
+                            }
+                            let ack_us = ack_start.elapsed().as_micros() as u64;
+                            let done_us = bench_start.elapsed().as_micros() as u64;
+                            samples.push((done_us - enq_start_us, ack_us));
+                            acked.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     Err(e) => {
                         eprintln!("worker {worker_idx}: claim error: {e}");
@@ -293,16 +314,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let duration_sec: u64 = env_var("DURATION_SEC", 20);
     let n_producers: usize = env_var("N_PRODUCERS", 4);
     let n_workers: usize = env_var("N_WORKERS", 8);
+    let claim_batch: usize = env_var("CLAIM_BATCH", 64).max(1);
     let flush_ms: u64 = env_var("FLUSH_INTERVAL_MS", 1);
     let store_latency_ms: u64 = env_var("STORE_LATENCY_MS", 0);
 
     eprintln!(
         "payload_sweep: sizes={sizes:?}B, duration={duration_sec}s, producers={n_producers}, \
-         workers={n_workers}, flush={flush_ms}ms, store_latency={store_latency_ms}ms",
+         workers={n_workers}, claim_batch={claim_batch}, flush={flush_ms}ms, \
+         store_latency={store_latency_ms}ms",
     );
 
     let base = store_from_env(store_latency_ms)?;
     let counting = Arc::new(CountingStore::new(base));
+
+    let cfg = RunCfg {
+        duration: Duration::from_secs(duration_sec),
+        n_producers,
+        n_workers,
+        claim_batch,
+        flush_ms,
+    };
 
     println!(
         "payload_bytes,enq_per_s,enq_mbps,enq_p50_us,enq_p99_us,done_per_s,e2e_p50_us,e2e_p99_us,ack_p99_us,bytes_per_job,puts_per_job,store_amp"
@@ -310,16 +341,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for &size in &sizes {
         let before_bytes = counting.put_bytes();
         let before_puts = counting.put_count();
-        let r = run_one(
-            counting.clone(),
-            format!("bench-db-{size}"),
-            size,
-            Duration::from_secs(duration_sec),
-            n_producers,
-            n_workers,
-            flush_ms,
-        )
-        .await?;
+        let r = run_one(counting.clone(), format!("bench-db-{size}"), size, &cfg).await?;
         let bytes = counting.put_bytes() - before_bytes;
         let puts = counting.put_count() - before_puts;
 
