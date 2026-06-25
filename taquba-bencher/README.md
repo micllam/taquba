@@ -29,6 +29,7 @@ documented in the header comment of its source file.
 | `cold_start` | Build a history of `N_HISTORY` acked jobs plus `N_LIVE` pending jobs, then reopen the same store and measure the reopen and the claims that follow. `PHASE=build`/`measure` split the build and reopen across processes; `GRACEFUL_CLOSE=0` crashes without a checkpoint for the expensive arm | What does the reopen (cold-open) cost, dominated by WAL replay since the last checkpoint, and what does the first claim cost once the in-memory scan bound is gone? Comparing the graceful and crash reopens quantifies the force-flush lever. |
 | `reaper_storm` | Abandon `N_EXPIRED` claims with expired leases (a simulated crash), reopen, and let the reaper requeue them while a second queue carries live traffic | How long does a mass lease-expiry sweep take, and how much does it disturb claim and end-to-end latency on a concurrently active queue? |
 | `sharding` | Open `N_SHARDS` independent stores in one process and saturate each with `PRODUCERS_PER_SHARD` durable-enqueue producers | Does throughput scale with shard count? SlateDB serializes WAL flushes per store (one PUT in flight at a time), so each store is one PUT stream; N stores should give ~N independent streams, up to the object store's PUT capacity. |
+| `payload_sweep` | For each size in `PAYLOAD_SIZES`, saturate concurrent enqueue/ack on its own store for `DURATION_SEC`, recording object-store PUT bytes through a counting wrapper | How do throughput, latency and object-store write volume (PUT bytes per payload byte) change as payload size grows? |
 
 ### taquba-workflow
 
@@ -107,6 +108,11 @@ cargo bench -p taquba-bencher --bench reaper_storm > storm.csv
 # multiplier appears only with real PUT latency, here simulated).
 STORE_LATENCY_MS=10 N_SHARDS=4 DURATION_SEC=30 \
     cargo bench -p taquba-bencher --bench sharding > sharding.csv
+
+# Payload-size sweep: throughput and write amplification across sizes.
+# Run on real storage (STORE_URL) for meaningful PUT-byte and bytes/s numbers.
+PAYLOAD_SIZES=64,1024,16384,262144 DURATION_SEC=20 \
+    cargo bench -p taquba-bencher --bench payload_sweep > payload_sweep.csv
 
 # Spread the load across 100 queues (one worker each), exercising the
 # global reaper / scheduler prefix scans and per-queue claim state.
@@ -252,6 +258,25 @@ One row per second with the aggregate enqueues completed across all
 shards; the final window may be partial. Per-shard totals and a summary
 (aggregate per second, per-shard mean, and shard min / max to show
 balance) print to stderr.
+
+For `payload_sweep`:
+
+```
+payload_bytes,enq_per_s,enq_mbps,enq_p50_us,enq_p99_us,done_per_s,e2e_p50_us,e2e_p99_us,ack_p99_us,bytes_per_job,puts_per_job,store_amp
+```
+
+One row per payload size. `enq_per_s` is the saturating durable-enqueue
+rate and `enq_mbps` is `enq_per_s * payload`; together they show how
+durable-enqueue throughput and the byte rate change with payload size.
+`bytes_per_job` is object-store PUT bytes per fully-processed job.
+`store_amp` is `bytes_per_job / payload`: end-to-end object-store bytes
+written per logical payload byte, combining taquba's per-transition
+rewrites and the engine's WAL, flush and compaction. It is not the
+storage engine's LSM write amplification in isolation, and in short runs
+compaction may not have run, so large-payload values are a lower bound.
+Load is saturating, so the `e2e_*` columns reflect backlog under that load,
+not clean round-trip latency; use `steady_state` with `PAYLOAD_BYTES`
+for that.
 
 For `step_transitions`:
 

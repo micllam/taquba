@@ -64,6 +64,11 @@ path = "benches/taquba/sharding.rs"
 harness = false
 
 [[bench]]
+name = "payload_sweep"
+path = "benches/taquba/payload_sweep.rs"
+harness = false
+
+[[bench]]
 name = "reaper_storm"
 path = "benches/taquba/reaper_storm.rs"
 harness = false

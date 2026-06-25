@@ -11,6 +11,9 @@ use taquba::object_store::prefix::PrefixStore;
 use taquba::object_store::throttle::{ThrottleConfig, ThrottledStore};
 use taquba::object_store::{ObjectStore, parse_url_opts};
 
+mod counting;
+pub use counting::CountingStore;
+
 mod jitter;
 use jitter::JitterStore;
 
