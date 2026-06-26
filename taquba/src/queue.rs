@@ -1219,7 +1219,7 @@ impl Queue {
                 // Front scan: bound unknown (cold start or process
                 // restart), so pre-existing keys may be live anywhere
                 // in the prefix.
-                let mut iter = txn.scan_prefix(prefix_bytes).await?;
+                let mut iter = txn.scan_prefix(prefix_bytes, ..).await?;
                 while candidates.len() < max_jobs {
                     match iter.next().await? {
                         Some(c) => candidates.push(c),
@@ -1637,7 +1637,7 @@ impl Queue {
     pub async fn list_queues(&self) -> Result<Vec<String>> {
         let mut seen = std::collections::HashSet::new();
         let mut queues = Vec::new();
-        let mut iter = self.db.scan_prefix(b"stats:").await?;
+        let mut iter = self.db.scan_prefix(b"stats:", ..).await?;
         while let Some(kv) = iter.next().await? {
             let key_str = match std::str::from_utf8(&kv.key) {
                 Ok(s) => s,
@@ -1674,7 +1674,7 @@ impl Queue {
         }
         let prefix = format!("dead:{}:", queue);
         let mut jobs = Vec::with_capacity(limit);
-        let mut iter = self.db.scan_prefix(prefix.as_bytes()).await?;
+        let mut iter = self.db.scan_prefix(prefix.as_bytes(), ..).await?;
         while let Some(kv) = iter.next().await? {
             if let Some(after_id) = after {
                 // Skip until we pass the cursor.
@@ -2158,7 +2158,7 @@ async fn restore_cursor_state(db: &Db, claim_cursor: &ClaimCursor) -> Result<()>
     let txn = db.begin(IsolationLevel::Snapshot).await?;
     let mut records = Vec::new();
     {
-        let mut iter = txn.scan_prefix(b"cursor:").await?;
+        let mut iter = txn.scan_prefix(b"cursor:", ..).await?;
         while let Some(kv) = iter.next().await? {
             let record: PersistedCursor = rmp_serde::from_slice(&kv.value)?;
             records.push((kv.key, record));

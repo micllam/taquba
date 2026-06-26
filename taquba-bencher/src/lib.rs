@@ -72,12 +72,12 @@ pub fn store_from_env(latency_ms: u64) -> Result<Arc<dyn ObjectStore>, Box<dyn s
     // several processes (e.g. cold_start's build and measure phases) share
     // one store.
     let run_prefix = match std::env::var("STORE_PREFIX") {
-        Ok(prefix) => path.child(prefix),
+        Ok(prefix) => path.join(prefix),
         Err(_) => {
             let millis = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_millis();
-            path.child(format!("bench-{millis}"))
+            path.join(format!("bench-{millis}"))
         }
     };
     eprintln!("store: {raw}, run prefix: {run_prefix}");

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The `object_store` types in the public API are now `object_store` 0.14.
+
 ## [0.7.0] - 2026-06-23
 
 ### Changed

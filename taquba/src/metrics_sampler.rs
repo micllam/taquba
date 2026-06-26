@@ -58,7 +58,9 @@ async fn sample(db: &Db, clock: &dyn Clock) -> Result<()> {
         // The front of the pending prefix is the next job to be claimed; its
         // age is how long that job has waited so far, which climbs when the
         // queue is not being drained fast enough.
-        let mut iter = db.scan_prefix(pending_prefix(&queue).as_bytes()).await?;
+        let mut iter = db
+            .scan_prefix(pending_prefix(&queue).as_bytes(), ..)
+            .await?;
         let age_secs = match iter.next().await? {
             Some(kv) => {
                 let job: JobRecord = rmp_serde::from_slice(&kv.value)?;
@@ -76,7 +78,7 @@ async fn sample(db: &Db, clock: &dyn Clock) -> Result<()> {
 async fn queues(db: &Db) -> Result<Vec<String>> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    let mut iter = db.scan_prefix(b"stats:").await?;
+    let mut iter = db.scan_prefix(b"stats:", ..).await?;
     while let Some(kv) = iter.next().await? {
         let Ok(key) = std::str::from_utf8(&kv.key) else {
             continue;

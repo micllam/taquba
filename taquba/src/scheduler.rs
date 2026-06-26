@@ -57,7 +57,7 @@ pub(crate) async fn promote_due_jobs(
     let now = clock.now_ms();
     let mut due_keys = Vec::new();
 
-    let mut iter = db.scan_prefix(b"scheduled:").await?;
+    let mut iter = db.scan_prefix(b"scheduled:", ..).await?;
     while let Some(kv) = iter.next().await? {
         // Key format: "scheduled:{run_at:020}:{queue}:{ulid}".
         // Sorted globally by `run_at`, so the first key with a timestamp in the

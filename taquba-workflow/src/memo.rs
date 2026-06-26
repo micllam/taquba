@@ -49,7 +49,7 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use taquba::object_store::{Error as ObjectStoreError, ObjectStore, path::Path};
+use taquba::object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, path::Path};
 
 use crate::error::{Error, Result};
 
@@ -244,7 +244,7 @@ impl MemoStore {
         // A marker at exactly `cutoff_ms` shares the offset's leading
         // segment and is therefore listed; the parse-side filter below
         // keeps the predicate strict.
-        let offset = prefix.child(format!("{:020}", invert_ts(cutoff_ms)));
+        let offset = prefix.clone().join(format!("{:020}", invert_ts(cutoff_ms)));
         let mut stream = self.store.list_with_offset(Some(&prefix), &offset);
         let mut out = Vec::new();
         while let Some(item) = stream.next().await {
@@ -285,8 +285,8 @@ impl MemoStore {
 
     fn memo_path(&self, run_id: &str, step_number: u32, key: &str) -> Path {
         self.memos_run_prefix(run_id)
-            .child(step_number.to_string())
-            .child(hex_sha256(key.as_bytes()))
+            .join(step_number.to_string())
+            .join(hex_sha256(key.as_bytes()))
     }
 
     fn memos_run_prefix(&self, run_id: &str) -> Path {
@@ -299,8 +299,8 @@ impl MemoStore {
 
     fn step_output_path(&self, run_id: &str, step_number: u32, step_payload: &[u8]) -> Path {
         self.step_outputs_run_prefix(run_id)
-            .child(step_number.to_string())
-            .child(hex_sha256(step_payload))
+            .join(step_number.to_string())
+            .join(hex_sha256(step_payload))
     }
 
     fn terminals_prefix(&self) -> Path {
@@ -309,7 +309,7 @@ impl MemoStore {
 
     fn terminal_marker_path(&self, run_id: &str, terminal_at_ms: u64) -> Path {
         self.terminals_prefix()
-            .child(format!("{:020}_{run_id}", invert_ts(terminal_at_ms)))
+            .join(format!("{:020}_{run_id}", invert_ts(terminal_at_ms)))
     }
 }
 

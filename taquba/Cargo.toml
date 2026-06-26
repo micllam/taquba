@@ -26,7 +26,7 @@ all-features = true
 
 [dependencies]
 # We always pull in SlateDB's `foyer` cache feature.
-slatedb = { version = "0.13.1", default-features = false, features = ["foyer"] }
+slatedb = { version = "0.14.0", default-features = false, features = ["foyer"] }
 ulid = { workspace = true, features = ["serde"] }
 rmp-serde = "1"
 bytes = "1"
@@ -40,7 +40,7 @@ metrics = { version = "0.24", optional = true }
 # Provides SlateDB's `MetricsRecorder` trait, bridged into the `metrics`
 # facade so SlateDB's storage metrics share the queue's recorder. Must track
 # the same version SlateDB itself depends on.
-slatedb-common = { version = "0.13.1", optional = true }
+slatedb-common = { version = "0.14.0", optional = true }
 
 [dev-dependencies]
 # Used only by the `#[cfg(feature = "metrics")]` tests.

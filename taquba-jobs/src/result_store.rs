@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use taquba::object_store::{Error as ObjectStoreError, ObjectStore, path::Path};
+use taquba::object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, path::Path};
 
 use crate::error::{Error, Result};
 use crate::job::ErrorKind;
@@ -102,7 +102,7 @@ impl ResultStore {
 
     fn terminal_marker_path(&self, job_id: &str, terminal_at_ms: u64) -> Path {
         self.terminals_prefix()
-            .child(format!("{:020}_{job_id}", invert_ts(terminal_at_ms)))
+            .join(format!("{:020}_{job_id}", invert_ts(terminal_at_ms)))
     }
 
     /// Persist a job's terminal outcome. Overwrites any prior outcome for the
@@ -173,7 +173,7 @@ impl ResultStore {
         // A marker at exactly `cutoff_ms` shares the offset's leading
         // segment and is therefore listed; the parse-side filter below
         // keeps the predicate strict.
-        let offset = prefix.child(format!("{:020}", invert_ts(cutoff_ms)));
+        let offset = prefix.clone().join(format!("{:020}", invert_ts(cutoff_ms)));
         let mut stream = self.store.list_with_offset(Some(&prefix), &offset);
         let mut out = Vec::new();
         while let Some(item) = stream.next().await {

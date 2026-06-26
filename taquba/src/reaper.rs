@@ -105,7 +105,7 @@ pub(crate) async fn reap_expired(
     let now = clock.now_ms();
     let mut expired_keys = Vec::new();
 
-    let mut iter = db.scan_prefix(b"claimed:").await?;
+    let mut iter = db.scan_prefix(b"claimed:", ..).await?;
     while let Some(kv) = iter.next().await? {
         // Key format: "claimed:{ts:020}:{queue}:{ulid}".
         // Sorted globally by `ts`, so the first key whose timestamp is in the
@@ -245,7 +245,7 @@ async fn sweep_done(
     let min_cutoff = max_keep_done.map(|r| now.saturating_sub(r.as_millis() as u64));
 
     let mut victims: Vec<(Vec<u8>, String)> = Vec::new();
-    let mut iter = db.scan_prefix(b"done:").await?;
+    let mut iter = db.scan_prefix(b"done:", ..).await?;
     while let Some(kv) = iter.next().await? {
         // Key format: "done:{completed_at:020}:{queue}:{id}".
         if let Some(min_cutoff) = min_cutoff {
@@ -309,7 +309,7 @@ async fn sweep_dead(
     let now = clock.now_ms();
 
     let mut victims: Vec<(Vec<u8>, String, String)> = Vec::new();
-    let mut iter = db.scan_prefix(b"dead:").await?;
+    let mut iter = db.scan_prefix(b"dead:", ..).await?;
     while let Some(kv) = iter.next().await? {
         let job: JobRecord = match rmp_serde::from_slice(&kv.value) {
             Ok(j) => j,
