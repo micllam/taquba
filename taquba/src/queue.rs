@@ -1187,29 +1187,24 @@ impl Queue {
             // the batch, proving nothing is live beyond the candidates.
             let mut drained = false;
             if let Some(sf) = scan.scan_from.clone() {
-                // Bound-resumed scan: start at the recorded bound (after
-                // the last claimed key, or at a key inserted behind it)
-                // and end at the queue's pending-prefix upper bound. Every
-                // live pending key sorts within the prefix, so an
-                // unbounded end would only make the step that detects a
-                // drained queue walk past the prefix into the rest of the
-                // keyspace before yielding an out-of-prefix key.
+                // Resume from the recorded bound (after the last claimed key,
+                // or a key inserted behind it). The subrange is relative to the
+                // prefix, so scan_prefix ends at the prefix upper bound natively
+                // and a drained queue is detected without scanning beyond the
+                // prefix.
+                let suffix = sf.key.slice(prefix_bytes.len()..);
                 let start = if sf.inclusive {
-                    Bound::Included(sf.key)
+                    Bound::Included(suffix)
                 } else {
-                    Bound::Excluded(sf.key)
+                    Bound::Excluded(suffix)
                 };
-                let mut end = prefix.clone().into_bytes();
-                // pending_prefix ends in ':', so incrementing the last
-                // byte yields the exclusive prefix upper bound without
-                // overflow.
-                *end.last_mut().expect("pending prefix is non-empty") += 1;
-                let end = Bound::Excluded(Bytes::copy_from_slice(&end));
-                let mut iter = txn.scan((start, end)).await?;
+                let mut iter = txn
+                    .scan_prefix(prefix_bytes, (start, Bound::Unbounded))
+                    .await?;
                 while candidates.len() < max_jobs {
                     match iter.next().await? {
-                        Some(c) if c.key.starts_with(prefix_bytes) => candidates.push(c),
-                        _ => {
+                        Some(c) => candidates.push(c),
+                        None => {
                             drained = true;
                             break;
                         }
