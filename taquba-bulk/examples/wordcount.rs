@@ -3,7 +3,7 @@
 //! Demonstrates the full path (submit N, process concurrently, stream output,
 //! roll up cost) over an in-memory store, with no network calls.
 //!
-//! Run with: `cargo run -p taquba-bulk --example wordcount_bulk`
+//! Run with: `cargo run -p taquba-bulk --example wordcount`
 
 use std::io::{BufWriter, stdout};
 use std::sync::Arc;

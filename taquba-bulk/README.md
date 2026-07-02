@@ -132,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-See [`examples/wordcount_bulk.rs`](examples/wordcount_bulk.rs) for a runnable,
+See [`examples/wordcount.rs`](examples/wordcount.rs) for a runnable,
 network-free end-to-end run, and
 [`examples/document_pipeline.rs`](examples/document_pipeline.rs) for a
 pipeline with several stages (extract, classify, validate) demonstrating
