@@ -120,7 +120,7 @@ impl StepRunner for FanoutRunner {
                     step.memo.put(FETCH_MEMO_KEY, &aggregate).await?;
                     aggregate
                 };
-                Ok(StepOutcome::Continue { payload: aggregate })
+                Ok(StepOutcome::continue_now(aggregate))
             }
             STEP_REPORT => {
                 let findings = std::str::from_utf8(&step.payload)

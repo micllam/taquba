@@ -15,7 +15,7 @@ use tracing::{debug, instrument, warn};
 
 use crate::error::{Error, Result};
 use crate::memo::MemoStore;
-use crate::runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner};
+use crate::runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
 
 /// Header key carrying the run identifier on every step job.
@@ -80,13 +80,34 @@ impl From<DurableDuration> for Duration {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+enum DurableTrigger {
+    Immediate,
+    After(DurableDuration),
+}
+
+impl From<&Trigger> for DurableTrigger {
+    fn from(trigger: &Trigger) -> Self {
+        match trigger {
+            Trigger::Immediate => Self::Immediate,
+            Trigger::After(delay) => Self::After((*delay).into()),
+        }
+    }
+}
+
+impl From<DurableTrigger> for Trigger {
+    fn from(trigger: DurableTrigger) -> Self {
+        match trigger {
+            DurableTrigger::Immediate => Self::Immediate,
+            DurableTrigger::After(delay) => Self::After(delay.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum DurableStepOutcome {
     Continue {
         payload: Vec<u8>,
-    },
-    ContinueAfter {
-        payload: Vec<u8>,
-        delay: DurableDuration,
+        when: DurableTrigger,
     },
     Succeed {
         result: Vec<u8>,
@@ -102,12 +123,9 @@ enum DurableStepOutcome {
 impl From<&StepOutcome> for DurableStepOutcome {
     fn from(outcome: &StepOutcome) -> Self {
         match outcome {
-            StepOutcome::Continue { payload } => Self::Continue {
+            StepOutcome::Continue { payload, when } => Self::Continue {
                 payload: payload.clone(),
-            },
-            StepOutcome::ContinueAfter { payload, delay } => Self::ContinueAfter {
-                payload: payload.clone(),
-                delay: (*delay).into(),
+                when: when.into(),
             },
             StepOutcome::Succeed { result } => Self::Succeed {
                 result: result.clone(),
@@ -125,10 +143,9 @@ impl From<&StepOutcome> for DurableStepOutcome {
 impl From<DurableStepOutcome> for StepOutcome {
     fn from(outcome: DurableStepOutcome) -> Self {
         match outcome {
-            DurableStepOutcome::Continue { payload } => Self::Continue { payload },
-            DurableStepOutcome::ContinueAfter { payload, delay } => Self::ContinueAfter {
+            DurableStepOutcome::Continue { payload, when } => Self::Continue {
                 payload,
-                delay: delay.into(),
+                when: when.into(),
             },
             DurableStepOutcome::Succeed { result } => Self::Succeed { result },
             DurableStepOutcome::Fail { reason } => Self::Fail { reason },
@@ -138,7 +155,7 @@ impl From<DurableStepOutcome> for StepOutcome {
 }
 
 /// Storage envelope for a step-output replay entry. `stored_at_ms`
-/// records when the outcome was persisted so a replayed `ContinueAfter`
+/// records when the outcome was persisted so a replayed delayed `Continue`
 /// can schedule the next step relative to the original settlement
 /// rather than the replay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -325,9 +342,9 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     /// scoped to `(run_id, step_number, SHA-256(step payload))`. If the
     /// same step is delivered again after a crash before ack, the stored
     /// outcome is replayed without invoking the runner again. A replayed
-    /// [`StepOutcome::ContinueAfter`] reduces its delay by the time
-    /// already elapsed since the outcome was stored, preserving the
-    /// original schedule.
+    /// [`StepOutcome::Continue`] with a [`Trigger::After`] delay reduces
+    /// the delay by the time already elapsed since the outcome was
+    /// stored, preserving the original schedule.
     ///
     /// This is disabled by default because it adds one object-store read
     /// per step delivery (the replay lookup) plus one write per recorded
@@ -1031,7 +1048,11 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         match rmp_serde::from_slice::<DurableStepOutcomeRecord>(&bytes) {
             Ok(record) => {
                 let mut outcome = StepOutcome::from(record.outcome);
-                if let StepOutcome::ContinueAfter { delay, .. } = &mut outcome {
+                if let StepOutcome::Continue {
+                    when: Trigger::After(delay),
+                    ..
+                } = &mut outcome
+                {
                     *delay = remaining_delay(record.stored_at_ms, self.clock.now_ms(), *delay);
                 }
                 Ok(Some(outcome))
@@ -1173,20 +1194,16 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     final_step: step_number,
                 })
                 .await),
-            Ok(StepOutcome::Continue { payload }) => Ok(self
-                .advance(
-                    &run_id,
-                    step_number + 1,
-                    payload,
-                    &user_headers,
-                    inherit_opts(),
-                )
-                .await),
-            Ok(StepOutcome::ContinueAfter { payload, delay }) => {
-                let now = UNIX_EPOCH + Duration::from_millis(self.clock.now_ms());
-                let opts = StepEnqueueOpts {
-                    run_at: Some(now + delay),
-                    ..inherit_opts()
+            Ok(StepOutcome::Continue { payload, when }) => {
+                let opts = match when {
+                    Trigger::Immediate => inherit_opts(),
+                    Trigger::After(delay) => {
+                        let now = UNIX_EPOCH + Duration::from_millis(self.clock.now_ms());
+                        StepEnqueueOpts {
+                            run_at: Some(now + delay),
+                            ..inherit_opts()
+                        }
+                    }
                 };
                 Ok(self
                     .advance(&run_id, step_number + 1, payload, &user_headers, opts)
@@ -1446,12 +1463,8 @@ mod tests {
             queue,
             store.clone(),
             ScriptedRunner::new(vec![
-                StepOutcome::Continue {
-                    payload: b"step1".to_vec(),
-                },
-                StepOutcome::Continue {
-                    payload: b"step2".to_vec(),
-                },
+                StepOutcome::continue_now(b"step1".to_vec()),
+                StepOutcome::continue_now(b"step2".to_vec()),
                 StepOutcome::Succeed {
                     result: b"final".to_vec(),
                 },
@@ -1477,6 +1490,57 @@ mod tests {
         assert_eq!(outcome.final_step, 2);
         assert_eq!(outcome.status, TerminalStatus::Succeeded);
         assert_eq!(outcome.result.as_deref(), Some(b"final".as_slice()));
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continue_after_delays_next_step_until_promotion() {
+        let initial = 1_700_000_000_000u64;
+        let (queue, store, clock) = fresh_queue_with_mock_clock(initial).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store.clone(),
+            ScriptedRunner::new(vec![
+                StepOutcome::continue_after(b"step1".to_vec(), Duration::from_secs(60)),
+                StepOutcome::Succeed {
+                    result: b"final".to_vec(),
+                },
+            ]),
+            ChannelHook { tx },
+        )
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        let handle = runtime
+            .submit(RunSpec {
+                input: b"start".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // The delayed step is held in `scheduled` and the run must not
+        // terminate while the delay is pending.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), rx.recv())
+                .await
+                .is_err()
+        );
+        let stats = queue.stats("workflow-steps").await.unwrap();
+        assert_eq!(stats.scheduled, 1);
+
+        advance(&clock, Duration::from_secs(61)).await;
+        queue.promote_scheduled_now().await.unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.run_id, handle.run_id);
+        assert_eq!(outcome.final_step, 1);
+        assert_eq!(outcome.status, TerminalStatus::Succeeded);
 
         let _ = shutdown.send(());
     }
@@ -1850,7 +1914,7 @@ mod tests {
             queue,
             store.clone(),
             ScriptedRunner::new(vec![
-                StepOutcome::Continue { payload: vec![] },
+                StepOutcome::continue_now(vec![]),
                 StepOutcome::Succeed { result: vec![] },
             ]),
             ChannelHook { tx },
@@ -1905,7 +1969,7 @@ mod tests {
                     0 => {
                         let rx = self.gate.lock().await.take().expect("gate consumed twice");
                         let payload = rx.await.expect("gate sender dropped");
-                        Ok(StepOutcome::Continue { payload })
+                        Ok(StepOutcome::continue_now(payload))
                     }
                     _ => std::future::pending().await,
                 }
@@ -2018,9 +2082,7 @@ mod tests {
         impl StepRunner for ContinueRunner {
             async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                Ok(StepOutcome::Continue {
-                    payload: b"step1-payload".to_vec(),
-                })
+                Ok(StepOutcome::continue_now(b"step1-payload".to_vec()))
             }
         }
 
@@ -2091,9 +2153,7 @@ mod tests {
         impl StepRunner for ContinueRunner {
             async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                Ok(StepOutcome::Continue {
-                    payload: b"step1-payload".to_vec(),
-                })
+                Ok(StepOutcome::continue_now(b"step1-payload".to_vec()))
             }
         }
 

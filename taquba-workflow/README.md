@@ -154,8 +154,7 @@ step retry does not re-submit the fan-out.
 
 | Outcome | Effect |
 |---|---|
-| `StepOutcome::Continue { payload }` | Enqueue the next step immediately. |
-| `StepOutcome::ContinueAfter { payload, delay }` | Schedule the next step `delay` from now. |
+| `StepOutcome::Continue { payload, when }` | Enqueue the next step; `when` (a `Trigger`) decides when it becomes claimable: `Trigger::Immediate` or `Trigger::After(delay)`. Constructors: `StepOutcome::continue_now(payload)`, `StepOutcome::continue_after(payload, delay)`. |
 | `StepOutcome::Succeed { result }` | Ack; terminal hook fires `Succeeded`. |
 | `StepOutcome::Fail { reason }` | Ack; terminal hook fires `Failed`. Runner verdict: no dead-letter. |
 | `StepOutcome::Cancel { reason }` | Ack; terminal hook fires `Cancelled`. Runner verdict: no dead-letter. |
@@ -282,9 +281,9 @@ so retries still invoke the runner. The record is keyed by
 `(run_id, step_number, SHA-256(step payload))` and is written before the
 runtime applies the outcome. If the same step is delivered again after a
 crash before ack, the stored outcome is replayed without invoking the
-runner again. A replayed `ContinueAfter` reduces its delay by the time
-already elapsed since the outcome was stored, preserving the original
-schedule.
+runner again. A replayed `Continue` with a `Trigger::After` delay reduces
+the delay by the time already elapsed since the outcome was stored,
+preserving the original schedule.
 
 This is disabled by default because it adds one object-store read per step
 delivery (the replay lookup) plus one write per recorded outcome, and makes
@@ -330,7 +329,7 @@ without configuring `WorkflowRuntimeBuilder::memo_retention`.
 
 Every timestamp the runtime writes (the `submitted_at_ms` on the
 durable per-run record, the `run_at` it computes when a step
-returns `ContinueAfter`, and the terminal-marker timestamps the
+continues with a `Trigger::After` delay, and the terminal-marker timestamps the
 memo-retention sweep consumes) is read through a `taquba::Clock`
 rather than `SystemTime::now()`. By default the runtime inherits
 the clock its `Queue` was opened with, so passing a `MockClock`
@@ -355,7 +354,7 @@ time source than the queue. The common case for production callers
 is to leave the default and let the queue's `SystemClock` flow
 through.
 
-This makes downstream tests deterministic: `ContinueAfter` delays,
+This makes downstream tests deterministic: `Trigger::After` delays,
 memo-retention sweep eligibility, and terminal-marker ages all
 advance under explicit `MockClock::advance` calls rather than
 wall-clock waits.

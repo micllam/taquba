@@ -49,9 +49,9 @@ impl StepRunner for Counter {
                 result: format!("reached {next}").into_bytes(),
             })
         } else {
-            Ok(StepOutcome::Continue {
-                payload: format!("{next}/{target}").into_bytes(),
-            })
+            Ok(StepOutcome::continue_now(
+                format!("{next}/{target}").into_bytes(),
+            ))
         }
     }
 }

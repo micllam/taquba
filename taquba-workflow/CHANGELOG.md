@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `StepOutcome::Continue` and `StepOutcome::ContinueAfter` are
+  unified into `StepOutcome::Continue { payload, when }`, where `when` is the
+  new `Trigger` enum (`Trigger::Immediate` or `Trigger::After(delay)`). The
+  constructors `StepOutcome::continue_now(payload)` and
+  `StepOutcome::continue_after(payload, delay)` build the two forms. This
+  prepares for additional trigger kinds without further variant growth. The
+  stored step-output replay record format changes accordingly.
 - The `object_store` types in the public API are now `object_store` 0.14.
 
 ## [0.7.0] - 2026-06-23

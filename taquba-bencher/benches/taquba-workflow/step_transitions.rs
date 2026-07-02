@@ -69,9 +69,7 @@ impl StepRunner for BenchRunner {
         if step.step_number + 1 >= self.n_steps {
             Ok(StepOutcome::Succeed { result: Vec::new() })
         } else {
-            Ok(StepOutcome::Continue {
-                payload: step.payload.clone(),
-            })
+            Ok(StepOutcome::continue_now(step.payload.clone()))
         }
     }
 }

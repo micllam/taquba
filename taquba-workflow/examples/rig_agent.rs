@@ -154,9 +154,7 @@ impl StepRunner for RigRunner {
                     ));
                 }
                 println!("[step 0] research findings: {findings}");
-                Ok(StepOutcome::Continue {
-                    payload: findings.into_bytes(),
-                })
+                Ok(StepOutcome::continue_now(findings.into_bytes()))
             }
             STEP_WRITE => {
                 let findings = std::str::from_utf8(&step.payload)

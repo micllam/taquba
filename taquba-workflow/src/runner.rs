@@ -21,7 +21,7 @@ pub struct Step {
     pub step_number: u32,
     /// Application-defined bytes. For step 0 this is the submission `input`;
     /// for later steps it is the bytes returned by the previous step's
-    /// [`StepOutcome::Continue`] / [`StepOutcome::ContinueAfter`].
+    /// [`StepOutcome::Continue`].
     pub payload: Vec<u8>,
     /// Submitter-supplied metadata, threaded through every step of the run.
     /// Reserved `workflow.*` headers are stripped before the runner sees them.
@@ -77,23 +77,31 @@ pub struct Step {
     pub memo: Memo,
 }
 
+/// When the next step of a run becomes claimable. Set on the `when`
+/// field of [`StepOutcome::Continue`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum Trigger {
+    /// The next step is claimable immediately.
+    Immediate,
+    /// The next step is claimable `Duration` from now.
+    After(Duration),
+}
+
 /// What the runner wants the runtime to do after this step.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum StepOutcome {
-    /// Run is not finished. Enqueue the next step immediately with `payload`
-    /// as its bytes. The runtime advances `step_number` by 1.
+    /// Run is not finished. Enqueue the next step with `payload` as its
+    /// bytes; `when` decides when it becomes claimable. The runtime
+    /// advances `step_number` by 1. The constructors
+    /// [`Self::continue_now`] and [`Self::continue_after`] build the
+    /// common forms.
     Continue {
         /// Bytes to hand to the next step's [`Step::payload`].
         payload: Vec<u8>,
-    },
-    /// Like [`Self::Continue`] but the next step is scheduled `delay` from
-    /// now (e.g. backing off after a 429 from a provider).
-    ContinueAfter {
-        /// Bytes to hand to the next step's [`Step::payload`].
-        payload: Vec<u8>,
-        /// How long to wait before the next step becomes claimable.
-        delay: Duration,
+        /// When the next step becomes claimable.
+        when: Trigger,
     },
     /// The run is finished successfully. The runtime acks the step and fires
     /// the configured terminal hook with
@@ -133,6 +141,24 @@ pub enum StepOutcome {
         /// Human-readable reason recorded on [`crate::RunOutcome::error`].
         reason: String,
     },
+}
+
+impl StepOutcome {
+    /// Continue the run; the next step is claimable immediately.
+    pub fn continue_now(payload: Vec<u8>) -> Self {
+        Self::Continue {
+            payload,
+            when: Trigger::Immediate,
+        }
+    }
+
+    /// Continue the run; the next step is claimable `delay` from now.
+    pub fn continue_after(payload: Vec<u8>, delay: Duration) -> Self {
+        Self::Continue {
+            payload,
+            when: Trigger::After(delay),
+        }
+    }
 }
 
 /// Failure outcomes the runner can return.
