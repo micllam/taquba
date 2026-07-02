@@ -6,8 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use taquba::object_store::ObjectStore;
 use taquba::{
-    AckEffects, Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, JobRecord, PermanentFailure,
-    Queue, Worker, WorkerError,
+    AckEffects, Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, JobRecord, JobStatus,
+    PermanentFailure, Queue, Worker, WorkerError,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -27,15 +27,58 @@ pub const HEADER_STEP: &str = "workflow.step";
 /// them as its own and strips them before invoking the runner.
 pub const RESERVED_HEADER_PREFIX: &str = "workflow.";
 
+/// Header key marking a step job as a signal waiter; the value is the
+/// correlation key the waiter is registered under.
+pub const HEADER_SIGNAL_WAIT: &str = "workflow.signal_wait";
+/// Header key marking a step job whose signal was already consumed at the
+/// previous step's settlement; the payload is read from the durable
+/// delivered record.
+pub const HEADER_SIGNAL_DELIVERED: &str = "workflow.signal_delivered";
+
 const DEDUP_PREFIX: &str = "run:";
 
 /// Prefix for the durable per-run record in Taquba's user KV namespace.
 const RUN_KV_PREFIX: &[u8] = b"workflow/runs/";
 
+/// Prefix for the durable waiter index: `correlation key -> job id` of the
+/// step job waiting on that key.
+const SIGNAL_WAIT_KV_PREFIX: &[u8] = b"workflow/signal-wait/";
+
+/// Prefix for the durable signal buffer: `correlation key -> payload` of a
+/// signal that arrived while no waiter was registered.
+const SIGNAL_BUF_KV_PREFIX: &[u8] = b"workflow/signal-buf/";
+
+/// Prefix for the durable delivered record: `(run id, step) -> payload` of
+/// a signal consumed on the waiter's behalf, read when that step is
+/// claimed and deleted with its settlement.
+const SIGNAL_DELIVERED_KV_PREFIX: &[u8] = b"workflow/signal-delivered/";
+
 fn run_kv_key(run_id: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(RUN_KV_PREFIX.len() + run_id.len());
     k.extend_from_slice(RUN_KV_PREFIX);
     k.extend_from_slice(run_id.as_bytes());
+    k
+}
+
+fn signal_wait_kv_key(correlation_key: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(SIGNAL_WAIT_KV_PREFIX.len() + correlation_key.len());
+    k.extend_from_slice(SIGNAL_WAIT_KV_PREFIX);
+    k.extend_from_slice(correlation_key.as_bytes());
+    k
+}
+
+fn signal_buf_kv_key(correlation_key: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(SIGNAL_BUF_KV_PREFIX.len() + correlation_key.len());
+    k.extend_from_slice(SIGNAL_BUF_KV_PREFIX);
+    k.extend_from_slice(correlation_key.as_bytes());
+    k
+}
+
+fn signal_delivered_kv_key(run_id: &str, step_number: u32) -> Vec<u8> {
+    let mut k = Vec::from(SIGNAL_DELIVERED_KV_PREFIX);
+    k.extend_from_slice(run_id.as_bytes());
+    k.push(b'/');
+    k.extend_from_slice(step_number.to_string().as_bytes());
     k
 }
 
@@ -83,6 +126,10 @@ impl From<DurableDuration> for Duration {
 enum DurableTrigger {
     Immediate,
     After(DurableDuration),
+    OnSignal {
+        correlation_key: String,
+        timeout: DurableDuration,
+    },
 }
 
 impl From<&Trigger> for DurableTrigger {
@@ -90,6 +137,13 @@ impl From<&Trigger> for DurableTrigger {
         match trigger {
             Trigger::Immediate => Self::Immediate,
             Trigger::After(delay) => Self::After((*delay).into()),
+            Trigger::OnSignal {
+                correlation_key,
+                timeout,
+            } => Self::OnSignal {
+                correlation_key: correlation_key.clone(),
+                timeout: (*timeout).into(),
+            },
         }
     }
 }
@@ -99,6 +153,13 @@ impl From<DurableTrigger> for Trigger {
         match trigger {
             DurableTrigger::Immediate => Self::Immediate,
             DurableTrigger::After(delay) => Self::After(delay.into()),
+            DurableTrigger::OnSignal {
+                correlation_key,
+                timeout,
+            } => Self::OnSignal {
+                correlation_key,
+                timeout: timeout.into(),
+            },
         }
     }
 }
@@ -191,6 +252,8 @@ struct StepEnqueueOpts {
     priority: Option<u32>,
     /// Per-step `max_attempts` override.
     max_attempts: Option<u32>,
+    /// Additional runtime-owned reserved headers for the step job.
+    reserved_headers: Vec<(&'static str, String)>,
 }
 
 /// Spec passed to [`WorkflowRuntime::submit`].
@@ -282,6 +345,25 @@ pub struct WorkflowRuntimeBuilder<R, H> {
     step_output_replay: bool,
     clock: Arc<dyn Clock>,
 }
+
+/// Outcome of [`WorkflowRuntime::signal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalOutcome {
+    /// A waiter was registered for the correlation key and has been woken;
+    /// its step runs next with [`Step::signal`] set to the payload.
+    Delivered,
+    /// No waiter was woken. The signal is buffered durably under the
+    /// correlation key and is consumed by the next waiter registered for
+    /// it, or discarded by [`WorkflowRuntime::clear_signal`].
+    Buffered,
+}
+
+/// Number of waiter-index reads [`WorkflowRuntime::signal`] performs
+/// before concluding no waiter exists, and the pause between them. A
+/// registration settling concurrently becomes visible within one
+/// acknowledgement commit, which these reads cover.
+const SIGNAL_WAIT_READ_ATTEMPTS: u32 = 10;
+const SIGNAL_WAIT_READ_INTERVAL: Duration = Duration::from_millis(25);
 
 impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     /// The Taquba queue name that step jobs are enqueued onto. Defaults to
@@ -720,6 +802,76 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         Ok(true)
     }
 
+    /// Deliver a signal for `correlation_key`, waking the run waiting on
+    /// it via [`Trigger::OnSignal`].
+    ///
+    /// When a waiter is registered and still waiting, its next step is
+    /// promoted immediately and observes `payload` on [`Step::signal`];
+    /// the call returns [`SignalOutcome::Delivered`]. Otherwise the signal
+    /// is buffered durably under the correlation key and the next waiter
+    /// registered for it consumes the buffered payload at its
+    /// registration; the call returns [`SignalOutcome::Buffered`].
+    ///
+    /// One buffered signal is held per correlation key: a second signal
+    /// before consumption replaces the first. A buffered signal persists
+    /// until a waiter consumes it or [`Self::clear_signal`] discards it.
+    /// The buffer write is durable before the call returns, so a signal
+    /// is never lost once this call returns; delivery to a waiter whose
+    /// registration is settling concurrently falls back to the buffer and
+    /// reaches it no later than its timeout.
+    pub async fn signal(&self, correlation_key: &str, payload: Vec<u8>) -> Result<SignalOutcome> {
+        let queue = &self.inner.queue;
+        let buf_key = signal_buf_kv_key(correlation_key);
+        // Buffer first, durably: a waiter registering concurrently reads
+        // the buffer at its settlement, so the signal is never lost even
+        // if the waiter index is not yet visible below.
+        queue.kv_put(&buf_key, &payload).await?;
+
+        let wait_key = signal_wait_kv_key(correlation_key);
+        for attempt in 0..SIGNAL_WAIT_READ_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(SIGNAL_WAIT_READ_INTERVAL).await;
+            }
+            let Some(waiter) = queue.kv_get(&wait_key).await? else {
+                continue;
+            };
+            let Ok(job_id) = std::str::from_utf8(&waiter).map(str::to_string) else {
+                let _ = queue.kv_compare_delete(&wait_key, &waiter).await;
+                return Ok(SignalOutcome::Buffered);
+            };
+            return match queue.wake_scheduled(&job_id, Some(payload.clone())).await? {
+                taquba::WakeOutcome::Woken => {
+                    let _ = queue.kv_compare_delete(&buf_key, &payload).await;
+                    let _ = queue.kv_compare_delete(&wait_key, &waiter).await;
+                    Ok(SignalOutcome::Delivered)
+                }
+                taquba::WakeOutcome::NotScheduled | taquba::WakeOutcome::NotFound => {
+                    // Stale index entry: the waiter was already promoted or
+                    // its run was cancelled. Remove the entry; the signal
+                    // stays buffered.
+                    let _ = queue.kv_compare_delete(&wait_key, &waiter).await;
+                    Ok(SignalOutcome::Buffered)
+                }
+            };
+        }
+        Ok(SignalOutcome::Buffered)
+    }
+
+    /// Discard the buffered signal for `correlation_key`, if one exists.
+    /// Returns `true` when a buffered signal was removed.
+    pub async fn clear_signal(&self, correlation_key: &str) -> Result<bool> {
+        let queue = &self.inner.queue;
+        let buf_key = signal_buf_kv_key(correlation_key);
+        loop {
+            let Some(current) = queue.kv_get(&buf_key).await? else {
+                return Ok(false);
+            };
+            if queue.kv_compare_delete(&buf_key, &current).await? {
+                return Ok(true);
+            }
+        }
+    }
+
     /// Drive the step worker loop until `shutdown` resolves. Spawns up
     /// to `max_concurrent_steps` step processors and, when
     /// [`WorkflowRuntimeBuilder::memo_retention`] is set, an additional
@@ -832,6 +984,9 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         let mut headers = user_headers.clone();
         headers.insert(HEADER_RUN_ID.to_string(), run_id.to_string());
         headers.insert(HEADER_STEP.to_string(), step_number.to_string());
+        for (key, value) in &opts.reserved_headers {
+            headers.insert((*key).to_string(), value.clone());
+        }
 
         let request = EnqueueRequest {
             queue: self.queue_name.clone(),
@@ -1048,12 +1203,21 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         match rmp_serde::from_slice::<DurableStepOutcomeRecord>(&bytes) {
             Ok(record) => {
                 let mut outcome = StepOutcome::from(record.outcome);
-                if let StepOutcome::Continue {
-                    when: Trigger::After(delay),
-                    ..
-                } = &mut outcome
-                {
-                    *delay = remaining_delay(record.stored_at_ms, self.clock.now_ms(), *delay);
+                match &mut outcome {
+                    StepOutcome::Continue {
+                        when: Trigger::After(delay),
+                        ..
+                    } => {
+                        *delay = remaining_delay(record.stored_at_ms, self.clock.now_ms(), *delay);
+                    }
+                    StepOutcome::Continue {
+                        when: Trigger::OnSignal { timeout, .. },
+                        ..
+                    } => {
+                        *timeout =
+                            remaining_delay(record.stored_at_ms, self.clock.now_ms(), *timeout);
+                    }
+                    _ => {}
                 }
                 Ok(Some(outcome))
             }
@@ -1104,6 +1268,13 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .registry_mark_running(&run_id, step_number, &job.id, &user_headers)
             .await;
 
+        let (step_signal, signal_kv_deletes) =
+            match self.resolve_step_signal(job, &run_id, step_number).await {
+                Ok(v) => v,
+                // Transient: the step retries and resolves again.
+                Err(e) => return Err(e.to_string().into()),
+            };
+
         let step = Step {
             run_id: run_id.clone(),
             step_number,
@@ -1113,6 +1284,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             attempts: job.attempts,
             cancel_token,
             memo: self.memo_store.new_memo(&run_id, step_number),
+            signal: step_signal,
         };
 
         // Preserve the run's per-step priority and max_attempts across the
@@ -1121,6 +1293,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             run_at: None,
             priority: Some(job.priority),
             max_attempts: Some(job.max_attempts),
+            reserved_headers: Vec::new(),
         };
 
         let mut replayed_step_output = false;
@@ -1173,7 +1346,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         //    whatever outcome the runner returned (including transient
         //    retries and permanent dead-letters), with `error: None` so
         //    consumers can distinguish external vs. runner-issued cancel.
-        match outcome {
+        let settled = match outcome {
             Ok(StepOutcome::Cancel { reason }) => Ok(self
                 .terminate_collecting_effects(RunOutcome {
                     run_id: run_id.clone(),
@@ -1194,21 +1367,42 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     final_step: step_number,
                 })
                 .await),
-            Ok(StepOutcome::Continue { payload, when }) => {
-                let opts = match when {
-                    Trigger::Immediate => inherit_opts(),
-                    Trigger::After(delay) => {
-                        let now = UNIX_EPOCH + Duration::from_millis(self.clock.now_ms());
-                        StepEnqueueOpts {
-                            run_at: Some(now + delay),
-                            ..inherit_opts()
-                        }
-                    }
-                };
-                Ok(self
-                    .advance(&run_id, step_number + 1, payload, &user_headers, opts)
-                    .await)
-            }
+            Ok(StepOutcome::Continue { payload, when }) => match when {
+                Trigger::Immediate => Ok(self
+                    .advance(
+                        &run_id,
+                        step_number + 1,
+                        payload,
+                        &user_headers,
+                        inherit_opts(),
+                    )
+                    .await),
+                Trigger::After(delay) => {
+                    let now = UNIX_EPOCH + Duration::from_millis(self.clock.now_ms());
+                    let opts = StepEnqueueOpts {
+                        run_at: Some(now + delay),
+                        ..inherit_opts()
+                    };
+                    Ok(self
+                        .advance(&run_id, step_number + 1, payload, &user_headers, opts)
+                        .await)
+                }
+                Trigger::OnSignal {
+                    correlation_key,
+                    timeout,
+                } => {
+                    self.advance_on_signal(
+                        &run_id,
+                        step_number + 1,
+                        payload,
+                        &user_headers,
+                        inherit_opts(),
+                        &correlation_key,
+                        timeout,
+                    )
+                    .await
+                }
+            },
             Ok(StepOutcome::Succeed { result }) => Ok(self
                 .terminate_collecting_effects(RunOutcome {
                     run_id: run_id.clone(),
@@ -1269,7 +1463,13 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 }
                 Err(message.into())
             }
-        }
+        };
+        // Durable signal entries scheduled for cleanup are deleted with the
+        // step's settlement; on retry paths they survive for redelivery.
+        settled.map(|mut effects| {
+            effects.kv_deletes.extend(signal_kv_deletes);
+            effects
+        })
     }
 
     /// Build the effects that advance the run to `next_step`: the next
@@ -1288,8 +1488,27 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         user_headers: &HashMap<String, String>,
         opts: StepEnqueueOpts,
     ) -> AckEffects {
+        self.advance_with_kv(run_id, next_step, payload, user_headers, opts, |_| {
+            HashMap::new()
+        })
+        .await
+    }
+
+    /// [`Self::advance`] with caller KV writes joined to the same
+    /// acknowledgement transaction. `kv_writes` receives the next step's
+    /// pre-assigned job id so the writes can reference it.
+    async fn advance_with_kv(
+        &self,
+        run_id: &str,
+        next_step: u32,
+        payload: Vec<u8>,
+        user_headers: &HashMap<String, String>,
+        opts: StepEnqueueOpts,
+        kv_writes: impl FnOnce(&str) -> HashMap<Vec<u8>, Vec<u8>>,
+    ) -> AckEffects {
         let (request, next_job_id) =
             self.step_enqueue_request(run_id, next_step, payload, user_headers, opts);
+        let kv_writes = kv_writes(&next_job_id);
         // Make sure to preserve `cancel_requested`.
         if let Some(entry) = self.registry.lock().await.get_mut(run_id) {
             entry.status.state = RunState::Pending;
@@ -1298,8 +1517,147 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         }
         AckEffects {
             enqueues: vec![request],
+            kv_writes,
             ..AckEffects::default()
         }
+    }
+
+    /// Build the effects that advance the run to a step that waits for a
+    /// signal for `correlation_key`. When a buffered signal already exists it is
+    /// consumed: the next step is enqueued immediately, the payload is
+    /// recorded under the durable delivered key and the buffer entry is
+    /// deleted, all in the acknowledgement transaction. Otherwise the next
+    /// step is scheduled `timeout` from now and the waiter index entry
+    /// joins the same transaction.
+    #[allow(clippy::too_many_arguments)]
+    async fn advance_on_signal(
+        &self,
+        run_id: &str,
+        next_step: u32,
+        payload: Vec<u8>,
+        user_headers: &HashMap<String, String>,
+        base_opts: StepEnqueueOpts,
+        correlation_key: &str,
+        timeout: Duration,
+    ) -> std::result::Result<AckEffects, WorkerError> {
+        let wait_key = signal_wait_kv_key(correlation_key);
+
+        // One waiter per correlation key: reject a registration while a
+        // live waiter holds the key. The check reads current state; a
+        // stale index entry (its job no longer scheduled) is overwritten.
+        // The rejection terminates the run like any permanent step error.
+        match self.queue.kv_get(&wait_key).await {
+            Ok(Some(existing)) => {
+                if let Ok(existing_id) = std::str::from_utf8(&existing)
+                    && let Ok(Some(job)) = self.queue.get_job(existing_id).await
+                    && job.status == JobStatus::Scheduled
+                {
+                    let message = format!(
+                        "a waiter is already registered for correlation key `{correlation_key}`"
+                    );
+                    self.terminate(RunOutcome {
+                        run_id: run_id.to_string(),
+                        status: TerminalStatus::Failed,
+                        result: None,
+                        error: Some(message.clone()),
+                        headers: user_headers.clone(),
+                        final_step: next_step.saturating_sub(1),
+                    })
+                    .await;
+                    return Err(PermanentFailure::new(message).into());
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return Err(e.to_string().into()),
+        }
+
+        let buf_key = signal_buf_kv_key(correlation_key);
+        match self.queue.kv_get(&buf_key).await {
+            Ok(Some(buffered)) => {
+                let opts = StepEnqueueOpts {
+                    reserved_headers: vec![(HEADER_SIGNAL_DELIVERED, "1".to_string())],
+                    ..base_opts
+                };
+                let delivered_key = signal_delivered_kv_key(run_id, next_step);
+                let buffered = buffered.to_vec();
+                let mut effects = self
+                    .advance_with_kv(run_id, next_step, payload, user_headers, opts, |_| {
+                        HashMap::from([(delivered_key, buffered)])
+                    })
+                    .await;
+                effects.kv_deletes.push(buf_key);
+                Ok(effects)
+            }
+            Ok(None) => {
+                let now = UNIX_EPOCH + Duration::from_millis(self.clock.now_ms());
+                let opts = StepEnqueueOpts {
+                    run_at: Some(now + timeout),
+                    reserved_headers: vec![(HEADER_SIGNAL_WAIT, correlation_key.to_string())],
+                    ..base_opts
+                };
+                let effects = self
+                    .advance_with_kv(run_id, next_step, payload, user_headers, opts, |job_id| {
+                        HashMap::from([(wait_key, job_id.as_bytes().to_vec())])
+                    })
+                    .await;
+                Ok(effects)
+            }
+            Err(e) => Err(e.to_string().into()),
+        }
+    }
+
+    /// Resolve the signal delivery for a claimed step job: the payload to
+    /// expose on [`Step::signal`] and the durable signal entries to delete
+    /// with the step's settlement.
+    async fn resolve_step_signal(
+        &self,
+        job: &JobRecord,
+        run_id: &str,
+        step_number: u32,
+    ) -> Result<(Option<Vec<u8>>, Vec<Vec<u8>>)> {
+        if job.headers.contains_key(HEADER_SIGNAL_DELIVERED) {
+            let delivered_key = signal_delivered_kv_key(run_id, step_number);
+            let payload = self.queue.kv_get(&delivered_key).await?.map(|b| b.to_vec());
+            if payload.is_none() {
+                warn!(run_id = %run_id, step_number, "delivered signal record is missing");
+            }
+            return Ok((payload, vec![delivered_key]));
+        }
+
+        let Some(correlation_key) = job.headers.get(HEADER_SIGNAL_WAIT) else {
+            return Ok((None, Vec::new()));
+        };
+        let wait_key = signal_wait_kv_key(correlation_key);
+        let _ = self
+            .queue
+            .kv_compare_delete(&wait_key, job.id.as_bytes())
+            .await;
+
+        if job.woken_at.is_some() {
+            // A signal promoted this job early. The payload is on the job
+            // record, so redelivery of this step observes it again.
+            return Ok((job.wake_payload.clone(), Vec::new()));
+        }
+
+        // The timeout promoted this job. A prior attempt of this step may
+        // already have consumed the buffer into the delivered record.
+        let delivered_key = signal_delivered_kv_key(run_id, step_number);
+        if let Some(prior) = self.queue.kv_get(&delivered_key).await? {
+            return Ok((Some(prior.to_vec()), vec![delivered_key]));
+        }
+        // A signal buffered after this waiter's settlement read of the
+        // buffer, without winning the wake, is consumed here so it is
+        // delivered rather than dropped. The delivery is recorded before
+        // the buffer is consumed, so a retry of this step observes the
+        // same signal.
+        let buf_key = signal_buf_kv_key(correlation_key);
+        if let Some(buffered) = self.queue.kv_get(&buf_key).await? {
+            let buffered = buffered.to_vec();
+            self.queue.kv_put(&delivered_key, &buffered).await?;
+            let _ = self.queue.kv_compare_delete(&buf_key, &buffered).await;
+            return Ok((Some(buffered), vec![delivered_key]));
+        }
+        Ok((None, Vec::new()))
     }
 }
 
@@ -1541,6 +1899,372 @@ mod tests {
         assert_eq!(outcome.run_id, handle.run_id);
         assert_eq!(outcome.final_step, 1);
         assert_eq!(outcome.status, TerminalStatus::Succeeded);
+
+        let _ = shutdown.send(());
+    }
+
+    type ObservedSignals = Arc<StdMutex<Vec<Option<Vec<u8>>>>>;
+
+    /// Two-step runner: step 0 continues with a signal wait on
+    /// `correlation_key`, step 1 records [`Step::signal`] and succeeds.
+    struct SignalProbe {
+        correlation_key: String,
+        timeout: Duration,
+        observed: ObservedSignals,
+    }
+
+    impl StepRunner for SignalProbe {
+        async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
+            if step.step_number == 0 {
+                Ok(StepOutcome::continue_on_signal(
+                    Vec::new(),
+                    self.correlation_key.clone(),
+                    self.timeout,
+                ))
+            } else {
+                self.observed.lock().unwrap().push(step.signal.clone());
+                Ok(StepOutcome::Succeed { result: Vec::new() })
+            }
+        }
+    }
+
+    async fn wait_for_scheduled(queue: &Queue, count: i64) {
+        for _ in 0..200 {
+            if queue.stats("workflow-steps").await.unwrap().scheduled == count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("scheduled count never reached {count}");
+    }
+
+    fn signal_probe_runtime(
+        queue: Arc<Queue>,
+        store: Arc<dyn taquba::object_store::ObjectStore>,
+        correlation_key: &str,
+        timeout: Duration,
+    ) -> (
+        WorkflowRuntime<SignalProbe, ChannelHook>,
+        ObservedSignals,
+        tokio::sync::mpsc::UnboundedReceiver<RunOutcome>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = WorkflowRuntime::builder(
+            queue,
+            store,
+            SignalProbe {
+                correlation_key: correlation_key.to_string(),
+                timeout,
+                observed: observed.clone(),
+            },
+            ChannelHook { tx },
+        )
+        .build();
+        (runtime, observed, rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn signal_wakes_waiting_run_early_with_payload() {
+        let (queue, store, _clock) = fresh_queue_with_mock_clock(1_700_000_000_000).await;
+        let (runtime, observed, mut rx) =
+            signal_probe_runtime(queue.clone(), store, "order-1", Duration::from_secs(3600));
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        wait_for_scheduled(&queue, 1).await;
+
+        let outcome = runtime.signal("order-1", b"paid".to_vec()).await.unwrap();
+        assert_eq!(outcome, SignalOutcome::Delivered);
+
+        // The run completes without the timeout elapsing on the mock clock.
+        let terminal = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.status, TerminalStatus::Succeeded);
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            &[Some(b"paid".to_vec())]
+        );
+
+        // Both durable signal entries are consumed.
+        assert!(
+            queue
+                .kv_get(&signal_wait_kv_key("order-1"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            queue
+                .kv_get(&signal_buf_kv_key("order-1"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn signal_timeout_delivers_none() {
+        let (queue, store, clock) = fresh_queue_with_mock_clock(1_700_000_000_000).await;
+        let (runtime, observed, mut rx) =
+            signal_probe_runtime(queue.clone(), store, "order-2", Duration::from_secs(60));
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        wait_for_scheduled(&queue, 1).await;
+
+        advance(&clock, Duration::from_secs(61)).await;
+        queue.promote_scheduled_now().await.unwrap();
+
+        let terminal = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.status, TerminalStatus::Succeeded);
+        assert_eq!(observed.lock().unwrap().as_slice(), &[None]);
+
+        assert!(
+            queue
+                .kv_get(&signal_wait_kv_key("order-2"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn signal_before_waiter_is_buffered_and_consumed_at_registration() {
+        let (queue, store, _clock) = fresh_queue_with_mock_clock(1_700_000_000_000).await;
+        let (runtime, observed, mut rx) =
+            signal_probe_runtime(queue.clone(), store, "order-3", Duration::from_secs(3600));
+        let shutdown = spawn_runtime(runtime.clone());
+
+        let outcome = runtime.signal("order-3", b"early".to_vec()).await.unwrap();
+        assert_eq!(outcome, SignalOutcome::Buffered);
+
+        runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // The buffered signal is consumed at registration: the run
+        // completes without any waiting and without the timeout elapsing.
+        let terminal = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.status, TerminalStatus::Succeeded);
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            &[Some(b"early".to_vec())]
+        );
+
+        assert!(
+            queue
+                .kv_get(&signal_buf_kv_key("order-3"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn second_signal_before_consumption_replaces_first() {
+        let (queue, store, _clock) = fresh_queue_with_mock_clock(1_700_000_000_000).await;
+        let (runtime, observed, mut rx) =
+            signal_probe_runtime(queue.clone(), store, "order-4", Duration::from_secs(3600));
+        let shutdown = spawn_runtime(runtime.clone());
+
+        assert_eq!(
+            runtime.signal("order-4", b"first".to_vec()).await.unwrap(),
+            SignalOutcome::Buffered
+        );
+        assert_eq!(
+            runtime.signal("order-4", b"second".to_vec()).await.unwrap(),
+            SignalOutcome::Buffered
+        );
+
+        runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let terminal = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.status, TerminalStatus::Succeeded);
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            &[Some(b"second".to_vec())]
+        );
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clear_signal_discards_buffered_signal() {
+        let (queue, store, _clock) = fresh_queue_with_mock_clock(1_700_000_000_000).await;
+        let (runtime, _observed, _rx) =
+            signal_probe_runtime(queue.clone(), store, "order-5", Duration::from_secs(60));
+
+        assert_eq!(
+            runtime.signal("order-5", b"stale".to_vec()).await.unwrap(),
+            SignalOutcome::Buffered
+        );
+        assert!(runtime.clear_signal("order-5").await.unwrap());
+        assert!(!runtime.clear_signal("order-5").await.unwrap());
+        assert!(
+            queue
+                .kv_get(&signal_buf_kv_key("order-5"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn duplicate_waiter_registration_fails_the_run() {
+        let (queue, store, _clock) = fresh_queue_with_mock_clock(1_700_000_000_000).await;
+        let (runtime, _observed, mut rx) =
+            signal_probe_runtime(queue.clone(), store, "order-6", Duration::from_secs(3600));
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                run_id: Some("run-a".to_string()),
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        wait_for_scheduled(&queue, 1).await;
+
+        runtime
+            .submit(RunSpec {
+                run_id: Some("run-b".to_string()),
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let terminal = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.run_id, "run-b");
+        assert_eq!(terminal.status, TerminalStatus::Failed);
+        assert!(
+            terminal
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("already registered"))
+        );
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_signal_missed_by_the_wake_is_delivered_at_timeout() {
+        let (queue, store, clock) = fresh_queue_with_mock_clock(1_700_000_000_000).await;
+        let (runtime, observed, mut rx) =
+            signal_probe_runtime(queue.clone(), store, "order-7", Duration::from_secs(60));
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        wait_for_scheduled(&queue, 1).await;
+
+        // A signal that was buffered without winning the wake (written
+        // directly to simulate the settling-registration window).
+        queue
+            .kv_put(&signal_buf_kv_key("order-7"), b"late")
+            .await
+            .unwrap();
+
+        advance(&clock, Duration::from_secs(61)).await;
+        queue.promote_scheduled_now().await.unwrap();
+
+        let terminal = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.status, TerminalStatus::Succeeded);
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            &[Some(b"late".to_vec())]
+        );
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_waiter_leaves_no_live_index_for_the_next_signal() {
+        let (queue, store, _clock) = fresh_queue_with_mock_clock(1_700_000_000_000).await;
+        let (runtime, _observed, mut rx) =
+            signal_probe_runtime(queue.clone(), store, "order-8", Duration::from_secs(3600));
+        let shutdown = spawn_runtime(runtime.clone());
+
+        let handle = runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        wait_for_scheduled(&queue, 1).await;
+
+        assert!(runtime.cancel(&handle.run_id).await.unwrap());
+        let terminal = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.status, TerminalStatus::Cancelled);
+
+        // The signal finds only a stale index entry, cleans it and buffers.
+        assert_eq!(
+            runtime.signal("order-8", b"orphan".to_vec()).await.unwrap(),
+            SignalOutcome::Buffered
+        );
+        assert!(
+            queue
+                .kv_get(&signal_wait_kv_key("order-8"))
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let _ = shutdown.send(());
     }

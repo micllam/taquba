@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Durable signals: `Trigger::OnSignal { correlation_key, timeout }` (built
+  by `StepOutcome::continue_on_signal`) defers the next step until
+  `WorkflowRuntime::signal` delivers a payload for the correlation key, or
+  until the timeout elapses. The next step reads the new `Step::signal`
+  field: `Some(payload)` when a signal arrived, `None` on timeout. A signal
+  with no registered waiter is buffered durably and consumed by the next
+  waiter for its key; `WorkflowRuntime::clear_signal` discards a buffered
+  signal. One buffered signal is held per key (a later signal replaces an
+  unconsumed one) and one waiter is allowed per key (a second registration
+  fails its run). New reserved headers `workflow.signal_wait` and
+  `workflow.signal_delivered`; new `SignalOutcome` enum.
+
 ### Changed
 
 - **Breaking:** `StepOutcome::Continue` and `StepOutcome::ContinueAfter` are

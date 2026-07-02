@@ -104,6 +104,7 @@ mod tests {
             attempts: 1,
             cancel_token: CancellationToken::new(),
             memo,
+            signal: None,
         }
     }
 

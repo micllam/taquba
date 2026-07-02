@@ -75,6 +75,13 @@ pub struct Step {
     ///
     /// See [`Memo`] for the full API.
     pub memo: Memo,
+    /// The signal payload, when this step was reached through a
+    /// [`Trigger::OnSignal`] wait that a signal resolved: the previous
+    /// step continued with `OnSignal`, and a
+    /// [`crate::WorkflowRuntime::signal`] call for the correlation key
+    /// arrived before the timeout. `None` when the timeout elapsed first
+    /// and on every step not preceded by an `OnSignal` wait.
+    pub signal: Option<Vec<u8>>,
 }
 
 /// When the next step of a run becomes claimable. Set on the `when`
@@ -86,6 +93,24 @@ pub enum Trigger {
     Immediate,
     /// The next step is claimable `Duration` from now.
     After(Duration),
+    /// The next step is claimable when a signal for `correlation_key`
+    /// arrives via [`crate::WorkflowRuntime::signal`], or after `timeout`,
+    /// whichever comes first. The next step reads [`Step::signal`] to
+    /// distinguish the two: `Some(payload)` when a signal arrived, `None`
+    /// when the timeout elapsed first. A signal that arrived before this
+    /// step settled is consumed at settlement and the next step runs
+    /// immediately.
+    ///
+    /// One waiter per correlation key: registering a second waiter while
+    /// one is already waiting fails the step permanently. Choose keys
+    /// that are unique per waiter (e.g. include the run id).
+    OnSignal {
+        /// Caller-chosen key the signaller addresses.
+        correlation_key: String,
+        /// Upper bound on the wait; the next step runs with
+        /// [`Step::signal`] `None` when it elapses first.
+        timeout: Duration,
+    },
 }
 
 /// What the runner wants the runtime to do after this step.
@@ -157,6 +182,22 @@ impl StepOutcome {
         Self::Continue {
             payload,
             when: Trigger::After(delay),
+        }
+    }
+
+    /// Continue the run; the next step is claimable when a signal for
+    /// `correlation_key` arrives, or after `timeout` at the latest.
+    pub fn continue_on_signal(
+        payload: Vec<u8>,
+        correlation_key: impl Into<String>,
+        timeout: Duration,
+    ) -> Self {
+        Self::Continue {
+            payload,
+            when: Trigger::OnSignal {
+                correlation_key: correlation_key.into(),
+                timeout,
+            },
         }
     }
 }

@@ -154,7 +154,7 @@ step retry does not re-submit the fan-out.
 
 | Outcome | Effect |
 |---|---|
-| `StepOutcome::Continue { payload, when }` | Enqueue the next step; `when` (a `Trigger`) decides when it becomes claimable: `Trigger::Immediate` or `Trigger::After(delay)`. Constructors: `StepOutcome::continue_now(payload)`, `StepOutcome::continue_after(payload, delay)`. |
+| `StepOutcome::Continue { payload, when }` | Enqueue the next step; `when` (a `Trigger`) decides when it becomes claimable: `Trigger::Immediate`, `Trigger::After(delay)` or `Trigger::OnSignal { correlation_key, timeout }`. Constructors: `StepOutcome::continue_now(payload)`, `StepOutcome::continue_after(payload, delay)`, `StepOutcome::continue_on_signal(payload, key, timeout)`. |
 | `StepOutcome::Succeed { result }` | Ack; terminal hook fires `Succeeded`. |
 | `StepOutcome::Fail { reason }` | Ack; terminal hook fires `Failed`. Runner verdict: no dead-letter. |
 | `StepOutcome::Cancel { reason }` | Ack; terminal hook fires `Cancelled`. Runner verdict: no dead-letter. |
@@ -200,6 +200,50 @@ Returns `Ok(false)` if the run is unknown or already terminal in this
 runtime. `cancel` only reaches runs submitted to this `WorkflowRuntime`
 instance; a second runtime in the same process (sharing the queue)
 maintains its own registry.
+
+## Durable signals
+
+A step can pause the rest of its run until an external event. Returning
+`StepOutcome::continue_on_signal` (a `Trigger::OnSignal`) defers the next
+step until a signal for the chosen correlation key arrives via
+`WorkflowRuntime::signal`, or until the timeout elapses. The next step
+reads `Step::signal`: `Some(payload)` when a signal arrived, `None` when
+the timeout fired. The natural fit is a run that waits for an approval, a
+webhook callback or another run's completion, with the timeout as the
+escalation path.
+
+```rust,ignore
+// In the runner: pause the run for the payment webhook, or escalate
+// after seven days.
+Ok(StepOutcome::continue_on_signal(
+    order_id.into_bytes(),
+    format!("payment:{order_id}"),
+    Duration::from_secs(7 * 24 * 3600),
+))
+
+// In the webhook handler (same process):
+match runtime.signal(&format!("payment:{order_id}"), body).await? {
+    SignalOutcome::Delivered => { /* a waiting run was woken */ }
+    SignalOutcome::Buffered => { /* held for the next waiter */ }
+}
+```
+
+Signals are durable in both directions. The waiting step is a scheduled
+job in the store, so the wait survives restarts and costs nothing while
+pending. A signal with no registered waiter is buffered durably under its
+correlation key and consumed by the next waiter registered for it, so a
+signal that arrives before its waiter is not lost;
+`WorkflowRuntime::clear_signal` discards a buffered signal that is no
+longer wanted.
+
+Semantics: delivery follows the crate's at-least-once model (the woken
+step can be redelivered and observes the same `Step::signal` value on
+every attempt). One buffered signal is held per correlation key; a second
+signal before consumption replaces the first. One waiter is allowed per
+correlation key; registering a second one fails that run, so choose keys
+unique to the waiter (include the run id when in doubt). Signals are
+scoped to the store: the signaler is the same process that hosts the
+runtime, per the single-process design.
 
 ## Reserved headers
 
