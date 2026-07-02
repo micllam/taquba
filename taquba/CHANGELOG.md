@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Queue::wake_scheduled`: move a scheduled job to pending before its
+  `run_at`, optionally attaching bytes that the worker observes on delivery
+  via the new `JobRecord::wake_payload` field. The wake stamps the new
+  `JobRecord::woken_at` field, so an early wake is distinguishable from
+  ordinary promotion at `run_at` regardless of whether bytes were attached.
+  The targeted counterpart of the scheduler's due-job promotion; returns a
+  `WakeOutcome`.
+- `Queue::kv_put`: standalone durable write to the user KV namespace, for
+  coordination state whose lifecycle is not tied to a single queue
+  transition. Writes coupled to a queue transition should continue to use
+  `enqueue_with_kv` / `ack_with`.
+- `Queue::kv_compare_delete`: delete a user KV entry only if it still holds
+  the expected value, so a concurrently replaced value is never deleted by
+  mistake.
+
 ### Changed
 
 - Upgraded the SlateDB dependency to 0.14 (from 0.13.1).

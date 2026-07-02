@@ -41,6 +41,19 @@ pub enum CancelOutcome {
     NotFound,
 }
 
+/// Outcome of [`Queue::wake_scheduled`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeOutcome {
+    /// The job was `Scheduled` and has been moved to pending. It is
+    /// claimable immediately.
+    Woken,
+    /// A job with this ID exists but is not `Scheduled` (it is pending,
+    /// claimed, done or dead). Nothing was changed.
+    NotScheduled,
+    /// No job with this ID was found.
+    NotFound,
+}
+
 impl CancelOutcome {
     /// `true` if the call acted on the job (either removed or requested).
     pub fn acted(self) -> bool {
@@ -809,6 +822,28 @@ impl Queue {
         Ok(self.db.get(user_scoped_key(key)).await?)
     }
 
+    /// Write a value to the user KV namespace.
+    ///
+    /// Caller-supplied keys are internally scoped under a reserved
+    /// `usr:` prefix and cannot collide with Taquba's internal layout.
+    /// Values above [`MAX_KV_VALUE_SIZE`] return
+    /// [`Error::KvValueTooLarge`]. The write is durable before the call
+    /// returns.
+    ///
+    /// This is the standalone form; to couple a KV write with a queue
+    /// transition in one transaction, use [`Self::enqueue_with_kv`] or
+    /// [`AckEffects::kv_writes`] via [`Self::ack_with`].
+    pub async fn kv_put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        if value.len() > MAX_KV_VALUE_SIZE {
+            return Err(Error::KvValueTooLarge {
+                size: value.len(),
+                max: MAX_KV_VALUE_SIZE,
+            });
+        }
+        self.db.put(user_scoped_key(key), value).await?;
+        Ok(())
+    }
+
     /// Delete a value from the user KV namespace.
     ///
     /// Caller-supplied keys are internally scoped under a reserved
@@ -816,6 +851,40 @@ impl Queue {
     pub async fn kv_delete(&self, key: &[u8]) -> Result<()> {
         self.db.delete(user_scoped_key(key)).await?;
         Ok(())
+    }
+
+    /// Delete a value from the user KV namespace only if its current
+    /// value equals `expected`.
+    ///
+    /// Returns `true` when the value matched and was deleted, `false`
+    /// when the key was absent or held a different value (nothing is
+    /// changed in that case). The read and the delete execute in one
+    /// transaction, so a concurrent writer cannot slip a new value in
+    /// between: either this call deletes the value it compared against,
+    /// or it reports `false`. The delete is durable before the call
+    /// returns `true`.
+    ///
+    /// Use this to consume a value that a concurrent writer may replace,
+    /// where an unconditional [`Self::kv_delete`] could delete a newer
+    /// value than the one read.
+    pub async fn kv_compare_delete(&self, key: &[u8], expected: &[u8]) -> Result<bool> {
+        let scoped = user_scoped_key(key);
+        loop {
+            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+            match txn.get(&scoped).await? {
+                Some(current) if current.as_ref() == expected => {}
+                _ => {
+                    txn.rollback();
+                    return Ok(false);
+                }
+            }
+            txn.delete(&scoped)?;
+            match txn.commit().await {
+                Ok(_) => return Ok(true),
+                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     /// Resolve [`EnqueueOptions`] against the queue's defaults and build
@@ -866,6 +935,8 @@ impl Queue {
             claimed_at: None,
             lease_expires_at: None,
             run_at,
+            woken_at: None,
+            wake_payload: None,
             priority,
             last_error: None,
             dedup_key: opts.dedup_key,
@@ -2001,6 +2072,93 @@ impl Queue {
         }
     }
 
+    /// Move a `Scheduled` job to pending immediately, before its `run_at`,
+    /// optionally attaching `wake_payload` bytes to the record.
+    ///
+    /// This is the targeted counterpart of the scheduler's due-job
+    /// promotion: the same transition (scheduled to pending), applied to one
+    /// job by ID at the caller's initiative instead of at `run_at`. On
+    /// [`WakeOutcome::Woken`] the job is claimable immediately and any
+    /// worker waiting on the queue is notified.
+    ///
+    /// The wake stamps [`JobRecord::woken_at`], so a worker can
+    /// distinguish an early wake from ordinary promotion at `run_at`
+    /// regardless of whether bytes were attached. `wake_payload` is
+    /// stored on [`JobRecord::wake_payload`]. Both values persist on the
+    /// record across later transitions, so redelivery after a lease
+    /// expiry observes them again. The payload contributes to the
+    /// serialized record that is rewritten on each transition; it is
+    /// intended for coordination data, not bulk payload.
+    ///
+    /// Exactly one caller wins the transition: a concurrent scheduler
+    /// promotion, `wake_scheduled` call, or [`Self::cancel`] and this call
+    /// conflict on the scheduled record, and the loser observes
+    /// [`WakeOutcome::NotScheduled`] or [`WakeOutcome::NotFound`]. The
+    /// commit is durable before the call returns.
+    pub async fn wake_scheduled(
+        &self,
+        id: &str,
+        wake_payload: Option<Vec<u8>>,
+    ) -> Result<WakeOutcome> {
+        loop {
+            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+
+            let index_key = job_index_key(id);
+            let current_key = match txn.get(index_key.as_bytes()).await? {
+                None => {
+                    txn.rollback();
+                    return Ok(WakeOutcome::NotFound);
+                }
+                Some(bytes) => match String::from_utf8(bytes.to_vec()) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        txn.rollback();
+                        return Err(Error::InvalidState);
+                    }
+                },
+            };
+
+            let mut job: JobRecord = match txn.get(current_key.as_bytes()).await? {
+                None => {
+                    txn.rollback();
+                    return Ok(WakeOutcome::NotFound);
+                }
+                Some(bytes) => rmp_serde::from_slice(&bytes)?,
+            };
+
+            if job.status != JobStatus::Scheduled {
+                txn.rollback();
+                return Ok(WakeOutcome::NotScheduled);
+            }
+
+            txn.delete(current_key.as_bytes())?;
+            job.status = JobStatus::Pending;
+            job.run_at = None;
+            job.woken_at = Some(self.now_ms());
+            job.wake_payload = wake_payload.clone();
+            let pending = pending_key(&job.queue, job.priority, &job.id);
+            let value = rmp_serde::to_vec_named(&job)?;
+            txn.put(pending.as_bytes(), &value)?;
+            txn.put(index_key.as_bytes(), pending.as_bytes())?;
+            update_stats(
+                &txn,
+                &job.queue,
+                &[(JobStatus::Pending, 1), (JobStatus::Scheduled, -1)],
+            )?;
+
+            match txn.commit().await {
+                Ok(_) => {
+                    self.claim_cursor.note_pending_insert(&job.queue, &pending);
+                    self.job_available.notify_waiters();
+                    debug!(job_id = %id, queue = %job.queue, "scheduled job woken");
+                    return Ok(WakeOutcome::Woken);
+                }
+                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
     /// Enqueue multiple jobs atomically in a single transaction.
     ///
     /// All jobs use the queue's configured `max_attempts` and `default_priority`.
@@ -2040,6 +2198,8 @@ impl Queue {
                 claimed_at: None,
                 lease_expires_at: None,
                 run_at: None,
+                woken_at: None,
+                wake_payload: None,
                 priority,
                 last_error: None,
                 dedup_key: None,
@@ -3489,6 +3649,306 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(job.id, id);
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_wake_scheduled_promotes_before_run_at() {
+        let initial = 1_700_000_000_000u64;
+        let clock = MockClock::new(initial);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        let run_at = std::time::UNIX_EPOCH + Duration::from_millis(initial + 60_000);
+        let id = q
+            .enqueue_with(
+                "jobs",
+                b"waiting".to_vec(),
+                EnqueueOptions {
+                    run_at: Some(run_at),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            q.claim("jobs", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let outcome = q
+            .wake_scheduled(&id, Some(b"signal".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(outcome, WakeOutcome::Woken);
+
+        let s = q.stats("jobs").await.unwrap();
+        assert_eq!(s.scheduled, 0);
+        assert_eq!(s.pending, 1);
+
+        let job = q
+            .claim("jobs", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.id, id);
+        assert_eq!(job.wake_payload.as_deref(), Some(b"signal".as_slice()));
+        assert_eq!(job.woken_at, Some(initial));
+        assert!(job.run_at.is_none());
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_wake_scheduled_without_payload() {
+        let initial = 1_700_000_000_000u64;
+        let clock = MockClock::new(initial);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        let run_at = std::time::UNIX_EPOCH + Duration::from_millis(initial + 60_000);
+        let id = q
+            .enqueue_with(
+                "jobs",
+                b"waiting".to_vec(),
+                EnqueueOptions {
+                    run_at: Some(run_at),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            q.wake_scheduled(&id, None).await.unwrap(),
+            WakeOutcome::Woken
+        );
+
+        let job = q
+            .claim("jobs", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(job.wake_payload.is_none());
+        assert_eq!(job.woken_at, Some(initial));
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_wake_scheduled_non_scheduled_outcomes() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+
+        let id = q.enqueue("jobs", b"p".to_vec()).await.unwrap();
+        assert_eq!(
+            q.wake_scheduled(&id, None).await.unwrap(),
+            WakeOutcome::NotScheduled
+        );
+
+        let job = q
+            .claim("jobs", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            q.wake_scheduled(&job.id, None).await.unwrap(),
+            WakeOutcome::NotScheduled
+        );
+
+        assert_eq!(
+            q.wake_scheduled("01ARZ3NDEKTSV4RRFFQ69G5FAV", None)
+                .await
+                .unwrap(),
+            WakeOutcome::NotFound
+        );
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_wake_scheduled_after_cancel_is_not_found() {
+        let initial = 1_700_000_000_000u64;
+        let clock = MockClock::new(initial);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        let run_at = std::time::UNIX_EPOCH + Duration::from_millis(initial + 60_000);
+        let id = q
+            .enqueue_with(
+                "jobs",
+                b"waiting".to_vec(),
+                EnqueueOptions {
+                    run_at: Some(run_at),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Removed);
+        assert_eq!(
+            q.wake_scheduled(&id, None).await.unwrap(),
+            WakeOutcome::NotFound
+        );
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_wake_scheduled_after_promotion_is_not_scheduled() {
+        let initial = 1_700_000_000_000u64;
+        let clock = MockClock::new(initial);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        let run_at = std::time::UNIX_EPOCH + Duration::from_millis(initial + 100);
+        let id = q
+            .enqueue_with(
+                "jobs",
+                b"soon".to_vec(),
+                EnqueueOptions {
+                    run_at: Some(run_at),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        clock.advance(Duration::from_millis(200));
+        q.promote_scheduled_now().await.unwrap();
+
+        assert_eq!(
+            q.wake_scheduled(&id, Some(b"late".to_vec())).await.unwrap(),
+            WakeOutcome::NotScheduled
+        );
+
+        let job = q
+            .claim("jobs", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(job.wake_payload.is_none());
+        assert!(job.woken_at.is_none());
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_wake_payload_persists_across_redelivery() {
+        let initial = 1_700_000_000_000u64;
+        let clock = MockClock::new(initial);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        let run_at = std::time::UNIX_EPOCH + Duration::from_millis(initial + 60_000);
+        let id = q
+            .enqueue_with(
+                "jobs",
+                b"waiting".to_vec(),
+                EnqueueOptions {
+                    run_at: Some(run_at),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            q.wake_scheduled(&id, Some(b"signal".to_vec()))
+                .await
+                .unwrap(),
+            WakeOutcome::Woken
+        );
+
+        let job = q
+            .claim("jobs", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.nack(job, "worker failed").await.unwrap();
+
+        // The retry backoff moves the job back to `scheduled`; promote it
+        // and verify the redelivered record still carries the wake payload.
+        clock.advance(Duration::from_secs(5));
+        q.promote_scheduled_now().await.unwrap();
+
+        let job = q
+            .claim("jobs", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.id, id);
+        assert_eq!(job.attempts, 2);
+        assert_eq!(job.wake_payload.as_deref(), Some(b"signal".as_slice()));
+        assert_eq!(job.woken_at, Some(initial));
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_kv_put_roundtrip_and_size_cap() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+
+        q.kv_put(b"config", b"v1").await.unwrap();
+        assert_eq!(
+            q.kv_get(b"config").await.unwrap().as_deref(),
+            Some(b"v1".as_slice())
+        );
+
+        let oversized = vec![0u8; MAX_KV_VALUE_SIZE + 1];
+        assert!(matches!(
+            q.kv_put(b"blob", &oversized).await,
+            Err(Error::KvValueTooLarge { .. })
+        ));
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_kv_compare_delete() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+
+        q.kv_put(b"latch", b"v1").await.unwrap();
+
+        assert!(!q.kv_compare_delete(b"latch", b"v2").await.unwrap());
+        assert_eq!(
+            q.kv_get(b"latch").await.unwrap().as_deref(),
+            Some(b"v1".as_slice())
+        );
+
+        assert!(q.kv_compare_delete(b"latch", b"v1").await.unwrap());
+        assert!(q.kv_get(b"latch").await.unwrap().is_none());
+
+        assert!(!q.kv_compare_delete(b"latch", b"v1").await.unwrap());
 
         q.close().await.unwrap();
     }

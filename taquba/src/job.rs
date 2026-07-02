@@ -53,6 +53,23 @@ pub struct JobRecord {
     /// while `status == Scheduled`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_at: Option<u64>,
+    /// When [`Queue::wake_scheduled`](crate::Queue::wake_scheduled) moved
+    /// this job to pending before its `run_at`. `None` for jobs that became
+    /// pending any other way, including promotion at `run_at` by the
+    /// scheduler, so a worker can distinguish an early wake from an
+    /// ordinary promotion regardless of whether bytes were attached. Once
+    /// set, the value persists across later transitions (retries,
+    /// redelivery after lease expiry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub woken_at: Option<u64>,
+    /// Bytes attached by [`Queue::wake_scheduled`](crate::Queue::wake_scheduled)
+    /// when this job was woken before its `run_at`. `None` when the wake
+    /// attached no bytes or the job was never woken early; check
+    /// [`Self::woken_at`] for the early-wake marker itself. Once attached,
+    /// the value persists across later transitions, so a worker observes it
+    /// on every delivery of the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_payload: Option<Vec<u8>>,
     /// Priority bucket; lower numbers are claimed first. See
     /// [`PRIORITY_HIGH`](crate::PRIORITY_HIGH),
     /// [`PRIORITY_NORMAL`](crate::PRIORITY_NORMAL), and

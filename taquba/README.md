@@ -26,6 +26,8 @@ server or a separate state layer (typically Postgres).
 - Multiple named queues per store with per-queue configuration.
 - Priority levels (FIFO within each priority).
 - Scheduled jobs, dedup keys, custom priority/attempts.
+- Targeted early wake of a scheduled job (`Queue::wake_scheduled`), with
+  optional attached bytes the worker observes on delivery.
 - Exponential retry backoff on `nack`.
 - Bounded dead-letter retention with paginated inspection.
 - Atomic batch enqueue.
@@ -198,12 +200,14 @@ collide with Taquba's own layout. Per-value size is capped at
 not bulk payload. Store large blobs in the underlying object store under a
 content-addressed key and put only the pointer in KV.
 
-The namespace is mutated **only** as a side effect of queue operations so there
-is no standalone `kv_put`. To create or update an entry, include it in the
-`kv_writes` map of an `enqueue_with_kv` or `ack_with` call (which makes the
-write atomic with the enqueue or acknowledgement). `kv_delete` is the one
-standalone primitive, for terminal cleanup of entries whose related queue op
-has already completed.
+The primary pattern couples KV mutations to queue operations: to create or
+update an entry atomically with a queue transition, include it in the
+`kv_writes` map of an `enqueue_with_kv` or `ack_with` call. Standalone
+primitives exist for state whose lifecycle is not tied to a single queue
+transition: `Queue::kv_put` writes an entry durably on its own, `kv_delete`
+removes one (terminal cleanup), and `Queue::kv_compare_delete` consumes an
+entry only if it still holds the value the caller read, so a concurrent
+replacement is never deleted by mistake.
 
 `Queue::ack_with` extends the same atomicity to settlement: it acknowledges a
 claimed job and, in the same transaction, enqueues follow-up jobs and applies

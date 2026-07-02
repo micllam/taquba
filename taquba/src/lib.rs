@@ -64,6 +64,9 @@
 //! - Lease-based claims: a background reaper requeues abandoned jobs.
 //! - Exponential retry backoff via the scheduled key space (configurable per
 //!   queue, see [`QueueConfig`]).
+//! - Scheduled jobs become pending at their `run_at`, or earlier via the
+//!   targeted [`Queue::wake_scheduled`], which can attach bytes the worker
+//!   observes on delivery.
 //! - Bounded dead-letter retention with paginated inspection.
 //!
 //! # Worker loop
@@ -128,13 +131,16 @@
 //! state, not bulk payload. Store large blobs in the underlying object
 //! store under a content-addressed key and put only the pointer in KV.
 //!
-//! The namespace is mutated **only** as a side effect of queue
-//! operations; there is no standalone `kv_put`. To create or update
-//! an entry, include it in the `kv_writes` map of an
-//! [`Queue::enqueue_with_kv`] or [`Queue::ack_with`] call (which makes
-//! the write atomic with the enqueue or acknowledgement).
-//! [`Queue::kv_delete`] is the one standalone primitive, for terminal
-//! cleanup of entries whose related queue op has already completed.
+//! The primary pattern couples KV mutations to queue operations: to
+//! create or update an entry atomically with a queue transition,
+//! include it in the `kv_writes` map of an [`Queue::enqueue_with_kv`]
+//! or [`Queue::ack_with`] call. Standalone primitives exist for state
+//! whose lifecycle is not tied to a single queue transition:
+//! [`Queue::kv_put`] writes an entry durably on its own,
+//! [`Queue::kv_delete`] removes one (terminal cleanup), and
+//! [`Queue::kv_compare_delete`] consumes an entry only if it still
+//! holds the value the caller read, so a concurrent replacement is
+//! never deleted by mistake.
 //!
 //! [`Queue::ack_with`] extends the same atomicity to settlement: it
 //! acknowledges a claimed job and, in the same transaction, enqueues
@@ -205,6 +211,7 @@ pub use job::{JobRecord, JobStatus};
 pub use queue::{
     AckEffects, CancelOutcome, EnqueueOptions, EnqueueRequest, EnqueueResult, MAX_KV_VALUE_SIZE,
     OpenOptions, PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_NORMAL, Queue, QueueConfig, WaitOutcome,
+    WakeOutcome,
 };
 pub use stats::QueueStats;
 pub use worker::{PermanentFailure, Worker, WorkerError, run_worker, run_worker_concurrent};
