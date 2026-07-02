@@ -242,8 +242,11 @@ every attempt). One buffered signal is held per correlation key; a second
 signal before consumption replaces the first. One waiter is allowed per
 correlation key; registering a second one fails that run, so choose keys
 unique to the waiter (include the run id when in doubt). Signals are
-scoped to the store: the signaler is the same process that hosts the
+scoped to the store: the signaller is the same process that hosts the
 runtime, per the single-process design.
+
+See [`examples/signals.rs`](examples/signals.rs) for a runnable approval
+flow covering all three delivery paths (signal, timeout, buffered).
 
 ## Reserved headers
 

@@ -196,6 +196,9 @@
 //! doubt). Signals are scoped to the store: the signaller is the same
 //! process that hosts the runtime, per the single-process design.
 //!
+//! See `examples/signals.rs` for a runnable approval flow covering all
+//! three delivery paths (signal, timeout, buffered).
+//!
 //! # Idempotency model
 //!
 //! Each step is enqueued with [`taquba::EnqueueOptions::dedup_key`] of
