@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Upgraded the SlateDB dependency to 0.14 (from 0.13.1).
+- Upgraded the SlateDB dependency to 0.14.1 (from 0.13.1).
 
 ## [0.9.0] - 2026-06-23
 
