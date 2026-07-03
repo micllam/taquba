@@ -956,6 +956,26 @@ impl Queue {
         Ok(())
     }
 
+    /// Offload every oversized payload in `jobs`, in order. On a
+    /// failure the objects already written for earlier entries are
+    /// deleted (no record points at them yet) and the error is
+    /// returned.
+    async fn offload_payloads<'a, I>(&self, jobs: I) -> Result<()>
+    where
+        I: IntoIterator<Item = &'a mut JobRecord>,
+    {
+        let mut jobs: Vec<&mut JobRecord> = jobs.into_iter().collect();
+        for i in 0..jobs.len() {
+            if let Err(err) = self.offload_payload(&mut *jobs[i]).await {
+                for job in &jobs[..i] {
+                    self.delete_payload_object(job).await;
+                }
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
     /// Fetch an offloaded payload into `job.payload`. No-op for records
     /// whose payload is inline.
     async fn materialize_payload(&self, job: &mut JobRecord) -> Result<()> {
@@ -974,6 +994,32 @@ impl Queue {
             self.payload_store
                 .delete_best_effort(payload_ref, &job.id)
                 .await;
+        }
+    }
+
+    /// Delete the payload objects of [`Self::ack_with`] follow-up jobs
+    /// that no committed record points at: every offloaded one when the
+    /// settlement failed, or the ones whose enqueue downgraded to
+    /// [`EnqueueResult::AlreadyEnqueued`] when it succeeded. `outcome`'s
+    /// results align index-wise with `prepared_jobs`.
+    async fn delete_unreferenced_follow_up_payloads(
+        &self,
+        prepared_jobs: &[PreparedJob],
+        outcome: &Result<Vec<EnqueueResult>>,
+    ) {
+        match outcome {
+            Ok(results) => {
+                for (prepared, result) in prepared_jobs.iter().zip(results) {
+                    if matches!(result, EnqueueResult::AlreadyEnqueued(_)) {
+                        self.delete_payload_object(&prepared.job).await;
+                    }
+                }
+            }
+            Err(_) => {
+                for prepared in prepared_jobs {
+                    self.delete_payload_object(&prepared.job).await;
+                }
+            }
         }
     }
 
@@ -1557,14 +1603,8 @@ impl Queue {
                 id_override_used,
             });
         }
-        for i in 0..prepared_jobs.len() {
-            if let Err(err) = self.offload_payload(&mut prepared_jobs[i].job).await {
-                for prepared in &prepared_jobs[..i] {
-                    self.delete_payload_object(&prepared.job).await;
-                }
-                return Err(err);
-            }
-        }
+        self.offload_payloads(prepared_jobs.iter_mut().map(|p| &mut p.job))
+            .await?;
 
         let outcome: Result<Vec<EnqueueResult>> = async {
             loop {
@@ -1617,24 +1657,8 @@ impl Queue {
         }
         .await;
 
-        // Remove the follow-up jobs' payload objects that no committed
-        // record points at: every offloaded one when the settlement
-        // failed, or the ones whose enqueue downgraded to
-        // `AlreadyEnqueued` when it succeeded.
-        match &outcome {
-            Ok(results) => {
-                for (prepared, result) in prepared_jobs.iter().zip(results) {
-                    if matches!(result, EnqueueResult::AlreadyEnqueued(_)) {
-                        self.delete_payload_object(&prepared.job).await;
-                    }
-                }
-            }
-            Err(_) => {
-                for prepared in &prepared_jobs {
-                    self.delete_payload_object(&prepared.job).await;
-                }
-            }
-        }
+        self.delete_unreferenced_follow_up_payloads(&prepared_jobs, &outcome)
+            .await;
         let results = outcome?;
 
         // The acked job's record is gone unless a done record was kept;
@@ -2339,16 +2363,8 @@ impl Queue {
             });
         }
 
-        // Offload oversized payloads before the transaction. On failure,
-        // remove the objects already written; no record points at them.
-        for i in 0..jobs.len() {
-            if let Err(err) = self.offload_payload(&mut jobs[i]).await {
-                for job in &jobs[..i] {
-                    self.delete_payload_object(job).await;
-                }
-                return Err(err);
-            }
-        }
+        // Offload oversized payloads before the transaction.
+        self.offload_payloads(jobs.iter_mut()).await?;
 
         let write = async {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
