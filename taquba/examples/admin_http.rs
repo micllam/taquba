@@ -11,6 +11,8 @@
 //   GET  /queues/{queue}/dead     dead_jobs: page through the dead-letter
 //                                 set (?after=<id>&limit=<n>)
 //   GET  /jobs/{id}               get_job: one job, in any state
+//   GET  /jobs/{id}/history       attempt_history: every settled attempt
+//                                 (retries, dead-letters, lease expiries)
 //   POST /jobs/{id}/cancel        cancel: remove a pending/scheduled job, or
 //                                 request cooperative cancellation of a
 //                                 claimed one
@@ -19,8 +21,9 @@
 //
 // The process generates its own demo traffic so every endpoint returns
 // data: an "emails" queue with a worker and a producer (some jobs fail
-// permanently and dead-letter), and a workerless "reports" queue (jobs
-// stay pending, plus one scheduled for tomorrow).
+// permanently and dead-letter, some retry transiently before
+// succeeding), and a workerless "reports" queue (jobs stay pending,
+// plus one scheduled for tomorrow).
 //
 // A typical triage flow, in another terminal:
 //
@@ -29,6 +32,7 @@
 //   curl -s 'localhost:3000/queues/reports/jobs?status=pending'
 //   curl -s 'localhost:3000/queues/emails/dead?limit=10'
 //   curl -s localhost:3000/jobs/<id>            # why did it die?
+//   curl -s localhost:3000/jobs/<id>/history    # every attempt's error
 //   curl -s -X POST localhost:3000/jobs/<id>/requeue
 //   curl -s -X POST localhost:3000/jobs/<id>/cancel
 //
@@ -49,8 +53,9 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use taquba::{
-    CancelOutcome, EnqueueOptions, JobRecord, JobStatus, OpenOptions, PermanentFailure, Queue,
-    QueueConfig, QueueStats, Worker, WorkerError, object_store::memory::InMemory, run_worker,
+    CancelOutcome, EnqueueOptions, JobAttempt, JobRecord, JobStatus, OpenOptions, PermanentFailure,
+    Queue, QueueConfig, QueueStats, Worker, WorkerError, object_store::memory::InMemory,
+    run_worker,
 };
 
 /// Admin-facing view of a [`JobRecord`]: serde renders the raw-byte
@@ -248,6 +253,15 @@ async fn job(
     }
 }
 
+async fn job_history(
+    State(q): State<Arc<Queue>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<JobAttempt>>, ApiError> {
+    // The history shares the job's lifetime, so an unknown or expunged
+    // job returns an empty list, consistent with get_job returning None.
+    Ok(Json(q.attempt_history(&id).await?))
+}
+
 async fn cancel_job(
     State(q): State<Arc<Queue>>,
     Path(id): Path<String>,
@@ -279,6 +293,15 @@ impl Worker for EmailWorker {
         if job.payload.starts_with(b"boom") {
             return Err(PermanentFailure::new("simulated permanent SMTP rejection").into());
         }
+        // "flaky" mails fail transiently until the third attempt, so
+        // /jobs/{id}/history shows Retried entries before the outcome.
+        if job.payload.starts_with(b"flaky") && job.attempts < 3 {
+            return Err(format!(
+                "simulated transient SMTP timeout (attempt {})",
+                job.attempts
+            )
+            .into());
+        }
         // Simulate slow work so claimed jobs are observable and a cancel
         // has a live claim to target.
         let work = tokio::time::sleep(Duration::from_secs(3));
@@ -300,10 +323,13 @@ impl Worker for EmailWorker {
 }
 
 async fn spawn_demo_traffic(q: &Arc<Queue>) -> Result<(), taquba::Error> {
-    // Seed the dead-letter set so /dead has content immediately.
+    // Seed the dead-letter set so /dead has content immediately, and one
+    // flaky mail so /jobs/{id}/history shows a retries-then-success run.
     q.enqueue("emails", b"boom: mail to nobody@example.com".to_vec())
         .await?;
     q.enqueue("emails", b"boom: mail to invalid@@address".to_vec())
+        .await?;
+    q.enqueue("emails", b"flaky: mail to greylisted@example.com".to_vec())
         .await?;
 
     // "reports" has no worker: its jobs stay pending, plus one scheduled
@@ -340,7 +366,8 @@ async fn spawn_demo_traffic(q: &Arc<Queue>) -> Result<(), taquba::Error> {
     });
 
     // Producer: one email every few seconds; every fourth fails permanently
-    // and dead-letters.
+    // and dead-letters, and every fourth starting from the second retries
+    // twice before succeeding.
     let producer_q = q.clone();
     tokio::spawn(async move {
         let mut n = 0u64;
@@ -349,6 +376,8 @@ async fn spawn_demo_traffic(q: &Arc<Queue>) -> Result<(), taquba::Error> {
             n += 1;
             let payload = if n.is_multiple_of(4) {
                 format!("boom: mail #{n} to bounce@example.com")
+            } else if (n + 2).is_multiple_of(4) {
+                format!("flaky: mail #{n} to greylisted{n}@example.com")
             } else {
                 format!("mail #{n} to user{n}@example.com")
             };
@@ -370,6 +399,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         QueueConfig {
             max_attempts: 3,
             retry_backoff_base: Duration::from_millis(500),
+            // Retain done records for an hour, so a completed job's record
+            // and attempt history stay inspectable instead of being
+            // removed on ack.
+            keep_done_jobs: Some(Duration::from_secs(3600)),
             ..QueueConfig::default()
         },
     );
@@ -384,6 +417,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/queues/{queue}/jobs", get(jobs_page))
         .route("/queues/{queue}/dead", get(dead_page))
         .route("/jobs/{id}", get(job))
+        .route("/jobs/{id}/history", get(job_history))
         .route("/jobs/{id}/cancel", post(cancel_job))
         .route("/jobs/{id}/requeue", post(requeue_job))
         .with_state(q);
@@ -396,6 +430,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  GET  /queues/{{queue}}/jobs?status=<state>&cursor=<token>&limit=<n>");
     println!("  GET  /queues/{{queue}}/dead?after=<id>&limit=<n>");
     println!("  GET  /jobs/{{id}}");
+    println!("  GET  /jobs/{{id}}/history");
     println!("  POST /jobs/{{id}}/cancel");
     println!("  POST /jobs/{{id}}/requeue");
     println!();
