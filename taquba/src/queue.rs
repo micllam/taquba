@@ -6856,6 +6856,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduled_job_offloads_and_materializes_after_promotion() {
+        let initial = 1_700_000_000_000;
+        let clock = MockClock::new(initial);
+        let store = make_store();
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            payload_offload_threshold: Some(64),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(store.clone(), "test", opts)
+            .await
+            .unwrap();
+
+        let payload = vec![7u8; 256];
+        let run_at = std::time::UNIX_EPOCH + Duration::from_millis(initial + 60_000);
+        let id = q
+            .enqueue_with(
+                "work",
+                payload.clone(),
+                EnqueueOptions {
+                    run_at: Some(run_at),
+                    ..EnqueueOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // The payload offloads at enqueue even though the record lands
+        // in the scheduled key space.
+        assert_eq!(object_count(&store, "test-payloads").await, 1);
+        let scheduled = q.get_job(&id).await.unwrap().unwrap();
+        assert_eq!(scheduled.status, JobStatus::Scheduled);
+        assert_eq!(scheduled.payload, payload);
+
+        clock.advance(Duration::from_millis(60_001));
+        q.promote_scheduled_now().await.unwrap();
+
+        // Promotion moves the record without touching the object; the
+        // claim materializes the payload.
+        assert_eq!(object_count(&store, "test-payloads").await, 1);
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.payload, payload);
+        q.ack(&job).await.unwrap();
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn reaper_dead_letter_preserves_the_payload_object() {
         let clock = MockClock::new(1_700_000_000_000);
         let store = make_store();
