@@ -296,7 +296,9 @@ pub struct OpenOptions {
     /// Path prefix for offloaded payload objects within the payload
     /// object store. `None` (the default) uses `"{path}-payloads"`, a
     /// sibling of the path the queue is opened at, which cannot overlap
-    /// SlateDB's own layout.
+    /// SlateDB's own layout. A custom value that shares the object
+    /// store with the queue must not equal or nest within the queue's
+    /// `path`.
     pub payload_path: Option<String>,
 }
 
@@ -6850,6 +6852,46 @@ mod tests {
             q.ack(&job).await.unwrap();
         }
         assert_eq!(object_count(&store, "test-payloads").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reaper_dead_letter_preserves_the_payload_object() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let store = make_store();
+        let opts = OpenOptions {
+            default_queue_config: QueueConfig {
+                max_attempts: 1,
+                ..QueueConfig::default()
+            },
+            clock: Arc::new(clock.clone()),
+            payload_offload_threshold: Some(64),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(store.clone(), "test", opts)
+            .await
+            .unwrap();
+
+        let payload = vec![2u8; 256];
+        let id = q.enqueue("work", payload.clone()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_millis(10))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(job);
+        clock.advance(Duration::from_millis(20));
+        q.reap_now().await.unwrap();
+
+        let dead = q.dead_jobs("work", None, 10).await.unwrap();
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].id, id);
+        assert_eq!(dead[0].payload, payload);
+        assert_eq!(
+            object_count(&store, "test-payloads").await,
+            1,
+            "reaper-driven dead-letter must preserve the payload object"
+        );
         q.close().await.unwrap();
     }
 
