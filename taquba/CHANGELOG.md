@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OpenOptions::payload_store` and `OpenOptions::payload_path`. New error
   variants `Error::PayloadStore` and `Error::PayloadMissing`. Setting the
   threshold to `None` disables offloading.
+- `QueueStats` implements `Serialize` and `Deserialize`, so stats snapshots
+  can be serialized directly (for example by a JSON admin endpoint) without
+  a caller-defined intermediate type.
 
 ### Changed
 

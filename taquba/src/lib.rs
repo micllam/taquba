@@ -175,6 +175,24 @@
 //! Setting [`OpenOptions::payload_offload_threshold`] to `None`
 //! disables offloading; payloads then stay inline regardless of size.
 //!
+//! # Inspecting and operating a queue
+//!
+//! The queue exposes its state for operational triage: [`Queue::list_queues`]
+//! names every queue that has ever held a job, [`Queue::stats`] returns
+//! per-state job counts for one queue, [`Queue::get_job`] looks up a single
+//! job by ID in any state and [`Queue::dead_jobs`] pages through the
+//! dead-letter set. Interventions cover the common operator actions:
+//! [`Queue::requeue_dead_job`] revives a dead job with a fresh retry budget,
+//! [`Queue::cancel`] removes a pending or scheduled job (or requests
+//! cooperative cancellation of a claimed one) and [`Queue::wake_scheduled`]
+//! promotes a scheduled job before its `run_at`.
+//!
+//! Because a store is single-writer, an admin surface that mutates state
+//! must live inside the process that owns the queue.
+//! `examples/admin_http.rs` shows the resulting shape: a minimal HTTP
+//! server inside the owning process, mapping these APIs onto JSON
+//! endpoints.
+//!
 //! # Background tasks
 //!
 //! [`Queue::open`] spawns two background tokio tasks for the lifetime of the

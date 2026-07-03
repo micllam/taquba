@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use slatedb::{Db, DbTransaction, MergeOperator, MergeOperatorError};
 
 use crate::error::{Error, Result};
@@ -84,7 +85,7 @@ pub(crate) fn update_stats(
 /// Returned by [`Queue::stats`](crate::Queue::stats). Counters are kept
 /// transactionally consistent with job-state writes via SlateDB's merge
 /// operator. Live-state counters reflect the current size of each key space.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueueStats {
     /// Name of the queue this snapshot describes.
     pub queue: String,
