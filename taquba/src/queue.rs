@@ -1283,9 +1283,35 @@ impl Queue {
         if self.claim_cursor.begin_claim(queue).known_empty {
             return Ok(Vec::new());
         }
-        let lock = self.claim_lock_for(queue);
-        let _guard = lock.lock().await;
+        let mut jobs = {
+            let lock = self.claim_lock_for(queue);
+            let _guard = lock.lock().await;
+            self.claim_batch_locked(queue, max_jobs, lease_duration)
+                .await?
+        };
+        // Offloaded payloads are fetched after the claim lock is
+        // released, so other claims on the queue proceed during the
+        // object-store reads. On a fetch failure the claim has already
+        // committed: the affected jobs stay claimed until their leases
+        // expire and are then redelivered. Their cancel tokens stay
+        // registered, so a cancel during that window still fires the
+        // token and persists the request.
+        for job in &mut jobs {
+            self.materialize_payload(job).await?;
+        }
+        Ok(jobs)
+    }
 
+    /// The scan-and-claim transaction of [`Self::claim_batch`]. The
+    /// caller holds the queue's claim lock for the duration of the
+    /// call; offloaded payloads are not fetched here, so the lock is
+    /// never held across a payload read.
+    async fn claim_batch_locked(
+        &self,
+        queue: &str,
+        max_jobs: usize,
+        lease_duration: Duration,
+    ) -> Result<Vec<JobRecord>> {
         let prefix = pending_prefix(queue);
         let prefix_bytes = prefix.as_slice();
         let timer = crate::obs::start();
@@ -1428,14 +1454,10 @@ impl Queue {
                         // insert since the epoch read revokes it.
                         self.claim_cursor.mark_empty(queue, scan.epoch);
                     }
-                    // Fetch offloaded payloads after the commit: the
-                    // claimed record stores only the payload reference.
-                    // On a fetch failure the claim has already
-                    // committed, so the affected jobs stay claimed until
-                    // their leases expire and are then redelivered.
-                    for job in &mut jobs {
-                        self.materialize_payload(job).await?;
-                    }
+                    // The claim histogram measures the claim
+                    // transaction; offloaded payload fetches happen
+                    // after the claim lock is released and are not
+                    // included.
                     crate::obs::claimed(queue, jobs.len() as u64, timer);
                     debug!(queue = queue, count = jobs.len(), "jobs claimed");
                     return Ok(jobs);
