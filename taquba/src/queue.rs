@@ -985,6 +985,38 @@ impl Queue {
         Ok(())
     }
 
+    /// Fetch the offloaded payloads of `jobs` concurrently, bounding a
+    /// batch's wall time by the slowest object rather than the sum of
+    /// the fetches. Jobs with inline payloads are untouched. On a fetch
+    /// failure, one error is returned after every fetch has settled.
+    async fn materialize_payloads(&self, jobs: &mut [JobRecord]) -> Result<()> {
+        let mut fetches = tokio::task::JoinSet::new();
+        for (index, job) in jobs.iter().enumerate() {
+            if let Some(ref payload_ref) = job.payload_ref {
+                let store = self.payload_store.clone();
+                let payload_ref = payload_ref.clone();
+                let id = job.id.clone();
+                fetches.spawn(async move { (index, store.get(&payload_ref, &id).await) });
+            }
+        }
+        let mut first_err = None;
+        while let Some(joined) = fetches.join_next().await {
+            let (index, result) = joined.expect("payload fetch task panicked");
+            match result {
+                Ok(payload) => jobs[index].payload = payload,
+                Err(err) => {
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
     /// Delete `job`'s payload object if it has one, logging any failure.
     /// Called only after the transaction that removed (or declined to
     /// write) the record: deleting earlier could leave a live record
@@ -1342,9 +1374,7 @@ impl Queue {
         // expire and are then redelivered. Their cancel tokens stay
         // registered, so a cancel during that window still fires the
         // token and persists the request.
-        for job in &mut jobs {
-            self.materialize_payload(job).await?;
-        }
+        self.materialize_payloads(&mut jobs).await?;
         Ok(jobs)
     }
 
