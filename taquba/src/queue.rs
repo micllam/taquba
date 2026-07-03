@@ -67,6 +67,18 @@ impl CancelOutcome {
     }
 }
 
+/// One page of a job listing. Returned by [`Queue::list_jobs`].
+#[derive(Debug, Clone)]
+pub struct JobPage {
+    /// Jobs on this page, in the scan order of the listed state's key
+    /// space (see [`Queue::list_jobs`]).
+    pub jobs: Vec<JobRecord>,
+    /// Opaque resume token: pass it as the `cursor` of the next
+    /// [`Queue::list_jobs`] call to continue the listing. `None` when no
+    /// further entries existed at scan time.
+    pub next_cursor: Option<Vec<u8>>,
+}
+
 /// High-priority bucket. Jobs at this priority are dequeued before normal and low.
 pub const PRIORITY_HIGH: u32 = 100;
 /// Default priority. FIFO ordering is preserved within the same priority level.
@@ -1936,6 +1948,99 @@ impl Queue {
             }
         }
         Ok(out)
+    }
+
+    /// Return a page of the given queue's jobs in one lifecycle state.
+    ///
+    /// Jobs are returned in the scan order of the state's key space:
+    ///
+    /// - `Pending`: claim order (priority, then enqueue order).
+    /// - `Scheduled`: `run_at` order, soonest first.
+    /// - `Claimed`: lease-expiry order, soonest first.
+    /// - `Done`: completion-time order, oldest first. Done records exist
+    ///   only on queues with [`QueueConfig::keep_done_jobs`] set.
+    /// - `Dead`: enqueue order, as in [`Queue::dead_jobs`].
+    ///
+    /// `cursor` is an opaque resume token: pass `None` to start from the
+    /// beginning, or [`JobPage::next_cursor`] from the previous page to
+    /// continue. A cursor identifies a scan position, not a job, so it
+    /// remains valid when the job it was taken at leaves the state. The
+    /// listing is not a snapshot: a job that changes state between page
+    /// reads may appear on no page or on two pages.
+    ///
+    /// The pending and dead key spaces group by queue, so those scans
+    /// cover only the requested queue. The claimed, scheduled and done
+    /// key spaces lead with a timestamp for the background sweeps, so
+    /// those scans cover the state's whole key space across queues and
+    /// filter on the queue name.
+    pub async fn list_jobs(
+        &self,
+        queue: &str,
+        status: JobStatus,
+        cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<JobPage> {
+        validate_queue_name(queue)?;
+        let empty = JobPage {
+            jobs: Vec::new(),
+            next_cursor: None,
+        };
+        if limit == 0 {
+            return Ok(empty);
+        }
+        let (prefix, filter_queue) = match status {
+            JobStatus::Pending => (pending_prefix(queue), false),
+            JobStatus::Dead => (dead_prefix(queue), false),
+            JobStatus::Claimed => (tag_prefix(KeyTag::Claimed).to_vec(), true),
+            JobStatus::Scheduled => (tag_prefix(KeyTag::Scheduled).to_vec(), true),
+            JobStatus::Done => (tag_prefix(KeyTag::Done).to_vec(), true),
+        };
+        let start = match cursor {
+            None => Bound::Unbounded,
+            // A cursor from a different key space does not identify a
+            // position under this prefix; nothing follows it here.
+            Some(c) if !c.starts_with(&prefix) => return Ok(empty),
+            Some(c) => Bound::Excluded(Bytes::copy_from_slice(&c[prefix.len()..])),
+        };
+
+        let mut page: Vec<(Bytes, JobRecord)> = Vec::with_capacity(limit);
+        let mut more = false;
+        let mut iter = self
+            .db
+            .scan_prefix(prefix, (start, Bound::Unbounded))
+            .await?;
+        while let Some(kv) = iter.next().await? {
+            let job: JobRecord = rmp_serde::from_slice(&kv.value)?;
+            if filter_queue && job.queue != queue {
+                continue;
+            }
+            if page.len() == limit {
+                more = true;
+                break;
+            }
+            page.push((kv.key, job));
+        }
+        let next_cursor = more.then(|| page[page.len() - 1].0.to_vec());
+
+        let mut jobs = Vec::with_capacity(page.len());
+        for (key, mut job) in page {
+            match self.materialize_payload(&mut job).await {
+                Ok(()) => jobs.push(job),
+                Err(Error::PayloadMissing { id }) => {
+                    // The scan can list a record just before a
+                    // record-removing transaction commits, with the object
+                    // fetch running just after that commit's payload-object
+                    // deletion. Re-check the record: a removed job is
+                    // omitted from the page, not reported as a lost
+                    // payload.
+                    if self.db.get(&key).await?.is_some() {
+                        return Err(Error::PayloadMissing { id });
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(JobPage { jobs, next_cursor })
     }
 
     /// Move a dead-letter job back to the pending queue for a fresh attempt.
@@ -7036,6 +7141,254 @@ mod tests {
         };
         let follow_up = q.get_job(&follow_up_ids).await.unwrap().unwrap();
         assert_eq!(follow_up.payload, vec![4u8; 256]);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_jobs_pages_pending_in_claim_order() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let low = q
+            .enqueue_with(
+                "work",
+                b"low".to_vec(),
+                EnqueueOptions {
+                    priority: Some(PRIORITY_LOW),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let normal_a = q.enqueue("work", b"a".to_vec()).await.unwrap();
+        let normal_b = q.enqueue("work", b"b".to_vec()).await.unwrap();
+        let high = q
+            .enqueue_with(
+                "work",
+                b"high".to_vec(),
+                EnqueueOptions {
+                    priority: Some(PRIORITY_HIGH),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut ids = Vec::new();
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let page = q
+                .list_jobs("work", JobStatus::Pending, cursor.as_deref(), 2)
+                .await
+                .unwrap();
+            ids.extend(page.jobs.iter().map(|j| j.id.clone()));
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(ids, vec![high, normal_a, normal_b, low]);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_jobs_orders_scheduled_by_run_at() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let later = q
+            .enqueue_with(
+                "work",
+                b"later".to_vec(),
+                EnqueueOptions {
+                    run_at: Some(std::time::SystemTime::now() + Duration::from_secs(7200)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let sooner = q
+            .enqueue_with(
+                "work",
+                b"sooner".to_vec(),
+                EnqueueOptions {
+                    run_at: Some(std::time::SystemTime::now() + Duration::from_secs(3600)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let page = q
+            .list_jobs("work", JobStatus::Scheduled, None, 10)
+            .await
+            .unwrap();
+        let ids: Vec<_> = page.jobs.iter().map(|j| j.id.clone()).collect();
+        assert_eq!(ids, vec![sooner, later]);
+        assert!(page.next_cursor.is_none());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_jobs_filters_claimed_by_queue() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let a1 = q.enqueue("qa", b"1".to_vec()).await.unwrap();
+        let a2 = q.enqueue("qa", b"2".to_vec()).await.unwrap();
+        q.enqueue("qb", b"3".to_vec()).await.unwrap();
+        let lease = Duration::from_secs(30);
+        q.claim("qa", lease).await.unwrap().unwrap();
+        q.claim("qa", lease).await.unwrap().unwrap();
+        q.claim("qb", lease).await.unwrap().unwrap();
+
+        let page = q
+            .list_jobs("qa", JobStatus::Claimed, None, 10)
+            .await
+            .unwrap();
+        let ids: Vec<_> = page.jobs.iter().map(|j| j.id.clone()).collect();
+        assert_eq!(ids, vec![a1, a2]);
+        assert!(page.jobs.iter().all(|j| j.status == JobStatus::Claimed));
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_jobs_pages_claimed_across_interleaved_queues() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let mut expected = Vec::new();
+        // Alternate claims between the two queues so the claimed key
+        // space interleaves them in lease-expiry order.
+        for i in 0..3u8 {
+            let id = q.enqueue("qa", vec![i]).await.unwrap();
+            q.enqueue("qb", vec![i]).await.unwrap();
+            expected.push(id);
+            let lease = Duration::from_secs(30);
+            q.claim("qa", lease).await.unwrap().unwrap();
+            q.claim("qb", lease).await.unwrap().unwrap();
+        }
+
+        let mut ids = Vec::new();
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut pages = 0;
+        loop {
+            let page = q
+                .list_jobs("qa", JobStatus::Claimed, cursor.as_deref(), 1)
+                .await
+                .unwrap();
+            assert!(page.jobs.len() <= 1);
+            ids.extend(page.jobs.iter().map(|j| j.id.clone()));
+            pages += 1;
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(ids, expected);
+        assert_eq!(pages, 3);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_jobs_done_lists_only_kept_records() {
+        let mut opts = OpenOptions::default();
+        opts.queue_configs.insert(
+            "kept".to_string(),
+            QueueConfig {
+                keep_done_jobs: Some(Duration::from_secs(3600)),
+                ..QueueConfig::default()
+            },
+        );
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+        let kept = q.enqueue("kept", b"k".to_vec()).await.unwrap();
+        q.enqueue("gone", b"g".to_vec()).await.unwrap();
+        let lease = Duration::from_secs(30);
+        let job = q.claim("kept", lease).await.unwrap().unwrap();
+        q.ack(&job).await.unwrap();
+        let job = q.claim("gone", lease).await.unwrap().unwrap();
+        q.ack(&job).await.unwrap();
+
+        let page = q
+            .list_jobs("kept", JobStatus::Done, None, 10)
+            .await
+            .unwrap();
+        let ids: Vec<_> = page.jobs.iter().map(|j| j.id.clone()).collect();
+        assert_eq!(ids, vec![kept]);
+        let page = q
+            .list_jobs("gone", JobStatus::Done, None, 10)
+            .await
+            .unwrap();
+        assert!(page.jobs.is_empty());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_jobs_dead_matches_dead_jobs() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        for i in 0..3u8 {
+            q.enqueue("work", vec![i]).await.unwrap();
+        }
+        let lease = Duration::from_secs(30);
+        while let Some(job) = q.claim("work", lease).await.unwrap() {
+            q.dead_letter(job, "failed").await.unwrap();
+        }
+
+        let via_dead_jobs: Vec<_> = q
+            .dead_jobs("work", None, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|j| j.id)
+            .collect();
+        assert_eq!(via_dead_jobs.len(), 3);
+        let page = q
+            .list_jobs("work", JobStatus::Dead, None, 10)
+            .await
+            .unwrap();
+        let via_list: Vec<_> = page.jobs.into_iter().map(|j| j.id).collect();
+        assert_eq!(via_list, via_dead_jobs);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_jobs_materializes_offloaded_payloads() {
+        let q = Queue::open_with_options(make_store(), "test", offload_opts())
+            .await
+            .unwrap();
+        let payload = vec![9u8; 512];
+        let id = q.enqueue("work", payload.clone()).await.unwrap();
+
+        let page = q
+            .list_jobs("work", JobStatus::Pending, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, id);
+        assert!(page.jobs[0].payload_ref.is_some());
+        assert_eq!(page.jobs[0].payload, payload);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_jobs_limit_zero_and_foreign_cursor_return_empty_pages() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        q.enqueue("work", b"x".to_vec()).await.unwrap();
+        q.enqueue("work", b"y".to_vec()).await.unwrap();
+
+        let zero = q
+            .list_jobs("work", JobStatus::Pending, None, 0)
+            .await
+            .unwrap();
+        assert!(zero.jobs.is_empty());
+        assert!(zero.next_cursor.is_none());
+
+        let first = q
+            .list_jobs("work", JobStatus::Pending, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(first.jobs.len(), 1);
+        let cursor = first.next_cursor.expect("a second pending entry exists");
+        let dead = q
+            .list_jobs("work", JobStatus::Dead, Some(&cursor), 10)
+            .await
+            .unwrap();
+        assert!(dead.jobs.is_empty());
+        assert!(dead.next_cursor.is_none());
         q.close().await.unwrap();
     }
 }

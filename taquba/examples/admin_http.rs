@@ -5,6 +5,9 @@
 //
 //   GET  /queues                  list_queues: every queue seen so far
 //   GET  /queues/{queue}/stats    stats: job counts by lifecycle state
+//   GET  /queues/{queue}/jobs     list_jobs: page through one lifecycle
+//                                 state (?status=pending|scheduled|claimed|
+//                                 done|dead&cursor=<token>&limit=<n>)
 //   GET  /queues/{queue}/dead     dead_jobs: page through the dead-letter
 //                                 set (?after=<id>&limit=<n>)
 //   GET  /jobs/{id}               get_job: one job, in any state
@@ -23,6 +26,7 @@
 //
 //   curl -s localhost:3000/queues
 //   curl -s localhost:3000/queues/emails/stats
+//   curl -s 'localhost:3000/queues/reports/jobs?status=pending'
 //   curl -s 'localhost:3000/queues/emails/dead?limit=10'
 //   curl -s localhost:3000/jobs/<id>            # why did it die?
 //   curl -s -X POST localhost:3000/jobs/<id>/requeue
@@ -155,6 +159,57 @@ async fn queue_stats(
     Path(queue): Path<String>,
 ) -> Result<Json<QueueStats>, ApiError> {
     Ok(Json(q.stats(&queue).await?))
+}
+
+#[derive(Deserialize)]
+struct JobsPageParams {
+    status: String,
+    /// Opaque resume token from the previous page's `next_cursor`.
+    cursor: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+
+async fn jobs_page(
+    State(q): State<Arc<Queue>>,
+    Path(queue): Path<String>,
+    Query(params): Query<JobsPageParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let status = match params.status.as_str() {
+        "pending" => JobStatus::Pending,
+        "scheduled" => JobStatus::Scheduled,
+        "claimed" => JobStatus::Claimed,
+        "done" => JobStatus::Done,
+        "dead" => JobStatus::Dead,
+        other => return Err(ApiError::BadRequest(format!("unknown status: {other}"))),
+    };
+    let cursor = params.cursor.as_deref().map(hex_decode).transpose()?;
+    let page = q
+        .list_jobs(&queue, status, cursor.as_deref(), params.limit)
+        .await?;
+    let views: Vec<JobView> = page.jobs.into_iter().map(JobView::from).collect();
+    Ok(Json(json!({
+        "jobs": views,
+        "next_cursor": page.next_cursor.map(|c| hex_encode(&c)),
+    })))
+}
+
+// The listing cursor is opaque bytes; hex makes it URL-safe.
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(s: &str) -> Result<Vec<u8>, ApiError> {
+    if !s.len().is_multiple_of(2) {
+        return Err(ApiError::BadRequest("invalid cursor".to_string()));
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16)
+                .map_err(|_| ApiError::BadRequest("invalid cursor".to_string()))
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -326,6 +381,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/queues", get(queues))
         .route("/queues/{queue}/stats", get(queue_stats))
+        .route("/queues/{queue}/jobs", get(jobs_page))
         .route("/queues/{queue}/dead", get(dead_page))
         .route("/jobs/{id}", get(job))
         .route("/jobs/{id}/cancel", post(cancel_job))
@@ -337,6 +393,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("  GET  /queues");
     println!("  GET  /queues/{{queue}}/stats");
+    println!("  GET  /queues/{{queue}}/jobs?status=<state>&cursor=<token>&limit=<n>");
     println!("  GET  /queues/{{queue}}/dead?after=<id>&limit=<n>");
     println!("  GET  /jobs/{{id}}");
     println!("  POST /jobs/{{id}}/cancel");

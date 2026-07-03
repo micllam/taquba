@@ -38,6 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `QueueStats` implements `Serialize` and `Deserialize`, so stats snapshots
   can be serialized directly (for example by a JSON admin endpoint) without
   a caller-defined intermediate type.
+- `Queue::list_jobs`: page through one queue's jobs in one lifecycle state,
+  returning the new `JobPage` (jobs plus an opaque resume cursor). Jobs are
+  returned in the state's scan order: pending in claim order, scheduled by
+  `run_at`, claimed by lease expiry, done by completion time and dead in
+  enqueue order. Complements `Queue::dead_jobs`, which remains the
+  ID-cursor listing of the dead-letter set.
 
 ### Changed
 

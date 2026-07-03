@@ -244,7 +244,8 @@ payloads then stay inline regardless of size.
 The queue exposes its state for operational triage: `Queue::list_queues`
 names every queue that has ever held a job, `Queue::stats` returns per-state
 job counts for one queue, `Queue::get_job` looks up a single job by ID in
-any state and `Queue::dead_jobs` pages through the dead-letter set.
+any state, `Queue::list_jobs` pages through one queue's jobs in one
+lifecycle state and `Queue::dead_jobs` pages through the dead-letter set.
 Interventions cover the common operator actions: `Queue::requeue_dead_job`
 revives a dead job with a fresh retry budget, `Queue::cancel` removes a
 pending or scheduled job (or requests cooperative cancellation of a claimed
