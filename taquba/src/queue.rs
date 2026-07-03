@@ -1861,10 +1861,25 @@ impl Queue {
                 break;
             }
         }
-        for job in &mut jobs {
-            self.materialize_payload(job).await?;
+        let mut out = Vec::with_capacity(jobs.len());
+        for mut job in jobs {
+            match self.materialize_payload(&mut job).await {
+                Ok(()) => out.push(job),
+                Err(Error::PayloadMissing { id }) => {
+                    // The scan can list a record just before the dead
+                    // retention sweep removes it, with the object fetch
+                    // running just after the sweep's payload-object
+                    // deletion. Re-check the record: a removed job is
+                    // omitted from the page, not reported as a lost
+                    // payload.
+                    if self.db.get(dead_key(queue, &id)).await?.is_some() {
+                        return Err(Error::PayloadMissing { id });
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
-        Ok(jobs)
+        Ok(out)
     }
 
     /// Move a dead-letter job back to the pending queue for a fresh attempt.
@@ -2039,8 +2054,23 @@ impl Queue {
             None => Ok(None),
             Some(bytes) => {
                 let mut job: JobRecord = rmp_serde::from_slice(&bytes)?;
-                self.materialize_payload(&mut job).await?;
-                Ok(Some(job))
+                match self.materialize_payload(&mut job).await {
+                    Ok(()) => Ok(Some(job)),
+                    Err(Error::PayloadMissing { id }) => {
+                        // The record can be read just before a
+                        // record-removing transaction commits, with the
+                        // object fetch running just after that commit's
+                        // payload-object deletion. Re-check the index:
+                        // a removed job reports absence, not a lost
+                        // payload.
+                        if self.db.get(&index_key).await?.is_none() {
+                            Ok(None)
+                        } else {
+                            Err(Error::PayloadMissing { id })
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
             }
         }
     }
@@ -6774,6 +6804,33 @@ mod tests {
             q.ack(&job).await.unwrap();
         }
         assert_eq!(object_count(&store, "test-payloads").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_payload_deletion_surfaces_payload_missing() {
+        use slatedb::object_store::ObjectStoreExt;
+
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        let id = q.enqueue("work", vec![1u8; 256]).await.unwrap();
+        let objects = store
+            .list_with_delimiter(Some(&slatedb::object_store::path::Path::from(
+                "test-payloads",
+            )))
+            .await
+            .unwrap()
+            .objects;
+        assert_eq!(objects.len(), 1);
+        store.delete(&objects[0].location).await.unwrap();
+
+        // The record is live, so the missing object is a real loss.
+        let err = q.get_job(&id).await.unwrap_err();
+        assert!(matches!(err, Error::PayloadMissing { id: ref e } if *e == id));
+
         q.close().await.unwrap();
     }
 
