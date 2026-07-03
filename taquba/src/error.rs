@@ -71,6 +71,17 @@ pub enum Error {
         /// The duplicate id that was rejected.
         id: String,
     },
+
+    /// A queue name failed validation. Queue names are limited to
+    /// [`crate::MAX_QUEUE_NAME_LEN`] bytes by the key encoding and are
+    /// rejected at the API boundary before any state is written.
+    #[error("invalid queue name `{queue}`: {reason}")]
+    InvalidQueueName {
+        /// The queue name that was rejected.
+        queue: String,
+        /// Why it was rejected.
+        reason: &'static str,
+    },
 }
 
 impl Error {
@@ -89,7 +100,8 @@ impl Error {
             | Self::ClaimLost
             | Self::KvValueTooLarge { .. }
             | Self::InvalidId { .. }
-            | Self::DuplicateJobId { .. } => true,
+            | Self::DuplicateJobId { .. }
+            | Self::InvalidQueueName { .. } => true,
             Self::Storage(_) => false,
         }
     }

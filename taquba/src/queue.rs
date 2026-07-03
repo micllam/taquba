@@ -16,6 +16,11 @@ use crate::claim_cursor::{ClaimCursor, CursorState, ScanFrom};
 use crate::clock::{Clock, default_clock};
 use crate::error::{Error, Result};
 use crate::job::{JobRecord, JobStatus};
+use crate::keys::{
+    KeyTag, MAX_QUEUE_NAME_LEN, claimed_key, cursor_key, dead_key, dead_prefix, dedup_index_key,
+    done_key, job_index_key, parse_stats_key, pending_key, pending_prefix, scheduled_key,
+    tag_prefix, user_scoped_key,
+};
 use crate::reaper::{Reaper, reap_expired};
 use crate::scheduler::{Scheduler, promote_due_jobs};
 use crate::stats::{CounterMergeOperator, QueueStats, read_stats, update_stats};
@@ -68,63 +73,6 @@ pub const PRIORITY_NORMAL: u32 = 1_000;
 /// Low-priority bucket. Jobs at this priority are dequeued after high and normal.
 pub const PRIORITY_LOW: u32 = 10_000;
 
-pub(crate) fn pending_key(queue: &str, priority: u32, id: &str) -> String {
-    format!("pending:{}:{:010}:{}", queue, priority, id)
-}
-
-pub(crate) fn pending_prefix(queue: &str) -> String {
-    format!("pending:{}:", queue)
-}
-
-pub(crate) fn dead_key(queue: &str, id: &str) -> String {
-    format!("dead:{}:{}", queue, id)
-}
-
-pub(crate) fn claimed_key(queue: &str, lease_expires_at: u64, id: &str) -> String {
-    // Timestamp comes before queue so the prefix scan in the reaper is sorted
-    // globally by expiry, allowing a single early-exit instead of a per-queue
-    // walk.
-    format!("claimed:{:020}:{}:{}", lease_expires_at, queue, id)
-}
-
-pub(crate) fn done_key(completed_at: u64, queue: &str, id: &str) -> String {
-    // Timestamp comes before queue so the prefix scan in the reaper is sorted
-    // globally by completion time, letting the retention sweep stop at the
-    // first unexpired record instead of walking the whole prefix.
-    format!("done:{:020}:{}:{}", completed_at, queue, id)
-}
-
-pub(crate) fn scheduled_key(queue: &str, run_at: u64, id: &str) -> String {
-    // Same layout reasoning as claimed_key.
-    format!("scheduled:{:020}:{}:{}", run_at, queue, id)
-}
-
-/// Parse the zero-padded leading timestamp from a time-first taquba
-/// key of the shape `{prefix}{ts:020}:{...}`. Returns `None` when
-/// `key` is not valid UTF-8, doesn't start with `prefix`, or has a
-/// malformed timestamp segment.
-///
-/// Used by the reaper / scheduler / retention sweeps to early-exit a
-/// prefix scan once they reach a key whose timestamp is past the
-/// relevant cutoff.
-pub(crate) fn parse_leading_timestamp(key: &[u8], prefix: &str) -> Option<u64> {
-    let key_str = std::str::from_utf8(key).ok()?;
-    let after = key_str.strip_prefix(prefix)?;
-    let ts_str = after.split(':').next()?;
-    ts_str.parse::<u64>().ok()
-}
-
-pub(crate) fn job_index_key(id: &str) -> String {
-    format!("jobindex:{}", id)
-}
-
-/// Per-queue claim-scan state persisted by a clean [`Queue::close`]
-/// and consumed (loaded into the in-memory cursor, then durably
-/// deleted) by the next open.
-pub(crate) fn cursor_key(queue: &str) -> String {
-    format!("cursor:{}", queue)
-}
-
 /// On-disk form of one queue's claim-scan state, stored under
 /// [`cursor_key`]. Written only by a clean [`Queue::close`]; the next
 /// open deletes the record before serving traffic, so a record is
@@ -142,18 +90,6 @@ struct PersistedCursor {
     known_empty: bool,
 }
 
-pub(crate) fn dedup_index_key(queue: &str, key: &str) -> String {
-    format!("dedup:{}:{}", queue, key)
-}
-
-/// Reserved prefix for the user-facing KV namespace.
-///
-/// Caller-supplied keys are internally scoped under this prefix so they
-/// cannot collide with Taquba's own key layout (`pending:`, `claimed:`,
-/// `dead:`, `done:`, `scheduled:`, `jobindex:`, `dedup:`, `stats:`,
-/// `cursor:`).
-const USR_PREFIX: &[u8] = b"usr:";
-
 /// Maximum size of a single value in the user KV namespace.
 ///
 /// The KV namespace is sized for coordination state (pointers, status
@@ -164,11 +100,16 @@ const USR_PREFIX: &[u8] = b"usr:";
 /// content-addressed key and put only the pointer in KV.
 pub const MAX_KV_VALUE_SIZE: usize = 256 * 1024;
 
-fn user_scoped_key(key: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(USR_PREFIX.len() + key.len());
-    out.extend_from_slice(USR_PREFIX);
-    out.extend_from_slice(key);
-    out
+/// Validate a queue name against the key encoding's one-byte length
+/// field. Called at every public entry point that accepts a queue name.
+fn validate_queue_name(queue: &str) -> Result<()> {
+    if queue.len() > MAX_QUEUE_NAME_LEN {
+        return Err(Error::InvalidQueueName {
+            queue: queue.to_string(),
+            reason: "queue name exceeds the maximum length of 255 bytes",
+        });
+    }
+    Ok(())
 }
 
 /// Maximum byte length of a caller-supplied
@@ -177,9 +118,7 @@ fn user_scoped_key(key: &[u8]) -> Vec<u8> {
 const MAX_ID_OVERRIDE_LEN: usize = 128;
 
 /// Validate a caller-supplied job id. Caller-supplied ids must be
-/// 1-[`MAX_ID_OVERRIDE_LEN`] bytes of `[A-Za-z0-9_-]`. `:` is reserved
-/// as the key delimiter in `pending:`/`scheduled:`/`claimed:` keys, and
-/// other non-alphanumeric bytes are rejected up front to keep ids safe
+/// 1-[`MAX_ID_OVERRIDE_LEN`] bytes of `[A-Za-z0-9_-]`, keeping ids safe
 /// for object-store paths and log lines downstream.
 fn validate_id_override(id: &str) -> Result<()> {
     if id.is_empty() {
@@ -267,7 +206,7 @@ pub struct QueueConfig {
     /// is zero.
     pub retry_backoff_max: Duration,
     /// If `Some(duration)`, completed jobs on this queue are written to the
-    /// `done:` keyspace and retained for `duration`. The reaper purges them
+    /// done key space and retained for `duration`. The reaper purges them
     /// once `completed_at + duration` has passed.
     ///
     /// If `None` (default), [`Queue::ack`] deletes successful jobs outright.
@@ -551,7 +490,7 @@ pub enum WaitOutcome {
 /// its primary key, awaiting staging into a transaction.
 struct PreparedJob {
     job: JobRecord,
-    key: String,
+    key: Vec<u8>,
     id_override_used: bool,
 }
 
@@ -562,7 +501,7 @@ struct StagedJob {
     queue: String,
     /// `Some` when the job landed in the pending key space, in which
     /// case the commit must be followed by a cursor note and a wakeup.
-    pending_key: Option<String>,
+    pending_key: Option<Vec<u8>>,
 }
 
 impl Queue {
@@ -742,6 +681,9 @@ impl Queue {
     /// When `run_at` is in the past or is now, the job is written straight to
     /// pending; otherwise it waits in the scheduled key space until the
     /// background scheduler promotes it.
+    ///
+    /// Queue names are limited to [`crate::MAX_QUEUE_NAME_LEN`] bytes;
+    /// longer names return [`Error::InvalidQueueName`].
     #[instrument(skip(self, payload), fields(queue, job_id))]
     pub async fn enqueue_with(
         &self,
@@ -767,7 +709,7 @@ impl Queue {
     /// and the existing job's id is returned.
     ///
     /// Caller-supplied KV keys are internally scoped under a reserved
-    /// `usr:` prefix so they cannot collide with Taquba's internal layout.
+    /// user key tag so they cannot collide with Taquba's internal layout.
     /// Each value is validated against [`MAX_KV_VALUE_SIZE`] up front;
     /// oversized values return [`Error::KvValueTooLarge`] before the
     /// transaction begins. Conflict retries are handled internally.
@@ -817,7 +759,7 @@ impl Queue {
     /// Read a value from the user KV namespace.
     ///
     /// Caller-supplied keys are internally scoped under a reserved
-    /// `usr:` prefix and cannot collide with Taquba's internal layout.
+    /// user key tag and cannot collide with Taquba's internal layout.
     pub async fn kv_get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         Ok(self.db.get(user_scoped_key(key)).await?)
     }
@@ -825,7 +767,7 @@ impl Queue {
     /// Write a value to the user KV namespace.
     ///
     /// Caller-supplied keys are internally scoped under a reserved
-    /// `usr:` prefix and cannot collide with Taquba's internal layout.
+    /// user key tag and cannot collide with Taquba's internal layout.
     /// Values above [`MAX_KV_VALUE_SIZE`] return
     /// [`Error::KvValueTooLarge`]. The write is durable before the call
     /// returns.
@@ -847,7 +789,7 @@ impl Queue {
     /// Delete a value from the user KV namespace.
     ///
     /// Caller-supplied keys are internally scoped under a reserved
-    /// `usr:` prefix and cannot collide with Taquba's internal layout.
+    /// user key tag and cannot collide with Taquba's internal layout.
     pub async fn kv_delete(&self, key: &[u8]) -> Result<()> {
         self.db.delete(user_scoped_key(key)).await?;
         Ok(())
@@ -896,7 +838,8 @@ impl Queue {
         queue: &str,
         payload: Vec<u8>,
         opts: EnqueueOptions,
-    ) -> Result<(JobRecord, String, bool)> {
+    ) -> Result<(JobRecord, Vec<u8>, bool)> {
+        validate_queue_name(queue)?;
         let cfg = self.queue_config(queue);
         let max_attempts = opts.max_attempts.unwrap_or(cfg.max_attempts);
         let priority = opts.priority.unwrap_or(cfg.default_priority);
@@ -964,7 +907,7 @@ impl Queue {
     async fn write_job(
         &self,
         job: JobRecord,
-        key: String,
+        key: Vec<u8>,
         id_override_used: bool,
         kv_writes: HashMap<Vec<u8>, Vec<u8>>,
     ) -> Result<EnqueueResult> {
@@ -1024,21 +967,21 @@ impl Queue {
             .map(|dk| dedup_index_key(&job.queue, dk));
 
         if let Some(ref dkey) = dkey
-            && let Some(bytes) = txn.get(dkey.as_bytes()).await?
+            && let Some(bytes) = txn.get(&dkey).await?
         {
             let existing = String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidState)?;
             return Ok(Err(existing));
         }
 
-        if *id_override_used && txn.get(job_index_key(&job.id).as_bytes()).await?.is_some() {
+        if *id_override_used && txn.get(job_index_key(&job.id)).await?.is_some() {
             return Err(Error::DuplicateJobId { id: job.id.clone() });
         }
 
         let value = rmp_serde::to_vec_named(job)?;
-        txn.put(key.as_bytes(), &value)?;
-        txn.put(job_index_key(&job.id).as_bytes(), key.as_bytes())?;
+        txn.put(key, &value)?;
+        txn.put(job_index_key(&job.id), key)?;
         if let Some(ref dkey) = dkey {
-            txn.put(dkey.as_bytes(), job.id.as_bytes())?;
+            txn.put(dkey, job.id.as_bytes())?;
         }
         update_stats(txn, &job.queue, &[(job.status, 1)])?;
 
@@ -1181,20 +1124,20 @@ impl Queue {
     /// Same-queue claim attempts serialise through an in-process
     /// `tokio::sync::Mutex`, avoiding the transaction-conflict
     /// retry that would otherwise resolve which worker takes the
-    /// head of `pending:`. The lock is per-queue, so different
+    /// head of the pending key space. The lock is per-queue, so different
     /// queues' claim paths still run in parallel.
     ///
     /// A per-queue in-memory cursor records the most recently
     /// claimed key and is used as the start bound on the next
     /// scan. This lets steady-state claims skip over the
     /// tombstones left by previously claimed (and deleted)
-    /// `pending:` entries. When the cursor scan yields nothing
+    /// pending entries. When the cursor scan yields nothing
     /// inside the queue's prefix (cursor exhausted, or an older
     /// job has been requeued by `nack` behind the cursor), the
     /// claim falls back to a front prefix scan and resets the
     /// cursor. When the front scan also finds nothing, the queue is
     /// marked empty in memory and subsequent claims return `None`
-    /// without scanning until the next `pending:` insert, so polling
+    /// without scanning until the next pending insert, so polling
     /// an empty queue does not re-walk the tombstone band left by
     /// previously claimed jobs.
     #[instrument(skip(self), fields(queue))]
@@ -1225,6 +1168,7 @@ impl Queue {
         max_jobs: usize,
         lease_duration: Duration,
     ) -> Result<Vec<JobRecord>> {
+        validate_queue_name(queue)?;
         if max_jobs == 0 {
             return Ok(Vec::new());
         }
@@ -1240,7 +1184,7 @@ impl Queue {
         let _guard = lock.lock().await;
 
         let prefix = pending_prefix(queue);
-        let prefix_bytes = prefix.as_bytes();
+        let prefix_bytes = prefix.as_slice();
         let timer = crate::obs::start();
         loop {
             // The scan state (and its pending-insert epoch) is read
@@ -1324,17 +1268,17 @@ impl Queue {
                 // Take the dedup_key off the record BEFORE serializing the
                 // claimed-state copy. If we left it on, a later nack would put a
                 // record back into pending still carrying the key, and the next
-                // claim would try to delete a `dedup:` index that may by now
+                // claim would try to delete a dedup index that may by now
                 // belong to a *different* job, corrupting the dedup invariant.
                 let dedup_key_to_release = job.dedup_key.take();
                 let claimed = claimed_key(&job.queue, lease_expires_at, &job.id);
                 let value = rmp_serde::to_vec_named(&job)?;
 
                 txn.delete(&kv.key)?;
-                txn.put(claimed.as_bytes(), &value)?;
-                txn.put(job_index_key(&job.id).as_bytes(), claimed.as_bytes())?;
+                txn.put(&claimed, &value)?;
+                txn.put(job_index_key(&job.id), &claimed)?;
                 if let Some(dk) = dedup_key_to_release.as_deref() {
-                    txn.delete(dedup_index_key(&job.queue, dk).as_bytes())?;
+                    txn.delete(dedup_index_key(&job.queue, dk))?;
                 }
                 jobs.push(job);
             }
@@ -1477,15 +1421,15 @@ impl Queue {
 
         let results = loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            txn.get(claimed.as_bytes()).await?.ok_or(Error::ClaimLost)?;
-            txn.delete(claimed.as_bytes())?;
+            txn.get(&claimed).await?.ok_or(Error::ClaimLost)?;
+            txn.delete(&claimed)?;
             if let Some((ref done_k, ref done_v)) = done_record {
-                txn.put(done_k.as_bytes(), done_v)?;
-                txn.put(job_index_key(&job.id).as_bytes(), done_k.as_bytes())?;
+                txn.put(done_k, done_v)?;
+                txn.put(job_index_key(&job.id), done_k)?;
             } else {
                 // Default: drop the index pointer too; the ID is no longer
                 // findable via get_job, but the queue stays small.
-                txn.delete(job_index_key(&job.id).as_bytes())?;
+                txn.delete(job_index_key(&job.id))?;
             }
             update_stats(
                 &txn,
@@ -1544,16 +1488,16 @@ impl Queue {
 
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            txn.get(claimed.as_bytes()).await?.ok_or(Error::ClaimLost)?;
-            txn.delete(claimed.as_bytes())?;
+            txn.get(&claimed).await?.ok_or(Error::ClaimLost)?;
+            txn.delete(&claimed)?;
 
             if job.attempts >= job.max_attempts {
                 job.status = JobStatus::Dead;
                 job.failed_at = Some(self.now_ms());
                 let dead = dead_key(&job.queue, &job.id);
                 let value = rmp_serde::to_vec_named(&job)?;
-                txn.put(dead.as_bytes(), &value)?;
-                txn.put(job_index_key(&job.id).as_bytes(), dead.as_bytes())?;
+                txn.put(&dead, &value)?;
+                txn.put(job_index_key(&job.id), &dead)?;
                 update_stats(
                     &txn,
                     &job.queue,
@@ -1577,8 +1521,8 @@ impl Queue {
                     let priority = job.priority;
                     let pending = pending_key(&job.queue, priority, &job.id);
                     let value = rmp_serde::to_vec_named(&job)?;
-                    txn.put(pending.as_bytes(), &value)?;
-                    txn.put(job_index_key(&job.id).as_bytes(), pending.as_bytes())?;
+                    txn.put(&pending, &value)?;
+                    txn.put(job_index_key(&job.id), &pending)?;
                     update_stats(
                         &txn,
                         &job.queue,
@@ -1596,8 +1540,8 @@ impl Queue {
                     job.run_at = Some(run_at);
                     let scheduled = scheduled_key(&job.queue, run_at, &job.id);
                     let value = rmp_serde::to_vec_named(&job)?;
-                    txn.put(scheduled.as_bytes(), &value)?;
-                    txn.put(job_index_key(&job.id).as_bytes(), scheduled.as_bytes())?;
+                    txn.put(&scheduled, &value)?;
+                    txn.put(job_index_key(&job.id), &scheduled)?;
                     update_stats(
                         &txn,
                         &job.queue,
@@ -1666,10 +1610,10 @@ impl Queue {
 
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            txn.get(claimed.as_bytes()).await?.ok_or(Error::ClaimLost)?;
-            txn.delete(claimed.as_bytes())?;
-            txn.put(dead.as_bytes(), &value)?;
-            txn.put(job_index_key(&job.id).as_bytes(), dead.as_bytes())?;
+            txn.get(&claimed).await?.ok_or(Error::ClaimLost)?;
+            txn.delete(&claimed)?;
+            txn.put(&dead, &value)?;
+            txn.put(job_index_key(&job.id), &dead)?;
             update_stats(
                 &txn,
                 &job.queue,
@@ -1696,6 +1640,7 @@ impl Queue {
 
     /// Return a snapshot of job counts for the given queue.
     pub async fn stats(&self, queue: &str) -> Result<QueueStats> {
+        validate_queue_name(queue)?;
         read_stats(&self.db, queue).await
     }
 
@@ -1703,19 +1648,13 @@ impl Queue {
     pub async fn list_queues(&self) -> Result<Vec<String>> {
         let mut seen = std::collections::HashSet::new();
         let mut queues = Vec::new();
-        let mut iter = self.db.scan_prefix(b"stats:", ..).await?;
+        let mut iter = self.db.scan_prefix(tag_prefix(KeyTag::Stats), ..).await?;
         while let Some(kv) = iter.next().await? {
-            let key_str = match std::str::from_utf8(&kv.key) {
-                Ok(s) => s,
-                Err(_) => continue,
+            let Some((queue, _metric)) = parse_stats_key(&kv.key) else {
+                continue;
             };
-            // Key: "stats:{queue}:{metric}".
-            let without_prefix = key_str.strip_prefix("stats:").unwrap_or(key_str);
-            if let Some(idx) = without_prefix.rfind(':') {
-                let queue = &without_prefix[..idx];
-                if seen.insert(queue.to_string()) {
-                    queues.push(queue.to_string());
-                }
+            if seen.insert(queue.clone()) {
+                queues.push(queue);
             }
         }
         Ok(queues)
@@ -1735,22 +1674,22 @@ impl Queue {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<JobRecord>> {
+        validate_queue_name(queue)?;
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let prefix = format!("dead:{}:", queue);
+        let prefix = dead_prefix(queue);
         let mut jobs = Vec::with_capacity(limit);
-        let mut iter = self.db.scan_prefix(prefix.as_bytes(), ..).await?;
+        let mut iter = self.db.scan_prefix(prefix, ..).await?;
         while let Some(kv) = iter.next().await? {
+            let job: JobRecord = rmp_serde::from_slice(&kv.value)?;
             if let Some(after_id) = after {
-                // Skip until we pass the cursor.
-                let key_str = std::str::from_utf8(&kv.key).unwrap_or("");
-                let id = key_str.rsplit(':').next().unwrap_or("");
-                if id <= after_id {
+                // Skip until past the cursor. Dead keys end with the job
+                // id, so the scan yields records in id order.
+                if job.id.as_str() <= after_id {
                     continue;
                 }
             }
-            let job: JobRecord = rmp_serde::from_slice(&kv.value)?;
             jobs.push(job);
             if jobs.len() >= limit {
                 break;
@@ -1783,12 +1722,12 @@ impl Queue {
         let value = rmp_serde::to_vec_named(&job)?;
 
         let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-        txn.get(dead.as_bytes())
+        txn.get(&dead)
             .await?
             .ok_or_else(|| Error::JobNotFound(job.id.clone()))?;
-        txn.delete(dead.as_bytes())?;
-        txn.put(pending.as_bytes(), &value)?;
-        txn.put(job_index_key(&job.id).as_bytes(), pending.as_bytes())?;
+        txn.delete(&dead)?;
+        txn.put(&pending, &value)?;
+        txn.put(job_index_key(&job.id), &pending)?;
         update_stats(
             &txn,
             &job.queue,
@@ -1831,12 +1770,10 @@ impl Queue {
 
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            txn.get(old_claimed.as_bytes())
-                .await?
-                .ok_or(Error::ClaimLost)?;
-            txn.delete(old_claimed.as_bytes())?;
-            txn.put(new_claimed.as_bytes(), &value)?;
-            txn.put(job_index_key(&job.id).as_bytes(), new_claimed.as_bytes())?;
+            txn.get(&old_claimed).await?.ok_or(Error::ClaimLost)?;
+            txn.delete(&old_claimed)?;
+            txn.put(&new_claimed, &value)?;
+            txn.put(job_index_key(&job.id), &new_claimed)?;
             match txn.commit().await {
                 Ok(_) => break,
                 Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
@@ -1925,14 +1862,11 @@ impl Queue {
     /// Returns `None` if the ID was never enqueued or has since been expunged.
     pub async fn get_job(&self, id: &str) -> Result<Option<JobRecord>> {
         let index_key = job_index_key(id);
-        let current_key = match self.db.get(index_key.as_bytes()).await? {
+        let current_key = match self.db.get(&index_key).await? {
             None => return Ok(None),
-            Some(bytes) => match String::from_utf8(bytes.to_vec()) {
-                Ok(s) => s,
-                Err(_) => return Err(Error::InvalidState),
-            },
+            Some(bytes) => bytes,
         };
-        match self.db.get(current_key.as_bytes()).await? {
+        match self.db.get(&current_key).await? {
             None => Ok(None),
             Some(bytes) => Ok(Some(rmp_serde::from_slice(&bytes)?)),
         }
@@ -1961,21 +1895,15 @@ impl Queue {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
 
             let index_key = job_index_key(id);
-            let current_key = match txn.get(index_key.as_bytes()).await? {
+            let current_key = match txn.get(&index_key).await? {
                 None => {
                     txn.rollback();
                     return Ok(CancelOutcome::NotFound);
                 }
-                Some(bytes) => match String::from_utf8(bytes.to_vec()) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        txn.rollback();
-                        return Err(Error::InvalidState);
-                    }
-                },
+                Some(bytes) => bytes,
             };
 
-            let mut job: JobRecord = match txn.get(current_key.as_bytes()).await? {
+            let mut job: JobRecord = match txn.get(&current_key).await? {
                 None => {
                     txn.rollback();
                     return Ok(CancelOutcome::NotFound);
@@ -1986,10 +1914,10 @@ impl Queue {
             let (msg, outcome, remove_from_registry) = match job.status {
                 JobStatus::Pending | JobStatus::Scheduled => {
                     let is_scheduled = matches!(job.status, JobStatus::Scheduled);
-                    txn.delete(current_key.as_bytes())?;
-                    txn.delete(index_key.as_bytes())?;
+                    txn.delete(&current_key)?;
+                    txn.delete(&index_key)?;
                     if let Some(ref dk) = job.dedup_key {
-                        txn.delete(dedup_index_key(&job.queue, dk).as_bytes())?;
+                        txn.delete(dedup_index_key(&job.queue, dk))?;
                     }
                     if is_scheduled {
                         update_stats(&txn, &job.queue, &[(JobStatus::Scheduled, -1)])?;
@@ -2022,7 +1950,7 @@ impl Queue {
                     }
                     job.cancel_requested = true;
                     let value = rmp_serde::to_vec_named(&job)?;
-                    txn.put(current_key.as_bytes(), &value)?;
+                    txn.put(&current_key, &value)?;
                     (
                         "claimed job cancellation requested",
                         CancelOutcome::Requested,
@@ -2104,21 +2032,15 @@ impl Queue {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
 
             let index_key = job_index_key(id);
-            let current_key = match txn.get(index_key.as_bytes()).await? {
+            let current_key = match txn.get(&index_key).await? {
                 None => {
                     txn.rollback();
                     return Ok(WakeOutcome::NotFound);
                 }
-                Some(bytes) => match String::from_utf8(bytes.to_vec()) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        txn.rollback();
-                        return Err(Error::InvalidState);
-                    }
-                },
+                Some(bytes) => bytes,
             };
 
-            let mut job: JobRecord = match txn.get(current_key.as_bytes()).await? {
+            let mut job: JobRecord = match txn.get(&current_key).await? {
                 None => {
                     txn.rollback();
                     return Ok(WakeOutcome::NotFound);
@@ -2131,15 +2053,15 @@ impl Queue {
                 return Ok(WakeOutcome::NotScheduled);
             }
 
-            txn.delete(current_key.as_bytes())?;
+            txn.delete(&current_key)?;
             job.status = JobStatus::Pending;
             job.run_at = None;
             job.woken_at = Some(self.now_ms());
             job.wake_payload = wake_payload.clone();
             let pending = pending_key(&job.queue, job.priority, &job.id);
             let value = rmp_serde::to_vec_named(&job)?;
-            txn.put(pending.as_bytes(), &value)?;
-            txn.put(index_key.as_bytes(), pending.as_bytes())?;
+            txn.put(&pending, &value)?;
+            txn.put(&index_key, &pending)?;
             update_stats(
                 &txn,
                 &job.queue,
@@ -2164,6 +2086,7 @@ impl Queue {
     /// All jobs use the queue's configured `max_attempts` and `default_priority`.
     /// Returns the IDs in the same order as `payloads`.
     pub async fn enqueue_batch(&self, queue: &str, payloads: Vec<Vec<u8>>) -> Result<Vec<String>> {
+        validate_queue_name(queue)?;
         if payloads.is_empty() {
             return Ok(Vec::new());
         }
@@ -2210,8 +2133,8 @@ impl Queue {
             };
             let key = pending_key(queue, priority, &id);
             let value = rmp_serde::to_vec_named(&job)?;
-            txn.put(key.as_bytes(), &value)?;
-            txn.put(job_index_key(&id).as_bytes(), key.as_bytes())?;
+            txn.put(&key, &value)?;
+            txn.put(job_index_key(&id), &key)?;
             ids.push(id);
         }
 
@@ -2277,7 +2200,7 @@ impl Queue {
     }
 }
 
-/// Write each queue's claim-scan state under its `cursor:` key. Runs
+/// Write each queue's claim-scan state under its cursor key. Runs
 /// after the background tasks have stopped; `close` consumes the
 /// handle, so the exported state cannot change between the export and
 /// the database closing.
@@ -2294,16 +2217,13 @@ async fn persist_cursor_state(db: &Db, claim_cursor: &ClaimCursor) -> Result<()>
             bound_inclusive: state.scan_from.is_some_and(|sf| sf.inclusive),
             known_empty: state.known_empty,
         };
-        txn.put(
-            cursor_key(&queue).as_bytes(),
-            &rmp_serde::to_vec_named(&record)?,
-        )?;
+        txn.put(cursor_key(&queue), &rmp_serde::to_vec_named(&record)?)?;
     }
     txn.commit().await?;
     Ok(())
 }
 
-/// Restore the claim cursor from `cursor:` records persisted by the
+/// Restore the claim cursor from cursor records persisted by the
 /// previous clean close, then durably delete them before the queue
 /// serves traffic. A record is valid only as of the close that wrote
 /// it: once inserts resume the live bound can move behind the
@@ -2313,7 +2233,7 @@ async fn restore_cursor_state(db: &Db, claim_cursor: &ClaimCursor) -> Result<()>
     let txn = db.begin(IsolationLevel::Snapshot).await?;
     let mut records = Vec::new();
     {
-        let mut iter = txn.scan_prefix(b"cursor:", ..).await?;
+        let mut iter = txn.scan_prefix(tag_prefix(KeyTag::Cursor), ..).await?;
         while let Some(kv) = iter.next().await? {
             let record: PersistedCursor = rmp_serde::from_slice(&kv.value)?;
             records.push((kv.key, record));
@@ -2394,40 +2314,6 @@ mod tests {
         }
         assert_eq!(gauge, Some(3.0), "sampler should report 3 pending jobs");
         q.close().await.unwrap();
-    }
-
-    #[test]
-    fn parse_leading_timestamp_round_trips_a_well_formed_key() {
-        let key = done_key(1_700_000_000_000, "work", "abc");
-        assert_eq!(
-            parse_leading_timestamp(key.as_bytes(), "done:"),
-            Some(1_700_000_000_000),
-        );
-    }
-
-    #[test]
-    fn parse_leading_timestamp_rejects_wrong_prefix() {
-        let key = b"claimed:00000000001700000000000:work:abc";
-        assert_eq!(parse_leading_timestamp(key, "done:"), None);
-    }
-
-    #[test]
-    fn parse_leading_timestamp_rejects_malformed_timestamp() {
-        let key = b"done:not-a-number:work:abc";
-        assert_eq!(parse_leading_timestamp(key, "done:"), None);
-    }
-
-    #[test]
-    fn parse_leading_timestamp_rejects_missing_separator() {
-        // Bare prefix with no following colon-delimited timestamp.
-        let key = b"done:";
-        assert_eq!(parse_leading_timestamp(key, "done:"), None);
-    }
-
-    #[test]
-    fn parse_leading_timestamp_rejects_non_utf8() {
-        let key = &[b'd', b'o', b'n', b'e', b':', 0xff, 0xff];
-        assert_eq!(parse_leading_timestamp(key, "done:"), None);
     }
 
     /// OpenOptions that disable retry backoff so nack tests can re-claim
@@ -4701,9 +4587,9 @@ mod tests {
     async fn test_renew_lease() {
         // Covers the three things `renew_lease` has to get right: the new
         // expiry replaces the old one, the reaper sees the renewed lease and
-        // skips the job, and the `jobindex:` pointer is updated so `get_job`
-        // resolves through the new `claimed:{ts}:...` key (not a dangling
-        // pointer at the old timestamp).
+        // skips the job, and the job-index pointer is updated so `get_job`
+        // resolves through the new claimed key (not a dangling pointer at
+        // the old timestamp).
         let q = Queue::open(make_store(), "test").await.unwrap();
 
         q.enqueue("work", b"payload".to_vec()).await.unwrap();
@@ -6025,19 +5911,16 @@ mod tests {
     async fn test_kv_keys_cannot_collide_with_internal_layout() {
         let q = Queue::open(make_store(), "test").await.unwrap();
 
-        // Enqueue a real job so the internal `pending:` keyspace is in use.
+        // Enqueue a real job so the internal pending key space is in use.
         q.enqueue("work", b"payload".to_vec()).await.unwrap();
 
-        // A user key that *looks* like an internal prefix is scoped under
-        // `usr:` and cannot interfere with queue state.
+        // A user key that matches a real internal key byte-for-byte is
+        // scoped under the user tag and cannot interfere with queue state.
         q.enqueue_with_kv(
             "other",
             b"sentinel".to_vec(),
             EnqueueOptions::default(),
-            HashMap::from([(
-                b"pending:work:0000000001:fake-id".to_vec(),
-                b"trickery".to_vec(),
-            )]),
+            HashMap::from([(pending_key("work", 1, "fake-id"), b"trickery".to_vec())]),
         )
         .await
         .unwrap();
@@ -6053,7 +5936,7 @@ mod tests {
         assert_eq!(claimed.payload, b"payload");
 
         // The user-visible key still reads back fine.
-        let v = q.kv_get(b"pending:work:0000000001:fake-id").await.unwrap();
+        let v = q.kv_get(&pending_key("work", 1, "fake-id")).await.unwrap();
         assert_eq!(v.as_deref(), Some(b"trickery".as_slice()));
 
         q.close().await.unwrap();
@@ -6249,10 +6132,7 @@ mod tests {
         assert!(scan.scan_from.is_some());
         assert!(!scan.known_empty);
         assert!(
-            q.db.get(cursor_key("work").as_bytes())
-                .await
-                .unwrap()
-                .is_none(),
+            q.db.get(cursor_key("work")).await.unwrap().is_none(),
             "the cursor record is consumed at open",
         );
 

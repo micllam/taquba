@@ -3,6 +3,7 @@ use slatedb::{Db, DbTransaction, MergeOperator, MergeOperatorError};
 
 use crate::error::{Error, Result};
 use crate::job::JobStatus;
+use crate::keys::stats_key;
 
 /// Map a [`JobStatus`] to the on-disk metric name used for its counter.
 pub(crate) fn metric_name(status: JobStatus) -> &'static str {
@@ -13,10 +14,6 @@ pub(crate) fn metric_name(status: JobStatus) -> &'static str {
         JobStatus::Dead => "dead",
         JobStatus::Scheduled => "scheduled",
     }
-}
-
-pub(crate) fn stats_key(queue: &str, metric: &str) -> String {
-    format!("stats:{}:{}", queue, metric)
 }
 
 /// Merge operator that accumulates i64 deltas using little-endian encoding.
@@ -69,14 +66,14 @@ pub(crate) fn update_stats(
     for (status, delta) in deltas {
         if *delta != 0 {
             let key = stats_key(queue, metric_name(*status));
-            txn.merge(key.as_bytes(), (*delta).to_le_bytes())?;
+            txn.merge(&key, (*delta).to_le_bytes())?;
             // Counter merges are commutative, so two transactions
             // merging the same stats key do not actually conflict.
             // Without this, every job-state transition on a queue
             // contends on the same handful of stats keys and
             // transaction-conflict retries dominate claim latency
             // under concurrency.
-            txn.unmark_write([key.as_bytes()])?;
+            txn.unmark_write([key.as_slice()])?;
         }
     }
     Ok(())
@@ -121,7 +118,7 @@ pub(crate) async fn read_stats(db: &Db, queue: &str) -> Result<QueueStats> {
 
 async fn count_for(db: &Db, queue: &str, status: JobStatus) -> Result<i64> {
     let key = stats_key(queue, metric_name(status));
-    match db.get(key.as_bytes()).await? {
+    match db.get(&key).await? {
         None => Ok(0),
         Some(bytes) => read_i64_le(&bytes).map_err(|_| Error::InvalidState),
     }

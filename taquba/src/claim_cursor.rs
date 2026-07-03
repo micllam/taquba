@@ -15,14 +15,14 @@ const MAX_INSERT_WAKEUPS: usize = 64;
 ///
 /// The scan-start bound is the position the next claim scans from,
 /// skipping the tombstone band left by previously claimed (and
-/// deleted) `pending:` entries. After a claim it excludes the claimed
+/// deleted) pending entries. After a claim it excludes the claimed
 /// key; after an insert that lands at or before it, it moves back to
 /// include the inserted key. The invariant is that every live
-/// `pending:` key sorts at or after the bound, so the claim path only
+/// pending key sorts at or after the bound, so the claim path only
 /// falls back to a front prefix scan when the bound is unknown (cold
 /// start or process restart).
 ///
-/// The epoch counts committed `pending:` inserts. When a claim's full
+/// The epoch counts committed pending inserts. When a claim's full
 /// prefix scan finds nothing, it records the epoch it observed before
 /// its transaction began; until the next insert bumps the epoch,
 /// subsequent claims return `None` without scanning. Without this,
@@ -53,7 +53,7 @@ pub(crate) struct ScanFrom {
 #[derive(Default)]
 struct QueueClaimState {
     scan_from: Option<ScanFrom>,
-    /// Bumped after every committed `pending:` insert.
+    /// Bumped after every committed pending insert.
     epoch: u64,
     /// The epoch observed by a claim whose full prefix scan found
     /// nothing. While it equals `epoch`, the queue is known empty.
@@ -142,7 +142,7 @@ impl ClaimCursor {
         };
     }
 
-    /// Record that a full `pending:` prefix scan found nothing, as
+    /// Record that a full pending prefix scan found nothing, as
     /// observed at `epoch` (the value returned by
     /// [`Self::begin_claim`] for the same attempt). The scan-start
     /// bound is kept: nothing is live behind it, and inserts landing
@@ -154,14 +154,14 @@ impl ClaimCursor {
         s.empty_as_of = Some(epoch);
     }
 
-    /// Record one committed `pending:` insert. See
+    /// Record one committed pending insert. See
     /// [`Self::note_pending_inserts`] for the semantics, including why
     /// this must be called after the insert's transaction commits.
-    pub(crate) fn note_pending_insert(&self, queue: &str, new_key: &str) {
+    pub(crate) fn note_pending_insert(&self, queue: &str, new_key: &[u8]) {
         self.note_pending_inserts(queue, new_key, 1);
     }
 
-    /// Record `count` committed `pending:` inserts whose smallest key
+    /// Record `count` committed pending inserts whose smallest key
     /// is `min_key`: bump the epoch, revoking any emptiness recorded
     /// against an earlier one, update the scan state so no claim can
     /// miss the key, and issue one queue-scoped wakeup per insert
@@ -176,13 +176,13 @@ impl ClaimCursor {
     /// [`Self::advance`] to clamp to, because an in-flight claim may
     /// otherwise advance the bound past it.
     ///
-    /// Every site that writes `pending:` keys (enqueue, batch
+    /// Every site that writes pending keys (enqueue, batch
     /// enqueue, nack-requeue, dead-job requeue, reaper-requeue,
     /// scheduler promotion) calls this *after* its transaction
     /// commits. Calling it before the commit would let a concurrent
     /// claim scan miss the job, record emptiness at the already-bumped
     /// epoch, and strand the job until the next insert.
-    pub(crate) fn note_pending_inserts(&self, queue: &str, min_key: &str, count: usize) {
+    pub(crate) fn note_pending_inserts(&self, queue: &str, min_key: &[u8], count: usize) {
         let wakeup = {
             let mut map = self.inner.lock().unwrap();
             let s = map.entry(queue.to_string()).or_default();
@@ -192,8 +192,7 @@ impl ClaimCursor {
                 // Move the bound back when a scan from it would skip
                 // the key.
                 Some(sf) => {
-                    min_key.as_bytes() < sf.key.as_ref()
-                        || (min_key.as_bytes() == sf.key.as_ref() && !sf.inclusive)
+                    min_key < sf.key.as_ref() || (min_key == sf.key.as_ref() && !sf.inclusive)
                 }
                 // Bound unknown (cold start or restart): a bound may be
                 // set only when a scan has proven the queue empty;
@@ -203,7 +202,7 @@ impl ClaimCursor {
             };
             if include_min_key {
                 s.scan_from = Some(ScanFrom {
-                    key: Bytes::copy_from_slice(min_key.as_bytes()),
+                    key: Bytes::copy_from_slice(min_key),
                     inclusive: true,
                 });
                 s.min_insert_ahead = None;
@@ -212,7 +211,7 @@ impl ClaimCursor {
                 // set yet), but an in-flight claim may be about to
                 // advance the bound past it; record it so that advance
                 // clamps.
-                let key = Bytes::copy_from_slice(min_key.as_bytes());
+                let key = Bytes::copy_from_slice(min_key);
                 let is_new_min = s
                     .min_insert_ahead
                     .as_ref()
@@ -306,7 +305,7 @@ mod tests {
 
         assert!(state.begin_claim("q").known_empty);
 
-        state.note_pending_insert("q", "pending:q:00000000:job-1");
+        state.note_pending_insert("q", b"pending:q:00000000:job-1");
         assert!(!state.begin_claim("q").known_empty);
     }
 
@@ -314,7 +313,7 @@ mod tests {
     fn insert_between_begin_and_mark_revokes_emptiness() {
         let state = ClaimCursor::new();
         let scan = state.begin_claim("q");
-        state.note_pending_insert("q", "pending:q:00000000:job-1");
+        state.note_pending_insert("q", b"pending:q:00000000:job-1");
         state.mark_empty("q", scan.epoch);
 
         assert!(!state.begin_claim("q").known_empty);
@@ -340,13 +339,13 @@ mod tests {
         let scan = state.begin_claim("q");
         state.advance("q", Bytes::from_static(b"pending:q:00000000:job-5"), &scan);
 
-        state.note_pending_insert("q", "pending:q:00000000:job-9");
+        state.note_pending_insert("q", b"pending:q:00000000:job-9");
         assert_eq!(
             state.begin_claim("q").scan_from,
             scan_from(b"pending:q:00000000:job-5", false),
         );
 
-        state.note_pending_insert("q", "pending:q:00000000:job-3");
+        state.note_pending_insert("q", b"pending:q:00000000:job-3");
         assert_eq!(
             state.begin_claim("q").scan_from,
             scan_from(b"pending:q:00000000:job-3", true),
@@ -359,7 +358,7 @@ mod tests {
         let scan = state.begin_claim("q");
         state.advance("q", Bytes::from_static(b"pending:q:00000000:job-5"), &scan);
 
-        state.note_pending_insert("q", "pending:q:00000000:job-5");
+        state.note_pending_insert("q", b"pending:q:00000000:job-5");
         assert_eq!(
             state.begin_claim("q").scan_from,
             scan_from(b"pending:q:00000000:job-5", true),
@@ -372,7 +371,7 @@ mod tests {
         let scan = state.begin_claim("q");
         state.mark_empty("q", scan.epoch);
 
-        state.note_pending_insert("q", "pending:q:00000000:job-1");
+        state.note_pending_insert("q", b"pending:q:00000000:job-1");
         assert_eq!(
             state.begin_claim("q").scan_from,
             scan_from(b"pending:q:00000000:job-1", true),
@@ -382,7 +381,7 @@ mod tests {
     #[test]
     fn insert_with_unknown_bound_keeps_the_front_scan_fallback() {
         let state = ClaimCursor::new();
-        state.note_pending_insert("q", "pending:q:00000000:job-1");
+        state.note_pending_insert("q", b"pending:q:00000000:job-1");
         assert!(state.begin_claim("q").scan_from.is_none());
     }
 
@@ -397,7 +396,7 @@ mod tests {
         // it, but it sorts below the keys the claim is about to
         // advance past.
         let observed = state.begin_claim("q");
-        state.note_pending_insert("q", "pending:q:00000000:job-3");
+        state.note_pending_insert("q", b"pending:q:00000000:job-3");
         state.advance(
             "q",
             Bytes::from_static(b"pending:q:00000000:job-5"),
@@ -417,7 +416,7 @@ mod tests {
         state.advance("q", Bytes::from_static(b"pending:q:00000000:job-2"), &scan);
 
         let observed = state.begin_claim("q");
-        state.note_pending_insert("q", "pending:q:00000000:job-3");
+        state.note_pending_insert("q", b"pending:q:00000000:job-3");
         state.advance(
             "q",
             Bytes::from_static(b"pending:q:00000000:job-5"),
@@ -446,7 +445,7 @@ mod tests {
         // and the reaper requeues it at its original key before the
         // claim's bound update runs.
         let observed = state.begin_claim("q");
-        state.note_pending_insert("q", "pending:q:00000000:job-5");
+        state.note_pending_insert("q", b"pending:q:00000000:job-5");
         state.advance(
             "q",
             Bytes::from_static(b"pending:q:00000000:job-5"),
@@ -466,7 +465,7 @@ mod tests {
         state.advance("q", Bytes::from_static(b"pending:q:00000000:job-2"), &scan);
 
         let observed = state.begin_claim("q");
-        state.note_pending_insert("q", "pending:q:00000000:job-9");
+        state.note_pending_insert("q", b"pending:q:00000000:job-9");
         state.advance(
             "q",
             Bytes::from_static(b"pending:q:00000000:job-5"),
@@ -487,7 +486,7 @@ mod tests {
         // it runs, a reaper requeue inserts a key that sorts below the
         // keys the claim will advance past.
         let observed = state.begin_claim("q");
-        state.note_pending_insert("q", "pending:q:00000000:job-1");
+        state.note_pending_insert("q", b"pending:q:00000000:job-1");
         state.advance(
             "q",
             Bytes::from_static(b"pending:q:00000000:job-5"),
@@ -530,7 +529,7 @@ mod tests {
             },
         );
 
-        state.note_pending_insert("q", "pending:q:00000000:job-1");
+        state.note_pending_insert("q", b"pending:q:00000000:job-1");
         let scan = state.begin_claim("q");
         assert!(!scan.known_empty);
         assert_eq!(scan.scan_from, scan_from(b"pending:q:00000000:job-1", true));
@@ -565,7 +564,7 @@ mod tests {
         state.advance("q", Bytes::from_static(b"pending:q:00000000:job-5"), &scan);
 
         let observed = state.begin_claim("q");
-        state.note_pending_insert("q", "pending:q:00000000:job-3");
+        state.note_pending_insert("q", b"pending:q:00000000:job-3");
         state.advance(
             "q",
             Bytes::from_static(b"pending:q:00000000:job-7"),

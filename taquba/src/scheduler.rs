@@ -10,7 +10,7 @@ use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::job::{JobRecord, JobStatus};
-use crate::queue::{job_index_key, parse_leading_timestamp, pending_key};
+use crate::keys::{KeyTag, job_index_key, parse_key_timestamp, pending_key, tag_prefix};
 use crate::stats::update_stats;
 
 pub(crate) struct Scheduler {
@@ -46,8 +46,8 @@ impl Scheduler {
     }
 }
 
-/// Scan the `scheduled:` key space and move any job whose `run_at` has passed
-/// into the `pending:` key space so workers can claim it. Returns the number
+/// Scan the scheduled key space and move any job whose `run_at` has passed
+/// into the pending key space so workers can claim it. Returns the number
 /// of jobs that were promoted.
 pub(crate) async fn promote_due_jobs(
     db: &Db,
@@ -57,12 +57,12 @@ pub(crate) async fn promote_due_jobs(
     let now = clock.now_ms();
     let mut due_keys = Vec::new();
 
-    let mut iter = db.scan_prefix(b"scheduled:", ..).await?;
+    let mut iter = db.scan_prefix(tag_prefix(KeyTag::Scheduled), ..).await?;
     while let Some(kv) = iter.next().await? {
-        // Key format: "scheduled:{run_at:020}:{queue}:{ulid}".
-        // Sorted globally by `run_at`, so the first key with a timestamp in the
-        // future ends the scan.
-        let Some(run_at) = parse_leading_timestamp(&kv.key, "scheduled:") else {
+        // Scheduled keys lead with `run_at`, so the scan is sorted globally
+        // by it and the first key with a timestamp in the future ends the
+        // scan.
+        let Some(run_at) = parse_key_timestamp(&kv.key, KeyTag::Scheduled) else {
             continue;
         };
         if run_at > now {
@@ -105,8 +105,8 @@ async fn promote_job(
         let priority = job.priority;
         let pending = pending_key(&job.queue, priority, &job.id);
         let value = rmp_serde::to_vec_named(&job)?;
-        txn.put(pending.as_bytes(), &value)?;
-        txn.put(job_index_key(&job.id).as_bytes(), pending.as_bytes())?;
+        txn.put(&pending, &value)?;
+        txn.put(job_index_key(&job.id), &pending)?;
         update_stats(
             &txn,
             &job.queue,

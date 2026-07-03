@@ -11,7 +11,8 @@ use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::job::{JobRecord, JobStatus};
-use crate::queue::{QueueConfig, dead_key, job_index_key, parse_leading_timestamp, pending_key};
+use crate::keys::{KeyTag, dead_key, job_index_key, parse_key_timestamp, pending_key, tag_prefix};
+use crate::queue::QueueConfig;
 use crate::stats::update_stats;
 
 pub(crate) struct Reaper {
@@ -44,9 +45,9 @@ impl Reaper {
             || queue_configs.values().any(|c| c.dead_retention.is_some());
 
         // Largest configured `keep_done_jobs` across every queue (named
-        // and default). Any `done:` record whose `completed_at` is
+        // and default). Any done record whose `completed_at` is
         // newer than `now - max_keep_done` cannot be expired for any
-        // queue, so the time-ordered `done:` scan can stop the first
+        // queue, so the time-ordered done scan can stop the first
         // time it sees a key past that threshold.
         let max_keep_done: Option<Duration> = default_queue_config
             .keep_done_jobs
@@ -105,12 +106,12 @@ pub(crate) async fn reap_expired(
     let now = clock.now_ms();
     let mut expired_keys = Vec::new();
 
-    let mut iter = db.scan_prefix(b"claimed:", ..).await?;
+    let mut iter = db.scan_prefix(tag_prefix(KeyTag::Claimed), ..).await?;
     while let Some(kv) = iter.next().await? {
-        // Key format: "claimed:{ts:020}:{queue}:{ulid}".
-        // Sorted globally by `ts`, so the first key whose timestamp is in the
-        // future ends the scan; everything after it is also in the future.
-        let Some(lease_expiry) = parse_leading_timestamp(&kv.key, "claimed:") else {
+        // Claimed keys lead with the lease expiry, so the scan is sorted
+        // globally by it and the first key whose timestamp is in the future
+        // ends the scan; everything after it is also in the future.
+        let Some(lease_expiry) = parse_key_timestamp(&kv.key, KeyTag::Claimed) else {
             continue;
         };
         if lease_expiry > now {
@@ -156,8 +157,8 @@ async fn reap_job(
             job.failed_at = Some(clock.now_ms());
             let dead = dead_key(&job.queue, &job.id);
             let value = rmp_serde::to_vec_named(&job)?;
-            txn.put(dead.as_bytes(), &value)?;
-            txn.put(job_index_key(&job.id).as_bytes(), dead.as_bytes())?;
+            txn.put(&dead, &value)?;
+            txn.put(job_index_key(&job.id), &dead)?;
             update_stats(
                 &txn,
                 &job.queue,
@@ -176,8 +177,8 @@ async fn reap_job(
             let priority = job.priority;
             let pending = pending_key(&job.queue, priority, &job.id);
             let value = rmp_serde::to_vec_named(&job)?;
-            txn.put(pending.as_bytes(), &value)?;
-            txn.put(job_index_key(&job.id).as_bytes(), pending.as_bytes())?;
+            txn.put(&pending, &value)?;
+            txn.put(job_index_key(&job.id), &pending)?;
             update_stats(
                 &txn,
                 &job.queue,
@@ -229,8 +230,8 @@ async fn reap_job(
 /// resolved per-record by looking up the job's queue via `keep_done_for`.
 /// Records on queues with `keep_done_jobs = None` are skipped.
 ///
-/// `done:` keys are sorted globally by `completed_at` (see
-/// [`crate::queue::done_key`]), so once the scan hits a key whose
+/// Done keys are sorted globally by `completed_at` (see
+/// [`crate::keys::done_key`]), so once the scan hits a key whose
 /// timestamp is newer than `now - max_keep_done`, no remaining record
 /// can be expired for any queue and the loop breaks. The per-record
 /// queue-specific retention check still runs below the threshold to
@@ -245,11 +246,12 @@ async fn sweep_done(
     let min_cutoff = max_keep_done.map(|r| now.saturating_sub(r.as_millis() as u64));
 
     let mut victims: Vec<(Vec<u8>, String)> = Vec::new();
-    let mut iter = db.scan_prefix(b"done:", ..).await?;
+    let mut iter = db.scan_prefix(tag_prefix(KeyTag::Done), ..).await?;
     while let Some(kv) = iter.next().await? {
-        // Key format: "done:{completed_at:020}:{queue}:{id}".
+        // Done keys lead with `completed_at`, so the scan is sorted globally
+        // by completion time.
         if let Some(min_cutoff) = min_cutoff {
-            let Some(completed_at_in_key) = parse_leading_timestamp(&kv.key, "done:") else {
+            let Some(completed_at_in_key) = parse_key_timestamp(&kv.key, KeyTag::Done) else {
                 continue;
             };
             if completed_at_in_key >= min_cutoff {
@@ -279,7 +281,7 @@ async fn sweep_done(
         // Re-check existence; could have been swept by a previous tick.
         if txn.get(&key).await?.is_some() {
             txn.delete(&key)?;
-            txn.delete(job_index_key(&id).as_bytes())?;
+            txn.delete(job_index_key(&id))?;
         }
         // Retention deletes do not await WAL durability: a commit lost
         // in a crash leaves the record in place for the next sweep,
@@ -309,7 +311,7 @@ async fn sweep_dead(
     let now = clock.now_ms();
 
     let mut victims: Vec<(Vec<u8>, String, String)> = Vec::new();
-    let mut iter = db.scan_prefix(b"dead:", ..).await?;
+    let mut iter = db.scan_prefix(tag_prefix(KeyTag::Dead), ..).await?;
     while let Some(kv) = iter.next().await? {
         let job: JobRecord = match rmp_serde::from_slice(&kv.value) {
             Ok(j) => j,
@@ -333,7 +335,7 @@ async fn sweep_dead(
         let txn = db.begin(IsolationLevel::Snapshot).await?;
         if txn.get(&key).await?.is_some() {
             txn.delete(&key)?;
-            txn.delete(job_index_key(&id).as_bytes())?;
+            txn.delete(job_index_key(&id))?;
             // Decrement the dead counter so QueueStats::dead reflects the live
             // size of the dead-letter inbox, consistent with how requeue
             // already adjusts it.

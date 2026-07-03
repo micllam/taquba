@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::job::JobRecord;
-use crate::queue::pending_prefix;
+use crate::keys::{KeyTag, parse_stats_key, pending_prefix, tag_prefix};
 use crate::stats::read_stats;
 
 pub(crate) struct MetricsSampler {
@@ -58,9 +58,7 @@ async fn sample(db: &Db, clock: &dyn Clock) -> Result<()> {
         // The front of the pending prefix is the next job to be claimed; its
         // age is how long that job has waited so far, which climbs when the
         // queue is not being drained fast enough.
-        let mut iter = db
-            .scan_prefix(pending_prefix(&queue).as_bytes(), ..)
-            .await?;
+        let mut iter = db.scan_prefix(pending_prefix(&queue), ..).await?;
         let age_secs = match iter.next().await? {
             Some(kv) => {
                 let job: JobRecord = rmp_serde::from_slice(&kv.value)?;
@@ -73,23 +71,18 @@ async fn sample(db: &Db, clock: &dyn Clock) -> Result<()> {
     Ok(())
 }
 
-/// Distinct queue names, discovered from the `stats:` key space (the same
+/// Distinct queue names, discovered from the stats key space (the same
 /// source as [`crate::Queue::list_queues`]).
 async fn queues(db: &Db) -> Result<Vec<String>> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    let mut iter = db.scan_prefix(b"stats:", ..).await?;
+    let mut iter = db.scan_prefix(tag_prefix(KeyTag::Stats), ..).await?;
     while let Some(kv) = iter.next().await? {
-        let Ok(key) = std::str::from_utf8(&kv.key) else {
+        let Some((queue, _metric)) = parse_stats_key(&kv.key) else {
             continue;
         };
-        // Key: "stats:{queue}:{metric}".
-        let without_prefix = key.strip_prefix("stats:").unwrap_or(key);
-        if let Some(idx) = without_prefix.rfind(':') {
-            let queue = &without_prefix[..idx];
-            if seen.insert(queue.to_string()) {
-                out.push(queue.to_string());
-            }
+        if seen.insert(queue.clone()) {
+            out.push(queue);
         }
     }
     Ok(out)

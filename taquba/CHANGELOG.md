@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (on-disk):** internal keys use a binary encoding. Every key is
+  `[tag, version, fields...]`: a one-byte key-space tag, a one-byte format
+  version and order-preserving binary fields (big-endian timestamps and
+  priorities, length-prefixed queue names), replacing the string prefixes
+  and zero-padded ASCII fields. Queue names are now limited to
+  `MAX_QUEUE_NAME_LEN` (255) bytes; longer names return the new
+  `Error::InvalidQueueName`.
 - Upgraded the SlateDB dependency to 0.14.1 (from 0.13.1).
 
 ## [0.9.0] - 2026-06-23

@@ -194,7 +194,7 @@ keep its own durable coordination state (status markers, dedup records,
 pointers to externally-stored blobs) consistent with the queue across crashes.
 `Queue::kv_get` and `Queue::kv_delete` read and clean up those entries.
 
-Caller keys live under a reserved `usr:` prefix internally so they cannot
+Caller keys live under a reserved user key tag internally so they cannot
 collide with Taquba's own layout. Per-value size is capped at
 `MAX_KV_VALUE_SIZE` (256 KiB); the namespace is sized for coordination state,
 not bulk payload. Store large blobs in the underlying object store under a

@@ -125,7 +125,7 @@
 //! the queue across crashes. [`Queue::kv_get`] and [`Queue::kv_delete`]
 //! read and clean up those entries.
 //!
-//! Caller keys live under a reserved `usr:` prefix internally so they
+//! Caller keys live under a reserved user key tag internally so they
 //! cannot collide with Taquba's own layout. Per-value size is capped at
 //! [`MAX_KV_VALUE_SIZE`]; the namespace is sized for coordination
 //! state, not bulk payload. Store large blobs in the underlying object
@@ -193,6 +193,7 @@ mod claim_cursor;
 mod clock;
 mod error;
 mod job;
+mod keys;
 #[cfg(feature = "metrics")]
 mod metrics_sampler;
 mod obs;
@@ -208,6 +209,7 @@ pub mod worker;
 pub use clock::{Clock, MockClock, SystemClock};
 pub use error::{Error, Result};
 pub use job::{JobRecord, JobStatus};
+pub use keys::MAX_QUEUE_NAME_LEN;
 pub use queue::{
     AckEffects, CancelOutcome, EnqueueOptions, EnqueueRequest, EnqueueResult, MAX_KV_VALUE_SIZE,
     OpenOptions, PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_NORMAL, Queue, QueueConfig, WaitOutcome,
