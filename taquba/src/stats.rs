@@ -3,7 +3,7 @@ use slatedb::{Db, DbTransaction, MergeOperator, MergeOperatorError};
 
 use crate::error::{Error, Result};
 use crate::job::JobStatus;
-use crate::keys::stats_key;
+use crate::keys::{KeyTag, parse_stats_key, stats_key, tag_prefix};
 
 /// Map a [`JobStatus`] to the on-disk metric name used for its counter.
 pub(crate) fn metric_name(status: JobStatus) -> &'static str {
@@ -103,6 +103,23 @@ pub struct QueueStats {
     /// jobs in retry-backoff between a [`Queue::nack`](crate::Queue::nack)
     /// and the scheduler's next promotion sweep.
     pub scheduled: i64,
+}
+
+/// Distinct queue names, discovered from the stats key space. A queue
+/// appears once it has had at least one job.
+pub(crate) async fn list_queues(db: &Db) -> Result<Vec<String>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut queues = Vec::new();
+    let mut iter = db.scan_prefix(tag_prefix(KeyTag::Stats), ..).await?;
+    while let Some(kv) = iter.next().await? {
+        let Some((queue, _metric)) = parse_stats_key(&kv.key) else {
+            continue;
+        };
+        if seen.insert(queue.clone()) {
+            queues.push(queue);
+        }
+    }
+    Ok(queues)
 }
 
 pub(crate) async fn read_stats(db: &Db, queue: &str) -> Result<QueueStats> {

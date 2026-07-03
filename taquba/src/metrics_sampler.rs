@@ -18,8 +18,8 @@ use tracing::{debug, warn};
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::job::JobRecord;
-use crate::keys::{KeyTag, parse_stats_key, pending_prefix, tag_prefix};
-use crate::stats::read_stats;
+use crate::keys::pending_prefix;
+use crate::stats::{list_queues, read_stats};
 
 pub(crate) struct MetricsSampler {
     pub(crate) db: Arc<Db>,
@@ -51,7 +51,7 @@ impl MetricsSampler {
 /// Read each queue's depth and oldest-pending age once and set the gauges.
 async fn sample(db: &Db, clock: &dyn Clock) -> Result<()> {
     let now = clock.now_ms();
-    for queue in queues(db).await? {
+    for queue in list_queues(db).await? {
         let stats = read_stats(db, &queue).await?;
         crate::obs::set_depth(&queue, stats.pending, stats.claimed);
 
@@ -69,21 +69,4 @@ async fn sample(db: &Db, clock: &dyn Clock) -> Result<()> {
         crate::obs::set_oldest_pending_age_seconds(&queue, age_secs);
     }
     Ok(())
-}
-
-/// Distinct queue names, discovered from the stats key space (the same
-/// source as [`crate::Queue::list_queues`]).
-async fn queues(db: &Db) -> Result<Vec<String>> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    let mut iter = db.scan_prefix(tag_prefix(KeyTag::Stats), ..).await?;
-    while let Some(kv) = iter.next().await? {
-        let Some((queue, _metric)) = parse_stats_key(&kv.key) else {
-            continue;
-        };
-        if seen.insert(queue.clone()) {
-            out.push(queue);
-        }
-    }
-    Ok(out)
 }

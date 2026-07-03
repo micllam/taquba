@@ -18,8 +18,8 @@ use crate::error::{Error, Result};
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{
     KeyTag, MAX_QUEUE_NAME_LEN, claimed_key, cursor_key, dead_key, dead_prefix, dedup_index_key,
-    done_key, job_index_key, parse_stats_key, pending_key, pending_prefix, scheduled_key,
-    tag_prefix, user_scoped_key,
+    done_key, job_index_key, pending_key, pending_prefix, scheduled_key, tag_prefix,
+    user_scoped_key,
 };
 use crate::reaper::{Reaper, reap_expired};
 use crate::scheduler::{Scheduler, promote_due_jobs};
@@ -1646,18 +1646,7 @@ impl Queue {
 
     /// Return the names of all queues that have ever had at least one job.
     pub async fn list_queues(&self) -> Result<Vec<String>> {
-        let mut seen = std::collections::HashSet::new();
-        let mut queues = Vec::new();
-        let mut iter = self.db.scan_prefix(tag_prefix(KeyTag::Stats), ..).await?;
-        while let Some(kv) = iter.next().await? {
-            let Some((queue, _metric)) = parse_stats_key(&kv.key) else {
-                continue;
-            };
-            if seen.insert(queue.clone()) {
-                queues.push(queue);
-            }
-        }
-        Ok(queues)
+        crate::stats::list_queues(&self.db).await
     }
 
     /// Return a page of dead-letter jobs for the given queue.
