@@ -246,6 +246,10 @@ names every queue that has ever held a job, `Queue::stats` returns per-state
 job counts for one queue, `Queue::get_job` looks up a single job by ID in
 any state, `Queue::list_jobs` pages through one queue's jobs in one
 lifecycle state and `Queue::dead_jobs` pages through the dead-letter set.
+`Queue::attempt_history` returns a job's recorded delivery history: one
+`JobAttempt` per settled attempt (retry, dead-letter, lease expiry,
+completion on a queue with retention), so a job that failed three
+different ways reports all three errors rather than only the last.
 Interventions cover the common operator actions: `Queue::requeue_dead_job`
 revives a dead job with a fresh retry budget, `Queue::cancel` removes a
 pending or scheduled job (or requests cooperative cancellation of a claimed

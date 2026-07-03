@@ -50,6 +50,12 @@ pub(crate) enum KeyTag {
     Cursor = 0x08,
     /// `[tag, ver, qlen, queue, metric name]`
     Stats = 0x09,
+    /// `[tag, ver, id]`; the value is the job's attempt history, a
+    /// merge-appended concatenation of serialized [`crate::JobAttempt`]
+    /// entries in write order. Deleted in the same transaction that
+    /// removes the job's last record (ack without retention, cancel,
+    /// the retention sweeps).
+    AttemptHistory = 0x0A,
     /// `[tag, caller bytes]`; no version byte, caller bytes are opaque.
     User = 0xFF,
 }
@@ -129,6 +135,13 @@ pub(crate) fn dead_prefix(queue: &str) -> Vec<u8> {
 pub(crate) fn job_index_key(id: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(2 + id.len());
     k.extend_from_slice(&header(KeyTag::JobIndex));
+    k.extend_from_slice(id.as_bytes());
+    k
+}
+
+pub(crate) fn attempt_history_key(id: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(2 + id.len());
+    k.extend_from_slice(&header(KeyTag::AttemptHistory));
     k.extend_from_slice(id.as_bytes());
     k
 }
@@ -260,6 +273,7 @@ mod tests {
             done_key(1, "q", "id"),
             dead_key("q", "id"),
             job_index_key("id"),
+            attempt_history_key("id"),
             dedup_index_key("q", "id"),
             cursor_key("q"),
             stats_key("q", "m"),

@@ -182,7 +182,11 @@
 //! per-state job counts for one queue, [`Queue::get_job`] looks up a single
 //! job by ID in any state, [`Queue::list_jobs`] pages through one queue's
 //! jobs in one lifecycle state and [`Queue::dead_jobs`] pages through the
-//! dead-letter set. Interventions cover the common operator actions:
+//! dead-letter set. [`Queue::attempt_history`] returns a job's recorded
+//! delivery history: one [`JobAttempt`] per settled attempt (retry,
+//! dead-letter, lease expiry, completion on a queue with retention), so a
+//! job that failed three different ways reports all three errors rather
+//! than only the last. Interventions cover the common operator actions:
 //! [`Queue::requeue_dead_job`] revives a dead job with a fresh retry budget,
 //! [`Queue::cancel`] removes a pending or scheduled job (or requests
 //! cooperative cancellation of a claimed one) and [`Queue::wake_scheduled`]
@@ -234,6 +238,7 @@
 mod claim_cursor;
 mod clock;
 mod error;
+mod history;
 mod job;
 mod keys;
 #[cfg(feature = "metrics")]
@@ -251,6 +256,7 @@ pub mod worker;
 
 pub use clock::{Clock, MockClock, SystemClock};
 pub use error::{Error, Result};
+pub use history::{AttemptOutcome, JobAttempt};
 pub use job::{JobRecord, JobStatus};
 pub use keys::MAX_QUEUE_NAME_LEN;
 pub use queue::{

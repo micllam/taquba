@@ -15,16 +15,17 @@ use ulid::Ulid;
 use crate::claim_cursor::{ClaimCursor, CursorState, ScanFrom};
 use crate::clock::{Clock, default_clock};
 use crate::error::{Error, Result};
+use crate::history::{AttemptOutcome, JobAttempt, append_attempt, decode_history};
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{
-    KeyTag, MAX_QUEUE_NAME_LEN, claimed_key, cursor_key, dead_key, dead_prefix, dedup_index_key,
-    done_key, job_index_key, pending_key, pending_prefix, scheduled_key, tag_prefix,
-    user_scoped_key,
+    KeyTag, MAX_QUEUE_NAME_LEN, attempt_history_key, claimed_key, cursor_key, dead_key,
+    dead_prefix, dedup_index_key, done_key, job_index_key, pending_key, pending_prefix,
+    scheduled_key, tag_prefix, user_scoped_key,
 };
 use crate::payload_store::PayloadStore;
 use crate::reaper::{Reaper, reap_expired};
 use crate::scheduler::{Scheduler, promote_due_jobs};
-use crate::stats::{CounterMergeOperator, QueueStats, read_stats, update_stats};
+use crate::stats::{QueueMergeOperator, QueueStats, read_stats, update_stats};
 
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(30);
@@ -574,7 +575,7 @@ impl Queue {
         }
         #[cfg_attr(not(feature = "metrics"), allow(unused_mut))]
         let mut builder = Db::builder(path, object_store)
-            .with_merge_operator(Arc::new(CounterMergeOperator))
+            .with_merge_operator(Arc::new(QueueMergeOperator))
             .with_settings(settings);
         #[cfg(feature = "metrics")]
         {
@@ -1658,10 +1659,23 @@ impl Queue {
                 if let Some((ref done_k, ref done_v)) = done_record {
                     txn.put(done_k, done_v)?;
                     txn.put(job_index_key(&job.id), done_k)?;
+                    append_attempt(
+                        &txn,
+                        &job.id,
+                        &JobAttempt {
+                            attempt: job.attempts,
+                            claimed_at: job.claimed_at,
+                            recorded_at: self.now_ms(),
+                            outcome: AttemptOutcome::Completed,
+                            error: None,
+                        },
+                    )?;
                 } else {
                     // Default: drop the index pointer too; the ID is no longer
-                    // findable via get_job, but the queue stays small.
+                    // findable via get_job, but the queue stays small. The
+                    // attempt history shares the record's lifetime.
                     txn.delete(job_index_key(&job.id))?;
+                    txn.delete(attempt_history_key(&job.id))?;
                 }
                 update_stats(
                     &txn,
@@ -1729,12 +1743,29 @@ impl Queue {
     pub async fn nack(&self, mut job: JobRecord, error: &str) -> Result<()> {
         let lease_expires_at = job.lease_expires_at.ok_or(Error::InvalidState)?;
         let claimed = claimed_key(&job.queue, lease_expires_at, &job.id);
+        // Captured before the retry branches clear it on the record.
+        let claimed_at = job.claimed_at;
         job.last_error = Some(error.to_string());
 
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
             txn.get(&claimed).await?.ok_or(Error::ClaimLost)?;
             txn.delete(&claimed)?;
+            append_attempt(
+                &txn,
+                &job.id,
+                &JobAttempt {
+                    attempt: job.attempts,
+                    claimed_at,
+                    recorded_at: self.now_ms(),
+                    outcome: if job.attempts >= job.max_attempts {
+                        AttemptOutcome::DeadLettered
+                    } else {
+                        AttemptOutcome::Retried
+                    },
+                    error: Some(error.to_string()),
+                },
+            )?;
 
             if job.attempts >= job.max_attempts {
                 job.status = JobStatus::Dead;
@@ -1845,9 +1876,11 @@ impl Queue {
     pub async fn dead_letter(&self, mut job: JobRecord, reason: &str) -> Result<()> {
         let lease_expires_at = job.lease_expires_at.ok_or(Error::InvalidState)?;
         let claimed = claimed_key(&job.queue, lease_expires_at, &job.id);
+        let claimed_at = job.claimed_at;
+        let failed_at = self.now_ms();
         job.last_error = Some(reason.to_string());
         job.status = JobStatus::Dead;
-        job.failed_at = Some(self.now_ms());
+        job.failed_at = Some(failed_at);
         job.claimed_at = None;
         job.lease_expires_at = None;
         let dead = dead_key(&job.queue, &job.id);
@@ -1859,6 +1892,17 @@ impl Queue {
             txn.delete(&claimed)?;
             txn.put(&dead, &value)?;
             txn.put(job_index_key(&job.id), &dead)?;
+            append_attempt(
+                &txn,
+                &job.id,
+                &JobAttempt {
+                    attempt: job.attempts,
+                    claimed_at,
+                    recorded_at: failed_at,
+                    outcome: AttemptOutcome::DeadLettered,
+                    error: Some(reason.to_string()),
+                },
+            )?;
             update_stats(
                 &txn,
                 &job.queue,
@@ -2043,6 +2087,26 @@ impl Queue {
         Ok(JobPage { jobs, next_cursor })
     }
 
+    /// Return a job's recorded delivery history, in write order.
+    ///
+    /// Each settlement of a claim appends one [`JobAttempt`]: an ack on a
+    /// queue with [`QueueConfig::keep_done_jobs`] set, a [`Self::nack`], a
+    /// [`Self::dead_letter`] and the reaper's handling of an expired
+    /// lease. [`Self::requeue_dead_job`] appends an
+    /// [`AttemptOutcome::Requeued`] marker and keeps the prior entries.
+    ///
+    /// The history shares the job's lifetime: it is removed in the same
+    /// transaction that removes the job's last record, so a job for which
+    /// [`Self::get_job`] returns `None` has an empty history. An ack on a
+    /// queue without retention therefore removes the history rather than
+    /// recording the completed attempt.
+    pub async fn attempt_history(&self, id: &str) -> Result<Vec<JobAttempt>> {
+        match self.db.get(attempt_history_key(id)).await? {
+            None => Ok(Vec::new()),
+            Some(bytes) => decode_history(&bytes),
+        }
+    }
+
     /// Move a dead-letter job back to the pending queue for a fresh attempt.
     ///
     /// Resets `attempts` to 0 and clears `last_error` so the job gets a full
@@ -2073,6 +2137,19 @@ impl Queue {
         txn.delete(&dead)?;
         txn.put(&pending, &value)?;
         txn.put(job_index_key(&job.id), &pending)?;
+        // The history is kept across the revival; the marker separates
+        // entries recorded before it from the reset attempt counter.
+        append_attempt(
+            &txn,
+            &job.id,
+            &JobAttempt {
+                attempt: 0,
+                claimed_at: None,
+                recorded_at: self.now_ms(),
+                outcome: AttemptOutcome::Requeued,
+                error: None,
+            },
+        )?;
         update_stats(
             &txn,
             &job.queue,
@@ -2280,6 +2357,9 @@ impl Queue {
                     let is_scheduled = matches!(job.status, JobStatus::Scheduled);
                     txn.delete(&current_key)?;
                     txn.delete(&index_key)?;
+                    // A nacked job waiting out its backoff has attempt
+                    // history; it is removed with the record.
+                    txn.delete(attempt_history_key(id))?;
                     if let Some(ref dk) = job.dedup_key {
                         txn.delete(dedup_index_key(&job.queue, dk))?;
                     }
@@ -7389,6 +7469,253 @@ mod tests {
             .unwrap();
         assert!(dead.jobs.is_empty());
         assert!(dead.next_cursor.is_none());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attempt_history_records_retries_then_completion() {
+        let opts = OpenOptions {
+            default_queue_config: QueueConfig {
+                keep_done_jobs: Some(Duration::from_secs(3600)),
+                retry_backoff_base: Duration::ZERO,
+                retry_backoff_max: Duration::ZERO,
+                ..QueueConfig::default()
+            },
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+        let id = q.enqueue("work", b"x".to_vec()).await.unwrap();
+        let lease = Duration::from_secs(30);
+
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.nack(job, "timeout").await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.nack(job, "connection reset").await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.ack(&job).await.unwrap();
+
+        let history = q.attempt_history(&id).await.unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].attempt, 1);
+        assert_eq!(history[0].outcome, AttemptOutcome::Retried);
+        assert_eq!(history[0].error.as_deref(), Some("timeout"));
+        assert!(history[0].claimed_at.is_some());
+        assert_eq!(history[1].attempt, 2);
+        assert_eq!(history[1].error.as_deref(), Some("connection reset"));
+        assert_eq!(history[2].attempt, 3);
+        assert_eq!(history[2].outcome, AttemptOutcome::Completed);
+        assert_eq!(history[2].error, None);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attempt_history_removed_when_ack_expunges_the_record() {
+        let q = Queue::open_with_options(make_store(), "test", no_backoff_opts())
+            .await
+            .unwrap();
+        let id = q.enqueue("work", b"x".to_vec()).await.unwrap();
+        let lease = Duration::from_secs(30);
+
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.nack(job, "failed").await.unwrap();
+        assert_eq!(q.attempt_history(&id).await.unwrap().len(), 1);
+
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.ack(&job).await.unwrap();
+        assert!(q.attempt_history(&id).await.unwrap().is_empty());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attempt_history_records_dead_letter_on_nack_at_attempt_limit() {
+        let opts = OpenOptions {
+            default_queue_config: QueueConfig {
+                max_attempts: 1,
+                ..QueueConfig::default()
+            },
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+        let id = q.enqueue("work", b"x".to_vec()).await.unwrap();
+
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.nack(job, "failed").await.unwrap();
+        assert_eq!(
+            q.get_job(&id).await.unwrap().unwrap().status,
+            JobStatus::Dead
+        );
+
+        let history = q.attempt_history(&id).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].attempt, 1);
+        assert_eq!(history[0].outcome, AttemptOutcome::DeadLettered);
+        assert_eq!(history[0].error.as_deref(), Some("failed"));
+        assert!(history[0].claimed_at.is_some());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attempt_history_survives_requeue_with_marker() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let id = q.enqueue("work", b"x".to_vec()).await.unwrap();
+        let lease = Duration::from_secs(30);
+
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.dead_letter(job, "unroutable").await.unwrap();
+
+        let dead = q.get_job(&id).await.unwrap().unwrap();
+        q.requeue_dead_job(dead).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.dead_letter(job, "still unroutable").await.unwrap();
+
+        let history = q.attempt_history(&id).await.unwrap();
+        let outcomes: Vec<_> = history.iter().map(|a| a.outcome).collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                AttemptOutcome::DeadLettered,
+                AttemptOutcome::Requeued,
+                AttemptOutcome::DeadLettered,
+            ]
+        );
+        assert_eq!(history[0].error.as_deref(), Some("unroutable"));
+        assert_eq!(history[1].attempt, 0);
+        assert_eq!(history[1].claimed_at, None);
+        assert_eq!(history[2].attempt, 1);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attempt_history_records_lease_expiries() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            default_queue_config: QueueConfig {
+                max_attempts: 2,
+                ..QueueConfig::default()
+            },
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+        let id = q.enqueue("work", b"x".to_vec()).await.unwrap();
+        let lease = Duration::from_secs(10);
+
+        q.claim("work", lease).await.unwrap().unwrap();
+        clock.advance(lease + Duration::from_secs(1));
+        q.reap_now().await.unwrap();
+
+        q.claim("work", lease).await.unwrap().unwrap();
+        clock.advance(lease + Duration::from_secs(1));
+        q.reap_now().await.unwrap();
+
+        let history = q.attempt_history(&id).await.unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].outcome, AttemptOutcome::LeaseExpired);
+        assert_eq!(history[0].attempt, 1);
+        assert_eq!(history[0].error, None);
+        assert_eq!(history[1].outcome, AttemptOutcome::DeadLettered);
+        assert_eq!(history[1].attempt, 2);
+        assert_eq!(history[1].error.as_deref(), Some("lease expired"));
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_of_scheduled_job_removes_attempt_history() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let id = q.enqueue("work", b"x".to_vec()).await.unwrap();
+
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        // Default backoff is non-zero, so the nacked job waits in
+        // `Scheduled` with one history entry.
+        q.nack(job, "failed").await.unwrap();
+        assert_eq!(q.attempt_history(&id).await.unwrap().len(), 1);
+
+        assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Removed);
+        assert!(q.attempt_history(&id).await.unwrap().is_empty());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dead_retention_sweep_removes_attempt_history() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let reaper_interval = Duration::from_millis(10);
+        let retention = Duration::from_millis(20);
+        let opts = OpenOptions {
+            reaper_interval,
+            clock: Arc::new(clock.clone()),
+            default_queue_config: QueueConfig {
+                dead_retention: Some(retention),
+                ..QueueConfig::default()
+            },
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+        let id = q.enqueue("work", b"x".to_vec()).await.unwrap();
+
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.dead_letter(job, "failed").await.unwrap();
+        assert_eq!(q.attempt_history(&id).await.unwrap().len(), 1);
+
+        clock.advance(retention + Duration::from_millis(10));
+        tokio::time::sleep(reaper_interval * 2).await;
+
+        assert!(q.get_job(&id).await.unwrap().is_none());
+        assert!(q.attempt_history(&id).await.unwrap().is_empty());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn done_retention_sweep_removes_attempt_history() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let reaper_interval = Duration::from_millis(10);
+        let retention = Duration::from_millis(20);
+        let opts = OpenOptions {
+            reaper_interval,
+            clock: Arc::new(clock.clone()),
+            default_queue_config: QueueConfig {
+                keep_done_jobs: Some(retention),
+                ..QueueConfig::default()
+            },
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+        let id = q.enqueue("work", b"x".to_vec()).await.unwrap();
+
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.ack(&job).await.unwrap();
+        assert_eq!(q.attempt_history(&id).await.unwrap().len(), 1);
+
+        clock.advance(retention + Duration::from_millis(10));
+        tokio::time::sleep(reaper_interval * 2).await;
+
+        assert!(q.get_job(&id).await.unwrap().is_none());
+        assert!(q.attempt_history(&id).await.unwrap().is_empty());
         q.close().await.unwrap();
     }
 }

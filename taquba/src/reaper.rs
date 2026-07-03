@@ -10,8 +10,12 @@ use tracing::{debug, warn};
 use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
 use crate::error::Result;
+use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{JobRecord, JobStatus};
-use crate::keys::{KeyTag, dead_key, job_index_key, parse_key_timestamp, pending_key, tag_prefix};
+use crate::keys::{
+    KeyTag, attempt_history_key, dead_key, job_index_key, parse_key_timestamp, pending_key,
+    tag_prefix,
+};
 use crate::payload_store::PayloadStore;
 use crate::queue::QueueConfig;
 use crate::stats::update_stats;
@@ -154,11 +158,24 @@ async fn reap_job(
 
         let mut job: JobRecord = rmp_serde::from_slice(&raw)?;
         txn.delete(claimed_key_bytes)?;
+        let claimed_at = job.claimed_at;
 
         if job.attempts >= job.max_attempts {
+            let now = clock.now_ms();
             job.status = JobStatus::Dead;
             job.last_error = Some("lease expired".to_string());
-            job.failed_at = Some(clock.now_ms());
+            job.failed_at = Some(now);
+            append_attempt(
+                &txn,
+                &job.id,
+                &JobAttempt {
+                    attempt: job.attempts,
+                    claimed_at,
+                    recorded_at: now,
+                    outcome: AttemptOutcome::DeadLettered,
+                    error: Some("lease expired".to_string()),
+                },
+            )?;
             let dead = dead_key(&job.queue, &job.id);
             let value = rmp_serde::to_vec_named(&job)?;
             txn.put(&dead, &value)?;
@@ -183,6 +200,17 @@ async fn reap_job(
             let value = rmp_serde::to_vec_named(&job)?;
             txn.put(&pending, &value)?;
             txn.put(job_index_key(&job.id), &pending)?;
+            append_attempt(
+                &txn,
+                &job.id,
+                &JobAttempt {
+                    attempt: job.attempts,
+                    claimed_at,
+                    recorded_at: clock.now_ms(),
+                    outcome: AttemptOutcome::LeaseExpired,
+                    error: None,
+                },
+            )?;
             update_stats(
                 &txn,
                 &job.queue,
@@ -288,6 +316,7 @@ async fn sweep_done(
         if existed {
             txn.delete(&key)?;
             txn.delete(job_index_key(&id))?;
+            txn.delete(attempt_history_key(&id))?;
         }
         // Retention deletes do not await WAL durability: a commit lost
         // in a crash leaves the record in place for the next sweep,
@@ -355,6 +384,7 @@ async fn sweep_dead(
         if existed {
             txn.delete(&key)?;
             txn.delete(job_index_key(&id))?;
+            txn.delete(attempt_history_key(&id))?;
             // Decrement the dead counter so QueueStats::dead reflects the live
             // size of the dead-letter inbox, consistent with how requeue
             // already adjusts it.

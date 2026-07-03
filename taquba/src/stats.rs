@@ -17,12 +17,14 @@ pub(crate) fn metric_name(status: JobStatus) -> &'static str {
     }
 }
 
-/// Merge operator that accumulates i64 deltas using little-endian encoding.
-///
-/// Used to maintain per-queue job counters without read-modify-write races.
-pub struct CounterMergeOperator;
+/// Merge operator covering every merging key space, dispatching on the
+/// key's tag byte: stats counters ([`KeyTag::Stats`]) accumulate i64
+/// deltas in little-endian encoding, and attempt history
+/// ([`KeyTag::AttemptHistory`]) appends serialized entries by
+/// concatenation. Both avoid read-modify-write races on their keys.
+pub struct QueueMergeOperator;
 
-impl MergeOperator for CounterMergeOperator {
+impl MergeOperator for QueueMergeOperator {
     fn merge(
         &self,
         key: &Bytes,
@@ -34,24 +36,50 @@ impl MergeOperator for CounterMergeOperator {
 
     fn merge_batch(
         &self,
-        _key: &Bytes,
+        key: &Bytes,
         existing_value: Option<Bytes>,
         operands: &[Bytes],
     ) -> std::result::Result<Bytes, MergeOperatorError> {
-        let mut total = existing_value
-            .map(|v| read_i64_le(&v))
-            .transpose()
-            .map_err(|_| MergeOperatorError::Callback {
-                message: "invalid 8-byte i64 operand".to_string(),
-            })?
-            .unwrap_or(0i64);
-        for op in operands {
-            total += read_i64_le(op).map_err(|_| MergeOperatorError::Callback {
-                message: "invalid 8-byte i64 operand".to_string(),
-            })?;
+        match key.first().copied() {
+            Some(tag) if tag == KeyTag::Stats.id() => merge_counters(existing_value, operands),
+            Some(tag) if tag == KeyTag::AttemptHistory.id() => {
+                Ok(merge_append(existing_value, operands))
+            }
+            _ => Err(MergeOperatorError::Callback {
+                message: "merge on a non-merging key space".to_string(),
+            }),
         }
-        Ok(Bytes::copy_from_slice(&total.to_le_bytes()))
     }
+}
+
+fn merge_counters(
+    existing_value: Option<Bytes>,
+    operands: &[Bytes],
+) -> std::result::Result<Bytes, MergeOperatorError> {
+    let mut total = existing_value
+        .map(|v| read_i64_le(&v))
+        .transpose()
+        .map_err(|_| MergeOperatorError::Callback {
+            message: "invalid 8-byte i64 operand".to_string(),
+        })?
+        .unwrap_or(0i64);
+    for op in operands {
+        total += read_i64_le(op).map_err(|_| MergeOperatorError::Callback {
+            message: "invalid 8-byte i64 operand".to_string(),
+        })?;
+    }
+    Ok(Bytes::copy_from_slice(&total.to_le_bytes()))
+}
+
+fn merge_append(existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
+    let existing = existing_value.as_deref().unwrap_or_default();
+    let total = existing.len() + operands.iter().map(|o| o.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(existing);
+    for op in operands {
+        out.extend_from_slice(op);
+    }
+    Bytes::from(out)
 }
 
 fn read_i64_le(bytes: &[u8]) -> std::result::Result<i64, ()> {

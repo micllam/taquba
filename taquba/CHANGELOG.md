@@ -44,6 +44,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `run_at`, claimed by lease expiry, done by completion time and dead in
   enqueue order. Complements `Queue::dead_jobs`, which remains the
   ID-cursor listing of the dead-letter set.
+- Per-attempt history: every settlement of a claim (ack on a queue with
+  `keep_done_jobs`, nack, dead-letter, lease expiry) appends one entry to a
+  durable per-job history, read back via the new
+  `Queue::attempt_history` as a `Vec<JobAttempt>` (attempt number, claim
+  and settlement times, an `AttemptOutcome` and the reported error), so a
+  job that failed multiple times exposes every error rather than only
+  `last_error`. `Queue::requeue_dead_job` appends a `Requeued` marker and
+  keeps prior entries. The history is written through a merge operator
+  (one write per settlement, no read-modify-write) and is removed in the
+  same transaction that removes the job's last record.
 
 ### Changed
 
