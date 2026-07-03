@@ -218,6 +218,27 @@ the settlement that created it won.
 See [`examples/atomic_settlement.rs`](examples/atomic_settlement.rs) for a
 runnable order pipeline built on these primitives.
 
+## Large payloads
+
+A job record is rewritten on every state transition (enqueue, claim, nack,
+ack), so a large inline payload is written many times over its lifetime.
+Payloads larger than `OpenOptions::payload_offload_threshold` (default
+256 KiB) are therefore offloaded: written once as an object in a payload
+object store, with the record storing a reference (`JobRecord::payload_ref`)
+instead of the bytes. Claims and job reads fetch the object and return the
+payload as usual, so offloading is transparent to worker code. The object is
+deleted when
+the record leaves the queue: on ack (or with the done record's retention
+sweep when `QueueConfig::keep_done_jobs` is set), on cancel and with the
+dead-letter retention sweep.
+
+By default payload objects live next to the queue's own state, under
+`"{path}-payloads"` in the object store the queue is opened on.
+`OpenOptions::payload_store` and `OpenOptions::payload_path` place them in a
+different prefix, bucket or account instead. Setting
+`OpenOptions::payload_offload_threshold` to `None` disables offloading;
+payloads then stay inline regardless of size.
+
 ## License
 
 Licensed under either of

@@ -21,6 +21,7 @@ use crate::keys::{
     done_key, job_index_key, pending_key, pending_prefix, scheduled_key, tag_prefix,
     user_scoped_key,
 };
+use crate::payload_store::PayloadStore;
 use crate::reaper::{Reaper, reap_expired};
 use crate::scheduler::{Scheduler, promote_due_jobs};
 use crate::stats::{CounterMergeOperator, QueueStats, read_stats, update_stats};
@@ -111,6 +112,11 @@ fn validate_queue_name(queue: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// Default value of [`OpenOptions::payload_offload_threshold`]: payloads
+/// larger than this are stored as objects in the payload object store
+/// instead of inline in the job record.
+pub const DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD: usize = 256 * 1024;
 
 /// Maximum byte length of a caller-supplied
 /// [`EnqueueOptions::id_override`]. Enforces a sane cap on key sizes
@@ -274,6 +280,24 @@ pub struct OpenOptions {
     /// `metrics` feature; event counters and latency histograms are emitted
     /// inline regardless of this setting.
     pub metrics_sample_interval: Option<Duration>,
+    /// Payload size in bytes above which an enqueued payload is offloaded:
+    /// written once as an object in the payload object store, with the
+    /// record storing [`JobRecord::payload_ref`] instead of inline bytes.
+    /// State transitions then rewrite only the small record, and claims
+    /// fetch the payload from the object store. Defaults to
+    /// [`DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD`]; `None` disables offloading,
+    /// keeping every payload inline regardless of size.
+    pub payload_offload_threshold: Option<usize>,
+    /// Object store for offloaded payloads. `None` (the default) uses the
+    /// object store the queue is opened on. Configuring a separate store
+    /// places payload bytes in a different bucket or account from the
+    /// queue's own state.
+    pub payload_store: Option<Arc<dyn ObjectStore>>,
+    /// Path prefix for offloaded payload objects within the payload
+    /// object store. `None` (the default) uses `"{path}-payloads"`, a
+    /// sibling of the path the queue is opened at, which cannot overlap
+    /// SlateDB's own layout.
+    pub payload_path: Option<String>,
 }
 
 impl Default for OpenOptions {
@@ -286,6 +310,9 @@ impl Default for OpenOptions {
             clock: default_clock(),
             flush_interval: None,
             metrics_sample_interval: None,
+            payload_offload_threshold: Some(DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD),
+            payload_store: None,
+            payload_path: None,
         }
     }
 }
@@ -439,6 +466,11 @@ pub struct Queue {
     /// retry, or reaper), or `Pending` / `Scheduled` jobs removed via
     /// [`Self::cancel`]. Drives [`Self::wait_for_completion`].
     completion_notify: Arc<tokio::sync::Notify>,
+    /// Storage for offloaded payload objects. Shared with the reaper,
+    /// whose retention sweeps delete the objects of expired records.
+    payload_store: Arc<PayloadStore>,
+    /// Payload size above which enqueues offload; `None` disables.
+    payload_offload_threshold: Option<usize>,
 }
 
 /// Outcome of [`Queue::wait_for_completion`].
@@ -517,6 +549,11 @@ impl Queue {
         opts: OpenOptions,
     ) -> Result<Self> {
         crate::obs::describe();
+        let payload_store = Arc::new(PayloadStore::new(
+            opts.payload_store.unwrap_or_else(|| object_store.clone()),
+            opts.payload_path
+                .unwrap_or_else(|| format!("{path}-payloads")),
+        ));
         let mut settings = Settings::default();
         if let Some(flush_interval) = opts.flush_interval {
             settings.flush_interval = Some(flush_interval);
@@ -544,6 +581,7 @@ impl Queue {
             job_available: job_available.clone(),
             completion_notify: completion_notify.clone(),
             claim_cursor: claim_cursor.clone(),
+            payload_store: payload_store.clone(),
         };
         let reaper_handle = tokio::spawn(reaper.run(reaper_rx));
         let (scheduler_shutdown, scheduler_rx) = watch::channel(false);
@@ -584,6 +622,8 @@ impl Queue {
             claim_locks: std::sync::Mutex::new(HashMap::new()),
             claim_cursor,
             completion_notify,
+            payload_store,
+            payload_offload_threshold: opts.payload_offload_threshold,
         })
     }
 
@@ -870,6 +910,7 @@ impl Queue {
             id,
             queue: queue.to_string(),
             payload,
+            payload_ref: None,
             headers: opts.headers,
             status,
             attempts: 0,
@@ -892,6 +933,50 @@ impl Queue {
         Ok((job, key, id_override_used))
     }
 
+    /// Offload `job`'s payload when it exceeds the configured threshold:
+    /// the payload is written once as an object named by a newly
+    /// generated ULID, [`JobRecord::payload_ref`] is set and the inline
+    /// payload is emptied. Runs before the transaction that writes the
+    /// record, so a committed record never points at an unwritten
+    /// object. The object name is unique to this enqueue attempt, so it
+    /// cannot overwrite another job's object, including when a
+    /// duplicate-id enqueue is later rejected.
+    async fn offload_payload(&self, job: &mut JobRecord) -> Result<()> {
+        let Some(threshold) = self.payload_offload_threshold else {
+            return Ok(());
+        };
+        if job.payload.len() <= threshold {
+            return Ok(());
+        }
+        let payload_ref = Ulid::new().to_string();
+        self.payload_store
+            .put(&payload_ref, std::mem::take(&mut job.payload))
+            .await?;
+        job.payload_ref = Some(payload_ref);
+        Ok(())
+    }
+
+    /// Fetch an offloaded payload into `job.payload`. No-op for records
+    /// whose payload is inline.
+    async fn materialize_payload(&self, job: &mut JobRecord) -> Result<()> {
+        if let Some(ref payload_ref) = job.payload_ref {
+            job.payload = self.payload_store.get(payload_ref, &job.id).await?;
+        }
+        Ok(())
+    }
+
+    /// Delete `job`'s payload object if it has one, logging any failure.
+    /// Called only after the transaction that removed (or declined to
+    /// write) the record: deleting earlier could leave a live record
+    /// whose payload is gone.
+    async fn delete_payload_object(&self, job: &JobRecord) {
+        if let Some(ref payload_ref) = job.payload_ref {
+            self.payload_store
+                .delete_best_effort(payload_ref, &job.id)
+                .await;
+        }
+    }
+
     /// Persist a prepared [`JobRecord`], optionally checking a dedup index
     /// and caller-supplied id uniqueness, and optionally applying
     /// additional KV writes, all in a single transaction. Retries on
@@ -906,21 +991,39 @@ impl Queue {
     /// [`EnqueueResult::New`].
     async fn write_job(
         &self,
-        job: JobRecord,
+        mut job: JobRecord,
         key: Vec<u8>,
         id_override_used: bool,
         kv_writes: HashMap<Vec<u8>, Vec<u8>>,
     ) -> Result<EnqueueResult> {
+        self.offload_payload(&mut job).await?;
         let prepared = PreparedJob {
             job,
             key,
             id_override_used,
         };
+        let result = self.write_job_txn(&prepared, &kv_writes).await;
+        // A payload object is live only when a new record committed;
+        // on a dedup downgrade or an error the record does not exist,
+        // so remove the object written above.
+        if !matches!(result, Ok(EnqueueResult::New(_))) {
+            self.delete_payload_object(&prepared.job).await;
+        }
+        result
+    }
+
+    /// The transaction loop of [`Self::write_job`], after any payload
+    /// offload has happened.
+    async fn write_job_txn(
+        &self,
+        prepared: &PreparedJob,
+        kv_writes: &HashMap<Vec<u8>, Vec<u8>>,
+    ) -> Result<EnqueueResult> {
         let timer = crate::obs::start();
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
 
-            let staged = match self.stage_job_writes(&txn, &prepared).await? {
+            let staged = match self.stage_job_writes(&txn, prepared).await? {
                 Ok(staged) => staged,
                 Err(already_enqueued) => {
                     txn.rollback();
@@ -928,7 +1031,7 @@ impl Queue {
                 }
             };
 
-            for (k, v) in &kv_writes {
+            for (k, v) in kv_writes {
                 txn.put(user_scoped_key(k), v)?;
             }
 
@@ -1325,6 +1428,14 @@ impl Queue {
                         // insert since the epoch read revokes it.
                         self.claim_cursor.mark_empty(queue, scan.epoch);
                     }
+                    // Fetch offloaded payloads after the commit: the
+                    // claimed record stores only the payload reference.
+                    // On a fetch failure the claim has already
+                    // committed, so the affected jobs stay claimed until
+                    // their leases expire and are then redelivered.
+                    for job in &mut jobs {
+                        self.materialize_payload(job).await?;
+                    }
                     crate::obs::claimed(queue, jobs.len() as u64, timer);
                     debug!(queue = queue, count = jobs.len(), "jobs claimed");
                     return Ok(jobs);
@@ -1395,7 +1506,10 @@ impl Queue {
         let keep_done = self.queue_keep_done_jobs(&job.queue).is_some();
         let done_record = if keep_done {
             let completed_at = self.now_ms();
-            let mut done_job = job.clone();
+            // Stored form: an offloaded payload stays in its object, which
+            // is retained with the done record and deleted by the
+            // retention sweep.
+            let mut done_job = job.stored_clone();
             done_job.status = JobStatus::Done;
             done_job.completed_at = Some(completed_at);
             Some((
@@ -1406,66 +1520,107 @@ impl Queue {
             None
         };
 
-        // Prepare the effect jobs once; their ids stay stable across
-        // transaction-conflict retries, as in the plain enqueue path.
+        // Prepare the follow-up jobs from `effects.enqueues` once; their
+        // ids stay stable across transaction-conflict retries, as in the
+        // plain enqueue path. Payload offloads happen here, before the
+        // transaction, so a committed record never points at an
+        // unwritten object.
         let mut prepared_jobs = Vec::with_capacity(effects.enqueues.len());
         for request in effects.enqueues {
-            let (effect_job, key, id_override_used) =
+            let (follow_up_job, key, id_override_used) =
                 self.prepare_job_record(&request.queue, request.payload, request.options)?;
             prepared_jobs.push(PreparedJob {
-                job: effect_job,
+                job: follow_up_job,
                 key,
                 id_override_used,
             });
         }
-
-        let results = loop {
-            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            txn.get(&claimed).await?.ok_or(Error::ClaimLost)?;
-            txn.delete(&claimed)?;
-            if let Some((ref done_k, ref done_v)) = done_record {
-                txn.put(done_k, done_v)?;
-                txn.put(job_index_key(&job.id), done_k)?;
-            } else {
-                // Default: drop the index pointer too; the ID is no longer
-                // findable via get_job, but the queue stays small.
-                txn.delete(job_index_key(&job.id))?;
+        for i in 0..prepared_jobs.len() {
+            if let Err(err) = self.offload_payload(&mut prepared_jobs[i].job).await {
+                for prepared in &prepared_jobs[..i] {
+                    self.delete_payload_object(&prepared.job).await;
+                }
+                return Err(err);
             }
-            update_stats(
-                &txn,
-                &job.queue,
-                &[(JobStatus::Claimed, -1), (JobStatus::Done, 1)],
-            )?;
+        }
 
-            let mut staged = Vec::with_capacity(prepared_jobs.len());
-            let mut results = Vec::with_capacity(prepared_jobs.len());
-            for prepared in &prepared_jobs {
-                match self.stage_job_writes(&txn, prepared).await? {
-                    Ok(staged_job) => {
-                        results.push(EnqueueResult::New(staged_job.id.clone()));
-                        staged.push(staged_job);
+        let outcome: Result<Vec<EnqueueResult>> = async {
+            loop {
+                let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+                txn.get(&claimed).await?.ok_or(Error::ClaimLost)?;
+                txn.delete(&claimed)?;
+                if let Some((ref done_k, ref done_v)) = done_record {
+                    txn.put(done_k, done_v)?;
+                    txn.put(job_index_key(&job.id), done_k)?;
+                } else {
+                    // Default: drop the index pointer too; the ID is no longer
+                    // findable via get_job, but the queue stays small.
+                    txn.delete(job_index_key(&job.id))?;
+                }
+                update_stats(
+                    &txn,
+                    &job.queue,
+                    &[(JobStatus::Claimed, -1), (JobStatus::Done, 1)],
+                )?;
+
+                let mut staged = Vec::with_capacity(prepared_jobs.len());
+                let mut results = Vec::with_capacity(prepared_jobs.len());
+                for prepared in &prepared_jobs {
+                    match self.stage_job_writes(&txn, prepared).await? {
+                        Ok(staged_job) => {
+                            results.push(EnqueueResult::New(staged_job.id.clone()));
+                            staged.push(staged_job);
+                        }
+                        Err(existing) => results.push(EnqueueResult::AlreadyEnqueued(existing)),
                     }
-                    Err(existing) => results.push(EnqueueResult::AlreadyEnqueued(existing)),
+                }
+                for (k, v) in &effects.kv_writes {
+                    txn.put(user_scoped_key(k), v)?;
+                }
+                for k in &effects.kv_deletes {
+                    txn.delete(user_scoped_key(k))?;
+                }
+
+                match txn.commit().await {
+                    Ok(_) => {
+                        for staged_job in &staged {
+                            self.note_staged_job(staged_job);
+                        }
+                        return Ok(results);
+                    }
+                    Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
+                    Err(e) => return Err(e.into()),
                 }
             }
-            for (k, v) in &effects.kv_writes {
-                txn.put(user_scoped_key(k), v)?;
-            }
-            for k in &effects.kv_deletes {
-                txn.delete(user_scoped_key(k))?;
-            }
+        }
+        .await;
 
-            match txn.commit().await {
-                Ok(_) => {
-                    for staged_job in &staged {
-                        self.note_staged_job(staged_job);
+        // Remove the follow-up jobs' payload objects that no committed
+        // record points at: every offloaded one when the settlement
+        // failed, or the ones whose enqueue downgraded to
+        // `AlreadyEnqueued` when it succeeded.
+        match &outcome {
+            Ok(results) => {
+                for (prepared, result) in prepared_jobs.iter().zip(results) {
+                    if matches!(result, EnqueueResult::AlreadyEnqueued(_)) {
+                        self.delete_payload_object(&prepared.job).await;
                     }
-                    break results;
                 }
-                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
-                Err(e) => return Err(e.into()),
             }
-        };
+            Err(_) => {
+                for prepared in &prepared_jobs {
+                    self.delete_payload_object(&prepared.job).await;
+                }
+            }
+        }
+        let results = outcome?;
+
+        // The acked job's record is gone unless a done record was kept;
+        // without one, its payload object is removed here, after the
+        // commit.
+        if !keep_done {
+            self.delete_payload_object(job).await;
+        }
 
         crate::obs::completed(&job.queue, timer);
         self.clear_cancel_token(&job.id);
@@ -1495,7 +1650,7 @@ impl Queue {
                 job.status = JobStatus::Dead;
                 job.failed_at = Some(self.now_ms());
                 let dead = dead_key(&job.queue, &job.id);
-                let value = rmp_serde::to_vec_named(&job)?;
+                let value = job.stored_bytes()?;
                 txn.put(&dead, &value)?;
                 txn.put(job_index_key(&job.id), &dead)?;
                 update_stats(
@@ -1520,7 +1675,7 @@ impl Queue {
                     job.status = JobStatus::Pending;
                     let priority = job.priority;
                     let pending = pending_key(&job.queue, priority, &job.id);
-                    let value = rmp_serde::to_vec_named(&job)?;
+                    let value = job.stored_bytes()?;
                     txn.put(&pending, &value)?;
                     txn.put(job_index_key(&job.id), &pending)?;
                     update_stats(
@@ -1539,7 +1694,7 @@ impl Queue {
                     job.status = JobStatus::Scheduled;
                     job.run_at = Some(run_at);
                     let scheduled = scheduled_key(&job.queue, run_at, &job.id);
-                    let value = rmp_serde::to_vec_named(&job)?;
+                    let value = job.stored_bytes()?;
                     txn.put(&scheduled, &value)?;
                     txn.put(job_index_key(&job.id), &scheduled)?;
                     update_stats(
@@ -1606,7 +1761,7 @@ impl Queue {
         job.claimed_at = None;
         job.lease_expires_at = None;
         let dead = dead_key(&job.queue, &job.id);
-        let value = rmp_serde::to_vec_named(&job)?;
+        let value = job.stored_bytes()?;
 
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
@@ -1684,6 +1839,9 @@ impl Queue {
                 break;
             }
         }
+        for job in &mut jobs {
+            self.materialize_payload(job).await?;
+        }
         Ok(jobs)
     }
 
@@ -1708,7 +1866,7 @@ impl Queue {
         // start this job afresh.
         job.cancel_requested = false;
         let pending = pending_key(&job.queue, priority, &job.id);
-        let value = rmp_serde::to_vec_named(&job)?;
+        let value = job.stored_bytes()?;
 
         let txn = self.db.begin(IsolationLevel::Snapshot).await?;
         txn.get(&dead)
@@ -1755,7 +1913,7 @@ impl Queue {
         let new_expiry = self.now_ms() + extension.as_millis() as u64;
         job.lease_expires_at = Some(new_expiry);
         let new_claimed = claimed_key(&job.queue, new_expiry, &job.id);
-        let value = rmp_serde::to_vec_named(job)?;
+        let value = job.stored_bytes()?;
 
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
@@ -1857,7 +2015,11 @@ impl Queue {
         };
         match self.db.get(&current_key).await? {
             None => Ok(None),
-            Some(bytes) => Ok(Some(rmp_serde::from_slice(&bytes)?)),
+            Some(bytes) => {
+                let mut job: JobRecord = rmp_serde::from_slice(&bytes)?;
+                self.materialize_payload(&mut job).await?;
+                Ok(Some(job))
+            }
         }
     }
 
@@ -1978,6 +2140,9 @@ impl Queue {
                     // terminal; the worker will fire the notify when it
                     // eventually acks / nacks / dead-letters.
                     if matches!(outcome, CancelOutcome::Removed) {
+                        // The record is deleted, so its payload object
+                        // (if any) is removed here, after the commit.
+                        self.delete_payload_object(&job).await;
                         self.completion_notify.notify_waiters();
                     }
                     debug!(job_id = %id, "{msg}");
@@ -2085,23 +2250,23 @@ impl Queue {
         let now = self.now_ms();
 
         let timer = crate::obs::start();
-        let mut ids = Vec::with_capacity(payloads.len());
-        let txn = self.db.begin(IsolationLevel::Snapshot).await?;
 
         // Use a monotonic generator so IDs in a single batch sort in insertion
         // order even when produced inside the same millisecond; `Ulid::new()`
         // alone is not monotonic and would break batch FIFO assertions.
         let mut id_gen = ulid::Generator::new();
 
+        let mut jobs = Vec::with_capacity(payloads.len());
         for payload in payloads {
             let id = id_gen
                 .generate()
                 .expect("monotonic ULID generator overflowed within one ms")
                 .to_string();
-            let job = JobRecord {
-                id: id.clone(),
+            jobs.push(JobRecord {
+                id,
                 queue: queue.to_string(),
                 payload,
+                payload_ref: None,
                 headers: HashMap::new(),
                 status: JobStatus::Pending,
                 attempts: 0,
@@ -2119,16 +2284,43 @@ impl Queue {
                 failed_at: None,
                 cancel_requested: false,
                 cancel_token: None,
-            };
-            let key = pending_key(queue, priority, &id);
-            let value = rmp_serde::to_vec_named(&job)?;
-            txn.put(&key, &value)?;
-            txn.put(job_index_key(&id), &key)?;
-            ids.push(id);
+            });
         }
 
-        update_stats(&txn, queue, &[(JobStatus::Pending, ids.len() as i64)])?;
-        txn.commit().await?;
+        // Offload oversized payloads before the transaction. On failure,
+        // remove the objects already written; no record points at them.
+        for i in 0..jobs.len() {
+            if let Err(err) = self.offload_payload(&mut jobs[i]).await {
+                for job in &jobs[..i] {
+                    self.delete_payload_object(job).await;
+                }
+                return Err(err);
+            }
+        }
+
+        let write = async {
+            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+            let mut ids = Vec::with_capacity(jobs.len());
+            for job in &jobs {
+                let key = pending_key(queue, priority, &job.id);
+                let value = rmp_serde::to_vec_named(job)?;
+                txn.put(&key, &value)?;
+                txn.put(job_index_key(&job.id), &key)?;
+                ids.push(job.id.clone());
+            }
+            update_stats(&txn, queue, &[(JobStatus::Pending, ids.len() as i64)])?;
+            txn.commit().await?;
+            Ok::<_, Error>(ids)
+        };
+        let ids = match write.await {
+            Ok(ids) => ids,
+            Err(err) => {
+                for job in &jobs {
+                    self.delete_payload_object(job).await;
+                }
+                return Err(err);
+            }
+        };
         crate::obs::enqueued(queue, ids.len() as u64, timer);
         // Batch ids are monotonic ULIDs at one priority, so the first id
         // yields the batch's smallest pending key for the cursor check.
@@ -6180,6 +6372,451 @@ mod tests {
         let job = q.claim("work", lease).await.unwrap().unwrap();
         assert_eq!(job.payload, b"urgent");
         q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    /// OpenOptions with a small offload threshold so tests exercise the
+    /// offload path.
+    fn offload_opts() -> OpenOptions {
+        OpenOptions {
+            payload_offload_threshold: Some(64),
+            default_queue_config: QueueConfig {
+                retry_backoff_base: Duration::ZERO,
+                retry_backoff_max: Duration::ZERO,
+                ..QueueConfig::default()
+            },
+            ..OpenOptions::default()
+        }
+    }
+
+    /// Number of objects under `prefix` in `store`. Payload objects for
+    /// a queue opened at `"test"` live under `"test-payloads"`.
+    async fn object_count(store: &Arc<dyn ObjectStore>, prefix: &str) -> usize {
+        store
+            .list_with_delimiter(Some(&slatedb::object_store::path::Path::from(prefix)))
+            .await
+            .unwrap()
+            .objects
+            .len()
+    }
+
+    #[tokio::test]
+    async fn offloaded_payload_round_trips_through_claim() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        let payload = vec![7u8; 1024];
+        let id = q.enqueue("work", payload.clone()).await.unwrap();
+        assert_eq!(object_count(&store, "test-payloads").await, 1);
+
+        let read = q.get_job(&id).await.unwrap().unwrap();
+        assert!(read.payload_ref.is_some());
+        assert_eq!(read.payload, payload);
+
+        let job = q.claim("work", Duration::from_secs(30)).await.unwrap();
+        let job = job.unwrap();
+        assert!(job.payload_ref.is_some());
+        assert_eq!(job.payload, payload);
+
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn offloaded_payload_survives_nack_and_reclaim() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        let payload = vec![3u8; 512];
+        q.enqueue("work", payload.clone()).await.unwrap();
+
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.nack(job, "retry").await.unwrap();
+        assert_eq!(
+            object_count(&store, "test-payloads").await,
+            1,
+            "a nack must not rewrite or remove the payload object"
+        );
+
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.payload, payload);
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ack_without_done_retention_deletes_the_payload_object() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        q.enqueue("work", vec![1u8; 256]).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.ack(&job).await.unwrap();
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn done_retention_keeps_the_payload_object_until_the_sweep() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let reaper_interval = Duration::from_millis(10);
+        let retention = Duration::from_millis(20);
+        let store = make_store();
+        let opts = OpenOptions {
+            reaper_interval,
+            default_queue_config: QueueConfig {
+                keep_done_jobs: Some(retention),
+                ..QueueConfig::default()
+            },
+            clock: Arc::new(clock.clone()),
+            payload_offload_threshold: Some(64),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(store.clone(), "test", opts)
+            .await
+            .unwrap();
+
+        let payload = vec![9u8; 256];
+        let id = q.enqueue("work", payload.clone()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.ack(&job).await.unwrap();
+
+        // The done record is kept, so the payload object stays and the
+        // record read materializes it.
+        assert_eq!(object_count(&store, "test-payloads").await, 1);
+        let done = q.get_job(&id).await.unwrap().unwrap();
+        assert_eq!(done.payload, payload);
+
+        clock.advance(retention + Duration::from_millis(10));
+        tokio::time::sleep(reaper_interval * 2).await;
+
+        assert!(q.get_job(&id).await.unwrap().is_none());
+        assert_eq!(
+            object_count(&store, "test-payloads").await,
+            0,
+            "the retention sweep must delete the payload object with the record"
+        );
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dead_retention_sweep_deletes_the_payload_object() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let reaper_interval = Duration::from_millis(10);
+        let retention = Duration::from_millis(20);
+        let store = make_store();
+        let opts = OpenOptions {
+            reaper_interval,
+            default_queue_config: QueueConfig {
+                dead_retention: Some(retention),
+                ..QueueConfig::default()
+            },
+            clock: Arc::new(clock.clone()),
+            payload_offload_threshold: Some(64),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(store.clone(), "test", opts)
+            .await
+            .unwrap();
+
+        q.enqueue("work", vec![5u8; 256]).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.dead_letter(job, "permanent").await.unwrap();
+        assert_eq!(object_count(&store, "test-payloads").await, 1);
+
+        clock.advance(retention + Duration::from_millis(10));
+        tokio::time::sleep(reaper_interval * 2).await;
+
+        assert!(q.dead_jobs("work", None, 10).await.unwrap().is_empty());
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dead_lettered_payload_survives_requeue_and_redelivery() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        let payload = vec![8u8; 512];
+        q.enqueue("work", payload.clone()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.dead_letter(job, "permanent").await.unwrap();
+
+        let dead = q.dead_jobs("work", None, 10).await.unwrap();
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].payload, payload, "dead_jobs materializes payloads");
+
+        q.requeue_dead_job(dead.into_iter().next().unwrap())
+            .await
+            .unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.payload, payload);
+        q.ack(&job).await.unwrap();
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_id_rejection_preserves_the_existing_payload_object() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        let payload = vec![1u8; 256];
+        let opts_with_id = || EnqueueOptions {
+            id_override: Some("fixed-id".to_string()),
+            ..EnqueueOptions::default()
+        };
+        q.enqueue_with("work", payload.clone(), opts_with_id())
+            .await
+            .unwrap();
+        let err = q
+            .enqueue_with("work", vec![2u8; 256], opts_with_id())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::DuplicateJobId { .. }));
+
+        // The rejected enqueue's object is removed; the live job's object
+        // is untouched and still readable.
+        assert_eq!(object_count(&store, "test-payloads").await, 1);
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.payload, payload);
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dedup_hit_removes_the_new_payload_object() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        let opts_with_dedup = || EnqueueOptions {
+            dedup_key: Some("once".to_string()),
+            ..EnqueueOptions::default()
+        };
+        let first = q
+            .enqueue_with("work", vec![1u8; 256], opts_with_dedup())
+            .await
+            .unwrap();
+        let second = q
+            .enqueue_with("work", vec![2u8; 256], opts_with_dedup())
+            .await
+            .unwrap();
+        assert_eq!(first, second, "dedup returns the existing job's id");
+        assert_eq!(object_count(&store, "test-payloads").await, 1);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn payloads_at_or_below_the_threshold_stay_inline() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        let id = q.enqueue("work", vec![0u8; 64]).await.unwrap();
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
+        let job = q.get_job(&id).await.unwrap().unwrap();
+        assert!(job.payload_ref.is_none());
+        assert_eq!(job.payload.len(), 64);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabled_offload_keeps_large_payloads_inline() {
+        let store = make_store();
+        let opts = OpenOptions {
+            payload_offload_threshold: None,
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(store.clone(), "test", opts)
+            .await
+            .unwrap();
+
+        let id = q.enqueue("work", vec![0u8; 1024 * 1024]).await.unwrap();
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
+        let job = q.get_job(&id).await.unwrap().unwrap();
+        assert!(job.payload_ref.is_none());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_of_a_pending_job_deletes_the_payload_object() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        let id = q.enqueue("work", vec![4u8; 256]).await.unwrap();
+        assert_eq!(object_count(&store, "test-payloads").await, 1);
+        assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Removed);
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn separate_payload_store_receives_the_payload_objects() {
+        let queue_store = make_store();
+        let payload_store = make_store();
+        let opts = OpenOptions {
+            payload_offload_threshold: Some(64),
+            payload_store: Some(payload_store.clone()),
+            payload_path: Some("blobs".to_string()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(queue_store.clone(), "test", opts)
+            .await
+            .unwrap();
+
+        let payload = vec![6u8; 256];
+        q.enqueue("work", payload.clone()).await.unwrap();
+        assert_eq!(object_count(&payload_store, "blobs").await, 1);
+        assert_eq!(object_count(&queue_store, "test-payloads").await, 0);
+
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.payload, payload);
+        q.ack(&job).await.unwrap();
+        assert_eq!(object_count(&payload_store, "blobs").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_enqueue_offloads_each_oversized_payload() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        let payloads = vec![vec![1u8; 256], vec![2u8; 16], vec![3u8; 256]];
+        q.enqueue_batch("work", payloads.clone()).await.unwrap();
+        assert_eq!(
+            object_count(&store, "test-payloads").await,
+            2,
+            "only the two oversized payloads offload"
+        );
+
+        for expected in payloads {
+            let job = q
+                .claim("work", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.payload, expected);
+            q.ack(&job).await.unwrap();
+        }
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ack_effect_enqueues_offload_and_clean_up_on_dedup_downgrade() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        // An existing job holds the dedup key the follow-up enqueue will hit.
+        q.enqueue_with(
+            "next",
+            vec![1u8; 16],
+            EnqueueOptions {
+                dedup_key: Some("once".to_string()),
+                ..EnqueueOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        q.enqueue("work", vec![2u8; 16]).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let results = q
+            .ack_with(
+                &job,
+                AckEffects {
+                    enqueues: vec![
+                        EnqueueRequest {
+                            queue: "next".to_string(),
+                            payload: vec![3u8; 256],
+                            options: EnqueueOptions {
+                                dedup_key: Some("once".to_string()),
+                                ..EnqueueOptions::default()
+                            },
+                        },
+                        EnqueueRequest {
+                            queue: "next".to_string(),
+                            payload: vec![4u8; 256],
+                            options: EnqueueOptions::default(),
+                        },
+                    ],
+                    ..AckEffects::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(results[0], EnqueueResult::AlreadyEnqueued(_)));
+        assert!(matches!(results[1], EnqueueResult::New(_)));
+        // The dedup-downgraded follow-up job's payload object is removed;
+        // the committed follow-up job's object remains.
+        assert_eq!(object_count(&store, "test-payloads").await, 1);
+
+        let follow_up_ids = match &results[1] {
+            EnqueueResult::New(id) => id.clone(),
+            _ => unreachable!(),
+        };
+        let follow_up = q.get_job(&follow_up_ids).await.unwrap().unwrap();
+        assert_eq!(follow_up.payload, vec![4u8; 256]);
         q.close().await.unwrap();
     }
 }

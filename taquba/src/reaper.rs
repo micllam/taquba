@@ -12,6 +12,7 @@ use crate::clock::Clock;
 use crate::error::Result;
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{KeyTag, dead_key, job_index_key, parse_key_timestamp, pending_key, tag_prefix};
+use crate::payload_store::PayloadStore;
 use crate::queue::QueueConfig;
 use crate::stats::update_stats;
 
@@ -24,6 +25,7 @@ pub(crate) struct Reaper {
     pub(crate) job_available: Arc<Notify>,
     pub(crate) completion_notify: Arc<Notify>,
     pub(crate) claim_cursor: ClaimCursor,
+    pub(crate) payload_store: Arc<PayloadStore>,
 }
 
 impl Reaper {
@@ -37,6 +39,7 @@ impl Reaper {
             job_available,
             completion_notify,
             claim_cursor,
+            payload_store,
         } = self;
 
         let any_keep_done = default_queue_config.keep_done_jobs.is_some()
@@ -78,13 +81,14 @@ impl Reaper {
                     }
                     if any_keep_done
                         && let Err(e) =
-                            sweep_done(&db, clock.as_ref(), &keep_done_for, max_keep_done)
+                            sweep_done(&db, clock.as_ref(), &keep_done_for, max_keep_done, &payload_store)
                                 .await
                         {
                             warn!("done retention sweep error: {e}");
                         }
                     if any_dead_retention
-                        && let Err(e) = sweep_dead(&db, clock.as_ref(), &dead_retention_for).await {
+                        && let Err(e) =
+                            sweep_dead(&db, clock.as_ref(), &dead_retention_for, &payload_store).await {
                             warn!("dead retention sweep error: {e}");
                         }
                 }
@@ -241,11 +245,12 @@ async fn sweep_done(
     clock: &dyn Clock,
     keep_done_for: &(dyn Fn(&str) -> Option<Duration> + Sync),
     max_keep_done: Option<Duration>,
+    payload_store: &PayloadStore,
 ) -> Result<()> {
     let now = clock.now_ms();
     let min_cutoff = max_keep_done.map(|r| now.saturating_sub(r.as_millis() as u64));
 
-    let mut victims: Vec<(Vec<u8>, String)> = Vec::new();
+    let mut victims: Vec<(Vec<u8>, String, Option<String>)> = Vec::new();
     let mut iter = db.scan_prefix(tag_prefix(KeyTag::Done), ..).await?;
     while let Some(kv) = iter.next().await? {
         // Done keys lead with `completed_at`, so the scan is sorted globally
@@ -271,15 +276,16 @@ async fn sweep_done(
         };
         let cutoff = now.saturating_sub(retention.as_millis() as u64);
         if completed_at < cutoff {
-            victims.push((kv.key.to_vec(), job.id.clone()));
+            victims.push((kv.key.to_vec(), job.id.clone(), job.payload_ref.clone()));
         }
     }
     drop(iter);
 
-    for (key, id) in victims {
+    for (key, id, payload_ref) in victims {
         let txn = db.begin(IsolationLevel::Snapshot).await?;
         // Re-check existence; could have been swept by a previous tick.
-        if txn.get(&key).await?.is_some() {
+        let existed = txn.get(&key).await?.is_some();
+        if existed {
             txn.delete(&key)?;
             txn.delete(job_index_key(&id))?;
         }
@@ -295,6 +301,12 @@ async fn sweep_done(
             Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
             Err(e) => return Err(e.into()),
         }
+        // The payload object is deleted only after the record-removing
+        // commit, so a crash in between leaves an orphaned object, never
+        // a live record whose payload is gone.
+        if existed && let Some(ref payload_ref) = payload_ref {
+            payload_store.delete_best_effort(payload_ref, &id).await;
+        }
     }
     Ok(())
 }
@@ -307,10 +319,11 @@ async fn sweep_dead(
     db: &Db,
     clock: &dyn Clock,
     dead_retention_for: &(dyn Fn(&str) -> Option<Duration> + Sync),
+    payload_store: &PayloadStore,
 ) -> Result<()> {
     let now = clock.now_ms();
 
-    let mut victims: Vec<(Vec<u8>, String, String)> = Vec::new();
+    let mut victims: Vec<(Vec<u8>, String, String, Option<String>)> = Vec::new();
     let mut iter = db.scan_prefix(tag_prefix(KeyTag::Dead), ..).await?;
     while let Some(kv) = iter.next().await? {
         let job: JobRecord = match rmp_serde::from_slice(&kv.value) {
@@ -326,14 +339,20 @@ async fn sweep_dead(
         };
         let cutoff = now.saturating_sub(retention.as_millis() as u64);
         if failed_at < cutoff {
-            victims.push((kv.key.to_vec(), job.queue.clone(), job.id.clone()));
+            victims.push((
+                kv.key.to_vec(),
+                job.queue.clone(),
+                job.id.clone(),
+                job.payload_ref.clone(),
+            ));
         }
     }
     drop(iter);
 
-    for (key, queue, id) in victims {
+    for (key, queue, id, payload_ref) in victims {
         let txn = db.begin(IsolationLevel::Snapshot).await?;
-        if txn.get(&key).await?.is_some() {
+        let existed = txn.get(&key).await?.is_some();
+        if existed {
             txn.delete(&key)?;
             txn.delete(job_index_key(&id))?;
             // Decrement the dead counter so QueueStats::dead reflects the live
@@ -353,6 +372,11 @@ async fn sweep_dead(
             Ok(_) => {}
             Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
             Err(e) => return Err(e.into()),
+        }
+        // The payload object is deleted only after the record-removing
+        // commit; see the matching comment in `sweep_done`.
+        if existed && let Some(ref payload_ref) = payload_ref {
+            payload_store.delete_best_effort(payload_ref, &id).await;
         }
     }
     Ok(())

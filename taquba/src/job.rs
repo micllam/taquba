@@ -22,7 +22,19 @@ pub struct JobRecord {
     /// Logical queue this job belongs to.
     pub queue: String,
     /// Application-defined payload.
+    ///
+    /// Always populated on records returned by the claim and read APIs.
+    /// When [`Self::payload_ref`] is `Some`, the payload was offloaded
+    /// to the payload object store at enqueue and is fetched from there
+    /// on each claim or read; the persisted record itself stores no
+    /// payload bytes.
     pub payload: Vec<u8>,
+    /// Name of this job's payload object in the payload object store.
+    /// `Some` only when the payload exceeded
+    /// [`OpenOptions::payload_offload_threshold`](crate::OpenOptions::payload_offload_threshold)
+    /// at enqueue. Managed by the queue; callers never set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_ref: Option<String>,
     /// Optional string-keyed metadata stored alongside the payload. Useful for
     /// data that benefits from being separable from the opaque body, e.g. HTTP
     /// headers or a target URL for a webhook delivery, or a schedule name and
@@ -121,6 +133,55 @@ pub struct JobRecord {
     /// immediately fired if [`Self::cancel_requested`] is `true`).
     #[serde(skip, default)]
     pub cancel_token: Option<CancellationToken>,
+}
+
+impl JobRecord {
+    /// Serialize the record in its stored form: when the payload is
+    /// offloaded ([`Self::payload_ref`] is `Some`), the inline payload
+    /// is excluded so state transitions never rewrite payload bytes.
+    /// The payload field is restored before returning, so the record
+    /// is unchanged from the caller's perspective.
+    pub(crate) fn stored_bytes(&mut self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+        if self.payload_ref.is_none() {
+            return rmp_serde::to_vec_named(self);
+        }
+        let payload = std::mem::take(&mut self.payload);
+        let bytes = rmp_serde::to_vec_named(self);
+        self.payload = payload;
+        bytes
+    }
+
+    /// Clone the record in its stored form: identical to [`Clone`]
+    /// except that an offloaded payload is not copied into the clone.
+    pub(crate) fn stored_clone(&self) -> JobRecord {
+        JobRecord {
+            payload: if self.payload_ref.is_some() {
+                Vec::new()
+            } else {
+                self.payload.clone()
+            },
+            id: self.id.clone(),
+            queue: self.queue.clone(),
+            payload_ref: self.payload_ref.clone(),
+            headers: self.headers.clone(),
+            status: self.status,
+            attempts: self.attempts,
+            max_attempts: self.max_attempts,
+            enqueued_at: self.enqueued_at,
+            claimed_at: self.claimed_at,
+            lease_expires_at: self.lease_expires_at,
+            run_at: self.run_at,
+            woken_at: self.woken_at,
+            wake_payload: self.wake_payload.clone(),
+            priority: self.priority,
+            last_error: self.last_error.clone(),
+            dedup_key: self.dedup_key.clone(),
+            completed_at: self.completed_at,
+            failed_at: self.failed_at,
+            cancel_requested: self.cancel_requested,
+            cancel_token: self.cancel_token.clone(),
+        }
+    }
 }
 
 fn is_false(v: &bool) -> bool {

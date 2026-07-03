@@ -152,6 +152,29 @@
 //! See `examples/atomic_settlement.rs` for a runnable order pipeline
 //! built on these primitives.
 //!
+//! # Large payloads
+//!
+//! A job record is rewritten on every state transition (enqueue, claim,
+//! nack, ack), so a large inline payload is written many times over its
+//! lifetime. Payloads larger than
+//! [`OpenOptions::payload_offload_threshold`] (default 256 KiB) are
+//! therefore offloaded: written once as an object in a payload object
+//! store, with the record storing a reference
+//! ([`JobRecord::payload_ref`]) instead of the bytes. Claims and job
+//! reads fetch the object and return the payload as usual, so
+//! offloading is transparent to worker code. The object is deleted
+//! when the record leaves the queue: on ack (or with the done record's
+//! retention sweep when
+//! [`QueueConfig::keep_done_jobs`] is set), on cancel and with the
+//! dead-letter retention sweep.
+//!
+//! By default payload objects live next to the queue's own state, under
+//! `"{path}-payloads"` in the object store the queue is opened on.
+//! [`OpenOptions::payload_store`] and [`OpenOptions::payload_path`]
+//! place them in a different prefix, bucket or account instead.
+//! Setting [`OpenOptions::payload_offload_threshold`] to `None`
+//! disables offloading; payloads then stay inline regardless of size.
+//!
 //! # Background tasks
 //!
 //! [`Queue::open`] spawns two background tokio tasks for the lifetime of the
@@ -197,6 +220,7 @@ mod keys;
 #[cfg(feature = "metrics")]
 mod metrics_sampler;
 mod obs;
+mod payload_store;
 mod queue;
 mod reaper;
 mod scheduler;
@@ -211,9 +235,9 @@ pub use error::{Error, Result};
 pub use job::{JobRecord, JobStatus};
 pub use keys::MAX_QUEUE_NAME_LEN;
 pub use queue::{
-    AckEffects, CancelOutcome, EnqueueOptions, EnqueueRequest, EnqueueResult, MAX_KV_VALUE_SIZE,
-    OpenOptions, PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_NORMAL, Queue, QueueConfig, WaitOutcome,
-    WakeOutcome,
+    AckEffects, CancelOutcome, DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD, EnqueueOptions, EnqueueRequest,
+    EnqueueResult, MAX_KV_VALUE_SIZE, OpenOptions, PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_NORMAL,
+    Queue, QueueConfig, WaitOutcome, WakeOutcome,
 };
 pub use stats::QueueStats;
 pub use worker::{PermanentFailure, Worker, WorkerError, run_worker, run_worker_concurrent};

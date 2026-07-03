@@ -23,6 +23,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Queue::kv_compare_delete`: delete a user KV entry only if it still holds
   the expected value, so a concurrently replaced value is never deleted by
   mistake.
+- Automatic payload offload: payloads larger than
+  `OpenOptions::payload_offload_threshold` (default 256 KiB, the new
+  `DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD`) are written once as objects in a
+  payload object store instead of inline in the job record, so state
+  transitions no longer rewrite large payloads. The record stores the new
+  `JobRecord::payload_ref` field; claims and job reads fetch the object
+  transparently, and the object is deleted when the record leaves the queue.
+  The payload store defaults to `"{path}-payloads"` in the queue's own
+  object store and is separately configurable via
+  `OpenOptions::payload_store` and `OpenOptions::payload_path`. New error
+  variants `Error::PayloadStore` and `Error::PayloadMissing`. Setting the
+  threshold to `None` disables offloading.
 
 ### Changed
 

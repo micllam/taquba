@@ -82,6 +82,22 @@ pub enum Error {
         /// Why it was rejected.
         reason: &'static str,
     },
+
+    /// The payload object store reported a failure while writing,
+    /// reading or deleting an offloaded payload. See
+    /// [`crate::OpenOptions::payload_offload_threshold`].
+    #[error("payload store error: {0}")]
+    PayloadStore(#[from] slatedb::object_store::Error),
+
+    /// An offloaded payload object was absent when a claim or a job
+    /// read tried to fetch it. The record still exists but its payload
+    /// cannot be recovered; this indicates external deletion of the
+    /// payload object.
+    #[error("offloaded payload missing for job `{id}`")]
+    PayloadMissing {
+        /// The job whose payload object was absent.
+        id: String,
+    },
 }
 
 impl Error {
@@ -101,8 +117,9 @@ impl Error {
             | Self::KvValueTooLarge { .. }
             | Self::InvalidId { .. }
             | Self::DuplicateJobId { .. }
-            | Self::InvalidQueueName { .. } => true,
-            Self::Storage(_) => false,
+            | Self::InvalidQueueName { .. }
+            | Self::PayloadMissing { .. } => true,
+            Self::Storage(_) | Self::PayloadStore(_) => false,
         }
     }
 }
