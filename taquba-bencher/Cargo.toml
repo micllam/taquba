@@ -73,6 +73,11 @@ path = "benches/taquba/reaper_storm.rs"
 harness = false
 
 [[bench]]
+name = "settle_ab"
+path = "benches/taquba/settle_ab.rs"
+harness = false
+
+[[bench]]
 name = "step_transitions"
 path = "benches/taquba-workflow/step_transitions.rs"
 harness = false

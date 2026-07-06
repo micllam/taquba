@@ -30,6 +30,7 @@ documented in the header comment of its source file.
 | `reaper_storm` | Abandon `N_EXPIRED` claims with expired leases (a simulated crash), reopen, and let the reaper requeue them while a second queue carries live traffic | How long does a mass lease-expiry sweep take, and how much does it disturb claim and end-to-end latency on a concurrently active queue? |
 | `sharding` | Open `N_SHARDS` independent stores in one process and saturate each with `PRODUCERS_PER_SHARD` durable-enqueue producers | Does throughput scale with shard count? SlateDB serializes WAL flushes per store (one PUT in flight at a time), so each store is one PUT stream; N stores should give ~N independent streams, up to the object store's PUT capacity. |
 | `payload_sweep` | For each size in `PAYLOAD_SIZES`, saturate concurrent enqueue/ack on its own store for `DURATION_SEC`, recording object-store PUT bytes through a counting wrapper | How do throughput, latency and object-store write volume (PUT bytes per payload byte) change as payload size grows? |
+| `settle_ab` | Pre-fill `N_JOBS` jobs and drain them with `N_WORKERS` sequential actors (claim, `PROC_MS` of simulated work, ack), once per arm: settlement durable (default) vs deferred (`QueueConfig::durable_settlement = false`) | Does deferring settlement durability raise per-actor throughput at fixed concurrency? The durable arm's ack stalls the actor for roughly one flush wait plus one PUT before its next claim; the deferred arm's ack returns after the in-memory commit. |
 
 ### taquba-workflow
 
@@ -120,6 +121,15 @@ STORE_LATENCY_MS=10 N_SHARDS=4 DURATION_SEC=30 \
 # inflating the byte counts.
 PAYLOAD_SIZES=64,1024,16384,262144 DURATION_SEC=20 CLAIM_BATCH=64 LEASE_SEC=60 \
     cargo bench -p taquba-bencher --bench payload_sweep > payload_sweep.csv
+
+# Deferred-settlement A/B: drain the same prefilled backlog with 8
+# sequential actors, settlement durable vs deferred, and compare
+# jobs-per-actor. PROC_MS simulates per-job work; 0 is the fast-job
+# regime where the settlement stall dominates. Run on real storage (or
+# with injected latency) so the durable arm's ack waits on a real PUT;
+# ARMS selects the arms, so a cloud host can run one arm per process.
+N_JOBS=5000 N_WORKERS=8 PROC_MS=0 STORE_LATENCY_MS=20 \
+    cargo bench -p taquba-bencher --bench settle_ab > settle_ab.csv
 
 # Spread the load across 100 queues (one worker each), exercising the
 # global reaper / scheduler prefix scans and per-queue claim state.
@@ -286,6 +296,21 @@ not clean round-trip latency; use `steady_state` with `PAYLOAD_BYTES`
 for that. Per size, a cumulative `store_amp` is logged to stderr each
 second so its convergence (compaction amortizing over a long run) is
 visible, not just the final per-size value.
+
+For `settle_ab`:
+
+```
+arm,n_jobs,n_workers,proc_ms,drain_secs,jobs_per_sec,jobs_per_actor_sec,claim_p50_us,claim_p99_us,ack_p50_us,ack_p99_us
+```
+
+One row per arm (`durable`, `deferred`). `drain_secs` runs from drain
+start (the prefill is excluded) to the last ack's completion, and
+`jobs_per_actor_sec` is `jobs_per_sec / n_workers`, the per-actor
+throughput the arms are compared on. `ack_*` measures the settlement
+stall the arms differ on: the durable arm's ack waits for WAL
+durability (roughly one flush wait plus one PUT), the deferred arm's
+returns after the in-memory commit. When both arms run, the
+jobs-per-actor multiple (deferred over durable) prints to stderr.
 
 For `step_transitions`:
 
