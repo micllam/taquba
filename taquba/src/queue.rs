@@ -237,6 +237,21 @@ pub struct QueueConfig {
     /// inspect or requeue without leaking storage. `None` disables the
     /// sweep for this queue: dead jobs accumulate without bound.
     pub dead_retention: Option<Duration>,
+    /// Whether settlement transitions ([`Queue::ack`], [`Queue::nack`],
+    /// [`Queue::dead_letter`]) await WAL durability before returning.
+    ///
+    /// `true` (the default) preserves the per-transition durability
+    /// contract. `false` commits settlements without awaiting the WAL
+    /// flush: a crash within a flush interval of a returned settlement
+    /// discards it, the claimed record remains, and the reaper
+    /// redelivers the job once its lease expires. Under at-least-once
+    /// delivery this widens the redelivery window; it does not weaken
+    /// the delivery contract. Jobs with an offloaded payload
+    /// ([`JobRecord::payload_ref`]) always settle durably: their ack
+    /// deletes the payload object after the commit, and a discarded
+    /// commit would restore a record whose payload object has already
+    /// been deleted.
+    pub durable_settlement: bool,
 }
 
 impl Default for QueueConfig {
@@ -249,6 +264,7 @@ impl Default for QueueConfig {
             retry_backoff_max: Duration::from_secs(300),
             keep_done_jobs: None,
             dead_retention: Some(Duration::from_secs(7 * 24 * 3600)),
+            durable_settlement: true,
         }
     }
 }
@@ -1651,6 +1667,17 @@ impl Queue {
         self.offload_payloads(prepared_jobs.iter_mut().map(|p| &mut p.job))
             .await?;
 
+        // Settlement durability: the queue's `durable_settlement` flag,
+        // except that an offloaded payload always settles durably (the
+        // payload object is deleted after the commit, and a discarded
+        // commit would restore a record whose payload object has
+        // already been deleted).
+        let write_opts = WriteOptions {
+            await_durable: self.queue_config(&job.queue).durable_settlement
+                || job.payload_ref.is_some(),
+            ..WriteOptions::default()
+        };
+
         let outcome: Result<Vec<EnqueueResult>> = async {
             loop {
                 let txn = self.db.begin(IsolationLevel::Snapshot).await?;
@@ -1701,7 +1728,7 @@ impl Queue {
                     txn.delete(user_scoped_key(k))?;
                 }
 
-                match txn.commit().await {
+                match txn.commit_with_options(&write_opts).await {
                     Ok(_) => {
                         for staged_job in &staged {
                             self.note_staged_job(staged_job);
@@ -1746,6 +1773,15 @@ impl Queue {
         // Captured before the retry branches clear it on the record.
         let claimed_at = job.claimed_at;
         job.last_error = Some(error.to_string());
+
+        // Settlement durability follows the queue's `durable_settlement`
+        // flag. The offloaded-payload exception does not apply: nack
+        // never deletes the payload object (the requeued, scheduled or
+        // dead record continues to reference it).
+        let write_opts = WriteOptions {
+            await_durable: self.queue_config(&job.queue).durable_settlement,
+            ..WriteOptions::default()
+        };
 
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
@@ -1833,7 +1869,7 @@ impl Queue {
                 }
             }
 
-            match txn.commit().await {
+            match txn.commit_with_options(&write_opts).await {
                 Ok(_) => break,
                 Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
                 Err(e) => return Err(e.into()),
@@ -1886,6 +1922,15 @@ impl Queue {
         let dead = dead_key(&job.queue, &job.id);
         let value = job.stored_bytes()?;
 
+        // Settlement durability follows the queue's `durable_settlement`
+        // flag. As with nack, the dead record continues to reference any
+        // offloaded payload object, so the offloaded-payload exception
+        // does not apply.
+        let write_opts = WriteOptions {
+            await_durable: self.queue_config(&job.queue).durable_settlement,
+            ..WriteOptions::default()
+        };
+
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
             txn.get(&claimed).await?.ok_or(Error::ClaimLost)?;
@@ -1908,7 +1953,7 @@ impl Queue {
                 &job.queue,
                 &[(JobStatus::Claimed, -1), (JobStatus::Dead, 1)],
             )?;
-            match txn.commit().await {
+            match txn.commit_with_options(&write_opts).await {
                 Ok(_) => break,
                 Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
                 Err(e) => return Err(e.into()),
@@ -2828,6 +2873,43 @@ mod tests {
         let second = q.claim("work", lease).await.unwrap().unwrap();
         assert_eq!(second.payload, b"second");
         q.ack(&second).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_settlement_ack_and_nack_settle_in_process() {
+        let q = Queue::open_with_options(
+            make_store(),
+            "test",
+            OpenOptions {
+                default_queue_config: QueueConfig {
+                    durable_settlement: false,
+                    retry_backoff_base: Duration::ZERO,
+                    ..QueueConfig::default()
+                },
+                ..OpenOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let lease = Duration::from_secs(5);
+
+        q.enqueue("work", b"acked".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.ack(&job).await.unwrap();
+        assert!(q.get_job(&job.id).await.unwrap().is_none());
+
+        q.enqueue("work", b"nacked".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.nack(job, "transient error").await.unwrap();
+        let retried = q.claim("work", lease).await.unwrap().unwrap();
+        assert_eq!(retried.payload, b"nacked");
+        q.ack(&retried).await.unwrap();
+
+        let stats = q.stats("work").await.unwrap();
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.claimed, 0);
+        assert_eq!(stats.done, 2);
         q.close().await.unwrap();
     }
 
