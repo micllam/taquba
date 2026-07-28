@@ -62,13 +62,6 @@ pub enum WakeOutcome {
     NotFound,
 }
 
-impl CancelOutcome {
-    /// `true` if the call acted on the job (either removed or requested).
-    pub fn acted(self) -> bool {
-        !matches!(self, CancelOutcome::NotFound)
-    }
-}
-
 /// One page of a job listing. Returned by [`Queue::list_jobs`].
 #[derive(Debug, Clone)]
 pub struct JobPage {
@@ -469,10 +462,6 @@ pub struct Queue {
     default_queue_config: QueueConfig,
     queue_configs: HashMap<String, QueueConfig>,
     clock: Arc<dyn Clock>,
-    /// In-process wakeup signal so workers blocked on an empty queue can resume
-    /// the moment a job becomes claimable, without waiting out their poll
-    /// interval.
-    job_available: Arc<tokio::sync::Notify>,
     /// In-process cancellation tokens for currently claimed jobs. Populated
     /// by every `claim*` path, cleared on `ack` / `nack` / `dead_letter`.
     /// `Queue::cancel` fires the token while the job is `Claimed`; the
@@ -559,7 +548,8 @@ struct StagedJob {
     id: String,
     queue: String,
     /// `Some` when the job landed in the pending key space, in which
-    /// case the commit must be followed by a cursor note and a wakeup.
+    /// case the commit must be followed by a cursor insert note, which
+    /// also wakes a waiting worker.
     pending_key: Option<Vec<u8>>,
 }
 
@@ -594,7 +584,6 @@ impl Queue {
             builder = builder.with_metrics_recorder(crate::obs::slatedb_recorder());
         }
         let db = Arc::new(builder.build().await?);
-        let job_available = Arc::new(tokio::sync::Notify::new());
         let completion_notify = Arc::new(tokio::sync::Notify::new());
         let claim_cursor = ClaimCursor::new();
         restore_cursor_state(&db, &claim_cursor).await?;
@@ -605,7 +594,6 @@ impl Queue {
             default_queue_config: opts.default_queue_config.clone(),
             queue_configs: opts.queue_configs.clone(),
             clock: opts.clock.clone(),
-            job_available: job_available.clone(),
             completion_notify: completion_notify.clone(),
             claim_cursor: claim_cursor.clone(),
             payload_store: payload_store.clone(),
@@ -616,7 +604,6 @@ impl Queue {
             db: db.clone(),
             interval: opts.scheduler_interval,
             clock: opts.clock.clone(),
-            job_available: job_available.clone(),
             claim_cursor: claim_cursor.clone(),
         };
         let scheduler_handle = tokio::spawn(scheduler.run(scheduler_rx));
@@ -644,7 +631,6 @@ impl Queue {
             default_queue_config: opts.default_queue_config,
             queue_configs: opts.queue_configs,
             clock: opts.clock,
-            job_available,
             claimed_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             claim_locks: std::sync::Mutex::new(HashMap::new()),
             claim_cursor,
@@ -1179,14 +1165,13 @@ impl Queue {
     }
 
     /// Post-commit bookkeeping for one staged job: a Pending job is
-    /// recorded on the claim cursor and wakes a waiting worker; a
+    /// recorded on the claim cursor, which wakes a waiting worker; a
     /// Scheduled job becomes claimable later via the scheduler loop,
-    /// which fires its own notify.
+    /// which records its own insert.
     fn note_staged_job(&self, staged: &StagedJob) {
         if let Some(ref pending_key) = staged.pending_key {
             self.claim_cursor
                 .note_pending_insert(&staged.queue, pending_key);
-            self.job_available.notify_waiters();
         }
         debug!(queue = %staged.queue, job_id = %staged.id, "job enqueued");
     }
@@ -1206,30 +1191,13 @@ impl Queue {
             .clone()
     }
 
-    /// Block up to `max_wait` for a job to become claimable on any queue.
-    ///
-    /// Returns when either an in-process enqueue / promotion / requeue fires
-    /// the wakeup notification, or the timeout elapses. The wakeup is
-    /// queue-agnostic and wakes every waiter; a pool of workers serving
-    /// one queue should prefer [`Self::wait_for_jobs_on`], which wakes
-    /// one waiter per inserted job. Callers must follow up with a
-    /// [`Self::claim`] call to see if anything is actually available on
-    /// their queue.
-    pub async fn wait_for_jobs(&self, max_wait: Duration) {
-        let notified = self.job_available.notified();
-        tokio::pin!(notified);
-        tokio::select! {
-            _ = &mut notified => {}
-            _ = tokio::time::sleep(max_wait) => {}
-        }
-    }
-
     /// Block up to `max_wait` for a job to become claimable on `queue`.
     ///
-    /// Unlike [`Self::wait_for_jobs`], the wakeup is queue-scoped and
-    /// delivered to one waiter per inserted job, so a pool of waiting
-    /// workers does not contend on the claim path when a single job
-    /// arrives. Returning does not guarantee a job is still available
+    /// The wakeup is queue-scoped and delivered to one waiter per
+    /// inserted job, so a pool of waiting workers does not contend on
+    /// the claim path when a single job arrives. To wait on several
+    /// queues at once, `select!` over one call per queue. Returning
+    /// does not guarantee a job is still available
     /// (another worker may claim it first); follow up with a claim
     /// call and wait again if it returns `None`.
     pub async fn wait_for_jobs_on(&self, queue: &str, max_wait: Duration) {
@@ -1818,11 +1786,11 @@ impl Queue {
         }
         self.clear_cancel_token(&job.id);
         if immediate_retry {
+            // The backoff path needs no insert note here: the
+            // scheduler records the insert itself when it promotes the
+            // job.
             let pending = pending_key(&job.queue, job.priority, &job.id);
             self.claim_cursor.note_pending_insert(&job.queue, &pending);
-            // Backoff path doesn't need a wake: the scheduler loop will fire
-            // notify_waiters() when it promotes the job.
-            self.job_available.notify_waiters();
         }
         if became_dead {
             // Retries exhausted: terminal transition. Wake completion waiters.
@@ -2091,7 +2059,6 @@ impl Queue {
         )?;
         txn.commit().await?;
         self.claim_cursor.note_pending_insert(&job.queue, &pending);
-        self.job_available.notify_waiters();
 
         debug!(queue = %job.queue, job_id = %job.id, "dead job re-queued");
         Ok(())
@@ -2425,7 +2392,6 @@ impl Queue {
             match txn.commit().await {
                 Ok(_) => {
                     self.claim_cursor.note_pending_insert(&job.queue, &pending);
-                    self.job_available.notify_waiters();
                     debug!(job_id = %id, queue = %job.queue, "scheduled job woken");
                     return Ok(WakeOutcome::Woken);
                 }
@@ -2505,7 +2471,6 @@ impl Queue {
             self.claim_cursor
                 .note_pending_inserts(queue, &key, ids.len());
         }
-        self.job_available.notify_waiters();
 
         debug!(queue = queue, count = ids.len(), "batch enqueued");
         Ok(ids)
@@ -2513,26 +2478,18 @@ impl Queue {
 
     /// Trigger an immediate reap sweep (primarily useful in tests and tooling).
     pub async fn reap_now(&self) -> Result<()> {
-        let count = reap_expired(
+        reap_expired(
             &self.db,
             self.clock.as_ref(),
             &self.completion_notify,
             &self.claim_cursor,
         )
-        .await?;
-        if count > 0 {
-            self.job_available.notify_waiters();
-        }
-        Ok(())
+        .await
     }
 
     /// Trigger an immediate scheduled-job promotion sweep (primarily useful in tests).
     pub async fn promote_scheduled_now(&self) -> Result<()> {
-        let count = promote_due_jobs(&self.db, self.clock.as_ref(), &self.claim_cursor).await?;
-        if count > 0 {
-            self.job_available.notify_waiters();
-        }
-        Ok(())
+        promote_due_jobs(&self.db, self.clock.as_ref(), &self.claim_cursor).await
     }
 
     /// Shut down the background reaper and scheduler, persist each

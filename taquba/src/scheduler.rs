@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use slatedb::config::WriteOptions;
 use slatedb::{Db, IsolationLevel};
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use crate::claim_cursor::ClaimCursor;
@@ -18,7 +18,6 @@ pub(crate) struct Scheduler {
     pub(crate) db: Arc<Db>,
     pub(crate) interval: Duration,
     pub(crate) clock: Arc<dyn Clock>,
-    pub(crate) job_available: Arc<Notify>,
     pub(crate) claim_cursor: ClaimCursor,
 }
 
@@ -28,16 +27,13 @@ impl Scheduler {
             db,
             interval,
             clock,
-            job_available,
             claim_cursor,
         } = self;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {
-                    match promote_due_jobs(&db, clock.as_ref(), &claim_cursor).await {
-                        Ok(0) => {}
-                        Ok(_) => job_available.notify_waiters(),
-                        Err(e) => warn!("scheduled job promoter error: {e}"),
+                    if let Err(e) = promote_due_jobs(&db, clock.as_ref(), &claim_cursor).await {
+                        warn!("scheduled job promoter error: {e}");
                     }
                 }
                 _ = shutdown.changed() => break,
@@ -48,13 +44,12 @@ impl Scheduler {
 }
 
 /// Scan the scheduled key space and move any job whose `run_at` has passed
-/// into the pending key space so workers can claim it. Returns the number
-/// of jobs that were promoted.
+/// into the pending key space so workers can claim it.
 pub(crate) async fn promote_due_jobs(
     db: &Db,
     clock: &dyn Clock,
     claim_cursor: &ClaimCursor,
-) -> Result<usize> {
+) -> Result<()> {
     let now = clock.now_ms();
     let mut due_keys = Vec::new();
 
@@ -73,12 +68,11 @@ pub(crate) async fn promote_due_jobs(
     }
     drop(iter);
 
-    let count = due_keys.len();
     for key_bytes in due_keys {
         promote_job(db, &key_bytes, claim_cursor).await?;
     }
 
-    Ok(count)
+    Ok(())
 }
 
 async fn promote_job(

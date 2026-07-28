@@ -66,6 +66,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Error::InvalidQueueName`.
 - Upgraded the SlateDB dependency to 0.14.1 (from 0.13.1).
 
+### Removed
+
+- **Breaking:** `Queue::wait_for_jobs`, the queue-agnostic wait. Use
+  the queue-scoped `Queue::wait_for_jobs_on`, which wakes one waiter
+  per inserted job; to wait on several queues at once, `select!` over
+  one call per queue. The internal queue-agnostic notify channel is
+  removed with it.
+- **Breaking:** `CancelOutcome::acted`. Match on the enum instead:
+  `!matches!(outcome, CancelOutcome::NotFound)`.
+- **Breaking:** `MockClock::set`. Construct with `MockClock::new` and
+  move time forward with `MockClock::advance`; tests should not move a
+  shared clock backwards.
+
 ## [0.9.0] - 2026-06-23
 
 ### Added

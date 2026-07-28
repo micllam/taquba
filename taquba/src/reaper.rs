@@ -27,7 +27,6 @@ pub(crate) struct Reaper {
     pub(crate) default_queue_config: QueueConfig,
     pub(crate) queue_configs: HashMap<String, QueueConfig>,
     pub(crate) clock: Arc<dyn Clock>,
-    pub(crate) job_available: Arc<Notify>,
     pub(crate) completion_notify: Arc<Notify>,
     pub(crate) claim_cursor: ClaimCursor,
     pub(crate) payload_store: Arc<PayloadStore>,
@@ -41,7 +40,6 @@ impl Reaper {
             default_queue_config,
             queue_configs,
             clock,
-            job_available,
             completion_notify,
             claim_cursor,
             payload_store,
@@ -79,10 +77,10 @@ impl Reaper {
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {
-                    match reap_expired(&db, clock.as_ref(), &completion_notify, &claim_cursor).await {
-                        Ok(0) => {}
-                        Ok(_) => job_available.notify_waiters(),
-                        Err(e) => warn!("lease reaper error: {e}"),
+                    if let Err(e) =
+                        reap_expired(&db, clock.as_ref(), &completion_notify, &claim_cursor).await
+                    {
+                        warn!("lease reaper error: {e}");
                     }
                     if any_keep_done
                         && let Err(e) =
@@ -104,14 +102,13 @@ impl Reaper {
     }
 }
 
-/// Returns the number of expired claims that were processed. Callers can use
-/// this to decide whether to wake any waiting workers.
+/// Requeue or dead-letter every claim whose lease has expired.
 pub(crate) async fn reap_expired(
     db: &Db,
     clock: &dyn Clock,
     completion_notify: &Notify,
     claim_cursor: &ClaimCursor,
-) -> Result<usize> {
+) -> Result<()> {
     let now = clock.now_ms();
     let mut expired_keys = Vec::new();
 
@@ -130,12 +127,11 @@ pub(crate) async fn reap_expired(
     }
     drop(iter);
 
-    let count = expired_keys.len();
     for key_bytes in expired_keys {
         reap_job(db, clock, &key_bytes, completion_notify, claim_cursor).await?;
     }
 
-    Ok(count)
+    Ok(())
 }
 
 async fn reap_job(

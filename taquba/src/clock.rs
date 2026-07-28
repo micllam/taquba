@@ -46,8 +46,7 @@ impl Clock for SystemClock {
 /// `MockClock` is cheaply cloneable: every clone shares the same
 /// underlying value, so advancing one advances all of them. Pass a
 /// clone into `OpenOptions::clock` and keep the original around to
-/// call [`advance`](Self::advance) / [`set`](Self::set) from the test
-/// body.
+/// call [`advance`](Self::advance) from the test body.
 ///
 /// ```
 /// use std::time::Duration;
@@ -72,11 +71,6 @@ impl MockClock {
     /// clock, return the new value.
     pub fn advance(&self, by: Duration) {
         self.0.fetch_add(by.as_millis() as u64, Ordering::SeqCst);
-    }
-
-    /// Set the clock to an absolute millisecond value.
-    pub fn set(&self, ms: u64) {
-        self.0.store(ms, Ordering::SeqCst);
     }
 }
 
