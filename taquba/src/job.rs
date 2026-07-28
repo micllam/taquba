@@ -136,6 +136,41 @@ pub struct JobRecord {
 }
 
 impl JobRecord {
+    /// Construct a fresh record in the pending state with every other
+    /// field at its initial value.
+    pub(crate) fn new_pending(
+        id: String,
+        queue: String,
+        payload: Vec<u8>,
+        max_attempts: u32,
+        priority: u32,
+        enqueued_at: u64,
+    ) -> Self {
+        JobRecord {
+            id,
+            queue,
+            payload,
+            payload_ref: None,
+            headers: HashMap::new(),
+            status: JobStatus::Pending,
+            attempts: 0,
+            max_attempts,
+            enqueued_at,
+            claimed_at: None,
+            lease_expires_at: None,
+            run_at: None,
+            woken_at: None,
+            wake_payload: None,
+            priority,
+            last_error: None,
+            dedup_key: None,
+            completed_at: None,
+            failed_at: None,
+            cancel_requested: false,
+            cancel_token: None,
+        }
+    }
+
     /// Serialize the record in its stored form: when the payload is
     /// offloaded ([`Self::payload_ref`] is `Some`), the inline payload
     /// is excluded so state transitions never rewrite payload bytes.

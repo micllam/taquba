@@ -115,6 +115,17 @@ struct PersistedCursor {
 /// content-addressed key and put only the pointer in KV.
 pub const MAX_KV_VALUE_SIZE: usize = 256 * 1024;
 
+/// Validate a user KV value against [`MAX_KV_VALUE_SIZE`].
+fn validate_kv_value_size(value: &[u8]) -> Result<()> {
+    if value.len() > MAX_KV_VALUE_SIZE {
+        return Err(Error::KvValueTooLarge {
+            size: value.len(),
+            max: MAX_KV_VALUE_SIZE,
+        });
+    }
+    Ok(())
+}
+
 /// Validate a queue name against the key encoding's one-byte length
 /// field. Called at every public entry point that accepts a queue name.
 fn validate_queue_name(queue: &str) -> Result<()> {
@@ -800,12 +811,7 @@ impl Queue {
         kv_writes: HashMap<Vec<u8>, Vec<u8>>,
     ) -> Result<EnqueueResult> {
         for value in kv_writes.values() {
-            if value.len() > MAX_KV_VALUE_SIZE {
-                return Err(Error::KvValueTooLarge {
-                    size: value.len(),
-                    max: MAX_KV_VALUE_SIZE,
-                });
-            }
+            validate_kv_value_size(value)?;
         }
 
         let (job, key, id_override_used) = self.prepare_job_record(queue, payload, opts)?;
@@ -832,12 +838,7 @@ impl Queue {
     /// transition in one transaction, use [`Self::enqueue_with_kv`] or
     /// [`AckEffects::kv_writes`] via [`Self::ack_with`].
     pub async fn kv_put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        if value.len() > MAX_KV_VALUE_SIZE {
-            return Err(Error::KvValueTooLarge {
-                size: value.len(),
-                max: MAX_KV_VALUE_SIZE,
-            });
-        }
+        validate_kv_value_size(value)?;
         self.db.put(user_scoped_key(key), value).await?;
         Ok(())
     }
@@ -922,29 +923,18 @@ impl Queue {
             None => (JobStatus::Pending, pending_key(queue, priority, &id)),
         };
 
-        let job = JobRecord {
+        let mut job = JobRecord::new_pending(
             id,
-            queue: queue.to_string(),
+            queue.to_string(),
             payload,
-            payload_ref: None,
-            headers: opts.headers,
-            status,
-            attempts: 0,
             max_attempts,
-            enqueued_at: self.now_ms(),
-            claimed_at: None,
-            lease_expires_at: None,
-            run_at,
-            woken_at: None,
-            wake_payload: None,
             priority,
-            last_error: None,
-            dedup_key: opts.dedup_key,
-            completed_at: None,
-            failed_at: None,
-            cancel_requested: false,
-            cancel_token: None,
-        };
+            self.now_ms(),
+        );
+        job.headers = opts.headers;
+        job.status = status;
+        job.run_at = run_at;
+        job.dedup_key = opts.dedup_key;
 
         Ok((job, key, id_override_used))
     }
@@ -1595,12 +1585,7 @@ impl Queue {
         effects: AckEffects,
     ) -> Result<Vec<EnqueueResult>> {
         for value in effects.kv_writes.values() {
-            if value.len() > MAX_KV_VALUE_SIZE {
-                return Err(Error::KvValueTooLarge {
-                    size: value.len(),
-                    max: MAX_KV_VALUE_SIZE,
-                });
-            }
+            validate_kv_value_size(value)?;
         }
 
         let timer = crate::obs::start();
@@ -1934,46 +1919,14 @@ impl Queue {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<JobRecord>> {
-        validate_queue_name(queue)?;
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let prefix = dead_prefix(queue);
-        let mut jobs = Vec::with_capacity(limit);
-        let mut iter = self.db.scan_prefix(prefix, ..).await?;
-        while let Some(kv) = iter.next().await? {
-            let job: JobRecord = rmp_serde::from_slice(&kv.value)?;
-            if let Some(after_id) = after {
-                // Skip until past the cursor. Dead keys end with the job
-                // id, so the scan yields records in id order.
-                if job.id.as_str() <= after_id {
-                    continue;
-                }
-            }
-            jobs.push(job);
-            if jobs.len() >= limit {
-                break;
-            }
-        }
-        let mut out = Vec::with_capacity(jobs.len());
-        for mut job in jobs {
-            match self.materialize_payload(&mut job).await {
-                Ok(()) => out.push(job),
-                Err(Error::PayloadMissing { id }) => {
-                    // The scan can list a record just before the dead
-                    // retention sweep removes it, with the object fetch
-                    // running just after the sweep's payload-object
-                    // deletion. Re-check the record: a removed job is
-                    // omitted from the page, not reported as a lost
-                    // payload.
-                    if self.db.get(dead_key(queue, &id)).await?.is_some() {
-                        return Err(Error::PayloadMissing { id });
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(out)
+        // Dead keys are the queue's dead prefix followed by the job id,
+        // so an id cursor converts to the key cursor of the equivalent
+        // [`Self::list_jobs`] call.
+        let cursor = after.map(|id| dead_key(queue, id));
+        Ok(self
+            .list_jobs(queue, JobStatus::Dead, cursor.as_deref(), limit)
+            .await?
+            .jobs)
     }
 
     /// Return a page of the given queue's jobs in one lifecycle state.
@@ -2314,21 +2267,9 @@ impl Queue {
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
 
-            let index_key = job_index_key(id);
-            let current_key = match txn.get(&index_key).await? {
-                None => {
-                    txn.rollback();
-                    return Ok(CancelOutcome::NotFound);
-                }
-                Some(bytes) => bytes,
-            };
-
-            let mut job: JobRecord = match txn.get(&current_key).await? {
-                None => {
-                    txn.rollback();
-                    return Ok(CancelOutcome::NotFound);
-                }
-                Some(bytes) => rmp_serde::from_slice(&bytes)?,
+            let Some((index_key, current_key, mut job)) = get_indexed_job(&txn, id).await? else {
+                txn.rollback();
+                return Ok(CancelOutcome::NotFound);
             };
 
             let (msg, outcome, remove_from_registry) = match job.status {
@@ -2457,21 +2398,9 @@ impl Queue {
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
 
-            let index_key = job_index_key(id);
-            let current_key = match txn.get(&index_key).await? {
-                None => {
-                    txn.rollback();
-                    return Ok(WakeOutcome::NotFound);
-                }
-                Some(bytes) => bytes,
-            };
-
-            let mut job: JobRecord = match txn.get(&current_key).await? {
-                None => {
-                    txn.rollback();
-                    return Ok(WakeOutcome::NotFound);
-                }
-                Some(bytes) => rmp_serde::from_slice(&bytes)?,
+            let Some((index_key, current_key, mut job)) = get_indexed_job(&txn, id).await? else {
+                txn.rollback();
+                return Ok(WakeOutcome::NotFound);
             };
 
             if job.status != JobStatus::Scheduled {
@@ -2533,29 +2462,14 @@ impl Queue {
                 .generate()
                 .expect("monotonic ULID generator overflowed within one ms")
                 .to_string();
-            jobs.push(JobRecord {
+            jobs.push(JobRecord::new_pending(
                 id,
-                queue: queue.to_string(),
+                queue.to_string(),
                 payload,
-                payload_ref: None,
-                headers: HashMap::new(),
-                status: JobStatus::Pending,
-                attempts: 0,
                 max_attempts,
-                enqueued_at: now,
-                claimed_at: None,
-                lease_expires_at: None,
-                run_at: None,
-                woken_at: None,
-                wake_payload: None,
                 priority,
-                last_error: None,
-                dedup_key: None,
-                completed_at: None,
-                failed_at: None,
-                cancel_requested: false,
-                cancel_token: None,
-            });
+                now,
+            ));
         }
 
         // Offload oversized payloads before the transaction.
@@ -2641,6 +2555,25 @@ impl Queue {
         self.db.close().await?;
         Ok(())
     }
+}
+
+/// Resolve a job id through its index entry within `txn`: returns the
+/// index key, the record's current key and the decoded record, or
+/// `None` when the id is not indexed or the indexed key holds no
+/// record.
+async fn get_indexed_job(
+    txn: &DbTransaction,
+    id: &str,
+) -> Result<Option<(Vec<u8>, Bytes, JobRecord)>> {
+    let index_key = job_index_key(id);
+    let Some(current_key) = txn.get(&index_key).await? else {
+        return Ok(None);
+    };
+    let Some(bytes) = txn.get(&current_key).await? else {
+        return Ok(None);
+    };
+    let job: JobRecord = rmp_serde::from_slice(&bytes)?;
+    Ok(Some((index_key, current_key, job)))
 }
 
 /// Write each queue's claim-scan state under its cursor key. Runs
