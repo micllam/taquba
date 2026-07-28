@@ -46,10 +46,12 @@
 
 use std::sync::Arc;
 
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use taquba::object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, path::Path};
+use taquba::object_store::{
+    Error as ObjectStoreError, ObjectMeta, ObjectStore, ObjectStoreExt, path::Path,
+};
 
 use crate::error::{Error, Result};
 
@@ -88,11 +90,12 @@ impl MemoStore {
         }
     }
 
-    /// Read a previously stored value for `(run_id, step_number, key)`,
-    /// or `Ok(None)` if none has been written.
-    async fn get(&self, run_id: &str, step_number: u32, key: &str) -> Result<Option<Vec<u8>>> {
-        let path = self.memo_path(run_id, step_number, key);
-        match self.store.get(&path).await {
+    /// Read the object at `path`, or `Ok(None)` when it does not
+    /// exist. A missing object is not an error: the retention sweep
+    /// may remove any entry at any time and every reader tolerates
+    /// absence by re-executing.
+    async fn read_opt(&self, path: &Path) -> Result<Option<Vec<u8>>> {
+        match self.store.get(path).await {
             Ok(result) => {
                 let bytes = result.bytes().await?;
                 Ok(Some(bytes.to_vec()))
@@ -102,14 +105,26 @@ impl MemoStore {
         }
     }
 
+    /// Write `value` at `path`, overwriting any prior object.
+    async fn write(&self, path: &Path, value: &[u8]) -> Result<()> {
+        self.store.put(path, value.to_vec().into()).await?;
+        Ok(())
+    }
+
+    /// Read a previously stored value for `(run_id, step_number, key)`,
+    /// or `Ok(None)` if none has been written.
+    async fn get(&self, run_id: &str, step_number: u32, key: &str) -> Result<Option<Vec<u8>>> {
+        self.read_opt(&self.memo_path(run_id, step_number, key))
+            .await
+    }
+
     /// Store `value` against `(run_id, step_number, key)`. A subsequent
     /// `put` with the same key overwrites the prior value; on
     /// at-least-once retries this means the most recent attempt's
     /// value wins.
     async fn put(&self, run_id: &str, step_number: u32, key: &str, value: &[u8]) -> Result<()> {
-        let path = self.memo_path(run_id, step_number, key);
-        self.store.put(&path, value.to_vec().into()).await?;
-        Ok(())
+        self.write(&self.memo_path(run_id, step_number, key), value)
+            .await
     }
 
     /// Build a [`Memo`] bound to `(run_id, step_number)`.
@@ -159,15 +174,8 @@ impl MemoStore {
         step_number: u32,
         step_payload: &[u8],
     ) -> Result<Option<Vec<u8>>> {
-        let path = self.step_output_path(run_id, step_number, step_payload);
-        match self.store.get(&path).await {
-            Ok(result) => {
-                let bytes = result.bytes().await?;
-                Ok(Some(bytes.to_vec()))
-            }
-            Err(ObjectStoreError::NotFound { .. }) => Ok(None),
-            Err(err) => Err(Error::Store(err)),
-        }
+        self.read_opt(&self.step_output_path(run_id, step_number, step_payload))
+            .await
     }
 
     pub(crate) async fn put_step_output(
@@ -177,9 +185,11 @@ impl MemoStore {
         step_payload: &[u8],
         value: &[u8],
     ) -> Result<()> {
-        let path = self.step_output_path(run_id, step_number, step_payload);
-        self.store.put(&path, value.to_vec().into()).await?;
-        Ok(())
+        self.write(
+            &self.step_output_path(run_id, step_number, step_payload),
+            value,
+        )
+        .await
     }
 
     /// Write a terminal marker for `run_id` at `terminal_at_ms`. The
@@ -202,27 +212,7 @@ impl MemoStore {
     /// warning rather than failing the whole listing.
     pub async fn list_terminal_markers(&self) -> Result<Vec<TerminalMarker>> {
         let prefix = self.terminals_prefix();
-        let mut stream = self.store.list(Some(&prefix));
-        let mut out = Vec::new();
-        while let Some(item) = stream.next().await {
-            let meta = item.map_err(Error::Store)?;
-            let Some(name) = meta.location.filename() else {
-                continue;
-            };
-            match parse_terminal_marker_name(name) {
-                Some((terminal_at_ms, run_id)) => out.push(TerminalMarker {
-                    run_id,
-                    terminal_at_ms,
-                }),
-                None => {
-                    tracing::warn!(
-                        path = %meta.location,
-                        "unparseable terminal marker; skipping",
-                    );
-                }
-            }
-        }
-        Ok(out)
+        collect_markers(self.store.list(Some(&prefix)), None).await
     }
 
     /// List the terminal markers whose `terminal_at_ms` is strictly
@@ -242,33 +232,11 @@ impl MemoStore {
     ) -> Result<Vec<TerminalMarker>> {
         let prefix = self.terminals_prefix();
         // A marker at exactly `cutoff_ms` shares the offset's leading
-        // segment and is therefore listed; the parse-side filter below
-        // keeps the predicate strict.
+        // segment and is therefore listed; the parse-side filter in
+        // `collect_markers` keeps the predicate strict.
         let offset = prefix.clone().join(format!("{:020}", invert_ts(cutoff_ms)));
-        let mut stream = self.store.list_with_offset(Some(&prefix), &offset);
-        let mut out = Vec::new();
-        while let Some(item) = stream.next().await {
-            let meta = item.map_err(Error::Store)?;
-            let Some(name) = meta.location.filename() else {
-                continue;
-            };
-            match parse_terminal_marker_name(name) {
-                Some((terminal_at_ms, run_id)) if terminal_at_ms < cutoff_ms => {
-                    out.push(TerminalMarker {
-                        run_id,
-                        terminal_at_ms,
-                    })
-                }
-                Some(_) => {}
-                None => {
-                    tracing::warn!(
-                        path = %meta.location,
-                        "unparseable terminal marker; skipping",
-                    );
-                }
-            }
-        }
-        Ok(out)
+        let stream = self.store.list_with_offset(Some(&prefix), &offset);
+        collect_markers(stream, Some(cutoff_ms)).await
     }
 
     /// Delete the terminal marker identified by `marker`.
@@ -319,6 +287,41 @@ impl MemoStore {
 /// order equals numeric order.
 fn invert_ts(ms: u64) -> u64 {
     u64::MAX - ms
+}
+
+/// Collect [`TerminalMarker`]s from a marker listing stream. When
+/// `cutoff_ms` is set, only markers with `terminal_at_ms` strictly
+/// below it are kept. Markers whose filenames cannot be parsed are
+/// skipped with a warning rather than failing the listing.
+async fn collect_markers(
+    mut stream: impl Stream<Item = std::result::Result<ObjectMeta, ObjectStoreError>> + Unpin,
+    cutoff_ms: Option<u64>,
+) -> Result<Vec<TerminalMarker>> {
+    let mut out = Vec::new();
+    while let Some(item) = stream.next().await {
+        let meta = item.map_err(Error::Store)?;
+        let Some(name) = meta.location.filename() else {
+            continue;
+        };
+        match parse_terminal_marker_name(name) {
+            Some((terminal_at_ms, run_id))
+                if cutoff_ms.is_none_or(|cutoff| terminal_at_ms < cutoff) =>
+            {
+                out.push(TerminalMarker {
+                    run_id,
+                    terminal_at_ms,
+                });
+            }
+            Some(_) => {}
+            None => {
+                tracing::warn!(
+                    path = %meta.location,
+                    "unparseable terminal marker; skipping",
+                );
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// A terminal marker as returned by [`MemoStore::list_terminal_markers`].
