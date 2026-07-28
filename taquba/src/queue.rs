@@ -26,6 +26,7 @@ use crate::payload_store::PayloadStore;
 use crate::reaper::{Reaper, reap_expired};
 use crate::scheduler::{Scheduler, promote_due_jobs};
 use crate::stats::{QueueMergeOperator, QueueStats, read_stats, update_stats};
+use crate::txn::{put_job_record, take_claim};
 
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(30);
@@ -1174,8 +1175,7 @@ impl Queue {
         }
 
         let value = rmp_serde::to_vec_named(job)?;
-        txn.put(key, &value)?;
-        txn.put(job_index_key(&job.id), key)?;
+        put_job_record(txn, key, &job_index_key(&job.id), &value)?;
         if let Some(ref dkey) = dkey {
             txn.put(dkey, job.id.as_bytes())?;
         }
@@ -1421,42 +1421,33 @@ impl Queue {
             // Set when the scan ran out of pending keys before filling
             // the batch, proving nothing is live beyond the candidates.
             let mut drained = false;
-            if let Some(sf) = scan.scan_from.clone() {
+            let mut iter = match scan.scan_from.clone() {
                 // Resume from the recorded bound (after the last claimed key,
                 // or a key inserted behind it). The subrange is relative to the
                 // prefix, so scan_prefix ends at the prefix upper bound natively
                 // and a drained queue is detected without scanning beyond the
                 // prefix.
-                let suffix = sf.key.slice(prefix_bytes.len()..);
-                let start = if sf.inclusive {
-                    Bound::Included(suffix)
-                } else {
-                    Bound::Excluded(suffix)
-                };
-                let mut iter = txn
-                    .scan_prefix(prefix_bytes, (start, Bound::Unbounded))
-                    .await?;
-                while candidates.len() < max_jobs {
-                    match iter.next().await? {
-                        Some(c) => candidates.push(c),
-                        None => {
-                            drained = true;
-                            break;
-                        }
-                    }
+                Some(sf) => {
+                    let suffix = sf.key.slice(prefix_bytes.len()..);
+                    let start = if sf.inclusive {
+                        Bound::Included(suffix)
+                    } else {
+                        Bound::Excluded(suffix)
+                    };
+                    txn.scan_prefix(prefix_bytes, (start, Bound::Unbounded))
+                        .await?
                 }
-            } else {
                 // Front scan: bound unknown (cold start or process
                 // restart), so pre-existing keys may be live anywhere
                 // in the prefix.
-                let mut iter = txn.scan_prefix(prefix_bytes, ..).await?;
-                while candidates.len() < max_jobs {
-                    match iter.next().await? {
-                        Some(c) => candidates.push(c),
-                        None => {
-                            drained = true;
-                            break;
-                        }
+                None => txn.scan_prefix(prefix_bytes, ..).await?,
+            };
+            while candidates.len() < max_jobs {
+                match iter.next().await? {
+                    Some(c) => candidates.push(c),
+                    None => {
+                        drained = true;
+                        break;
                     }
                 }
             }
@@ -1495,8 +1486,7 @@ impl Queue {
                 let value = rmp_serde::to_vec_named(&job)?;
 
                 txn.delete(&kv.key)?;
-                txn.put(&claimed, &value)?;
-                txn.put(job_index_key(&job.id), &claimed)?;
+                put_job_record(&txn, &claimed, &job_index_key(&job.id), &value)?;
                 if let Some(dk) = dedup_key_to_release.as_deref() {
                     txn.delete(dedup_index_key(&job.queue, dk))?;
                 }
@@ -1654,11 +1644,9 @@ impl Queue {
         let outcome: Result<Vec<EnqueueResult>> = async {
             loop {
                 let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-                txn.get(&claimed).await?.ok_or(Error::ClaimLost)?;
-                txn.delete(&claimed)?;
+                take_claim(&txn, &claimed).await?;
                 if let Some((ref done_k, ref done_v)) = done_record {
-                    txn.put(done_k, done_v)?;
-                    txn.put(job_index_key(&job.id), done_k)?;
+                    put_job_record(&txn, done_k, &job_index_key(&job.id), done_v)?;
                     append_attempt(
                         &txn,
                         &job.id,
@@ -1749,8 +1737,7 @@ impl Queue {
 
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            txn.get(&claimed).await?.ok_or(Error::ClaimLost)?;
-            txn.delete(&claimed)?;
+            take_claim(&txn, &claimed).await?;
             append_attempt(
                 &txn,
                 &job.id,
@@ -1772,8 +1759,7 @@ impl Queue {
                 job.failed_at = Some(self.now_ms());
                 let dead = dead_key(&job.queue, &job.id);
                 let value = job.stored_bytes()?;
-                txn.put(&dead, &value)?;
-                txn.put(job_index_key(&job.id), &dead)?;
+                put_job_record(&txn, &dead, &job_index_key(&job.id), &value)?;
                 update_stats(
                     &txn,
                     &job.queue,
@@ -1797,8 +1783,7 @@ impl Queue {
                     let priority = job.priority;
                     let pending = pending_key(&job.queue, priority, &job.id);
                     let value = job.stored_bytes()?;
-                    txn.put(&pending, &value)?;
-                    txn.put(job_index_key(&job.id), &pending)?;
+                    put_job_record(&txn, &pending, &job_index_key(&job.id), &value)?;
                     update_stats(
                         &txn,
                         &job.queue,
@@ -1816,8 +1801,7 @@ impl Queue {
                     job.run_at = Some(run_at);
                     let scheduled = scheduled_key(&job.queue, run_at, &job.id);
                     let value = job.stored_bytes()?;
-                    txn.put(&scheduled, &value)?;
-                    txn.put(job_index_key(&job.id), &scheduled)?;
+                    put_job_record(&txn, &scheduled, &job_index_key(&job.id), &value)?;
                     update_stats(
                         &txn,
                         &job.queue,
@@ -1888,10 +1872,8 @@ impl Queue {
 
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            txn.get(&claimed).await?.ok_or(Error::ClaimLost)?;
-            txn.delete(&claimed)?;
-            txn.put(&dead, &value)?;
-            txn.put(job_index_key(&job.id), &dead)?;
+            take_claim(&txn, &claimed).await?;
+            put_job_record(&txn, &dead, &job_index_key(&job.id), &value)?;
             append_attempt(
                 &txn,
                 &job.id,
@@ -2135,8 +2117,7 @@ impl Queue {
             .await?
             .ok_or_else(|| Error::JobNotFound(job.id.clone()))?;
         txn.delete(&dead)?;
-        txn.put(&pending, &value)?;
-        txn.put(job_index_key(&job.id), &pending)?;
+        put_job_record(&txn, &pending, &job_index_key(&job.id), &value)?;
         // The history is kept across the revival; the marker separates
         // entries recorded before it from the reset attempt counter.
         append_attempt(
@@ -2192,10 +2173,8 @@ impl Queue {
 
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            txn.get(&old_claimed).await?.ok_or(Error::ClaimLost)?;
-            txn.delete(&old_claimed)?;
-            txn.put(&new_claimed, &value)?;
-            txn.put(job_index_key(&job.id), &new_claimed)?;
+            take_claim(&txn, &old_claimed).await?;
+            put_job_record(&txn, &new_claimed, &job_index_key(&job.id), &value)?;
             match txn.commit().await {
                 Ok(_) => break,
                 Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
@@ -2507,8 +2486,7 @@ impl Queue {
             job.wake_payload = wake_payload.clone();
             let pending = pending_key(&job.queue, job.priority, &job.id);
             let value = rmp_serde::to_vec_named(&job)?;
-            txn.put(&pending, &value)?;
-            txn.put(&index_key, &pending)?;
+            put_job_record(&txn, &pending, &index_key, &value)?;
             update_stats(
                 &txn,
                 &job.queue,
@@ -2589,8 +2567,7 @@ impl Queue {
             for job in &jobs {
                 let key = pending_key(queue, priority, &job.id);
                 let value = rmp_serde::to_vec_named(job)?;
-                txn.put(&key, &value)?;
-                txn.put(job_index_key(&job.id), &key)?;
+                put_job_record(&txn, &key, &job_index_key(&job.id), &value)?;
                 ids.push(job.id.clone());
             }
             update_stats(&txn, queue, &[(JobStatus::Pending, ids.len() as i64)])?;

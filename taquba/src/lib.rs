@@ -249,6 +249,7 @@ mod queue;
 mod reaper;
 mod scheduler;
 mod stats;
+mod txn;
 /// Worker-loop primitives: the [`worker::Worker`] trait, plus the
 /// [`worker::run_worker`] / [`worker::run_worker_concurrent`] drivers that
 /// own the claim -> process -> ack/nack lifecycle and graceful shutdown.

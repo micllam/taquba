@@ -12,6 +12,7 @@ use crate::error::Result;
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{KeyTag, job_index_key, parse_key_timestamp, pending_key, tag_prefix};
 use crate::stats::update_stats;
+use crate::txn::put_job_record;
 
 pub(crate) struct Scheduler {
     pub(crate) db: Arc<Db>,
@@ -105,8 +106,7 @@ async fn promote_job(
         let priority = job.priority;
         let pending = pending_key(&job.queue, priority, &job.id);
         let value = rmp_serde::to_vec_named(&job)?;
-        txn.put(&pending, &value)?;
-        txn.put(job_index_key(&job.id), &pending)?;
+        put_job_record(&txn, &pending, &job_index_key(&job.id), &value)?;
         update_stats(
             &txn,
             &job.queue,

@@ -19,6 +19,7 @@ use crate::keys::{
 use crate::payload_store::PayloadStore;
 use crate::queue::QueueConfig;
 use crate::stats::update_stats;
+use crate::txn::put_job_record;
 
 pub(crate) struct Reaper {
     pub(crate) db: Arc<Db>,
@@ -178,8 +179,7 @@ async fn reap_job(
             )?;
             let dead = dead_key(&job.queue, &job.id);
             let value = rmp_serde::to_vec_named(&job)?;
-            txn.put(&dead, &value)?;
-            txn.put(job_index_key(&job.id), &dead)?;
+            put_job_record(&txn, &dead, &job_index_key(&job.id), &value)?;
             update_stats(
                 &txn,
                 &job.queue,
@@ -198,8 +198,7 @@ async fn reap_job(
             let priority = job.priority;
             let pending = pending_key(&job.queue, priority, &job.id);
             let value = rmp_serde::to_vec_named(&job)?;
-            txn.put(&pending, &value)?;
-            txn.put(job_index_key(&job.id), &pending)?;
+            put_job_record(&txn, &pending, &job_index_key(&job.id), &value)?;
             append_attempt(
                 &txn,
                 &job.id,
