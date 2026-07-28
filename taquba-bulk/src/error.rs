@@ -9,10 +9,6 @@ pub enum Error {
     #[error(transparent)]
     Workflow(#[from] taquba_workflow::Error),
 
-    /// An error from a direct Taquba queue operation.
-    #[error(transparent)]
-    Queue(#[from] taquba::Error),
-
     /// Reading an input source or writing an output sink failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

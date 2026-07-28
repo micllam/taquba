@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The `object_store` types in the public API are now `object_store` 0.14.
 
+### Removed
+
+- **Breaking:** the `Error::Queue` variant and its
+  `From<taquba::Error>` conversion. No code path constructed it: the
+  crate performs no direct queue operations, and queue failures inside
+  the workflow runtime surface as `Error::Workflow`.
+
 ## [0.3.0] - 2026-06-23
 
 ### Changed
