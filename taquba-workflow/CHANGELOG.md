@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prepares for additional trigger kinds without further variant growth. The
   stored step-output replay record format changes accordingly.
 - The `object_store` types in the public API are now `object_store` 0.14.
+- A failure to serialize the durable run record during submit now surfaces
+  as `Error::Serialization` instead of `Error::Queue`. Both classify as
+  permanent; only the variant changed.
 
 ## [0.7.0] - 2026-06-23
 

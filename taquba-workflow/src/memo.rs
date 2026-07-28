@@ -111,22 +111,6 @@ impl MemoStore {
         Ok(())
     }
 
-    /// Read a previously stored value for `(run_id, step_number, key)`,
-    /// or `Ok(None)` if none has been written.
-    async fn get(&self, run_id: &str, step_number: u32, key: &str) -> Result<Option<Vec<u8>>> {
-        self.read_opt(&self.memo_path(run_id, step_number, key))
-            .await
-    }
-
-    /// Store `value` against `(run_id, step_number, key)`. A subsequent
-    /// `put` with the same key overwrites the prior value; on
-    /// at-least-once retries this means the most recent attempt's
-    /// value wins.
-    async fn put(&self, run_id: &str, step_number: u32, key: &str, value: &[u8]) -> Result<()> {
-        self.write(&self.memo_path(run_id, step_number, key), value)
-            .await
-    }
-
     /// Build a [`Memo`] bound to `(run_id, step_number)`.
     pub fn new_memo(&self, run_id: impl Into<String>, step_number: u32) -> Memo {
         Memo::new(self.clone(), run_id, step_number)
@@ -365,7 +349,9 @@ impl Memo {
     /// Read a previously stored value for `key`, or `Ok(None)` if
     /// none has been written.
     pub async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        self.store.get(&self.run_id, self.step_number, key).await
+        self.store
+            .read_opt(&self.store.memo_path(&self.run_id, self.step_number, key))
+            .await
     }
 
     /// Store `value` for `key`, overwriting any prior value.
@@ -376,7 +362,10 @@ impl Memo {
     /// reflects whatever the most recent attempt wrote.
     pub async fn put(&self, key: &str, value: &[u8]) -> Result<()> {
         self.store
-            .put(&self.run_id, self.step_number, key, value)
+            .write(
+                &self.store.memo_path(&self.run_id, self.step_number, key),
+                value,
+            )
             .await
     }
 

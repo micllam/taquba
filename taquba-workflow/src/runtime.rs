@@ -454,7 +454,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
             terminal_hook: self.terminal_hook,
             max_concurrent_steps: self.max_concurrent_steps,
             poll_interval: self.poll_interval,
-            registry: Mutex::new(HashMap::new()),
+            registry: std::sync::Mutex::new(HashMap::new()),
             submit_locks: std::sync::Mutex::new(HashMap::new()),
             memo_store,
             memo_retention: self.memo_retention,
@@ -487,7 +487,10 @@ struct RuntimeInner<R, H> {
     terminal_hook: H,
     max_concurrent_steps: usize,
     poll_interval: Duration,
-    registry: Mutex<HashMap<String, RegistryEntry>>,
+    /// Never held across an await: every access reads or mutates the
+    /// map synchronously and drops the guard before the next await
+    /// point.
+    registry: std::sync::Mutex<HashMap<String, RegistryEntry>>,
     /// Per-run-id submission locks. Each lock is held across the
     /// duplicate checks and the step-0 enqueue of its run, so two
     /// concurrent submits of the same run cannot both pass the checks
@@ -612,7 +615,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         let input_hash = hash_input(&spec.input);
 
         {
-            let registry = self.inner.registry.lock().await;
+            let registry = self.inner.registry.lock().unwrap();
             if let Some(entry) = registry.get(run_id) {
                 // Worker-resumed entries have no stored hash; fall through
                 // to the durable-record check below, which always carries
@@ -660,8 +663,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             run_id: run_id.to_string(),
             submitted_at_ms: self.inner.clock.now_ms(),
             input_hash,
-        })
-        .map_err(taquba::Error::from)?;
+        })?;
         let kv = HashMap::from([(run_kv_key(run_id), record_bytes)]);
 
         let job_id = match self
@@ -685,7 +687,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             }
         };
 
-        self.inner.registry.lock().await.insert(
+        self.inner.registry.lock().unwrap().insert(
             run_id.to_string(),
             RegistryEntry {
                 status: RunStatus {
@@ -716,7 +718,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// position; the cancellation overlay wins over `Pending`/`Running`
     /// until the terminal hook fires.
     pub async fn status(&self, run_id: &str) -> Option<RunStatus> {
-        self.inner.registry.lock().await.get(run_id).map(|e| {
+        self.inner.registry.lock().unwrap().get(run_id).map(|e| {
             let mut status = e.status.clone();
             if e.cancel_requested {
                 status.state = RunState::Cancelling;
@@ -752,7 +754,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// outcome it already delivered, and no additional hook fires.
     pub async fn cancel(&self, run_id: &str) -> Result<bool> {
         let (job_id, headers, current_step) = {
-            let mut registry = self.inner.registry.lock().await;
+            let mut registry = self.inner.registry.lock().unwrap();
             let Some(entry) = registry.get_mut(run_id) else {
                 return Ok(false);
             };
@@ -1062,7 +1064,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     /// future submit). A settlement that fails redelivers the step,
     /// which re-terminates and retries the delete.
     async fn terminate_collecting_effects(&self, outcome: RunOutcome) -> AckEffects {
-        self.registry.lock().await.remove(&outcome.run_id);
+        self.registry.lock().unwrap().remove(&outcome.run_id);
         if self.memo_retention.is_some()
             && let Err(err) = self
                 .memo_store
@@ -1157,7 +1159,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         job_id: &str,
         user_headers: &HashMap<String, String>,
     ) -> CancellationToken {
-        let mut registry = self.registry.lock().await;
+        let mut registry = self.registry.lock().unwrap();
         match registry.get_mut(run_id) {
             Some(entry) => {
                 entry.status.state = RunState::Running;
@@ -1321,7 +1323,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         let external_cancel = self
             .registry
             .lock()
-            .await
+            .unwrap()
             .get(&run_id)
             .is_some_and(|e| e.cancel_requested);
 
@@ -1510,7 +1512,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             self.step_enqueue_request(run_id, next_step, payload, user_headers, opts);
         let kv_writes = kv_writes(&next_job_id);
         // Make sure to preserve `cancel_requested`.
-        if let Some(entry) = self.registry.lock().await.get_mut(run_id) {
+        if let Some(entry) = self.registry.lock().unwrap().get_mut(run_id) {
             entry.status.state = RunState::Pending;
             entry.status.current_step = next_step;
             entry.current_job_id = next_job_id;
