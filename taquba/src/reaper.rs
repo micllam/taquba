@@ -309,32 +309,7 @@ async fn sweep_done(
     drop(iter);
 
     for (key, id, payload_ref) in victims {
-        let txn = db.begin(IsolationLevel::Snapshot).await?;
-        // Re-check existence; could have been swept by a previous tick.
-        let existed = txn.get(&key).await?.is_some();
-        if existed {
-            txn.delete(&key)?;
-            txn.delete(job_index_key(&id))?;
-            txn.delete(attempt_history_key(&id))?;
-        }
-        // Retention deletes do not await WAL durability: a commit lost
-        // in a crash leaves the record in place for the next sweep,
-        // and the existence re-check above keeps the rerun idempotent.
-        let write_opts = WriteOptions {
-            await_durable: false,
-            ..WriteOptions::default()
-        };
-        match txn.commit_with_options(&write_opts).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
-            Err(e) => return Err(e.into()),
-        }
-        // The payload object is deleted only after the record-removing
-        // commit, so a crash in between leaves an orphaned object, never
-        // a live record whose payload is gone.
-        if existed && let Some(ref payload_ref) = payload_ref {
-            payload_store.delete_best_effort(payload_ref, &id).await;
-        }
+        sweep_victim(db, payload_store, &key, &id, payload_ref.as_deref(), None).await?;
     }
     Ok(())
 }
@@ -378,35 +353,61 @@ async fn sweep_dead(
     drop(iter);
 
     for (key, queue, id, payload_ref) in victims {
-        let txn = db.begin(IsolationLevel::Snapshot).await?;
-        let existed = txn.get(&key).await?.is_some();
-        if existed {
-            txn.delete(&key)?;
-            txn.delete(job_index_key(&id))?;
-            txn.delete(attempt_history_key(&id))?;
-            // Decrement the dead counter so QueueStats::dead reflects the live
-            // size of the dead-letter inbox, consistent with how requeue
-            // already adjusts it.
-            update_stats(&txn, &queue, &[(JobStatus::Dead, -1)])?;
+        sweep_victim(
+            db,
+            payload_store,
+            &key,
+            &id,
+            payload_ref.as_deref(),
+            Some(&queue),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Delete one expired record in its own transaction: re-check that the
+/// record still exists, then remove it together with its job index
+/// entry and attempt history and, when `dead_stats_queue` is set,
+/// decrement that queue's dead counter so `QueueStats::dead` reflects
+/// the live size of the dead-letter inbox.
+///
+/// The commit does not await WAL durability: a commit lost in a crash
+/// leaves the record in place for the next sweep and the existence
+/// re-check keeps the rerun idempotent, including the counter
+/// decrement. A conflicting commit leaves the victim to the next
+/// sweep. The payload object is deleted only after the commit, so a
+/// crash in between leaves an orphaned object, never a live record
+/// whose payload is gone.
+async fn sweep_victim(
+    db: &Db,
+    payload_store: &PayloadStore,
+    key: &[u8],
+    id: &str,
+    payload_ref: Option<&str>,
+    dead_stats_queue: Option<&str>,
+) -> Result<()> {
+    let txn = db.begin(IsolationLevel::Snapshot).await?;
+    let existed = txn.get(key).await?.is_some();
+    if existed {
+        txn.delete(key)?;
+        txn.delete(job_index_key(id))?;
+        txn.delete(attempt_history_key(id))?;
+        if let Some(queue) = dead_stats_queue {
+            update_stats(&txn, queue, &[(JobStatus::Dead, -1)])?;
         }
-        // Retention deletes do not await WAL durability: a commit lost
-        // in a crash leaves the record in place for the next sweep,
-        // and the existence re-check above keeps the rerun idempotent,
-        // including the dead counter decrement.
-        let write_opts = WriteOptions {
-            await_durable: false,
-            ..WriteOptions::default()
-        };
-        match txn.commit_with_options(&write_opts).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
-            Err(e) => return Err(e.into()),
-        }
-        // The payload object is deleted only after the record-removing
-        // commit; see the matching comment in `sweep_done`.
-        if existed && let Some(ref payload_ref) = payload_ref {
-            payload_store.delete_best_effort(payload_ref, &id).await;
-        }
+    }
+    let write_opts = WriteOptions {
+        await_durable: false,
+        ..WriteOptions::default()
+    };
+    match txn.commit_with_options(&write_opts).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == slatedb::ErrorKind::Transaction => return Ok(()),
+        Err(e) => return Err(e.into()),
+    }
+    if existed && let Some(payload_ref) = payload_ref {
+        payload_store.delete_best_effort(payload_ref, id).await;
     }
     Ok(())
 }
