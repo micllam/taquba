@@ -146,29 +146,15 @@ impl<T> BulkCtx<T> {
         F: Future<Output = Result<R, E>>,
         E: From<StepError>,
     {
-        match self.memo.get(key).await {
-            Ok(Some(bytes)) => match rmp_serde::from_slice::<R>(&bytes) {
-                Ok(value) => return Ok(value),
-                Err(err) => {
-                    // Self-healing: a cached entry we can't decode is treated
-                    // as a miss so `f` recomputes and overwrites it.
-                    tracing::warn!(
-                        run_id = %self.run_id,
-                        key = %key,
-                        error = %err,
-                        "memoized cache entry failed to deserialize; recomputing",
-                    );
-                }
-            },
-            Ok(None) => {}
-            Err(err) => return Err(E::from(memo_error(err))),
+        if let Some(value) = self
+            .decode_cached::<R>(self.memo.get(key).await, Some(key))
+            .map_err(E::from)?
+        {
+            return Ok(value);
         }
 
         let value = f.await?;
-        // A serialization failure is deterministic, so a retry produces the
-        // same error; fail permanently.
-        let bytes = rmp_serde::to_vec_named(&value)
-            .map_err(|e| E::from(StepError::permanent(format!("memo serialize failed: {e}"))))?;
+        let bytes = encode_memo_value(&value).map_err(E::from)?;
         self.memo
             .put(key, &bytes)
             .await
@@ -201,24 +187,15 @@ impl<T> BulkCtx<T> {
         F: Future<Output = Result<R, E>>,
         E: From<StepError>,
     {
-        match self.memo.content_get(input).await {
-            Ok(Some(bytes)) => match rmp_serde::from_slice::<R>(&bytes) {
-                Ok(value) => return Ok(value),
-                Err(err) => {
-                    tracing::warn!(
-                        run_id = %self.run_id,
-                        error = %err,
-                        "content-addressed memoized cache entry failed to deserialize; recomputing",
-                    );
-                }
-            },
-            Ok(None) => {}
-            Err(err) => return Err(E::from(memo_error(err))),
+        if let Some(value) = self
+            .decode_cached::<R>(self.memo.content_get(input).await, None)
+            .map_err(E::from)?
+        {
+            return Ok(value);
         }
 
         let value = f.await?;
-        let bytes = rmp_serde::to_vec_named(&value)
-            .map_err(|e| E::from(StepError::permanent(format!("memo serialize failed: {e}"))))?;
+        let bytes = encode_memo_value(&value).map_err(E::from)?;
         self.memo
             .content_put(input, &bytes)
             .await
@@ -288,12 +265,56 @@ impl<T> BulkCtx<T> {
     pub(crate) fn cost(&self) -> CostReport {
         self.cost.clone()
     }
+
+    /// Decode a cached memo entry: `Ok(Some(value))` on a hit,
+    /// `Ok(None)` on a miss, and `Err` when the memo read itself
+    /// failed. An entry that fails to deserialize is treated as a miss
+    /// (self-healing: the caller recomputes and overwrites it), logged
+    /// with `key` when the entry is key-addressed.
+    fn decode_cached<R: DeserializeOwned>(
+        &self,
+        cached: taquba_workflow::Result<Option<Vec<u8>>>,
+        key: Option<&str>,
+    ) -> Result<Option<R>, StepError> {
+        let bytes = match cached {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(None),
+            Err(err) => return Err(memo_error(err)),
+        };
+        match rmp_serde::from_slice::<R>(&bytes) {
+            Ok(value) => Ok(Some(value)),
+            Err(err) => {
+                match key {
+                    Some(key) => tracing::warn!(
+                        run_id = %self.run_id,
+                        key = %key,
+                        error = %err,
+                        "memoized cache entry failed to deserialize; recomputing",
+                    ),
+                    None => tracing::warn!(
+                        run_id = %self.run_id,
+                        error = %err,
+                        "content-addressed memoized cache entry failed to deserialize; recomputing",
+                    ),
+                }
+                Ok(None)
+            }
+        }
+    }
 }
 
 /// Map a workflow/object-store memo error to a [`StepError`], preserving the
 /// transient/permanent classification.
 fn memo_error(err: taquba_workflow::Error) -> StepError {
     err.into()
+}
+
+/// Serialize a computed value for the memo. A serialization failure is
+/// deterministic, so a retry produces the same error and the failure
+/// is classified permanent.
+fn encode_memo_value<R: Serialize>(value: &R) -> Result<Vec<u8>, StepError> {
+    rmp_serde::to_vec_named(value)
+        .map_err(|e| StepError::permanent(format!("memo serialize failed: {e}")))
 }
 
 #[cfg(test)]
