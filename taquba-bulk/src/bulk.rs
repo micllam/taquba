@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::error::{Error, Result};
-use crate::io::{NullSink, OutputRecord, OutputSink, output_to_value};
+use crate::io::{NullSink, OutputRecord, OutputSink};
 use crate::pipeline::Pipeline;
 use crate::progress::{BulkReport, ProgressSnapshot, ProgressState};
 use crate::runner::{ItemEnvelope, PipelineRunner};
@@ -74,7 +74,10 @@ where
         let (output, cost) = match status {
             TerminalStatus::Succeeded => match &outcome.result {
                 Some(bytes) => match rmp_serde::from_slice::<ItemEnvelope<O>>(bytes) {
-                    Ok(envelope) => (output_to_value(&envelope.output).ok(), Some(envelope.cost)),
+                    Ok(envelope) => (
+                        serde_json::to_value(&envelope.output).ok(),
+                        Some(envelope.cost),
+                    ),
                     Err(err) => {
                         warn!(
                             run_id = %outcome.run_id,
@@ -224,7 +227,7 @@ impl<P: Pipeline> BulkBuilder<P> {
             sink: sink.clone(),
             _output: PhantomData,
         };
-        let runner = PipelineRunner::new(Arc::new(self.pipeline));
+        let runner = PipelineRunner::new(self.pipeline);
         let runtime = WorkflowRuntime::builder(self.queue, self.object_store, runner, hook)
             .queue_name(self.queue_name)
             .memo_prefix(self.memo_prefix)

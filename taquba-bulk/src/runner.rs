@@ -1,7 +1,5 @@
 //! Adapter that drives a [`Pipeline`] as a single [`taquba_workflow`] step.
 
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 use taquba_workflow::{Step, StepError, StepOutcome, StepRunner};
 
@@ -24,11 +22,11 @@ pub(crate) struct ItemEnvelope<O> {
 /// lives inside [`Pipeline::run`] via [`BulkCtx::memoized`]; the runner never
 /// emits [`StepOutcome::Continue`].
 pub(crate) struct PipelineRunner<P> {
-    pipeline: Arc<P>,
+    pipeline: P,
 }
 
 impl<P> PipelineRunner<P> {
-    pub(crate) fn new(pipeline: Arc<P>) -> Self {
+    pub(crate) fn new(pipeline: P) -> Self {
         Self { pipeline }
     }
 }
@@ -63,6 +61,7 @@ impl<P: Pipeline> StepRunner for PipelineRunner<P> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use taquba::object_store::memory::InMemory;
     use taquba_workflow::MemoStore;
     use tokio_util::sync::CancellationToken;
@@ -110,7 +109,7 @@ mod tests {
 
     #[tokio::test]
     async fn runs_pipeline_and_encodes_envelope() {
-        let runner = PipelineRunner::new(Arc::new(Doubler));
+        let runner = PipelineRunner::new(Doubler);
         let step = step_with_input(rmp_serde::to_vec_named(&21u32).unwrap());
 
         let outcome = runner.run_step(&step).await.unwrap();
@@ -124,7 +123,7 @@ mod tests {
 
     #[tokio::test]
     async fn undecodable_input_is_permanent() {
-        let runner = PipelineRunner::new(Arc::new(Doubler));
+        let runner = PipelineRunner::new(Doubler);
         // A string where a u32 is expected: msgpack decode fails.
         let step = step_with_input(rmp_serde::to_vec_named(&"not a number").unwrap());
         let err = runner.run_step(&step).await.unwrap_err();
@@ -133,7 +132,7 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_error_propagates_as_step_error() {
-        let runner = PipelineRunner::new(Arc::new(AlwaysFails));
+        let runner = PipelineRunner::new(AlwaysFails);
         let step = step_with_input(rmp_serde::to_vec_named(&1u32).unwrap());
         let err = runner.run_step(&step).await.unwrap_err();
         assert_eq!(err.message, "nope");

@@ -158,7 +158,7 @@ impl<T> BulkCtx<T> {
         self.memo
             .put(key, &bytes)
             .await
-            .map_err(|e| E::from(memo_error(e)))?;
+            .map_err(|e| E::from(StepError::from(e)))?;
         Ok(value)
     }
 
@@ -199,7 +199,7 @@ impl<T> BulkCtx<T> {
         self.memo
             .content_put(input, &bytes)
             .await
-            .map_err(|e| E::from(memo_error(e)))?;
+            .map_err(|e| E::from(StepError::from(e)))?;
         Ok(value)
     }
 
@@ -279,7 +279,7 @@ impl<T> BulkCtx<T> {
         let bytes = match cached {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return Ok(None),
-            Err(err) => return Err(memo_error(err)),
+            Err(err) => return Err(err.into()),
         };
         match rmp_serde::from_slice::<R>(&bytes) {
             Ok(value) => Ok(Some(value)),
@@ -301,12 +301,6 @@ impl<T> BulkCtx<T> {
             }
         }
     }
-}
-
-/// Map a workflow/object-store memo error to a [`StepError`], preserving the
-/// transient/permanent classification.
-fn memo_error(err: taquba_workflow::Error) -> StepError {
-    err.into()
 }
 
 /// Serialize a computed value for the memo. A serialization failure is

@@ -9,7 +9,6 @@
 use std::io::{BufRead, Write};
 use std::sync::Mutex;
 
-use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
@@ -114,16 +113,10 @@ impl OutputSink for NullSink {
     }
 }
 
-/// Convert a serializable pipeline output into a JSON value for an
-/// [`OutputRecord`].
-pub(crate) fn output_to_value<O: Serialize>(output: &O) -> Result<Value> {
-    Ok(serde_json::to_value(output)?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct Item {
