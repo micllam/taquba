@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Breaking:** the `Error::Queue` variant and its
+  `From<taquba::Error>` conversion. No code path constructed it:
+  enqueue failures inside the scheduler loop are logged and dropped by
+  documented policy, so only `InvalidExpression` and `DuplicateName`
+  are reachable.
+- **Breaking:** `Error::is_permanent`. With `Error::Queue` gone it
+  returned `true` for every variant; both remaining variants are
+  permanent configuration errors, as the enum documentation now
+  states.
+
 ## [0.5.0] - 2026-06-23
 
 ### Changed
