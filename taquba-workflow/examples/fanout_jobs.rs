@@ -173,10 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Typed-jobs layer, sharing the queue with the workflow runtime
     // below. The runner's dispatch worker runs until shutdown.
-    let mut jobs = JobRunner::builder()
-        .queue(queue.clone())
-        .object_store(store.clone())
-        .build()?;
+    let mut jobs = JobRunner::builder(queue.clone(), store.clone()).build();
     jobs.register::<FetchPage>();
     let jobs_handle = jobs.spawn(std::future::pending::<()>());
     let jobs = Arc::new(jobs);

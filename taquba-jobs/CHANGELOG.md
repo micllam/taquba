@@ -9,8 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The `object_store` types in the public API (for example
-  `JobRunnerBuilder::object_store`) are now `object_store` 0.14.
+- **Breaking:** `JobRunner::builder` takes the required dependencies
+  positionally as `builder(queue, object_store)`, and
+  `JobRunnerBuilder::build` is infallible (it returns `JobRunner`
+  instead of `Result<JobRunner>`). The `JobRunnerBuilder::queue` and
+  `JobRunnerBuilder::object_store` setters are removed along with the
+  now-unreachable `Error::MissingQueue` and `Error::MissingObjectStore`
+  variants.
+- The `object_store` types in the public API (for example the store
+  passed to `JobRunner::builder`) are now `object_store` 0.14.
 
 ## [0.5.0] - 2026-06-23
 

@@ -9,16 +9,6 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// [`JobRunnerBuilder::build`](crate::JobRunnerBuilder::build) was called
-    /// without a queue configured.
-    #[error("a queue is required to build a JobRunner")]
-    MissingQueue,
-
-    /// [`JobRunnerBuilder::build`](crate::JobRunnerBuilder::build) was called
-    /// without an object store configured.
-    #[error("an object store is required to build a JobRunner")]
-    MissingObjectStore,
-
     /// An operation on the underlying taquba queue failed.
     #[error("queue error: {0}")]
     Queue(#[from] taquba::Error),
@@ -57,17 +47,15 @@ pub enum Error {
 impl Error {
     /// True if this error has no chance of succeeding on retry.
     ///
-    /// Builder misconfiguration (`MissingQueue`, `MissingObjectStore`),
-    /// `(De)serialization` failures, `JobNotFound`, and
-    /// `ReservedHeader` are all permanent: the caller's input would
-    /// have to change for the operation to succeed. `Store(_)` is
-    /// conservatively treated as transient (object-store I/O can
-    /// blip). `Queue(_)` delegates to [`taquba::Error::is_permanent`].
+    /// `(De)serialization` failures, `JobNotFound` and `ReservedHeader`
+    /// are all permanent: the caller's input would have to change for
+    /// the operation to succeed. `Store(_)` is conservatively treated
+    /// as transient (object-store I/O can fail intermittently).
+    /// `Queue(_)` delegates
+    /// to [`taquba::Error::is_permanent`].
     pub fn is_permanent(&self) -> bool {
         match self {
-            Self::MissingQueue
-            | Self::MissingObjectStore
-            | Self::Encode(_)
+            Self::Encode(_)
             | Self::Decode(_)
             | Self::JobNotFound(_)
             | Self::ReservedHeader(_)
@@ -87,8 +75,6 @@ mod tests {
 
     #[test]
     fn jobs_variants_are_permanent() {
-        assert!(Error::MissingQueue.is_permanent());
-        assert!(Error::MissingObjectStore.is_permanent());
         assert!(Error::JobNotFound("job-1".into()).is_permanent());
         assert!(Error::ReservedHeader("jobs.type".into()).is_permanent());
         assert!(Error::InputMismatch("idem-key".into()).is_permanent());

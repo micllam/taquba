@@ -484,9 +484,22 @@ pub struct JobRunner {
 }
 
 impl JobRunner {
-    /// Start configuring a runner.
-    pub fn builder() -> JobRunnerBuilder {
-        JobRunnerBuilder::new()
+    /// Start configuring a runner over `queue`, with job result blobs
+    /// persisted to `object_store`.
+    ///
+    /// `queue` accepts a `Queue` or an `Arc<Queue>`. `object_store` is
+    /// typically the same `Arc<dyn ObjectStore>` passed to
+    /// [`Queue::open`](taquba::Queue::open), but it does not have to be:
+    /// pointing result blobs at a different store (a different bucket, a
+    /// different backend) is supported. The blobs land under
+    /// [`JobRunnerBuilder::result_prefix`]; that prefix must not overlap
+    /// the `path` the queue's SlateDB store was opened at if the two
+    /// share a store.
+    pub fn builder(
+        queue: impl Into<Arc<Queue>>,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> JobRunnerBuilder {
+        JobRunnerBuilder::new(queue.into(), object_store)
     }
 
     /// Register a job type so the spawned worker can dispatch it.
@@ -637,8 +650,8 @@ impl RunnerHandle {
 
 /// Builder for a [`JobRunner`]. Created via [`JobRunner::builder`].
 pub struct JobRunnerBuilder {
-    queue: Option<Arc<Queue>>,
-    object_store: Option<Arc<dyn ObjectStore>>,
+    queue: Arc<Queue>,
+    object_store: Arc<dyn ObjectStore>,
     queue_name: String,
     result_prefix: Option<String>,
     state: State,
@@ -649,10 +662,10 @@ pub struct JobRunnerBuilder {
 }
 
 impl JobRunnerBuilder {
-    fn new() -> Self {
+    fn new(queue: Arc<Queue>, object_store: Arc<dyn ObjectStore>) -> Self {
         Self {
-            queue: None,
-            object_store: None,
+            queue,
+            object_store,
             queue_name: DEFAULT_QUEUE_NAME.to_string(),
             result_prefix: None,
             state: State::default(),
@@ -661,28 +674,6 @@ impl JobRunnerBuilder {
             result_retention: None,
             clock: None,
         }
-    }
-
-    /// The taquba queue to run jobs on. Required.
-    ///
-    /// Accepts a `Queue` or an `Arc<Queue>`.
-    pub fn queue(mut self, queue: impl Into<Arc<Queue>>) -> Self {
-        self.queue = Some(queue.into());
-        self
-    }
-
-    /// The object store job result blobs are persisted to. Required.
-    ///
-    /// Typically the same `Arc<dyn ObjectStore>` passed to
-    /// [`Queue::open`](taquba::Queue::open), but it does not have to be:
-    /// pointing result blobs at a different store (a different bucket, a
-    /// different backend) is supported. The blobs land under
-    /// [`result_prefix`](Self::result_prefix); that prefix must not overlap
-    /// the `path` the queue's SlateDB store was opened at if the two share a
-    /// store.
-    pub fn object_store(mut self, store: Arc<dyn ObjectStore>) -> Self {
-        self.object_store = Some(store);
-        self
     }
 
     /// The logical queue name jobs are enqueued under. Defaults to `"jobs"`.
@@ -771,22 +762,15 @@ impl JobRunnerBuilder {
     }
 
     /// Build the runner.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::MissingQueue`] if no queue was configured, or
-    /// [`Error::MissingObjectStore`] if no object store was configured.
-    pub fn build(self) -> Result<JobRunner> {
-        let queue = self.queue.ok_or(Error::MissingQueue)?;
-        let object_store = self.object_store.ok_or(Error::MissingObjectStore)?;
+    pub fn build(self) -> JobRunner {
         let prefix = self
             .result_prefix
             .unwrap_or_else(|| format!("{}-results", self.queue_name));
-        let results = ResultStore::new(object_store, prefix);
-        let clock = self.clock.unwrap_or_else(|| queue.clock());
+        let results = ResultStore::new(self.object_store, prefix);
+        let clock = self.clock.unwrap_or_else(|| self.queue.clock());
 
         let submitter = Submitter {
-            queue,
+            queue: self.queue,
             queue_name: Arc::from(self.queue_name),
             results,
             state: Arc::new(self.state),
@@ -794,13 +778,13 @@ impl JobRunnerBuilder {
             result_retention: self.result_retention,
         };
 
-        Ok(JobRunner {
+        JobRunner {
             submitter,
             handlers: HashMap::new(),
             concurrency: self.concurrency,
             poll_interval: self.poll_interval,
             spawned: false,
-        })
+        }
     }
 }
 
@@ -1079,12 +1063,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn submit_without_idempotency_key_is_always_newly_submitted() {
         let (queue, store) = open_queue("test-no-idem").await;
-        let runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store)
-            .state("ok")
-            .build()
-            .unwrap();
+        let runner = JobRunner::builder(queue, store).state("ok").build();
 
         let first = runner.submit(Adder { a: 1, b: 2 }).await.unwrap();
         let second = runner.submit(Adder { a: 1, b: 2 }).await.unwrap();
@@ -1096,12 +1075,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn submit_run_and_join_success() {
         let (queue, store) = open_queue("test-success").await;
-        let mut runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store)
-            .state("ok")
-            .build()
-            .unwrap();
+        let mut runner = JobRunner::builder(queue, store).state("ok").build();
         runner.register::<Adder>();
         let handle = runner.spawn(std::future::pending::<()>());
 
@@ -1115,12 +1089,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn await_handle_directly_yields_output() {
         let (queue, store) = open_queue("test-await").await;
-        let mut runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store)
-            .state("ok")
-            .build()
-            .unwrap();
+        let mut runner = JobRunner::builder(queue, store).state("ok").build();
         runner.register::<Adder>();
         let handle = runner.spawn(std::future::pending::<()>());
 
@@ -1134,11 +1103,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn permanent_failure_is_dead_lettered_with_recorded_outcome() {
         let (queue, store) = open_queue("test-failure").await;
-        let mut runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store)
-            .build()
-            .unwrap();
+        let mut runner = JobRunner::builder(queue, store).build();
         runner.register::<AlwaysFails>();
         let handle = runner.spawn(std::future::pending::<()>());
 
@@ -1156,11 +1121,7 @@ mod tests {
     async fn idempotency_key_collapses_duplicate_submissions() {
         let (queue, store) = open_queue("test-idempotency").await;
         // No spawn: jobs stay pending so the dedup key is still held.
-        let runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store)
-            .build()
-            .unwrap();
+        let runner = JobRunner::builder(queue, store).build();
 
         let first = runner.submit(Keyed { n: 1 }).await.unwrap();
         assert!(first.newly_submitted());
@@ -1176,11 +1137,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn input_mismatch_on_same_key_different_payload() {
         let (queue, store) = open_queue("test-mismatch").await;
-        let runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store)
-            .build()
-            .unwrap();
+        let runner = JobRunner::builder(queue, store).build();
 
         runner
             .submit(FixedKey {
@@ -1210,11 +1167,7 @@ mod tests {
         // background tasks before the next round opens the same store.
         {
             let queue = Arc::new(Queue::open(store.clone(), queue_name).await.unwrap());
-            let runner = JobRunner::builder()
-                .queue(queue.clone())
-                .object_store(store.clone())
-                .build()
-                .unwrap();
+            let runner = JobRunner::builder(queue.clone(), store.clone()).build();
             runner
                 .submit(FixedKey {
                     content: "alpha".into(),
@@ -1225,11 +1178,7 @@ mod tests {
 
         // Round 2: fresh queue against the same store, differing payload.
         let queue = Arc::new(Queue::open(store.clone(), queue_name).await.unwrap());
-        let runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store)
-            .build()
-            .unwrap();
+        let runner = JobRunner::builder(queue, store).build();
         let result = runner
             .submit(FixedKey {
                 content: "beta".into(),
@@ -1245,11 +1194,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn idempotency_key_short_circuits_to_cached_success_after_completion() {
         let (queue, store) = open_queue("test-cached-success").await;
-        let mut runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store)
-            .build()
-            .unwrap();
+        let mut runner = JobRunner::builder(queue, store).build();
         runner.register::<Keyed>();
         let handle = runner.spawn(std::future::pending::<()>());
 
@@ -1285,11 +1230,7 @@ mod tests {
             },
         )
         .await;
-        let mut runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store)
-            .build()
-            .unwrap();
+        let mut runner = JobRunner::builder(queue, store).build();
         runner.register::<KeyedFailure>();
         let handle = runner.spawn(std::future::pending::<()>());
 
@@ -1320,11 +1261,7 @@ mod tests {
         // Round 1: run a keyed job to completion against this store.
         let first_id = {
             let queue = Arc::new(Queue::open(store.clone(), queue_name).await.unwrap());
-            let mut runner = JobRunner::builder()
-                .queue(queue.clone())
-                .object_store(store.clone())
-                .build()
-                .unwrap();
+            let mut runner = JobRunner::builder(queue.clone(), store.clone()).build();
             runner.register::<Keyed>();
             let handle = runner.spawn(std::future::pending::<()>());
 
@@ -1340,11 +1277,7 @@ mod tests {
         // record from round 1 + its result blob are still on disk, so
         // re-submitting the same payload should short-circuit.
         let queue = Arc::new(Queue::open(store.clone(), queue_name).await.unwrap());
-        let runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store)
-            .build()
-            .unwrap();
+        let runner = JobRunner::builder(queue, store).build();
         let second = runner.submit(Keyed { n: 99 }).await.unwrap();
         assert!(!second.newly_submitted());
         assert_eq!(second.id(), first_id);
@@ -1362,13 +1295,10 @@ mod tests {
         let queue_name = "test-resubmit-after-sweep";
         let (queue, store) = open_queue(queue_name).await;
         let runs = Arc::new(AtomicU32::new(0));
-        let mut runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store.clone())
+        let mut runner = JobRunner::builder(queue, store.clone())
             .queue_name(queue_name)
             .state(runs.clone())
-            .build()
-            .unwrap();
+            .build();
         runner.register::<CountedKeyed>();
         let handle = runner.spawn(std::future::pending::<()>());
 
@@ -1413,11 +1343,7 @@ mod tests {
     async fn unknown_job_type_is_dead_lettered() {
         let (queue, store) = open_queue("test-unknown").await;
         // Register nothing; submit a job whose type has no handler.
-        let mut runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store)
-            .build()
-            .unwrap();
+        let mut runner = JobRunner::builder(queue, store).build();
         let handle = runner.spawn(std::future::pending::<()>());
 
         let job = runner.submit(Keyed { n: 9 }).await.unwrap();
@@ -1434,11 +1360,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn reserved_header_in_submit_options_is_rejected() {
         let (queue, store) = open_queue("test-reserved-header").await;
-        let runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store)
-            .build()
-            .unwrap();
+        let runner = JobRunner::builder(queue, store).build();
 
         let mut opts = SubmitOptions::default();
         opts.headers
@@ -1458,11 +1380,7 @@ mod tests {
             ..QueueConfig::default()
         };
         let (queue, store) = open_queue_with_config("test-transient-exhaust", cfg).await;
-        let mut runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store)
-            .build()
-            .unwrap();
+        let mut runner = JobRunner::builder(queue, store).build();
         runner.register::<AlwaysFailsTransient>();
         let handle = runner.spawn(std::future::pending::<()>());
 
@@ -1482,11 +1400,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn awaiting_failed_handle_returns_join_error_job() {
         let (queue, store) = open_queue("test-join-error-job").await;
-        let mut runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store)
-            .build()
-            .unwrap();
+        let mut runner = JobRunner::builder(queue, store).build();
         runner.register::<AlwaysFails>();
         let handle = runner.spawn(std::future::pending::<()>());
 
@@ -1512,12 +1426,7 @@ mod tests {
         // sees no record on its first poll and returns NotFound; the
         // durable result blob must be consulted instead.
         let (queue, store) = open_queue("test-notfound-fallback").await;
-        let mut runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store)
-            .state("ok")
-            .build()
-            .unwrap();
+        let mut runner = JobRunner::builder(queue, store).state("ok").build();
         runner.register::<Adder>();
         let handle = runner.spawn(std::future::pending::<()>());
 
@@ -1571,12 +1480,9 @@ mod tests {
         };
         let (queue, store) = open_queue_with_config("test-fanout", cfg).await;
         let counter = Arc::new(AtomicU32::new(0));
-        let mut runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store)
+        let mut runner = JobRunner::builder(queue, store)
             .state(counter.clone())
-            .build()
-            .unwrap();
+            .build();
         runner.register::<Coordinator>();
         runner.register::<Increment>();
         let handle = runner.spawn(std::future::pending::<()>());
@@ -1615,12 +1521,7 @@ mod tests {
         let clock = MockClock::new(t0_ms);
         let (queue, store) =
             open_queue_with_clock("test-scheduled", clock.clone(), QueueConfig::default()).await;
-        let mut runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store)
-            .state("ok")
-            .build()
-            .unwrap();
+        let mut runner = JobRunner::builder(queue, store).state("ok").build();
         runner.register::<Adder>();
         let handle = runner.spawn(std::future::pending::<()>());
 
@@ -1664,12 +1565,9 @@ mod tests {
         };
         let (queue, store) = open_queue_with_clock("test-lease", clock.clone(), cfg).await;
         let attempts = Arc::new(AtomicU32::new(0));
-        let mut runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store)
+        let mut runner = JobRunner::builder(queue, store)
             .state(attempts.clone())
-            .build()
-            .unwrap();
+            .build();
         runner.register::<Reclaimable>();
         let handle = runner.spawn(std::future::pending::<()>());
 
@@ -1678,7 +1576,7 @@ mod tests {
         // Let the first claim land (worker increments `attempts` and
         // enters its long sleep). The 200ms sleep just has to exceed
         // the worker's `poll_interval` so the worker's
-        // `wait_for_jobs` returns.
+        // `wait_for_jobs_on` returns.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
@@ -1714,14 +1612,11 @@ mod tests {
     async fn terminal_marker_written_when_retention_is_set() {
         let queue_name = "test-retention-marker";
         let (queue, store) = open_queue(queue_name).await;
-        let mut runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store.clone())
+        let mut runner = JobRunner::builder(queue, store.clone())
             .queue_name(queue_name)
             .state("ok")
             .result_retention(Duration::from_secs(60))
-            .build()
-            .unwrap();
+            .build();
         runner.register::<Adder>();
         let handle = runner.spawn(std::future::pending::<()>());
 
@@ -1743,13 +1638,10 @@ mod tests {
     async fn no_terminal_marker_when_retention_is_unset() {
         let queue_name = "test-retention-off";
         let (queue, store) = open_queue(queue_name).await;
-        let mut runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store.clone())
+        let mut runner = JobRunner::builder(queue, store.clone())
             .queue_name(queue_name)
             .state("ok")
-            .build()
-            .unwrap();
+            .build();
         runner.register::<Adder>();
         let handle = runner.spawn(std::future::pending::<()>());
 
@@ -1782,13 +1674,10 @@ mod tests {
             },
         )
         .await;
-        let mut runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store.clone())
+        let mut runner = JobRunner::builder(queue, store.clone())
             .queue_name(queue_name)
             .result_retention(Duration::from_secs(60))
-            .build()
-            .unwrap();
+            .build();
         runner.register::<AlwaysFails>();
         let handle = runner.spawn(std::future::pending::<()>());
 
@@ -1817,14 +1706,11 @@ mod tests {
         let clock = MockClock::new(t0_ms);
         let (queue, store) =
             open_queue_with_clock(queue_name, clock.clone(), QueueConfig::default()).await;
-        let mut runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store.clone())
+        let mut runner = JobRunner::builder(queue, store.clone())
             .queue_name(queue_name)
             .state("ok")
             .result_retention(Duration::from_millis(200))
-            .build()
-            .unwrap();
+            .build();
         runner.register::<Adder>();
         let handle = runner.spawn(std::future::pending::<()>());
 
@@ -1854,14 +1740,11 @@ mod tests {
         let clock = MockClock::new(t0_ms);
         let (queue, store) =
             open_queue_with_clock(queue_name, clock.clone(), QueueConfig::default()).await;
-        let mut runner = JobRunner::builder()
-            .queue(queue)
-            .object_store(store.clone())
+        let mut runner = JobRunner::builder(queue, store.clone())
             .queue_name(queue_name)
             .state("ok")
             .result_retention(Duration::from_millis(100))
-            .build()
-            .unwrap();
+            .build();
         runner.register::<Adder>();
         let handle = runner.spawn(std::future::pending::<()>());
 

@@ -102,11 +102,9 @@
 //! # async fn run() -> taquba_jobs::Result<()> {
 //! # let store = Arc::new(InMemory::new());
 //! # let queue = Arc::new(Queue::open(store.clone(), "demo").await?);
-//! let runner = JobRunner::builder()
-//!     .queue(queue)
-//!     .object_store(store)
+//! let runner = JobRunner::builder(queue, store)
 //!     .result_retention(Duration::from_secs(24 * 60 * 60))
-//!     .build()?;
+//!     .build();
 //! # let _ = runner; Ok(()) }
 //! ```
 //!
@@ -160,11 +158,9 @@
 //!     ..OpenOptions::default()
 //! };
 //! let queue = Arc::new(Queue::open_with_options(store.clone(), "db", opts).await?);
-//! let runner = JobRunner::builder()
-//!     .queue(queue)
-//!     .object_store(store)
+//! let runner = JobRunner::builder(queue, store)
 //!     .queue_name("background-jobs") // same string as in queue_configs
-//!     .build()?;
+//!     .build();
 //! # let _ = runner;
 //! # Ok(()) }
 //! ```
@@ -214,11 +210,9 @@
 //! let store = Arc::new(InMemory::new());
 //! let queue = Arc::new(Queue::open(store.clone(), "background-jobs").await?);
 //!
-//! let mut runner = JobRunner::builder()
-//!     .queue(queue)
-//!     .object_store(store)
+//! let mut runner = JobRunner::builder(queue, store)
 //!     .max_concurrent_jobs(50)
-//!     .build()?;
+//!     .build();
 //!
 //! runner.register::<SendEmail>();
 //! let handle = runner.spawn(std::future::pending::<()>());

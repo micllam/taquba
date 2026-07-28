@@ -107,11 +107,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(InMemory::new());
     let queue = Arc::new(Queue::open(store.clone(), "background-jobs").await?);
 
-    let runner = JobRunner::builder()
-        .queue(queue)
-        .object_store(store)
+    let runner = JobRunner::builder(queue, store)
         .result_retention(Duration::from_secs(24 * 60 * 60))
-        .build()?;
+        .build();
 
     // ... register and spawn as usual ...
     drop(runner);
@@ -167,11 +165,9 @@ let opts = OpenOptions {
     ..OpenOptions::default()
 };
 let queue = Arc::new(Queue::open_with_options(store.clone(), "db", opts).await?);
-let runner = JobRunner::builder()
-    .queue(queue)
-    .object_store(store)
+let runner = JobRunner::builder(queue, store)
     .queue_name("background-jobs") // same string as in queue_configs
-    .build()?;
+    .build();
 ```
 
 ## Fan-out from handlers
@@ -220,11 +216,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(InMemory::new());
     let queue = Arc::new(Queue::open(store.clone(), "background-jobs").await?);
 
-    let mut runner = JobRunner::builder()
-        .queue(queue)
-        .object_store(store)
+    let mut runner = JobRunner::builder(queue, store)
         .max_concurrent_jobs(50)
-        .build()?;
+        .build();
 
     runner.register::<SendEmail>();
     let handle = runner.spawn(std::future::pending::<()>());

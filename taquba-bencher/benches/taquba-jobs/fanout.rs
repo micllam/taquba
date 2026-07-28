@@ -124,11 +124,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?,
     );
 
-    let mut runner = JobRunner::builder()
-        .queue(queue.clone())
-        .object_store(store)
+    let mut runner = JobRunner::builder(queue.clone(), store)
         .max_concurrent_jobs(max_concurrent)
-        .build()?;
+        .build();
     runner.register::<BenchJob>();
     let worker = runner.spawn(std::future::pending::<()>());
 
