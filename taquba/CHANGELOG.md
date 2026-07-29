@@ -54,6 +54,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps prior entries. The history is written through a merge operator
   (one write per settlement, no read-modify-write) and is removed in the
   same transaction that removes the job's last record.
+- `Queue::kv_compare_put`: write a user KV entry only if it still holds an
+  expected value (`Some`) or is still absent (`None`), in one transaction.
+  The read-modify-write primitive for the namespace; concurrent updates of
+  one entry lose no writes.
+- `Queue::kv_scan`: paged listing of the user KV namespace under a key
+  prefix, in ascending key order with an opaque resume cursor (returned as
+  the new `KvPage`). The enumeration and export primitive for the
+  namespace; internal key spaces are never visible in the results.
 
 ### Changed
 

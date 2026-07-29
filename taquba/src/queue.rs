@@ -74,6 +74,19 @@ pub struct JobPage {
     pub next_cursor: Option<Vec<u8>>,
 }
 
+/// One page of a user KV listing. Returned by [`Queue::kv_scan`].
+#[derive(Debug, Clone)]
+pub struct KvPage {
+    /// Entries on this page as `(key, value)` pairs, in ascending byte
+    /// order of the keys. Keys are in the caller namespace, without the
+    /// internal user key tag.
+    pub entries: Vec<(Vec<u8>, Bytes)>,
+    /// Opaque resume token: pass it as the `cursor` of the next
+    /// [`Queue::kv_scan`] call to continue the listing. `None` when no
+    /// further entries existed at scan time.
+    pub next_cursor: Option<Vec<u8>>,
+}
+
 /// High-priority bucket. Jobs at this priority are dequeued before normal and low.
 pub const PRIORITY_HIGH: u32 = 100;
 /// Default priority. FIFO ordering is preserved within the same priority level.
@@ -759,7 +772,12 @@ impl Queue {
     /// On success ([`EnqueueResult::New`]), the job is enqueued and every
     /// entry in `kv_writes` is applied atomically. On a `dedup_key` hit
     /// ([`EnqueueResult::AlreadyEnqueued`]), **no KV writes are applied**
-    /// and the existing job's id is returned.
+    /// and the existing job's id is returned. Because a dedup hit
+    /// discards `kv_writes`, derive them deterministically from the
+    /// dedup key: a producer that retries after a crash then converges
+    /// on the winning submission's writes rather than diverging from
+    /// them. This is not an upsert; a KV write that must apply
+    /// regardless of the dedup outcome belongs in [`Self::kv_put`].
     ///
     /// Caller-supplied KV keys are internally scoped under a reserved
     /// user key tag so they cannot collide with Taquba's internal layout.
@@ -817,8 +835,11 @@ impl Queue {
     /// Caller-supplied keys are internally scoped under a reserved
     /// user key tag and cannot collide with Taquba's internal layout.
     /// Values above [`MAX_KV_VALUE_SIZE`] return
-    /// [`Error::KvValueTooLarge`]. The write is durable before the call
-    /// returns.
+    /// [`Error::KvValueTooLarge`]; unlike job payloads, user KV values
+    /// are never offloaded to the payload store, so the cap is a hard
+    /// error. Store larger values as objects under caller-owned keys
+    /// and keep only the pointer in KV. The write is durable before the
+    /// call returns.
     ///
     /// This is the standalone form; to couple a KV write with a queue
     /// transition in one transaction, use [`Self::enqueue_with_kv`] or
@@ -844,10 +865,10 @@ impl Queue {
     /// Returns `true` when the value matched and was deleted, `false`
     /// when the key was absent or held a different value (nothing is
     /// changed in that case). The read and the delete execute in one
-    /// transaction, so a concurrent writer cannot slip a new value in
-    /// between: either this call deletes the value it compared against,
-    /// or it reports `false`. The delete is durable before the call
-    /// returns `true`.
+    /// transaction, so no concurrent write can be interleaved between
+    /// the compare and the delete: either this call deletes the value
+    /// it compared against, or it reports `false`. The delete is
+    /// durable before the call returns `true`.
     ///
     /// Use this to consume a value that a concurrent writer may replace,
     /// where an unconditional [`Self::kv_delete`] could delete a newer
@@ -870,6 +891,128 @@ impl Queue {
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+
+    /// Write a value to the user KV namespace only if its current state
+    /// matches `expected`.
+    ///
+    /// `expected` is the compare arm: `Some(v)` requires the key to
+    /// currently hold exactly `v`; `None` requires the key to be
+    /// absent. Returns `true` when the state matched and the write was
+    /// applied, `false` when it did not (nothing is changed in that
+    /// case). The read and the write execute in one transaction, so no
+    /// concurrent write can be interleaved between the compare and the
+    /// write: either this call replaces the state it compared against,
+    /// or it reports `false`. The write is durable before the call
+    /// returns `true`.
+    ///
+    /// Values above [`MAX_KV_VALUE_SIZE`] return
+    /// [`Error::KvValueTooLarge`].
+    ///
+    /// This is the read-modify-write primitive for the namespace: read
+    /// a value, compute its successor and call
+    /// `kv_compare_put(key, Some(&read), &next)` in a retry loop, or
+    /// claim a key exclusively with `kv_compare_put(key, None, &init)`.
+    /// Transaction conflicts with concurrent writers are retried
+    /// internally, but a contended key serializes its writers; state
+    /// with many independent writers scales better split across
+    /// multiple keys than concentrated in one key.
+    pub async fn kv_compare_put(
+        &self,
+        key: &[u8],
+        expected: Option<&[u8]>,
+        value: &[u8],
+    ) -> Result<bool> {
+        if value.len() > MAX_KV_VALUE_SIZE {
+            return Err(Error::KvValueTooLarge {
+                size: value.len(),
+                max: MAX_KV_VALUE_SIZE,
+            });
+        }
+        let scoped = user_scoped_key(key);
+        loop {
+            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+            let matched = match (txn.get(&scoped).await?, expected) {
+                (Some(current), Some(e)) => current.as_ref() == e,
+                (None, None) => true,
+                _ => false,
+            };
+            if !matched {
+                txn.rollback();
+                return Ok(false);
+            }
+            txn.put(&scoped, value)?;
+            match txn.commit().await {
+                Ok(_) => return Ok(true),
+                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// List entries of the user KV namespace under `prefix`, in
+    /// ascending byte order of the keys.
+    ///
+    /// An empty `prefix` lists the whole namespace. `cursor` is an
+    /// opaque resume token: pass `None` to start from the beginning, or
+    /// [`KvPage::next_cursor`] from the previous page to continue. A
+    /// cursor identifies a scan position, not an entry, so it remains
+    /// valid when the entry it was taken at is deleted. The listing is
+    /// not a snapshot: an entry written or deleted between page reads
+    /// may be missed or observed depending on its key's position
+    /// relative to the cursor.
+    ///
+    /// Only caller-namespace entries are returned; Taquba's internal
+    /// key spaces are never visible here. This is the enumeration and
+    /// export primitive for the namespace: a full sweep
+    /// (`prefix = b""`, follow `next_cursor` to exhaustion) observes
+    /// every entry that existed for the whole sweep.
+    pub async fn kv_scan(
+        &self,
+        prefix: &[u8],
+        cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<KvPage> {
+        let empty = KvPage {
+            entries: Vec::new(),
+            next_cursor: None,
+        };
+        if limit == 0 {
+            return Ok(empty);
+        }
+        let scoped_prefix = user_scoped_key(prefix);
+        let start = match cursor {
+            None => Bound::Unbounded,
+            // A cursor from a different prefix does not identify a
+            // position under this one; nothing follows it here.
+            Some(c) if !c.starts_with(&scoped_prefix) => return Ok(empty),
+            Some(c) => Bound::Excluded(Bytes::copy_from_slice(&c[scoped_prefix.len()..])),
+        };
+
+        let mut page: Vec<(Bytes, Bytes)> = Vec::with_capacity(limit);
+        let mut more = false;
+        let mut iter = self
+            .db
+            .scan_prefix(scoped_prefix, (start, Bound::Unbounded))
+            .await?;
+        while let Some(kv) = iter.next().await? {
+            if page.len() == limit {
+                more = true;
+                break;
+            }
+            page.push((kv.key, kv.value));
+        }
+        let next_cursor = more.then(|| page[page.len() - 1].0.to_vec());
+        // Stored keys carry the one-byte user tag; callers see their own
+        // namespace, so it is stripped here. Cursors keep the stored form.
+        let entries = page
+            .into_iter()
+            .map(|(k, v)| (k[1..].to_vec(), v))
+            .collect();
+        Ok(KvPage {
+            entries,
+            next_cursor,
+        })
     }
 
     /// Resolve [`EnqueueOptions`] against the queue's defaults and build
@@ -4169,6 +4312,170 @@ mod tests {
 
         assert!(!q.kv_compare_delete(b"latch", b"v1").await.unwrap());
 
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_kv_compare_put() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+
+        assert!(!q.kv_compare_put(b"slot", Some(b"v1"), b"v2").await.unwrap());
+        assert!(q.kv_get(b"slot").await.unwrap().is_none());
+
+        assert!(q.kv_compare_put(b"slot", None, b"v1").await.unwrap());
+        assert_eq!(
+            q.kv_get(b"slot").await.unwrap().as_deref(),
+            Some(b"v1".as_slice())
+        );
+
+        assert!(!q.kv_compare_put(b"slot", None, b"v2").await.unwrap());
+        assert_eq!(
+            q.kv_get(b"slot").await.unwrap().as_deref(),
+            Some(b"v1".as_slice())
+        );
+
+        assert!(!q.kv_compare_put(b"slot", Some(b"v0"), b"v2").await.unwrap());
+        assert_eq!(
+            q.kv_get(b"slot").await.unwrap().as_deref(),
+            Some(b"v1".as_slice())
+        );
+
+        assert!(q.kv_compare_put(b"slot", Some(b"v1"), b"v2").await.unwrap());
+        assert_eq!(
+            q.kv_get(b"slot").await.unwrap().as_deref(),
+            Some(b"v2".as_slice())
+        );
+
+        let oversized = vec![0u8; MAX_KV_VALUE_SIZE + 1];
+        assert!(matches!(
+            q.kv_compare_put(b"slot", Some(b"v2"), &oversized).await,
+            Err(Error::KvValueTooLarge { .. })
+        ));
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_kv_compare_put_loses_no_updates_under_contention() {
+        let q = Arc::new(Queue::open(make_store(), "test").await.unwrap());
+        q.kv_put(b"counter", &0u64.to_be_bytes()).await.unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let q = Arc::clone(&q);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..25 {
+                    loop {
+                        let current = q.kv_get(b"counter").await.unwrap().unwrap();
+                        let n = u64::from_be_bytes(current.as_ref().try_into().unwrap());
+                        let next = (n + 1).to_be_bytes();
+                        if q.kv_compare_put(b"counter", Some(current.as_ref()), &next)
+                            .await
+                            .unwrap()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let total = q.kv_get(b"counter").await.unwrap().unwrap();
+        assert_eq!(u64::from_be_bytes(total.as_ref().try_into().unwrap()), 100);
+
+        let q = Arc::try_unwrap(q).unwrap_or_else(|_| panic!("queue still shared"));
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_kv_scan_pages_and_filters_by_prefix() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+
+        for i in 0..5u8 {
+            q.kv_put(&[b"runs/".as_slice(), &[b'0' + i]].concat(), &[i])
+                .await
+                .unwrap();
+        }
+        q.kv_put(b"config", b"c").await.unwrap();
+
+        let page = q.kv_scan(b"runs/", None, 3).await.unwrap();
+        assert_eq!(page.entries.len(), 3);
+        assert_eq!(page.entries[0].0, b"runs/0");
+        assert!(page.next_cursor.is_some());
+
+        let rest = q
+            .kv_scan(b"runs/", page.next_cursor.as_deref(), 10)
+            .await
+            .unwrap();
+        assert_eq!(rest.entries.len(), 2);
+        assert_eq!(rest.entries[1].0, b"runs/4");
+        assert!(rest.next_cursor.is_none());
+
+        let all = q.kv_scan(b"", None, 100).await.unwrap();
+        assert_eq!(all.entries.len(), 6);
+        assert_eq!(all.entries[0].0, b"config");
+
+        let empty = q.kv_scan(b"", None, 0).await.unwrap();
+        assert!(empty.entries.is_empty() && empty.next_cursor.is_none());
+
+        let foreign = q
+            .kv_scan(b"other/", page.next_cursor.as_deref(), 10)
+            .await
+            .unwrap();
+        assert!(foreign.entries.is_empty() && foreign.next_cursor.is_none());
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_kv_scan_excludes_internal_keys() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+
+        q.enqueue("jobs", b"payload".to_vec()).await.unwrap();
+        q.enqueue_with(
+            "jobs",
+            b"later".to_vec(),
+            EnqueueOptions {
+                run_at: Some(std::time::SystemTime::now() + Duration::from_secs(3600)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        q.kv_put(b"only", b"entry").await.unwrap();
+
+        let page = q.kv_scan(b"", None, 100).await.unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].0, b"only");
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_kv_state_survives_crash_reopen() {
+        let store = make_store();
+        let q = Queue::open(store.clone(), "test").await.unwrap();
+        q.kv_put(b"standalone", b"v1").await.unwrap();
+        let mut kv = HashMap::new();
+        kv.insert(b"coupled".to_vec(), b"v2".to_vec());
+        q.enqueue_with_kv("jobs", b"p".to_vec(), EnqueueOptions::default(), kv)
+            .await
+            .unwrap();
+        drop(q);
+
+        let q = Queue::open(store, "test").await.unwrap();
+        assert_eq!(
+            q.kv_get(b"standalone").await.unwrap().as_deref(),
+            Some(b"v1".as_slice())
+        );
+        assert_eq!(
+            q.kv_get(b"coupled").await.unwrap().as_deref(),
+            Some(b"v2".as_slice())
+        );
+        assert_eq!(q.stats("jobs").await.unwrap().pending, 1);
         q.close().await.unwrap();
     }
 

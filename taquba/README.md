@@ -202,12 +202,21 @@ content-addressed key and put only the pointer in KV.
 
 The primary pattern couples KV mutations to queue operations: to create or
 update an entry atomically with a queue transition, include it in the
-`kv_writes` map of an `enqueue_with_kv` or `ack_with` call. Standalone
-primitives exist for state whose lifecycle is not tied to a single queue
-transition: `Queue::kv_put` writes an entry durably on its own, `kv_delete`
-removes one (terminal cleanup), and `Queue::kv_compare_delete` consumes an
-entry only if it still holds the value the caller read, so a concurrent
-replacement is never deleted by mistake.
+`kv_writes` map of an `enqueue_with_kv` or `ack_with` call. Note the dedup
+interaction: a `dedup_key` hit discards the accompanying `kv_writes`, so
+derive them deterministically from the dedup key (see the
+`enqueue_with_kv` docs).
+
+Standalone primitives exist for state whose lifecycle is not tied to a
+single queue transition: `Queue::kv_put` writes an entry durably on its own,
+`kv_delete` removes one (terminal cleanup), `Queue::kv_compare_delete`
+consumes an entry only if it still holds the value the caller read, so a
+concurrent replacement is never deleted by mistake, and
+`Queue::kv_compare_put` writes only if the key still holds an expected value
+(or is still absent), the read-modify-write primitive that makes concurrent
+updates of one entry lose no writes. `Queue::kv_scan` lists entries under a
+key prefix in pages, for enumerating live state and for exporting the
+namespace.
 
 `Queue::ack_with` extends the same atomicity to settlement: it acknowledges a
 claimed job and, in the same transaction, enqueues follow-up jobs and applies
