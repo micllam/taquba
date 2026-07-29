@@ -16,9 +16,9 @@ job, enqueue its follow-ups, and update caller-owned KV state.
 
 Built on [SlateDB](https://github.com/slatedb/slatedb). All producers and
 workers for a given store run inside one process and share an `Arc<Queue>`.
-Use Taquba when you want durable background jobs whose state survives node
-loss, ephemeral disks, and region failures, without operating a queue
-server or a separate state layer (typically Postgres).
+Use Taquba for durable background jobs whose state survives node loss,
+ephemeral disks, and region failures, without operating a queue server or a
+separate state layer (typically Postgres).
 
 ## Features
 
@@ -35,13 +35,60 @@ server or a separate state layer (typically Postgres).
   caller KV in one transaction.
 - Worker loop with graceful shutdown and notify-based wakeups (no busy polling).
 
+## When Taquba fits
+
+Database-backed queues excel at jobs attached to an application database;
+Taquba is well-suited to work attached to data. Object storage as the
+backing store earns its place when at least one of the following holds:
+
+- Payloads are big: payloads above a threshold are offloaded to their own
+  objects with a transactional lifecycle, written once and deleted when
+  the job leaves the queue.
+- Backlogs are big or bursty: a million-job backlog costs only its
+  storage and requires no maintenance.
+- The workload is mostly idle: an idle queue incurs only storage costs,
+  and per-tenant isolation is a key prefix. There is no server with a
+  baseline cost that accrues while nothing runs.
+- State crosses machine or account boundaries: a bucket is reachable from
+  a laptop, a CI runner or a spot instance with credentials alone, so
+  compute is replaceable by construction.
+- The work coordinates data already in the bucket: queue state, payloads,
+  results and history share one lifecycle, one restore domain and one
+  access policy.
+- The execution trail must be tamper-proof: attempt history, results and
+  terminal markers commit in the same transactions as the work, and
+  object lock makes the trail immutable by storage policy.
+- Steps are expensive and IO-bound: for steps that take much longer than
+  an object-store write the per-transition durability cost is negligible,
+  a retried run does not re-pay memoized steps, and expensive steps sit
+  far from the commit-rate ceiling. LLM calls and rate-limited external
+  APIs are the strongest fit.
+
+## When Taquba does not fit
+
+- The queue must share the application's database transactions: a
+  database-backed queue enqueues jobs and commits their effects inside
+  the application's own transactions.
+- A worker fleet across machines: Taquba is single-writer, so one
+  process owns each store. This caps compute that runs in the worker
+  process itself at one node; steps that call remote services scale
+  with async concurrency inside the single process.
+- Latency-sensitive paths: every durable transition is an object-store
+  write, so end-to-end latency is floored by a PUT round trip.
+- Cheap jobs at high volume: throughput is bound by the durable commit
+  rate, and sub-millisecond jobs pay the durability cost on every
+  transition.
+Measured performance numbers, with the environment and commit that
+produced them, are recorded in
+[`taquba-bencher/RESULTS.md`](https://github.com/micllam/taquba/blob/master/taquba-bencher/RESULTS.md).
+
 ## Stability
 
 Taquba is pre-1.0. The Rust API may evolve between minor versions per Cargo's
 standard `0.x.y` semantics (`0.1` -> `0.2` may break source compatibility), and
 the on-disk format on object storage is *not* guaranteed stable across minor
 versions either. Treat a Taquba minor-version bump as a one-way migration:
-drain your queue first, or be prepared to start the bucket fresh.
+drain your queue first, or be prepared to start from an empty store.
 
 Patch releases (`0.1.0` -> `0.1.1`) preserve both the Rust API and the on-disk
 format.
@@ -55,8 +102,8 @@ are recorded in
 
 ## Install
 
-The in-memory and local-disk stores work with no feature flag, handy for
-tests and the quick-start below:
+The in-memory and local-disk stores work with no feature flag, suitable for
+tests and the quick start below:
 
 ```bash
 cargo add taquba
@@ -267,9 +314,9 @@ one) and `Queue::wake_scheduled` promotes a scheduled job before its
 
 Because a store is single-writer, an admin surface that mutates state must
 live inside the process that owns the queue.
-[`examples/admin_http.rs`](examples/admin_http.rs) shows the resulting
-shape: a minimal HTTP server inside the owning process, mapping these APIs
-onto JSON endpoints.
+[`examples/admin_http.rs`](examples/admin_http.rs) demonstrates the
+pattern: a minimal HTTP server inside the owning process, mapping these
+APIs onto JSON endpoints.
 
 ## License
 

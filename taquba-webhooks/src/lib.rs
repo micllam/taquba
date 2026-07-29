@@ -62,14 +62,14 @@
 //!   up to the queue's `max_attempts`, then dead-letters.
 //! - **Other 4xx (client errors), missing/invalid configuration headers**:
 //!   dead-letter immediately via [`taquba::PermanentFailure`]. The receiver
-//!   has explicitly rejected the request; retrying won't help.
+//!   has explicitly rejected the request, so retries cannot succeed.
 //!
 //! # Receiver-side idempotency
 //!
 //! Each delivery includes a `Webhook-Id` header (configurable via
 //! [`WebhookWorker::with_delivery_id_header`]) carrying [`taquba::JobRecord::id`].
-//! Taquba is at-least-once, so receivers must dedupe on this header to handle
-//! retries correctly.
+//! Taquba is at-least-once, so receivers must deduplicate on this header to
+//! handle retries correctly.
 //!
 //! [Taquba]: https://docs.rs/taquba
 

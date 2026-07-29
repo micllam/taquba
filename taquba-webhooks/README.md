@@ -59,7 +59,7 @@ reserved keys:
 | `webhook.timeout_ms` | no | Per-request timeout |
 | `http.<name>` | no | HTTP header to send (e.g. `http.Content-Type`) |
 
-Other entries in `headers` are ignored by the worker — your application can
+Other entries in `headers` are ignored by the worker; your application can
 use them for its own metadata.
 
 ## Delivery semantics
@@ -70,14 +70,14 @@ use them for its own metadata.
   up to the queue's `max_attempts`, then dead-letters.
 - **Other 4xx (client errors), missing/invalid configuration headers**:
   dead-letter immediately via `taquba::PermanentFailure`. The receiver has
-  explicitly rejected the request; retrying won't help.
+  explicitly rejected the request, so retries cannot succeed.
 
 ## Receiver-side idempotency
 
 Each delivery includes a `Webhook-Id` header (configurable via
 `WebhookWorker::with_delivery_id_header`) carrying `JobRecord::id`. Taquba
-guarantees at-least-once, not exactly-once, so receivers must dedupe on this
-header to handle retries correctly.
+guarantees at-least-once, not exactly-once, so receivers must deduplicate on
+this header to handle retries correctly.
 
 ## License
 

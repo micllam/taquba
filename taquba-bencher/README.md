@@ -202,7 +202,7 @@ host and bucket for those runs.
 
 ## Output format
 
-Each benchmark prints CSV to `stdout`. The header tells you the
+Each benchmark prints CSV to `stdout`. The header names the
 columns; for `claim_drain` they are:
 
 ```
@@ -285,7 +285,7 @@ Load is saturating, so the `e2e_*` columns reflect backlog under that load,
 not clean round-trip latency; use `steady_state` with `PAYLOAD_BYTES`
 for that. Per size, a cumulative `store_amp` is logged to stderr each
 second so its convergence (compaction amortizing over a long run) is
-visible, not just the final per-size value.
+visible, rather than only the final per-size value.
 
 For `step_transitions`:
 
@@ -324,7 +324,7 @@ result blob without re-running the job.
 
 ## When to add a new benchmark here
 
-New entries make sense when:
+New entries are warranted when:
 
 - A user-visible perf claim in a README or CHANGELOG would
   benefit from a reproducible measurement.

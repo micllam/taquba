@@ -11,8 +11,8 @@ top of the [Taquba](../taquba) durable task queue.
 > workspace README for the queue core and the other crates that compose with
 > this one.
 
-`taquba-workflow` is the plumbing for any multi-step process that
-benefits from durable state between steps: idempotent step execution,
+`taquba-workflow` provides the durable machinery for any multi-step process
+that benefits from durable state between steps: idempotent step execution,
 retries with backoff, graceful restart, and terminal-state notifications.
 Implement `StepRunner` with bytes-in / bytes-out per-step logic; the
 runtime persists everything else.
@@ -60,7 +60,7 @@ cargo add taquba-workflow --features webhooks
 
 Per-queue retention (`QueueConfig::keep_done_jobs` and
 `QueueConfig::dead_retention`) is set on the `taquba::Queue` before it's
-handed to the runtime. Pick an explicit name via
+handed to the runtime. Choose an explicit name via
 `WorkflowRuntimeBuilder::queue_name` and key `OpenOptions::queue_configs`
 on the same string.
 
@@ -141,9 +141,13 @@ ANTHROPIC_API_KEY=... cargo run -p taquba-workflow --example rig_agent
 OPENAI_API_KEY=...    cargo run -p taquba-workflow --example rig_agent
 ```
 
-`rig_agent` is a two-stage AI agent (research, then write) that
-demonstrates between-step durability: kill the process after step 0 and
-a fresh process resumes at step 1.
+`rig_agent` is a two-stage AI agent (research, then write) structured
+for between-step durability: step 0's research is persisted as queue
+state before step 1 begins, so on a persistent store a process that
+crashes between the steps resumes at step 1 without re-running the
+research. The example itself runs on the in-memory store; substitute a
+persistent `object_store` backend to observe recovery across a process
+restart.
 
 `fanout_jobs` composes the runtime with `taquba-jobs` for fan-out
 inside one run: a step submits one typed job per URL to a shared
@@ -241,7 +245,7 @@ step can be redelivered and observes the same `Step::signal` value on
 every attempt). One buffered signal is held per correlation key; a second
 signal before consumption replaces the first. One waiter is allowed per
 correlation key; registering a second one fails that run, so choose keys
-unique to the waiter (include the run id when in doubt). Signals are
+unique to the waiter (include the run id if uniqueness is uncertain). Signals are
 scoped to the store: the signaller is the same process that hosts the
 runtime, per the single-process design.
 
@@ -264,7 +268,7 @@ through every step and reach the terminal hook on `RunOutcome::headers`.
 Each step is enqueued with `dedup_key = "run:{run_id}:{step_number}"`,
 preventing concurrent duplicate steps. But Taquba is at-least-once: a
 step can be claimed and executed twice if its lease expires before ack.
-**`StepRunner` impls must be idempotent for the same
+**`StepRunner` implementations must be idempotent for the same
 `(run_id, step_number)`.**
 
 ## Memoizing within-step side effects
@@ -310,7 +314,7 @@ Ok(StepOutcome::Succeed { result: draft })
 
 Content-addressed memo keys remain scoped to `(run_id, step_number)`;
 they are not a cross-run cache. If multiple logical operations may
-receive the same input shape, include an operation name in the
+receive identical inputs, include an operation name in the
 serialized input.
 
 Memo entries live in the object store passed to
@@ -361,7 +365,7 @@ behind by an earlier one.
 
 Because the sweep is keyed on those terminal markers, and a terminated
 run never resumes, it never deletes the memo or replay entries of an
-in-flight run out from under a resume. A resuming step that finds an
+in-flight run that a resume may still read. A resuming step that finds an
 entry absent re-executes the work (delivery is at-least-once
 regardless), so a missing entry is always safe to observe rather than a
 dangling reference: deletion is left unguarded precisely because every
@@ -413,7 +417,7 @@ re-submission of an active run that carries the same input is a no-op
 and the returned `SubmitOutcome` has `newly_submitted = false`. A
 re-submission that carries a *different* input is rejected with
 `Error::InputMismatch`: reusing a `run_id` with new content is a
-programmer error; pick a fresh `run_id` for a new run.
+programmer error; choose a fresh `run_id` for a new run.
 
 Duplicates are caught from two sources, in order:
 

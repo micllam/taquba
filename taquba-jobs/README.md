@@ -11,14 +11,14 @@ Durable, typed async function execution on top of the [Taquba](https://docs.rs/t
 > this one.
 
 `taquba-jobs` is a primitive for running functions reliably in the background:
-define a typed `Job`, submit instances of it, get the typed result back.
-Durability, retries, idempotency and result persistence are handled for you;
-the worker process stays stateless and replaceable because all state lives in
-object storage via Taquba.
+define a typed `Job`, submit instances of it and receive the typed result.
+Durability, retries, idempotency and result persistence are handled by the
+runner; the worker process stays stateless and replaceable because all state
+lives in object storage via Taquba.
 
 It sits one level above [`taquba`](https://docs.rs/taquba): Taquba is the raw
 durable queue (opaque byte payloads, lease-based claims, dead-letter queue)
-and `taquba-jobs` adds the function-shaped abstraction (typed inputs, typed
+and `taquba-jobs` adds the function abstraction (typed inputs, typed
 outputs, a type registry, and durable result delivery).
 
 Within the ecosystem, [`taquba-workflow`](https://docs.rs/taquba-workflow)
@@ -64,7 +64,7 @@ job. Two phases:
   `JobHandle` pointing at the in-flight job, with
   `newly_submitted() == false`. If the payload differs from the
   original, the submission fails with `Error::InputMismatch` instead
-  of silently dedup-hitting a job whose input was something else.
+  of silently matching a job that was submitted with different input.
   The payload check survives process restarts: the SHA-256 of the
   serialized payload is persisted in Taquba's user KV namespace
   atomically with the enqueue.
@@ -142,7 +142,7 @@ the runner needs a different clock than the queue.
 
 Per-queue retention (`QueueConfig::keep_done_jobs` and
 `QueueConfig::dead_retention`) is set on the `taquba::Queue` before it's
-handed to the runner. Pick an explicit name via
+handed to the runner. Choose an explicit name via
 `JobRunnerBuilder::queue_name` and key `OpenOptions::queue_configs` on the
 same string.
 

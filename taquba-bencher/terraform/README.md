@@ -68,9 +68,10 @@ On a missing CLI or an `aws s3 ls` error it appends an `ERR` row
 
 ## Running a long bench in the background
 
-An SSM shell dies with your connection, killing any foreground bench.
-For multi-hour runs, start the bench and the sampler as transient
-`systemd-run` units; they survive disconnects and are queryable with
+An SSM shell terminates when the connection drops, and a foreground
+bench terminates with it. For multi-hour runs, start the bench and the
+sampler as transient `systemd-run` units; they survive disconnects and
+are queryable with
 `systemctl` and `journalctl`:
 
 ```bash
@@ -94,15 +95,15 @@ systemctl stop taquba-storage    # stop the sampler once the bench ends
 
 `terraform destroy` deletes everything, including the instance and the
 bucket (`force_destroy` removes the bucket even with run data still in
-it). Be aware of where your data actually lives before you tear down:
+it). Note where the data resides before destroying:
 
 - The **bucket** holds the system-under-test's data (the
   `bench-<unix-millis>` queue workload), not your results.
 - The benches write their CSV to **stdout on the host**, so the numbers
-  land on the instance's local disk. Destroy deletes that too.
+  land on the instance's local disk, which destroy also deletes.
 
-So both places your data could be are wiped on destroy. Capture what you
-need first. Since `../RESULTS.md` records summarised percentiles rather
+Both locations are therefore removed on destroy; capture anything needed
+first. Since `../RESULTS.md` records summarised percentiles rather
 than raw CSV, the minimum is to read the run's summary off the host (it
 prints to stderr) and write the entry before destroying.
 

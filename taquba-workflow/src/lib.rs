@@ -1,11 +1,12 @@
 //! Durable execution on object storage: an at-least-once workflow runtime on
 //! top of the [Taquba] task queue.
 //!
-//! `taquba-workflow` is the plumbing for any multi-step process that
-//! benefits from durable state between steps: idempotent step execution,
-//! retries with backoff, graceful shutdown / restart, and terminal-state
-//! notifications. Implement [`StepRunner`] with bytes-in / bytes-out
-//! per-step logic and the runtime persists everything else.
+//! `taquba-workflow` provides the durable machinery for any multi-step
+//! process that benefits from durable state between steps: idempotent
+//! step execution, retries with backoff, graceful shutdown / restart,
+//! and terminal-state notifications. Implement [`StepRunner`] with
+//! bytes-in / bytes-out per-step logic and the runtime persists
+//! everything else.
 //!
 //! It's particularly well-suited for **AI agent runs**, where each step is
 //! one LLM call (or one full agent loop) and a process restart between
@@ -43,7 +44,7 @@
 //!
 //! Per-queue retention ([`taquba::QueueConfig::keep_done_jobs`] and
 //! [`taquba::QueueConfig::dead_retention`]) is set on the
-//! [`taquba::Queue`] before it's handed to the runtime. Pick an explicit
+//! [`taquba::Queue`] before it's handed to the runtime. Choose an explicit
 //! name via [`WorkflowRuntimeBuilder::queue_name`] and key
 //! [`taquba::OpenOptions::queue_configs`] on the same string.
 //!
@@ -252,7 +253,7 @@
 //!
 //! Content-addressed memo keys remain scoped to `(run_id, step_number)`;
 //! they are not a cross-run cache. If multiple logical operations may
-//! receive the same input shape, include an operation name in the
+//! receive identical inputs, include an operation name in the
 //! serialized input.
 //!
 //! Memo entries live in the object store passed to
@@ -303,7 +304,7 @@
 //!
 //! Because the sweep is keyed on those terminal markers, and a
 //! terminated run never resumes, it never deletes the memo or replay
-//! entries of an in-flight run out from under a resume. A resuming
+//! entries of an in-flight run that a resume may still read. A resuming
 //! step that finds an entry absent re-executes the work (delivery is
 //! at-least-once regardless), so a missing entry is always safe to
 //! observe rather than a dangling reference: deletion is left
@@ -358,7 +359,7 @@
 //! no-op and the returned [`SubmitOutcome`] has `newly_submitted = false`.
 //! A re-submission that carries a *different* input is rejected with
 //! [`Error::InputMismatch`]: reusing a `run_id` with new content is a
-//! programmer error; pick a fresh `run_id` for a new run.
+//! programmer error; choose a fresh `run_id` for a new run.
 //!
 //! Duplicates are caught from two sources, in order:
 //!

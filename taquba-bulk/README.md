@@ -24,8 +24,8 @@ Each input item becomes one `taquba-workflow` run whose single step invokes
 `Pipeline::run`. The pipeline's own logical steps live inside that method as
 `BulkCtx::memoized` or `BulkCtx::memoized_by_content` calls. Taquba delivers
 at-least-once, so a step may run again if its lease expires before it acks;
-memoization makes that replay cheap, because each completed logical step
-returns its cached result instead of repeating a paid call. A pipeline error
+memoization makes that replay inexpensive, because each completed logical
+step returns its cached result instead of repeating a paid call. A pipeline error
 retries with backoff and then dead-letters the item (terminating it failed);
 the rest of the batch is unaffected.
 
@@ -61,7 +61,7 @@ The helper serializes the key as MessagePack, hashes it with SHA-256, and
 uses the digest inside the item's existing workflow memo namespace. The entry
 remains scoped to one item run; this is not a cross-item cache. Include an
 operation name in the serialized key when multiple logical operations may
-receive the same input shape.
+receive identical inputs.
 
 ## Single process, remote work per step
 
@@ -168,7 +168,7 @@ the same run id resumes from its last cached step rather than recomputing.
 
 Line-delimited JSON: `read_jsonl` decodes inputs and `JsonlSink` writes one
 result record per line. Both sides are traits (`OutputSink`), so other
-formats can be added without touching the runner. The default sink is
+formats can be added without modifying the runner. The default sink is
 `NullSink`, for pipelines whose results are side effects.
 
 ## License

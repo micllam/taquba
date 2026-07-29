@@ -7,25 +7,56 @@
 //!
 //! Built on [SlateDB] and the [`object_store`] crate (local disk, S3, GCS,
 //! Azure Blob, MinIO, etc.). All producers and workers for a given store run
-//! inside one process and share an `Arc<Queue>`. Use Taquba when you want
-//! durable background jobs whose state survives node loss, ephemeral disks,
-//! and region failures, without operating a queue server or a separate
-//! state layer (typically Postgres).
+//! inside one process and share an `Arc<Queue>`. Use Taquba for durable
+//! background jobs whose state survives node loss, ephemeral disks, and
+//! region failures, without operating a queue server or a separate state
+//! layer (typically Postgres).
 //!
 //! # When Taquba fits
 //!
-//! - A single-binary service that needs durable background jobs without
-//!   operating a queue server.
-//! - Edge or ephemeral compute where the local disk is gone after each
-//!   invocation but the bucket persists.
-//! - Low-to-moderate-throughput workloads where cheap per-PUT pricing on
-//!   object storage beats running a database or broker.
+//! Database-backed queues excel at jobs attached to an application
+//! database; Taquba is well-suited to work attached to data. Object
+//! storage as the backing store earns its place when at least one of
+//! the following holds:
+//!
+//! - Payloads are big: payloads above a threshold are offloaded to their
+//!   own objects with a transactional lifecycle, written once and
+//!   deleted when the job leaves the queue.
+//! - Backlogs are big or bursty: a million-job backlog costs only its
+//!   storage and requires no maintenance.
+//! - The workload is mostly idle: an idle queue incurs only storage
+//!   costs, and per-tenant isolation is a key prefix. There is no
+//!   server with a baseline cost that accrues while nothing runs.
+//! - State crosses machine or account boundaries: a bucket is reachable
+//!   from a laptop, a CI runner or a spot instance with credentials
+//!   alone, so compute is replaceable by construction.
+//! - The work coordinates data already in the bucket: queue state,
+//!   payloads, results and history share one lifecycle, one restore
+//!   domain and one access policy.
+//! - The execution trail must be tamper-proof: attempt history, results
+//!   and terminal markers commit in the same transactions as the work,
+//!   and object lock makes the trail immutable by storage policy.
+//! - Steps are expensive and IO-bound: for steps that take much longer
+//!   than an object-store write the per-transition durability cost is
+//!   negligible, a retried run does not re-pay memoized steps, and
+//!   expensive steps sit far from the commit-rate ceiling. LLM calls
+//!   and rate-limited external APIs are the strongest fit.
 //!
 //! # When Taquba does not fit
 //!
-//! - If you need a worker fleet spread across multiple machines.
-//! - Sustained high-throughput pipelines or low-latency request paths.
-//!
+//! - The queue must share the application's database transactions: a
+//!   database-backed queue enqueues jobs and commits their effects
+//!   inside the application's own transactions.
+//! - A worker fleet across machines: Taquba is single-writer, so one
+//!   process owns each store. This caps compute that runs in the
+//!   worker process itself at one node; steps that call remote
+//!   services scale with async concurrency inside the single process.
+//! - Latency-sensitive paths: every durable transition is an
+//!   object-store write, so end-to-end latency is floored by a PUT
+//!   round trip.
+//! - Cheap jobs at high volume: throughput is bound by the durable
+//!   commit rate, and sub-millisecond jobs pay the durability cost on
+//!   every transition.
 //! Measured performance numbers, with the environment and commit that
 //! produced them, are recorded in `RESULTS.md` in the source repository.
 //!
@@ -203,7 +234,7 @@
 //!
 //! Because a store is single-writer, an admin surface that mutates state
 //! must live inside the process that owns the queue.
-//! `examples/admin_http.rs` shows the resulting shape: a minimal HTTP
+//! `examples/admin_http.rs` demonstrates the pattern: a minimal HTTP
 //! server inside the owning process, mapping these APIs onto JSON
 //! endpoints.
 //!
