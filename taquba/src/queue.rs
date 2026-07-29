@@ -2745,6 +2745,228 @@ mod tests {
         Arc::new(InMemory::new())
     }
 
+    use futures_core::stream::BoxStream;
+    use slatedb::object_store::{
+        CopyOptions, Error as StoreError, GetOptions, GetResult, ListResult, MultipartUpload,
+        ObjectMeta, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as StoreResult,
+        path::Path as StorePath,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// In-memory object store whose `put` requests fail with a synthetic
+    /// service-unavailable error while the flag is set. Reads, lists and
+    /// deletes are unaffected.
+    #[derive(Debug)]
+    struct FaultStore {
+        inner: Arc<dyn ObjectStore>,
+        fail_puts: AtomicBool,
+    }
+
+    impl FaultStore {
+        fn wrap() -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(InMemory::new()),
+                fail_puts: AtomicBool::new(false),
+            })
+        }
+
+        fn fail_puts(&self, fail: bool) {
+            self.fail_puts.store(fail, Ordering::SeqCst);
+        }
+
+        fn synthetic_503() -> StoreError {
+            StoreError::Generic {
+                store: "FaultStore",
+                source: "synthetic 503 Service Unavailable".into(),
+            }
+        }
+    }
+
+    impl std::fmt::Display for FaultStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FaultStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FaultStore {
+        async fn put_opts(
+            &self,
+            location: &StorePath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> StoreResult<PutResult> {
+            if self.fail_puts.load(Ordering::SeqCst) {
+                return Err(Self::synthetic_503());
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &StorePath,
+            opts: PutMultipartOptions,
+        ) -> StoreResult<Box<dyn MultipartUpload>> {
+            if self.fail_puts.load(Ordering::SeqCst) {
+                return Err(Self::synthetic_503());
+            }
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &StorePath,
+            options: GetOptions,
+        ) -> StoreResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, StoreResult<StorePath>>,
+        ) -> BoxStream<'static, StoreResult<StorePath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&StorePath>) -> BoxStream<'static, StoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&StorePath>) -> StoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &StorePath,
+            to: &StorePath,
+            options: CopyOptions,
+        ) -> StoreResult<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_kv_compare_put_stalls_during_store_outage_without_partial_state() {
+        let store = FaultStore::wrap();
+        let q = Queue::open(store.clone(), "test").await.unwrap();
+        q.kv_put(b"slot", b"v1").await.unwrap();
+
+        store.fail_puts(true);
+        // The compare-miss arm is read-only and completes despite the
+        // write fault.
+        assert!(!q.kv_compare_put(b"slot", Some(b"v0"), b"v2").await.unwrap());
+        // The matched arm awaits durability. SlateDB retries transient
+        // store errors with backoff instead of failing the flush, so the
+        // call must stall rather than report success. Paused runtime time
+        // drives the retry backoff virtually; the elapsed timeout drops
+        // the in-flight call, simulating a crash mid-outage.
+        let stalled = tokio::time::timeout(
+            Duration::from_secs(30),
+            q.kv_compare_put(b"slot", Some(b"v1"), b"v2"),
+        )
+        .await;
+        assert!(stalled.is_err());
+        drop(q);
+
+        store.fail_puts(false);
+        let q = Queue::open(store, "test").await.unwrap();
+        assert_eq!(
+            q.kv_get(b"slot").await.unwrap().as_deref(),
+            Some(b"v1".as_slice())
+        );
+        assert!(q.kv_compare_put(b"slot", Some(b"v1"), b"v2").await.unwrap());
+        assert_eq!(
+            q.kv_get(b"slot").await.unwrap().as_deref(),
+            Some(b"v2".as_slice())
+        );
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ack_with_applies_no_effects_when_a_crash_interrupts_a_stalled_settlement() {
+        let store = FaultStore::wrap();
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = || OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(store.clone(), "test", opts())
+            .await
+            .unwrap();
+        let effects = || AckEffects {
+            enqueues: vec![EnqueueRequest {
+                queue: "next".to_string(),
+                payload: b"follow".to_vec(),
+                options: EnqueueOptions::default(),
+            }],
+            kv_writes: HashMap::from([(b"runs/1".to_vec(), b"done".to_vec())]),
+            kv_deletes: Vec::new(),
+        };
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        // A durable barrier write, so the claim record is flushed before
+        // faults are enabled and the crash loses only the settlement.
+        q.kv_put(b"barrier", b"x").await.unwrap();
+
+        // The settlement stalls on the unavailable store (SlateDB retries
+        // transient put errors with backoff, driven virtually by the
+        // paused runtime); the elapsed timeout drops the in-flight call
+        // and the queue is dropped without a close, simulating a crash
+        // mid-outage.
+        store.fail_puts(true);
+        let stalled =
+            tokio::time::timeout(Duration::from_secs(30), q.ack_with(&job, effects())).await;
+        assert!(stalled.is_err());
+        drop(q);
+
+        store.fail_puts(false);
+        let q = Queue::open_with_options(store, "test", opts())
+            .await
+            .unwrap();
+        // None of the settlement's effects survived the crash.
+        assert!(q.kv_get(b"runs/1").await.unwrap().is_none());
+        assert!(
+            q.claim("next", Duration::from_secs(5))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // The job is still owned by the crashed claim; expire the lease
+        // and redeliver.
+        clock.advance(Duration::from_secs(60));
+        q.reap_now().await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.payload, b"job");
+        let results = q.ack_with(&job, effects()).await.unwrap();
+        assert!(matches!(results[0], EnqueueResult::New(_)));
+        assert_eq!(
+            q.kv_get(b"runs/1").await.unwrap().as_deref(),
+            Some(b"done".as_slice())
+        );
+        let follow = q
+            .claim("next", Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(follow.payload, b"follow");
+        assert!(
+            q.claim("next", Duration::from_secs(5))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        q.close().await.unwrap();
+    }
+
     #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn metrics_sampler_emits_pending_depth_gauge() {

@@ -3164,8 +3164,10 @@ dependencies = [
 name = "taquba"
 version = "0.9.0"
 dependencies = [
+ "async-trait",
  "axum",
  "bytes",
+ "futures-core",
  "metrics",
  "metrics-util 0.18.0",
  "rmp-serde",

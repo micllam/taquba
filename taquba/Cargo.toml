@@ -45,6 +45,9 @@ slatedb-common = { version = "0.14.1", optional = true }
 [dev-dependencies]
 # Used only by the `#[cfg(feature = "metrics")]` tests.
 metrics-util = "0.18"
+# Used only by the fault-injection tests' object-store wrapper.
+async-trait = "0.1"
+futures-core = "0.3"
 # Used only by `examples/admin_http.rs`.
 axum = "0.8"
 serde_json = "1"
