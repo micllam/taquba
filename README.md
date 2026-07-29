@@ -138,7 +138,7 @@ Taquba's strongest fit is a single-process service performing expensive,
 IO- or API-bound, retry-worthy work over data that lives in (or belongs in)
 object storage.
 
-**Taquba is a good fit when:**
+**Taquba is a good fit when any of the following holds:**
 
 - **Payloads are big.** Object storage is built for large values. Payloads
   above a threshold are offloaded to their own objects with a transactional
@@ -174,7 +174,7 @@ object storage.
   far from the commit-rate ceiling. LLM calls, remote renders and
   rate-limited third-party APIs are the strongest fit.
 
-**A different tool is the better choice when:**
+**A different tool is the better choice when any of the following holds:**
 
 - **You need the queue to share the application's database transactions.**
   A database-backed queue enqueues jobs and commits their effects inside
