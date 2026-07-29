@@ -296,14 +296,17 @@ pub struct OpenOptions {
     /// Override SlateDB's WAL flush interval. `None` keeps SlateDB's
     /// own default.
     ///
-    /// `txn.commit()` blocks until the next flush tick, so this value
-    /// is the lower bound on per-operation latency for every taquba
-    /// state transition (`enqueue`, `claim`, `ack`, `nack`,
-    /// `dead_letter`).
+    /// The transitions that await durability (`enqueue`, `ack`,
+    /// `nack`, `dead_letter`) block until the next flush tick, so this
+    /// value is the lower bound on their per-operation latency.
+    /// `claim` and the background sweeps commit without awaiting the
+    /// flush and are not bound by it.
     ///
-    /// Does not affect durability semantics: commits still wait for
-    /// the flush before returning, so at-least-once delivery is
-    /// preserved regardless of the interval chosen.
+    /// Does not affect durability semantics: the awaiting transitions
+    /// wait for the flush whatever the interval is, and a non-awaiting
+    /// transition lost in a crash is redone on recovery, so
+    /// at-least-once delivery is preserved regardless of the interval
+    /// chosen.
     pub flush_interval: Option<Duration>,
     /// How often the background metrics sampler reads per-queue depth and
     /// the oldest-pending age and emits them as gauges. `None` (the default)
