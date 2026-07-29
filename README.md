@@ -192,6 +192,7 @@ object storage.
   durable commit rate: thousands of transitions per second against S3,
   scaling with concurrency, but sub-millisecond jobs pay the durability
   cost on every transition and reach that ceiling quickly.
+
 The measured numbers behind these claims, stamped with the environment and
 commit that produced them, are in
 [`taquba-bencher/RESULTS.md`](./taquba-bencher/RESULTS.md).
