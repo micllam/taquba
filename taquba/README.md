@@ -78,6 +78,7 @@ the backing store when at least one of the following holds:
 - Cheap jobs at high volume: throughput is bound by the durable commit
   rate, and sub-millisecond jobs pay the durability cost on every
   transition.
+
 Measured performance numbers, with the environment and commit that
 produced them, are recorded in
 [`taquba-bencher/RESULTS.md`](https://github.com/micllam/taquba/blob/master/taquba-bencher/RESULTS.md).
