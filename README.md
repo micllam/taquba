@@ -136,8 +136,9 @@ this way.
 
 Taquba's strongest fit is a single-process service performing expensive,
 IO- or API-bound, retry-worthy work over data that lives in (or belongs in)
-object storage. Choose object storage as the backing store when at least
-one of the following holds:
+object storage.
+
+**Taquba is a good fit when:**
 
 - **Payloads are big.** Object storage is built for large values. Payloads
   above a threshold are offloaded to their own objects with a transactional
