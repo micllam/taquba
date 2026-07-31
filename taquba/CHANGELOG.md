@@ -72,7 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and zero-padded ASCII fields. Queue names are now limited to
   `MAX_QUEUE_NAME_LEN` (255) bytes; longer names return the new
   `Error::InvalidQueueName`.
-- Upgraded the SlateDB dependency to 0.14.1 (from 0.13.1).
+- Upgraded the SlateDB dependency to 0.15.0 (from 0.13.1).
 
 ### Removed
 
