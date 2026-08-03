@@ -96,4 +96,5 @@ jobs:
         with:
           name: soak-csv-${{ github.run_id }}
           path: soak.csv
+          retention-days: 14
           if-no-files-found: error
