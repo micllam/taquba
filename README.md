@@ -2,6 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/taquba.svg)](https://crates.io/crates/taquba)
 [![docs.rs](https://img.shields.io/docsrs/taquba)](https://docs.rs/taquba)
+[![CI](https://github.com/micllam/taquba/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/micllam/taquba/actions/workflows/ci.yml)
 [![license](https://img.shields.io/crates/l/taquba.svg)](#license)
 
 A durable task queue and durable-execution workflow runtime for Rust with
