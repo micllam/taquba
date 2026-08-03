@@ -2749,20 +2749,26 @@ mod tests {
     }
 
     use futures_core::stream::BoxStream;
+    use futures_util::StreamExt;
     use slatedb::object_store::{
         CopyOptions, Error as StoreError, GetOptions, GetResult, ListResult, MultipartUpload,
         ObjectMeta, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as StoreResult,
         path::Path as StorePath,
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    /// In-memory object store whose `put` requests fail with a synthetic
-    /// service-unavailable error while the flag is set. Reads, lists and
-    /// deletes are unaffected.
+    /// In-memory object store whose `put` and `delete` requests fail with
+    /// a synthetic service-unavailable error while the corresponding flag
+    /// is set. Reads and lists are unaffected.
     #[derive(Debug)]
     struct FaultStore {
         inner: Arc<dyn ObjectStore>,
         fail_puts: AtomicBool,
+        fail_deletes: AtomicBool,
+        /// Puts permitted before every later put fails. `usize::MAX`
+        /// disables the countdown, leaving `fail_puts` as the only cause
+        /// of failure.
+        puts_before_failure: AtomicUsize,
     }
 
     impl FaultStore {
@@ -2770,11 +2776,40 @@ mod tests {
             Arc::new(Self {
                 inner: Arc::new(InMemory::new()),
                 fail_puts: AtomicBool::new(false),
+                fail_deletes: AtomicBool::new(false),
+                puts_before_failure: AtomicUsize::new(usize::MAX),
             })
         }
 
         fn fail_puts(&self, fail: bool) {
             self.fail_puts.store(fail, Ordering::SeqCst);
+        }
+
+        fn fail_deletes(&self, fail: bool) {
+            self.fail_deletes.store(fail, Ordering::SeqCst);
+        }
+
+        /// Permit `n` further puts, then fail every put after them.
+        fn fail_puts_after(&self, n: usize) {
+            self.puts_before_failure.store(n, Ordering::SeqCst);
+        }
+
+        /// Whether this put fails, consuming one permitted put when it
+        /// does not. Callers of the payload store issue puts
+        /// sequentially, so a read followed by a store is sufficient.
+        fn put_fails(&self) -> bool {
+            if self.fail_puts.load(Ordering::SeqCst) {
+                return true;
+            }
+            match self.puts_before_failure.load(Ordering::SeqCst) {
+                usize::MAX => false,
+                0 => true,
+                remaining => {
+                    self.puts_before_failure
+                        .store(remaining - 1, Ordering::SeqCst);
+                    false
+                }
+            }
         }
 
         fn synthetic_503() -> StoreError {
@@ -2799,7 +2834,7 @@ mod tests {
             payload: PutPayload,
             opts: PutOptions,
         ) -> StoreResult<PutResult> {
-            if self.fail_puts.load(Ordering::SeqCst) {
+            if self.put_fails() {
                 return Err(Self::synthetic_503());
             }
             self.inner.put_opts(location, payload, opts).await
@@ -2810,7 +2845,7 @@ mod tests {
             location: &StorePath,
             opts: PutMultipartOptions,
         ) -> StoreResult<Box<dyn MultipartUpload>> {
-            if self.fail_puts.load(Ordering::SeqCst) {
+            if self.put_fails() {
                 return Err(Self::synthetic_503());
             }
             self.inner.put_multipart_opts(location, opts).await
@@ -2824,10 +2859,17 @@ mod tests {
             self.inner.get_opts(location, options).await
         }
 
+        // Deletion reaches the trait through `delete_stream`, so the fault
+        // is injected by replacing each location's result with an error.
         fn delete_stream(
             &self,
             locations: BoxStream<'static, StoreResult<StorePath>>,
         ) -> BoxStream<'static, StoreResult<StorePath>> {
+            if self.fail_deletes.load(Ordering::SeqCst) {
+                return locations
+                    .map(|location| location.and(Err(Self::synthetic_503())))
+                    .boxed();
+            }
             self.inner.delete_stream(locations)
         }
 
@@ -7137,6 +7179,161 @@ mod tests {
             .unwrap();
         assert_eq!(job.payload, payload);
         q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    /// OpenOptions offloading to `payloads`, leaving the queue's own store
+    /// healthy so only payload-object requests are subject to faults.
+    fn faulty_payload_opts(payloads: Arc<dyn ObjectStore>) -> OpenOptions {
+        OpenOptions {
+            payload_store: Some(payloads),
+            ..offload_opts()
+        }
+    }
+
+    #[tokio::test]
+    async fn enqueue_writes_no_record_when_the_payload_object_write_fails() {
+        let payloads = FaultStore::wrap();
+        let payload_store: Arc<dyn ObjectStore> = payloads.clone();
+        let q = Queue::open_with_options(
+            make_store(),
+            "test",
+            faulty_payload_opts(payload_store.clone()),
+        )
+        .await
+        .unwrap();
+
+        payloads.fail_puts(true);
+        let err = q.enqueue("work", vec![9u8; 256]).await.unwrap_err();
+
+        assert!(
+            matches!(err, Error::PayloadStore(StoreError::Generic { store, .. }) if store == "FaultStore"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            q.stats("work").await.unwrap().pending,
+            0,
+            "a record must not be written when its payload object was not"
+        );
+        assert_eq!(object_count(&payload_store, "test-payloads").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn enqueue_batch_removes_earlier_payload_objects_when_a_later_write_fails() {
+        let payloads = FaultStore::wrap();
+        let payload_store: Arc<dyn ObjectStore> = payloads.clone();
+        let q = Queue::open_with_options(
+            make_store(),
+            "test",
+            faulty_payload_opts(payload_store.clone()),
+        )
+        .await
+        .unwrap();
+
+        // The third payload write fails, after two objects have been written.
+        payloads.fail_puts_after(2);
+        let err = q
+            .enqueue_batch("work", vec![vec![1u8; 256], vec![2u8; 256], vec![3u8; 256]])
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::PayloadStore(StoreError::Generic { store, .. }) if store == "FaultStore"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            object_count(&payload_store, "test-payloads").await,
+            0,
+            "objects written before the failure must be removed, since no record points at them"
+        );
+        assert_eq!(q.stats("work").await.unwrap().pending, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ack_settles_the_job_when_the_payload_object_delete_fails() {
+        let payloads = FaultStore::wrap();
+        let payload_store: Arc<dyn ObjectStore> = payloads.clone();
+        let q = Queue::open_with_options(
+            make_store(),
+            "test",
+            faulty_payload_opts(payload_store.clone()),
+        )
+        .await
+        .unwrap();
+
+        let id = q.enqueue("work", vec![4u8; 256]).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+
+        payloads.fail_deletes(true);
+        q.ack(&job).await.unwrap();
+
+        assert!(
+            q.get_job(&id).await.unwrap().is_none(),
+            "the payload delete is best-effort and must not prevent settlement"
+        );
+        assert_eq!(
+            object_count(&payload_store, "test-payloads").await,
+            1,
+            "a failed delete leaves an unreferenced object, the record having been removed first"
+        );
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ack_with_deletes_the_payload_object_of_a_deduplicated_follow_up() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        q.enqueue_with(
+            "next",
+            vec![1u8; 256],
+            EnqueueOptions {
+                dedup_key: Some("dk".to_string()),
+                ..EnqueueOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        assert_eq!(object_count(&store, "test-payloads").await, 1);
+
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let results = q
+            .ack_with(
+                &job,
+                AckEffects {
+                    enqueues: vec![EnqueueRequest {
+                        queue: "next".to_string(),
+                        payload: vec![2u8; 256],
+                        options: EnqueueOptions {
+                            dedup_key: Some("dk".to_string()),
+                            ..EnqueueOptions::default()
+                        },
+                    }],
+                    ..AckEffects::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(&results[0], EnqueueResult::AlreadyEnqueued(_)));
+        assert_eq!(
+            object_count(&store, "test-payloads").await,
+            1,
+            "the downgraded follow-up's object is removed, leaving only the existing job's"
+        );
         q.close().await.unwrap();
     }
 
