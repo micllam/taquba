@@ -1,0 +1,99 @@
+name: Nightly
+
+# Limited to jobs that are unbounded by construction: one runs until a clock
+# expires, the other runs for hours. Bounded jobs run per push in ci.yml.
+on:
+  schedule:
+    # 02:00 UTC.
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      loop_minutes:
+        description: "Minutes to loop the test suite for"
+        required: false
+        default: ""
+      soak_schedule:
+        description: "RATE_SCHEDULE for the soak (comma-separated seconds:rate)"
+        required: false
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  # The suite uses MockClock, `start_paused` virtual time, lease expiry,
+  # reaper and scheduler intervals and spawned tasks. Intermittent failures in
+  # those paths can be absent from any single run, so the suite is repeated.
+  flaky-tests:
+    runs-on: ubuntu-latest
+    # Above the step timeout below. A failed step sends a notification; a
+    # job-level timeout cancels the run, and GitHub does not notify on
+    # cancellations.
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+      - name: Loop the test suite
+        timeout-minutes: 45
+        env:
+          LOOP_MINUTES: ${{ inputs.loop_minutes || '15' }}
+        run: |
+          set -euo pipefail
+          # Build once so the loop measures test execution, not compilation.
+          cargo test --workspace --all-features --locked --no-run
+          SECONDS=0
+          deadline=$((LOOP_MINUTES * 60))
+          iteration=1
+          while [ $SECONDS -lt $deadline ]; do
+            echo "=== iteration $iteration (elapsed ${SECONDS}s) ==="
+            if ! cargo test --workspace --all-features --locked; then
+              echo "suite failed on iteration $iteration" >&2
+              exit 1
+            fi
+            iteration=$((iteration + 1))
+          done
+          echo "completed $((iteration - 1)) iteration(s) in ${SECONDS}s with no failures"
+
+  # Measures whether the queue remains leak-free and error-free under changing
+  # load, and whether backlog builds and drains. Real object storage is
+  # required only for recorded measurements, so this runs against the
+  # throttled in-memory store.
+  #
+  # Fails on a panic, an error return or exhausted memory. Gradual degradation
+  # such as a rising backlog or increasing latency is not detected here and
+  # requires reading the CSV artifact.
+  soak:
+    runs-on: ubuntu-latest
+    # GitHub-hosted jobs are limited to six hours; longer runs stay manual.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench
+      - name: Varying-load soak against the throttled in-memory store
+        timeout-minutes: 80
+        env:
+          # 20ms per object-store call approximates an S3-class backend.
+          STORE_LATENCY_MS: "20"
+          # Idle, baseline, ramp, a burst above the sustainable rate, then
+          # recovery. The idle and overload segments exercise backlog build
+          # and drain, which a fixed rate does not reach.
+          RATE_SCHEDULE: ${{ inputs.soak_schedule || '120:0,900:150,600:400,300:800,600:150' }}
+          # A realistic flush interval rather than the 1ms isolation setting.
+          FLUSH_INTERVAL_MS: "20"
+          N_WORKERS: "32"
+          N_PRODUCERS: "8"
+        run: cargo bench -p taquba-bencher --bench steady_state --locked | tee soak.csv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-csv-${{ github.run_id }}
+          path: soak.csv
+          if-no-files-found: error

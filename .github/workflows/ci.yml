@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# Supersede an in-flight run when a newer commit lands on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Debug info increases target directory size and link time; no job here
+  # reads a symbolised backtrace.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  # Separate from `test` so lint and test failures are reported in the same run.
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
+      - run: cargo doc --workspace --all-features --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # Fail when a `taquba` feature is not built by any row of the `features`
+      # matrix below.
+      - name: check the feature matrix covers every taquba feature
+        run: |
+          set -euo pipefail
+          features=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "taquba") | .features | keys[]' \
+            | grep -v '^default$')
+          for feature in $features; do
+            grep -qE -- "--features $feature( |\$)" .github/workflows/ci.yml \
+              || { echo "taquba feature '$feature' is built by no CI job" >&2; exit 1; }
+          done
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+      - run: cargo test --workspace --all-features --locked
+
+  # `--all-features` enables every backend at once. This matrix builds the
+  # configurations that are selected in practice: the default feature set is
+  # empty, and aws, gcp and azure are chosen individually.
+  features:
+    name: check (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            args: ""
+          - name: aws
+            args: --features aws
+          - name: gcp
+            args: --features gcp
+          - name: azure
+            args: --features azure
+          - name: metrics
+            args: --features metrics
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: features
+      - run: cargo check -p taquba --locked --no-default-features ${{ matrix.args }}
+
+  minio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      minio:
+        # The official minio image requires a `server /data` command, which
+        # service containers cannot supply. The Bitnami build starts from
+        # environment variables and pre-creates the bucket. bitnamilegacy is
+        # frozen, so the digest is pinned.
+        image: bitnamilegacy/minio@sha256:451fe6858cb770cc9d0e77ba811ce287420f781c7c1b806a386f6896471a349c
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+          MINIO_DEFAULT_BUCKETS: taquba
+        ports:
+          - 9000:9000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench
+      # Exercises enqueue, the claim scan, settlement and the durable commit
+      # path against a real S3 API. Timings from a shared runner are not
+      # comparable with the recorded benchmark results and are not retained.
+      - name: claim_drain against MinIO
+        env:
+          STORE_URL: s3://taquba/
+          STORE_PREFIX: ci-${{ github.run_id }}
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_REGION: us-east-1
+          AWS_ENDPOINT: http://127.0.0.1:9000
+          AWS_ALLOW_HTTP: "true"
+          N_JOBS: "2000"
+          N_WORKERS: "16"
+        run: cargo bench -p taquba-bencher --features aws --bench claim_drain --locked
