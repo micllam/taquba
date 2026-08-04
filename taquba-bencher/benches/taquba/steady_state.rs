@@ -41,6 +41,10 @@
 //                       reported as 0 in this mode: a successful call's
 //                       latency is dominated by time waiting for
 //                       a job to exist, which is not claim-path cost.
+//   DRAIN_TIMEOUT_SEC   seconds the backlog drain may run after producers
+//                       stop before the run is abandoned (default 0, no
+//                       limit). On expiry the CSV is written and the
+//                       process exits non-zero.
 //   PAYLOAD_BYTES       per-job payload size, min 8 (default 64).
 //   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1).
 //   STORE_LATENCY_MS    injected object-store latency per call (default 0).
@@ -139,6 +143,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let payload_bytes: usize = env_var("PAYLOAD_BYTES", 64).max(8);
     let flush_interval_ms: u64 = env_var("FLUSH_INTERVAL_MS", 1);
     let store_latency_ms: u64 = env_var("STORE_LATENCY_MS", 0);
+    let drain_timeout: Option<Duration> = match env_var("DRAIN_TIMEOUT_SEC", 0u64) {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    };
 
     // Offered-load schedule: either a time-varying RATE_SCHEDULE or a single
     // fixed segment from RATE for DURATION_SEC. RATE_SCHEDULE is mutually
@@ -208,6 +216,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // lease that expires after a worker's last poll is requeued by the
     // reaper and must still find live workers.
     let drain_complete = Arc::new(AtomicBool::new(false));
+    // Set by the watcher when DRAIN_TIMEOUT_SEC expires. Unlike
+    // `drain_complete` it stops workers without waiting for an empty poll,
+    // which an undrained queue never yields.
+    let drain_abandoned = Arc::new(AtomicBool::new(false));
 
     // Each entry is (elapsed_us_at_completion, latency_us).
     type Sample = (u64, u64);
@@ -277,9 +289,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let queue = queue.clone();
         let queue_name = queue_names[worker_idx % queue_names.len()].clone();
         let drain_complete = drain_complete.clone();
+        let drain_abandoned = drain_abandoned.clone();
         worker_handles.push(tokio::spawn(async move {
             let mut samples: Vec<DoneSample> = Vec::with_capacity(8192);
             'poll: loop {
+                if drain_abandoned.load(Ordering::Relaxed) {
+                    break;
+                }
                 let claim_start = Instant::now();
                 let claimed = if wait_claim_ms > 0 {
                     queue
@@ -338,8 +354,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let queue_names = queue_names.clone();
         let producers_done = producers_done.clone();
         let drain_complete = drain_complete.clone();
+        let drain_abandoned = drain_abandoned.clone();
         tokio::spawn(async move {
             let mut depth_samples: Vec<(u64, i64)> = Vec::new();
+            // First sample after producers stopped; DRAIN_TIMEOUT_SEC runs
+            // from here.
+            let mut drain_start: Option<Instant> = None;
+            let mut undrained: Option<i64> = None;
             let mut tick = tokio::time::interval(WATCHER_TICK);
             tick.tick().await; // skip immediate first tick
             'sample: loop {
@@ -358,12 +379,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let elapsed = bench_start.elapsed().as_secs();
                 depth_samples.push((elapsed, pending));
                 eprintln!("  t={elapsed}s pending={pending} claimed={claimed} done={done}");
-                if producers_done.load(Ordering::Relaxed) && pending == 0 && claimed == 0 {
-                    drain_complete.store(true, Ordering::Relaxed);
-                    eprintln!("drain complete");
-                    return depth_samples;
+                if producers_done.load(Ordering::Relaxed) {
+                    if pending == 0 && claimed == 0 {
+                        drain_complete.store(true, Ordering::Relaxed);
+                        eprintln!("drain complete");
+                        break;
+                    }
+                    let started = *drain_start.get_or_insert_with(Instant::now);
+                    if let Some(limit) = drain_timeout
+                        && started.elapsed() >= limit
+                    {
+                        drain_abandoned.store(true, Ordering::Relaxed);
+                        undrained = Some(pending + claimed);
+                        eprintln!(
+                            "drain abandoned after {}s with pending={pending} claimed={claimed}",
+                            started.elapsed().as_secs(),
+                        );
+                        break;
+                    }
                 }
             }
+            (depth_samples, undrained)
         })
     };
 
@@ -384,7 +420,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => eprintln!("worker {idx}: task join error: {e}"),
         }
     }
-    let depth_samples = watcher.await.unwrap_or_default();
+    let (depth_samples, undrained) = watcher.await.unwrap_or_default();
 
     // Merge into per-second windows.
     #[derive(Default)]
@@ -462,5 +498,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // emitted inline, gauges from the sampler, SlateDB metrics via the bridge).
     #[cfg(feature = "metrics")]
     taquba_bencher::report_metrics(&prometheus);
+
+    // Returned after the CSV is written, so the time series is not lost.
+    if let Some(depth) = undrained {
+        return Err(format!(
+            "backlog did not drain within DRAIN_TIMEOUT_SEC: {depth} jobs outstanding"
+        )
+        .into());
+    }
     Ok(())
 }

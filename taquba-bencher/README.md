@@ -69,6 +69,11 @@ cargo bench -p taquba-bencher --bench steady_state > steady.csv
 RATE_SCHEDULE=300:0,1800:500,600:2000 \
     cargo bench -p taquba-bencher --bench steady_state > soak.csv
 
+# Same, bounding the drain that follows the last segment, so an undrainable
+# backlog exits non-zero with the CSV written instead of running unbounded.
+DRAIN_TIMEOUT_SEC=600 RATE_SCHEDULE=300:0,1800:500,600:2000 \
+    cargo bench -p taquba-bencher --bench steady_state > soak.csv
+
 # Same, with 20ms of injected object-store latency per call to
 # approximate an S3-class backend instead of the in-memory store.
 STORE_LATENCY_MS=20 RATE=200 \
@@ -151,6 +156,12 @@ N_JOBS=2000 JOB_WORK_MS=50 MAX_CONCURRENT=200 \
 `STORE_LATENCY_MS` wraps the in-memory store in `object_store`'s
 `ThrottledStore`, so every get, put, list, and delete sleeps that long
 before running. It is available on every benchmark.
+
+`DRAIN_TIMEOUT_SEC` (`steady_state`) bounds the backlog drain that follows
+the last schedule segment. A backlog the workers cannot clear otherwise
+drains without limit, outlasting any enclosing job timeout and leaving an
+empty CSV. On expiry the workers stop, the CSV is written and the process
+exits non-zero reporting the undrained depth.
 
 `STORE_JITTER_MS` adds, on top of any `STORE_LATENCY_MS` floor, a random
 tail latency in `[0, STORE_JITTER_MS]` (right-skewed, so most writes are

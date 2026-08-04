@@ -86,15 +86,30 @@ jobs:
           # recovery. The idle and overload segments exercise backlog build
           # and drain, which a fixed rate does not reach.
           RATE_SCHEDULE: ${{ inputs.soak_schedule || '120:0,900:150,600:400,300:800,600:150' }}
+          # Claims serialise per queue and the lock is held across the scan,
+          # so once the compacted level holds more than one sorted run an
+          # unbatched claim costs one object-store read per job and the
+          # queue is capped at one claim per read. Batching amortises that
+          # read across the batch, as `run_worker_concurrent` does.
+          CLAIM_BATCH: "16"
+          # Otherwise an undrainable backlog runs to the step timeout, which
+          # leaves no CSV.
+          DRAIN_TIMEOUT_SEC: "600"
           # A realistic flush interval rather than the 1ms isolation setting.
           FLUSH_INTERVAL_MS: "20"
           N_WORKERS: "32"
           N_PRODUCERS: "8"
-        run: cargo bench -p taquba-bencher --bench steady_state --locked | tee soak.csv
+        # stdout is the CSV, stderr the per-second progress; both are kept.
+        run: |
+          set -o pipefail
+          cargo bench -p taquba-bencher --bench steady_state --locked \
+            2>&1 1>soak.csv | tee soak.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: soak-csv-${{ github.run_id }}
-          path: soak.csv
+          path: |
+            soak.csv
+            soak.log
           retention-days: 14
           if-no-files-found: error
