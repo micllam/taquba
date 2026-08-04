@@ -19,7 +19,6 @@ thiserror = { workspace = true }
 
 rmp-serde = "1"
 sha2 = "0.10"
-ulid = { workspace = true }
 
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 

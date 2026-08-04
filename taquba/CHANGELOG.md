@@ -62,6 +62,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefix, in ascending key order with an opaque resume cursor (returned as
   the new `KvPage`). The enumeration and export primitive for the
   namespace; internal key spaces are never visible in the results.
+- `Queue::next_job_id`: take a job id without enqueuing, for callers that
+  need it before the enqueue commits and pass it back as
+  `EnqueueOptions::id_override`. Ids come from the queue's own generator,
+  so an override taken this way preserves claim order where an
+  independently generated one need not.
 
 ### Changed
 

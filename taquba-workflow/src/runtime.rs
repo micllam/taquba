@@ -982,7 +982,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         user_headers: &HashMap<String, String>,
         opts: StepEnqueueOpts,
     ) -> (EnqueueRequest, String) {
-        let job_id = ulid::Ulid::new().to_string();
+        let job_id = self.queue.next_job_id();
         let mut headers = user_headers.clone();
         headers.insert(HEADER_RUN_ID.to_string(), run_id.to_string());
         headers.insert(HEADER_STEP.to_string(), step_number.to_string());

@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `object_store` types in the public API (for example the store
   passed to `JobRunner::builder`) are now `object_store` 0.14.
 
+### Fixed
+
+- Submissions take their job id from `Queue::next_job_id` rather than
+  generating one independently, so submissions made in sequence inside
+  one millisecond are claimed in that order instead of arbitrarily.
+  Submissions that overlap are ordered by when each took its id, as for a
+  direct enqueue. The id is still taken before the enqueue and passed as
+  `id_override`, so the submission record still commits with it.
+
 ## [0.5.0] - 2026-06-23
 
 ### Changed

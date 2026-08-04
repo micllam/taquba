@@ -668,11 +668,13 @@ impl Queue {
         self.clock.now_ms()
     }
 
-    /// Generate the next job id. Ids increase with call order. The
-    /// timestamp comes from this queue's [`Clock`]; when that clock
-    /// repeats or goes backwards the preceding timestamp is reused and
-    /// the random component incremented.
-    pub(crate) fn next_id(&self) -> String {
+    /// Generate a job id without enqueuing anything.
+    ///
+    /// For callers that need the id before the enqueue commits, to write
+    /// a record pointing at the job in the same transaction; pass it as
+    /// [`EnqueueOptions::id_override`]. Ids increase with call order and
+    /// take their timestamp from this queue's [`Clock`].
+    pub fn next_job_id(&self) -> String {
         let at = std::time::UNIX_EPOCH + Duration::from_millis(self.now_ms());
         let mut generator = self.id_gen.lock().expect("id generator mutex poisoned");
         match generator.generate_from_datetime(at) {
@@ -1067,7 +1069,7 @@ impl Queue {
                 validate_id_override(&supplied)?;
                 (supplied, true)
             }
-            None => (self.next_id(), false),
+            None => (self.next_job_id(), false),
         };
 
         let (status, key) = match run_at {
@@ -2585,7 +2587,7 @@ impl Queue {
 
         let mut jobs = Vec::with_capacity(payloads.len());
         for payload in payloads {
-            let id = self.next_id();
+            let id = self.next_job_id();
             jobs.push(JobRecord::new_pending(
                 id,
                 queue.to_string(),
@@ -4129,7 +4131,7 @@ mod tests {
         .await
         .unwrap();
 
-        let ids: Vec<String> = (0..10).map(|_| q.next_id()).collect();
+        let ids: Vec<String> = (0..10).map(|_| q.next_job_id()).collect();
 
         // The first ten characters of a ULID are its millisecond timestamp.
         assert!(

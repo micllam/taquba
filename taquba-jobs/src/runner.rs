@@ -268,7 +268,7 @@ impl Submitter {
         // atomically with the enqueue. After the job acks (releasing
         // the queue dedup key), the recorded id remains the pointer
         // back to the result blob.
-        let id = ulid::Ulid::new().to_string();
+        let id = self.queue.next_job_id();
         let record_bytes = rmp_serde::to_vec_named(&JobSubmissionRecord {
             input_hash,
             job_id: id.clone(),

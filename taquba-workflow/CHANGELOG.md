@@ -35,6 +35,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as `Error::Serialization` instead of `Error::Queue`. Both classify as
   permanent; only the variant changed.
 
+### Fixed
+
+- Step enqueues take their job id from `Queue::next_job_id` rather than
+  generating one independently, so steps enqueued in sequence inside one
+  millisecond are claimed in that order instead of arbitrarily. Steps
+  whose enqueues overlap are ordered by when each took its id, as for a
+  direct enqueue. The id is still taken before the request is built and
+  passed as `id_override`.
+
 ## [0.7.0] - 2026-06-23
 
 ### Changed
