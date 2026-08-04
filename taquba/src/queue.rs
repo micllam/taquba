@@ -493,6 +493,11 @@ pub struct Queue {
     claim_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Per-queue resume point for the next claim scan.
     claim_cursor: ClaimCursor,
+    /// Source of job ids. Pending keys sort by id within a priority, so
+    /// ids must increase with enqueue order, including inside one
+    /// millisecond. One generator per store suffices: a store has a
+    /// single writer process.
+    id_gen: std::sync::Mutex<ulid::Generator>,
     /// Wakeup fired whenever any job reaches a terminal state: `Done`
     /// (acked, kept or not), `Dead` (dead-lettered by worker, exhausted
     /// retry, or reaper), or `Pending` / `Scheduled` jobs removed via
@@ -650,6 +655,7 @@ impl Queue {
             claimed_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             claim_locks: std::sync::Mutex::new(HashMap::new()),
             claim_cursor,
+            id_gen: std::sync::Mutex::new(ulid::Generator::new()),
             completion_notify,
             payload_store,
             payload_offload_threshold: opts.payload_offload_threshold,
@@ -660,6 +666,20 @@ impl Queue {
     /// from this queue's configured [`Clock`].
     pub(crate) fn now_ms(&self) -> u64 {
         self.clock.now_ms()
+    }
+
+    /// Generate the next job id. Ids increase with call order. The
+    /// timestamp comes from this queue's [`Clock`]; when that clock
+    /// repeats or goes backwards the preceding timestamp is reused and
+    /// the random component incremented.
+    pub(crate) fn next_id(&self) -> String {
+        let at = std::time::UNIX_EPOCH + Duration::from_millis(self.now_ms());
+        let mut generator = self.id_gen.lock().expect("id generator mutex poisoned");
+        match generator.generate_from_datetime(at) {
+            Ok(id) => id.to_string(),
+            // Unreachable short of 2^80 ids inside one millisecond.
+            Err(_) => Ulid::from_datetime(at).to_string(),
+        }
     }
 
     /// Register a freshly-claimed job's cancellation token. Called from
@@ -1047,7 +1067,7 @@ impl Queue {
                 validate_id_override(&supplied)?;
                 (supplied, true)
             }
-            None => (Ulid::new().to_string(), false),
+            None => (self.next_id(), false),
         };
 
         let (status, key) = match run_at {
@@ -2563,17 +2583,9 @@ impl Queue {
 
         let timer = crate::obs::start();
 
-        // Use a monotonic generator so IDs in a single batch sort in insertion
-        // order even when produced inside the same millisecond; `Ulid::new()`
-        // alone is not monotonic and would break batch FIFO assertions.
-        let mut id_gen = ulid::Generator::new();
-
         let mut jobs = Vec::with_capacity(payloads.len());
         for payload in payloads {
-            let id = id_gen
-                .generate()
-                .expect("monotonic ULID generator overflowed within one ms")
-                .to_string();
+            let id = self.next_id();
             jobs.push(JobRecord::new_pending(
                 id,
                 queue.to_string(),
@@ -4097,6 +4109,60 @@ mod tests {
 
         assert_eq!(j1.id, id_first);
         assert_eq!(j2.id, id_second);
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_ids_increase_within_one_millisecond() {
+        // A clock that never advances puts every id in one millisecond,
+        // which is the case a non-monotonic id source orders arbitrarily.
+        let clock = MockClock::new(1_700_000_000_000);
+        let q = Queue::open_with_options(
+            make_store(),
+            "test",
+            OpenOptions {
+                clock: Arc::new(clock.clone()),
+                ..OpenOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let ids: Vec<String> = (0..10).map(|_| q.next_id()).collect();
+
+        // The first ten characters of a ULID are its millisecond timestamp.
+        assert!(
+            ids.iter().all(|id| id[..10] == ids[0][..10]),
+            "every id must carry the frozen clock's millisecond"
+        );
+        assert!(
+            ids.windows(2).all(|w| w[0] < w[1]),
+            "ids must increase with generation order"
+        );
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fifo_holds_across_a_claim_batch() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+
+        let mut enqueued = Vec::new();
+        for i in 0..20 {
+            enqueued.push(
+                q.enqueue("jobs", format!("job-{i}").into_bytes())
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let claimed = q
+            .claim_batch("jobs", 20, Duration::from_secs(30))
+            .await
+            .unwrap();
+        let claimed_ids: Vec<String> = claimed.into_iter().map(|j| j.id).collect();
+        assert_eq!(claimed_ids, enqueued);
 
         q.close().await.unwrap();
     }

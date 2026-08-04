@@ -72,6 +72,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and zero-padded ASCII fields. Queue names are now limited to
   `MAX_QUEUE_NAME_LEN` (255) bytes; longer names return the new
   `Error::InvalidQueueName`.
+- A job id's timestamp component is taken from the queue's `Clock` rather
+  than from the system clock. When that clock repeats or goes backwards
+  the id keeps the preceding id's timestamp and increments its random
+  component, so ids still ascend and a timestamp never moves backwards.
+  Under the default clock the timestamp is the system time in
+  milliseconds, as before.
 - Upgraded the SlateDB dependency to 0.15.0 (from 0.13.1).
 
 ### Removed
@@ -111,6 +117,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Job ids now increase with enqueue order even when generated inside one
+  millisecond, so jobs of equal priority are claimed in enqueue order as
+  documented. Ids come from one monotonic ULID generator per store rather
+  than from `Ulid::new()`, which ordered ids of the same millisecond
+  arbitrarily; pending keys sort by id within a priority, so those jobs
+  could be claimed out of order, which concurrent producers made reachable
+  in ordinary use. `enqueue_batch` was already monotonic within one call
+  and is now monotonic across calls as well. Ids remain ULIDs and the key
+  layout is unchanged; a caller-supplied `EnqueueOptions::id_override`
+  still determines its own ordering.
 - `Queue::claim` and `Queue::claim_batch` now bound the cursor-resumed
   scan to the queue's `pending:` prefix instead of scanning unbounded to
   the end of the keyspace. When a claim resumed from the recorded cursor
