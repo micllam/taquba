@@ -13,7 +13,7 @@ on:
         required: false
         default: ""
       soak_schedule:
-        description: "RATE_SCHEDULE for the soak (comma-separated seconds:rate)"
+        description: "RATE_SCHEDULE for every soak arm (comma-separated seconds:rate)"
         required: false
         default: ""
 
@@ -71,21 +71,44 @@ jobs:
     runs-on: ubuntu-latest
     # GitHub-hosted jobs are limited to six hours; longer runs stay manual.
     timeout-minutes: 90
+    strategy:
+      # Each arm reports its own result.
+      fail-fast: false
+      matrix:
+        include:
+          # Offered load within worker capacity throughout.
+          - arm: varying
+            schedule: 120:0,900:150,600:400,300:800,600:150
+            producers: 8
+            workers: 32
+            queues: 1
+          # Offered load above worker capacity, so the burst builds a
+          # backlog and the recovery segment drains it. Producers enqueue
+          # serially, so exceeding that capacity takes more of them.
+          - arm: backlog
+            schedule: 60:0,300:150,300:1000,600:150
+            producers: 32
+            workers: 32
+            queues: 1
+          # Exercises the global reaper and scheduler prefix scans and the
+          # per-queue claim state.
+          - arm: sharded
+            schedule: 120:0,600:150,300:600,300:150
+            producers: 16
+            workers: 32
+            queues: 4
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: bench
-      - name: Varying-load soak against the throttled in-memory store
+      - name: Soak (${{ matrix.arm }}) against the throttled in-memory store
         timeout-minutes: 80
         env:
           # 20ms per object-store call approximates an S3-class backend.
           STORE_LATENCY_MS: "20"
-          # Idle, baseline, ramp, a burst above the sustainable rate, then
-          # recovery. The idle and overload segments exercise backlog build
-          # and drain, which a fixed rate does not reach.
-          RATE_SCHEDULE: ${{ inputs.soak_schedule || '120:0,900:150,600:400,300:800,600:150' }}
+          RATE_SCHEDULE: ${{ inputs.soak_schedule || matrix.schedule }}
           # Claims serialise per queue and the lock is held across the scan,
           # so once the compacted level holds more than one sorted run an
           # unbatched claim costs one object-store read per job and the
@@ -97,8 +120,9 @@ jobs:
           DRAIN_TIMEOUT_SEC: "600"
           # A realistic flush interval rather than the 1ms isolation setting.
           FLUSH_INTERVAL_MS: "20"
-          N_WORKERS: "32"
-          N_PRODUCERS: "8"
+          N_WORKERS: ${{ matrix.workers }}
+          N_PRODUCERS: ${{ matrix.producers }}
+          N_QUEUES: ${{ matrix.queues }}
         # stdout is the CSV, stderr the per-second progress; both are kept.
         run: |
           set -o pipefail
@@ -107,7 +131,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: soak-csv-${{ github.run_id }}
+          name: soak-csv-${{ matrix.arm }}-${{ github.run_id }}
           path: |
             soak.csv
             soak.log
