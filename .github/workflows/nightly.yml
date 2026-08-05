@@ -231,3 +231,14 @@ jobs:
       # Vulnerabilities fail the job. Unmaintained and unsound crates are
       # reported without failing it.
       - run: cargo audit
+
+  # Tests the resolution a consumer gets, since no lockfile is published.
+  unlocked-deps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve every dependency to its newest compatible version
+        run: cargo update
+      - run: cargo test --workspace --all-features
