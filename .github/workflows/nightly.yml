@@ -1,7 +1,7 @@
 name: Nightly
 
-# Limited to jobs that are unbounded by construction: one runs until a clock
-# expires, the other runs for hours. Bounded jobs run per push in ci.yml.
+# Limited to jobs that run unbounded or whose input changes without a push.
+# Bounded jobs that read only the repository run per push in ci.yml.
 on:
   schedule:
     # 02:00 UTC.
@@ -218,3 +218,16 @@ jobs:
             soak.log
           retention-days: 14
           if-no-files-found: error
+
+  advisories:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # A prebuilt binary.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Vulnerabilities fail the job. Unmaintained and unsound crates are
+      # reported without failing it.
+      - run: cargo audit
