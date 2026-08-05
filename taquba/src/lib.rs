@@ -148,6 +148,14 @@
 //! job, so the poll interval only bounds the latency of out-of-band
 //! events such as a scheduled job becoming due.
 //!
+//! Claims serialise per queue. The claim lock is held across the scan
+//! and the commit, so a queue's claim rate is the batch size divided by
+//! the scan-and-commit latency and does not increase with the number of
+//! workers: additional workers on one queue wait on the lock, raising
+//! claim latency in proportion without raising throughput. Batching
+//! amortizes one lock hold across the batch, and sharding work across
+//! queues raises that limit further, the lock being per queue.
+//!
 //! # Coordinating with caller state
 //!
 //! [`Queue::enqueue_with_kv`] enqueues a job *and* applies a set of writes

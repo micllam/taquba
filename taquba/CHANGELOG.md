@@ -84,6 +84,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Under the default clock the timestamp is the system time in
   milliseconds, as before.
 - Upgraded the SlateDB dependency to 0.15.0 (from 0.13.1).
+- The claim scan opts in to block caching, which SlateDB leaves off for
+  scans. Without it a claim re-read the same block from object storage
+  every time, once the compacted level held a sorted run the scan had to
+  consult, so an unbatched queue was limited to one claim per
+  object-store read. Claim throughput now holds across that transition.
 
 ### Removed
 

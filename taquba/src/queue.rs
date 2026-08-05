@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use slatedb::config::{Settings, WriteOptions};
+use slatedb::config::{ScanOptions, Settings, WriteOptions};
 use slatedb::object_store::ObjectStore;
 use slatedb::{Db, DbTransaction, IsolationLevel};
 use tokio::sync::watch;
@@ -1547,6 +1547,11 @@ impl Queue {
             // Set when the scan ran out of pending keys before filling
             // the batch, proving nothing is live beyond the candidates.
             let mut drained = false;
+            // SlateDB leaves block caching off for scans. This scan takes at
+            // most `max_jobs` entries from one prefix and the next claim
+            // resumes where it stopped, so uncached it re-reads the same
+            // block once a compacted sorted run overlaps the prefix.
+            let scan_options = ScanOptions::default().with_cache_blocks(true);
             let mut iter = match scan.scan_from.clone() {
                 // Resume from the recorded bound (after the last claimed key,
                 // or a key inserted behind it). The subrange is relative to the
@@ -1560,13 +1565,20 @@ impl Queue {
                     } else {
                         Bound::Excluded(suffix)
                     };
-                    txn.scan_prefix(prefix_bytes, (start, Bound::Unbounded))
-                        .await?
+                    txn.scan_prefix_with_options(
+                        prefix_bytes,
+                        (start, Bound::Unbounded),
+                        &scan_options,
+                    )
+                    .await?
                 }
                 // Front scan: bound unknown (cold start or process
                 // restart), so pre-existing keys may be live anywhere
                 // in the prefix.
-                None => txn.scan_prefix(prefix_bytes, ..).await?,
+                None => {
+                    txn.scan_prefix_with_options(prefix_bytes, .., &scan_options)
+                        .await?
+                }
             };
             while candidates.len() < max_jobs {
                 match iter.next().await? {
