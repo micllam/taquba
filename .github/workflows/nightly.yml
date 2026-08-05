@@ -16,6 +16,14 @@ on:
         description: "RATE_SCHEDULE for every soak arm (comma-separated seconds:rate)"
         required: false
         default: ""
+      soak_min_done:
+        description: "Completion-rate lower bound for every soak arm, to match soak_schedule"
+        required: false
+        default: ""
+
+# No job here writes to the repository.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -165,7 +173,8 @@ jobs:
       - name: Assert the closing windows stayed within the arm's bounds
         if: always()
         env:
-          MIN_DONE: ${{ matrix.min_done }}
+          # A dispatched schedule offers a rate the arm's own bound would fail.
+          MIN_DONE: ${{ inputs.soak_min_done || matrix.min_done }}
           MAX_E2E_P99_MS: ${{ matrix.max_e2e_p99_ms || '5000' }}
           MAX_CLAIM_P99_MS: ${{ matrix.max_claim_p99_ms || '250' }}
         run: |
