@@ -64,9 +64,10 @@ jobs:
   # required only for recorded measurements, so this runs against the
   # throttled in-memory store.
   #
-  # Fails on a panic, an error return or exhausted memory. Gradual degradation
-  # such as a rising backlog or increasing latency is not detected here and
-  # requires reading the CSV artifact.
+  # Fails on a panic, an error return, exhausted memory or a completion rate
+  # in the closing windows below the arm's lower bound. Gradual degradation
+  # that does not reach that bound, such as a slowly rising backlog or
+  # increasing latency, still requires reading the CSV artifact.
   soak:
     runs-on: ubuntu-latest
     # GitHub-hosted jobs are limited to six hours; longer runs stay manual.
@@ -97,6 +98,21 @@ jobs:
             producers: 16
             workers: 32
             queues: 4
+          # Claims one job per call at a rate a single queue sustains,
+          # and runs long enough to cross the compaction that first
+          # leaves the claim scan a sorted run to consult. The other
+          # arms batch, which amortizes per-claim scan cost across the
+          # batch and would mask a regression in it. This arm sustains
+          # its rate only while an unbatched claim is served from cache.
+          - arm: unbatched
+            schedule: 60:0,1500:100
+            producers: 8
+            workers: 32
+            queues: 1
+            claim_batch: 1
+            # One claim per call, so the sustainable rate is well below
+            # the batched arms' and varies with the runner.
+            min_done: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -109,12 +125,12 @@ jobs:
           # 20ms per object-store call approximates an S3-class backend.
           STORE_LATENCY_MS: "20"
           RATE_SCHEDULE: ${{ inputs.soak_schedule || matrix.schedule }}
-          # Claims serialise per queue and the lock is held across the scan,
-          # so once the compacted level holds more than one sorted run an
-          # unbatched claim costs one object-store read per job and the
-          # queue is capped at one claim per read. Batching amortises that
-          # read across the batch, as `run_worker_concurrent` does.
-          CLAIM_BATCH: "16"
+          # Claims serialise per queue and the lock is held across the
+          # scan, so a queue's claim rate rises with the batch size
+          # rather than with worker count. `run_worker_concurrent`
+          # batches for the same reason. The unbatched arm overrides
+          # this so the one-claim-per-call path remains measured.
+          CLAIM_BATCH: ${{ matrix.claim_batch || '16' }}
           # Otherwise an undrainable backlog runs to the step timeout, which
           # leaves no CSV.
           DRAIN_TIMEOUT_SEC: "600"
@@ -128,6 +144,34 @@ jobs:
           set -o pipefail
           cargo bench -p taquba-bencher --bench steady_state --locked \
             2>&1 1>soak.csv | tee soak.log
+      # A mid-run fall in throughput does not change the exit code: the
+      # queue continues to accept and complete work, at a rate far below
+      # the one offered, and the only record is the CSV artifact. Every
+      # arm's schedule ends at a rate its workers sustain, so a mean
+      # materially below that lower bound over the closing windows
+      # indicates the queue no longer sustains the offered load.
+      - name: Assert the closing windows sustained their offered rate
+        if: always()
+        env:
+          MIN_DONE: ${{ matrix.min_done || '100' }}
+        run: |
+          set -euo pipefail
+          awk -F, -v floor="$MIN_DONE" '
+            NR > 1 && $4 ~ /^[0-9]+$/ { done[n++] = $4 }
+            END {
+              window = 120
+              if (n < window) {
+                printf "only %d windows recorded, expected at least %d\n", n, window > "/dev/stderr"
+                exit 1
+              }
+              for (i = n - window; i < n; i++) total += done[i]
+              mean = total / window
+              printf "mean completions over the last %d windows: %.1f/s (lower bound %.1f)\n", window, mean, floor
+              if (mean < floor) {
+                print "claim throughput fell below the lower bound: see the CSV artifact" > "/dev/stderr"
+                exit 1
+              }
+            }' soak.csv
       - uses: actions/upload-artifact@v4
         if: always()
         with:
