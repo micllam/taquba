@@ -100,6 +100,12 @@ steps that record results through the memo store extend the same protection
 inside a step: a retried step returns cached results for completed calls
 (LLM requests, paid APIs) instead of re-executing them.
 
+Both levels are runnable in
+[`taquba-workflow/examples/crash_resume.rs`](./taquba-workflow/examples/crash_resume.rs):
+start it, press Ctrl-C during any stage and start it again. The second process
+resumes the same run, skips the stages already committed and serves the
+completed units of the interrupted stage from the memo store.
+
 ## How it compares
 
 Durable execution today usually comes in one of three forms:

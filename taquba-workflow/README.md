@@ -136,18 +136,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```bash
 cargo run -p taquba-workflow --example single_step
 cargo run -p taquba-workflow --example multi_step
+cargo run -p taquba-workflow --example crash_resume
 cargo run -p taquba-workflow --example fanout_jobs
 ANTHROPIC_API_KEY=... cargo run -p taquba-workflow --example rig_agent
 OPENAI_API_KEY=...    cargo run -p taquba-workflow --example rig_agent
 ```
+
+`crash_resume` runs on the local filesystem and is the one example that
+demonstrates recovery directly: start it, interrupt it during any stage
+and start it again. The second process resumes the same run, skips the
+stages already committed and serves the completed units of the
+interrupted stage from the memo store.
 
 `rig_agent` is a two-stage AI agent (research, then write) structured
 for between-step durability: step 0's research is persisted as queue
 state before step 1 begins, so on a persistent store a process that
 crashes between the steps resumes at step 1 without re-running the
 research. The example itself runs on the in-memory store; substitute a
-persistent `object_store` backend to observe recovery across a process
-restart.
+persistent `object_store` backend, as `crash_resume` does, to observe
+recovery across a process restart.
 
 `fanout_jobs` composes the runtime with `taquba-jobs` for fan-out
 inside one run: a step submits one typed job per URL to a shared
