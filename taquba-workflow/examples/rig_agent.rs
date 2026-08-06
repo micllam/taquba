@@ -1,4 +1,4 @@
-//! Two-stage agent run powered by the [Rig](https://crates.io/crates/rig-core) crate:
+//! Two-stage agent run powered by the [Rig](https://crates.io/crates/rig) crate:
 //!
 //! - **Step 0 (`research`)**: an agent equipped with a mocked
 //!   `lookup_fact` tool gathers information about the submitted topic.
@@ -33,10 +33,9 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use rig_core::client::{CompletionClient, ProviderClient};
-use rig_core::completion::{Prompt, ToolDefinition};
+use rig_agent::prelude::*;
+use rig_agent::tool::ToolContext;
 use rig_core::providers::{anthropic, openai};
-use rig_core::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use taquba::Queue;
@@ -67,26 +66,30 @@ impl Tool for LookupFact {
     type Args = LookupArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Look up a short factual statement about a query. Use \
-                          for any topic the user asks about."
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The thing to look up a fact about."
-                    }
-                },
-                "required": ["query"]
-            }),
-        }
+    fn description(&self) -> String {
+        "Look up a short factual statement about a query. Use for any topic \
+         the user asks about."
+            .to_string()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The thing to look up a fact about."
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         // Stub. Real impls would call out to a search/RAG backend.
         Ok(format!(
             "Stub fact about '{}': it is widely studied and has many surprising \
