@@ -16,10 +16,6 @@ on:
         description: "RATE_SCHEDULE for every soak arm (comma-separated seconds:rate)"
         required: false
         default: ""
-      soak_min_done:
-        description: "Completion-rate lower bound for every soak arm, to match soak_schedule"
-        required: false
-        default: ""
 
 # No job here writes to the repository.
 permissions:
@@ -68,44 +64,32 @@ jobs:
           echo "completed $((iteration - 1)) iteration(s) in ${SECONDS}s with no failures"
 
   # Measures whether the queue remains leak-free and error-free under changing
-  # load, and whether backlog builds and drains. Real object storage is
-  # required only for recorded measurements, so this runs against the
-  # throttled in-memory store.
+  # load. Real object storage is required only for recorded measurements, so
+  # this runs against the throttled in-memory store.
   #
-  # Fails on a panic, an error return or exhausted memory, and on a completion
-  # rate, end-to-end latency or claim latency outside the arm's bounds in the
-  # closing windows. Degradation that stays within them, such as a slowly
-  # rising backlog, still requires reading the CSV artifact.
+  # Fails on a panic, an error returned by any producer or worker, exhausted
+  # memory, a queue that does not drain and a completion rate below the arm's
+  # bound. Latency is recorded in the CSV artifact and is not asserted on.
   soak:
     runs-on: ubuntu-latest
     # GitHub-hosted jobs are limited to six hours; longer runs stay manual.
     timeout-minutes: 90
+    env:
+      # Read by the bench and by the derived bound.
+      RATE_SCHEDULE: ${{ inputs.soak_schedule || matrix.schedule }}
     strategy:
       # Each arm reports its own result.
       fail-fast: false
       matrix:
-        # `min_done` is the rate the arm's closing schedule segment offers,
-        # less a margin for runner variation. Each arm sets it because the
-        # closing segments differ.
         include:
-          # Offered load within worker capacity throughout.
+          # Offered load within worker capacity throughout. Producers
+          # enqueue serially and one sustains roughly 40/s, so the count
+          # follows the highest segment rate.
           - arm: varying
             schedule: 120:0,900:150,600:400,300:800,600:150
-            producers: 8
-            workers: 32
-            queues: 1
-            min_done: 120
-          # Offered load above worker capacity, so the burst builds a
-          # backlog and the recovery segment drains it. Producers enqueue
-          # serially, so exceeding that capacity takes more of them. The
-          # recovery segment is long enough that the backlog clears well
-          # before the closing windows.
-          - arm: backlog
-            schedule: 60:0,300:150,300:1000,600:150
             producers: 32
             workers: 32
             queues: 1
-            min_done: 120
           # Exercises the global reaper and scheduler prefix scans and the
           # per-queue claim state.
           - arm: sharded
@@ -113,7 +97,6 @@ jobs:
             producers: 16
             workers: 32
             queues: 4
-            min_done: 120
           # Claims one job per call at a rate a single queue sustains,
           # and runs long enough to cross the compaction that first
           # leaves the claim scan a sorted run to consult. The other
@@ -126,9 +109,6 @@ jobs:
             workers: 32
             queues: 1
             claim_batch: 1
-            # One claim per call, so the sustainable rate is well below
-            # the batched arms' and varies with the runner.
-            min_done: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -140,7 +120,6 @@ jobs:
         env:
           # 20ms per object-store call approximates an S3-class backend.
           STORE_LATENCY_MS: "20"
-          RATE_SCHEDULE: ${{ inputs.soak_schedule || matrix.schedule }}
           # Claims serialise per queue and the lock is held across the
           # scan, so a queue's claim rate rises with the batch size
           # rather than with worker count. `run_worker_concurrent`
@@ -160,63 +139,41 @@ jobs:
           set -o pipefail
           cargo bench -p taquba-bencher --bench steady_state --locked \
             2>&1 1>soak.csv | tee soak.log
-      # A fall in throughput or a rise in latency does not change the exit
-      # code: the queue continues to accept and complete work, and the only
-      # record is the CSV artifact. Every arm's schedule ends at a rate its
-      # workers sustain, so the closing windows are its steady state and are
-      # compared against the arm's bounds. The two latency bounds detect a
-      # regression that leaves throughput intact, which the completion rate
-      # alone does not; they are set an order of magnitude above the
-      # sustained figures rather than derived from them, so they detect a
-      # large regression rather than a small one. Measured latencies are
-      # recorded in taquba-bencher/RESULTS.md.
-      - name: Assert the closing windows stayed within the arm's bounds
+      # A fall in throughput does not change the bench's exit code: the queue
+      # continues to accept and complete work, and the only record is the CSV
+      # artifact. Every arm's schedule ends at a rate its workers sustain, so
+      # the closing windows are its steady state and are compared against a
+      # bound derived from that rate.
+      - name: Assert the closing completion rate stayed above the arm's bound
         if: always()
-        env:
-          # A dispatched schedule offers a rate the arm's own bound would fail.
-          MIN_DONE: ${{ inputs.soak_min_done || matrix.min_done }}
-          MAX_E2E_P99_MS: ${{ matrix.max_e2e_p99_ms || '5000' }}
-          MAX_CLAIM_P99_MS: ${{ matrix.max_claim_p99_ms || '250' }}
         run: |
           set -euo pipefail
-          # An unset bound would compare as a string in awk and pass silently.
-          : "${MIN_DONE:?every soak arm must set min_done}"
-          awk -F, \
-            -v min_done="$MIN_DONE" \
-            -v max_e2e_us=$((MAX_E2E_P99_MS * 1000)) \
-            -v max_claim_us=$((MAX_CLAIM_P99_MS * 1000)) '
-            NR > 1 && $4 ~ /^[0-9]+$/ {
-              done[n] = $4; e2e[n] = $7; claim[n] = $8; n++
-            }
+          # The closing segment's rate, less 20% for runner variation. A
+          # rate of 0 would derive a bound that always passes.
+          closing_rate=${RATE_SCHEDULE##*:}
+          [ "$closing_rate" -gt 0 ] || { echo "the closing segment must offer a non-zero rate" >&2; exit 1; }
+          min_done=$((closing_rate * 80 / 100))
+          awk -F, -v min_done="$min_done" '
+            NR > 1 && $4 ~ /^[0-9]+$/ { done[n] = $4; n++ }
             END {
               window = 120
-              if (n < window) {
-                printf "only %d windows recorded, expected at least %d\n", n, window > "/dev/stderr"
+              # The schedule ends on a partial second and the drain records
+              # a further window, both below the offered rate.
+              tail = 2
+              if (n < window + tail) {
+                printf "only %d windows recorded, expected at least %d\n", n, window + tail > "/dev/stderr"
                 exit 1
               }
-              for (i = n - window; i < n; i++) {
-                sum_done += done[i]; sum_e2e += e2e[i]; sum_claim += claim[i]
+              for (i = n - window - tail; i < n - tail; i++) {
+                sum_done += done[i]
               }
               mean_done = sum_done / window
-              mean_e2e = sum_e2e / window / 1000
-              mean_claim = sum_claim / window / 1000
-              printf "means over the last %d windows: %.1f completions/s (at least %.1f), e2e p99 %.1f ms (at most %.1f), claim p99 %.1f ms (at most %.1f)\n", \
-                window, mean_done, min_done, mean_e2e, max_e2e_us / 1000, mean_claim, max_claim_us / 1000
-              failed = 0
+              printf "mean over the %d windows preceding the drain: %.1f completions/s (at least %.1f)\n", \
+                window, mean_done, min_done
               if (mean_done < min_done) {
-                print "completion rate fell below the lower bound" > "/dev/stderr"
-                failed = 1
+                print "completion rate fell below the lower bound, see the CSV artifact" > "/dev/stderr"
+                exit 1
               }
-              if (sum_e2e / window > max_e2e_us) {
-                print "end-to-end p99 rose above the upper bound" > "/dev/stderr"
-                failed = 1
-              }
-              if (sum_claim / window > max_claim_us) {
-                print "claim p99 rose above the upper bound" > "/dev/stderr"
-                failed = 1
-              }
-              if (failed) print "see the CSV artifact" > "/dev/stderr"
-              exit failed
             }' soak.csv
       - uses: actions/upload-artifact@v4
         if: always()

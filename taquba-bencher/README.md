@@ -163,6 +163,10 @@ drains without limit, outlasting any enclosing job timeout and leaving an
 empty CSV. On expiry the workers stop, the CSV is written and the process
 exits non-zero reporting the undrained depth.
 
+An enqueue, claim or ack error stops the producer or worker that returned
+it. `steady_state` writes the CSV and then exits non-zero reporting the
+first such error.
+
 `STORE_JITTER_MS` adds, on top of any `STORE_LATENCY_MS` floor, a random
 tail latency in `[0, STORE_JITTER_MS]` (right-skewed, so most writes are
 delayed little and a few by close to the maximum) to each write. It injects

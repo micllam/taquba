@@ -76,8 +76,8 @@
 // offered rate exceeds what the queue sustains. Status and progress
 // prints go to stderr so stdout stays a clean data stream.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use taquba::{OpenOptions, Queue, QueueConfig};
@@ -92,6 +92,15 @@ const WATCHER_TICK: Duration = Duration::from_secs(1);
 /// How long an idle worker sleeps before re-polling while producers
 /// are still running.
 const IDLE_BACKOFF: Duration = Duration::from_millis(2);
+
+/// Records the first error reported by a producer or worker. Later
+/// errors are discarded.
+fn record_error(slot: &Mutex<Option<String>>, message: String) {
+    let mut slot = slot.lock().expect("task error mutex poisoned");
+    if slot.is_none() {
+        *slot = Some(message);
+    }
+}
 
 /// Parse a `RATE_SCHEDULE` value: a comma-separated list of
 /// `seconds:rate` segments (e.g. `60:0,300:500,120:2000`). A rate of 0 is
@@ -220,6 +229,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `drain_complete` it stops workers without waiting for an empty poll,
     // which an undrained queue never yields.
     let drain_abandoned = Arc::new(AtomicBool::new(false));
+    // First error returned by a producer or worker; it fails the run.
+    let task_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     // Each entry is (elapsed_us_at_completion, latency_us).
     type Sample = (u64, u64);
@@ -237,6 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let queue = queue.clone();
         let queue_names = queue_names.clone();
         let schedule = schedule.clone();
+        let task_error = task_error.clone();
         producer_handles.push(tokio::spawn(async move {
             let mut samples: Vec<Sample> = Vec::with_capacity(8192);
             let mut seq = producer_idx;
@@ -269,7 +281,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             samples.push((done_us, done_us - enq_start_us));
                         }
                         Err(e) => {
-                            eprintln!("producer {producer_idx}: enqueue error: {e}");
+                            let message = format!("producer {producer_idx}: enqueue error: {e}");
+                            eprintln!("{message}");
+                            record_error(&task_error, message);
                             return samples;
                         }
                     }
@@ -290,6 +304,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let queue_name = queue_names[worker_idx % queue_names.len()].clone();
         let drain_complete = drain_complete.clone();
         let drain_abandoned = drain_abandoned.clone();
+        let task_error = task_error.clone();
         worker_handles.push(tokio::spawn(async move {
             let mut samples: Vec<DoneSample> = Vec::with_capacity(8192);
             'poll: loop {
@@ -328,7 +343,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 u64::from_le_bytes(job.payload[..8].try_into().unwrap());
                             let ack_start = Instant::now();
                             if let Err(e) = queue.ack(job).await {
-                                eprintln!("worker {worker_idx}: ack error: {e}");
+                                let message = format!("worker {worker_idx}: ack error: {e}");
+                                eprintln!("{message}");
+                                record_error(&task_error, message);
                                 break 'poll;
                             }
                             let ack_us = ack_start.elapsed().as_micros() as u64;
@@ -337,7 +354,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Err(e) => {
-                        eprintln!("worker {worker_idx}: claim error: {e}");
+                        let message = format!("worker {worker_idx}: claim error: {e}");
+                        eprintln!("{message}");
+                        record_error(&task_error, message);
                         break;
                     }
                 }
@@ -500,6 +519,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     taquba_bencher::report_metrics(&prometheus);
 
     // Returned after the CSV is written, so the time series is not lost.
+    // Checked before the drain, which a stopped task also fails.
+    if let Some(message) = task_error.lock().expect("task error mutex poisoned").take() {
+        return Err(message.into());
+    }
     if let Some(depth) = undrained {
         return Err(format!(
             "backlog did not drain within DRAIN_TIMEOUT_SEC: {depth} jobs outstanding"
