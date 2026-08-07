@@ -7,8 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-07
+
 ### Changed
 
+- Raised the minimum `taquba` requirement to 0.10.
 - **Breaking:** `JobRunner::builder` takes the required dependencies
   positionally as `builder(queue, object_store)`, and
   `JobRunnerBuilder::build` is infallible (it returns `JobRunner`

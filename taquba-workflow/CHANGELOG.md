@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-07
+
 ### Added
 
 - Durable signals: `Trigger::OnSignal { correlation_key, timeout }` (built
@@ -23,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Raised the minimum `taquba` requirement to 0.10.
 - **Breaking:** `StepOutcome::Continue` and `StepOutcome::ContinueAfter` are
   unified into `StepOutcome::Continue { payload, when }`, where `when` is the
   new `Trigger` enum (`Trigger::Immediate` or `Trigger::After(delay)`). The

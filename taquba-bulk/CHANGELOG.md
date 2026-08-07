@@ -7,8 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-07
+
 ### Changed
 
+- Raised the minimum `taquba` requirement to 0.10 and `taquba-workflow` to 0.8.
 - The `object_store` types in the public API are now `object_store` 0.14.
 
 ### Removed
