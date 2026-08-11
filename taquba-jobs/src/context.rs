@@ -2,7 +2,7 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use taquba::Queue;
+use taquba::{LeaseHandle, Queue};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::Result;
@@ -40,6 +40,7 @@ pub struct JobContext<'a> {
     job_id: &'a str,
     attempt: u32,
     cancel_token: CancellationToken,
+    lease: LeaseHandle,
 }
 
 impl<'a> JobContext<'a> {
@@ -48,12 +49,14 @@ impl<'a> JobContext<'a> {
         job_id: &'a str,
         attempt: u32,
         cancel_token: CancellationToken,
+        lease: LeaseHandle,
     ) -> Self {
         Self {
             submitter,
             job_id,
             attempt,
             cancel_token,
+            lease,
         }
     }
 
@@ -100,6 +103,17 @@ impl<'a> JobContext<'a> {
     /// completion.
     pub fn cancel_token(&self) -> &CancellationToken {
         &self.cancel_token
+    }
+
+    /// The lease handle for this delivery.
+    ///
+    /// A long-running handler calls
+    /// [`LeaseHandle::ensure_at_least`] at progress points (or once,
+    /// with a slow call's timeout, before issuing it) so the lease
+    /// covers the remaining work and the job is not re-queued while it
+    /// still runs.
+    pub fn lease(&self) -> &LeaseHandle {
+        &self.lease
     }
 
     /// The underlying taquba queue, for direct queue operations.

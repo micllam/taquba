@@ -334,7 +334,12 @@ type DispatchFuture<'a> =
 
 /// Type-erased dispatch from a job-type header to a typed [`Job::run`].
 trait ErasedHandler: Send + Sync {
-    fn dispatch<'a>(&'a self, job: &'a JobRecord, submitter: &'a Submitter) -> DispatchFuture<'a>;
+    fn dispatch<'a>(
+        &'a self,
+        job: &'a JobRecord,
+        submitter: &'a Submitter,
+        lease: &'a LeaseHandle,
+    ) -> DispatchFuture<'a>;
 }
 
 struct TypedHandler<J: Job> {
@@ -342,8 +347,13 @@ struct TypedHandler<J: Job> {
 }
 
 impl<J: Job> ErasedHandler for TypedHandler<J> {
-    fn dispatch<'a>(&'a self, job: &'a JobRecord, submitter: &'a Submitter) -> DispatchFuture<'a> {
-        Box::pin(run_typed::<J>(job, submitter))
+    fn dispatch<'a>(
+        &'a self,
+        job: &'a JobRecord,
+        submitter: &'a Submitter,
+        lease: &'a LeaseHandle,
+    ) -> DispatchFuture<'a> {
+        Box::pin(run_typed::<J>(job, submitter, lease))
     }
 }
 
@@ -351,6 +361,7 @@ impl<J: Job> ErasedHandler for TypedHandler<J> {
 async fn run_typed<J: Job>(
     job: &JobRecord,
     submitter: &Submitter,
+    lease: &LeaseHandle,
 ) -> std::result::Result<(), WorkerError> {
     // A payload that won't deserialize will never deserialize: dead-letter it.
     let input: J = rmp_serde::from_slice(&job.payload).map_err(|err| {
@@ -361,7 +372,13 @@ async fn run_typed<J: Job>(
     })?;
 
     let cancel_token = job.cancel_token.clone().unwrap_or_default();
-    let ctx = JobContext::new(submitter, &job.id, job.attempts, cancel_token);
+    let ctx = JobContext::new(
+        submitter,
+        &job.id,
+        job.attempts,
+        cancel_token,
+        lease.clone(),
+    );
 
     tracing::info!(
         job_id = %job.id,
@@ -455,7 +472,7 @@ impl Worker for Dispatcher {
     async fn process(
         &self,
         job: &JobRecord,
-        _lease: &LeaseHandle,
+        lease: &LeaseHandle,
     ) -> std::result::Result<(), WorkerError> {
         let job_type = job.headers.get(JOB_TYPE_HEADER).ok_or_else(|| {
             WorkerError::from(PermanentFailure::new(format!(
@@ -468,7 +485,7 @@ impl Worker for Dispatcher {
                 "no handler registered for job type `{job_type}`"
             )))
         })?;
-        handler.dispatch(job, &self.submitter).await
+        handler.dispatch(job, &self.submitter, lease).await
     }
 }
 
@@ -883,6 +900,27 @@ mod tests {
         }
     }
 
+    /// A job that extends its lease through the context and reports the
+    /// resulting expiry.
+    #[derive(Serialize, Deserialize)]
+    struct Renewing;
+
+    impl Job for Renewing {
+        const NAME: &'static str = "test.renewing";
+        type Output = u64;
+        type Error = TestError;
+
+        async fn run(&self, ctx: JobContext<'_>) -> std::result::Result<u64, TestError> {
+            ctx.lease()
+                .ensure_at_least(Duration::from_secs(600))
+                .map_err(|e| TestError(e.to_string()))?;
+            Ok(ctx
+                .queue()
+                .lease_expiry(DEFAULT_QUEUE_NAME, ctx.job_id())
+                .expect("a running delivery holds a lease"))
+        }
+    }
+
     /// A parent job that submits N children from inside its handler. The
     /// parent itself doesn't touch the counter; observing the counter reach
     /// N proves the children all ran.
@@ -1100,6 +1138,25 @@ mod tests {
         let job = runner.submit(Adder { a: 10, b: 7 }).await.unwrap();
         let sum = job.await.unwrap();
         assert_eq!(sum, 17);
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_handler_extends_its_lease_through_the_context() {
+        let base = 1_700_000_000_000;
+        let (queue, store) =
+            open_queue_with_clock("test-renew", MockClock::new(base), QueueConfig::default()).await;
+        let mut runner = JobRunner::builder(queue, store).build();
+        runner.register::<Renewing>();
+        let handle = runner.spawn(std::future::pending::<()>());
+
+        let job = runner.submit(Renewing).await.unwrap();
+        let expiry = job.await.unwrap();
+        assert!(
+            expiry >= base + 600_000,
+            "the extension must reach the lease registry",
+        );
 
         handle.shutdown().await.unwrap();
     }

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `JobContext::lease`: the delivery's `taquba::LeaseHandle`. A
+  long-running handler calls `ensure_at_least` at progress points (or
+  once, with a slow call's timeout, before issuing it) so the job is not
+  re-queued while it still runs.
+
 ## [0.6.0] - 2026-08-07
 
 ### Changed

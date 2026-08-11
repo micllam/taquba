@@ -234,8 +234,9 @@
 //!   [`Job::Error`], and the [`Job::run`] body, plus hooks for idempotency,
 //!   attempt limits, and error classification).
 //! - [`JobRunner`]: registers job types, submits jobs, spawns the worker.
-//! - [`JobContext`]: the per-call context handed to [`Job::run`]: application
-//!   state, the queue, the job's identity, a cancellation token.
+//! - [`JobContext`]: the per-call context passed to [`Job::run`]: application
+//!   state, the queue, the job's identity, a cancellation token and the
+//!   delivery's lease handle.
 //! - [`JobHandle`]: returned from [`JobRunner::submit`]; await it for the
 //!   typed result, or poll its [`status`](JobHandle::status) /
 //!   [`fetch_result`](JobHandle::fetch_result).
