@@ -43,6 +43,7 @@ impl<P: Pipeline> StepRunner for PipelineRunner<P> {
             step.headers.clone(),
             step.memo.clone(),
             step.cancel_token.clone(),
+            step.lease.clone(),
         );
 
         let output = self.pipeline.run(&ctx).await.map_err(Into::into)?;
@@ -102,6 +103,7 @@ mod tests {
             job_id: "job-1".into(),
             attempts: 1,
             cancel_token: CancellationToken::new(),
+            lease: taquba::LeaseHandle::detached(),
             memo,
             signal: None,
         }

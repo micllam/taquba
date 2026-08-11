@@ -5,6 +5,7 @@ use std::future::Future;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use taquba::LeaseHandle;
 use taquba_workflow::{Memo, StepError};
 use tokio_util::sync::CancellationToken;
 
@@ -86,8 +87,9 @@ pub trait Pipeline: Send + Sync + 'static {
 /// Per-item execution context handed to [`Pipeline::run`].
 ///
 /// Wraps the typed input together with the durable per-item
-/// [memo](taquba_workflow::Memo), a [cost accumulator](CostReport), and the
-/// run's cooperative [cancellation token](CancellationToken).
+/// [memo](taquba_workflow::Memo), a [cost accumulator](CostReport), the
+/// run's cooperative [cancellation token](CancellationToken) and the
+/// delivery's [lease handle](LeaseHandle).
 pub struct BulkCtx<T> {
     /// The deserialized input item for this run.
     pub input: T,
@@ -99,6 +101,7 @@ pub struct BulkCtx<T> {
     memo: Memo,
     cost: CostReport,
     cancel_token: CancellationToken,
+    lease: LeaseHandle,
 }
 
 impl<T> BulkCtx<T> {
@@ -108,6 +111,7 @@ impl<T> BulkCtx<T> {
         headers: HashMap<String, String>,
         memo: Memo,
         cancel_token: CancellationToken,
+        lease: LeaseHandle,
     ) -> Self {
         Self {
             input,
@@ -116,6 +120,7 @@ impl<T> BulkCtx<T> {
             memo,
             cost: CostReport::new(),
             cancel_token,
+            lease,
         }
     }
 
@@ -261,6 +266,15 @@ impl<T> BulkCtx<T> {
         &self.cancel_token
     }
 
+    /// The lease handle for this item's delivery. A long-running
+    /// pipeline calls [`LeaseHandle::ensure_at_least`] at progress
+    /// points (or once, with a slow call's timeout, before issuing it)
+    /// so the item is not re-queued while it still runs; see
+    /// [`taquba_workflow::Step::lease`].
+    pub fn lease(&self) -> &LeaseHandle {
+        &self.lease
+    }
+
     /// Snapshot of the cost accumulated so far for this item.
     pub(crate) fn cost(&self) -> CostReport {
         self.cost.clone()
@@ -333,6 +347,7 @@ mod tests {
             HashMap::new(),
             memo,
             CancellationToken::new(),
+            taquba::LeaseHandle::detached(),
         )
     }
 
@@ -452,6 +467,7 @@ mod tests {
             HashMap::new(),
             memo.clone(),
             CancellationToken::new(),
+            taquba::LeaseHandle::detached(),
         );
         let replay_ctx = BulkCtx::new(
             (),
@@ -459,6 +475,7 @@ mod tests {
             HashMap::new(),
             memo,
             CancellationToken::new(),
+            taquba::LeaseHandle::detached(),
         );
         let calls = AtomicU32::new(0);
 
@@ -499,6 +516,7 @@ mod tests {
             HashMap::new(),
             memo.clone(),
             CancellationToken::new(),
+            taquba::LeaseHandle::detached(),
         );
         let replay_ctx = BulkCtx::new(
             (),
@@ -506,6 +524,7 @@ mod tests {
             HashMap::new(),
             memo,
             CancellationToken::new(),
+            taquba::LeaseHandle::detached(),
         );
         let calls = AtomicU32::new(0);
         let input = ContentInput {
