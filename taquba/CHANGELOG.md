@@ -67,6 +67,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (source):** `JobRecord::lease_expires_at` is removed; the
   lease expiry is process state, read with `Queue::lease_expiry`.
 
+### Fixed
+
+- A `Queue::cancel` request persisted while the job was claimed is no
+  longer lost when the delivery settles with `Queue::nack` or
+  `Queue::dead_letter`: the settlement bases the record it writes on the
+  record stored at settlement time rather than the claim's copy.
+
 ## [0.10.0] - 2026-08-07
 
 ### Added

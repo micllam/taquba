@@ -1901,14 +1901,17 @@ impl Queue {
     #[instrument(skip(self, claim), fields(queue = %claim.queue, job_id = %claim.id))]
     pub async fn nack(&self, claim: &Claim, error: &str) -> Result<()> {
         let token = claim.token();
-        let mut job = claim.job().clone();
-        // Captured before the retry branches clear it on the record.
-        let claimed_at = job.claimed_at;
-        job.last_error = Some(error.to_string());
+        let (queue, id) = (claim.job().queue.as_str(), claim.job().id.as_str());
 
-        loop {
+        let job = loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            take_claim(&txn, &self.lease_registry, &job.queue, &job.id, token).await?;
+            // The returned record is the base for the written record;
+            // the claim's copy predates a cancel committed during the
+            // delivery.
+            let mut job = take_claim(&txn, &self.lease_registry, queue, id, token).await?;
+            // Captured before the retry branches clear it on the record.
+            let claimed_at = job.claimed_at;
+            job.last_error = Some(error.to_string());
             append_attempt(
                 &txn,
                 &job.id,
@@ -1988,11 +1991,11 @@ impl Queue {
             }
 
             match txn.commit().await {
-                Ok(_) => break,
+                Ok(_) => break job,
                 Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
                 Err(e) => return Err(e.into()),
             }
-        }
+        };
 
         let immediate_retry = matches!(job.status, JobStatus::Pending);
         let became_dead = matches!(job.status, JobStatus::Dead);
@@ -2030,19 +2033,19 @@ impl Queue {
     #[instrument(skip(self, claim), fields(queue = %claim.queue, job_id = %claim.id))]
     pub async fn dead_letter(&self, claim: &Claim, reason: &str) -> Result<()> {
         let token = claim.token();
-        let mut job = claim.job().clone();
-        let claimed_at = job.claimed_at;
+        let (queue, id) = (claim.job().queue.as_str(), claim.job().id.as_str());
         let failed_at = self.now_ms();
-        job.last_error = Some(reason.to_string());
-        job.status = JobStatus::Dead;
-        job.failed_at = Some(failed_at);
-        job.claimed_at = None;
-        let dead = dead_key(&job.queue, &job.id);
-        let value = job.stored_bytes()?;
 
-        loop {
+        let job = loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            take_claim(&txn, &self.lease_registry, &job.queue, &job.id, token).await?;
+            let mut job = take_claim(&txn, &self.lease_registry, queue, id, token).await?;
+            let claimed_at = job.claimed_at;
+            job.last_error = Some(reason.to_string());
+            job.status = JobStatus::Dead;
+            job.failed_at = Some(failed_at);
+            job.claimed_at = None;
+            let dead = dead_key(&job.queue, &job.id);
+            let value = job.stored_bytes()?;
             put_job_record(&txn, &dead, &job_index_key(&job.id), &value)?;
             append_attempt(
                 &txn,
@@ -2061,11 +2064,11 @@ impl Queue {
                 &[(JobStatus::Claimed, -1), (JobStatus::Dead, 1)],
             )?;
             match txn.commit().await {
-                Ok(_) => break,
+                Ok(_) => break job,
                 Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
                 Err(e) => return Err(e.into()),
             }
-        }
+        };
 
         crate::obs::dead_lettered(&job.queue);
         self.lease_registry.remove(&job.queue, &job.id, token);
@@ -6216,6 +6219,70 @@ mod tests {
         );
 
         q.ack(&job2).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancel_requested_during_the_delivery_survives_a_nack() {
+        let q = Queue::open_with_options(make_store(), "test", no_backoff_opts())
+            .await
+            .unwrap();
+
+        let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let claim = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Requested);
+
+        q.nack(&claim, "transient").await.unwrap();
+
+        let requeued = q.get_job(&id).await.unwrap().unwrap();
+        assert_eq!(requeued.status, JobStatus::Pending);
+        assert!(
+            requeued.cancel_requested,
+            "the nack must not overwrite the persisted cancel request",
+        );
+
+        let reclaim = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reclaim.cancel_requested);
+        assert!(
+            reclaim
+                .cancel_token
+                .clone()
+                .expect("re-claim returned a token")
+                .is_cancelled(),
+            "the re-claim must surface a pre-cancelled token",
+        );
+
+        q.ack(&reclaim).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancel_requested_during_the_delivery_survives_a_dead_letter() {
+        let q = Queue::open_with_options(make_store(), "test", no_backoff_opts())
+            .await
+            .unwrap();
+
+        let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let claim = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Requested);
+
+        q.dead_letter(&claim, "permanent").await.unwrap();
+
+        let dead = q.get_job(&id).await.unwrap().unwrap();
+        assert_eq!(dead.status, JobStatus::Dead);
+        assert!(dead.cancel_requested);
         q.close().await.unwrap();
     }
 

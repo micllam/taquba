@@ -2,6 +2,7 @@
 use slatedb::DbTransaction;
 
 use crate::error::{Error, Result};
+use crate::job::JobRecord;
 use crate::keys::claimed_key;
 use crate::lease_registry::LeaseRegistry;
 
@@ -23,9 +24,9 @@ pub(crate) fn put_job_record(
     Ok(())
 }
 
-/// Verify that the job still holds the claim `token` identifies, then
-/// stage the deletion of its record. Returns [`Error::ClaimLost`]
-/// otherwise.
+/// Verify that the job still holds the claim `token` identifies, stage
+/// the deletion of its record and return the stored record. Returns
+/// [`Error::ClaimLost`] when the claim has ended.
 ///
 /// This is the fence every settlement passes through, in three parts.
 /// The registry token check rejects a settlement superseded by a
@@ -36,21 +37,27 @@ pub(crate) fn put_job_record(
 /// Call it inside the retry loop so a retry re-runs both checks. A
 /// renewal changes neither the token nor the record, so a claim held
 /// across one still settles.
+///
+/// A settlement that writes a record must base it on the returned
+/// record, which includes changes committed during the claim (a
+/// cancel's `cancel_requested` flag); the claim's own copy predates
+/// them.
 pub(crate) async fn take_claim(
     txn: &DbTransaction,
     registry: &LeaseRegistry,
     queue: &str,
     id: &str,
     token: u64,
-) -> Result<()> {
+) -> Result<JobRecord> {
     match registry.current(queue, id) {
         Some((_, current)) if current == token => {}
         _ => return Err(Error::ClaimLost),
     }
     let key = claimed_key(queue, id);
-    if txn.get(&key).await?.is_none() {
+    let Some(raw) = txn.get(&key).await? else {
         return Err(Error::ClaimLost);
-    }
+    };
+    let job: JobRecord = rmp_serde::from_slice(&raw)?;
     txn.delete(&key)?;
-    Ok(())
+    Ok(job)
 }
