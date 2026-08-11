@@ -243,9 +243,10 @@
 //! jobs in one lifecycle state and [`Queue::dead_jobs`] pages through the
 //! dead-letter set. [`Queue::attempt_history`] returns a job's recorded
 //! delivery history: one [`JobAttempt`] per settled attempt (retry,
-//! dead-letter, lease expiry, completion on a queue with retention), so a
-//! job that failed three different ways reports all three errors rather
-//! than only the last. Interventions cover the common operator actions:
+//! dead-letter, lease expiry, interruption at open, operator requeue,
+//! completion on a queue with retention), so a job that failed three
+//! different ways reports all three errors rather than only the last.
+//! Interventions cover the common operator actions:
 //! [`Queue::requeue_dead_job`] revives a dead job with a fresh retry budget,
 //! [`Queue::cancel`] removes a pending or scheduled job (or requests
 //! cooperative cancellation of a claimed one) and [`Queue::wake_scheduled`]
