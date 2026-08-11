@@ -6,14 +6,29 @@ use tracing::debug;
 
 use crate::{Error, HEADER_METHOD, HEADER_TIMEOUT_MS, HEADER_URL, HTTP_HEADER_PREFIX};
 
+/// Upper bound on a delivery when the job declares no
+/// [`HEADER_TIMEOUT_MS`](crate::HEADER_TIMEOUT_MS) override and the
+/// worker sets no [`WebhookWorker::with_default_timeout`].
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// HTTP-based webhook delivery worker. Implements [`taquba::Worker`] so it
 /// drops straight into [`taquba::run_worker`] / [`taquba::run_worker_concurrent`].
 ///
 /// Build with [`Self::new`] (or [`Self::with_client`] if you need to share a
 /// pre-configured [`reqwest::Client`]) and chain the optional builder methods.
+///
+/// Every delivery is bounded: the request timeout is the job's
+/// [`HEADER_TIMEOUT_MS`](crate::HEADER_TIMEOUT_MS) header when present,
+/// otherwise the worker's default ([`DEFAULT_TIMEOUT`] unless overridden
+/// with [`Self::with_default_timeout`]). The timeout is applied per
+/// request and takes precedence over a timeout configured on the
+/// [`reqwest::Client`]. Before sending, the worker extends the job's
+/// lease to cover the timeout, so a slow receiver does not cause the
+/// job to be re-queued mid-delivery.
 pub struct WebhookWorker {
     client: reqwest::Client,
     delivery_id_header: Option<String>,
+    default_timeout: Duration,
 }
 
 impl WebhookWorker {
@@ -27,7 +42,16 @@ impl WebhookWorker {
         Self {
             client,
             delivery_id_header: Some("Webhook-Id".to_string()),
+            default_timeout: DEFAULT_TIMEOUT,
         }
+    }
+
+    /// Override the request timeout applied to jobs that declare no
+    /// [`HEADER_TIMEOUT_MS`](crate::HEADER_TIMEOUT_MS) header. Defaults
+    /// to [`DEFAULT_TIMEOUT`].
+    pub fn with_default_timeout(mut self, timeout: Duration) -> Self {
+        self.default_timeout = timeout;
+        self
     }
 
     /// Override the header name used to carry [`taquba::JobRecord::id`] for
@@ -55,9 +79,9 @@ impl Worker for WebhookWorker {
     async fn process(
         &self,
         job: &JobRecord,
-        _lease: &LeaseHandle,
+        lease: &LeaseHandle,
     ) -> std::result::Result<(), WorkerError> {
-        match deliver(self, job).await {
+        match deliver(self, job, lease).await {
             Ok(()) => Ok(()),
             Err(e) if e.is_permanent() => Err(PermanentFailure::new(e.to_string()).into()),
             Err(e) => Err(e.into()),
@@ -65,7 +89,26 @@ impl Worker for WebhookWorker {
     }
 }
 
-async fn deliver(worker: &WebhookWorker, job: &JobRecord) -> Result<(), Error> {
+/// The request timeout for a delivery: the job's [`HEADER_TIMEOUT_MS`]
+/// header, or `default` when the header is absent.
+fn effective_timeout(
+    headers: &std::collections::HashMap<String, String>,
+    default: Duration,
+) -> Result<Duration, Error> {
+    match headers.get(HEADER_TIMEOUT_MS) {
+        Some(s) => Ok(Duration::from_millis(
+            s.parse::<u64>()
+                .map_err(|_| Error::InvalidTimeout(s.clone()))?,
+        )),
+        None => Ok(default),
+    }
+}
+
+async fn deliver(
+    worker: &WebhookWorker,
+    job: &JobRecord,
+    lease: &LeaseHandle,
+) -> Result<(), Error> {
     let url = job
         .headers
         .get(HEADER_URL)
@@ -81,13 +124,7 @@ async fn deliver(worker: &WebhookWorker, job: &JobRecord) -> Result<(), Error> {
     let method = reqwest::Method::from_str(method_str)
         .map_err(|_| Error::InvalidMethod(method_str.to_string()))?;
 
-    let timeout = match job.headers.get(HEADER_TIMEOUT_MS) {
-        Some(s) => Some(Duration::from_millis(
-            s.parse::<u64>()
-                .map_err(|_| Error::InvalidTimeout(s.clone()))?,
-        )),
-        None => None,
-    };
+    let timeout = effective_timeout(&job.headers, worker.default_timeout)?;
 
     let mut req = worker.client.request(method, &url);
 
@@ -103,9 +140,13 @@ async fn deliver(worker: &WebhookWorker, job: &JobRecord) -> Result<(), Error> {
         req = req.header(name, job.id.as_str());
     }
 
-    if let Some(t) = timeout {
-        req = req.timeout(t);
-    }
+    req = req.timeout(timeout);
+
+    // One extension covering the bounded send; there is no progress
+    // signal inside it to renew on.
+    lease
+        .ensure_at_least(timeout)
+        .map_err(|e| Error::Delivery(format!("lease extension failed: {e}")))?;
 
     let response = req
         .body(job.payload.clone())
@@ -138,5 +179,41 @@ async fn deliver(worker: &WebhookWorker, job: &JobRecord) -> Result<(), Error> {
         Err(Error::PermanentDelivery(message))
     } else {
         Err(Error::Delivery(message))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    #[test]
+    fn effective_timeout_defaults_when_no_header_is_present() {
+        let headers = HashMap::new();
+        assert_eq!(
+            effective_timeout(&headers, DEFAULT_TIMEOUT).unwrap(),
+            DEFAULT_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn effective_timeout_prefers_the_header_override() {
+        let mut headers = HashMap::new();
+        headers.insert(HEADER_TIMEOUT_MS.to_string(), "15000".to_string());
+        assert_eq!(
+            effective_timeout(&headers, DEFAULT_TIMEOUT).unwrap(),
+            Duration::from_millis(15_000)
+        );
+    }
+
+    #[test]
+    fn effective_timeout_rejects_a_non_numeric_header() {
+        let mut headers = HashMap::new();
+        headers.insert(HEADER_TIMEOUT_MS.to_string(), "soon".to_string());
+        assert!(matches!(
+            effective_timeout(&headers, DEFAULT_TIMEOUT),
+            Err(Error::InvalidTimeout(_))
+        ));
     }
 }

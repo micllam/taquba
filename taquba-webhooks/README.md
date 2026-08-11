@@ -56,7 +56,7 @@ reserved keys:
 |---|---|---|
 | `webhook.url` | yes | Target URL |
 | `webhook.method` | no | HTTP method (default `POST`) |
-| `webhook.timeout_ms` | no | Per-request timeout |
+| `webhook.timeout_ms` | no | Per-request timeout (default `DEFAULT_TIMEOUT`, 30s) |
 | `http.<name>` | no | HTTP header to send (e.g. `http.Content-Type`) |
 
 Other entries in `headers` are ignored by the worker; your application can
@@ -71,6 +71,15 @@ use them for its own metadata.
 - **Other 4xx (client errors), missing/invalid configuration headers**:
   dead-letter immediately via `taquba::PermanentFailure`. The receiver has
   explicitly rejected the request, so retries cannot succeed.
+
+## Bounded deliveries
+
+Every delivery is bounded: the request timeout is the job's
+`webhook.timeout_ms` header when present, otherwise the worker's default
+(`DEFAULT_TIMEOUT`, 30s, configurable via
+`WebhookWorker::with_default_timeout`). Before sending, the worker extends
+the job's lease to cover the timeout, so a slow receiver does not cause the
+job to be re-queued mid-delivery.
 
 ## Receiver-side idempotency
 

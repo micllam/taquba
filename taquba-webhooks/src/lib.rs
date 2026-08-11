@@ -48,7 +48,7 @@
 //! |---|---|---|
 //! | [`HEADER_URL`] (`webhook.url`) | yes | Target URL |
 //! | [`HEADER_METHOD`] (`webhook.method`) | no | HTTP method (default `POST`) |
-//! | [`HEADER_TIMEOUT_MS`] (`webhook.timeout_ms`) | no | Per-request timeout |
+//! | [`HEADER_TIMEOUT_MS`] (`webhook.timeout_ms`) | no | Per-request timeout (default [`DEFAULT_TIMEOUT`]) |
 //! | [`HTTP_HEADER_PREFIX`]`<name>` (`http.<name>`) | no | HTTP header to send |
 //!
 //! Other entries in `headers` are ignored by the worker; your application
@@ -63,6 +63,15 @@
 //! - **Other 4xx (client errors), missing/invalid configuration headers**:
 //!   dead-letter immediately via [`taquba::PermanentFailure`]. The receiver
 //!   has explicitly rejected the request, so retries cannot succeed.
+//!
+//! # Bounded deliveries
+//!
+//! Every delivery is bounded: the request timeout is the job's
+//! [`HEADER_TIMEOUT_MS`] header when present, otherwise the worker's
+//! default ([`DEFAULT_TIMEOUT`], configurable via
+//! [`WebhookWorker::with_default_timeout`]). Before sending, the worker
+//! extends the job's lease to cover the timeout, so a slow receiver
+//! does not cause the job to be re-queued mid-delivery.
 //!
 //! # Receiver-side idempotency
 //!
@@ -223,7 +232,7 @@ pub async fn enqueue_webhook(
 }
 
 mod worker;
-pub use worker::WebhookWorker;
+pub use worker::{DEFAULT_TIMEOUT, WebhookWorker};
 
 #[cfg(test)]
 mod tests {
