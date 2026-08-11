@@ -944,9 +944,9 @@ impl<R: StepRunner + 'static, H: TerminalHook + 'static> Worker for StepWorker<R
     async fn process_with_effects(
         &self,
         job: &JobRecord,
-        _lease: &LeaseHandle,
+        lease: &LeaseHandle,
     ) -> std::result::Result<AckEffects, WorkerError> {
-        self.inner.process_step(job).await
+        self.inner.process_step(job, lease).await
     }
 }
 
@@ -1253,7 +1253,11 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .await
     }
 
-    async fn process_step(&self, job: &JobRecord) -> std::result::Result<AckEffects, WorkerError> {
+    async fn process_step(
+        &self,
+        job: &JobRecord,
+        lease: &LeaseHandle,
+    ) -> std::result::Result<AckEffects, WorkerError> {
         let (run_id, step_number) = match Self::parse_step_headers(job) {
             Ok(v) => v,
             Err(e) => {
@@ -1286,6 +1290,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             job_id: job.id.clone(),
             attempts: job.attempts,
             cancel_token,
+            lease: lease.clone(),
             memo: self.memo_store.new_memo(&run_id, step_number),
             signal: step_signal,
         };
@@ -1778,6 +1783,66 @@ mod tests {
                 .await;
         });
         tx
+    }
+
+    /// A runner that extends its lease through the step and reports the
+    /// resulting expiry.
+    struct RenewingRunner {
+        queue: Arc<Queue>,
+        tx: tokio::sync::mpsc::UnboundedSender<u64>,
+    }
+
+    impl StepRunner for RenewingRunner {
+        async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
+            step.lease
+                .ensure_at_least(Duration::from_secs(600))
+                .map_err(|e| StepError::transient(e.to_string()))?;
+            let expiry = self
+                .queue
+                .lease_expiry("workflow-steps", &step.job_id)
+                .expect("a running step holds a lease");
+            let _ = self.tx.send(expiry);
+            Ok(StepOutcome::Succeed { result: Vec::new() })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_step_runner_extends_its_lease_through_the_step() {
+        let base = 1_700_000_000_000;
+        let (queue, store, _clock) = fresh_queue_with_mock_clock(base).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (hook_tx, mut hook_rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store.clone(),
+            RenewingRunner { queue, tx },
+            ChannelHook { tx: hook_tx },
+        )
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let expiry = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            expiry >= base + 600_000,
+            "the extension must reach the lease registry",
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(2), hook_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+
+        let _ = shutdown.send(());
     }
 
     #[tokio::test(start_paused = true)]
@@ -2844,12 +2909,20 @@ mod tests {
         // Simulate a crash after the step output was stored but before
         // the settlement committed: discard the effects of the first
         // delivery so nothing is enqueued.
-        let _ = runtime.inner.process_step(&job).await.unwrap();
+        let _ = runtime
+            .inner
+            .process_step(&job, &LeaseHandle::detached())
+            .await
+            .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         // Re-processing the same claimed record replays the stored step
         // outcome without invoking the runner a second time.
-        let effects = runtime.inner.process_step(&job).await.unwrap();
+        let effects = runtime
+            .inner
+            .process_step(&job, &LeaseHandle::detached())
+            .await
+            .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         queue.ack_with(&job, effects).await.unwrap();
 
@@ -2918,7 +2991,11 @@ mod tests {
             .await
             .unwrap();
 
-        runtime.inner.process_step(&job).await.unwrap();
+        runtime
+            .inner
+            .process_step(&job, &LeaseHandle::detached())
+            .await
+            .unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -2927,7 +3004,11 @@ mod tests {
 
         // The recomputed outcome overwrites the corrupt entry, so a
         // second delivery replays it without invoking the runner again.
-        runtime.inner.process_step(&job).await.unwrap();
+        runtime
+            .inner
+            .process_step(&job, &LeaseHandle::detached())
+            .await
+            .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -2974,7 +3055,11 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        runtime.inner.process_step(&job).await.unwrap();
+        runtime
+            .inner
+            .process_step(&job, &LeaseHandle::detached())
+            .await
+            .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let first = rx.recv().await.unwrap();
         assert_eq!(first.status, TerminalStatus::Succeeded);
@@ -2983,7 +3068,11 @@ mod tests {
         // Simulate redelivery after a crash before ack. The stored
         // outcome settles the run again (the terminal hook is
         // at-least-once) without invoking the runner.
-        runtime.inner.process_step(&job).await.unwrap();
+        runtime
+            .inner
+            .process_step(&job, &LeaseHandle::detached())
+            .await
+            .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let second = rx.recv().await.unwrap();
         assert_eq!(second.status, TerminalStatus::Succeeded);

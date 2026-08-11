@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 
+use taquba::LeaseHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::memo::Memo;
@@ -26,7 +27,7 @@ pub struct Step {
     /// Submitter-supplied metadata, threaded through every step of the run.
     /// Reserved `workflow.*` headers are stripped before the runner sees them.
     pub headers: HashMap<String, String>,
-    /// The Taquba job ID for this step, useful for tracing and lease renewal.
+    /// The Taquba job ID for this step, useful for tracing.
     pub job_id: String,
     /// How many times Taquba has attempted to deliver this step. `1` on the
     /// first attempt; `>1` after a lease expiry / nack retry.
@@ -56,6 +57,13 @@ pub struct Step {
     /// subsequent step of the run (including any retry of this one)
     /// observes `is_cancelled() == true` immediately.
     pub cancel_token: CancellationToken,
+    /// The lease handle for this step's delivery. A long-running runner
+    /// calls [`LeaseHandle::ensure_at_least`] at progress points (or
+    /// once, with a slow call's timeout, before issuing it) so the step
+    /// is not re-queued while it still runs. Use
+    /// [`LeaseHandle::detached`] when constructing a `Step` in tests; a
+    /// detached handle's calls succeed without effect.
+    pub lease: LeaseHandle,
     /// Per-step durable key-value store, scoped to this step's
     /// `(run_id, step_number)`. Use to memoize expensive within-step
     /// side effects (LLM calls, paid APIs) so an at-least-once retry

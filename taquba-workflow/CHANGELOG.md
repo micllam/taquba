@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `Step` gains the public field `lease`, the delivery's
+  `taquba::LeaseHandle`. A long-running runner calls `ensure_at_least`
+  at progress points (or once, with a slow call's timeout, before
+  issuing it) so the step is not re-queued while it still runs. Code
+  constructing a `Step` in tests adds
+  `lease: taquba::LeaseHandle::detached()`.
+
 ## [0.8.0] - 2026-08-07
 
 ### Added

@@ -153,6 +153,14 @@
 //! [`WorkflowRuntime`] instance; a second runtime in the same process
 //! (sharing the queue) maintains its own registry.
 //!
+//! # Long-running steps
+//!
+//! A step that outlives the queue's lease is re-queued by the reaper
+//! and delivered a second time. A long-running runner avoids this by
+//! extending its lease through [`Step::lease`]: call
+//! [`taquba::LeaseHandle::ensure_at_least`] at progress points, or
+//! once, with a slow call's timeout, before issuing the call.
+//!
 //! # Durable signals
 //!
 //! A step can pause the rest of its run until an external event. Returning
