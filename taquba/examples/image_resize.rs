@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use taquba::{
-    EnqueueOptions, JobRecord, OpenOptions, PRIORITY_HIGH, PRIORITY_NORMAL, Queue, QueueConfig,
-    Worker, WorkerError, object_store::memory::InMemory, run_worker,
+    EnqueueOptions, JobRecord, LeaseHandle, OpenOptions, PRIORITY_HIGH, PRIORITY_NORMAL, Queue,
+    QueueConfig, Worker, WorkerError, object_store::memory::InMemory, run_worker,
 };
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -37,7 +37,7 @@ impl ResizeTask {
 struct ResizeWorker;
 
 impl Worker for ResizeWorker {
-    async fn process(&self, job: &JobRecord) -> Result<(), WorkerError> {
+    async fn process(&self, job: &JobRecord, _lease: &LeaseHandle) -> Result<(), WorkerError> {
         let task = ResizeTask::decode(&job.payload);
 
         // In a real worker you would call an image library here.

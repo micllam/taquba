@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use taquba::object_store::ObjectStore;
 use taquba::{
     AckEffects, Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, JobRecord, JobStatus,
-    PermanentFailure, Queue, Worker, WorkerError,
+    LeaseHandle, PermanentFailure, Queue, Worker, WorkerError,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -944,6 +944,7 @@ impl<R: StepRunner + 'static, H: TerminalHook + 'static> Worker for StepWorker<R
     async fn process_with_effects(
         &self,
         job: &JobRecord,
+        _lease: &LeaseHandle,
     ) -> std::result::Result<AckEffects, WorkerError> {
         self.inner.process_step(job).await
     }

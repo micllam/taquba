@@ -15,8 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use taquba::{
-    EnqueueOptions, JobRecord, OpenOptions, PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_NORMAL, Queue,
-    QueueConfig, Worker, WorkerError, object_store::memory::InMemory, run_worker,
+    EnqueueOptions, JobRecord, LeaseHandle, OpenOptions, PRIORITY_HIGH, PRIORITY_LOW,
+    PRIORITY_NORMAL, Queue, QueueConfig, Worker, WorkerError, object_store::memory::InMemory,
+    run_worker,
 };
 
 // In a real application you would encode these as JSON or MessagePack.
@@ -50,7 +51,7 @@ impl EmailWorker {
 }
 
 impl Worker for EmailWorker {
-    async fn process(&self, job: &JobRecord) -> Result<(), WorkerError> {
+    async fn process(&self, job: &JobRecord, _lease: &LeaseHandle) -> Result<(), WorkerError> {
         let n = self
             .calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)

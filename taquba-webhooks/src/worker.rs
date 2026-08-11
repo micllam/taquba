@@ -1,7 +1,7 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use taquba::{JobRecord, PermanentFailure, Worker, WorkerError};
+use taquba::{JobRecord, LeaseHandle, PermanentFailure, Worker, WorkerError};
 use tracing::debug;
 
 use crate::{Error, HEADER_METHOD, HEADER_TIMEOUT_MS, HEADER_URL, HTTP_HEADER_PREFIX};
@@ -52,7 +52,11 @@ impl Default for WebhookWorker {
 }
 
 impl Worker for WebhookWorker {
-    async fn process(&self, job: &JobRecord) -> std::result::Result<(), WorkerError> {
+    async fn process(
+        &self,
+        job: &JobRecord,
+        _lease: &LeaseHandle,
+    ) -> std::result::Result<(), WorkerError> {
         match deliver(self, job).await {
             Ok(()) => Ok(()),
             Err(e) if e.is_permanent() => Err(PermanentFailure::new(e.to_string()).into()),

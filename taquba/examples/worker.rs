@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use taquba::{
-    JobRecord, OpenOptions, Queue, QueueConfig, Worker, WorkerError,
+    JobRecord, LeaseHandle, OpenOptions, Queue, QueueConfig, Worker, WorkerError,
     object_store::memory::InMemory, run_worker,
 };
 
@@ -27,7 +27,7 @@ impl PrintWorker {
 }
 
 impl Worker for PrintWorker {
-    async fn process(&self, job: &JobRecord) -> Result<(), WorkerError> {
+    async fn process(&self, job: &JobRecord, _lease: &LeaseHandle) -> Result<(), WorkerError> {
         let n = self
             .count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)

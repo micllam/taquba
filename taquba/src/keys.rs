@@ -10,11 +10,20 @@
 //! a key.
 //!
 //! Scan layouts follow one rule: the field the scan orders by comes
-//! first. The `Claimed`, `Scheduled` and `Done` spaces lead with a
-//! timestamp so the reaper, scheduler and retention sweeps perform one
-//! global scan with an early exit; the `Pending` space leads with the
-//! queue name so claims scan one queue, ordered by priority and then
-//! by ID.
+//! first. The `Scheduled` and `Done` spaces lead with a timestamp so
+//! the scheduler and retention sweeps perform one global scan with an
+//! early exit; the `Pending`, `Claimed` and `Dead` spaces lead with the
+//! queue name so a listing covers one queue, `Pending` ordered by
+//! priority and then by ID and the other two by ID. The dead retention
+//! sweep is the exception: it scans the whole `Dead` space and reads
+//! the age off each record.
+//!
+//! A claimed job occupies one key: `Claimed` holds the record under a
+//! key stable for the life of the claim. The lease itself, the current
+//! expiry and the claim token, is process state held in
+//! `crate::lease_registry`, never stored: a lease held by a process
+//! that no longer runs is void, so every claimed record found at open
+//! is re-queued and a renewal writes nothing durable.
 //!
 //! User KV keys are `[KeyTag::User, caller bytes]` with no version
 //! byte: caller bytes are opaque data, not a schema this module owns.
@@ -34,7 +43,10 @@ pub(crate) const KEY_VERSION: u8 = 1;
 pub(crate) enum KeyTag {
     /// `[tag, ver, qlen, queue, priority u32 BE, id]`
     Pending = 0x01,
-    /// `[tag, ver, lease_expires_at u64 BE, qlen, queue, id]`
+    /// `[tag, ver, qlen, queue, id]`; the value is the job record. The
+    /// key is stable for the lifetime of the claim, so a lease renewal
+    /// leaves it untouched. The claim's lease lives in
+    /// `crate::lease_registry`, not in a key space.
     Claimed = 0x02,
     /// `[tag, ver, run_at u64 BE, qlen, queue, id]`
     Scheduled = 0x03,
@@ -105,8 +117,27 @@ fn time_first_key(tag: KeyTag, ts: u64, queue: &str, id: &str) -> Vec<u8> {
     k
 }
 
-pub(crate) fn claimed_key(queue: &str, lease_expires_at: u64, id: &str) -> Vec<u8> {
-    time_first_key(KeyTag::Claimed, lease_expires_at, queue, id)
+fn queue_first_key(tag: KeyTag, queue: &str, id: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(2 + 1 + queue.len() + id.len());
+    k.extend_from_slice(&header(tag));
+    push_queue(&mut k, queue);
+    k.extend_from_slice(id.as_bytes());
+    k
+}
+
+fn queue_prefix(tag: KeyTag, queue: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(2 + 1 + queue.len());
+    k.extend_from_slice(&header(tag));
+    push_queue(&mut k, queue);
+    k
+}
+
+pub(crate) fn claimed_key(queue: &str, id: &str) -> Vec<u8> {
+    queue_first_key(KeyTag::Claimed, queue, id)
+}
+
+pub(crate) fn claimed_prefix(queue: &str) -> Vec<u8> {
+    queue_prefix(KeyTag::Claimed, queue)
 }
 
 pub(crate) fn scheduled_key(queue: &str, run_at: u64, id: &str) -> Vec<u8> {
@@ -118,18 +149,11 @@ pub(crate) fn done_key(completed_at: u64, queue: &str, id: &str) -> Vec<u8> {
 }
 
 pub(crate) fn dead_key(queue: &str, id: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(2 + 1 + queue.len() + id.len());
-    k.extend_from_slice(&header(KeyTag::Dead));
-    push_queue(&mut k, queue);
-    k.extend_from_slice(id.as_bytes());
-    k
+    queue_first_key(KeyTag::Dead, queue, id)
 }
 
 pub(crate) fn dead_prefix(queue: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(2 + 1 + queue.len());
-    k.extend_from_slice(&header(KeyTag::Dead));
-    push_queue(&mut k, queue);
-    k
+    queue_prefix(KeyTag::Dead, queue)
 }
 
 pub(crate) fn job_index_key(id: &str) -> Vec<u8> {
@@ -241,18 +265,23 @@ mod tests {
 
     #[test]
     fn parse_key_timestamp_round_trips() {
-        let key = claimed_key("work", 1_700_000_000_123, "abc");
+        let key = scheduled_key("work", 1_700_000_000_123, "abc");
         assert_eq!(
-            parse_key_timestamp(&key, KeyTag::Claimed),
+            parse_key_timestamp(&key, KeyTag::Scheduled),
             Some(1_700_000_000_123)
         );
     }
 
     #[test]
     fn parse_key_timestamp_rejects_other_tags_and_short_keys() {
-        let key = claimed_key("work", 42, "abc");
+        let key = scheduled_key("work", 42, "abc");
         assert_eq!(parse_key_timestamp(&key, KeyTag::Done), None);
-        assert_eq!(parse_key_timestamp(&key[..6], KeyTag::Claimed), None);
+        assert_eq!(parse_key_timestamp(&key[..6], KeyTag::Scheduled), None);
+    }
+
+    #[test]
+    fn claimed_keys_of_nested_queue_names_do_not_collide() {
+        assert_ne!(claimed_key("ab", "01A"), claimed_key("a", "b01A"));
     }
 
     #[test]
@@ -268,7 +297,7 @@ mod tests {
     fn key_spaces_do_not_overlap() {
         let keys = [
             pending_key("q", 1, "id"),
-            claimed_key("q", 1, "id"),
+            claimed_key("q", "id"),
             scheduled_key("q", 1, "id"),
             done_key(1, "q", "id"),
             dead_key("q", "id"),

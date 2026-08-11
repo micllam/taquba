@@ -108,12 +108,16 @@
 //! claim / ack / nack loop, retries, and graceful shutdown:
 //!
 //! ```no_run
-//! use taquba::{JobRecord, Worker, WorkerError};
+//! use taquba::{JobRecord, LeaseHandle, Worker, WorkerError};
 //!
 //! struct EmailWorker;
 //!
 //! impl Worker for EmailWorker {
-//!     async fn process(&self, job: &JobRecord) -> Result<(), WorkerError> {
+//!     async fn process(
+//!         &self,
+//!         job: &JobRecord,
+//!         _lease: &LeaseHandle,
+//!     ) -> Result<(), WorkerError> {
 //!         let to = std::str::from_utf8(&job.payload)?;
 //!         # async fn send_email(_to: &str) -> Result<(), WorkerError> { Ok(()) }
 //!         send_email(to).await?;
@@ -131,7 +135,13 @@
 //! lease and the reaper requeues it, the late acknowledgement fails
 //! with [`Error::ClaimLost`], the loop logs it and continues, and the
 //! redelivered attempt settles the job instead. Errors on the claim
-//! path still stop the loop.
+//! path still stop the loop. A long-running [`Worker::process`] can
+//! avoid the requeue by extending its own lease through the
+//! [`LeaseHandle`] it receives: call [`LeaseHandle::ensure_at_least`]
+//! at progress points, or once with a slow call's timeout before
+//! issuing it. The claim stays with the loop, which settles the job
+//! when `process` returns. See `examples/long_running.rs` for both
+//! patterns.
 //!
 //! A worker can implement [`Worker::process_with_effects`] instead of
 //! [`Worker::process`] to return [`AckEffects`]: follow-up enqueues and
@@ -257,6 +267,10 @@
 //! - **Scheduler** - promotes scheduled jobs whose `run_at` has passed
 //!   (interval: [`OpenOptions::scheduler_interval`]).
 //!
+//! Opening a queue also re-queues every job left claimed by a previous
+//! process: crash recovery happens at open, and lease expiry detects a
+//! delivery that stops progressing while the process lives.
+//!
 //! Call [`Queue::close`] for a clean shutdown; it stops both tasks and
 //! flushes the underlying SlateDB instance.
 //!
@@ -290,6 +304,8 @@ mod error;
 mod history;
 mod job;
 mod keys;
+mod lease;
+mod lease_registry;
 #[cfg(feature = "metrics")]
 mod metrics_sampler;
 mod obs;
@@ -307,8 +323,9 @@ pub mod worker;
 pub use clock::{Clock, MockClock, SystemClock};
 pub use error::{Error, Result};
 pub use history::{AttemptOutcome, JobAttempt};
-pub use job::{JobRecord, JobStatus};
+pub use job::{Claim, JobRecord, JobStatus};
 pub use keys::MAX_QUEUE_NAME_LEN;
+pub use lease::LeaseHandle;
 pub use queue::{
     AckEffects, CancelOutcome, DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD, EnqueueOptions, EnqueueRequest,
     EnqueueResult, JobPage, KvPage, MAX_KV_VALUE_SIZE, OpenOptions, PRIORITY_HIGH, PRIORITY_LOW,

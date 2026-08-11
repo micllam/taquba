@@ -5,7 +5,8 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
-use crate::job::JobRecord;
+use crate::job::{Claim, JobRecord};
+use crate::lease::LeaseHandle;
 use crate::queue::{AckEffects, Queue};
 
 /// Boxed error type returned from [`Worker::process`].
@@ -18,7 +19,7 @@ pub type WorkerError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// Use when the failure is *known* not to recover on retry.
 ///
 /// ```rust,ignore
-/// async fn process(&self, job: &JobRecord) -> Result<(), WorkerError> {
+/// async fn process(&self, job: &JobRecord, _lease: &LeaseHandle) -> Result<(), WorkerError> {
 ///     match http.send(...).await {
 ///         Ok(_) => Ok(()),
 ///         Err(e) if e.is_4xx() => Err(PermanentFailure::new(e.to_string()).into()),
@@ -57,7 +58,11 @@ impl std::error::Error for PermanentFailure {}
 /// struct EmailWorker;
 ///
 /// impl taquba::Worker for EmailWorker {
-///     async fn process(&self, job: &taquba::JobRecord) -> Result<(), taquba::WorkerError> {
+///     async fn process(
+///         &self,
+///         job: &taquba::JobRecord,
+///         _lease: &taquba::LeaseHandle,
+///     ) -> Result<(), taquba::WorkerError> {
 ///         let to = std::str::from_utf8(&job.payload)?;
 ///         send_email(to).await?;
 ///         Ok(())
@@ -77,6 +82,11 @@ pub trait Worker: Send + Sync {
     /// `max_attempts`). The returned error is converted to a string via
     /// `Display` and stored on the job's `last_error` field.
     ///
+    /// `lease` extends the claim's lease for long-running work; see
+    /// [`LeaseHandle::ensure_at_least`]. The claim itself stays with
+    /// the worker loop, which settles the job when this returns, so an
+    /// implementation cannot settle its own job mid-execution.
+    ///
     /// Processing is called sequentially for each job in [`run_worker`], or
     /// concurrently up to the configured limit in [`run_worker_concurrent`].
     /// Implementations must be idempotent: Taquba guarantees at-least-once
@@ -84,14 +94,15 @@ pub trait Worker: Send + Sync {
     fn process(
         &self,
         job: &JobRecord,
+        lease: &LeaseHandle,
     ) -> impl Future<Output = std::result::Result<(), WorkerError>> + Send {
-        async move { self.process_with_effects(job).await.map(|_| ()) }
+        async move { self.process_with_effects(job, lease).await.map(|_| ()) }
     }
 
     /// Process a single claimed job and return effects to apply
     /// atomically with its acknowledgement.
     ///
-    /// Like [`Self::process`], but an `Ok` return carries
+    /// Like [`Self::process`], but an `Ok` return supplies
     /// [`AckEffects`] that the worker loop passes to
     /// [`crate::Queue::ack_with`], so follow-up enqueues and caller KV
     /// changes land in the same transaction as the ack. Errors behave
@@ -99,8 +110,13 @@ pub trait Worker: Send + Sync {
     fn process_with_effects(
         &self,
         job: &JobRecord,
+        lease: &LeaseHandle,
     ) -> impl Future<Output = std::result::Result<AckEffects, WorkerError>> + Send {
-        async move { self.process(job).await.map(|()| AckEffects::default()) }
+        async move {
+            self.process(job, lease)
+                .await
+                .map(|()| AckEffects::default())
+        }
     }
 }
 
@@ -125,16 +141,15 @@ pub trait Worker: Send + Sync {
 /// due).
 ///
 /// Errors from the claim path terminate the loop and propagate.
-/// Settlement failures do not: they affect one job, not the loop. In
+/// Settlement failures do not: they affect only the one job. In
 /// particular, when a job outlives its lease and the reaper requeues it,
 /// the late settlement fails with [`Error::ClaimLost`]; the loop logs it
 /// and continues, and the redelivered attempt settles the job instead.
-/// Size the queue's lease to cover processing time so this stays rare.
-/// [`Queue::renew_lease`] cannot be used from within [`Worker::process`]:
-/// renewal rotates the claimed key and updates the renewing record in
-/// place, but `process` receives a shared reference and the loop settles
-/// with its own copy, which would no longer identify the claim. Renewal
-/// is for callers that run their own claim / settle loop.
+/// Size the queue's lease to cover processing time so late settlements
+/// are rare, or have a long-running [`Worker::process`] extend it
+/// through the [`LeaseHandle`] it was given: renewal advances the lease
+/// and leaves the claim valid for the settlement the loop performs
+/// afterwards.
 pub async fn run_worker<W, F>(
     queue_handle: &Queue,
     queue: &str,
@@ -279,15 +294,16 @@ async fn process_and_settle<W: Worker>(
     queue_handle: &Queue,
     queue: &str,
     worker: &W,
-    job: JobRecord,
+    claim: Claim,
 ) {
-    let job_id = job.id.clone();
-    let settlement = match worker.process_with_effects(&job).await {
-        Ok(effects) => queue_handle.ack_with(&job, effects).await.map(|_| ()),
+    let job_id = claim.id.clone();
+    let lease = queue_handle.lease_handle(&claim);
+    let settlement = match worker.process_with_effects(claim.job(), &lease).await {
+        Ok(effects) => queue_handle.ack_with(&claim, effects).await.map(|_| ()),
         Err(e) if e.downcast_ref::<PermanentFailure>().is_some() => {
-            queue_handle.dead_letter(job, &e.to_string()).await
+            queue_handle.dead_letter(&claim, &e.to_string()).await
         }
-        Err(e) => queue_handle.nack(job, &e.to_string()).await,
+        Err(e) => queue_handle.nack(&claim, &e.to_string()).await,
     };
     match settlement {
         Ok(()) => {}
@@ -326,7 +342,11 @@ mod tests {
     }
 
     impl Worker for CountingWorker {
-        async fn process(&self, _job: &JobRecord) -> std::result::Result<(), WorkerError> {
+        async fn process(
+            &self,
+            _job: &JobRecord,
+            _lease: &LeaseHandle,
+        ) -> std::result::Result<(), WorkerError> {
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(now, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -344,6 +364,7 @@ mod tests {
         async fn process_with_effects(
             &self,
             job: &JobRecord,
+            _lease: &LeaseHandle,
         ) -> std::result::Result<AckEffects, WorkerError> {
             self.processed.fetch_add(1, Ordering::SeqCst);
             if job.payload == b"first" {
@@ -405,7 +426,11 @@ mod tests {
     }
 
     impl Worker for LeaseLosingWorker {
-        async fn process(&self, _job: &JobRecord) -> std::result::Result<(), WorkerError> {
+        async fn process(
+            &self,
+            _job: &JobRecord,
+            _lease: &LeaseHandle,
+        ) -> std::result::Result<(), WorkerError> {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 // First attempt: outlive the lease and let the reaper
                 // requeue the job, so the loop's ack finds the claim

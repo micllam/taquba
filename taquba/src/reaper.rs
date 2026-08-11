@@ -9,13 +9,14 @@ use tracing::{debug, warn};
 
 use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{
-    KeyTag, attempt_history_key, dead_key, job_index_key, parse_key_timestamp, pending_key,
-    tag_prefix,
+    KeyTag, attempt_history_key, claimed_key, dead_key, job_index_key, parse_key_timestamp,
+    pending_key, tag_prefix,
 };
+use crate::lease_registry::{DueLease, LeaseRegistry};
 use crate::payload_store::PayloadStore;
 use crate::queue::QueueConfig;
 use crate::stats::update_stats;
@@ -30,6 +31,7 @@ pub(crate) struct Reaper {
     pub(crate) completion_notify: Arc<Notify>,
     pub(crate) claim_cursor: ClaimCursor,
     pub(crate) payload_store: Arc<PayloadStore>,
+    pub(crate) lease_registry: LeaseRegistry,
 }
 
 impl Reaper {
@@ -43,6 +45,7 @@ impl Reaper {
             completion_notify,
             claim_cursor,
             payload_store,
+            lease_registry,
         } = self;
 
         let any_keep_done = default_queue_config.keep_done_jobs.is_some()
@@ -78,7 +81,14 @@ impl Reaper {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {
                     if let Err(e) =
-                        reap_expired(&db, clock.as_ref(), &completion_notify, &claim_cursor).await
+                        reap_expired(
+                            &db,
+                            clock.as_ref(),
+                            &completion_notify,
+                            &claim_cursor,
+                            &lease_registry,
+                        )
+                        .await
                     {
                         warn!("lease reaper error: {e}");
                     }
@@ -108,27 +118,37 @@ pub(crate) async fn reap_expired(
     clock: &dyn Clock,
     completion_notify: &Notify,
     claim_cursor: &ClaimCursor,
+    lease_registry: &LeaseRegistry,
 ) -> Result<()> {
     let now = clock.now_ms();
-    let mut expired_keys = Vec::new();
+    let due = lease_registry.take_due(now);
 
-    let mut iter = db.scan_prefix(tag_prefix(KeyTag::Claimed), ..).await?;
-    while let Some(kv) = iter.next().await? {
-        // Claimed keys lead with the lease expiry, so the scan is sorted
-        // globally by it and the first key whose timestamp is in the future
-        // ends the scan; everything after it is also in the future.
-        let Some(lease_expiry) = parse_key_timestamp(&kv.key, KeyTag::Claimed) else {
-            continue;
-        };
-        if lease_expiry > now {
-            break;
+    // Due entries stay in the registry, marked, while they are
+    // examined; each is removed only after its reap commits. A tick
+    // that ends early therefore leaves nothing displaced, and the next
+    // tick retries whatever remains due.
+    for lease in &due {
+        match reap_job(
+            db,
+            clock,
+            lease_registry,
+            lease,
+            completion_notify,
+            claim_cursor,
+        )
+        .await
+        {
+            Ok(()) => {}
+            // A storage failure applies to the remaining entries as
+            // well; end the tick.
+            Err(e @ Error::Storage(_)) => return Err(e),
+            // Any other error, an undecodable record for example, is
+            // specific to this job. Its entry stays marked for the next
+            // tick and must not block the entries behind it.
+            Err(e) => {
+                warn!(queue = %lease.queue, job_id = %lease.id, "reaping expired lease failed: {e}");
+            }
         }
-        expired_keys.push(kv.key.clone());
-    }
-    drop(iter);
-
-    for key_bytes in expired_keys {
-        reap_job(db, clock, &key_bytes, completion_notify, claim_cursor).await?;
     }
 
     Ok(())
@@ -137,120 +157,223 @@ pub(crate) async fn reap_expired(
 async fn reap_job(
     db: &Db,
     clock: &dyn Clock,
-    claimed_key_bytes: &[u8],
+    registry: &LeaseRegistry,
+    lease: &DueLease,
     completion_notify: &Notify,
     claim_cursor: &ClaimCursor,
 ) -> Result<()> {
+    let DueLease {
+        queue, id, token, ..
+    } = lease;
+    let (queue, id, token) = (queue.as_str(), id.as_str(), *token);
+    let claimed_key_bytes = claimed_key(queue, id);
+
     loop {
         let txn = db.begin(IsolationLevel::Snapshot).await?;
 
-        let raw = match txn.get(claimed_key_bytes).await? {
-            // Job was already acked/nacked by the worker: nothing to do.
-            None => {
+        // A settlement removes the entry after its commit; an entry
+        // that is gone or belongs to a new claim leaves nothing to
+        // reap. The check runs after the transaction begins: a claim
+        // transition the check does not see must then commit after the
+        // snapshot and conflict on the staged delete of the claimed
+        // key. Checked before the transaction, a late settlement and
+        // re-claim completing in between would leave this transaction
+        // reading the new claim's record, indistinguishable in the
+        // store from the old claim's.
+        match registry.current(queue, id) {
+            Some((_, current)) if current == token => {}
+            _ => {
                 txn.rollback();
                 return Ok(());
             }
-            Some(raw) => raw,
+        }
+
+        // An entry with no claimed record is the residue of a claim
+        // whose commit failed (the entry is registered first), or of a
+        // settlement whose entry removal has not run yet. Neither case
+        // leaves a claim to recover; drop the entry.
+        let Some(raw) = txn.get(&claimed_key_bytes).await? else {
+            txn.rollback();
+            registry.remove(queue, id, token);
+            debug!(queue = %queue, job_id = %id, "dropped lease entry with no claimed record");
+            return Ok(());
         };
 
         let mut job: JobRecord = rmp_serde::from_slice(&raw)?;
-        txn.delete(claimed_key_bytes)?;
-        let claimed_at = job.claimed_at;
+        let end = stage_unsettled_claim_end(
+            &txn,
+            &mut job,
+            clock.now_ms(),
+            AttemptOutcome::LeaseExpired,
+            "lease expired",
+        )?;
 
-        if job.attempts >= job.max_attempts {
-            let now = clock.now_ms();
-            job.status = JobStatus::Dead;
-            job.last_error = Some("lease expired".to_string());
-            job.failed_at = Some(now);
-            append_attempt(
-                &txn,
-                &job.id,
-                &JobAttempt {
-                    attempt: job.attempts,
-                    claimed_at,
-                    recorded_at: now,
-                    outcome: AttemptOutcome::DeadLettered,
-                    error: Some("lease expired".to_string()),
-                },
-            )?;
-            let dead = dead_key(&job.queue, &job.id);
-            let value = rmp_serde::to_vec_named(&job)?;
-            put_job_record(&txn, &dead, &job_index_key(&job.id), &value)?;
-            update_stats(
-                &txn,
-                &job.queue,
-                &[(JobStatus::Claimed, -1), (JobStatus::Dead, 1)],
-            )?;
-            warn!(
-                queue = %job.queue,
-                job_id = %job.id,
-                attempts = job.attempts,
-                "lease expired: job dead-lettered"
-            );
-        } else {
-            job.status = JobStatus::Pending;
-            job.claimed_at = None;
-            job.lease_expires_at = None;
-            let priority = job.priority;
-            let pending = pending_key(&job.queue, priority, &job.id);
-            let value = rmp_serde::to_vec_named(&job)?;
-            put_job_record(&txn, &pending, &job_index_key(&job.id), &value)?;
-            append_attempt(
-                &txn,
-                &job.id,
-                &JobAttempt {
-                    attempt: job.attempts,
-                    claimed_at,
-                    recorded_at: clock.now_ms(),
-                    outcome: AttemptOutcome::LeaseExpired,
-                    error: None,
-                },
-            )?;
-            update_stats(
-                &txn,
-                &job.queue,
-                &[(JobStatus::Pending, 1), (JobStatus::Claimed, -1)],
-            )?;
-            debug!(
-                queue = %job.queue,
-                job_id = %job.id,
-                attempts = job.attempts,
-                "lease expired: job re-queued"
-            );
-        }
-
-        let became_dead = matches!(job.status, JobStatus::Dead);
-        let requeued_pending_key =
-            (!became_dead).then(|| pending_key(&job.queue, job.priority, &job.id));
-        // Reap commits do not await WAL durability. Each expired claim
-        // is processed in its own transaction, so awaiting the flush
-        // serialises the sweep at one job per flush interval. A commit
-        // lost in a crash leaves the expired claimed key in place and
-        // the next sweep re-processes it: the rewrite is idempotent and
-        // requeues do not consume an attempt. Any later durable commit
-        // flushes preceding WAL entries, so a job's post-requeue
-        // history is never durable without the requeue itself.
+        // The commit does not await WAL durability: each expired claim
+        // is its own transaction, so awaiting the flush would serialise
+        // the sweep at one job per flush interval, and a commit lost in
+        // a crash is redone by the requeue of claimed records at the
+        // next open.
         let write_opts = WriteOptions {
             await_durable: false,
             ..WriteOptions::default()
         };
         match txn.commit_with_options(&write_opts).await {
             Ok(_) => {
-                if let Some(key) = requeued_pending_key {
-                    claim_cursor.note_pending_insert(&job.queue, &key);
-                    crate::obs::reaped(&job.queue, 1);
-                }
-                if became_dead {
-                    crate::obs::dead_lettered(&job.queue);
-                    completion_notify.notify_waiters();
+                registry.remove(queue, id, token);
+                match end {
+                    ClaimEnd::Requeued { pending_key } => {
+                        claim_cursor.note_pending_insert(&job.queue, &pending_key);
+                        crate::obs::reaped(&job.queue, 1);
+                    }
+                    ClaimEnd::DeadLettered => {
+                        crate::obs::dead_lettered(&job.queue);
+                        completion_notify.notify_waiters();
+                    }
                 }
                 return Ok(());
             }
-            // Worker acked/nacked while we were running; retry to re-check.
+            // A settlement committed concurrently; retry against fresh state.
             Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
             Err(e) => return Err(e.into()),
         }
     }
+}
+
+/// How an unsettled claim's job left the claimed state.
+enum ClaimEnd {
+    Requeued { pending_key: Vec<u8> },
+    DeadLettered,
+}
+
+/// Stage the transition of a claimed job whose claim ended without a
+/// settlement: back to pending, or to the dead-letter set once its
+/// attempts are exhausted. Shared by the reaper and the open-time
+/// requeue; `error` names the cause in the history and log entries.
+fn stage_unsettled_claim_end(
+    txn: &slatedb::DbTransaction,
+    job: &mut JobRecord,
+    now: u64,
+    outcome: AttemptOutcome,
+    error: &str,
+) -> Result<ClaimEnd> {
+    let claimed_at = job.claimed_at;
+    txn.delete(claimed_key(&job.queue, &job.id))?;
+
+    if job.attempts >= job.max_attempts {
+        job.status = JobStatus::Dead;
+        job.last_error = Some(error.to_string());
+        job.failed_at = Some(now);
+        append_attempt(
+            txn,
+            &job.id,
+            &JobAttempt {
+                attempt: job.attempts,
+                claimed_at,
+                recorded_at: now,
+                outcome: AttemptOutcome::DeadLettered,
+                error: Some(error.to_string()),
+            },
+        )?;
+        let dead = dead_key(&job.queue, &job.id);
+        let value = rmp_serde::to_vec_named(&job)?;
+        put_job_record(txn, &dead, &job_index_key(&job.id), &value)?;
+        update_stats(
+            txn,
+            &job.queue,
+            &[(JobStatus::Claimed, -1), (JobStatus::Dead, 1)],
+        )?;
+        warn!(
+            queue = %job.queue,
+            job_id = %job.id,
+            attempts = job.attempts,
+            "{error}: job dead-lettered"
+        );
+        Ok(ClaimEnd::DeadLettered)
+    } else {
+        job.status = JobStatus::Pending;
+        job.claimed_at = None;
+        let pending = pending_key(&job.queue, job.priority, &job.id);
+        let value = rmp_serde::to_vec_named(&job)?;
+        put_job_record(txn, &pending, &job_index_key(&job.id), &value)?;
+        append_attempt(
+            txn,
+            &job.id,
+            &JobAttempt {
+                attempt: job.attempts,
+                claimed_at,
+                recorded_at: now,
+                outcome,
+                error: None,
+            },
+        )?;
+        update_stats(
+            txn,
+            &job.queue,
+            &[(JobStatus::Pending, 1), (JobStatus::Claimed, -1)],
+        )?;
+        debug!(
+            queue = %job.queue,
+            job_id = %job.id,
+            attempts = job.attempts,
+            "{error}: job re-queued"
+        );
+        Ok(ClaimEnd::Requeued {
+            pending_key: pending,
+        })
+    }
+}
+
+/// Re-queue every claimed record found in the store. Called at open,
+/// before workers or the reaper start: the queue is single-process and
+/// single-writer, so a claim present at open belongs to a process that
+/// no longer runs and is void. The requeue consumes no attempt itself;
+/// attempts count claims, so `max_attempts` still bounds a
+/// crash-looping job.
+///
+/// Runs after the claim cursor is restored, and notes each re-queued
+/// job's pending key, which sorts behind the restored clean-close
+/// bound.
+pub(crate) async fn requeue_interrupted_claims(
+    db: &Db,
+    clock: &dyn Clock,
+    claim_cursor: &ClaimCursor,
+) -> Result<()> {
+    let mut interrupted: Vec<JobRecord> = Vec::new();
+    let mut iter = db.scan_prefix(tag_prefix(KeyTag::Claimed), ..).await?;
+    while let Some(kv) = iter.next().await? {
+        match rmp_serde::from_slice::<JobRecord>(&kv.value) {
+            Ok(job) => interrupted.push(job),
+            // Re-queueing needs the record; the key is left in place
+            // for later inspection.
+            Err(e) => warn!(key = ?kv.key, "undecodable claimed record at open: {e}"),
+        }
+    }
+    drop(iter);
+
+    for mut job in interrupted {
+        let txn = db.begin(IsolationLevel::Snapshot).await?;
+        let end = stage_unsettled_claim_end(
+            &txn,
+            &mut job,
+            clock.now_ms(),
+            AttemptOutcome::Interrupted,
+            "claim interrupted by process exit",
+        )?;
+        // The commit does not await WAL durability: awaiting the flush
+        // would serialise the open at one job per flush interval, and a
+        // requeue lost in a crash is redone by the next open from the
+        // claimed record it left in place. Nothing else writes at open,
+        // so a commit error surfaces to the caller and fails the open.
+        let write_opts = WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        };
+        txn.commit_with_options(&write_opts).await?;
+        if let ClaimEnd::Requeued { pending_key } = end {
+            claim_cursor.note_pending_insert(&job.queue, &pending_key);
+        }
+    }
+    Ok(())
 }
 
 /// Delete done jobs whose retention window has expired. The window is
@@ -329,7 +452,6 @@ async fn sweep_dead(
             Ok(j) => j,
             Err(_) => continue,
         };
-        // Skip records without a failed_at.
         let Some(failed_at) = job.failed_at else {
             continue;
         };

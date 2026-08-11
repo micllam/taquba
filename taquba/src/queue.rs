@@ -16,12 +16,13 @@ use crate::claim_cursor::{ClaimCursor, CursorState, ScanFrom};
 use crate::clock::{Clock, default_clock};
 use crate::error::{Error, Result};
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt, decode_history};
-use crate::job::{JobRecord, JobStatus};
+use crate::job::{Claim, JobRecord, JobStatus};
 use crate::keys::{
-    KeyTag, MAX_QUEUE_NAME_LEN, attempt_history_key, claimed_key, cursor_key, dead_key,
-    dead_prefix, dedup_index_key, done_key, job_index_key, pending_key, pending_prefix,
+    KeyTag, MAX_QUEUE_NAME_LEN, attempt_history_key, claimed_key, claimed_prefix, cursor_key,
+    dead_key, dead_prefix, dedup_index_key, done_key, job_index_key, pending_key, pending_prefix,
     scheduled_key, tag_prefix, user_scoped_key,
 };
+use crate::lease_registry::LeaseRegistry;
 use crate::payload_store::PayloadStore;
 use crate::reaper::{Reaper, reap_expired};
 use crate::scheduler::{Scheduler, promote_due_jobs};
@@ -201,6 +202,15 @@ impl EnqueueResult {
             Self::New(id) | Self::AlreadyEnqueued(id) => id,
         }
     }
+}
+
+/// Generate a claim token. A ULID's low 64 bits fall inside its 80-bit
+/// random component, so tokens are distinct across claims of the same
+/// job. The value identifies a claim and is not ordered, so it fences
+/// only against this queue's own state and is not a fencing token for
+/// anything outside it.
+fn new_claim_token() -> u64 {
+    Ulid::new().0 as u64
 }
 
 /// Compute the retry delay for the next attempt after a nack.
@@ -493,6 +503,7 @@ pub struct Queue {
     claim_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Per-queue resume point for the next claim scan.
     claim_cursor: ClaimCursor,
+    lease_registry: LeaseRegistry,
     /// Source of job ids. Pending keys sort by id within a priority, so
     /// ids must increase with enqueue order, including inside one
     /// millisecond. One generator per store suffices: a store has a
@@ -608,6 +619,13 @@ impl Queue {
         let completion_notify = Arc::new(tokio::sync::Notify::new());
         let claim_cursor = ClaimCursor::new();
         restore_cursor_state(&db, &claim_cursor).await?;
+        // A claimed record found at open belongs to a process that no
+        // longer holds the store, so its claim is void and the job is
+        // re-queued immediately. Runs after `restore_cursor_state` so
+        // each re-queued job's pending insert is recorded against the
+        // restored bound.
+        crate::reaper::requeue_interrupted_claims(&db, opts.clock.as_ref(), &claim_cursor).await?;
+        let lease_registry = LeaseRegistry::new();
         let (reaper_shutdown, reaper_rx) = watch::channel(false);
         let reaper = Reaper {
             db: db.clone(),
@@ -618,6 +636,7 @@ impl Queue {
             completion_notify: completion_notify.clone(),
             claim_cursor: claim_cursor.clone(),
             payload_store: payload_store.clone(),
+            lease_registry: lease_registry.clone(),
         };
         let reaper_handle = tokio::spawn(reaper.run(reaper_rx));
         let (scheduler_shutdown, scheduler_rx) = watch::channel(false);
@@ -655,6 +674,7 @@ impl Queue {
             claimed_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             claim_locks: std::sync::Mutex::new(HashMap::new()),
             claim_cursor,
+            lease_registry,
             id_gen: std::sync::Mutex::new(ulid::Generator::new()),
             completion_notify,
             payload_store,
@@ -719,6 +739,20 @@ impl Queue {
     /// Look up the configured lease duration for a queue.
     pub fn queue_lease_duration(&self, queue: &str) -> Duration {
         self.queue_config(queue).lease_duration
+    }
+
+    /// Build the lease capability for a claim, which the worker loop
+    /// passes to [`Worker::process`](crate::worker::Worker::process).
+    /// The handle extends the lease but cannot settle the job, so user
+    /// code never holds a claim and a queue together.
+    pub(crate) fn lease_handle(&self, claim: &Claim) -> crate::lease::LeaseHandle {
+        crate::lease::LeaseHandle::new(
+            self.lease_registry.clone(),
+            self.clock.clone(),
+            claim.queue.clone(),
+            claim.id.clone(),
+            claim.token(),
+        )
     }
 
     /// Look up the configured `keep_done_jobs` retention for a queue.
@@ -1149,9 +1183,9 @@ impl Queue {
     /// batch's wall time by the slowest object rather than the sum of
     /// the fetches. Jobs with inline payloads are untouched. On a fetch
     /// failure, one error is returned after every fetch has settled.
-    async fn materialize_payloads(&self, jobs: &mut [JobRecord]) -> Result<()> {
+    async fn materialize_payloads(&self, jobs: &mut [Claim]) -> Result<()> {
         let mut fetches = tokio::task::JoinSet::new();
-        for (index, job) in jobs.iter().enumerate() {
+        for (index, job) in jobs.iter().map(|c| c.job()).enumerate() {
             if let Some(ref payload_ref) = job.payload_ref {
                 let store = self.payload_store.clone();
                 let payload_ref = payload_ref.clone();
@@ -1163,7 +1197,7 @@ impl Queue {
         while let Some(joined) = fetches.join_next().await {
             let (index, result) = joined.expect("payload fetch task panicked");
             match result {
-                Ok(payload) => jobs[index].payload = payload,
+                Ok(payload) => jobs[index].job_mut().payload = payload,
                 Err(err) => {
                     if first_err.is_none() {
                         first_err = Some(err);
@@ -1345,7 +1379,7 @@ impl Queue {
     }
 
     /// Claim the next pending job using the configured default lease duration.
-    pub async fn claim_next(&self, queue: &str) -> Result<Option<JobRecord>> {
+    pub async fn claim_next(&self, queue: &str) -> Result<Option<Claim>> {
         let lease_duration = self.queue_config(queue).lease_duration;
         self.claim(queue, lease_duration).await
     }
@@ -1401,7 +1435,7 @@ impl Queue {
         queue: &str,
         lease_duration: Duration,
         max_wait: Duration,
-    ) -> Result<Option<JobRecord>> {
+    ) -> Result<Option<Claim>> {
         let wakeup = self.claim_cursor.wakeup_for(queue);
         let deadline = tokio::time::Instant::now() + max_wait;
         loop {
@@ -1463,7 +1497,7 @@ impl Queue {
     /// an empty queue does not re-walk the tombstone band left by
     /// previously claimed jobs.
     #[instrument(skip(self), fields(queue))]
-    pub async fn claim(&self, queue: &str, lease_duration: Duration) -> Result<Option<JobRecord>> {
+    pub async fn claim(&self, queue: &str, lease_duration: Duration) -> Result<Option<Claim>> {
         Ok(self.claim_batch(queue, 1, lease_duration).await?.pop())
     }
 
@@ -1489,7 +1523,7 @@ impl Queue {
         queue: &str,
         max_jobs: usize,
         lease_duration: Duration,
-    ) -> Result<Vec<JobRecord>> {
+    ) -> Result<Vec<Claim>> {
         validate_queue_name(queue)?;
         if max_jobs == 0 {
             return Ok(Vec::new());
@@ -1528,7 +1562,7 @@ impl Queue {
         queue: &str,
         max_jobs: usize,
         lease_duration: Duration,
-    ) -> Result<Vec<JobRecord>> {
+    ) -> Result<Vec<Claim>> {
         let prefix = pending_prefix(queue);
         let prefix_bytes = prefix.as_slice();
         let timer = crate::obs::start();
@@ -1611,7 +1645,6 @@ impl Queue {
                 let mut job: JobRecord = rmp_serde::from_slice(&kv.value)?;
                 job.status = JobStatus::Claimed;
                 job.claimed_at = Some(now);
-                job.lease_expires_at = Some(lease_expires_at);
                 job.attempts += 1;
 
                 // Take the dedup_key off the record BEFORE serializing the
@@ -1620,15 +1653,22 @@ impl Queue {
                 // claim would try to delete a dedup index that may by now
                 // belong to a *different* job, corrupting the dedup invariant.
                 let dedup_key_to_release = job.dedup_key.take();
-                let claimed = claimed_key(&job.queue, lease_expires_at, &job.id);
+                let token = new_claim_token();
+                let claimed = claimed_key(&job.queue, &job.id);
                 let value = rmp_serde::to_vec_named(&job)?;
 
                 txn.delete(&kv.key)?;
                 put_job_record(&txn, &claimed, &job_index_key(&job.id), &value)?;
+                // Registered before the commit, so a failed commit
+                // leaves a stale entry, discarded when due; a missing
+                // entry would leave the claim invisible to the reaper
+                // until the next open.
+                self.lease_registry
+                    .insert(&job.queue, &job.id, lease_expires_at, token);
                 if let Some(dk) = dedup_key_to_release.as_deref() {
                     txn.delete(dedup_index_key(&job.queue, dk))?;
                 }
-                jobs.push(job);
+                jobs.push(Claim::new(job, token));
             }
             let count = jobs.len() as i64;
             update_stats(
@@ -1647,18 +1687,15 @@ impl Queue {
             // would be silently lost until the lease expired. Registering
             // first closes that window; on a commit conflict we unregister
             // and retry.
-            for job in &mut jobs {
-                self.install_cancel_token(job);
+            for claim in &mut jobs {
+                self.install_cancel_token(claim.job_mut());
             }
             // Claims commit without awaiting WAL durability. The claimed
-            // state only matters across a restart, and this queue is
-            // single-process: a crash kills the worker holding the job, so
-            // losing the unflushed claim leaves the job pending and it is
-            // redelivered immediately on recovery, instead of waiting out
-            // a durably-recorded lease. Conflict detection is unaffected,
-            // and any later durable commit (ack, nack, enqueue) flushes
-            // the WAL entries ahead of it, so a settled job's claim is
-            // durable by ordering.
+            // state only matters across a restart, where either version
+            // of it recovers: a claim lost with the unflushed WAL leaves
+            // the job pending, and a durable one is requeued at open,
+            // the difference being only that the durable claim has
+            // consumed an attempt.
             let write_opts = WriteOptions {
                 await_durable: false,
                 ..WriteOptions::default()
@@ -1683,14 +1720,14 @@ impl Queue {
                 }
                 Err(e) if e.kind() == slatedb::ErrorKind::Transaction => {
                     warn!(queue = queue, "claim transaction conflict, retrying");
-                    for job in &jobs {
-                        self.clear_cancel_token(&job.id);
+                    for claim in &jobs {
+                        self.clear_cancel_token(&claim.id);
                     }
                     continue;
                 }
                 Err(e) => {
-                    for job in &jobs {
-                        self.clear_cancel_token(&job.id);
+                    for claim in &jobs {
+                        self.clear_cancel_token(&claim.id);
                     }
                     return Err(e.into());
                 }
@@ -1706,8 +1743,10 @@ impl Queue {
     /// Set [`QueueConfig::keep_done_jobs`] (per-queue, or on
     /// [`OpenOptions::default_queue_config`] for an instance-wide default)
     /// to retain completed jobs for a bounded duration.
-    pub async fn ack(&self, job: &JobRecord) -> Result<()> {
-        self.ack_with(job, AckEffects::default()).await.map(|_| ())
+    pub async fn ack(&self, claim: &Claim) -> Result<()> {
+        self.ack_with(claim, AckEffects::default())
+            .await
+            .map(|_| ())
     }
 
     /// Acknowledge successful completion and apply `effects` in the
@@ -1726,19 +1765,15 @@ impl Queue {
     /// job in the scheduled key space. The returned results align
     /// index-wise with `effects.enqueues`. KV writes and deletes
     /// behave like [`Self::enqueue_with_kv`] and [`Self::kv_delete`].
-    #[instrument(skip(self, job, effects), fields(queue = %job.queue, job_id = %job.id))]
-    pub async fn ack_with(
-        &self,
-        job: &JobRecord,
-        effects: AckEffects,
-    ) -> Result<Vec<EnqueueResult>> {
+    #[instrument(skip(self, claim, effects), fields(queue = %claim.queue, job_id = %claim.id))]
+    pub async fn ack_with(&self, claim: &Claim, effects: AckEffects) -> Result<Vec<EnqueueResult>> {
+        let job = claim.job();
         for value in effects.kv_writes.values() {
             validate_kv_value_size(value)?;
         }
 
         let timer = crate::obs::start();
-        let lease_expires_at = job.lease_expires_at.ok_or(Error::InvalidState)?;
-        let claimed = claimed_key(&job.queue, lease_expires_at, &job.id);
+        let token = claim.token();
         let keep_done = self.queue_keep_done_jobs(&job.queue).is_some();
         let done_record = if keep_done {
             let completed_at = self.now_ms();
@@ -1777,7 +1812,7 @@ impl Queue {
         let outcome: Result<Vec<EnqueueResult>> = async {
             loop {
                 let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-                take_claim(&txn, &claimed).await?;
+                take_claim(&txn, &self.lease_registry, &job.queue, &job.id, token).await?;
                 if let Some((ref done_k, ref done_v)) = done_record {
                     put_job_record(&txn, done_k, &job_index_key(&job.id), done_v)?;
                     append_attempt(
@@ -1839,6 +1874,9 @@ impl Queue {
         self.delete_unreferenced_follow_up_payloads(&prepared_jobs, &outcome)
             .await;
         let results = outcome?;
+        // After the commit and token-fenced, so a removal that runs
+        // after a re-claim leaves the new claim's entry.
+        self.lease_registry.remove(&job.queue, &job.id, token);
 
         // The acked job's record is gone unless a done record was kept;
         // without one, its payload object is removed here, after the
@@ -1860,17 +1898,17 @@ impl Queue {
     /// when the backoff is non-zero, the job is parked in the scheduled key space and
     /// the background scheduler promotes it once the delay has elapsed. With zero
     /// backoff the job goes straight back to pending.
-    #[instrument(skip(self, job), fields(queue = %job.queue, job_id = %job.id))]
-    pub async fn nack(&self, mut job: JobRecord, error: &str) -> Result<()> {
-        let lease_expires_at = job.lease_expires_at.ok_or(Error::InvalidState)?;
-        let claimed = claimed_key(&job.queue, lease_expires_at, &job.id);
+    #[instrument(skip(self, claim), fields(queue = %claim.queue, job_id = %claim.id))]
+    pub async fn nack(&self, claim: &Claim, error: &str) -> Result<()> {
+        let token = claim.token();
+        let mut job = claim.job().clone();
         // Captured before the retry branches clear it on the record.
         let claimed_at = job.claimed_at;
         job.last_error = Some(error.to_string());
 
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            take_claim(&txn, &claimed).await?;
+            take_claim(&txn, &self.lease_registry, &job.queue, &job.id, token).await?;
             append_attempt(
                 &txn,
                 &job.id,
@@ -1909,7 +1947,6 @@ impl Queue {
                 let backoff =
                     backoff_delay(job.attempts, cfg.retry_backoff_base, cfg.retry_backoff_max);
                 job.claimed_at = None;
-                job.lease_expires_at = None;
 
                 if backoff.is_zero() {
                     job.status = JobStatus::Pending;
@@ -1964,6 +2001,7 @@ impl Queue {
         } else {
             crate::obs::nacked(&job.queue);
         }
+        self.lease_registry.remove(&job.queue, &job.id, token);
         self.clear_cancel_token(&job.id);
         if immediate_retry {
             // The backoff path needs no insert note here: the
@@ -1989,23 +2027,22 @@ impl Queue {
     /// [`worker::run_worker_concurrent`](crate::worker::run_worker_concurrent)
     /// call this automatically when a worker returns
     /// [`worker::PermanentFailure`](crate::worker::PermanentFailure).
-    #[instrument(skip(self, job), fields(queue = %job.queue, job_id = %job.id))]
-    pub async fn dead_letter(&self, mut job: JobRecord, reason: &str) -> Result<()> {
-        let lease_expires_at = job.lease_expires_at.ok_or(Error::InvalidState)?;
-        let claimed = claimed_key(&job.queue, lease_expires_at, &job.id);
+    #[instrument(skip(self, claim), fields(queue = %claim.queue, job_id = %claim.id))]
+    pub async fn dead_letter(&self, claim: &Claim, reason: &str) -> Result<()> {
+        let token = claim.token();
+        let mut job = claim.job().clone();
         let claimed_at = job.claimed_at;
         let failed_at = self.now_ms();
         job.last_error = Some(reason.to_string());
         job.status = JobStatus::Dead;
         job.failed_at = Some(failed_at);
         job.claimed_at = None;
-        job.lease_expires_at = None;
         let dead = dead_key(&job.queue, &job.id);
         let value = job.stored_bytes()?;
 
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            take_claim(&txn, &claimed).await?;
+            take_claim(&txn, &self.lease_registry, &job.queue, &job.id, token).await?;
             put_job_record(&txn, &dead, &job_index_key(&job.id), &value)?;
             append_attempt(
                 &txn,
@@ -2031,6 +2068,7 @@ impl Queue {
         }
 
         crate::obs::dead_lettered(&job.queue);
+        self.lease_registry.remove(&job.queue, &job.id, token);
         self.clear_cancel_token(&job.id);
         self.completion_notify.notify_waiters();
         warn!(
@@ -2083,7 +2121,7 @@ impl Queue {
     ///
     /// - `Pending`: claim order (priority, then enqueue order).
     /// - `Scheduled`: `run_at` order, soonest first.
-    /// - `Claimed`: lease-expiry order, soonest first.
+    /// - `Claimed`: enqueue order, as in [`Queue::dead_jobs`].
     /// - `Done`: completion-time order, oldest first. Done records exist
     ///   only on queues with [`QueueConfig::keep_done_jobs`] set.
     /// - `Dead`: enqueue order, as in [`Queue::dead_jobs`].
@@ -2095,11 +2133,11 @@ impl Queue {
     /// listing is not a snapshot: a job that changes state between page
     /// reads may appear on no page or on two pages.
     ///
-    /// The pending and dead key spaces group by queue, so those scans
-    /// cover only the requested queue. The claimed, scheduled and done
-    /// key spaces lead with a timestamp for the background sweeps, so
-    /// those scans cover the state's whole key space across queues and
-    /// filter on the queue name.
+    /// The pending, claimed and dead key spaces group by queue, so those
+    /// scans cover only the requested queue. The scheduled and done
+    /// listings scan a key space that leads with a timestamp for the
+    /// background sweeps, so they cover every queue and filter on the
+    /// queue name.
     pub async fn list_jobs(
         &self,
         queue: &str,
@@ -2115,10 +2153,13 @@ impl Queue {
         if limit == 0 {
             return Ok(empty);
         }
+        // `filter_queue` enables the queue-name filter on each scanned
+        // record and is set only for the key spaces that cover every
+        // queue.
         let (prefix, filter_queue) = match status {
             JobStatus::Pending => (pending_prefix(queue), false),
             JobStatus::Dead => (dead_prefix(queue), false),
-            JobStatus::Claimed => (tag_prefix(KeyTag::Claimed).to_vec(), true),
+            JobStatus::Claimed => (claimed_prefix(queue), false),
             JobStatus::Scheduled => (tag_prefix(KeyTag::Scheduled).to_vec(), true),
             JobStatus::Done => (tag_prefix(KeyTag::Done).to_vec(), true),
         };
@@ -2130,6 +2171,9 @@ impl Queue {
             Some(c) => Bound::Excluded(Bytes::copy_from_slice(&c[prefix.len()..])),
         };
 
+        // Each row includes the key it was scanned at, which is both the
+        // key its record lives under and the position the cursor
+        // resumes from.
         let mut page: Vec<(Bytes, JobRecord)> = Vec::with_capacity(limit);
         let mut more = false;
         let mut iter = self
@@ -2150,7 +2194,7 @@ impl Queue {
         let next_cursor = more.then(|| page[page.len() - 1].0.to_vec());
 
         let mut jobs = Vec::with_capacity(page.len());
-        for (key, mut job) in page {
+        for (record_key, mut job) in page {
             match self.materialize_payload(&mut job).await {
                 Ok(()) => jobs.push(job),
                 Err(Error::PayloadMissing { id }) => {
@@ -2160,7 +2204,7 @@ impl Queue {
                     // deletion. Re-check the record: a removed job is
                     // omitted from the page, not reported as a lost
                     // payload.
-                    if self.db.get(&key).await?.is_some() {
+                    if self.db.get(&record_key).await?.is_some() {
                         return Err(Error::PayloadMissing { id });
                     }
                 }
@@ -2205,7 +2249,6 @@ impl Queue {
         job.attempts = 0;
         job.last_error = None;
         job.claimed_at = None;
-        job.lease_expires_at = None;
         job.failed_at = None;
         // Revival clears any prior cancel request: the operator chose to
         // start this job afresh.
@@ -2244,46 +2287,49 @@ impl Queue {
         Ok(())
     }
 
-    /// Extend the lease on a claimed job. Updates `job.lease_expires_at` in place.
+    /// Extend the lease on a claimed job, returning the new expiry as
+    /// epoch milliseconds.
     ///
     /// Call this periodically for long-running jobs to prevent the reaper from
     /// treating them as abandoned and re-queuing them.
     ///
-    /// Renewal rotates the job's claimed key, which embeds the lease expiry.
-    /// A copy of the record taken before a renewal therefore no longer
-    /// identifies the claim: [`Self::ack`], [`Self::nack`], and further
-    /// renewals fail with [`Error::ClaimLost`] unless they receive the
-    /// record updated by the most recent renewal.
+    /// The lease is process state, so renewal is a synchronous memory
+    /// operation with no durable write. The claim is unchanged and
+    /// stays valid for settlement; [`Self::lease_expiry`] reports the
+    /// current value.
     ///
-    /// For the same reason, renewal is for callers that run their own
-    /// claim / settle loop. It cannot be used from within the
-    /// [`run_worker`](crate::worker::run_worker) loops: their `process`
-    /// hook receives a shared reference, and the loop settles with its
-    /// own copy of the record, which no longer identifies the claim
-    /// once a renewal rotates the key.
-    #[instrument(skip(self, job), fields(queue = %job.queue, job_id = %job.id))]
-    pub async fn renew_lease(&self, job: &mut JobRecord, extension: Duration) -> Result<()> {
-        let old_expiry = job.lease_expires_at.ok_or(Error::InvalidState)?;
-        let old_claimed = claimed_key(&job.queue, old_expiry, &job.id);
-
+    /// Fails with [`Error::ClaimLost`] once the claim has ended or the
+    /// reaper has begun re-queuing the expired lease.
+    ///
+    /// This method serves callers that call [`Self::claim`] /
+    /// [`Self::claim_batch`] directly and hold the [`Claim`]. Inside
+    /// a [`Worker::process`](crate::worker::Worker::process) hook the
+    /// claim stays with the worker loop; extend the lease there through
+    /// the [`crate::LeaseHandle`] the hook receives.
+    #[instrument(skip(self, claim), fields(queue = %claim.queue, job_id = %claim.id))]
+    pub fn renew_lease(&self, claim: &Claim, extension: Duration) -> Result<u64> {
+        let job = claim.job();
         let new_expiry = self.now_ms() + extension.as_millis() as u64;
-        job.lease_expires_at = Some(new_expiry);
-        let new_claimed = claimed_key(&job.queue, new_expiry, &job.id);
-        let value = job.stored_bytes()?;
-
-        loop {
-            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            take_claim(&txn, &old_claimed).await?;
-            put_job_record(&txn, &new_claimed, &job_index_key(&job.id), &value)?;
-            match txn.commit().await {
-                Ok(_) => break,
-                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
-                Err(e) => return Err(e.into()),
-            }
+        if !self
+            .lease_registry
+            .renew(&job.queue, &job.id, claim.token(), new_expiry)
+        {
+            return Err(Error::ClaimLost);
         }
-
         debug!(queue = %job.queue, job_id = %job.id, new_expiry, "lease renewed");
-        Ok(())
+        Ok(new_expiry)
+    }
+
+    /// The current lease expiry of a claimed job, as epoch milliseconds.
+    ///
+    /// The lease is process state, so this is a synchronous read of the
+    /// in-memory lease registry and reflects any renewal. Returns `None`
+    /// when no live lease for the job exists in this process, including
+    /// when the job is in any state other than `Claimed`.
+    pub fn lease_expiry(&self, queue: &str, id: &str) -> Option<u64> {
+        self.lease_registry
+            .current(queue, id)
+            .map(|(expires_at, _)| expires_at)
     }
 
     /// Wait until the given job reaches a terminal state, or until
@@ -2363,32 +2409,35 @@ impl Queue {
     /// Returns `None` if the ID was never enqueued or has since been expunged.
     pub async fn get_job(&self, id: &str) -> Result<Option<JobRecord>> {
         let index_key = job_index_key(id);
-        let current_key = match self.db.get(&index_key).await? {
-            None => return Ok(None),
-            Some(bytes) => bytes,
+        // The index and the record are read from one snapshot.
+        let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+        let found = match txn.get(&index_key).await? {
+            None => None,
+            Some(current_key) => match txn.get(&current_key).await? {
+                None => None,
+                Some(bytes) => Some(rmp_serde::from_slice::<JobRecord>(&bytes)?),
+            },
         };
-        match self.db.get(&current_key).await? {
-            None => Ok(None),
-            Some(bytes) => {
-                let mut job: JobRecord = rmp_serde::from_slice(&bytes)?;
-                match self.materialize_payload(&mut job).await {
-                    Ok(()) => Ok(Some(job)),
-                    Err(Error::PayloadMissing { id }) => {
-                        // The record can be read just before a
-                        // record-removing transaction commits, with the
-                        // object fetch running just after that commit's
-                        // payload-object deletion. Re-check the index:
-                        // a removed job reports absence, not a lost
-                        // payload.
-                        if self.db.get(&index_key).await?.is_none() {
-                            Ok(None)
-                        } else {
-                            Err(Error::PayloadMissing { id })
-                        }
-                    }
-                    Err(e) => Err(e),
+        txn.rollback();
+
+        let Some(mut job) = found else {
+            return Ok(None);
+        };
+        match self.materialize_payload(&mut job).await {
+            Ok(()) => Ok(Some(job)),
+            Err(Error::PayloadMissing { id }) => {
+                // The record can be read just before a record-removing
+                // transaction commits, with the object fetch running
+                // just after that commit's payload-object deletion.
+                // Re-check the index so a job removed in that window
+                // is reported as absent.
+                if self.db.get(&index_key).await?.is_none() {
+                    Ok(None)
+                } else {
+                    Err(Error::PayloadMissing { id })
                 }
             }
+            Err(e) => Err(e),
         }
     }
 
@@ -2655,6 +2704,7 @@ impl Queue {
             self.clock.as_ref(),
             &self.completion_notify,
             &self.claim_cursor,
+            &self.lease_registry,
         )
         .await
     }
@@ -2768,6 +2818,7 @@ async fn restore_cursor_state(db: &Db, claim_cursor: &ClaimCursor) -> Result<()>
 mod tests {
     use super::*;
     use crate::clock::MockClock;
+    use crate::lease::LeaseHandle;
     use slatedb::object_store::memory::InMemory;
 
     fn make_store() -> Arc<dyn ObjectStore> {
@@ -3254,7 +3305,7 @@ mod tests {
         for job in &first {
             assert_eq!(job.status, JobStatus::Claimed);
             assert_eq!(job.attempts, 1);
-            assert!(job.lease_expires_at.is_some());
+            assert!(q.lease_expiry("work", &job.id).is_some());
         }
 
         let rest = q.claim_batch("work", 3, lease).await.unwrap();
@@ -3321,7 +3372,7 @@ mod tests {
         let job = q.claim("work", lease).await.unwrap().unwrap();
         assert!(q.claim("work", lease).await.unwrap().is_none());
 
-        q.nack(job, "retry").await.unwrap();
+        q.nack(&job, "retry").await.unwrap();
 
         let retried = q.claim("work", lease).await.unwrap().unwrap();
         assert_eq!(retried.payload, b"job");
@@ -3365,7 +3416,7 @@ mod tests {
         assert_eq!(job.status, JobStatus::Claimed);
         assert_eq!(job.attempts, 1);
         assert!(job.claimed_at.is_some());
-        assert!(job.lease_expires_at.is_some());
+        assert!(q.lease_expiry("email", &job.id).is_some());
 
         q.close().await.unwrap();
     }
@@ -3632,7 +3683,7 @@ mod tests {
             .unwrap();
         assert_eq!(job.attempts, 1);
 
-        q.nack(job, "transient error").await.unwrap();
+        q.nack(&job, "transient error").await.unwrap();
 
         let retried = q
             .claim("email", Duration::from_secs(30))
@@ -3668,7 +3719,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            q.nack(job, "persistent error").await.unwrap();
+            q.nack(&job, "persistent error").await.unwrap();
         }
         assert!(
             q.claim("email", Duration::from_secs(30))
@@ -3923,7 +3974,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        q.nack(job, "fail").await.unwrap();
+        q.nack(&job, "fail").await.unwrap();
 
         let s = q.stats("email").await.unwrap();
         assert_eq!(s.pending, 0);
@@ -3968,7 +4019,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        q.nack(job, "fatal").await.unwrap();
+        q.nack(&job, "fatal").await.unwrap();
 
         let dead = q.dead_jobs("work", None, 100).await.unwrap();
         assert_eq!(dead.len(), 1);
@@ -4012,7 +4063,7 @@ mod tests {
         let job = q.claim_next("fast").await.unwrap().unwrap();
         assert_eq!(job.max_attempts, 1);
         // Lease is 5s
-        let lease_expires_at = job.lease_expires_at.unwrap();
+        let lease_expires_at = q.lease_expiry("fast", &job.id).unwrap();
         let claimed_at = job.claimed_at.unwrap();
         assert!(lease_expires_at - claimed_at <= 5_001); // within 5s + 1ms tolerance
 
@@ -4175,7 +4226,7 @@ mod tests {
             .claim_batch("jobs", 20, Duration::from_secs(30))
             .await
             .unwrap();
-        let claimed_ids: Vec<String> = claimed.into_iter().map(|j| j.id).collect();
+        let claimed_ids: Vec<String> = claimed.into_iter().map(|c| c.into_job().id).collect();
         assert_eq!(claimed_ids, enqueued);
 
         q.close().await.unwrap();
@@ -4218,7 +4269,7 @@ mod tests {
             .unwrap();
         assert_eq!(job.id, id_high);
 
-        q.nack(job, "retry me").await.unwrap();
+        q.nack(&job, "retry me").await.unwrap();
 
         // High-priority job should be claimed again before the normal one.
         let reclaimed = q
@@ -4603,7 +4654,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        q.nack(job, "worker failed").await.unwrap();
+        q.nack(&job, "worker failed").await.unwrap();
 
         // The retry backoff moves the job back to `scheduled`; promote it
         // and verify the redelivered record still carries the wake payload.
@@ -4933,7 +4984,7 @@ mod tests {
             .unwrap();
         assert_eq!(claimed.attempts, 1);
 
-        q.dead_letter(claimed, "permanent failure").await.unwrap();
+        q.dead_letter(&claimed, "permanent failure").await.unwrap();
 
         let job = q.get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Dead);
@@ -4954,7 +5005,11 @@ mod tests {
 
         struct PermanentFailWorker;
         impl Worker for PermanentFailWorker {
-            async fn process(&self, _job: &JobRecord) -> std::result::Result<(), WorkerError> {
+            async fn process(
+                &self,
+                _job: &JobRecord,
+                _lease: &LeaseHandle,
+            ) -> std::result::Result<(), WorkerError> {
                 Err(PermanentFailure::new("HTTP 410 Gone").into())
             }
         }
@@ -5003,7 +5058,11 @@ mod tests {
 
         struct EchoWorker;
         impl Worker for EchoWorker {
-            async fn process(&self, _job: &JobRecord) -> std::result::Result<(), WorkerError> {
+            async fn process(
+                &self,
+                _job: &JobRecord,
+                _lease: &LeaseHandle,
+            ) -> std::result::Result<(), WorkerError> {
                 Ok(())
             }
         }
@@ -5279,7 +5338,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            q.nack(job, "fatal").await.unwrap();
+            q.nack(&job, "fatal").await.unwrap();
         }
 
         assert_eq!(q.dead_jobs("ephemeral", None, 100).await.unwrap().len(), 1);
@@ -5418,7 +5477,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let id = job.id.clone();
-        q.nack(job, "fatal").await.unwrap();
+        q.nack(&job, "fatal").await.unwrap();
 
         let dead = q.dead_jobs("work", None, 100).await.unwrap();
         assert_eq!(dead.len(), 1);
@@ -5465,7 +5524,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        q.nack(job, "fatal").await.unwrap();
+        q.nack(&job, "fatal").await.unwrap();
 
         let dead = q.dead_jobs("work", None, 100).await.unwrap().pop().unwrap();
         assert!(dead.failed_at.is_some());
@@ -5520,7 +5579,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        q.nack(job, "fatal").await.unwrap();
+        q.nack(&job, "fatal").await.unwrap();
 
         let dead = q.dead_jobs("work", None, 100).await.unwrap().pop().unwrap();
         clock.advance(retention + Duration::from_millis(10));
@@ -5562,7 +5621,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let id = job.id.clone();
-        q.nack(job, "fatal").await.unwrap();
+        q.nack(&job, "fatal").await.unwrap();
 
         let dead = q.get_job(&id).await.unwrap().unwrap();
         assert_eq!(dead.status, JobStatus::Dead);
@@ -5572,28 +5631,29 @@ mod tests {
 
     #[tokio::test]
     async fn test_renew_lease() {
-        // Covers the three things `renew_lease` has to get right: the new
-        // expiry replaces the old one, the reaper sees the renewed lease and
-        // skips the job, and the job-index pointer is updated so `get_job`
-        // resolves through the new claimed key (not a dangling pointer at
-        // the old timestamp).
-        let q = Queue::open(make_store(), "test").await.unwrap();
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
 
         q.enqueue("work", b"payload".to_vec()).await.unwrap();
-        let mut job = q
+        let job = q
             .claim("work", Duration::from_millis(1))
             .await
             .unwrap()
             .unwrap();
-        let original_expiry = job.lease_expires_at.unwrap();
+        let original_expiry = q.lease_expiry("work", &job.id).unwrap();
 
-        q.renew_lease(&mut job, Duration::from_secs(30))
-            .await
-            .unwrap();
-        let new_expiry = job.lease_expires_at.unwrap();
+        let new_expiry = q.renew_lease(&job, Duration::from_secs(30)).unwrap();
         assert!(new_expiry > original_expiry, "renewed expiry must be later");
 
-        // Reaper skips the renewed lease.
+        // Reaper skips the renewed lease even once the original expiry
+        // has passed.
+        clock.advance(Duration::from_secs(1));
         q.reap_now().await.unwrap();
         assert!(
             q.claim("work", Duration::from_secs(30))
@@ -5602,10 +5662,243 @@ mod tests {
                 .is_none()
         );
 
-        // get_job resolves through the new claimed key, not the old one.
         let fetched = q.get_job(&job.id).await.unwrap().unwrap();
         assert_eq!(fetched.status, JobStatus::Claimed);
-        assert_eq!(fetched.lease_expires_at.unwrap(), new_expiry);
+        // The claim still holds, so the original handle settles it.
+        q.ack(&job).await.unwrap();
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn renewal_leaves_the_claim_settleable() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+
+        clock.advance(Duration::from_secs(10));
+        let renewed = q.renew_lease(&job, Duration::from_secs(60)).unwrap();
+        assert_eq!(q.lease_expiry("work", &job.id), Some(renewed));
+
+        // The claim taken before the renewal keeps its token, so it
+        // still settles the delivery.
+        q.ack(&job).await.unwrap();
+
+        let stats = q.stats("work").await.unwrap();
+        assert_eq!(stats.done, 1);
+        assert_eq!(stats.claimed, 0);
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reaping_leaves_no_claim_state() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        // Two jobs, one with retries left and one out of attempts, so the
+        // requeue and dead-letter branches are both covered.
+        let retried = q.enqueue("work", b"a".to_vec()).await.unwrap();
+        let doomed = q
+            .enqueue_with(
+                "work",
+                b"b".to_vec(),
+                EnqueueOptions {
+                    max_attempts: Some(1),
+                    ..EnqueueOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let claimed = q
+            .claim_batch("work", 2, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 2);
+
+        clock.advance(Duration::from_secs(31));
+        q.reap_now().await.unwrap();
+
+        for id in [&retried, &doomed] {
+            assert!(q.lease_registry.current("work", id).is_none());
+            assert!(q.db.get(&claimed_key("work", id)).await.unwrap().is_none());
+        }
+        let stats = q.stats("work").await.unwrap();
+        assert_eq!(stats.claimed, 0);
+        assert_eq!(stats.pending, 1);
+        assert_eq!(stats.dead, 1);
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_settlement_after_a_reclaim_is_rejected() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let stale = q
+            .claim("work", Duration::from_millis(1))
+            .await
+            .unwrap()
+            .unwrap();
+
+        clock.advance(Duration::from_millis(2));
+        q.reap_now().await.unwrap();
+
+        // The re-claim writes the same claimed key the stale copy names,
+        // so only the claim token separates the two deliveries.
+        let fresh = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.id, id);
+
+        assert!(matches!(q.ack(&stale).await, Err(Error::ClaimLost)));
+        assert!(matches!(
+            q.nack(&stale, "late failure").await,
+            Err(Error::ClaimLost)
+        ));
+        assert!(matches!(
+            q.dead_letter(&stale, "late permanent failure").await,
+            Err(Error::ClaimLost)
+        ));
+
+        // The live claim is untouched by the rejected settlements.
+        let stats = q.stats("work").await.unwrap();
+        assert_eq!(stats.claimed, 1);
+        assert_eq!(stats.done, 0);
+        assert_eq!(stats.dead, 0);
+        q.ack(&fresh).await.unwrap();
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn settling_after_renewal_leaves_no_lease_entry() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let renewed = q.renew_lease(&job, Duration::from_secs(60)).unwrap();
+
+        // The ack removes the lease entry the renewal moved.
+        q.ack(&job).await.unwrap();
+        assert!(q.lease_registry.current("work", &job.id).is_none());
+        assert!(q.lease_expiry("work", &job.id).is_none());
+
+        // Nothing is left to come due, so the reaper requeues nothing,
+        // even past the renewed expiry.
+        assert!(renewed > clock.now_ms());
+        clock.advance(Duration::from_secs(61));
+        q.reap_now().await.unwrap();
+        let stats = q.stats("work").await.unwrap();
+        assert_eq!(stats.done, 1);
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.dead, 0);
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn settlement_is_rejected_when_the_registry_entry_outlives_the_claim() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let claim = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.ack(&claim).await.unwrap();
+
+        // The registry lags the store: an entry is removed only after
+        // the commit that ends its claim, so a settlement transaction
+        // begun inside that lag passes the token check and conflicts
+        // with nothing. Recreate the lagging entry and require the
+        // in-transaction record read to reject the settlement.
+        q.lease_registry
+            .insert("work", &claim.id, clock.now_ms() + 30_000, claim.token());
+        assert!(matches!(
+            q.nack(&claim, "late failure").await,
+            Err(Error::ClaimLost)
+        ));
+        assert!(matches!(q.ack(&claim).await, Err(Error::ClaimLost)));
+
+        let stats = q.stats("work").await.unwrap();
+        assert_eq!(stats.done, 1);
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.dead, 0);
+        assert_eq!(stats.claimed, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lease_expiry_reports_the_renewed_expiry_not_the_claim_time_one() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let claim_time_expiry = q.lease_expiry("work", &job.id).unwrap();
+
+        clock.advance(Duration::from_secs(10));
+        let renewed = q.renew_lease(&job, Duration::from_secs(60)).unwrap();
+        assert!(renewed > claim_time_expiry);
+        assert_eq!(q.lease_expiry("work", &job.id), Some(renewed));
 
         q.close().await.unwrap();
     }
@@ -5637,18 +5930,16 @@ mod tests {
 
         assert!(matches!(q.ack(&stale).await, Err(Error::ClaimLost)));
         assert!(matches!(
-            q.nack(stale.clone(), "late failure").await,
+            q.nack(&stale, "late failure").await,
             Err(Error::ClaimLost)
         ));
         assert!(matches!(
-            q.dead_letter(stale.clone(), "late permanent failure").await,
+            q.dead_letter(&stale, "late permanent failure").await,
             Err(Error::ClaimLost)
         ));
 
-        let mut stale_for_renew = stale.clone();
         assert!(matches!(
-            q.renew_lease(&mut stale_for_renew, Duration::from_secs(30))
-                .await,
+            q.renew_lease(&stale, Duration::from_secs(30)),
             Err(Error::ClaimLost)
         ));
 
@@ -5716,18 +6007,16 @@ mod tests {
 
         assert!(matches!(q.ack(&stale).await, Err(Error::ClaimLost)));
         assert!(matches!(
-            q.nack(stale.clone(), "late failure").await,
+            q.nack(&stale, "late failure").await,
             Err(Error::ClaimLost)
         ));
         assert!(matches!(
-            q.dead_letter(stale.clone(), "late permanent failure").await,
+            q.dead_letter(&stale, "late permanent failure").await,
             Err(Error::ClaimLost)
         ));
 
-        let mut stale_for_renew = stale.clone();
         assert!(matches!(
-            q.renew_lease(&mut stale_for_renew, Duration::from_secs(30))
-                .await,
+            q.renew_lease(&stale, Duration::from_secs(30)),
             Err(Error::ClaimLost)
         ));
 
@@ -5748,10 +6037,9 @@ mod tests {
 
     #[tokio::test]
     async fn ack_succeeds_on_expired_lease_before_reaper_runs() {
-        // The settlement guard keys on whether the claimed: record still
-        // exists, not on whether the lease has expired. A worker that
-        // finishes after its lease lapsed but before the reaper has
-        // requeued the job still owns the record, so the settlement lands.
+        // Settlement is fenced on the claim token; the claim stays
+        // settleable past its lease expiry until the reaper requeues
+        // the job.
         let clock = MockClock::new(1_700_000_000_000);
         let opts = OpenOptions {
             clock: Arc::new(clock.clone()),
@@ -6081,7 +6369,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        q.dead_letter(job, "permanent").await.unwrap();
+        q.dead_letter(&job, "permanent").await.unwrap();
 
         match waiter.await.unwrap() {
             WaitOutcome::Completed(Some(record)) => {
@@ -6163,7 +6451,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let id = job.id.clone();
-        q.dead_letter(job, "permanent").await.unwrap();
+        q.dead_letter(&job, "permanent").await.unwrap();
 
         // Even with a zero timeout, the already-terminal case must return.
         match q
@@ -6204,7 +6492,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        q.dead_letter(job, "permanent").await.unwrap();
+        q.dead_letter(&job, "permanent").await.unwrap();
 
         for waiter in waiters {
             match waiter.await.unwrap() {
@@ -6422,7 +6710,7 @@ mod tests {
         // After claim, dedup_key must be cleared on the record so a future
         // claim doesn't try to release the (now reused) index.
         assert!(job.dedup_key.is_none());
-        q.nack(job, "transient").await.unwrap();
+        q.nack(&job, "transient").await.unwrap();
 
         // A fresh enqueue_unique with the same key should be accepted now
         // (claim released the index) and create a different job.
@@ -6498,7 +6786,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        q.nack(job, "transient").await.unwrap();
+        q.nack(&job, "transient").await.unwrap();
 
         let s = q.stats("work").await.unwrap();
         assert_eq!(s.pending, 0, "must not be pending immediately");
@@ -6548,7 +6836,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let id = job.id.clone();
-        q.nack(job, "boom").await.unwrap();
+        q.nack(&job, "boom").await.unwrap();
 
         // Advance past the backoff and trigger promotion.
         clock.advance(Duration::from_millis(20));
@@ -6607,7 +6895,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            q.nack(job, "fail").await.unwrap();
+            q.nack(&job, "fail").await.unwrap();
             ids.push(id);
         }
 
@@ -6644,7 +6932,11 @@ mod tests {
             finished: Arc<AtomicBool>,
         }
         impl Worker for SlowWorker {
-            async fn process(&self, _job: &JobRecord) -> std::result::Result<(), WorkerError> {
+            async fn process(
+                &self,
+                _job: &JobRecord,
+                _lease: &LeaseHandle,
+            ) -> std::result::Result<(), WorkerError> {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 self.finished.store(true, Ordering::SeqCst);
                 Ok(())
@@ -6693,6 +6985,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_process_can_renew_its_own_lease() {
+        use crate::worker::{Worker, WorkerError, run_worker};
+
+        struct RenewingWorker {
+            queue: Arc<Queue>,
+            clock: MockClock,
+        }
+        impl Worker for RenewingWorker {
+            async fn process(
+                &self,
+                _job: &JobRecord,
+                lease: &LeaseHandle,
+            ) -> std::result::Result<(), WorkerError> {
+                lease.ensure_at_least(Duration::from_secs(60)).unwrap();
+                self.clock.advance(Duration::from_secs(2));
+                self.queue.reap_now().await.unwrap();
+                Ok(())
+            }
+        }
+
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            default_queue_config: QueueConfig {
+                lease_duration: Duration::from_secs(1),
+                ..QueueConfig::default()
+            },
+            ..OpenOptions::default()
+        };
+        let q = Arc::new(
+            Queue::open_with_options(make_store(), "test", opts)
+                .await
+                .unwrap(),
+        );
+        q.enqueue("work", b"x".to_vec()).await.unwrap();
+
+        let worker = RenewingWorker {
+            queue: q.clone(),
+            clock: clock.clone(),
+        };
+        run_worker(
+            &q,
+            "work",
+            &worker,
+            Duration::from_millis(10),
+            std::future::ready(()),
+        )
+        .await
+        .unwrap();
+
+        let stats = q.stats("work").await.unwrap();
+        assert_eq!(stats.done, 1, "the ack after a renewal must succeed");
+        assert_eq!(stats.pending, 0, "the renewed job must not be requeued");
+        assert_eq!(stats.claimed, 0);
+    }
+
+    #[tokio::test]
     async fn test_claim_with_wait_wakes_or_times_out() {
         // Both arms of the internal `select!`: the timeout branch returns
         // None when nothing arrives, and the notify branch wakes immediately
@@ -6736,7 +7085,11 @@ mod tests {
 
         struct EchoWorker;
         impl Worker for EchoWorker {
-            async fn process(&self, _job: &JobRecord) -> std::result::Result<(), WorkerError> {
+            async fn process(
+                &self,
+                _job: &JobRecord,
+                _lease: &LeaseHandle,
+            ) -> std::result::Result<(), WorkerError> {
                 tokio::time::sleep(Duration::from_millis(5)).await;
                 Ok(())
             }
@@ -7245,7 +7598,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        q.nack(job, "retry").await.unwrap();
+        q.nack(&job, "retry").await.unwrap();
         assert_eq!(
             object_count(&store, "test-payloads").await,
             1,
@@ -7508,7 +7861,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        q.dead_letter(job, "permanent").await.unwrap();
+        q.dead_letter(&job, "permanent").await.unwrap();
         assert_eq!(object_count(&store, "test-payloads").await, 1);
 
         clock.advance(retention + Duration::from_millis(10));
@@ -7533,7 +7886,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        q.dead_letter(job, "permanent").await.unwrap();
+        q.dead_letter(&job, "permanent").await.unwrap();
 
         let dead = q.dead_jobs("work", None, 10).await.unwrap();
         assert_eq!(dead.len(), 1);
@@ -7983,7 +8336,13 @@ mod tests {
 
     #[tokio::test]
     async fn list_jobs_filters_claimed_by_queue() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
+        let opts = OpenOptions {
+            clock: Arc::new(MockClock::new(1_700_000_000_000)),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
         let a1 = q.enqueue("qa", b"1".to_vec()).await.unwrap();
         let a2 = q.enqueue("qa", b"2".to_vec()).await.unwrap();
         q.enqueue("qb", b"3".to_vec()).await.unwrap();
@@ -8003,18 +8362,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_jobs_pages_claimed_across_interleaved_queues() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
+    async fn list_jobs_orders_claimed_by_id_stably_under_renewal() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        // Claim order is the reverse of expiry order, so a listing
+        // ordered by lease expiry would return these in reverse order.
+        let mut handles = Vec::new();
+        for secs in [90, 60, 30] {
+            q.enqueue("work", vec![secs as u8]).await.unwrap();
+            let claim = q
+                .claim("work", Duration::from_secs(secs))
+                .await
+                .unwrap()
+                .unwrap();
+            handles.push(claim);
+        }
+        let [ca, cb, cc] = <[Claim; 3]>::try_from(handles).unwrap();
+        let (a, b, c) = (ca.id.clone(), cb.id.clone(), cc.id.clone());
+
+        let ids =
+            |page: &JobPage| -> Vec<String> { page.jobs.iter().map(|j| j.id.clone()).collect() };
+        let page = q
+            .list_jobs("work", JobStatus::Claimed, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(ids(&page), vec![a.clone(), b.clone(), c.clone()]);
+
+        // A renewal leaves the ordering alone.
+        let renewed = q.renew_lease(&ca, Duration::from_secs(600)).unwrap();
+        let page = q
+            .list_jobs("work", JobStatus::Claimed, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(ids(&page), vec![a.clone(), b, c]);
+        assert_eq!(q.lease_expiry("work", &a), Some(renewed));
+
+        drop((cb, cc));
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_jobs_pages_claimed_one_queue_at_a_time() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
         let mut expected = Vec::new();
-        // Alternate claims between the two queues so the claimed key
-        // space interleaves them in lease-expiry order.
+        // Alternate claims between the two queues, so a listing that
+        // scanned a key space covering both would page the other
+        // queue's rows in.
         for i in 0..3u8 {
             let id = q.enqueue("qa", vec![i]).await.unwrap();
             q.enqueue("qb", vec![i]).await.unwrap();
             expected.push(id);
             let lease = Duration::from_secs(30);
             q.claim("qa", lease).await.unwrap().unwrap();
+            clock.advance(Duration::from_millis(1));
             q.claim("qb", lease).await.unwrap().unwrap();
+            clock.advance(Duration::from_millis(1));
         }
 
         let mut ids = Vec::new();
@@ -8081,7 +8497,7 @@ mod tests {
         }
         let lease = Duration::from_secs(30);
         while let Some(job) = q.claim("work", lease).await.unwrap() {
-            q.dead_letter(job, "failed").await.unwrap();
+            q.dead_letter(&job, "failed").await.unwrap();
         }
 
         let via_dead_jobs: Vec<_> = q
@@ -8166,9 +8582,9 @@ mod tests {
         let lease = Duration::from_secs(30);
 
         let job = q.claim("work", lease).await.unwrap().unwrap();
-        q.nack(job, "timeout").await.unwrap();
+        q.nack(&job, "timeout").await.unwrap();
         let job = q.claim("work", lease).await.unwrap().unwrap();
-        q.nack(job, "connection reset").await.unwrap();
+        q.nack(&job, "connection reset").await.unwrap();
         let job = q.claim("work", lease).await.unwrap().unwrap();
         q.ack(&job).await.unwrap();
 
@@ -8195,7 +8611,7 @@ mod tests {
         let lease = Duration::from_secs(30);
 
         let job = q.claim("work", lease).await.unwrap().unwrap();
-        q.nack(job, "failed").await.unwrap();
+        q.nack(&job, "failed").await.unwrap();
         assert_eq!(q.attempt_history(&id).await.unwrap().len(), 1);
 
         let job = q.claim("work", lease).await.unwrap().unwrap();
@@ -8223,7 +8639,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        q.nack(job, "failed").await.unwrap();
+        q.nack(&job, "failed").await.unwrap();
         assert_eq!(
             q.get_job(&id).await.unwrap().unwrap().status,
             JobStatus::Dead
@@ -8245,12 +8661,12 @@ mod tests {
         let lease = Duration::from_secs(30);
 
         let job = q.claim("work", lease).await.unwrap().unwrap();
-        q.dead_letter(job, "unroutable").await.unwrap();
+        q.dead_letter(&job, "unroutable").await.unwrap();
 
         let dead = q.get_job(&id).await.unwrap().unwrap();
         q.requeue_dead_job(dead).await.unwrap();
         let job = q.claim("work", lease).await.unwrap().unwrap();
-        q.dead_letter(job, "still unroutable").await.unwrap();
+        q.dead_letter(&job, "still unroutable").await.unwrap();
 
         let history = q.attempt_history(&id).await.unwrap();
         let outcomes: Vec<_> = history.iter().map(|a| a.outcome).collect();
@@ -8317,7 +8733,7 @@ mod tests {
             .unwrap();
         // Default backoff is non-zero, so the nacked job waits in
         // `Scheduled` with one history entry.
-        q.nack(job, "failed").await.unwrap();
+        q.nack(&job, "failed").await.unwrap();
         assert_eq!(q.attempt_history(&id).await.unwrap().len(), 1);
 
         assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Removed);
@@ -8349,7 +8765,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        q.dead_letter(job, "failed").await.unwrap();
+        q.dead_letter(&job, "failed").await.unwrap();
         assert_eq!(q.attempt_history(&id).await.unwrap().len(), 1);
 
         clock.advance(retention + Duration::from_millis(10));
@@ -8392,6 +8808,180 @@ mod tests {
 
         assert!(q.get_job(&id).await.unwrap().is_none());
         assert!(q.attempt_history(&id).await.unwrap().is_empty());
+        q.close().await.unwrap();
+    }
+
+    // Every claimed record must hold a registry entry; a record
+    // without one is invisible to the reaper until the next open.
+    async fn assert_every_claim_has_a_lease_entry(q: &Queue) {
+        let mut iter =
+            q.db.scan_prefix(tag_prefix(KeyTag::Claimed), ..)
+                .await
+                .unwrap();
+        let mut claims = 0;
+        while let Some(kv) = iter.next().await.unwrap() {
+            let job: JobRecord = rmp_serde::from_slice(&kv.value).unwrap();
+            assert!(
+                q.lease_registry.current(&job.queue, &job.id).is_some(),
+                "no lease entry for {}/{}",
+                job.queue,
+                job.id
+            );
+            claims += 1;
+        }
+        assert!(claims > 0, "no claims to check");
+    }
+
+    #[tokio::test]
+    async fn every_live_claim_has_a_lease_entry() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        for i in 0..3u8 {
+            q.enqueue("work", vec![i]).await.unwrap();
+        }
+        let claims = q
+            .claim_batch("work", 3, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_every_claim_has_a_lease_entry(&q).await;
+
+        let renewed = q.renew_lease(&claims[0], Duration::from_secs(90)).unwrap();
+        assert_every_claim_has_a_lease_entry(&q).await;
+        assert!(q.lease_registry.contains("work", &claims[0].id, renewed));
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unreapable_job_does_not_block_the_leases_behind_it() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        let poison = q.enqueue("work", b"a".to_vec()).await.unwrap();
+        let healthy = q.enqueue("work", b"b".to_vec()).await.unwrap();
+        let claims = q
+            .claim_batch("work", 2, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 2);
+
+        // The poisoned record sorts first, both jobs sharing an expiry.
+        q.db.put(claimed_key("work", &poison), b"not messagepack")
+            .await
+            .unwrap();
+
+        clock.advance(Duration::from_secs(31));
+        q.reap_now().await.unwrap();
+
+        assert_eq!(
+            q.get_job(&healthy).await.unwrap().unwrap().status,
+            JobStatus::Pending
+        );
+        // The poisoned job's entry is kept for a later tick; the
+        // healthy job's was removed by its requeue.
+        assert_eq!(q.lease_registry.len(), 1);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_claim_held_at_close_is_requeued_at_open() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = || OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", opts())
+            .await
+            .unwrap();
+        let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let claim = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        // Drop the claim without settling it, as a crashed worker would.
+        drop(claim);
+        q.close().await.unwrap();
+
+        // A claim present at open belongs to a process that no longer
+        // holds the store, so it is requeued immediately, before its
+        // lease expires.
+        let q = Queue::open_with_options(store, "test", opts())
+            .await
+            .unwrap();
+        let job = q.get_job(&id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Pending);
+        let stats = q.stats("work").await.unwrap();
+        assert_eq!(stats.pending, 1);
+        assert_eq!(stats.claimed, 0);
+        let history = q.attempt_history(&id).await.unwrap();
+        assert_eq!(history.last().unwrap().outcome, AttemptOutcome::Interrupted);
+
+        // The requeued job is claimable at once: its pending insert is
+        // recorded against the restored clean-close bound. The next
+        // attempt is consumed by the re-claim.
+        let reclaim = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reclaim.id, id);
+        assert_eq!(reclaim.attempts, 2);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_claim_out_of_attempts_is_dead_lettered_at_open() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = || OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", opts())
+            .await
+            .unwrap();
+        let id = q
+            .enqueue_with(
+                "work",
+                b"payload".to_vec(),
+                EnqueueOptions {
+                    max_attempts: Some(1),
+                    ..EnqueueOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let claim = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(claim);
+        q.close().await.unwrap();
+
+        let q = Queue::open_with_options(store, "test", opts())
+            .await
+            .unwrap();
+        let job = q.get_job(&id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Dead);
+        let stats = q.stats("work").await.unwrap();
+        assert_eq!(stats.dead, 1);
+        assert_eq!(stats.claimed, 0);
         q.close().await.unwrap();
     }
 }

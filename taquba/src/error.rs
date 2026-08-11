@@ -25,16 +25,18 @@ pub enum Error {
     JobNotFound(String),
 
     /// An operation was issued against a job in the wrong state; for example,
-    /// `ack`-ing a record that is missing its `lease_expires_at`, or
-    /// `requeue_dead_job` on a record that is no longer in the dead state.
+    /// `requeue_dead_job` on a record that is not in the dead state.
+    /// Settlement cannot report this: it takes a `Claim`, so a record
+    /// read through `get_job` or `list_jobs` cannot be settled at all.
     #[error("job is not in the expected state")]
     InvalidState,
 
     /// A settlement or lease operation found no claim under the record it
-    /// was given: the lease expired and the reaper requeued the job, or
-    /// the record is a stale copy from before a lease renewal rotated the
-    /// claimed key. Retrying with the same record cannot succeed; a
-    /// redelivered attempt settles the job instead.
+    /// was given: the lease expired and the reaper requeued the job, or the
+    /// job was settled already. Retrying with the same record cannot
+    /// succeed; a redelivered attempt settles the job instead. A record
+    /// taken before a lease renewal is not stale, because the renewal
+    /// leaves the claim token unchanged.
     #[error("job claim is no longer held")]
     ClaimLost,
 

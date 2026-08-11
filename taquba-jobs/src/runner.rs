@@ -9,8 +9,8 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use taquba::object_store::ObjectStore;
 use taquba::{
-    Clock, EnqueueOptions, EnqueueResult, JobRecord, PermanentFailure, Queue, Worker, WorkerError,
-    run_worker_concurrent,
+    Clock, EnqueueOptions, EnqueueResult, JobRecord, LeaseHandle, PermanentFailure, Queue, Worker,
+    WorkerError, run_worker_concurrent,
 };
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -452,7 +452,11 @@ struct Dispatcher {
 }
 
 impl Worker for Dispatcher {
-    async fn process(&self, job: &JobRecord) -> std::result::Result<(), WorkerError> {
+    async fn process(
+        &self,
+        job: &JobRecord,
+        _lease: &LeaseHandle,
+    ) -> std::result::Result<(), WorkerError> {
         let job_type = job.headers.get(JOB_TYPE_HEADER).ok_or_else(|| {
             WorkerError::from(PermanentFailure::new(format!(
                 "job {} is missing the `{JOB_TYPE_HEADER}` header",

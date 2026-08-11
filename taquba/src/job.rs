@@ -11,9 +11,9 @@ use tokio_util::sync::CancellationToken;
 /// Mostly read-only from the caller's perspective; fields are mutated by
 /// Taquba as the job moves through its lifecycle (see [`JobStatus`]).
 ///
-/// All timestamp fields (`enqueued_at`, `claimed_at`, `lease_expires_at`,
-/// `run_at`, `completed_at`, `failed_at`) are wall-clock milliseconds since
-/// the UNIX epoch.
+/// All timestamp fields (`enqueued_at`, `claimed_at`, `run_at`,
+/// `completed_at`, `failed_at`) are wall-clock milliseconds since the
+/// UNIX epoch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobRecord {
     /// Unique [ULID](https://github.com/ulid/spec) assigned at enqueue time.
@@ -58,9 +58,6 @@ pub struct JobRecord {
     /// When the most recent claim happened, if the job has ever been claimed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimed_at: Option<u64>,
-    /// When the current lease expires. `Some` only while `status == Claimed`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lease_expires_at: Option<u64>,
     /// Earliest time at which a scheduled job becomes claimable. `Some` only
     /// while `status == Scheduled`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,6 +132,85 @@ pub struct JobRecord {
     pub cancel_token: Option<CancellationToken>,
 }
 
+/// A held claim on a job: the record as it was delivered, plus the token
+/// identifying this delivery.
+///
+/// Produced only by the `Queue::claim*` calls, and required by
+/// [`Queue::ack`](crate::Queue::ack),
+/// [`Queue::ack_with`](crate::Queue::ack_with),
+/// [`Queue::nack`](crate::Queue::nack),
+/// [`Queue::dead_letter`](crate::Queue::dead_letter) and
+/// [`Queue::renew_lease`](crate::Queue::renew_lease). A [`JobRecord`]
+/// read through [`Queue::get_job`](crate::Queue::get_job) or
+/// [`Queue::list_jobs`](crate::Queue::list_jobs) therefore cannot settle
+/// a delivery the caller does not hold.
+///
+/// The token is unique per claim but not ordered, so it identifies a
+/// delivery without ranking it. It fences settlement against the queue's
+/// own state and is deliberately not exposed: it would not serve as a
+/// fencing token against an external system, which needs monotonicity to
+/// reject a stale writer.
+///
+/// Dereferences to the claimed [`JobRecord`], so a caller reads
+/// `claim.payload` and `claim.id` directly.
+///
+/// A record read through any other path cannot be settled, and that is
+/// enforced at compile time rather than reported at runtime:
+///
+/// ```compile_fail
+/// # use std::sync::Arc;
+/// # use taquba::{JobStatus, Queue, object_store::memory::InMemory};
+/// # async fn run() -> taquba::Result<()> {
+/// let q = Queue::open(Arc::new(InMemory::new()), "demo").await?;
+/// let page = q.list_jobs("work", JobStatus::Claimed, None, 10).await?;
+/// let listed = &page.jobs[0];
+/// q.ack(listed).await?; // expected &Claim, found &JobRecord
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Not [`Clone`]: a claim is the sole handle able to settle its
+/// delivery. The record itself is reachable through [`Claim::job`] and
+/// [`Claim::into_job`].
+#[derive(Debug)]
+pub struct Claim {
+    job: JobRecord,
+    token: u64,
+}
+
+impl Claim {
+    pub(crate) fn new(job: JobRecord, token: u64) -> Self {
+        Claim { job, token }
+    }
+
+    pub(crate) fn token(&self) -> u64 {
+        self.token
+    }
+
+    pub(crate) fn job_mut(&mut self) -> &mut JobRecord {
+        &mut self.job
+    }
+
+    /// The claimed job.
+    pub fn job(&self) -> &JobRecord {
+        &self.job
+    }
+
+    /// Consume the claim and return the record, discarding the token.
+    /// The record can no longer settle the delivery.
+    pub fn into_job(self) -> JobRecord {
+        self.job
+    }
+}
+
+impl std::ops::Deref for Claim {
+    type Target = JobRecord;
+
+    fn deref(&self) -> &JobRecord {
+        &self.job
+    }
+}
+
 impl JobRecord {
     /// Construct a fresh record in the pending state with every other
     /// field at its initial value.
@@ -157,7 +233,6 @@ impl JobRecord {
             max_attempts,
             enqueued_at,
             claimed_at: None,
-            lease_expires_at: None,
             run_at: None,
             woken_at: None,
             wake_payload: None,
@@ -204,7 +279,6 @@ impl JobRecord {
             max_attempts: self.max_attempts,
             enqueued_at: self.enqueued_at,
             claimed_at: self.claimed_at,
-            lease_expires_at: self.lease_expires_at,
             run_at: self.run_at,
             woken_at: self.woken_at,
             wake_payload: self.wake_payload.clone(),

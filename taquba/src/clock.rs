@@ -1,7 +1,7 @@
 //! Time source for taquba.
 //!
 //! Every state transition that records a timestamp (`enqueued_at`,
-//! `completed_at`, `failed_at`, `lease_expires_at`) and every comparison
+//! `completed_at`, `failed_at`, the lease expiry) and every comparison
 //! against a stored timestamp (retention cutoffs, scheduled-job
 //! promotion) reads the current time through a [`Clock`]. Production
 //! callers leave [`OpenOptions::clock`](crate::OpenOptions::clock) at

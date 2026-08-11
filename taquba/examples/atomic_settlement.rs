@@ -29,8 +29,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use taquba::{
-    AckEffects, EnqueueOptions, EnqueueRequest, EnqueueResult, JobRecord, Queue, Worker,
-    WorkerError, object_store::memory::InMemory, run_worker,
+    AckEffects, EnqueueOptions, EnqueueRequest, EnqueueResult, JobRecord, LeaseHandle, Queue,
+    Worker, WorkerError, object_store::memory::InMemory, run_worker,
 };
 
 const ORDERS_QUEUE: &str = "orders";
@@ -45,7 +45,11 @@ fn status_key(order_id: &str) -> Vec<u8> {
 struct OrderWorker;
 
 impl Worker for OrderWorker {
-    async fn process_with_effects(&self, job: &JobRecord) -> Result<AckEffects, WorkerError> {
+    async fn process_with_effects(
+        &self,
+        job: &JobRecord,
+        _lease: &LeaseHandle,
+    ) -> Result<AckEffects, WorkerError> {
         let order_id = std::str::from_utf8(&job.payload)?.to_string();
         println!("[orders]        processing order {order_id}");
 
@@ -69,7 +73,11 @@ impl Worker for OrderWorker {
 struct ConfirmationWorker;
 
 impl Worker for ConfirmationWorker {
-    async fn process_with_effects(&self, job: &JobRecord) -> Result<AckEffects, WorkerError> {
+    async fn process_with_effects(
+        &self,
+        job: &JobRecord,
+        _lease: &LeaseHandle,
+    ) -> Result<AckEffects, WorkerError> {
         let order_id = std::str::from_utf8(&job.payload)?.to_string();
         println!("[confirmations] confirming order {order_id}");
 

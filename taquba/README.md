@@ -162,12 +162,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use taquba::object_store::memory::InMemory;
-use taquba::{JobRecord, Queue, Worker, WorkerError, run_worker};
+use taquba::{JobRecord, LeaseHandle, Queue, Worker, WorkerError, run_worker};
 
 struct EmailWorker;
 
 impl Worker for EmailWorker {
-    async fn process(&self, job: &JobRecord) -> Result<(), WorkerError> {
+    async fn process(&self, job: &JobRecord, _lease: &LeaseHandle) -> Result<(), WorkerError> {
         let to = std::str::from_utf8(&job.payload)?;
         send_email(to).await
     }
@@ -209,7 +209,17 @@ including retries and dead-letter inspection.
 Settlement failures do not stop the loop: when a job outlives its lease
 and the reaper requeues it, the late acknowledgement fails with
 `ClaimLost`, the loop logs it and continues, and the redelivered attempt
-settles the job instead. Errors on the claim path still stop the loop.
+settles the job instead. Errors on the claim path still stop the loop. A
+long-running `Worker::process` can avoid the requeue by extending its own
+lease through the `LeaseHandle` it receives: call
+`LeaseHandle::ensure_at_least` at progress points, or once with a slow
+call's timeout before issuing it. The claim stays with the loop, which
+settles the job when `process` returns. See
+[`examples/long_running.rs`](examples/long_running.rs) for both patterns.
+
+Opening a queue re-queues every job left claimed by a previous process:
+crash recovery happens at open, and lease expiry detects a delivery that
+stops progressing while the process lives.
 
 A worker can implement `Worker::process_with_effects` instead of
 `Worker::process` to return `AckEffects`: follow-up enqueues and caller KV

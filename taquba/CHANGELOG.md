@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `LeaseHandle`: the lease capability passed to `Worker::process`.
+  `LeaseHandle::ensure_at_least(remaining)` extends the lease when it
+  would end sooner than `remaining` from now (plus an internal
+  settlement margin), never shortens it, and fails with
+  `Error::ClaimLost` once the claim has ended. `LeaseHandle::detached`
+  builds a no-op handle so worker types stay constructible in unit
+  tests.
+- `Queue::lease_expiry`: the current lease expiry of a claimed job, read
+  synchronously from the in-memory lease state. Returns `None` when this
+  process holds no live lease for the job.
+
+### Changed
+
+- **Breaking (on-disk):** a claimed job's record now lives under a
+  `Claimed` key that is stable for the life of the claim, and the lease
+  itself (current expiry and claim token) is in-memory process state
+  rather than stored. A lease renewal is a synchronous memory operation
+  with no durable write. Drain a store of claimed jobs before upgrading:
+  jobs left claimed under the old layout are not migrated.
+- **Breaking (behaviour):** every claimed job found when the queue is
+  opened is re-queued immediately (or dead-lettered if out of attempts),
+  rather than waiting out its recorded lease: a claim present at open
+  belongs to a process that no longer holds the store. If that process
+  is in fact still running (a fenced writer, for example), its side
+  effects can overlap the requeued job's as soon as the store opens.
+  The requeue appends the new `AttemptOutcome::Interrupted` history
+  entry; the next claim consumes an attempt as usual, so `max_attempts`
+  still bounds a crash-looping job.
+- **Breaking (source):** `Queue::renew_lease` is now synchronous (no
+  longer `async`), since renewal writes nothing durable.
+- **Breaking (source):** the `Queue::claim*` calls return a new `Claim`
+  type instead of `JobRecord`, and `Queue::ack`, `Queue::ack_with`,
+  `Queue::nack`, `Queue::dead_letter` and `Queue::renew_lease` take one by
+  shared reference. `Claim` dereferences to the claimed record, so
+  `claim.payload` and `claim.id` read as before; `Claim::job` borrows the
+  record and `Claim::into_job` takes it by value. A claim survives a lease
+  renewal and settles afterwards; a claim held across a reaper requeue is
+  still rejected with `Error::ClaimLost`. Inside a `Worker`, renewal goes
+  through the `LeaseHandle` instead; `Queue::renew_lease` serves callers
+  that call `claim`/`claim_batch` directly.
+- **Breaking (source):** `Worker::process` and `Worker::process_with_effects`
+  take `&JobRecord` plus `&LeaseHandle`. The claim never reaches user
+  code: the worker loop keeps it and settles the job when `process`
+  returns, and the handle extends the lease without being able to
+  settle, so a handler cannot settle its own job mid-execution even if
+  it holds the queue.
+- `Queue::get_job` and `Queue::list_jobs` return `JobRecord`, which the
+  settlement calls no longer accept, so settling a record without holding
+  its claim is a compile error rather than `Error::InvalidState` at run
+  time.
+- **`Queue::renew_lease` returns the new expiry** (epoch milliseconds)
+  instead of updating the record in place.
+- **Breaking (behaviour):** `Queue::list_jobs` with `JobStatus::Claimed`
+  returns jobs in enqueue order rather than lease-expiry order, and scans
+  only the requested queue. Lease-expiry order is not stable under renewal.
+- **Breaking (source):** `JobRecord::lease_expires_at` is removed; the
+  lease expiry is process state, read with `Queue::lease_expiry`.
+
 ## [0.10.0] - 2026-08-07
 
 ### Added

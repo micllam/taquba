@@ -53,9 +53,9 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use taquba::{
-    CancelOutcome, EnqueueOptions, JobAttempt, JobRecord, JobStatus, OpenOptions, PermanentFailure,
-    Queue, QueueConfig, QueueStats, Worker, WorkerError, object_store::memory::InMemory,
-    run_worker,
+    CancelOutcome, EnqueueOptions, JobAttempt, JobRecord, JobStatus, LeaseHandle, OpenOptions,
+    PermanentFailure, Queue, QueueConfig, QueueStats, Worker, WorkerError,
+    object_store::memory::InMemory, run_worker,
 };
 
 /// Admin-facing view of a [`JobRecord`]: serde renders the raw-byte
@@ -90,14 +90,16 @@ struct JobView {
     payload_preview: String,
 }
 
-impl From<JobRecord> for JobView {
-    fn from(job: JobRecord) -> Self {
+impl JobView {
+    fn build(q: &Queue, job: JobRecord) -> Self {
         const PREVIEW_MAX: usize = 128;
         let cut = job.payload.len().min(PREVIEW_MAX);
         let mut payload_preview = String::from_utf8_lossy(&job.payload[..cut]).into_owned();
         if job.payload.len() > PREVIEW_MAX {
             payload_preview.push('…');
         }
+        // `Some` only for a job claimed by this process.
+        let lease_expires_at = q.lease_expiry(&job.queue, &job.id);
         Self {
             id: job.id,
             queue: job.queue,
@@ -107,7 +109,7 @@ impl From<JobRecord> for JobView {
             priority: job.priority,
             enqueued_at: job.enqueued_at,
             claimed_at: job.claimed_at,
-            lease_expires_at: job.lease_expires_at,
+            lease_expires_at,
             run_at: job.run_at,
             completed_at: job.completed_at,
             failed_at: job.failed_at,
@@ -192,7 +194,11 @@ async fn jobs_page(
     let page = q
         .list_jobs(&queue, status, cursor.as_deref(), params.limit)
         .await?;
-    let views: Vec<JobView> = page.jobs.into_iter().map(JobView::from).collect();
+    let views: Vec<JobView> = page
+        .jobs
+        .into_iter()
+        .map(|job| JobView::build(&q, job))
+        .collect();
     Ok(Json(json!({
         "jobs": views,
         "next_cursor": page.next_cursor.map(|c| hex_encode(&c)),
@@ -239,7 +245,10 @@ async fn dead_page(
         .await?;
     // A full page may continue; a short page is the end of the set.
     let next_after = (jobs.len() == params.limit).then(|| jobs.last().map(|j| j.id.clone()));
-    let views: Vec<JobView> = jobs.into_iter().map(JobView::from).collect();
+    let views: Vec<JobView> = jobs
+        .into_iter()
+        .map(|job| JobView::build(&q, job))
+        .collect();
     Ok(Json(json!({ "jobs": views, "next_after": next_after })))
 }
 
@@ -248,7 +257,7 @@ async fn job(
     Path(id): Path<String>,
 ) -> Result<Json<JobView>, ApiError> {
     match q.get_job(&id).await? {
-        Some(job) => Ok(Json(job.into())),
+        Some(job) => Ok(Json(JobView::build(&q, job))),
         None => Err(ApiError::NotFound(format!("job not found: {id}"))),
     }
 }
@@ -289,7 +298,7 @@ async fn requeue_job(
 struct EmailWorker;
 
 impl Worker for EmailWorker {
-    async fn process(&self, job: &JobRecord) -> Result<(), WorkerError> {
+    async fn process(&self, job: &JobRecord, _lease: &LeaseHandle) -> Result<(), WorkerError> {
         if job.payload.starts_with(b"boom") {
             return Err(PermanentFailure::new("simulated permanent SMTP rejection").into());
         }

@@ -8,14 +8,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use taquba::{JobRecord, Queue, Worker, WorkerError, object_store::memory::InMemory, run_worker};
+use taquba::{
+    JobRecord, LeaseHandle, Queue, Worker, WorkerError, object_store::memory::InMemory, run_worker,
+};
 use taquba_cron::CronScheduler;
 use tokio::sync::oneshot;
 
 struct PrintWorker;
 
 impl Worker for PrintWorker {
-    async fn process(&self, job: &JobRecord) -> Result<(), WorkerError> {
+    async fn process(&self, job: &JobRecord, _lease: &LeaseHandle) -> Result<(), WorkerError> {
         let payload = std::str::from_utf8(&job.payload).unwrap_or("<binary>");
         let now = chrono::Utc::now().format("%H:%M:%S UTC");
         println!(

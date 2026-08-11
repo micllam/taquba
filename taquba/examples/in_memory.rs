@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .claim("tasks", Duration::from_secs(30))
         .await?
         .expect("queue not empty");
-    q.nack(job_b, "something went wrong").await?;
+    q.nack(&job_b, "something went wrong").await?;
     println!("nacked task B - it will be retried");
 
     // task B is back at the front; claim it again
@@ -83,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?
         .expect("task C pending");
     // max_attempts=1 so this nack goes straight to dead-letter
-    q.nack(job_c, "unrecoverable failure").await?;
+    q.nack(&job_c, "unrecoverable failure").await?;
 
     let dead = q.dead_jobs("tasks", None, 100).await?;
     assert_eq!(dead.len(), 1);

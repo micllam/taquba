@@ -45,8 +45,8 @@ pub struct JobAttempt {
     /// How the attempt ended.
     pub outcome: AttemptOutcome,
     /// The error reported for a failed attempt. `None` for
-    /// [`AttemptOutcome::Completed`], [`AttemptOutcome::LeaseExpired`]
-    /// and [`AttemptOutcome::Requeued`].
+    /// [`AttemptOutcome::Completed`], [`AttemptOutcome::LeaseExpired`],
+    /// [`AttemptOutcome::Interrupted`] and [`AttemptOutcome::Requeued`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -61,12 +61,16 @@ pub enum AttemptOutcome {
     Retried,
     /// The attempt failed terminally: an explicit
     /// [`Queue::dead_letter`](crate::Queue::dead_letter), a
-    /// [`Queue::nack`](crate::Queue::nack) at the attempt limit or a
-    /// lease expiry at the attempt limit.
+    /// [`Queue::nack`](crate::Queue::nack) at the attempt limit or an
+    /// expired or interrupted claim at the attempt limit.
     DeadLettered,
     /// The claim's lease expired and the reaper re-queued the job. The
     /// worker's own outcome for this attempt is unknown.
     LeaseExpired,
+    /// The process holding the claim exited without settling it; the
+    /// job was re-queued when the store was next opened. The worker's
+    /// own outcome for this attempt is unknown.
+    Interrupted,
     /// An operator revived the dead job via
     /// [`Queue::requeue_dead_job`](crate::Queue::requeue_dead_job),
     /// resetting its attempt count.
