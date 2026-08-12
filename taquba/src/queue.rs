@@ -2325,6 +2325,7 @@ impl Queue {
         {
             return Err(Error::ClaimLost);
         }
+        crate::obs::renewed(&job.queue);
         debug!(queue = %job.queue, job_id = %job.id, new_expiry, "lease renewed");
         Ok(new_expiry)
     }

@@ -19,6 +19,7 @@
 //! - `taquba_jobs_nacked_total{queue}`: jobs requeued or scheduled after a nack.
 //! - `taquba_jobs_dead_lettered_total{queue}`: jobs moved to the dead set.
 //! - `taquba_jobs_reaped_total{queue}`: expired claims requeued by the reaper.
+//! - `taquba_lease_renewals_total{queue}`: lease renewals on claimed jobs.
 //! - `taquba_enqueue_duration_seconds{queue}` / `taquba_claim_duration_seconds{queue}`
 //!   / `taquba_ack_duration_seconds{queue}`: per-operation latency histograms.
 //! - `taquba_pending_jobs{queue}` / `taquba_claimed_jobs{queue}`: current
@@ -63,6 +64,10 @@ mod imp {
         metrics::describe_counter!(
             "taquba_jobs_reaped_total",
             "Expired claims requeued by the reaper"
+        );
+        metrics::describe_counter!(
+            "taquba_lease_renewals_total",
+            "Lease renewals on claimed jobs"
         );
         metrics::describe_histogram!(
             "taquba_enqueue_duration_seconds",
@@ -113,6 +118,10 @@ mod imp {
 
     pub(crate) fn reaped(queue: &str, n: u64) {
         metrics::counter!("taquba_jobs_reaped_total", "queue" => queue.to_owned()).increment(n);
+    }
+
+    pub(crate) fn renewed(queue: &str) {
+        metrics::counter!("taquba_lease_renewals_total", "queue" => queue.to_owned()).increment(1);
     }
 
     pub(crate) fn set_depth(queue: &str, pending: i64, claimed: i64) {
@@ -258,6 +267,8 @@ mod imp {
     pub(crate) fn dead_lettered(_queue: &str) {}
     #[inline]
     pub(crate) fn reaped(_queue: &str, _n: u64) {}
+    #[inline]
+    pub(crate) fn renewed(_queue: &str) {}
 }
 
 pub(crate) use imp::*;
@@ -278,6 +289,7 @@ mod tests {
             super::nacked("q");
             super::dead_lettered("q");
             super::reaped("q", 3);
+            super::renewed("q");
         });
 
         let emitted: Vec<String> = snapshotter
@@ -294,6 +306,7 @@ mod tests {
             "taquba_jobs_nacked_total",
             "taquba_jobs_dead_lettered_total",
             "taquba_jobs_reaped_total",
+            "taquba_lease_renewals_total",
             "taquba_enqueue_duration_seconds",
             "taquba_claim_duration_seconds",
             "taquba_ack_duration_seconds",

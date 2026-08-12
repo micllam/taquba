@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requested cancellation of the job, leaving the lease to expire. The
   claim is still held and settleable, so a delivery that observes its
   cancellation token settles as usual.
+- Metrics: the new `taquba_lease_renewals_total{queue}` counter counts
+  lease renewals, incremented by `Queue::renew_lease` and by a
+  `LeaseHandle::ensure_at_least` call that extends the lease (`metrics`
+  feature).
 
 ### Changed
 

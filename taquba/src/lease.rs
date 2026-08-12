@@ -105,6 +105,7 @@ impl LeaseHandle {
         {
             return Err(Error::ClaimLost);
         }
+        crate::obs::renewed(&inner.queue);
         debug!(queue = %inner.queue, job_id = %inner.id, new_expiry = needed, "lease extended");
         Ok(())
     }
