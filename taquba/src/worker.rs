@@ -132,7 +132,10 @@ pub trait Worker: Send + Sync {
 /// Shutdown is only honoured at safe points: between jobs and while the queue
 /// is idle. An in-flight `process` call is always allowed to finish so the
 /// claim does not get abandoned to the reaper (which would waste a retry on
-/// every graceful restart).
+/// every graceful restart). The drain has no internal bound; the bound is
+/// the process supervisor's kill timeout. A killed process is recovered at the
+/// next open, where every claimed job is requeued immediately and its
+/// next claim consumes one attempt.
 ///
 /// `poll_interval` is the maximum time the loop will wait on an empty queue
 /// before re-checking. In-process inserts wake the loop immediately via the
@@ -199,7 +202,8 @@ where
 /// sized to the free capacity via [`Queue::claim_batch`], so a backlog costs
 /// one claim transaction per batch instead of per job; each job is still
 /// processed and acked individually. On shutdown the loop stops claiming new
-/// work and waits for the in-flight set to drain before returning.
+/// work and waits for the in-flight set to drain before returning, without
+/// an internal bound; see [`run_worker`] on recovery from a supervisor kill.
 ///
 /// Claim errors propagate and terminate the loop. Settlement failures and
 /// panics inside spawned tasks are logged but do not terminate the loop;

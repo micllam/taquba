@@ -127,7 +127,8 @@
 //! Pass any future as the shutdown signal: `tokio::signal::ctrl_c()`, a
 //! oneshot, etc. Shutdown is honoured at safe points: between jobs and
 //! during idle waits. In-flight jobs always finish, so leases are never
-//! abandoned to the reaper.
+//! abandoned to the reaper; the drain has no internal bound, so the
+//! process supervisor's kill timeout bounds a restart.
 //!
 //! Settlement failures do not stop the loop: when a job outlives its
 //! lease and the reaper requeues it, the late acknowledgement fails
@@ -268,7 +269,9 @@
 //!
 //! Opening a queue also re-queues every job left claimed by a previous
 //! process: crash recovery happens at open, and lease expiry detects a
-//! delivery that stops progressing while the process lives.
+//! delivery that stops progressing while the process lives. A job
+//! interrupted this way consumes one attempt at its next claim, so
+//! `max_attempts` also counts hard restarts of a long job.
 //!
 //! Call [`Queue::close`] for a clean shutdown; it stops both tasks and
 //! flushes the underlying SlateDB instance.

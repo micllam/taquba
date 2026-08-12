@@ -237,7 +237,9 @@ pub(crate) fn backoff_delay(attempts: u32, base: Duration, max: Duration) -> Dur
 /// ```
 #[derive(Debug, Clone)]
 pub struct QueueConfig {
-    /// Maximum delivery attempts before a job is dead-lettered.
+    /// Maximum delivery attempts before a job is dead-lettered. Attempts
+    /// count claims: a job interrupted by a process restart is requeued
+    /// at the next open, and its next claim consumes an attempt.
     pub max_attempts: u32,
     /// How long a claimed job's lease lasts. Used by [`Queue::claim_next`].
     pub lease_duration: Duration,

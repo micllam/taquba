@@ -202,8 +202,9 @@ async fn main() -> taquba::Result<()> {
 Pass any future as the shutdown signal: `tokio::signal::ctrl_c()`,
 a oneshot, etc. Shutdown is honoured at safe points: between jobs and during
 idle waits. In-flight jobs always finish, so leases are never abandoned to the
-reaper. See [`examples/worker.rs`](examples/worker.rs) for a full setup
-including retries and dead-letter inspection.
+reaper; the drain has no internal bound, so the process supervisor's kill
+timeout bounds a restart. See [`examples/worker.rs`](examples/worker.rs) for a full
+setup including retries and dead-letter inspection.
 
 Settlement failures do not stop the loop: when a job outlives its lease
 and the reaper requeues it, the late acknowledgement fails with
@@ -218,7 +219,9 @@ settles the job when `process` returns. See
 
 Opening a queue re-queues every job left claimed by a previous process:
 crash recovery happens at open, and lease expiry detects a delivery that
-stops progressing while the process lives.
+stops progressing while the process lives. A job interrupted this way
+consumes one attempt at its next claim, so `max_attempts` also counts
+hard restarts of a long job.
 
 A worker can implement `Worker::process_with_effects` instead of
 `Worker::process` to return `AckEffects`: follow-up enqueues and caller KV
