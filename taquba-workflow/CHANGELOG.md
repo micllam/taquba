@@ -7,8 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-12
+
 ### Changed
 
+- Raised the minimum `taquba` requirement to 0.11.
 - **Breaking:** `Step` gains the public field `lease`, the delivery's
   `taquba::LeaseHandle`. A long-running runner calls `ensure_at_least`
   at progress points (or once, with a slow call's timeout, before

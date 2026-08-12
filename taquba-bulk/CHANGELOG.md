@@ -7,12 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-12
+
 ### Added
 
 - `BulkCtx::lease`: the delivery's `taquba::LeaseHandle`. A
   long-running pipeline calls `ensure_at_least` at progress points (or
   once, with a slow call's timeout, before issuing it) so the item is
   not re-queued while it still runs.
+
+### Changed
+
+- Raised the minimum `taquba` requirement to 0.11 and `taquba-workflow`
+  to 0.9.
 
 ## [0.4.0] - 2026-08-07
 

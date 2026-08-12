@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-12
+
 ### Added
 
 - `DEFAULT_TIMEOUT` (30s) and `WebhookWorker::with_default_timeout`: the
@@ -15,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Raised the minimum `taquba` requirement to 0.11.
 - **Breaking (behaviour):** every delivery is bounded. A job without a
   `webhook.timeout_ms` header previously ran with no request timeout;
   it now uses the worker's default. The per-request timeout takes
