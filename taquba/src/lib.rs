@@ -14,9 +14,7 @@
 //!
 //! # When Taquba fits
 //!
-//! Database-backed queues excel at jobs attached to an application
-//! database; Taquba is well-suited to work attached to data. Choose
-//! object storage as the backing store when at least one of the
+//! Choose object storage as the backing store when at least one of the
 //! following holds:
 //!
 //! - Payloads are big: payloads above a threshold are offloaded to their

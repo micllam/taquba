@@ -8,14 +8,12 @@
 A durable task queue and durable-execution workflow runtime for Rust with
 **built-in transactional coordination on object storage**, and no stateful
 service to operate. Workflow state lives directly in your object storage;
-every compute node is replaceable. Database-backed queues excel at jobs
-attached to an application database; Taquba is well-suited to work
-attached to data.
+every compute node is replaceable.
 
 Taquba is a workspace of Rust crates that compose into a durable execution
 stack. There is no Postgres, Redis, or broker daemon to run alongside your
-workers. Queue records, workflow memos, lease bookkeeping, and retention all
-live in customer-owned object storage (S3, GCS, Azure Blob, or local disk) via
+workers. Queue records, workflow memos and retention all live in
+customer-owned object storage (S3, GCS, Azure Blob or local disk) via
 [SlateDB](https://github.com/slatedb/slatedb). Workers are stateless and
 interchangeable, making spot / preemptible compute the default deployment
 model.
