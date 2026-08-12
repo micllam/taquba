@@ -19,7 +19,7 @@ use crate::clock::Clock;
 use crate::error::Result;
 use crate::job::JobRecord;
 use crate::keys::pending_prefix;
-use crate::stats::{list_queues, read_stats};
+use crate::read::{list_queues, stats};
 
 pub(crate) struct MetricsSampler {
     pub(crate) db: Arc<Db>,
@@ -52,7 +52,7 @@ impl MetricsSampler {
 async fn sample(db: &Db, clock: &dyn Clock) -> Result<()> {
     let now = clock.now_ms();
     for queue in list_queues(db).await? {
-        let stats = read_stats(db, &queue).await?;
+        let stats = stats(db, &queue).await?;
         crate::obs::set_depth(&queue, stats.pending, stats.claimed);
 
         // The front of the pending prefix is the next job to be claimed; its

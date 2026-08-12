@@ -1,10 +1,10 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use slatedb::{Db, DbTransaction, MergeOperator, MergeOperatorError};
+use slatedb::{DbTransaction, MergeOperator, MergeOperatorError};
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::job::JobStatus;
-use crate::keys::{KeyTag, parse_stats_key, stats_key, tag_prefix};
+use crate::keys::{KeyTag, stats_key};
 
 /// Map a [`JobStatus`] to the on-disk metric name used for its counter.
 pub(crate) fn metric_name(status: JobStatus) -> &'static str {
@@ -132,40 +132,4 @@ pub struct QueueStats {
     /// jobs in retry-backoff between a [`Queue::nack`](crate::Queue::nack)
     /// and the scheduler's next promotion sweep.
     pub scheduled: i64,
-}
-
-/// Distinct queue names, discovered from the stats key space. A queue
-/// appears once it has had at least one job.
-pub(crate) async fn list_queues(db: &Db) -> Result<Vec<String>> {
-    let mut seen = std::collections::HashSet::new();
-    let mut queues = Vec::new();
-    let mut iter = db.scan_prefix(tag_prefix(KeyTag::Stats), ..).await?;
-    while let Some(kv) = iter.next().await? {
-        let Some((queue, _metric)) = parse_stats_key(&kv.key) else {
-            continue;
-        };
-        if seen.insert(queue.clone()) {
-            queues.push(queue);
-        }
-    }
-    Ok(queues)
-}
-
-pub(crate) async fn read_stats(db: &Db, queue: &str) -> Result<QueueStats> {
-    Ok(QueueStats {
-        queue: queue.to_string(),
-        pending: count_for(db, queue, JobStatus::Pending).await?,
-        claimed: count_for(db, queue, JobStatus::Claimed).await?,
-        done: count_for(db, queue, JobStatus::Done).await?,
-        dead: count_for(db, queue, JobStatus::Dead).await?,
-        scheduled: count_for(db, queue, JobStatus::Scheduled).await?,
-    })
-}
-
-async fn count_for(db: &Db, queue: &str, status: JobStatus) -> Result<i64> {
-    let key = stats_key(queue, metric_name(status));
-    match db.get(&key).await? {
-        None => Ok(0),
-        Some(bytes) => read_i64_le(&bytes).map_err(|_| Error::InvalidState),
-    }
 }

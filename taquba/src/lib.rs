@@ -257,6 +257,45 @@
 //! server inside the owning process, mapping these APIs onto JSON
 //! endpoints.
 //!
+//! # Observing from another process
+//!
+//! The single-writer rule constrains only writes. [`QueueReader`]
+//! opens the same store path from any process with bucket credentials
+//! and serves the queue's read-only API: [`QueueReader::stats`],
+//! [`QueueReader::list_queues`], [`QueueReader::list_jobs`],
+//! [`QueueReader::dead_jobs`], [`QueueReader::get_job`],
+//! [`QueueReader::attempt_history`] and the KV reads. Dashboards, CLIs
+//! and health checks observe a live queue without an admin endpoint
+//! inside the worker process.
+//!
+//! A reader is observation only: it takes no writes, offers no lease
+//! view and reads a lagging view of the store. The lag
+//! is bounded by the writer's flush interval plus the reader's
+//! [`ReaderOptions::manifest_poll_interval`], and the reader sees whole
+//! commits or nothing. A job reported `Claimed` means a claim was taken
+//! and no settlement is visible yet; whether the claim is live is state
+//! inside the writer process, which the reader cannot see.
+//!
+//! By default a reader maintains a checkpoint so the objects its view
+//! references are protected from garbage collection. Checkpoint
+//! refreshes are manifest writes, so this mode requires write
+//! credentials to the bucket; it never touches the writer's epoch and
+//! does not fence the writer. [`ReaderMode::FollowLatest`] performs no
+//! object-store writes, for read-only credentials, at the cost of a
+//! read failing when garbage collection removes an object under an
+//! aged view. Two caveats: reader and writer must run the same taquba
+//! minor version, because the layout may change between minors and no
+//! version stamp is stored, and opening a reader against a path no
+//! writer has ever created fails on the missing manifest, an error a
+//! health check racing the first deployment must expect.
+//!
+//! To make job outcomes observable across processes, settle them into
+//! the KV namespace: [`Queue::ack_with`] writes outcome entries
+//! atomically with the settlement (and [`Queue::enqueue_with_kv`] maps
+//! caller identifiers to job ids at submit), and the reader's
+//! [`QueueReader::kv_get`] / [`QueueReader::kv_scan`] serve them from
+//! any process.
+//!
 //! # Background tasks
 //!
 //! [`Queue::open`] spawns two background tokio tasks for the lifetime of the
@@ -313,6 +352,8 @@ mod metrics_sampler;
 mod obs;
 mod payload_store;
 mod queue;
+mod read;
+mod reader;
 mod reaper;
 mod scheduler;
 mod stats;
@@ -333,6 +374,7 @@ pub use queue::{
     EnqueueResult, JobPage, KvPage, MAX_KV_VALUE_SIZE, OpenOptions, PRIORITY_HIGH, PRIORITY_LOW,
     PRIORITY_NORMAL, Queue, QueueConfig, WaitOutcome, WakeOutcome,
 };
+pub use reader::{QueueReader, ReaderMode, ReaderOptions};
 pub use stats::QueueStats;
 pub use worker::{PermanentFailure, Worker, WorkerError, run_worker, run_worker_concurrent};
 

@@ -28,6 +28,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lease renewals, incremented by `Queue::renew_lease` and by a
   `LeaseHandle::ensure_at_least` call that extends the lease (`metrics`
   feature).
+- `QueueReader`: a read-only view of a queue store, openable from a
+  process other than the writer's. Serves the queue's read-only API
+  (`stats`, `list_queues`, `list_jobs`, `dead_jobs`, `get_job`,
+  `attempt_history`, `kv_get`, `kv_scan`) against a view that lags the
+  writer by its flush interval plus the reader's manifest poll
+  interval, observing whole commits or nothing. `ReaderOptions` selects
+  a `ReaderMode`: the default `ManagedCheckpoint` maintains a
+  garbage-collection-protected checkpoint and requires write
+  credentials to the bucket; `FollowLatest` performs no object-store
+  writes but must tolerate reads failing on collected objects. A
+  reader offers no lease view, and `Error::PayloadMissing` through a
+  reader can be transient (see its docs). Reader and writer must run
+  the same taquba minor version.
 
 ### Changed
 

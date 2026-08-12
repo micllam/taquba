@@ -99,9 +99,13 @@ pub enum Error {
     PayloadStore(#[from] slatedb::object_store::Error),
 
     /// An offloaded payload object was absent when a claim or a job
-    /// read tried to fetch it. The record still exists but its payload
-    /// cannot be recovered; this indicates external deletion of the
-    /// payload object.
+    /// read tried to fetch it. On the writing [`crate::Queue`] the
+    /// record still exists but its payload cannot be recovered; this
+    /// indicates external deletion of the payload object. Through a
+    /// [`crate::QueueReader`] the condition can be transient: a job
+    /// removal deletes the payload object after its record, so a
+    /// reader whose lagging view still holds the record can find the
+    /// object gone until the view advances past the removal.
     #[error("offloaded payload missing for job `{id}`")]
     PayloadMissing {
         /// The job whose payload object was absent.

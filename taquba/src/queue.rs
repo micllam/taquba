@@ -15,18 +15,18 @@ use ulid::Ulid;
 use crate::claim_cursor::{ClaimCursor, CursorState, ScanFrom};
 use crate::clock::{Clock, default_clock};
 use crate::error::{Error, Result};
-use crate::history::{AttemptOutcome, JobAttempt, append_attempt, decode_history};
+use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{Claim, JobRecord, JobStatus};
 use crate::keys::{
-    KeyTag, MAX_QUEUE_NAME_LEN, attempt_history_key, claimed_key, claimed_prefix, cursor_key,
-    dead_key, dead_prefix, dedup_index_key, done_key, job_index_key, pending_key, pending_prefix,
-    scheduled_key, tag_prefix, user_scoped_key,
+    KeyTag, MAX_QUEUE_NAME_LEN, attempt_history_key, claimed_key, cursor_key, dead_key,
+    dedup_index_key, done_key, job_index_key, pending_key, pending_prefix, scheduled_key,
+    tag_prefix, user_scoped_key,
 };
 use crate::lease_registry::LeaseRegistry;
 use crate::payload_store::PayloadStore;
 use crate::reaper::{Reaper, reap_expired};
 use crate::scheduler::{Scheduler, promote_due_jobs};
-use crate::stats::{QueueMergeOperator, QueueStats, read_stats, update_stats};
+use crate::stats::{QueueMergeOperator, QueueStats, update_stats};
 use crate::txn::{put_job_record, take_claim};
 
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
@@ -135,7 +135,7 @@ fn validate_kv_value_size(value: &[u8]) -> Result<()> {
 
 /// Validate a queue name against the key encoding's one-byte length
 /// field. Called at every public entry point that accepts a queue name.
-fn validate_queue_name(queue: &str) -> Result<()> {
+pub(crate) fn validate_queue_name(queue: &str) -> Result<()> {
     if queue.len() > MAX_QUEUE_NAME_LEN {
         return Err(Error::InvalidQueueName {
             queue: queue.to_string(),
@@ -889,7 +889,7 @@ impl Queue {
     /// Caller-supplied keys are internally scoped under a reserved
     /// user key tag and cannot collide with Taquba's internal layout.
     pub async fn kv_get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        Ok(self.db.get(user_scoped_key(key)).await?)
+        crate::read::kv_get(self.db.as_ref(), key).await
     }
 
     /// Write a value to the user KV namespace.
@@ -1035,46 +1035,7 @@ impl Queue {
         cursor: Option<&[u8]>,
         limit: usize,
     ) -> Result<KvPage> {
-        let empty = KvPage {
-            entries: Vec::new(),
-            next_cursor: None,
-        };
-        if limit == 0 {
-            return Ok(empty);
-        }
-        let scoped_prefix = user_scoped_key(prefix);
-        let start = match cursor {
-            None => Bound::Unbounded,
-            // A cursor from a different prefix does not identify a
-            // position under this one; nothing follows it here.
-            Some(c) if !c.starts_with(&scoped_prefix) => return Ok(empty),
-            Some(c) => Bound::Excluded(Bytes::copy_from_slice(&c[scoped_prefix.len()..])),
-        };
-
-        let mut page: Vec<(Bytes, Bytes)> = Vec::with_capacity(limit);
-        let mut more = false;
-        let mut iter = self
-            .db
-            .scan_prefix(scoped_prefix, (start, Bound::Unbounded))
-            .await?;
-        while let Some(kv) = iter.next().await? {
-            if page.len() == limit {
-                more = true;
-                break;
-            }
-            page.push((kv.key, kv.value));
-        }
-        let next_cursor = more.then(|| page[page.len() - 1].0.to_vec());
-        // Stored keys carry the one-byte user tag; callers see their own
-        // namespace, so it is stripped here. Cursors keep the stored form.
-        let entries = page
-            .into_iter()
-            .map(|(k, v)| (k[1..].to_vec(), v))
-            .collect();
-        Ok(KvPage {
-            entries,
-            next_cursor,
-        })
+        crate::read::kv_scan(self.db.as_ref(), prefix, cursor, limit).await
     }
 
     /// Resolve [`EnqueueOptions`] against the queue's defaults and build
@@ -1176,10 +1137,7 @@ impl Queue {
     /// Fetch an offloaded payload into `job.payload`. No-op for records
     /// whose payload is inline.
     async fn materialize_payload(&self, job: &mut JobRecord) -> Result<()> {
-        if let Some(ref payload_ref) = job.payload_ref {
-            job.payload = self.payload_store.get(payload_ref, &job.id).await?;
-        }
-        Ok(())
+        crate::read::materialize_payload(&self.payload_store, job).await
     }
 
     /// Fetch the offloaded payloads of `jobs` concurrently, bounding a
@@ -2088,13 +2046,12 @@ impl Queue {
 
     /// Return a snapshot of job counts for the given queue.
     pub async fn stats(&self, queue: &str) -> Result<QueueStats> {
-        validate_queue_name(queue)?;
-        read_stats(&self.db, queue).await
+        crate::read::stats(self.db.as_ref(), queue).await
     }
 
     /// Return the names of all queues that have ever had at least one job.
     pub async fn list_queues(&self) -> Result<Vec<String>> {
-        crate::stats::list_queues(&self.db).await
+        crate::read::list_queues(self.db.as_ref()).await
     }
 
     /// Return a page of dead-letter jobs for the given queue.
@@ -2111,14 +2068,7 @@ impl Queue {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<JobRecord>> {
-        // Dead keys are the queue's dead prefix followed by the job id,
-        // so an id cursor converts to the key cursor of the equivalent
-        // [`Self::list_jobs`] call.
-        let cursor = after.map(|id| dead_key(queue, id));
-        Ok(self
-            .list_jobs(queue, JobStatus::Dead, cursor.as_deref(), limit)
-            .await?
-            .jobs)
+        crate::read::dead_jobs(self.db.as_ref(), &self.payload_store, queue, after, limit).await
     }
 
     /// Return a page of the given queue's jobs in one lifecycle state.
@@ -2151,73 +2101,15 @@ impl Queue {
         cursor: Option<&[u8]>,
         limit: usize,
     ) -> Result<JobPage> {
-        validate_queue_name(queue)?;
-        let empty = JobPage {
-            jobs: Vec::new(),
-            next_cursor: None,
-        };
-        if limit == 0 {
-            return Ok(empty);
-        }
-        // `filter_queue` enables the queue-name filter on each scanned
-        // record and is set only for the key spaces that cover every
-        // queue.
-        let (prefix, filter_queue) = match status {
-            JobStatus::Pending => (pending_prefix(queue), false),
-            JobStatus::Dead => (dead_prefix(queue), false),
-            JobStatus::Claimed => (claimed_prefix(queue), false),
-            JobStatus::Scheduled => (tag_prefix(KeyTag::Scheduled).to_vec(), true),
-            JobStatus::Done => (tag_prefix(KeyTag::Done).to_vec(), true),
-        };
-        let start = match cursor {
-            None => Bound::Unbounded,
-            // A cursor from a different key space does not identify a
-            // position under this prefix; nothing follows it here.
-            Some(c) if !c.starts_with(&prefix) => return Ok(empty),
-            Some(c) => Bound::Excluded(Bytes::copy_from_slice(&c[prefix.len()..])),
-        };
-
-        // Each row includes the key it was scanned at, which is both the
-        // key its record lives under and the position the cursor
-        // resumes from.
-        let mut page: Vec<(Bytes, JobRecord)> = Vec::with_capacity(limit);
-        let mut more = false;
-        let mut iter = self
-            .db
-            .scan_prefix(prefix, (start, Bound::Unbounded))
-            .await?;
-        while let Some(kv) = iter.next().await? {
-            let job: JobRecord = rmp_serde::from_slice(&kv.value)?;
-            if filter_queue && job.queue != queue {
-                continue;
-            }
-            if page.len() == limit {
-                more = true;
-                break;
-            }
-            page.push((kv.key, job));
-        }
-        let next_cursor = more.then(|| page[page.len() - 1].0.to_vec());
-
-        let mut jobs = Vec::with_capacity(page.len());
-        for (record_key, mut job) in page {
-            match self.materialize_payload(&mut job).await {
-                Ok(()) => jobs.push(job),
-                Err(Error::PayloadMissing { id }) => {
-                    // The scan can list a record just before a
-                    // record-removing transaction commits, with the object
-                    // fetch running just after that commit's payload-object
-                    // deletion. Re-check the record: a removed job is
-                    // omitted from the page, not reported as a lost
-                    // payload.
-                    if self.db.get(&record_key).await?.is_some() {
-                        return Err(Error::PayloadMissing { id });
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(JobPage { jobs, next_cursor })
+        crate::read::list_jobs(
+            self.db.as_ref(),
+            &self.payload_store,
+            queue,
+            status,
+            cursor,
+            limit,
+        )
+        .await
     }
 
     /// Return a job's recorded delivery history, in write order.
@@ -2234,10 +2126,7 @@ impl Queue {
     /// queue without retention therefore removes the history rather than
     /// recording the completed attempt.
     pub async fn attempt_history(&self, id: &str) -> Result<Vec<JobAttempt>> {
-        match self.db.get(attempt_history_key(id)).await? {
-            None => Ok(Vec::new()),
-            Some(bytes) => decode_history(&bytes),
-        }
+        crate::read::attempt_history(self.db.as_ref(), id).await
     }
 
     /// Move a dead-letter job back to the pending queue for a fresh attempt.
