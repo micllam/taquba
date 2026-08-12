@@ -752,6 +752,7 @@ impl Queue {
             claim.queue.clone(),
             claim.id.clone(),
             claim.token(),
+            claim.job().cancel_token.clone(),
         )
     }
 
@@ -2302,7 +2303,9 @@ impl Queue {
     /// current value.
     ///
     /// Fails with [`Error::ClaimLost`] once the claim has ended or the
-    /// reaper has begun re-queuing the expired lease.
+    /// reaper has begun re-queuing the expired lease. Fails with
+    /// [`Error::CancelRequested`] once [`Self::cancel`] has been called
+    /// on the job, leaving the lease to expire.
     ///
     /// This method serves callers that call [`Self::claim`] /
     /// [`Self::claim_batch`] directly and hold the [`Claim`]. Inside
@@ -2312,6 +2315,9 @@ impl Queue {
     #[instrument(skip(self, claim), fields(queue = %claim.queue, job_id = %claim.id))]
     pub fn renew_lease(&self, claim: &Claim, extension: Duration) -> Result<u64> {
         let job = claim.job();
+        if job.cancel_token.as_ref().is_some_and(|t| t.is_cancelled()) {
+            return Err(Error::CancelRequested);
+        }
         let new_expiry = self.now_ms() + extension.as_millis() as u64;
         if !self
             .lease_registry
@@ -5669,6 +5675,45 @@ mod tests {
         assert_eq!(fetched.status, JobStatus::Claimed);
         // The claim still holds, so the original handle settles it.
         q.ack(&job).await.unwrap();
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn renewal_is_refused_once_cancellation_is_requested() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let lease = q.lease_handle(&job);
+        lease.ensure_at_least(Duration::from_secs(60)).unwrap();
+
+        assert_eq!(q.cancel(&job.id).await.unwrap(), CancelOutcome::Requested);
+
+        let expiry = q.lease_expiry("work", &job.id);
+        assert!(matches!(
+            q.renew_lease(&job, Duration::from_secs(600)),
+            Err(Error::CancelRequested)
+        ));
+        assert!(matches!(
+            lease.ensure_at_least(Duration::from_secs(600)),
+            Err(Error::CancelRequested)
+        ));
+        assert_eq!(q.lease_expiry("work", &job.id), expiry);
+
+        // The claim is still held, so the delivery settles as usual.
+        q.nack(&job, "cancelled").await.unwrap();
 
         q.close().await.unwrap();
     }

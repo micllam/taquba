@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Queue::lease_expiry`: the current lease expiry of a claimed job, read
   synchronously from the in-memory lease state. Returns `None` when this
   process holds no live lease for the job.
+- `Error::CancelRequested`: `Queue::renew_lease` and
+  `LeaseHandle::ensure_at_least` refuse renewal once `Queue::cancel` has
+  requested cancellation of the job, leaving the lease to expire. The
+  claim is still held and settleable, so a delivery that observes its
+  cancellation token settles as usual.
 
 ### Changed
 

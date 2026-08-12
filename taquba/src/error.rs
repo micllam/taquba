@@ -40,6 +40,13 @@ pub enum Error {
     #[error("job claim is no longer held")]
     ClaimLost,
 
+    /// A lease renewal was refused because cancellation of the job has
+    /// been requested. The claim is still held and settleable; with
+    /// renewal refused, the lease expires unless the delivery settles
+    /// first.
+    #[error("job cancellation has been requested")]
+    CancelRequested,
+
     /// A value passed to [`crate::Queue::enqueue_with_kv`] exceeded the
     /// configured maximum size for the user KV namespace. The cap is
     /// enforced at the API boundary to keep bulk payload out of the LSM
@@ -116,6 +123,7 @@ impl Error {
             | Self::JobNotFound(_)
             | Self::InvalidState
             | Self::ClaimLost
+            | Self::CancelRequested
             | Self::KvValueTooLarge { .. }
             | Self::InvalidId { .. }
             | Self::DuplicateJobId { .. }
@@ -138,6 +146,7 @@ mod tests {
         assert!(Error::JobNotFound("job-1".into()).is_permanent());
         assert!(Error::InvalidState.is_permanent());
         assert!(Error::ClaimLost.is_permanent());
+        assert!(Error::CancelRequested.is_permanent());
         assert!(Error::KvValueTooLarge { size: 10, max: 5 }.is_permanent());
         assert!(
             Error::InvalidId {

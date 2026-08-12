@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::clock::Clock;
@@ -36,6 +37,7 @@ struct Inner {
     queue: String,
     id: String,
     token: u64,
+    cancel: Option<CancellationToken>,
 }
 
 impl LeaseHandle {
@@ -45,6 +47,7 @@ impl LeaseHandle {
         queue: String,
         id: String,
         token: u64,
+        cancel: Option<CancellationToken>,
     ) -> Self {
         Self {
             inner: Some(Inner {
@@ -53,6 +56,7 @@ impl LeaseHandle {
                 queue,
                 id,
                 token,
+                cancel,
             }),
         }
     }
@@ -75,10 +79,15 @@ impl LeaseHandle {
     /// Fails with [`Error::ClaimLost`] once the claim has ended or the
     /// reaper has begun re-queuing the expired lease; stop working on
     /// the delivery then, since another claim may already own the job.
+    /// Fails with [`Error::CancelRequested`] once cancellation of the
+    /// job has been requested, leaving the lease to expire.
     pub fn ensure_at_least(&self, remaining: Duration) -> Result<()> {
         let Some(inner) = &self.inner else {
             return Ok(());
         };
+        if inner.cancel.as_ref().is_some_and(|t| t.is_cancelled()) {
+            return Err(Error::CancelRequested);
+        }
         let needed = inner.clock.now_ms()
             + remaining.as_millis() as u64
             + SETTLEMENT_MARGIN.as_millis() as u64;
@@ -136,6 +145,7 @@ mod tests {
             "q".into(),
             "a".into(),
             7,
+            None,
         );
 
         // Covered: 10s + margin fits inside the 30s lease.
@@ -159,6 +169,7 @@ mod tests {
             "q".into(),
             "a".into(),
             7,
+            None,
         );
 
         registry.remove("q", "a", 7);
@@ -173,5 +184,31 @@ mod tests {
             handle.ensure_at_least(Duration::from_secs(10)),
             Err(Error::ClaimLost)
         ));
+    }
+
+    #[test]
+    fn ensure_at_least_is_refused_once_cancellation_is_requested() {
+        let registry = LeaseRegistry::new();
+        let clock = MockClock::new(1_000_000);
+        registry.insert("q", "a", 1_030_000, 7);
+        let cancel = CancellationToken::new();
+        let handle = LeaseHandle::new(
+            registry.clone(),
+            Arc::new(clock.clone()),
+            "q".into(),
+            "a".into(),
+            7,
+            Some(cancel.clone()),
+        );
+
+        handle.ensure_at_least(Duration::from_secs(60)).unwrap();
+
+        cancel.cancel();
+        let before = registry.current("q", "a");
+        assert!(matches!(
+            handle.ensure_at_least(Duration::from_secs(600)),
+            Err(Error::CancelRequested)
+        ));
+        assert_eq!(registry.current("q", "a"), before);
     }
 }
