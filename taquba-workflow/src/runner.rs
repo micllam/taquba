@@ -5,6 +5,7 @@ use std::time::Duration;
 use taquba::LeaseHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::effects::EffectsHandle;
 use crate::memo::Memo;
 
 /// A single step within a workflow run, handed to [`StepRunner::run_step`].
@@ -83,6 +84,19 @@ pub struct Step {
     ///
     /// See [`Memo`] for the full API.
     pub memo: Memo,
+    /// Application KV effects for this step. Writes and deletes staged
+    /// here are applied in the same transaction as the settlement that
+    /// commits the returned outcome, so application state cannot
+    /// diverge from the run's transition on a crash:
+    ///
+    /// ```ignore
+    /// step.effects.put(format!("app/runs/{}", step.run_id), b"done".to_vec())?;
+    /// Ok(StepOutcome::Succeed { result })
+    /// ```
+    ///
+    /// See [`EffectsHandle`] for the staging rules. Use
+    /// [`EffectsHandle::detached`] when constructing a `Step` in tests.
+    pub effects: EffectsHandle,
     /// The signal payload, when this step was reached through a
     /// [`Trigger::OnSignal`] wait that a signal resolved: the previous
     /// step continued with `OnSignal`, and a

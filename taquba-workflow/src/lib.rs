@@ -208,6 +208,53 @@
 //! See `examples/signals.rs` for a runnable approval flow covering all
 //! three delivery paths (signal, timeout, buffered).
 //!
+//! # Application KV effects
+//!
+//! Application state that describes a run (a status row, a progress
+//! marker, an outcome record) can be written to Taquba's caller KV
+//! namespace in the same transaction as the run's own transitions, so
+//! a crash cannot leave the two disagreeing. Two surfaces:
+//!
+//! - [`RunSpec::kv_writes`]: writes applied atomically with the step-0
+//!   enqueue. A duplicate submission drops its writes.
+//! - [`Step::effects`]: an [`EffectsHandle`] that stages writes and
+//!   deletes during a step. Everything staged is applied in the
+//!   settlement transaction that commits the outcome the runner
+//!   returned, whichever outcome that is (`Continue`, `Succeed`,
+//!   `Fail` or `Cancel`).
+//!
+//! ```ignore
+//! // Inside StepRunner::run_step: the outcome record commits with the
+//! // step's own settlement.
+//! step.effects.put(format!("app/runs/{}", step.run_id), summary)?;
+//! Ok(StepOutcome::Succeed { result })
+//! ```
+//!
+//! Semantics:
+//!
+//! - Delivery is at-least-once, so a retried step stages its effects
+//!   again; every staged value must be correct when applied more than
+//!   once (write absolute values).
+//! - No effects are applied when the runner returns a [`StepError`]
+//!   (the step retries or dead-letters) or when an external
+//!   [`WorkflowRuntime::cancel`] overrides the outcome. A runner-issued
+//!   [`StepOutcome::Cancel`] keeps its effects.
+//! - Operations are validated as they are staged: the `workflow/`
+//!   prefix ([`RESERVED_KV_PREFIX`]) is reserved for the runtime,
+//!   values are capped at [`taquba::MAX_KV_VALUE_SIZE`] and a key
+//!   cannot be staged for both a write and a delete within one step.
+//! - With [`WorkflowRuntimeBuilder::step_output_replay`] enabled, the
+//!   replay record stores the staged effects with the outcome, so a
+//!   replayed delivery applies them without invoking the runner.
+//!
+//! The written values are readable through [`taquba::Queue::kv_get`]
+//! and, from another process, through a `taquba::QueueReader`. Layer
+//! crates reserve their own KV prefixes (`workflow/`, `jobs/`);
+//! namespace application keys under a distinct application prefix.
+//!
+//! See `examples/kv_effects.rs` for a runnable order flow maintaining a
+//! status row through both surfaces.
+//!
 //! # Idempotency model
 //!
 //! Each step is enqueued with [`taquba::EnqueueOptions::dedup_key`] of
@@ -279,7 +326,9 @@
 //! `(run_id, step_number, SHA-256(step payload))` and is written before
 //! the runtime applies the outcome. If the same step is delivered again
 //! after a crash before ack, the stored outcome is replayed without
-//! invoking the runner again. A replayed [`StepOutcome::Continue`] with a
+//! invoking the runner again. The record includes the effects staged
+//! through [`Step::effects`], so a replayed outcome applies them as
+//! well. A replayed [`StepOutcome::Continue`] with a
 //! [`Trigger::After`] delay reduces the delay by the time already elapsed
 //! since the outcome was stored, preserving the original schedule.
 //!
@@ -392,19 +441,21 @@
 
 #![warn(missing_docs)]
 
+mod effects;
 mod error;
 mod memo;
 mod runner;
 mod runtime;
 mod terminal;
 
+pub use effects::EffectsHandle;
 pub use error::{Error, Result};
 pub use memo::{Memo, MemoStore, TerminalMarker};
 pub use runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 pub use runtime::{
     HEADER_RUN_ID, HEADER_SIGNAL_DELIVERED, HEADER_SIGNAL_WAIT, HEADER_STEP,
-    RESERVED_HEADER_PREFIX, RunSpec, RunState, RunStatus, SignalOutcome, SubmitOutcome,
-    WorkflowRuntime, WorkflowRuntimeBuilder,
+    RESERVED_HEADER_PREFIX, RESERVED_KV_PREFIX, RunSpec, RunState, RunStatus, SignalOutcome,
+    SubmitOutcome, WorkflowRuntime, WorkflowRuntimeBuilder,
 };
 #[cfg(feature = "webhooks")]
 pub use terminal::WebhookTerminalHook;

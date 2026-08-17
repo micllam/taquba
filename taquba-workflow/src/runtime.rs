@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 
+use crate::effects::{EffectsHandle, StagedEffects};
 use crate::error::{Error, Result};
 use crate::memo::MemoStore;
 use crate::runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
@@ -26,6 +27,12 @@ pub const HEADER_STEP: &str = "workflow.step";
 /// headers must not start with this prefix; if they do, the runtime treats
 /// them as its own and strips them before invoking the runner.
 pub const RESERVED_HEADER_PREFIX: &str = "workflow.";
+
+/// Reserved prefix the runtime owns in the caller KV namespace. Keys
+/// passed via [`RunSpec::kv_writes`] or staged through an
+/// [`crate::EffectsHandle`] must not start with this prefix; they are
+/// rejected with [`Error::ReservedKvKey`].
+pub const RESERVED_KV_PREFIX: &str = "workflow/";
 
 /// Header key marking a step job as a signal waiter; the value is the
 /// correlation key the waiter is registered under.
@@ -223,6 +230,12 @@ impl From<DurableStepOutcome> for StepOutcome {
 struct DurableStepOutcomeRecord {
     stored_at_ms: u64,
     outcome: DurableStepOutcome,
+    /// Effects staged through [`crate::EffectsHandle`] during the
+    /// recorded delivery, restored into the settlement when the outcome
+    /// is replayed. Defaulted so records written before the field
+    /// existed deserialize.
+    #[serde(default)]
+    effects: StagedEffects,
 }
 
 /// The portion of `delay` still ahead of `now_ms`, measured from
@@ -274,6 +287,14 @@ pub struct RunSpec {
     pub priority: Option<u32>,
     /// Override the queue's `max_attempts` for every step of this run.
     pub max_attempts_per_step: Option<u32>,
+    /// Writes applied to the caller KV namespace in the same transaction
+    /// as the step-0 enqueue. Applied only when the submission is new: a
+    /// duplicate submission's writes are dropped, and the writes do not
+    /// participate in the duplicate-submission input check. Keys must
+    /// not start with the reserved `workflow/` prefix
+    /// ([`RESERVED_KV_PREFIX`]); values are capped at
+    /// [`taquba::MAX_KV_VALUE_SIZE`].
+    pub kv_writes: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 /// Outcome of [`WorkflowRuntime::submit`].
@@ -423,7 +444,9 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     /// recorded, so retries still invoke the runner. The replay key is
     /// scoped to `(run_id, step_number, SHA-256(step payload))`. If the
     /// same step is delivered again after a crash before ack, the stored
-    /// outcome is replayed without invoking the runner again. A replayed
+    /// outcome is replayed without invoking the runner again. The record
+    /// includes the effects staged through [`Step::effects`], so a
+    /// replayed outcome applies them as well. A replayed
     /// [`StepOutcome::Continue`] with a [`Trigger::After`] delay reduces
     /// the delay by the time already elapsed since the outcome was
     /// stored, preserving the original schedule.
@@ -594,6 +617,13 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
                 return Err(Error::ReservedHeaderInSubmit(k.clone()));
             }
         }
+        for key in spec.kv_writes.keys() {
+            if key.starts_with(RESERVED_KV_PREFIX.as_bytes()) {
+                return Err(Error::ReservedKvKey(
+                    String::from_utf8_lossy(key).into_owned(),
+                ));
+            }
+        }
 
         // Hold this run's submit lock across the duplicate checks and
         // the enqueue, so two concurrent submits with the same `run_id`
@@ -664,7 +694,8 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             submitted_at_ms: self.inner.clock.now_ms(),
             input_hash,
         })?;
-        let kv = HashMap::from([(run_kv_key(run_id), record_bytes)]);
+        let mut kv = spec.kv_writes;
+        kv.insert(run_kv_key(run_id), record_bytes);
 
         let job_id = match self
             .inner
@@ -1195,7 +1226,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         run_id: &str,
         step_number: u32,
         step_payload: &[u8],
-    ) -> Result<Option<StepOutcome>> {
+    ) -> Result<Option<(StepOutcome, StagedEffects)>> {
         let Some(bytes) = self
             .memo_store
             .get_step_output(run_id, step_number, step_payload)
@@ -1222,7 +1253,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     }
                     _ => {}
                 }
-                Ok(Some(outcome))
+                Ok(Some((outcome, record.effects)))
             }
             Err(err) => {
                 warn!(
@@ -1242,10 +1273,12 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         step_number: u32,
         step_payload: &[u8],
         outcome: &StepOutcome,
+        effects: &StagedEffects,
     ) -> Result<()> {
         let record = DurableStepOutcomeRecord {
             stored_at_ms: self.clock.now_ms(),
             outcome: DurableStepOutcome::from(outcome),
+            effects: effects.clone(),
         };
         let bytes = rmp_serde::to_vec_named(&record)?;
         self.memo_store
@@ -1282,6 +1315,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 Err(e) => return Err(e.to_string().into()),
             };
 
+        let effects_handle = EffectsHandle::for_delivery();
         let step = Step {
             run_id: run_id.clone(),
             step_number,
@@ -1292,6 +1326,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             cancel_token,
             lease: lease.clone(),
             memo: self.memo_store.new_memo(&run_id, step_number),
+            effects: effects_handle.clone(),
             signal: step_signal,
         };
 
@@ -1305,13 +1340,15 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         };
 
         let mut replayed_step_output = false;
+        let mut replayed_effects = StagedEffects::default();
         let outcome = if self.step_output_replay {
             match self
                 .load_step_output(&run_id, step_number, &job.payload)
                 .await
             {
-                Ok(Some(outcome)) => {
+                Ok(Some((outcome, effects))) => {
                     replayed_step_output = true;
+                    replayed_effects = effects;
                     debug!(
                         run_id = %run_id,
                         step_number,
@@ -1326,6 +1363,16 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             self.runner.run_step(&step).await
         };
 
+        // Sealed as soon as the runner has returned: an effect staged
+        // through a retained handle clone after this point could not
+        // join the settlement, so staging it errors.
+        let staged_effects = effects_handle.seal_and_take();
+        let caller_effects = if replayed_step_output {
+            replayed_effects
+        } else {
+            staged_effects
+        };
+
         let external_cancel = self
             .registry
             .lock()
@@ -1338,7 +1385,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             && !external_cancel
             && let Ok(ref outcome) = outcome
             && let Err(err) = self
-                .store_step_output(&run_id, step_number, &job.payload, outcome)
+                .store_step_output(&run_id, step_number, &job.payload, outcome, &caller_effects)
                 .await
         {
             if err.is_permanent() {
@@ -1346,6 +1393,8 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             }
             return Err(err.to_string().into());
         }
+
+        let runner_cancelled = matches!(outcome, Ok(StepOutcome::Cancel { .. }));
 
         // Cancellation precedence:
         // 1. A runner-issued `StepOutcome::Cancel` wins (it carries an
@@ -1476,6 +1525,14 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         // step's settlement; on retry paths they survive for redelivery.
         settled.map(|mut effects| {
             effects.kv_deletes.extend(signal_kv_deletes);
+            // The external-cancel override commits Cancelled in place of
+            // the runner's outcome; the staged effects describe that
+            // outcome and are discarded with it. A runner-issued Cancel
+            // keeps its effects.
+            if runner_cancelled || !external_cancel {
+                effects.kv_writes.extend(caller_effects.writes);
+                effects.kv_deletes.extend(caller_effects.deletes);
+            }
             effects
         })
     }
@@ -4073,6 +4130,448 @@ mod tests {
             Some(b"cached".to_vec()),
             "sweep must not remove memos of a run with no terminal marker",
         );
+
+        let _ = shutdown.send(());
+    }
+
+    #[test]
+    fn internal_kv_prefixes_are_under_the_reserved_prefix() {
+        for prefix in [
+            RUN_KV_PREFIX,
+            SIGNAL_WAIT_KV_PREFIX,
+            SIGNAL_BUF_KV_PREFIX,
+            SIGNAL_DELIVERED_KV_PREFIX,
+        ] {
+            assert!(
+                prefix.starts_with(RESERVED_KV_PREFIX.as_bytes()),
+                "internal kv prefix `{}` is outside the reserved prefix",
+                String::from_utf8_lossy(prefix),
+            );
+        }
+    }
+
+    async fn wait_for_kv(queue: &Queue, key: &[u8]) -> Vec<u8> {
+        for _ in 0..200 {
+            if let Some(v) = queue.kv_get(key).await.unwrap() {
+                return v.to_vec();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "kv key `{}` was never written",
+            String::from_utf8_lossy(key)
+        );
+    }
+
+    async fn wait_for_drained(queue: &Queue) {
+        for _ in 0..200 {
+            let stats = queue.stats("workflow-steps").await.unwrap();
+            if stats.pending == 0 && stats.claimed == 0 && stats.scheduled == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the queue never drained");
+    }
+
+    /// Runner that stages one `app/step-{n}` write per step and returns
+    /// the next scripted result.
+    struct EffectStagingRunner {
+        script: Arc<StdMutex<Vec<std::result::Result<StepOutcome, StepError>>>>,
+    }
+
+    impl EffectStagingRunner {
+        fn new(script: Vec<std::result::Result<StepOutcome, StepError>>) -> Self {
+            Self {
+                script: Arc::new(StdMutex::new(script)),
+            }
+        }
+    }
+
+    impl StepRunner for EffectStagingRunner {
+        async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
+            step.effects
+                .put(format!("app/step-{}", step.step_number), b"done".to_vec())
+                .map_err(|e| StepError::permanent(e.to_string()))?;
+            self.script.lock().unwrap().remove(0)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn submit_kv_writes_apply_only_to_a_new_submission() {
+        let (queue, store) = fresh_queue().await;
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            ScriptedRunner::new(vec![]),
+            NoopTerminalHook,
+        )
+        .build();
+        // No worker loop runs, so the step stays queued and the second
+        // submit is a duplicate of an active run.
+        let first = runtime
+            .submit(RunSpec {
+                run_id: Some("kv-run".to_string()),
+                input: b"in".to_vec(),
+                kv_writes: HashMap::from([(b"app/first".to_vec(), b"1".to_vec())]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(first.newly_submitted);
+        assert_eq!(
+            queue.kv_get(b"app/first").await.unwrap().as_deref(),
+            Some(b"1".as_slice())
+        );
+
+        let duplicate = runtime
+            .submit(RunSpec {
+                run_id: Some("kv-run".to_string()),
+                input: b"in".to_vec(),
+                kv_writes: HashMap::from([(b"app/second".to_vec(), b"2".to_vec())]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!duplicate.newly_submitted);
+        assert!(queue.kv_get(b"app/second").await.unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reserved_kv_key_in_submit_is_rejected() {
+        let (queue, store) = fresh_queue().await;
+        let runtime =
+            WorkflowRuntime::builder(queue, store, ScriptedRunner::new(vec![]), NoopTerminalHook)
+                .build();
+        let err = runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                kv_writes: HashMap::from([(b"workflow/x".to_vec(), b"v".to_vec())]),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::ReservedKvKey(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn step_effects_commit_with_the_acking_settlement() {
+        let (queue, store) = fresh_queue().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            EffectStagingRunner::new(vec![
+                Ok(StepOutcome::continue_now(b"next".to_vec())),
+                Ok(StepOutcome::Succeed { result: Vec::new() }),
+            ]),
+            ChannelHook { tx },
+        )
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        assert_eq!(wait_for_kv(&queue, b"app/step-0").await, b"done");
+        assert_eq!(wait_for_kv(&queue, b"app/step-1").await, b"done");
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn step_effects_commit_when_the_runner_fails_the_run() {
+        let (queue, store) = fresh_queue().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            EffectStagingRunner::new(vec![Ok(StepOutcome::Fail {
+                reason: "denied".to_string(),
+            })]),
+            ChannelHook { tx },
+        )
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.status, TerminalStatus::Failed);
+        assert_eq!(outcome.error.as_deref(), Some("denied"));
+        assert_eq!(wait_for_kv(&queue, b"app/step-0").await, b"done");
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_runner_issued_cancel_keeps_its_staged_effects() {
+        let (queue, store) = fresh_queue().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            EffectStagingRunner::new(vec![Ok(StepOutcome::Cancel {
+                reason: "obsolete".to_string(),
+            })]),
+            ChannelHook { tx },
+        )
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.status, TerminalStatus::Cancelled);
+        assert_eq!(outcome.error.as_deref(), Some("obsolete"));
+        assert_eq!(wait_for_kv(&queue, b"app/step-0").await, b"done");
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_external_cancel_discards_staged_effects() {
+        struct StageThenAwaitCancel {
+            started: tokio::sync::mpsc::UnboundedSender<()>,
+        }
+
+        impl StepRunner for StageThenAwaitCancel {
+            async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                step.effects
+                    .put(b"app/override".to_vec(), b"staged".to_vec())
+                    .map_err(|e| StepError::permanent(e.to_string()))?;
+                let _ = self.started.send(());
+                step.cancel_token.cancelled().await;
+                Ok(StepOutcome::continue_now(Vec::new()))
+            }
+        }
+
+        let (queue, store) = fresh_queue().await;
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            StageThenAwaitCancel {
+                started: started_tx,
+            },
+            ChannelHook { tx },
+        )
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        let handle = runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(runtime.cancel(&handle.run_id).await.unwrap());
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.status, TerminalStatus::Cancelled);
+        assert_eq!(outcome.error, None);
+
+        wait_for_drained(&queue).await;
+        assert!(queue.kv_get(b"app/override").await.unwrap().is_none());
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_step_error_applies_no_staged_effects() {
+        let (queue, store) = fresh_queue().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            EffectStagingRunner::new(vec![Err(StepError::permanent("permanent failure"))]),
+            ChannelHook { tx },
+        )
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.status, TerminalStatus::Failed);
+
+        for _ in 0..200 {
+            if queue.stats("workflow-steps").await.unwrap().dead == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(queue.stats("workflow-steps").await.unwrap().dead, 1);
+        assert!(queue.kv_get(b"app/step-0").await.unwrap().is_none());
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_replayed_step_outcome_restores_its_staged_effects() {
+        struct StagingContinueRunner {
+            calls: Arc<AtomicU32>,
+        }
+
+        impl StepRunner for StagingContinueRunner {
+            async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                step.effects
+                    .put(b"app/replayed".to_vec(), b"v".to_vec())
+                    .map_err(|e| StepError::transient(e.to_string()))?;
+                step.effects
+                    .delete(b"app/stale".to_vec())
+                    .map_err(|e| StepError::transient(e.to_string()))?;
+                Ok(StepOutcome::continue_now(b"step1".to_vec()))
+            }
+        }
+
+        let (queue, store) = fresh_queue().await;
+        let calls = Arc::new(AtomicU32::new(0));
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            StagingContinueRunner {
+                calls: calls.clone(),
+            },
+            NoopTerminalHook,
+        )
+        .step_output_replay()
+        .build();
+
+        queue.kv_put(b"app/stale", b"old").await.unwrap();
+        runtime
+            .submit(RunSpec {
+                run_id: Some("replay-effects".to_string()),
+                input: b"input".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let job = queue
+            .claim("workflow-steps", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // First delivery: the returned effects are dropped, simulating a
+        // crash between the replay-record write and the settlement.
+        let _ = runtime
+            .inner
+            .process_step(&job, &LeaseHandle::detached())
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(queue.kv_get(b"app/replayed").await.unwrap().is_none());
+
+        // Redelivery replays the stored outcome and restores the staged
+        // effects into the settlement without invoking the runner.
+        let effects = runtime
+            .inner
+            .process_step(&job, &LeaseHandle::detached())
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            effects.kv_writes.get(b"app/replayed".as_slice()),
+            Some(&b"v".to_vec())
+        );
+        assert!(effects.kv_deletes.contains(&b"app/stale".to_vec()));
+        queue.ack_with(&job, effects).await.unwrap();
+        assert_eq!(
+            queue.kv_get(b"app/replayed").await.unwrap().as_deref(),
+            Some(b"v".as_slice())
+        );
+        assert!(queue.kv_get(b"app/stale").await.unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_write_through_an_escaped_handle_is_refused() {
+        struct EscapingRunner {
+            escaped: Arc<StdMutex<Option<EffectsHandle>>>,
+        }
+
+        impl StepRunner for EscapingRunner {
+            async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                *self.escaped.lock().unwrap() = Some(step.effects.clone());
+                Ok(StepOutcome::Succeed { result: Vec::new() })
+            }
+        }
+
+        let (queue, store) = fresh_queue().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let escaped = Arc::new(StdMutex::new(None));
+        let runtime = WorkflowRuntime::builder(
+            queue,
+            store,
+            EscapingRunner {
+                escaped: escaped.clone(),
+            },
+            ChannelHook { tx },
+        )
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let handle = escaped.lock().unwrap().take().unwrap();
+        assert!(matches!(
+            handle.put("app/late", "v"),
+            Err(Error::EffectsSealed)
+        ));
 
         let _ = shutdown.send(());
     }

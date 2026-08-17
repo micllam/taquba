@@ -32,6 +32,27 @@ pub enum Error {
     #[error("run `{0}` is active with a different input; pick a fresh run_id")]
     InputMismatch(String),
 
+    /// A caller KV key passed via [`crate::RunSpec::kv_writes`] or staged
+    /// through an [`crate::EffectsHandle`] starts with the reserved
+    /// `workflow/` prefix. The runtime owns that prefix; callers must use
+    /// any other key.
+    #[error("kv key `{0}` uses the reserved `workflow/` prefix")]
+    ReservedKvKey(String),
+
+    /// A key was staged through an [`crate::EffectsHandle`] for both a
+    /// write and a delete within one step. The combination has no defined
+    /// order in the settlement transaction and is rejected when the
+    /// second operation is staged.
+    #[error("kv key `{0}` is staged for both a write and a delete")]
+    ConflictingKvEffect(String),
+
+    /// An effect was staged through an [`crate::EffectsHandle`] clone
+    /// after its step returned. Effects are collected when `run_step`
+    /// returns; an effect staged after that point cannot join the
+    /// settlement.
+    #[error("the effects handle is sealed; its step has returned")]
+    EffectsSealed,
+
     /// Underlying error from a Taquba queue operation.
     #[error(transparent)]
     Queue(#[from] taquba::Error),
@@ -57,6 +78,9 @@ impl Error {
             | Self::InvalidStepHeader { .. }
             | Self::ReservedHeaderInSubmit(_)
             | Self::InputMismatch(_)
+            | Self::ReservedKvKey(_)
+            | Self::ConflictingKvEffect(_)
+            | Self::EffectsSealed
             | Self::Serialization(_) => true,
             Self::Queue(e) => e.is_permanent(),
             Self::Store(_) => false,
@@ -83,6 +107,9 @@ mod tests {
         );
         assert!(Error::ReservedHeaderInSubmit("workflow.foo".into()).is_permanent());
         assert!(Error::InputMismatch("run-1".into()).is_permanent());
+        assert!(Error::ReservedKvKey("workflow/x".into()).is_permanent());
+        assert!(Error::ConflictingKvEffect("k".into()).is_permanent());
+        assert!(Error::EffectsSealed.is_permanent());
     }
 
     #[test]

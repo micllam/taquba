@@ -105,6 +105,7 @@ mod tests {
             cancel_token: CancellationToken::new(),
             lease: taquba::LeaseHandle::detached(),
             memo,
+            effects: taquba_workflow::EffectsHandle::detached(),
             signal: None,
         }
     }

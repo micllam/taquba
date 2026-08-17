@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Application KV effects. `RunSpec` gains the `kv_writes` field: writes
+  applied to the caller KV namespace in the same transaction as the
+  step-0 enqueue, dropped on a duplicate submission. `Step` gains the
+  `effects` field, an `EffectsHandle` that stages caller KV writes and
+  deletes during a step; everything staged is applied in the settlement
+  transaction that commits the outcome the runner returned (`Continue`,
+  `Succeed`, `Fail` or `Cancel`). No effects are applied on `StepError`
+  paths, and an external `WorkflowRuntime::cancel` that overrides the
+  runner's outcome discards the staged effects. Keys must not start
+  with the reserved `workflow/` prefix (the new `RESERVED_KV_PREFIX`
+  constant); staging validates at the call site. New error variants
+  `ReservedKvKey`, `ConflictingKvEffect` and `EffectsSealed`.
+
+### Changed
+
+- **Breaking:** `Step` gains the public field `effects`. Code
+  constructing a `Step` in tests adds
+  `effects: taquba_workflow::EffectsHandle::detached()`. `RunSpec`
+  gains the public field `kv_writes`; constructions using
+  `..Default::default()` are unaffected.
+- The stored step-output replay record now includes the effects staged
+  during the recorded delivery, so a replayed outcome applies them.
+  Records written by earlier versions deserialize with no effects.
+
 ## [0.9.0] - 2026-08-12
 
 ### Changed
