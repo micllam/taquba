@@ -54,6 +54,11 @@
 //! Other entries in `headers` are ignored by the worker; your application
 //! can use them for its own metadata.
 //!
+//! [`webhook_enqueue_request`] builds the enqueue request without
+//! performing it, so a delivery can be staged into a settlement
+//! transaction via [`taquba::AckEffects::enqueues`] and committed
+//! atomically with an acknowledgement.
+//!
 //! # Delivery semantics
 //!
 //! - **2xx response**: ack (Taquba marks the job done).
@@ -87,7 +92,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use taquba::{EnqueueOptions, Queue};
+use taquba::{EnqueueOptions, EnqueueRequest, Queue};
 
 /// Errors returned by the producer and worker.
 #[derive(Debug, thiserror::Error)]
@@ -194,18 +199,19 @@ impl WebhookRequest {
     }
 }
 
-/// Enqueue a webhook delivery onto Taquba's `target_queue`. The returned
-/// string is the [`taquba::JobRecord::id`] of the new job.
+/// Build the [`taquba::EnqueueRequest`] for a webhook delivery without
+/// performing the enqueue, for staging into a settlement transaction via
+/// [`taquba::AckEffects::enqueues`]. [`enqueue_webhook`] is the
+/// standalone form.
 ///
-/// `body` becomes the HTTP request body; `request` is encoded into the job's
-/// [`taquba::JobRecord::headers`] under the reserved keys documented at the
-/// crate root.
-pub async fn enqueue_webhook(
-    queue: &Queue,
+/// `body` becomes the HTTP request body; `request` is encoded into the
+/// job's [`taquba::JobRecord::headers`] under the reserved keys
+/// documented at the crate root.
+pub fn webhook_enqueue_request(
     target_queue: &str,
     request: WebhookRequest,
     body: Vec<u8>,
-) -> Result<String> {
+) -> EnqueueRequest {
     let WebhookRequest {
         url,
         method,
@@ -223,12 +229,32 @@ pub async fn enqueue_webhook(
         job_headers.insert(format!("{HTTP_HEADER_PREFIX}{name}"), value);
     }
 
-    let opts = EnqueueOptions {
-        headers: job_headers,
-        ..Default::default()
-    };
+    EnqueueRequest {
+        queue: target_queue.to_string(),
+        payload: body,
+        options: EnqueueOptions {
+            headers: job_headers,
+            ..Default::default()
+        },
+    }
+}
 
-    Ok(queue.enqueue_with(target_queue, body, opts).await?)
+/// Enqueue a webhook delivery onto Taquba's `target_queue`. The returned
+/// string is the [`taquba::JobRecord::id`] of the new job.
+///
+/// `body` becomes the HTTP request body; `request` is encoded into the job's
+/// [`taquba::JobRecord::headers`] under the reserved keys documented at the
+/// crate root.
+pub async fn enqueue_webhook(
+    queue: &Queue,
+    target_queue: &str,
+    request: WebhookRequest,
+    body: Vec<u8>,
+) -> Result<String> {
+    let req = webhook_enqueue_request(target_queue, request, body);
+    Ok(queue
+        .enqueue_with(&req.queue, req.payload, req.options)
+        .await?)
 }
 
 mod worker;
@@ -239,6 +265,27 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use taquba::object_store::memory::InMemory;
+
+    #[test]
+    fn build_request_packs_request_into_headers() {
+        let request = WebhookRequest::new("https://example.com/hook")
+            .method("PUT")
+            .header("Content-Type", "application/json")
+            .timeout(Duration::from_secs(15));
+
+        let req = webhook_enqueue_request("webhooks", request, b"body".to_vec());
+
+        assert_eq!(req.queue, "webhooks");
+        assert_eq!(req.payload, b"body");
+        let headers = &req.options.headers;
+        assert_eq!(headers.get(HEADER_URL).unwrap(), "https://example.com/hook");
+        assert_eq!(headers.get(HEADER_METHOD).unwrap(), "PUT");
+        assert_eq!(headers.get(HEADER_TIMEOUT_MS).unwrap(), "15000");
+        assert_eq!(
+            headers.get("http.Content-Type").unwrap(),
+            "application/json"
+        );
+    }
 
     #[tokio::test]
     async fn enqueue_packs_request_into_headers() {

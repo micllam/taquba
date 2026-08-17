@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `webhook_enqueue_request` builds the `taquba::EnqueueRequest` for a
+  delivery without performing the enqueue, so a delivery can be staged
+  into a settlement transaction via `taquba::AckEffects::enqueues`.
+  `enqueue_webhook` now delegates to it.
+
 ## [0.6.0] - 2026-08-12
 
 ### Added

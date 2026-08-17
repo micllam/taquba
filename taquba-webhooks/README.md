@@ -47,6 +47,11 @@ let request = WebhookRequest::new("https://example.com/hook")
 enqueue_webhook(&queue, "webhooks", request, br#"{"event":"ping"}"#.to_vec()).await?;
 ```
 
+`webhook_enqueue_request` builds the enqueue request without performing it,
+so a delivery can be staged into a settlement transaction via
+`taquba::AckEffects::enqueues` and committed atomically with an
+acknowledgement.
+
 ## Reserved header keys
 
 Webhook configuration travels with each job in `JobRecord::headers` under
