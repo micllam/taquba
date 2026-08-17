@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-17
+
 ### Changed
 
 - Raised the minimum `taquba-workflow` requirement to 0.10. Each item's

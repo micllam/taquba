@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-17
+
 ### Added
 
 - Application KV effects. `RunSpec` gains the `kv_writes` field: writes
@@ -36,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Raised the minimum `taquba-webhooks` requirement to 0.7 (the
+  `webhooks` feature).
 - **Breaking:** `TerminalHook::on_termination` takes a `TerminalEffects`
   parameter and returns `Result<(), StepError>`; every implementation
   updates its signature. `NoopTerminalHook` now observes nothing, so
