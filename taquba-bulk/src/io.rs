@@ -48,6 +48,12 @@ pub struct OutputRecord<'a> {
 /// [`OutputRecord`] per item as it reaches a terminal state, possibly from
 /// many worker tasks concurrently, so `write` takes `&self` and must handle
 /// its own synchronization.
+///
+/// Item completion is delivered at least once. Duplicate deliveries are
+/// detected and skipped within one batch process, so a repeated record
+/// for one `run_id` is rare (a delivery racing its own redelivery, or a
+/// batch resumed after a crash) but possible; consumers that must not
+/// double-apply a record deduplicate on `run_id`.
 pub trait OutputSink: Send + Sync {
     /// Persist one completed item's record.
     fn write(&self, record: &OutputRecord<'_>) -> Result<()>;

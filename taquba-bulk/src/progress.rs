@@ -1,5 +1,6 @@
 //! Batch-level progress and the final run report.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crate::cost::CostReport;
@@ -63,6 +64,9 @@ pub(crate) struct ProgressState {
     pub cancelled: usize,
     pub cost: CostReport,
     pub failed_run_ids: Vec<String>,
+    /// Run ids already recorded, so a redelivered terminal notification
+    /// (delivery is at-least-once) is not counted twice.
+    pub counted: HashSet<String>,
     started_at: Instant,
 }
 
@@ -75,6 +79,7 @@ impl ProgressState {
             cancelled: 0,
             cost: CostReport::new(),
             failed_run_ids: Vec::new(),
+            counted: HashSet::new(),
             started_at: Instant::now(),
         }
     }

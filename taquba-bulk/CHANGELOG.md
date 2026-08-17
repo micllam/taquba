@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Raised the minimum `taquba-workflow` requirement to 0.10. Each item's
+  termination is now delivered to the batch hook as a workflow
+  notification job, so a batch performs one additional queue job per
+  item and the output row is written only after the item's terminal
+  outcome committed.
+
+### Fixed
+
+- A redelivered terminal notification for an item (delivery is
+  at-least-once) is now recorded once: the duplicate neither writes a
+  second output row nor advances the progress counters, which
+  previously could report the batch done while items were still
+  running.
+
 ## [0.5.0] - 2026-08-12
 
 ### Added

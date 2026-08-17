@@ -73,6 +73,19 @@ where
         outcome: &RunOutcome,
         _effects: &TerminalEffects,
     ) -> std::result::Result<(), StepError> {
+        // Delivery is at-least-once; an item already recorded is not
+        // written or counted again.
+        if self
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .counted
+            .contains(&outcome.run_id)
+        {
+            return Ok(());
+        }
+
         let status = outcome.status;
 
         // For a succeeded item, decode the envelope to recover the output
@@ -110,6 +123,9 @@ where
 
         let done = {
             let mut state = self.shared.state.lock().unwrap();
+            if !state.counted.insert(outcome.run_id.clone()) {
+                return Ok(());
+            }
             match status {
                 TerminalStatus::Succeeded => state.succeeded += 1,
                 TerminalStatus::Failed => {
@@ -613,5 +629,41 @@ mod tests {
             .collect();
         assert!(ids.contains(&"n-5".to_string()));
         assert!(ids.contains(&"n-7".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_redelivered_notification_counts_an_item_once() {
+        let mut state = ProgressState::new();
+        state.total = 2;
+        let shared = Arc::new(Shared {
+            state: Mutex::new(state),
+            notify: Notify::new(),
+        });
+        let sink = Arc::new(Collect::default());
+        let hook = BulkHook::<u32> {
+            shared: shared.clone(),
+            sink: sink.clone(),
+            _output: PhantomData,
+        };
+
+        let outcome = RunOutcome {
+            run_id: "item-1".to_string(),
+            status: TerminalStatus::Succeeded,
+            result: None,
+            error: None,
+            headers: HashMap::new(),
+            final_step: 0,
+        };
+        hook.on_termination(&outcome, &TerminalEffects::detached())
+            .await
+            .unwrap();
+        hook.on_termination(&outcome, &TerminalEffects::detached())
+            .await
+            .unwrap();
+
+        let state = shared.state.lock().unwrap();
+        assert_eq!(state.succeeded, 1);
+        assert!(!state.is_done(), "one of two items is terminal");
+        assert_eq!(sink.records.lock().unwrap().len(), 1);
     }
 }
