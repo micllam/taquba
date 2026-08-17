@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::future::Future;
 
+use crate::effects::TerminalEffects;
+use crate::runner::StepError;
+
 /// Terminal state of a workflow run, passed to a [`TerminalHook`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -69,50 +72,95 @@ pub struct RunOutcome {
     pub final_step: u32,
 }
 
-/// User-implemented hook fired once per run when the run reaches a terminal
-/// state.
+/// User-implemented hook processing a run's termination.
 ///
-/// The hook is called from the worker task that processed the terminal step,
-/// after the step is acked / dead-lettered. Hook errors are not propagated;
-/// implementations should either be infallible or log internally.
+/// Termination is delivered as a queue job: the settlement that commits
+/// a run's terminal outcome atomically enqueues a **notification job**
+/// on the same queue, and the hook runs as that job's worker. The
+/// consequences:
+///
+/// - The hook observes only outcomes that committed. A settlement that
+///   loses its claim loses its notification with it, so a redelivered
+///   terminal step notifies only the outcome it actually commits.
+/// - Delivery is at-least-once: a crash after the hook ran but before
+///   the notification job was acknowledged re-delivers it, so
+///   implementations must be idempotent.
+/// - A transient error ([`StepError::transient`]) retries the
+///   notification job per the queue's backoff up to the terminal step's
+///   `max_attempts`; a permanent error dead-letters it, where
+///   [`taquba::Queue::dead_jobs`] finds it.
+/// - Effects staged on the [`TerminalEffects`] handle are applied in
+///   the same transaction as the notification's acknowledgement when
+///   the hook returns `Ok`.
+///
+/// Runs terminated without an acknowledging settlement (an external
+/// cancellation of a pending step, a step that dead-letters) enqueue
+/// the notification job on its own after the terminal transition
+/// commits, so a crash between the two can lose or duplicate that
+/// notification.
 pub trait TerminalHook: Send + Sync {
-    /// Called when a run reaches [`TerminalStatus::Succeeded`],
-    /// [`TerminalStatus::Failed`], or [`TerminalStatus::Cancelled`].
-    fn on_termination(&self, outcome: &RunOutcome) -> impl Future<Output = ()> + Send;
+    /// Process the termination of one run. `outcome` is the committed
+    /// terminal state; effects staged on `effects` commit with this
+    /// notification's acknowledgement.
+    fn on_termination(
+        &self,
+        outcome: &RunOutcome,
+        effects: &TerminalEffects,
+    ) -> impl Future<Output = std::result::Result<(), StepError>> + Send;
+
+    /// Whether a notification job should be enqueued for `outcome`.
+    /// Consulted when the run terminates; returning `false` skips the
+    /// notification entirely, so [`Self::on_termination`] is never
+    /// called for that run. Defaults to `true`.
+    fn observes(&self, outcome: &RunOutcome) -> bool {
+        let _ = outcome;
+        true
+    }
 }
 
-/// A no-op terminal hook. Useful when the user only cares about run
-/// observation via tracing or external state.
+/// A no-op terminal hook. Declares itself unobservant, so runs
+/// terminate without enqueueing a notification job.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopTerminalHook;
 
 impl TerminalHook for NoopTerminalHook {
-    async fn on_termination(&self, _outcome: &RunOutcome) {}
+    async fn on_termination(
+        &self,
+        _outcome: &RunOutcome,
+        _effects: &TerminalEffects,
+    ) -> std::result::Result<(), StepError> {
+        Ok(())
+    }
+
+    fn observes(&self, _outcome: &RunOutcome) -> bool {
+        false
+    }
 }
 
 #[cfg(feature = "webhooks")]
 mod webhook {
-    use super::{RunOutcome, TerminalHook, TerminalStatus};
-    use std::sync::Arc;
+    use super::{RunOutcome, StepError, TerminalEffects, TerminalHook, TerminalStatus};
     use std::time::Duration;
-    use taquba::Queue;
-    use taquba_webhooks::{WebhookRequest, enqueue_webhook};
+    use taquba_webhooks::{WebhookRequest, webhook_enqueue_request};
 
-    /// Convenience terminal hook that fires an HTTP webhook delivery via
-    /// `taquba-webhooks` whenever a run terminates.
+    /// Terminal hook that delivers an HTTP webhook via `taquba-webhooks`
+    /// when a run terminates.
     ///
-    /// The hook reads the target URL from the run's submission headers under
-    /// [`Self::URL_HEADER`] (default `"callback_url"`). Runs without that
-    /// header are simply ignored. The default key intentionally avoids the
-    /// reserved `workflow.*` prefix so submitters can set it directly via
-    /// [`crate::RunSpec::headers`].
+    /// The hook reads the target URL from the run's submission headers
+    /// under [`Self::URL_HEADER`] (default `"callback_url"`); runs
+    /// without that header enqueue no notification at all. The default
+    /// key intentionally avoids the reserved `workflow.*` prefix so
+    /// submitters can set it directly via [`crate::RunSpec::headers`].
+    ///
+    /// The webhook enqueue is staged as a notification effect, so the
+    /// delivery job is created exactly once, atomically with the
+    /// notification's acknowledgement.
     ///
     /// The webhook body is the raw `result` bytes for succeeded runs, and
     /// the UTF-8 error message for failed runs. The run identifier and
     /// terminal status are passed in the `Workflow-Run-Id` and
     /// `Workflow-Run-Status` HTTP headers respectively.
     pub struct WebhookTerminalHook {
-        queue: Arc<Queue>,
         target_queue: String,
         url_header: String,
         timeout: Option<Duration>,
@@ -125,13 +173,11 @@ mod webhook {
         /// rejected.
         pub const URL_HEADER: &'static str = "callback_url";
 
-        /// Build a hook that enqueues webhook deliveries onto `target_queue`
-        /// of the supplied Taquba queue. The submitter sets a callback URL
-        /// per run via the [`Self::URL_HEADER`] header on
-        /// [`crate::RunSpec::headers`].
-        pub fn new(queue: Arc<Queue>, target_queue: impl Into<String>) -> Self {
+        /// Build a hook that enqueues webhook deliveries onto
+        /// `target_queue`. The submitter sets a callback URL per run via
+        /// the [`Self::URL_HEADER`] header on [`crate::RunSpec::headers`].
+        pub fn new(target_queue: impl Into<String>) -> Self {
             Self {
-                queue,
                 target_queue: target_queue.into(),
                 url_header: Self::URL_HEADER.to_string(),
                 timeout: None,
@@ -153,9 +199,13 @@ mod webhook {
     }
 
     impl TerminalHook for WebhookTerminalHook {
-        async fn on_termination(&self, outcome: &RunOutcome) {
+        async fn on_termination(
+            &self,
+            outcome: &RunOutcome,
+            effects: &TerminalEffects,
+        ) -> std::result::Result<(), StepError> {
             let Some(url) = outcome.headers.get(&self.url_header) else {
-                return;
+                return Ok(());
             };
             let mut req = WebhookRequest::new(url)
                 .header("Workflow-Run-Id", &outcome.run_id)
@@ -169,13 +219,15 @@ mod webhook {
                     outcome.error.clone().unwrap_or_default().into_bytes()
                 }
             };
-            if let Err(e) = enqueue_webhook(&self.queue, &self.target_queue, req, body).await {
-                tracing::warn!(
-                    run_id = %outcome.run_id,
-                    error = %e,
-                    "webhook terminal-hook enqueue failed"
-                );
-            }
+            let request = webhook_enqueue_request(&self.target_queue, req, body);
+            effects
+                .enqueue(request)
+                .map_err(|e| StepError::permanent(e.to_string()))?;
+            Ok(())
+        }
+
+        fn observes(&self, outcome: &RunOutcome) -> bool {
+            outcome.headers.contains_key(&self.url_header)
         }
     }
 }

@@ -23,8 +23,8 @@ use std::time::Duration;
 use taquba::object_store::local::LocalFileSystem;
 use taquba::{OpenOptions, Queue, QueueConfig};
 use taquba_workflow::{
-    RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalHook, TerminalStatus,
-    WorkflowRuntime,
+    RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects, TerminalHook,
+    TerminalStatus, WorkflowRuntime,
 };
 use tokio::sync::oneshot;
 
@@ -98,7 +98,11 @@ struct ShutdownOnTermination {
 }
 
 impl TerminalHook for ShutdownOnTermination {
-    async fn on_termination(&self, outcome: &RunOutcome) {
+    async fn on_termination(
+        &self,
+        outcome: &RunOutcome,
+        _effects: &TerminalEffects,
+    ) -> std::result::Result<(), StepError> {
         println!();
         match outcome.status {
             TerminalStatus::Succeeded => println!(
@@ -117,6 +121,7 @@ impl TerminalHook for ShutdownOnTermination {
         if let Some(tx) = self.shutdown.lock().await.take() {
             let _ = tx.send(());
         }
+        Ok(())
     }
 }
 

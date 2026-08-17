@@ -45,8 +45,8 @@ use std::time::{Duration, Instant};
 use taquba::{OpenOptions, Queue, QueueConfig};
 use taquba_bencher::{env_var, init_tracing, pct, store_from_env};
 use taquba_workflow::{
-    RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalHook, TerminalStatus,
-    WorkflowRuntime,
+    RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects, TerminalHook,
+    TerminalStatus, WorkflowRuntime,
 };
 
 /// Step completion sample: (elapsed_us, run_idx, step_number).
@@ -79,7 +79,11 @@ struct CountingHook {
 }
 
 impl TerminalHook for CountingHook {
-    async fn on_termination(&self, outcome: &RunOutcome) {
+    async fn on_termination(
+        &self,
+        outcome: &RunOutcome,
+        _effects: &TerminalEffects,
+    ) -> std::result::Result<(), StepError> {
         if !matches!(outcome.status, TerminalStatus::Succeeded) {
             eprintln!(
                 "run {} terminated as {:?}: {:?}",
@@ -87,6 +91,7 @@ impl TerminalHook for CountingHook {
             );
         }
         self.terminated.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 

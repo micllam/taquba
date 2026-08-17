@@ -12,7 +12,8 @@ use std::sync::Arc;
 use taquba::Queue;
 use taquba::object_store::memory::InMemory;
 use taquba_workflow::{
-    RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalHook, WorkflowRuntime,
+    RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects, TerminalHook,
+    WorkflowRuntime,
 };
 use tokio::sync::oneshot;
 
@@ -31,7 +32,11 @@ struct PrintAndExit {
 }
 
 impl TerminalHook for PrintAndExit {
-    async fn on_termination(&self, outcome: &RunOutcome) {
+    async fn on_termination(
+        &self,
+        outcome: &RunOutcome,
+        _effects: &TerminalEffects,
+    ) -> std::result::Result<(), StepError> {
         println!(
             "run {} -> {:?}: {}",
             outcome.run_id,
@@ -41,6 +46,7 @@ impl TerminalHook for PrintAndExit {
         if let Some(tx) = self.shutdown.lock().await.take() {
             let _ = tx.send(());
         }
+        Ok(())
     }
 }
 

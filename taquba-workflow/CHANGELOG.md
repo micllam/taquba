@@ -22,8 +22,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constant); staging validates at the call site. New error variants
   `ReservedKvKey`, `ConflictingKvEffect` and `EffectsSealed`.
 
+- Terminal notifications as queue jobs. The settlement that commits a
+  run's terminal outcome atomically enqueues a notification job (new
+  reserved header `workflow.terminal`, dedup key `run:{run_id}:terminal`,
+  priority and `max_attempts` inherited from the terminal step) whose
+  payload is the committed outcome, and the `TerminalHook` runs as that
+  job's worker. The hook observes only outcomes that committed, delivery
+  is at-least-once and a failing hook retries per the queue's backoff or
+  dead-letters on a permanent error. The new `TerminalEffects` handle
+  stages KV writes, deletes and follow-up enqueues that commit with the
+  notification's acknowledgement, and the new defaulted
+  `TerminalHook::observes` skips the notification per outcome.
+
 ### Changed
 
+- **Breaking:** `TerminalHook::on_termination` takes a `TerminalEffects`
+  parameter and returns `Result<(), StepError>`; every implementation
+  updates its signature. `NoopTerminalHook` now observes nothing, so
+  runs terminate without enqueueing a notification.
+- **Breaking:** `WebhookTerminalHook::new` no longer takes a `Queue`;
+  the hook stages its delivery enqueue as a notification effect, so the
+  webhook job is created exactly once with the acknowledgement, and
+  runs without a callback header enqueue no notification.
+- `WorkflowRuntime::cancel` of a pending step enqueues the notification
+  job and returns without waiting for the hook to run. Runs terminated
+  without an acknowledging settlement (pending-step cancel, a step that
+  dead-letters) enqueue the notification best-effort after the terminal
+  transition commits.
 - **Breaking:** `Step` gains the public field `effects`. Code
   constructing a `Step` in tests adds
   `effects: taquba_workflow::EffectsHandle::detached()`. `RunSpec`

@@ -22,8 +22,8 @@ use std::time::Duration;
 use taquba::Queue;
 use taquba::object_store::memory::InMemory;
 use taquba_workflow::{
-    RunOutcome, RunSpec, SignalOutcome, Step, StepError, StepOutcome, StepRunner, TerminalHook,
-    WorkflowRuntime,
+    RunOutcome, RunSpec, SignalOutcome, Step, StepError, StepOutcome, StepRunner, TerminalEffects,
+    TerminalHook, WorkflowRuntime,
 };
 
 /// Correlation key for an order's approval signal.
@@ -77,8 +77,13 @@ struct CollectOutcomes {
 }
 
 impl TerminalHook for CollectOutcomes {
-    async fn on_termination(&self, outcome: &RunOutcome) {
+    async fn on_termination(
+        &self,
+        outcome: &RunOutcome,
+        _effects: &TerminalEffects,
+    ) -> std::result::Result<(), StepError> {
         let _ = self.tx.send(outcome.clone());
+        Ok(())
     }
 }
 

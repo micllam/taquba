@@ -495,11 +495,34 @@ Duplicates are caught from two sources, in order:
 
 ## Terminal hook
 
-`TerminalHook::on_termination` fires once per run on `Succeeded`,
-`Failed`, or `Cancelled`, receiving the submitter's headers and the
-runner's result or error. `WebhookTerminalHook` (behind the `webhooks`
-feature) fires HTTP callbacks via `taquba-webhooks`; set the per-run URL
-on `RunSpec::headers["callback_url"]`.
+`TerminalHook::on_termination` processes a run's termination
+(`Succeeded`, `Failed` or `Cancelled`), receiving the submitter's
+headers and the runner's result or error. Termination is delivered as a
+queue job: the settlement that commits a run's terminal outcome
+atomically enqueues a notification job, and the hook runs as that job's
+worker. The hook therefore observes only outcomes that committed, and
+delivery is at-least-once, so implementations must be idempotent. A
+transient error retries the notification per the queue's backoff up to
+the terminal step's `max_attempts`; a permanent error dead-letters it.
+
+The hook stages effects on a `TerminalEffects` handle: KV writes and
+deletes plus follow-up enqueues, applied in the same transaction as the
+notification's acknowledgement. `TerminalHook::observes` (default
+`true`) is consulted when a run terminates; returning `false` skips the
+notification job for that run. `NoopTerminalHook` observes nothing, so
+runs terminate with no notification cost.
+
+Runs terminated without an acknowledging settlement (an external
+cancellation of a pending step, a step that dead-letters) enqueue the
+notification on its own after the terminal transition commits, so a
+crash between the two can lose or duplicate that notification.
+
+`WebhookTerminalHook` (behind the `webhooks` feature) delivers HTTP
+callbacks via `taquba-webhooks`, staging the delivery enqueue as a
+notification effect so it is created exactly once with the
+acknowledgement; set the per-run URL on
+`RunSpec::headers["callback_url"]`. Runs without that header enqueue no
+notification.
 
 ## License
 

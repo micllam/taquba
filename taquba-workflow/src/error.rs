@@ -46,11 +46,11 @@ pub enum Error {
     #[error("kv key `{0}` is staged for both a write and a delete")]
     ConflictingKvEffect(String),
 
-    /// An effect was staged through an [`crate::EffectsHandle`] clone
-    /// after its step returned. Effects are collected when `run_step`
-    /// returns; an effect staged after that point cannot join the
-    /// settlement.
-    #[error("the effects handle is sealed; its step has returned")]
+    /// An effect was staged through an [`crate::EffectsHandle`] or
+    /// [`crate::TerminalEffects`] clone after its delivery returned.
+    /// Effects are collected when the runner or hook returns; an effect
+    /// staged after that point cannot join the settlement.
+    #[error("the effects handle is sealed; its delivery has returned")]
     EffectsSealed,
 
     /// Underlying error from a Taquba queue operation.

@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 
-use crate::effects::{EffectsHandle, StagedEffects};
+use crate::effects::{EffectsHandle, StagedEffects, TerminalEffects};
 use crate::error::{Error, Result};
 use crate::memo::MemoStore;
 use crate::runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
@@ -33,6 +33,11 @@ pub const RESERVED_HEADER_PREFIX: &str = "workflow.";
 /// [`crate::EffectsHandle`] must not start with this prefix; they are
 /// rejected with [`Error::ReservedKvKey`].
 pub const RESERVED_KV_PREFIX: &str = "workflow/";
+
+/// Header key marking a job as a terminal-notification job, whose
+/// payload is the run's committed outcome and whose worker is the
+/// configured [`TerminalHook`].
+pub const HEADER_TERMINAL: &str = "workflow.terminal";
 
 /// Header key marking a step job as a signal waiter; the value is the
 /// correlation key the waiter is registered under.
@@ -238,6 +243,72 @@ struct DurableStepOutcomeRecord {
     effects: StagedEffects,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+enum DurableTerminalStatus {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+impl From<TerminalStatus> for DurableTerminalStatus {
+    fn from(status: TerminalStatus) -> Self {
+        match status {
+            TerminalStatus::Succeeded => Self::Succeeded,
+            TerminalStatus::Failed => Self::Failed,
+            TerminalStatus::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+impl From<DurableTerminalStatus> for TerminalStatus {
+    fn from(status: DurableTerminalStatus) -> Self {
+        match status {
+            DurableTerminalStatus::Succeeded => Self::Succeeded,
+            DurableTerminalStatus::Failed => Self::Failed,
+            DurableTerminalStatus::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+/// Stored payload of a terminal-notification job: the committed
+/// [`RunOutcome`], self-contained so the notification survives restarts
+/// and redeliveries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableRunOutcome {
+    run_id: String,
+    status: DurableTerminalStatus,
+    result: Option<Vec<u8>>,
+    error: Option<String>,
+    headers: HashMap<String, String>,
+    final_step: u32,
+}
+
+impl From<&RunOutcome> for DurableRunOutcome {
+    fn from(outcome: &RunOutcome) -> Self {
+        Self {
+            run_id: outcome.run_id.clone(),
+            status: outcome.status.into(),
+            result: outcome.result.clone(),
+            error: outcome.error.clone(),
+            headers: outcome.headers.clone(),
+            final_step: outcome.final_step,
+        }
+    }
+}
+
+impl From<DurableRunOutcome> for RunOutcome {
+    fn from(outcome: DurableRunOutcome) -> Self {
+        Self {
+            run_id: outcome.run_id,
+            status: outcome.status.into(),
+            result: outcome.result,
+            error: outcome.error,
+            headers: outcome.headers,
+            final_step: outcome.final_step,
+        }
+    }
+}
+
 /// The portion of `delay` still ahead of `now_ms`, measured from
 /// `stored_at_ms`. Saturates to the full delay if the clock reads
 /// earlier than the stored timestamp.
@@ -315,8 +386,8 @@ pub struct SubmitOutcome {
 }
 
 /// In-memory status snapshot for an active run. Returned by
-/// [`WorkflowRuntime::status`]. Terminal runs are not retained; once the
-/// terminal hook fires, the registry entry is removed.
+/// [`WorkflowRuntime::status`]. Terminal runs are not retained; the
+/// registry entry is removed when the run terminates.
 #[derive(Debug, Clone)]
 pub struct RunStatus {
     /// The run's identifier.
@@ -335,11 +406,11 @@ pub enum RunState {
     Pending,
     /// A step is currently being processed by a worker.
     Running,
-    /// [`WorkflowRuntime::cancel`] was called for this run and the
-    /// terminal hook has not yet fired. Reported until the in-flight
-    /// step returns and the runtime settles the run as
-    /// [`crate::TerminalStatus::Cancelled`] (entry removed and hook
-    /// fired); after that, [`WorkflowRuntime::status`] returns `None`.
+    /// [`WorkflowRuntime::cancel`] was called for this run and the run
+    /// has not yet terminated. Reported until the in-flight step
+    /// returns and the runtime settles the run as
+    /// [`crate::TerminalStatus::Cancelled`] (entry removed); after
+    /// that, [`WorkflowRuntime::status`] returns `None`.
     ///
     /// Only set by external cancellation. A pure runner-issued
     /// [`crate::StepOutcome::Cancel`] (with no external `cancel()`
@@ -538,8 +609,8 @@ struct RuntimeInner<R, H> {
 /// observable [`RunStatus`] with the in-process state needed to resolve
 /// [`WorkflowRuntime::cancel`] races: the Taquba job currently
 /// representing the run (so `cancel` can target it), the submitter's
-/// headers (so the terminal hook fires with the right metadata even when
-/// `cancel` fires it directly from a pending step), a flag for any
+/// headers (so the notification includes the right metadata even when
+/// `cancel` terminates a pending step directly), a flag for any
 /// pending cancellation request, and a [`CancellationToken`] cloned into
 /// the in-flight [`Step`] so runners can short-circuit cooperatively.
 struct RegistryEntry {
@@ -747,7 +818,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// Returns [`RunState::Cancelling`] for any run with a pending
     /// cancellation request, regardless of its underlying step lifecycle
     /// position; the cancellation overlay wins over `Pending`/`Running`
-    /// until the terminal hook fires.
+    /// until the run terminates.
     pub async fn status(&self, run_id: &str) -> Option<RunStatus> {
         self.inner.registry.lock().unwrap().get(run_id).map(|e| {
             let mut status = e.status.clone();
@@ -765,24 +836,26 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// terminal, never submitted here, or owned by a different runtime
     /// instance).
     ///
-    /// The terminal hook fires once with [`TerminalStatus::Cancelled`]:
+    /// The run terminates as [`TerminalStatus::Cancelled`] and its
+    /// notification job is enqueued for the terminal hook:
     ///
-    /// - **Pending / scheduled step**: the queued step job is cancelled in
-    ///   Taquba and the hook fires from this call before it returns.
+    /// - **Pending / scheduled step**: the queued step job is cancelled
+    ///   in Taquba and the notification is enqueued before this call
+    ///   returns; the hook runs from a worker afterwards.
     /// - **Running step**: cancellation is delivered to the runner via
     ///   [`Step::cancel_token`]; runners that watch the token short-circuit
     ///   immediately. Runners that ignore the token are allowed to run to
     ///   completion (futures cannot be safely aborted mid-step). In both
     ///   cases the runner's [`StepOutcome`] / [`StepError`] is discarded
-    ///   and the hook fires from the worker once the step returns, with
+    ///   and the worker settles the run once the step returns, with
     ///   any pending transient retry suppressed and the step acked rather
     ///   than nacked.
     ///
     /// Cancellation is best-effort: if the run is already terminal by the
     /// time `cancel` is called (either because the runner returned a
     /// terminating [`StepOutcome`] or a prior `cancel` already settled
-    /// it), `cancel` returns `Ok(false)`, the run keeps whatever terminal
-    /// outcome it already delivered, and no additional hook fires.
+    /// it), `cancel` returns `Ok(false)` and the run keeps whatever
+    /// terminal outcome it already delivered.
     pub async fn cancel(&self, run_id: &str) -> Result<bool> {
         let (job_id, headers, current_step) = {
             let mut registry = self.inner.registry.lock().unwrap();
@@ -806,29 +879,32 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         match self.inner.queue.cancel(&job_id).await? {
             taquba::CancelOutcome::Removed => {
                 // Job was Pending/Scheduled and is now removed; no worker
-                // will ever see it. Fire the hook here. `error` is `None`:
+                // will ever see it. Terminate here. `error` is `None`:
                 // external cancellation carries no reason at the API level.
                 self.inner
-                    .terminate(RunOutcome {
-                        run_id: run_id.to_string(),
-                        status: TerminalStatus::Cancelled,
-                        result: None,
-                        error: None,
-                        headers,
-                        final_step: current_step,
-                    })
+                    .terminate(
+                        RunOutcome {
+                            run_id: run_id.to_string(),
+                            status: TerminalStatus::Cancelled,
+                            result: None,
+                            error: None,
+                            headers,
+                            final_step: current_step,
+                        },
+                        None,
+                    )
                     .await;
             }
             taquba::CancelOutcome::Requested => {
                 // Worker is processing the step. The worker reads our own
                 // registry `cancel_requested` flag after `run_step` returns
-                // and fires the hook.
+                // and terminates the run.
             }
             taquba::CancelOutcome::NotFound => {
                 // Job already gone from Taquba (e.g. just acked between our
                 // registry read and the queue call). The worker path still
-                // honours our `cancel_requested` flag if it hasn't fired the
-                // hook yet; if it has, this cancel is a no-op past the
+                // honours our `cancel_requested` flag if it hasn't terminated
+                // the run yet; if it has, this cancel is a no-op past the
                 // registry update.
             }
         }
@@ -1062,16 +1138,58 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         Ok((run_id, step_number))
     }
 
+    /// Build the enqueue request for a run's terminal-notification job.
+    /// `priority` and `max_attempts` are inherited from the terminal
+    /// step when one exists.
+    fn notification_enqueue_request(
+        &self,
+        outcome: &RunOutcome,
+        priority: Option<u32>,
+        max_attempts: Option<u32>,
+    ) -> Result<EnqueueRequest> {
+        let payload = rmp_serde::to_vec_named(&DurableRunOutcome::from(outcome))?;
+        let mut headers = HashMap::new();
+        headers.insert(HEADER_RUN_ID.to_string(), outcome.run_id.clone());
+        headers.insert(HEADER_TERMINAL.to_string(), "1".to_string());
+        Ok(EnqueueRequest {
+            queue: self.queue_name.clone(),
+            payload,
+            options: EnqueueOptions {
+                headers,
+                priority,
+                max_attempts,
+                dedup_key: Some(format!("{DEDUP_PREFIX}{}:terminal", outcome.run_id)),
+                ..EnqueueOptions::default()
+            },
+        })
+    }
+
     /// Settle a run into its terminal state where no acknowledgement
-    /// transaction exists to carry the durable record delete (the
-    /// pending-step path of [`WorkflowRuntime::cancel`], and worker
-    /// paths that dead-letter or nack instead of acking). Performs the
-    /// delete of [`Self::terminate_collecting_effects`] directly,
-    /// best-effort: a transient failure is logged but does not affect
-    /// the already-running cleanup of *this* run.
-    async fn terminate(&self, outcome: RunOutcome) {
+    /// transaction exists to apply the effects (the pending-step path
+    /// of [`WorkflowRuntime::cancel`], and worker paths that
+    /// dead-letter or nack). Applies the effects of
+    /// [`Self::terminate_collecting_effects`] directly, best-effort: a
+    /// failure is logged but does not affect the already-running
+    /// cleanup of *this* run. The notification enqueue runs before the
+    /// record delete, so a partial failure prefers losing the record
+    /// cleanup over losing the notification.
+    async fn terminate(&self, outcome: RunOutcome, priority: Option<u32>) {
         let run_id = outcome.run_id.clone();
-        let effects = self.terminate_collecting_effects(outcome).await;
+        let effects = self
+            .terminate_collecting_effects(outcome, priority, None)
+            .await;
+        for request in effects.enqueues {
+            if let Err(err) = self
+                .queue
+                .enqueue_with(&request.queue, request.payload, request.options)
+                .await
+            {
+                warn!(
+                    run_id = %run_id,
+                    "failed to enqueue the terminal notification: {err}"
+                );
+            }
+        }
         for key in &effects.kv_deletes {
             if let Err(err) = self.queue.kv_delete(key).await {
                 warn!(
@@ -1083,19 +1201,24 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     }
 
     /// Settle a run into its terminal state: drop its registry entry,
-    /// write a terminal marker (if memo retention is enabled), fire
-    /// the terminal hook, and return the durable run record's delete
-    /// as [`AckEffects`] for the step's acknowledgement transaction.
-    /// Registry removal happens first so that
-    /// [`WorkflowRuntime::status`] doesn't briefly report an
-    /// already-terminated run as active while a slow hook (e.g. a
-    /// webhook delivery) is in flight. The marker is written *before*
-    /// the record delete can commit, so a crash between the two leaves
-    /// the marker around to drive memo cleanup; losing the marker is
-    /// worse than leaving a stale run record (which only blocks one
-    /// future submit). A settlement that fails redelivers the step,
-    /// which re-terminates and retries the delete.
-    async fn terminate_collecting_effects(&self, outcome: RunOutcome) -> AckEffects {
+    /// write a terminal marker (if memo retention is enabled), and
+    /// return the durable run record's delete plus the
+    /// terminal-notification enqueue (when the hook observes this
+    /// outcome) as [`AckEffects`] for the step's acknowledgement
+    /// transaction. The notification job's payload is the committed
+    /// outcome and the configured [`TerminalHook`] runs as its worker.
+    /// The marker is written *before* the record delete can commit, so
+    /// a crash between the two leaves the marker around to drive memo
+    /// cleanup; losing the marker is worse than leaving a stale run
+    /// record (which only blocks one future submit). A settlement that
+    /// fails redelivers the step, which re-terminates and rebuilds the
+    /// same effects.
+    async fn terminate_collecting_effects(
+        &self,
+        outcome: RunOutcome,
+        priority: Option<u32>,
+        max_attempts: Option<u32>,
+    ) -> AckEffects {
         self.registry.lock().unwrap().remove(&outcome.run_id);
         if self.memo_retention.is_some()
             && let Err(err) = self
@@ -1109,10 +1232,60 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             );
         }
         let kv_deletes = vec![run_kv_key(&outcome.run_id)];
-        self.terminal_hook.on_termination(&outcome).await;
+        let enqueues = if self.terminal_hook.observes(&outcome) {
+            match self.notification_enqueue_request(&outcome, priority, max_attempts) {
+                Ok(request) => vec![request],
+                Err(err) => {
+                    warn!(
+                        run_id = %outcome.run_id,
+                        "failed to build the terminal notification: {err}"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
         AckEffects {
+            enqueues,
             kv_deletes,
             ..AckEffects::default()
+        }
+    }
+
+    /// Process a terminal-notification job: decode the committed
+    /// outcome and run the configured [`TerminalHook`] as the job's
+    /// worker. Effects the hook stages join this job's acknowledgement.
+    /// A transient hook error retries the job per the queue's backoff;
+    /// a permanent one dead-letters it.
+    async fn process_notification(
+        &self,
+        job: &JobRecord,
+    ) -> std::result::Result<AckEffects, WorkerError> {
+        let outcome: RunOutcome = match rmp_serde::from_slice::<DurableRunOutcome>(&job.payload) {
+            Ok(durable) => durable.into(),
+            Err(err) => {
+                warn!(job_id = %job.id, error = %err, "terminal notification has a malformed payload");
+                return Err(PermanentFailure::new(err.to_string()).into());
+            }
+        };
+        let effects = TerminalEffects::for_delivery();
+        let result = self.terminal_hook.on_termination(&outcome, &effects).await;
+        let (staged, enqueues) = effects.seal_and_take();
+        match result {
+            Ok(()) => Ok(AckEffects {
+                enqueues,
+                kv_writes: staged.writes,
+                kv_deletes: staged.deletes.into_iter().collect(),
+            }),
+            Err(StepError {
+                message,
+                kind: StepErrorKind::Permanent,
+            }) => Err(PermanentFailure::new(message).into()),
+            Err(StepError {
+                message,
+                kind: StepErrorKind::Transient,
+            }) => Err(message.into()),
         }
     }
 
@@ -1291,6 +1464,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         job: &JobRecord,
         lease: &LeaseHandle,
     ) -> std::result::Result<AckEffects, WorkerError> {
+        if job.headers.contains_key(HEADER_TERMINAL) {
+            return self.process_notification(job).await;
+        }
+
         let (run_id, step_number) = match Self::parse_step_headers(job) {
             Ok(v) => v,
             Err(e) => {
@@ -1405,24 +1582,32 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         //    consumers can distinguish external vs. runner-issued cancel.
         let settled = match outcome {
             Ok(StepOutcome::Cancel { reason }) => Ok(self
-                .terminate_collecting_effects(RunOutcome {
-                    run_id: run_id.clone(),
-                    status: TerminalStatus::Cancelled,
-                    result: None,
-                    error: Some(reason),
-                    headers: user_headers,
-                    final_step: step_number,
-                })
+                .terminate_collecting_effects(
+                    RunOutcome {
+                        run_id: run_id.clone(),
+                        status: TerminalStatus::Cancelled,
+                        result: None,
+                        error: Some(reason),
+                        headers: user_headers,
+                        final_step: step_number,
+                    },
+                    Some(job.priority),
+                    Some(job.max_attempts),
+                )
                 .await),
             _ if external_cancel => Ok(self
-                .terminate_collecting_effects(RunOutcome {
-                    run_id: run_id.clone(),
-                    status: TerminalStatus::Cancelled,
-                    result: None,
-                    error: None,
-                    headers: user_headers,
-                    final_step: step_number,
-                })
+                .terminate_collecting_effects(
+                    RunOutcome {
+                        run_id: run_id.clone(),
+                        status: TerminalStatus::Cancelled,
+                        result: None,
+                        error: None,
+                        headers: user_headers,
+                        final_step: step_number,
+                    },
+                    Some(job.priority),
+                    Some(job.max_attempts),
+                )
                 .await),
             Ok(StepOutcome::Continue { payload, when }) => match when {
                 Trigger::Immediate => Ok(self
@@ -1461,42 +1646,53 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 }
             },
             Ok(StepOutcome::Succeed { result }) => Ok(self
-                .terminate_collecting_effects(RunOutcome {
-                    run_id: run_id.clone(),
-                    status: TerminalStatus::Succeeded,
-                    result: Some(result),
-                    error: None,
-                    headers: user_headers,
-                    final_step: step_number,
-                })
+                .terminate_collecting_effects(
+                    RunOutcome {
+                        run_id: run_id.clone(),
+                        status: TerminalStatus::Succeeded,
+                        result: Some(result),
+                        error: None,
+                        headers: user_headers,
+                        final_step: step_number,
+                    },
+                    Some(job.priority),
+                    Some(job.max_attempts),
+                )
                 .await),
             Ok(StepOutcome::Fail { reason }) => {
                 // Runner verdict: workflow failed but the step itself ran
-                // cleanly. Ack the step (no dead-letter) and fire the hook
-                // with `Failed`.
+                // cleanly. Ack the step (no dead-letter); the run
+                // terminates as `Failed`.
                 Ok(self
-                    .terminate_collecting_effects(RunOutcome {
-                        run_id: run_id.clone(),
-                        status: TerminalStatus::Failed,
-                        result: None,
-                        error: Some(reason),
-                        headers: user_headers,
-                        final_step: step_number,
-                    })
+                    .terminate_collecting_effects(
+                        RunOutcome {
+                            run_id: run_id.clone(),
+                            status: TerminalStatus::Failed,
+                            result: None,
+                            error: Some(reason),
+                            headers: user_headers,
+                            final_step: step_number,
+                        },
+                        Some(job.priority),
+                        Some(job.max_attempts),
+                    )
                     .await)
             }
             Err(StepError {
                 message,
                 kind: StepErrorKind::Permanent,
             }) => {
-                self.terminate(RunOutcome {
-                    run_id: run_id.clone(),
-                    status: TerminalStatus::Failed,
-                    result: None,
-                    error: Some(message.clone()),
-                    headers: user_headers,
-                    final_step: step_number,
-                })
+                self.terminate(
+                    RunOutcome {
+                        run_id: run_id.clone(),
+                        status: TerminalStatus::Failed,
+                        result: None,
+                        error: Some(message.clone()),
+                        headers: user_headers,
+                        final_step: step_number,
+                    },
+                    Some(job.priority),
+                )
                 .await;
                 Err(PermanentFailure::new(message).into())
             }
@@ -1504,18 +1700,21 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 message,
                 kind: StepErrorKind::Transient,
             }) => {
-                // Last attempt: this nack will dead-letter. Fire the failure
-                // hook now so the user is notified once, before the job
-                // record disappears from the registry.
+                // Last attempt: this nack will dead-letter. Terminate the
+                // run now, while the registry entry and headers are in
+                // hand.
                 if job.attempts >= job.max_attempts {
-                    self.terminate(RunOutcome {
-                        run_id: run_id.clone(),
-                        status: TerminalStatus::Failed,
-                        result: None,
-                        error: Some(message.clone()),
-                        headers: user_headers,
-                        final_step: step_number,
-                    })
+                    self.terminate(
+                        RunOutcome {
+                            run_id: run_id.clone(),
+                            status: TerminalStatus::Failed,
+                            result: None,
+                            error: Some(message.clone()),
+                            headers: user_headers,
+                            final_step: step_number,
+                        },
+                        Some(job.priority),
+                    )
                     .await;
                 }
                 Err(message.into())
@@ -1620,14 +1819,17 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     let message = format!(
                         "a waiter is already registered for correlation key `{correlation_key}`"
                     );
-                    self.terminate(RunOutcome {
-                        run_id: run_id.to_string(),
-                        status: TerminalStatus::Failed,
-                        result: None,
-                        error: Some(message.clone()),
-                        headers: user_headers.clone(),
-                        final_step: next_step.saturating_sub(1),
-                    })
+                    self.terminate(
+                        RunOutcome {
+                            run_id: run_id.to_string(),
+                            status: TerminalStatus::Failed,
+                            result: None,
+                            error: Some(message.clone()),
+                            headers: user_headers.clone(),
+                            final_step: next_step.saturating_sub(1),
+                        },
+                        base_opts.priority,
+                    )
                     .await;
                     return Err(PermanentFailure::new(message).into());
                 }
@@ -1742,8 +1944,13 @@ mod tests {
     }
 
     impl TerminalHook for ChannelHook {
-        async fn on_termination(&self, outcome: &RunOutcome) {
+        async fn on_termination(
+            &self,
+            outcome: &RunOutcome,
+            _effects: &TerminalEffects,
+        ) -> std::result::Result<(), StepError> {
             let _ = self.tx.send(outcome.clone());
+            Ok(())
         }
     }
 
@@ -3118,22 +3325,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        let first = rx.recv().await.unwrap();
-        assert_eq!(first.status, TerminalStatus::Succeeded);
-        assert_eq!(first.result.as_deref(), Some(b"final".as_slice()));
 
-        // Simulate redelivery after a crash before ack. The stored
-        // outcome settles the run again (the terminal hook is
-        // at-least-once) without invoking the runner.
-        runtime
+        // Redelivery after a crash before ack: the stored outcome
+        // settles the run without invoking the runner again.
+        let effects = runtime
             .inner
             .process_step(&job, &LeaseHandle::detached())
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        let second = rx.recv().await.unwrap();
-        assert_eq!(second.status, TerminalStatus::Succeeded);
-        assert_eq!(second.result.as_deref(), Some(b"final".as_slice()));
+        queue.ack_with(&job, effects).await.unwrap();
+
+        // The committed settlement enqueued one notification; the hook
+        // observes the replayed outcome when it is processed.
+        let notification = queue
+            .claim("workflow-steps", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let effects = runtime
+            .inner
+            .process_step(&notification, &LeaseHandle::detached())
+            .await
+            .unwrap();
+        queue.ack_with(&notification, effects).await.unwrap();
+        let outcome = rx.recv().await.unwrap();
+        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        assert_eq!(outcome.result.as_deref(), Some(b"final".as_slice()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// Submits a run whose runner always returns
@@ -3247,7 +3466,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn cancel_pending_run_fires_cancelled_hook() {
         // Pending case: a run sits in the queue, we call `cancel()` before
-        // any worker claims it. The hook fires from `cancel` itself.
+        // any worker claims it. `cancel` removes the step job and enqueues
+        // the notification before returning.
         struct UnreachableRunner;
         impl StepRunner for UnreachableRunner {
             async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
@@ -3283,17 +3503,26 @@ mod tests {
 
         let was_cancelled = runtime.cancel(&handle.run_id).await.unwrap();
         assert!(was_cancelled);
+        assert!(runtime.status(&handle.run_id).await.is_none());
 
-        let outcome = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        // The step job is gone; the one claimable job is the notification.
+        let notification = queue
+            .claim("workflow-steps", Duration::from_secs(30))
             .await
-            .expect("hook fired in time")
-            .expect("hook channel open");
+            .unwrap()
+            .unwrap();
+        let effects = runtime
+            .inner
+            .process_step(&notification, &LeaseHandle::detached())
+            .await
+            .unwrap();
+        queue.ack_with(&notification, effects).await.unwrap();
+        let outcome = rx.recv().await.unwrap();
         assert_eq!(outcome.run_id, handle.run_id);
         assert_eq!(outcome.status, TerminalStatus::Cancelled);
         // External cancellation carries no reason: `error` is `None`.
         assert!(outcome.error.is_none());
         assert_eq!(outcome.headers.get("tenant").unwrap(), "acme");
-        assert!(runtime.status(&handle.run_id).await.is_none());
 
         let stats = queue.stats("workflow-steps").await.unwrap();
         assert_eq!(stats.dead, 0, "cancel must not dead-letter");
@@ -3580,9 +3809,13 @@ mod tests {
 
         let (queue, store) = fresh_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime =
-            WorkflowRuntime::builder(queue, store.clone(), UnreachableRunner, ChannelHook { tx })
-                .build();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store.clone(),
+            UnreachableRunner,
+            ChannelHook { tx },
+        )
+        .build();
         // Deliberately do not spawn the worker loop, so step 0 stays
         // Pending while both cancels race.
 
@@ -3600,19 +3833,31 @@ mod tests {
         let second = runtime.cancel(&handle.run_id).await.unwrap();
         assert!(
             !second,
-            "second cancel must report Ok(false): registry entry is gone after the first fired the hook",
+            "second cancel must report Ok(false): the first removed the registry entry",
         );
 
-        // Hook fires exactly once.
-        let _ = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        // Exactly one notification job exists for the double-cancelled run.
+        let notification = queue
+            .claim("workflow-steps", Duration::from_secs(30))
             .await
-            .expect("hook fired in time")
-            .expect("hook channel open");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+            .unwrap()
+            .expect("the first cancel enqueued the notification");
+        let effects = runtime
+            .inner
+            .process_step(&notification, &LeaseHandle::detached())
+            .await
+            .unwrap();
+        queue.ack_with(&notification, effects).await.unwrap();
+        let _ = rx.recv().await.unwrap();
         assert!(
-            rx.try_recv().is_err(),
-            "hook must fire exactly once for a double-cancelled run",
+            queue
+                .claim("workflow-steps", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_none(),
+            "a double-cancelled run must enqueue one notification",
         );
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test(start_paused = true)]
@@ -4526,6 +4771,328 @@ mod tests {
             Some(b"v".as_slice())
         );
         assert!(queue.kv_get(b"app/stale").await.unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_the_committed_outcome_produces_a_notification() {
+        struct GatedSecondAttempt {
+            calls: Arc<AtomicU32>,
+            running: tokio::sync::mpsc::UnboundedSender<()>,
+        }
+
+        impl StepRunner for GatedSecondAttempt {
+            async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Ok(StepOutcome::Succeed {
+                        result: b"done".to_vec(),
+                    });
+                }
+                let _ = self.running.send(());
+                step.cancel_token.cancelled().await;
+                Ok(StepOutcome::Succeed {
+                    result: b"done".to_vec(),
+                })
+            }
+        }
+
+        let (queue, store) = fresh_queue().await;
+        let (running_tx, mut running_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            GatedSecondAttempt {
+                calls: Arc::new(AtomicU32::new(0)),
+                running: running_tx,
+            },
+            ChannelHook { tx },
+        )
+        .build();
+
+        runtime
+            .submit(RunSpec {
+                run_id: Some("phantom".to_string()),
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let job = queue
+            .claim("workflow-steps", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // First settlement attempt: the runner succeeds, but the effects
+        // are dropped, as when the settlement loses the claim. The
+        // Succeeded notification is dropped with them.
+        let _ = runtime
+            .inner
+            .process_step(&job, &LeaseHandle::detached())
+            .await
+            .unwrap();
+
+        // The redelivered attempt observes an external cancel and
+        // commits Cancelled.
+        let worker = {
+            let inner = runtime.inner.clone();
+            let queue = queue.clone();
+            tokio::spawn(async move {
+                let effects = inner
+                    .process_step(&job, &LeaseHandle::detached())
+                    .await
+                    .unwrap();
+                queue.ack_with(&job, effects).await.unwrap();
+            })
+        };
+        running_rx.recv().await.unwrap();
+        assert!(runtime.cancel("phantom").await.unwrap());
+        worker.await.unwrap();
+
+        let notification = queue
+            .claim("workflow-steps", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .expect("the committed settlement enqueued its notification");
+        let effects = runtime
+            .inner
+            .process_step(&notification, &LeaseHandle::detached())
+            .await
+            .unwrap();
+        queue.ack_with(&notification, effects).await.unwrap();
+        let outcome = rx.recv().await.unwrap();
+        assert_eq!(outcome.status, TerminalStatus::Cancelled);
+        assert!(
+            queue
+                .claim("workflow-steps", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_none(),
+            "the outcome that never committed must produce no notification",
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hook_effects_commit_with_the_notification_ack() {
+        struct EffectHook;
+
+        impl TerminalHook for EffectHook {
+            async fn on_termination(
+                &self,
+                outcome: &RunOutcome,
+                effects: &TerminalEffects,
+            ) -> std::result::Result<(), StepError> {
+                effects
+                    .put(
+                        format!("app/outcomes/{}", outcome.run_id),
+                        outcome.status.as_str(),
+                    )
+                    .map_err(|e| StepError::permanent(e.to_string()))?;
+                effects
+                    .enqueue(EnqueueRequest {
+                        queue: "side-effects".to_string(),
+                        payload: outcome.run_id.clone().into_bytes(),
+                        options: EnqueueOptions::default(),
+                    })
+                    .map_err(|e| StepError::permanent(e.to_string()))?;
+                Ok(())
+            }
+        }
+
+        let (queue, store) = fresh_queue().await;
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            ScriptedRunner::new(vec![StepOutcome::Succeed { result: Vec::new() }]),
+            EffectHook,
+        )
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                run_id: Some("hooked".to_string()),
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            wait_for_kv(&queue, b"app/outcomes/hooked").await,
+            b"succeeded"
+        );
+        let side = queue
+            .claim("side-effects", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .expect("the staged enqueue committed with the notification ack");
+        assert_eq!(side.payload.as_slice(), b"hooked");
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transiently_failing_hook_retries_the_notification() {
+        struct FlakyHook {
+            calls: Arc<AtomicU32>,
+        }
+
+        impl TerminalHook for FlakyHook {
+            async fn on_termination(
+                &self,
+                outcome: &RunOutcome,
+                effects: &TerminalEffects,
+            ) -> std::result::Result<(), StepError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(StepError::transient("first attempt fails"));
+                }
+                effects
+                    .put(format!("app/notified/{}", outcome.run_id), b"1".to_vec())
+                    .map_err(|e| StepError::permanent(e.to_string()))?;
+                Ok(())
+            }
+        }
+
+        let (queue, store) = fresh_queue_fast_retry().await;
+        let calls = Arc::new(AtomicU32::new(0));
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            ScriptedRunner::new(vec![StepOutcome::Succeed { result: Vec::new() }]),
+            FlakyHook {
+                calls: calls.clone(),
+            },
+        )
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                run_id: Some("flaky".to_string()),
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(wait_for_kv(&queue, b"app/notified/flaky").await, b"1");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_noop_hook_enqueues_no_notification() {
+        let (queue, store) = fresh_queue().await;
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            ScriptedRunner::new(vec![StepOutcome::Succeed { result: Vec::new() }]),
+            NoopTerminalHook,
+        )
+        .build();
+        runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let job = queue
+            .claim("workflow-steps", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let effects = runtime
+            .inner
+            .process_step(&job, &LeaseHandle::detached())
+            .await
+            .unwrap();
+        assert!(effects.enqueues.is_empty());
+        queue.ack_with(&job, effects).await.unwrap();
+        assert!(
+            queue
+                .claim("workflow-steps", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "webhooks")]
+    #[tokio::test(start_paused = true)]
+    async fn the_webhook_hook_stages_its_delivery_as_a_notification_effect() {
+        use crate::terminal::WebhookTerminalHook;
+
+        let (queue, store) = fresh_queue().await;
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            ScriptedRunner::new(vec![
+                StepOutcome::Succeed {
+                    result: b"payload".to_vec(),
+                },
+                StepOutcome::Succeed { result: Vec::new() },
+            ]),
+            WebhookTerminalHook::new("callbacks"),
+        )
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                run_id: Some("with-callback".to_string()),
+                input: Vec::new(),
+                headers: HashMap::from([(
+                    "callback_url".to_string(),
+                    "https://example.com/done".to_string(),
+                )]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let webhook = loop {
+            if let Some(job) = queue
+                .claim("callbacks", Duration::from_secs(30))
+                .await
+                .unwrap()
+            {
+                break job;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(webhook.payload.as_slice(), b"payload");
+        assert_eq!(
+            webhook.headers.get("webhook.url").unwrap(),
+            "https://example.com/done"
+        );
+        assert_eq!(
+            webhook.headers.get("http.Workflow-Run-Status").unwrap(),
+            "succeeded"
+        );
+
+        // A run without a callback header enqueues no notification.
+        runtime
+            .submit(RunSpec {
+                run_id: Some("without-callback".to_string()),
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        wait_for_drained(&queue).await;
+        assert!(
+            queue
+                .claim("callbacks", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let _ = shutdown.send(());
     }
 
     #[tokio::test(start_paused = true)]

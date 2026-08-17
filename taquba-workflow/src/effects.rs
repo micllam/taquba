@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
+use taquba::EnqueueRequest;
 
 use crate::error::{Error, Result};
 use crate::runtime::RESERVED_KV_PREFIX;
@@ -135,6 +136,114 @@ fn check_key(state: &EffectsState, key: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Effects staged by a [`TerminalHook`](crate::TerminalHook) during a
+/// notification delivery, applied in the same transaction as the
+/// notification job's acknowledgement.
+///
+/// Passed to
+/// [`TerminalHook::on_termination`](crate::TerminalHook::on_termination).
+/// Beyond the KV writes and deletes of [`EffectsHandle`] (validated by
+/// the same rules), a hook stages follow-up enqueues, so work driven by
+/// a run's termination is created atomically with the notification
+/// being acknowledged. Effects are applied only when the hook returns
+/// `Ok`; a retried hook stages its effects again.
+///
+/// The handle is sealed once the hook returns; staging through a clone
+/// retained past that point returns [`Error::EffectsSealed`]. Use
+/// [`TerminalEffects::detached`] when invoking a hook directly in
+/// tests.
+#[derive(Debug, Clone)]
+pub struct TerminalEffects {
+    inner: Arc<Mutex<TerminalState>>,
+}
+
+#[derive(Debug, Default)]
+struct TerminalState {
+    kv: EffectsState,
+    enqueues: Vec<EnqueueRequest>,
+}
+
+impl TerminalEffects {
+    /// Build a handle bound to no delivery, for invoking a
+    /// [`TerminalHook`](crate::TerminalHook) directly in tests. A
+    /// detached handle accepts and validates effects like a
+    /// delivery-bound one, is never sealed and its staged effects are
+    /// never applied.
+    pub fn detached() -> Self {
+        Self::for_delivery()
+    }
+
+    pub(crate) fn for_delivery() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(TerminalState::default())),
+        }
+    }
+
+    /// Stage a follow-up enqueue, committed with the notification's
+    /// acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::EffectsSealed`] when the hook has returned.
+    pub fn enqueue(&self, request: EnqueueRequest) -> Result<()> {
+        let mut state = self.inner.lock().unwrap();
+        if state.kv.sealed {
+            return Err(Error::EffectsSealed);
+        }
+        state.enqueues.push(request);
+        Ok(())
+    }
+
+    /// Stage a write of `value` under `key` in the caller KV namespace.
+    ///
+    /// # Errors
+    ///
+    /// As [`EffectsHandle::put`].
+    pub fn put(&self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Result<()> {
+        let key = key.into();
+        let value = value.into();
+        let mut state = self.inner.lock().unwrap();
+        check_key(&state.kv, &key)?;
+        if value.len() > taquba::MAX_KV_VALUE_SIZE {
+            return Err(Error::Queue(taquba::Error::KvValueTooLarge {
+                size: value.len(),
+                max: taquba::MAX_KV_VALUE_SIZE,
+            }));
+        }
+        if state.kv.staged.deletes.contains(&key) {
+            return Err(Error::ConflictingKvEffect(display_key(&key)));
+        }
+        state.kv.staged.writes.insert(key, value);
+        Ok(())
+    }
+
+    /// Stage a delete of `key` from the caller KV namespace.
+    ///
+    /// # Errors
+    ///
+    /// As [`EffectsHandle::delete`].
+    pub fn delete(&self, key: impl Into<Vec<u8>>) -> Result<()> {
+        let key = key.into();
+        let mut state = self.inner.lock().unwrap();
+        check_key(&state.kv, &key)?;
+        if state.kv.staged.writes.contains_key(&key) {
+            return Err(Error::ConflictingKvEffect(display_key(&key)));
+        }
+        state.kv.staged.deletes.insert(key);
+        Ok(())
+    }
+
+    /// Seal the handle and move out everything staged.
+    pub(crate) fn seal_and_take(&self) -> (StagedEffects, Vec<EnqueueRequest>) {
+        let mut state = self.inner.lock().unwrap();
+        state.kv.sealed = true;
+        (
+            std::mem::take(&mut state.kv.staged),
+            std::mem::take(&mut state.enqueues),
+        )
+    }
+}
+
 fn display_key(key: &[u8]) -> String {
     String::from_utf8_lossy(key).into_owned()
 }
@@ -190,6 +299,52 @@ mod tests {
         assert_eq!(staged.writes.len(), 1);
         assert!(matches!(clone.put("b", "v"), Err(Error::EffectsSealed)));
         assert!(matches!(clone.delete("b"), Err(Error::EffectsSealed)));
+    }
+
+    #[test]
+    fn a_sealed_terminal_handle_rejects_staging() {
+        let handle = TerminalEffects::for_delivery();
+        handle.put("a", "v").unwrap();
+        handle.delete("b").unwrap();
+        handle
+            .enqueue(taquba::EnqueueRequest {
+                queue: "side".to_string(),
+                payload: Vec::new(),
+                options: Default::default(),
+            })
+            .unwrap();
+        let (staged, enqueues) = handle.seal_and_take();
+        assert_eq!(staged.writes.len(), 1);
+        assert_eq!(staged.deletes.len(), 1);
+        assert_eq!(enqueues.len(), 1);
+        assert!(matches!(handle.put("c", "v"), Err(Error::EffectsSealed)));
+        assert!(matches!(handle.delete("c"), Err(Error::EffectsSealed)));
+        assert!(matches!(
+            handle.enqueue(taquba::EnqueueRequest {
+                queue: "side".to_string(),
+                payload: Vec::new(),
+                options: Default::default(),
+            }),
+            Err(Error::EffectsSealed)
+        ));
+    }
+
+    #[test]
+    fn the_terminal_handle_applies_the_kv_staging_rules() {
+        let handle = TerminalEffects::detached();
+        assert!(matches!(
+            handle.put("workflow/x", "v"),
+            Err(Error::ReservedKvKey(_))
+        ));
+        assert!(matches!(
+            handle.delete("workflow/x"),
+            Err(Error::ReservedKvKey(_))
+        ));
+        handle.put("a", "v").unwrap();
+        assert!(matches!(
+            handle.delete("a"),
+            Err(Error::ConflictingKvEffect(_))
+        ));
     }
 
     #[test]

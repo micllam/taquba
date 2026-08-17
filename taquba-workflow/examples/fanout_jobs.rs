@@ -35,8 +35,8 @@ use taquba::Queue;
 use taquba::object_store::memory::InMemory;
 use taquba_jobs::{Job, JobContext, JobRunner};
 use taquba_workflow::{
-    RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalHook, TerminalStatus,
-    WorkflowRuntime,
+    RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects, TerminalHook,
+    TerminalStatus, WorkflowRuntime,
 };
 use tokio::sync::oneshot;
 
@@ -143,7 +143,11 @@ struct ShutdownOnComplete {
 }
 
 impl TerminalHook for ShutdownOnComplete {
-    async fn on_termination(&self, outcome: &RunOutcome) {
+    async fn on_termination(
+        &self,
+        outcome: &RunOutcome,
+        _effects: &TerminalEffects,
+    ) -> std::result::Result<(), StepError> {
         println!(
             "\n=== run {} {} (final_step={}) ===",
             outcome.run_id, outcome.status, outcome.final_step
@@ -163,6 +167,7 @@ impl TerminalHook for ShutdownOnComplete {
         if let Some(tx) = self.shutdown.lock().await.take() {
             let _ = tx.send(());
         }
+        Ok(())
     }
 }
 

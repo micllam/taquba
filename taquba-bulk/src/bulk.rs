@@ -11,7 +11,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use taquba::Queue;
 use taquba::object_store::ObjectStore;
-use taquba_workflow::{RunOutcome, RunSpec, TerminalHook, TerminalStatus, WorkflowRuntime};
+use taquba_workflow::{
+    RunOutcome, RunSpec, StepError, TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
+};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -66,7 +68,11 @@ impl<O> TerminalHook for BulkHook<O>
 where
     O: Serialize + DeserializeOwned + Send + 'static,
 {
-    async fn on_termination(&self, outcome: &RunOutcome) {
+    async fn on_termination(
+        &self,
+        outcome: &RunOutcome,
+        _effects: &TerminalEffects,
+    ) -> std::result::Result<(), StepError> {
         let status = outcome.status;
 
         // For a succeeded item, decode the envelope to recover the output
@@ -126,6 +132,7 @@ where
         if done {
             self.shared.notify.notify_one();
         }
+        Ok(())
     }
 }
 

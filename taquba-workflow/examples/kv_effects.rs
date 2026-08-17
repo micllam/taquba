@@ -30,7 +30,8 @@ use std::time::Duration;
 use taquba::Queue;
 use taquba::object_store::memory::InMemory;
 use taquba_workflow::{
-    RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalHook, WorkflowRuntime,
+    RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects, TerminalHook,
+    WorkflowRuntime,
 };
 
 fn status_key(run_id: &str) -> Vec<u8> {
@@ -67,8 +68,13 @@ struct CollectOutcomes {
 }
 
 impl TerminalHook for CollectOutcomes {
-    async fn on_termination(&self, outcome: &RunOutcome) {
+    async fn on_termination(
+        &self,
+        outcome: &RunOutcome,
+        _effects: &TerminalEffects,
+    ) -> std::result::Result<(), StepError> {
         let _ = self.tx.send(outcome.clone());
+        Ok(())
     }
 }
 
@@ -108,13 +114,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
     });
 
+    // The hook runs as the worker of a notification job enqueued
+    // atomically with the terminal acknowledgement, so once the outcome
+    // arrives the final effects are already committed.
     let outcome = outcomes.recv().await.expect("terminal outcome");
     println!("run terminated: {}", outcome.status);
-
-    // The terminal hook fires from the worker; the settlement applying
-    // the final effects commits just after it. Wait for the terminal
-    // step to settle before reading.
-    wait_for_drained(&queue).await?;
 
     println!("final: status = {}", read_status(&queue, run_id).await?);
     let pending = queue.kv_get(&pending_key(run_id)).await?;
@@ -130,15 +134,4 @@ async fn read_status(queue: &Queue, run_id: &str) -> Result<String, taquba::Erro
     Ok(value
         .map(|v| String::from_utf8_lossy(&v).into_owned())
         .unwrap_or_else(|| "<absent>".to_string()))
-}
-
-async fn wait_for_drained(queue: &Queue) -> Result<(), Box<dyn std::error::Error>> {
-    for _ in 0..200 {
-        let stats = queue.stats("workflow-steps").await?;
-        if stats.pending == 0 && stats.claimed == 0 && stats.scheduled == 0 {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    Err("the queue did not drain".into())
 }
