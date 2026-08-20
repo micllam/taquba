@@ -25,7 +25,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use slatedb::Db;
 use tokio::sync::watch;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::clock::Clock;
 use crate::error::Result;
@@ -67,6 +67,12 @@ pub struct StoreActivity {
 /// plus one durable commit apart, and a commit waits for the store's
 /// flush interval), or watch [`Self::counter`] advance across polls to
 /// avoid clock comparison entirely.
+///
+/// A clean [`Queue::close`](crate::Queue::close) commits a final beat
+/// marked [`Self::closed`], so a stale closed beat indicates a
+/// deliberate shutdown rather than a vanished writer. The marker is
+/// best-effort: a writer that could not commit it leaves its last
+/// periodic beat in place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriterHeartbeat {
     /// Beat counter, increasing across beats and across writer
@@ -81,6 +87,10 @@ pub struct WriterHeartbeat {
     /// beat whose epoch is below the manifest's current writer epoch
     /// was written by a superseded writer.
     pub writer_epoch: u64,
+    /// Whether this beat is the closing beat of a clean
+    /// [`Queue::close`](crate::Queue::close). The next open writes an
+    /// unclosed beat.
+    pub closed: bool,
 }
 
 /// Serialized form of a heartbeat, stored under the heartbeat key.
@@ -90,6 +100,7 @@ pub(crate) struct HeartbeatRecord {
     pub(crate) at_ms: u64,
     pub(crate) interval_ms: u64,
     pub(crate) writer_epoch: u64,
+    pub(crate) closed: bool,
 }
 
 impl HeartbeatRecord {
@@ -99,6 +110,7 @@ impl HeartbeatRecord {
             at_ms: self.at_ms,
             interval: Duration::from_millis(self.interval_ms),
             writer_epoch: self.writer_epoch,
+            closed: self.closed,
         }
     }
 }
@@ -112,12 +124,14 @@ pub(crate) async fn write_beat(
     counter: u64,
     interval: Duration,
     writer_epoch: u64,
+    closed: bool,
 ) -> Result<()> {
     let record = HeartbeatRecord {
         counter,
         at_ms: clock.now_ms(),
         interval_ms: interval.as_millis() as u64,
         writer_epoch,
+        closed,
     };
     let bytes = rmp_serde::to_vec(&record)?;
     db.put(heartbeat_key(), bytes).await?;
@@ -149,7 +163,9 @@ pub(crate) struct HeartbeatTask {
 }
 
 impl HeartbeatTask {
-    pub(crate) async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
+    /// Beat until shutdown, then return the task so the closer can
+    /// commit the closing beat with the task's counter.
+    pub(crate) async fn run(mut self, mut shutdown: watch::Receiver<bool>) -> Self {
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(self.interval) => {
@@ -167,6 +183,7 @@ impl HeartbeatTask {
                         counter,
                         self.interval,
                         self.writer_epoch,
+                        false,
                     )
                     .await
                     {
@@ -182,5 +199,25 @@ impl HeartbeatTask {
             }
         }
         debug!("liveness heartbeat stopped");
+        self
+    }
+
+    /// Commit the closing beat of a clean close. Best-effort: a failure
+    /// is logged and counted, leaving the last periodic beat in place,
+    /// and the close proceeds.
+    pub(crate) async fn write_closing_beat(self) {
+        if let Err(e) = write_beat(
+            &self.db,
+            self.clock.as_ref(),
+            self.next_counter,
+            self.interval,
+            self.writer_epoch,
+            true,
+        )
+        .await
+        {
+            crate::obs::heartbeat_failed();
+            warn!("closing liveness beat failed: {e}");
+        }
     }
 }

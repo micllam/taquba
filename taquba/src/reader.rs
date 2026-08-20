@@ -452,6 +452,7 @@ mod tests {
         assert_eq!(beat.counter, 1);
         assert_eq!(beat.at_ms, 1_700_000_000_000);
         assert_eq!(beat.interval, Duration::from_secs(3600));
+        assert!(!beat.closed);
 
         reader.close().await.unwrap();
         q.close().await.unwrap();
@@ -479,11 +480,34 @@ mod tests {
         let reader = QueueReader::open(store, "test").await.unwrap();
         let second = reader.writer_heartbeat().await.unwrap().unwrap();
         assert_eq!(first.counter, 1);
-        assert_eq!(second.counter, 2);
+        // The first close's closing beat took counter 2.
+        assert_eq!(second.counter, 3);
+        assert!(!second.closed);
         assert!(second.writer_epoch > first.writer_epoch);
 
         reader.close().await.unwrap();
         q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_clean_close_writes_a_closed_beat() {
+        let store = make_store();
+        let opts = OpenOptions {
+            clock: Arc::new(crate::MockClock::new(1_700_000_000_000)),
+            liveness_heartbeat: Some(Duration::from_secs(3600)),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(store.clone(), "test", opts)
+            .await
+            .unwrap();
+        q.close().await.unwrap();
+
+        let reader = QueueReader::open(store, "test").await.unwrap();
+        let beat = reader.writer_heartbeat().await.unwrap().unwrap();
+        assert!(beat.closed);
+        assert_eq!(beat.counter, 2);
+
+        reader.close().await.unwrap();
     }
 
     #[tokio::test]

@@ -20,12 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commits a liveness beat on the interval, the first during open, and
   `QueueReader::writer_heartbeat` returns the latest as a
   `WriterHeartbeat` (counter, writer clock time, interval, writer
-  epoch). A beat is an ordinary store commit, so a writer that lost
-  the store to a successor stops producing observable beats at its
-  next flush; a fresh beat proves the process that owns the store is
-  alive and proves nothing about its workers. A failed beat is logged
-  at error level and counted as `taquba_heartbeat_failures_total`
-  (`metrics` feature).
+  epoch, closed marker). A beat is an ordinary store commit, so a
+  writer that lost the store to a successor stops producing observable
+  beats at its next flush; a fresh beat proves the process that owns
+  the store is alive and proves nothing about its workers. A clean
+  `Queue::close` commits a final beat marked closed, distinguishing a
+  deliberate shutdown from a writer that stopped beating. A failed
+  beat is logged at error level and counted as
+  `taquba_heartbeat_failures_total` (`metrics` feature).
 - `Error::StoreNotInitialized`: `QueueReader::open` against a path
   holding no objects at all reports the typed variant; a path holding
   objects whose manifest cannot be read still reports

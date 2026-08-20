@@ -336,9 +336,11 @@ pub struct OpenOptions {
     /// successor stops producing observable beats at its next flush,
     /// and each failed beat is logged at error level and counted as
     /// `taquba_heartbeat_failures_total` (`metrics` feature). The first
-    /// beat is committed during open; the steady-state cost is one
-    /// durable commit per interval, whose WAL, L0 and compaction churn
-    /// is negligible.
+    /// beat is committed during open, and a clean [`Queue::close`]
+    /// commits a final beat marked closed, so a stale closed beat
+    /// indicates a deliberate shutdown rather than a vanished writer.
+    /// The steady-state cost is one durable commit per interval, whose
+    /// WAL, L0 and compaction churn is negligible.
     ///
     /// A beat awaits durability, so successive beats land the interval
     /// plus one commit latency apart. Choose an interval well above
@@ -509,8 +511,12 @@ pub struct Queue {
     metrics_sampler: Option<(watch::Sender<bool>, JoinHandle<()>)>,
     /// Shutdown sender and join handle for the optional liveness
     /// heartbeat. `Some` only when `OpenOptions::liveness_heartbeat`
-    /// was set.
-    heartbeat: Option<(watch::Sender<bool>, JoinHandle<()>)>,
+    /// was set. Joining returns the task so `close` can commit the
+    /// closing beat with the task's counter.
+    heartbeat: Option<(
+        watch::Sender<bool>,
+        JoinHandle<crate::liveness::HeartbeatTask>,
+    )>,
     default_queue_config: QueueConfig,
     queue_configs: HashMap<String, QueueConfig>,
     clock: Arc<dyn Clock>,
@@ -700,6 +706,7 @@ impl Queue {
                     counter,
                     interval,
                     writer_epoch,
+                    false,
                 )
                 .await?;
                 let (tx, rx) = watch::channel(false);
@@ -2674,7 +2681,10 @@ impl Queue {
     /// The persisted state lets the next open resume claims at the
     /// recorded bound instead of re-scanning the tombstone band left
     /// by previously claimed jobs, so the first claim after a clean
-    /// restart costs the same as a warm one.
+    /// restart costs the same as a warm one. With
+    /// [`OpenOptions::liveness_heartbeat`] set, a final beat marked
+    /// closed is committed best-effort, so readers can distinguish
+    /// this close from a writer that stopped beating.
     pub async fn close(self) -> Result<()> {
         let _ = self.reaper_shutdown.send(true);
         let _ = self.reaper_handle.await;
@@ -2686,7 +2696,9 @@ impl Queue {
         }
         if let Some((shutdown, handle)) = self.heartbeat {
             let _ = shutdown.send(true);
-            let _ = handle.await;
+            if let Ok(task) = handle.await {
+                task.write_closing_beat().await;
+            }
         }
         persist_cursor_state(&self.db, &self.claim_cursor).await?;
         self.db.close().await?;
