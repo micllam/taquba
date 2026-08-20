@@ -366,9 +366,23 @@ read-only credentials, at the cost of a read failing when garbage
 collection removes an object under an aged view. Two caveats: reader
 and writer must run the same taquba minor version, because the layout
 may change between minors and no version stamp is stored, and opening
-a reader against a path no writer has ever created fails on the
-missing manifest, an error a health check racing the first deployment
-must expect.
+a reader against a path no writer has ever created fails with
+`Error::StoreNotInitialized`, which a health check racing the first
+deployment must expect.
+
+A reader also answers whether a writer process is alive, the first
+question admin tooling asks before a destructive act such as opening
+the store as a writer, which fences a live one. `last_store_activity`
+reads the manifest's newest L0 flush timestamp and the writer epoch
+for display, plus the durable sequence number; a destructive operation
+watches the sequence number for advance over a few poll intervals, a
+judgment that involves no clock comparison. With
+`OpenOptions::liveness_heartbeat` set, the writer additionally commits
+a beat on an interval and `writer_heartbeat` reads the latest one. A
+beat is an ordinary store commit, so a writer that lost the store to a
+successor stops producing observable beats at its next flush: a fresh
+beat proves the process that owns the store is alive, and proves
+nothing about that process's workers.
 
 To make job outcomes observable across processes, settle them into the
 KV namespace: `Queue::ack_with` writes outcome entries atomically with

@@ -12,13 +12,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::StreamExt;
 use slatedb::config::DbReaderOptions;
+use slatedb::manifest::SsTableId;
 use slatedb::object_store::ObjectStore;
 use slatedb::{DbReader, DbReaderMode};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::history::JobAttempt;
 use crate::job::{JobRecord, JobStatus};
+use crate::liveness::{StoreActivity, WriterHeartbeat};
 use crate::payload_store::PayloadStore;
 use crate::queue::{JobPage, KvPage};
 use crate::stats::{QueueMergeOperator, QueueStats};
@@ -111,9 +114,9 @@ impl Default for ReaderOptions {
 ///
 /// Reader and writer must run the same taquba minor version: the
 /// on-disk layout may change between minors and no layout stamp is
-/// stored. Opening a reader against a path no writer has ever
-/// created fails on the missing manifest; a health check racing the
-/// first deployment must expect that error.
+/// stored. Opening a reader against a path no writer has ever created
+/// fails with [`Error::StoreNotInitialized`](crate::Error::StoreNotInitialized);
+/// a health check racing the first deployment must expect that error.
 ///
 /// # Observable outcomes
 ///
@@ -151,7 +154,7 @@ impl QueueReader {
             ReaderMode::ManagedCheckpoint => DbReaderMode::ManagedCheckpoint,
             ReaderMode::FollowLatest => DbReaderMode::FollowLatest,
         };
-        let reader = DbReader::builder(path, object_store)
+        let reader = DbReader::builder(path, object_store.clone())
             .with_reader_mode(mode)
             // Stats counters and attempt histories are merge operands;
             // without the operator their reads fail.
@@ -162,11 +165,61 @@ impl QueueReader {
                 ..DbReaderOptions::default()
             })
             .build()
-            .await?;
+            .await;
+        let reader = match reader {
+            Ok(reader) => reader,
+            // A missing manifest and a corrupt one share an error kind;
+            // an empty path identifies the never-written store.
+            Err(e)
+                if e.kind() == slatedb::ErrorKind::Data
+                    && store_path_is_empty(&object_store, path).await =>
+            {
+                return Err(Error::StoreNotInitialized {
+                    path: path.to_string(),
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
         Ok(Self {
             reader,
             payload_store,
         })
+    }
+
+    /// Return store-level activity read from this reader's view of the
+    /// manifest and the durable sequence number.
+    ///
+    /// [`StoreActivity::last_flush_at_ms`] and
+    /// [`StoreActivity::writer_epoch`] answer a display query with no
+    /// waiting. A destructive operation judges liveness by reading
+    /// [`StoreActivity::durable_seq`] more than once, a few
+    /// [`ReaderOptions::manifest_poll_interval`]s apart, and treating
+    /// advance as proof of live commits; that judgment involves no
+    /// clock comparison.
+    pub fn last_store_activity(&self) -> StoreActivity {
+        let status = self.reader.status();
+        let manifest = &status.current_manifest;
+        // L0 SSTs are written by the writer's memtable flusher, newest
+        // at the front; their ids embed the writer clock's timestamp.
+        let last_flush_at_ms = manifest.l0().front().and_then(|view| match view.sst.id {
+            SsTableId::Compacted(id) => Some(id.timestamp_ms()),
+            SsTableId::Wal(_) => None,
+        });
+        StoreActivity {
+            last_flush_at_ms,
+            writer_epoch: manifest.writer_epoch(),
+            durable_seq: status.durable_seq,
+        }
+    }
+
+    /// Return the most recent liveness beat committed by a writer with
+    /// [`OpenOptions::liveness_heartbeat`](crate::OpenOptions::liveness_heartbeat)
+    /// enabled, or `None` when no writer has ever written one.
+    ///
+    /// See [`WriterHeartbeat`] for what a beat proves and how to judge
+    /// its staleness.
+    pub async fn writer_heartbeat(&self) -> Result<Option<WriterHeartbeat>> {
+        crate::read::writer_heartbeat(&self.reader).await
     }
 
     /// Return a snapshot of job counts for the given queue.
@@ -258,6 +311,15 @@ impl QueueReader {
     }
 }
 
+/// Whether the store path holds no objects at all. Consulted only after
+/// an open failure, to separate a never-written store from one whose
+/// manifest cannot be read.
+async fn store_path_is_empty(store: &Arc<dyn ObjectStore>, path: &str) -> bool {
+    let prefix = slatedb::object_store::path::Path::from(path);
+    let mut listing = store.list(Some(&prefix));
+    listing.next().await.is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +406,119 @@ mod tests {
         assert_eq!(stats.done, 1);
 
         reader.close().await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn opening_a_reader_on_a_never_written_store_is_store_not_initialized() {
+        let store = make_store();
+        let err = match QueueReader::open(store, "test").await {
+            Err(e) => e,
+            Ok(_) => panic!("open succeeded on a never-written store"),
+        };
+        assert!(matches!(err, Error::StoreNotInitialized { ref path } if path == "test"));
+        assert!(!err.is_permanent());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_store_with_objects_is_a_storage_error() {
+        let store = make_store();
+        store
+            .put(&Path::from("test/unrelated"), b"x".to_vec().into())
+            .await
+            .unwrap();
+        let err = match QueueReader::open(store, "test").await {
+            Err(e) => e,
+            Ok(_) => panic!("open succeeded on an unreadable store"),
+        };
+        assert!(matches!(err, Error::Storage(_)));
+    }
+
+    #[tokio::test]
+    async fn a_writer_heartbeat_is_visible_to_a_reader() {
+        let store = make_store();
+        let clock = crate::MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            liveness_heartbeat: Some(Duration::from_secs(3600)),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(store.clone(), "test", opts)
+            .await
+            .unwrap();
+
+        let reader = QueueReader::open(store, "test").await.unwrap();
+        let beat = reader.writer_heartbeat().await.unwrap().unwrap();
+        assert_eq!(beat.counter, 1);
+        assert_eq!(beat.at_ms, 1_700_000_000_000);
+        assert_eq!(beat.interval, Duration::from_secs(3600));
+
+        reader.close().await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reopened_writer_continues_the_heartbeat_counter() {
+        let store = make_store();
+        let opts = || OpenOptions {
+            clock: Arc::new(crate::MockClock::new(1_700_000_000_000)),
+            liveness_heartbeat: Some(Duration::from_secs(3600)),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(store.clone(), "test", opts())
+            .await
+            .unwrap();
+        let reader = QueueReader::open(store.clone(), "test").await.unwrap();
+        let first = reader.writer_heartbeat().await.unwrap().unwrap();
+        reader.close().await.unwrap();
+        q.close().await.unwrap();
+
+        let q = Queue::open_with_options(store.clone(), "test", opts())
+            .await
+            .unwrap();
+        let reader = QueueReader::open(store, "test").await.unwrap();
+        let second = reader.writer_heartbeat().await.unwrap().unwrap();
+        assert_eq!(first.counter, 1);
+        assert_eq!(second.counter, 2);
+        assert!(second.writer_epoch > first.writer_epoch);
+
+        reader.close().await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_heartbeat_is_reported_when_not_configured() {
+        let store = make_store();
+        let q = Queue::open(store.clone(), "test").await.unwrap();
+        q.enqueue("work", b"x".to_vec()).await.unwrap();
+
+        let reader = QueueReader::open(store, "test").await.unwrap();
+        assert!(reader.writer_heartbeat().await.unwrap().is_none());
+
+        reader.close().await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn store_activity_reports_the_epoch_and_advances_with_commits() {
+        let store = make_store();
+        let q = Queue::open(store.clone(), "test").await.unwrap();
+        q.enqueue("work", b"a".to_vec()).await.unwrap();
+
+        let reader_a = QueueReader::open(store.clone(), "test").await.unwrap();
+        let before = reader_a.last_store_activity();
+        assert!(before.writer_epoch >= 1);
+
+        for _ in 0..3 {
+            q.enqueue("work", b"b".to_vec()).await.unwrap();
+        }
+        let reader_b = QueueReader::open(store, "test").await.unwrap();
+        let after = reader_b.last_store_activity();
+        assert!(after.durable_seq > before.durable_seq);
+        assert_eq!(after.writer_epoch, before.writer_epoch);
+
+        reader_a.close().await.unwrap();
+        reader_b.close().await.unwrap();
         q.close().await.unwrap();
     }
 

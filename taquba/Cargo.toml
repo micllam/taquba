@@ -36,6 +36,7 @@ tokio-util = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 metrics = { version = "0.24", optional = true }
 # Provides SlateDB's `MetricsRecorder` trait, bridged into the `metrics`
 # facade so SlateDB's storage metrics share the queue's recorder. Must track
@@ -48,7 +49,6 @@ metrics-util = "0.18"
 # Used only by the fault-injection tests' object-store wrapper.
 async-trait = "0.1"
 futures-core = "0.3"
-futures-util = { version = "0.3", default-features = false }
 # Used only by `examples/admin_http.rs`.
 axum = "0.8"
 serde_json = "1"

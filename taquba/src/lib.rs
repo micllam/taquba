@@ -286,8 +286,24 @@
 //! aged view. Two caveats: reader and writer must run the same taquba
 //! minor version, because the layout may change between minors and no
 //! version stamp is stored, and opening a reader against a path no
-//! writer has ever created fails on the missing manifest, an error a
-//! health check racing the first deployment must expect.
+//! writer has ever created fails with [`Error::StoreNotInitialized`],
+//! which a health check racing the first deployment must expect.
+//!
+//! A reader also answers whether a writer process is alive, the first
+//! question admin tooling asks before a destructive act such as
+//! opening the store as a writer, which fences a live one.
+//! [`QueueReader::last_store_activity`] reads the manifest's newest L0
+//! flush timestamp and the writer epoch for display, plus the durable
+//! sequence number; a destructive operation watches the sequence
+//! number for advance over a few poll intervals, a judgment that
+//! involves no clock comparison. With
+//! [`OpenOptions::liveness_heartbeat`] set, the writer additionally
+//! commits a beat on an interval and
+//! [`QueueReader::writer_heartbeat`] reads the latest one. A beat is
+//! an ordinary store commit, so a writer that lost the store to a
+//! successor stops producing observable beats at its next flush: a
+//! fresh beat proves the process that owns the store is alive, and
+//! proves nothing about that process's workers.
 //!
 //! To make job outcomes observable across processes, settle them into
 //! the KV namespace: [`Queue::ack_with`] writes outcome entries
@@ -347,6 +363,7 @@ mod job;
 mod keys;
 mod lease;
 mod lease_registry;
+mod liveness;
 #[cfg(feature = "metrics")]
 mod metrics_sampler;
 mod obs;
@@ -369,6 +386,7 @@ pub use history::{AttemptOutcome, JobAttempt};
 pub use job::{Claim, JobRecord, JobStatus};
 pub use keys::MAX_QUEUE_NAME_LEN;
 pub use lease::LeaseHandle;
+pub use liveness::{StoreActivity, WriterHeartbeat};
 pub use queue::{
     AckEffects, CancelOutcome, DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD, EnqueueOptions, EnqueueRequest,
     EnqueueResult, JobPage, KvPage, MAX_KV_VALUE_SIZE, OpenOptions, PRIORITY_HIGH, PRIORITY_LOW,

@@ -20,6 +20,8 @@
 //! - `taquba_jobs_dead_lettered_total{queue}`: jobs moved to the dead set.
 //! - `taquba_jobs_reaped_total{queue}`: expired claims requeued by the reaper.
 //! - `taquba_lease_renewals_total{queue}`: lease renewals on claimed jobs.
+//! - `taquba_heartbeat_failures_total`: liveness heartbeat commits that
+//!   failed; store-level, so it carries no `queue` label.
 //! - `taquba_enqueue_duration_seconds{queue}` / `taquba_claim_duration_seconds{queue}`
 //!   / `taquba_ack_duration_seconds{queue}`: per-operation latency histograms.
 //! - `taquba_pending_jobs{queue}` / `taquba_claimed_jobs{queue}`: current
@@ -68,6 +70,10 @@ mod imp {
         metrics::describe_counter!(
             "taquba_lease_renewals_total",
             "Lease renewals on claimed jobs"
+        );
+        metrics::describe_counter!(
+            "taquba_heartbeat_failures_total",
+            "Liveness heartbeat commits that failed"
         );
         metrics::describe_histogram!(
             "taquba_enqueue_duration_seconds",
@@ -122,6 +128,10 @@ mod imp {
 
     pub(crate) fn renewed(queue: &str) {
         metrics::counter!("taquba_lease_renewals_total", "queue" => queue.to_owned()).increment(1);
+    }
+
+    pub(crate) fn heartbeat_failed() {
+        metrics::counter!("taquba_heartbeat_failures_total").increment(1);
     }
 
     pub(crate) fn set_depth(queue: &str, pending: i64, claimed: i64) {
@@ -269,6 +279,8 @@ mod imp {
     pub(crate) fn reaped(_queue: &str, _n: u64) {}
     #[inline]
     pub(crate) fn renewed(_queue: &str) {}
+    #[inline]
+    pub(crate) fn heartbeat_failed() {}
 }
 
 pub(crate) use imp::*;
@@ -290,6 +302,7 @@ mod tests {
             super::dead_lettered("q");
             super::reaped("q", 3);
             super::renewed("q");
+            super::heartbeat_failed();
         });
 
         let emitted: Vec<String> = snapshotter
@@ -307,6 +320,7 @@ mod tests {
             "taquba_jobs_dead_lettered_total",
             "taquba_jobs_reaped_total",
             "taquba_lease_renewals_total",
+            "taquba_heartbeat_failures_total",
             "taquba_enqueue_duration_seconds",
             "taquba_claim_duration_seconds",
             "taquba_ack_duration_seconds",

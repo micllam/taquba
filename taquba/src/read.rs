@@ -15,9 +15,10 @@ use crate::error::{Error, Result};
 use crate::history::{JobAttempt, decode_history};
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{
-    KeyTag, attempt_history_key, claimed_prefix, dead_key, dead_prefix, job_index_key,
-    parse_stats_key, pending_prefix, stats_key, tag_prefix, user_scoped_key,
+    KeyTag, attempt_history_key, claimed_prefix, dead_key, dead_prefix, heartbeat_key,
+    job_index_key, parse_stats_key, pending_prefix, stats_key, tag_prefix, user_scoped_key,
 };
+use crate::liveness::{HeartbeatRecord, WriterHeartbeat};
 use crate::payload_store::PayloadStore;
 use crate::queue::{JobPage, KvPage, validate_queue_name};
 use crate::stats::{QueueStats, metric_name};
@@ -255,6 +256,18 @@ pub(crate) async fn get_job<H: ReadHandle>(
     let mut job: JobRecord = rmp_serde::from_slice(&bytes)?;
     materialize_payload(payloads, &mut job).await?;
     Ok(Some(job))
+}
+
+/// Body of `writer_heartbeat`: the stored liveness beat decoded to its
+/// public form, or `None` when no writer has ever written one.
+pub(crate) async fn writer_heartbeat<H: ReadHandle>(handle: &H) -> Result<Option<WriterHeartbeat>> {
+    match handle.get(&heartbeat_key()).await? {
+        Some(bytes) => {
+            let record: HeartbeatRecord = rmp_serde::from_slice(&bytes)?;
+            Ok(Some(record.into_public()))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Body of `kv_get`: one point read under the user key tag.

@@ -111,15 +111,28 @@ pub enum Error {
         /// The job whose payload object was absent.
         id: String,
     },
+
+    /// [`crate::QueueReader::open`] found no store at the path: the
+    /// open failed on the missing manifest and the path holds no
+    /// objects at all, so no writer has ever created the store there.
+    /// A store whose path holds objects but whose manifest cannot be
+    /// read reports [`Self::Storage`].
+    #[error("no store exists at `{path}`")]
+    StoreNotInitialized {
+        /// The store path that holds no objects.
+        path: String,
+    },
 }
 
 impl Error {
     /// True if retrying the operation will not change the outcome; callers
     /// should fast-fail rather than back off.
     ///
-    /// [`Self::Storage`] is conservatively treated as transient.
-    /// The remaining variants are programmer / data-shape errors
-    /// where retrying cannot help.
+    /// [`Self::Storage`] is conservatively treated as transient, as is
+    /// [`Self::StoreNotInitialized`]: a health check racing the first
+    /// deployment observes it until the writer creates the store, so a
+    /// retry can succeed. The remaining variants report incorrect
+    /// usage or malformed data, which retrying cannot change.
     pub fn is_permanent(&self) -> bool {
         match self {
             Self::Serialization(_)
@@ -133,7 +146,7 @@ impl Error {
             | Self::DuplicateJobId { .. }
             | Self::InvalidQueueName { .. }
             | Self::PayloadMissing { .. } => true,
-            Self::Storage(_) | Self::PayloadStore(_) => false,
+            Self::Storage(_) | Self::PayloadStore(_) | Self::StoreNotInitialized { .. } => false,
         }
     }
 }

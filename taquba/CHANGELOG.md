@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Writer-liveness observables on `QueueReader`, for admin tooling that
+  must judge whether a writer process is alive before a destructive
+  act. `QueueReader::last_store_activity` returns a `StoreActivity`:
+  the manifest's newest L0 flush timestamp and writer epoch for
+  display, plus the durable sequence number, which a destructive
+  operation watches for advance over a few poll intervals so the
+  judgment involves no clock comparison.
+- `OpenOptions::liveness_heartbeat` (default `None`): the writer
+  commits a liveness beat on the interval, the first during open, and
+  `QueueReader::writer_heartbeat` returns the latest as a
+  `WriterHeartbeat` (counter, writer clock time, interval, writer
+  epoch). A beat is an ordinary store commit, so a writer that lost
+  the store to a successor stops producing observable beats at its
+  next flush; a fresh beat proves the process that owns the store is
+  alive and proves nothing about its workers. A failed beat is logged
+  at error level and counted as `taquba_heartbeat_failures_total`
+  (`metrics` feature).
+- `Error::StoreNotInitialized`: `QueueReader::open` against a path
+  holding no objects at all reports the typed variant; a path holding
+  objects whose manifest cannot be read still reports
+  `Error::Storage`.
+
 ## [0.11.0] - 2026-08-12
 
 ### Added

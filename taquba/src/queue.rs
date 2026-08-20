@@ -326,6 +326,25 @@ pub struct OpenOptions {
     /// `metrics` feature; event counters and latency histograms are emitted
     /// inline regardless of this setting.
     pub metrics_sample_interval: Option<Duration>,
+    /// Interval on which the writer commits a liveness heartbeat that
+    /// [`crate::QueueReader::writer_heartbeat`] reads from another
+    /// process. `None` (the default) writes no heartbeat.
+    ///
+    /// A beat is an ordinary store commit, so a fresh beat proves the
+    /// process that owns the store is alive; it proves nothing about
+    /// that process's workers. A writer that lost the store to a
+    /// successor stops producing observable beats at its next flush,
+    /// and each failed beat is logged at error level and counted as
+    /// `taquba_heartbeat_failures_total` (`metrics` feature). The first
+    /// beat is committed during open; the steady-state cost is one
+    /// durable commit per interval, whose WAL, L0 and compaction churn
+    /// is negligible.
+    ///
+    /// A beat awaits durability, so successive beats land the interval
+    /// plus one commit latency apart. Choose an interval well above
+    /// [`Self::flush_interval`], so the cadence readers observe stays
+    /// close to the declared interval by which they judge staleness.
+    pub liveness_heartbeat: Option<Duration>,
     /// Payload size in bytes above which an enqueued payload is offloaded:
     /// written once as an object in the payload object store, with the
     /// record storing [`JobRecord::payload_ref`] instead of inline bytes.
@@ -358,6 +377,7 @@ impl Default for OpenOptions {
             clock: default_clock(),
             flush_interval: None,
             metrics_sample_interval: None,
+            liveness_heartbeat: None,
             payload_offload_threshold: Some(DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD),
             payload_store: None,
             payload_path: None,
@@ -487,6 +507,10 @@ pub struct Queue {
     /// `Some` only when built with the `metrics` feature and
     /// `OpenOptions::metrics_sample_interval` was set.
     metrics_sampler: Option<(watch::Sender<bool>, JoinHandle<()>)>,
+    /// Shutdown sender and join handle for the optional liveness
+    /// heartbeat. `Some` only when `OpenOptions::liveness_heartbeat`
+    /// was set.
+    heartbeat: Option<(watch::Sender<bool>, JoinHandle<()>)>,
     default_queue_config: QueueConfig,
     queue_configs: HashMap<String, QueueConfig>,
     clock: Arc<dyn Clock>,
@@ -663,6 +687,34 @@ impl Queue {
         #[cfg(not(feature = "metrics"))]
         let metrics_sampler: Option<(watch::Sender<bool>, JoinHandle<()>)> = None;
 
+        let heartbeat = match opts.liveness_heartbeat {
+            Some(interval) => {
+                // The first beat is committed before open returns, so an
+                // open store with the heartbeat enabled always holds one,
+                // and the counter continues from any earlier writer's.
+                let counter = crate::liveness::stored_counter(&db).await? + 1;
+                let writer_epoch = db.manifest().writer_epoch();
+                crate::liveness::write_beat(
+                    &db,
+                    opts.clock.as_ref(),
+                    counter,
+                    interval,
+                    writer_epoch,
+                )
+                .await?;
+                let (tx, rx) = watch::channel(false);
+                let task = crate::liveness::HeartbeatTask {
+                    db: db.clone(),
+                    clock: opts.clock.clone(),
+                    interval,
+                    next_counter: counter + 1,
+                    writer_epoch,
+                };
+                Some((tx, tokio::spawn(task.run(rx))))
+            }
+            None => None,
+        };
+
         Ok(Self {
             db,
             reaper_shutdown,
@@ -670,6 +722,7 @@ impl Queue {
             scheduler_shutdown,
             scheduler_handle,
             metrics_sampler,
+            heartbeat,
             default_queue_config: opts.default_queue_config,
             queue_configs: opts.queue_configs,
             clock: opts.clock,
@@ -2628,6 +2681,10 @@ impl Queue {
         let _ = self.scheduler_shutdown.send(true);
         let _ = self.scheduler_handle.await;
         if let Some((shutdown, handle)) = self.metrics_sampler {
+            let _ = shutdown.send(true);
+            let _ = handle.await;
+        }
+        if let Some((shutdown, handle)) = self.heartbeat {
             let _ = shutdown.send(true);
             let _ = handle.await;
         }

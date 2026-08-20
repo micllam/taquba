@@ -68,6 +68,11 @@ pub(crate) enum KeyTag {
     /// removes the job's last record (ack without retention, cancel,
     /// the retention sweeps).
     AttemptHistory = 0x0A,
+    /// `[tag, ver]`; a single key per store. The value is the writer's
+    /// most recent liveness heartbeat, written every
+    /// [`crate::OpenOptions::liveness_heartbeat`] interval and read
+    /// through [`crate::QueueReader::writer_heartbeat`].
+    Heartbeat = 0x0B,
     /// `[tag, caller bytes]`; no version byte, caller bytes are opaque.
     User = 0xFF,
 }
@@ -183,6 +188,10 @@ pub(crate) fn cursor_key(queue: &str) -> Vec<u8> {
     k.extend_from_slice(&header(KeyTag::Cursor));
     k.extend_from_slice(queue.as_bytes());
     k
+}
+
+pub(crate) fn heartbeat_key() -> Vec<u8> {
+    header(KeyTag::Heartbeat).to_vec()
 }
 
 pub(crate) fn stats_key(queue: &str, metric: &str) -> Vec<u8> {
@@ -306,6 +315,7 @@ mod tests {
             dedup_index_key("q", "id"),
             cursor_key("q"),
             stats_key("q", "m"),
+            heartbeat_key(),
             user_scoped_key(b"id"),
         ];
         for (i, a) in keys.iter().enumerate() {
