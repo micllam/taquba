@@ -137,16 +137,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 cargo run -p taquba-workflow --example single_step
 cargo run -p taquba-workflow --example multi_step
 cargo run -p taquba-workflow --example crash_resume
+cargo run -p taquba-workflow --example durable_approvals
 cargo run -p taquba-workflow --example fanout_jobs
 ANTHROPIC_API_KEY=... cargo run -p taquba-workflow --example rig_agent
 OPENAI_API_KEY=...    cargo run -p taquba-workflow --example rig_agent
 ```
 
-`crash_resume` runs on the local filesystem and is the one example that
-demonstrates recovery directly: start it, interrupt it during any stage
-and start it again. The second process resumes the same run, skips the
-stages already committed and serves the completed units of the
-interrupted stage from the memo store.
+`crash_resume` runs on the local filesystem and demonstrates recovery
+directly: start it, interrupt it during any stage and start it again.
+The second process resumes the same run, skips the stages already
+committed and serves the completed units of the interrupted stage from
+the memo store.
+
+`durable_approvals` runs an agent loop on the local filesystem and
+holds it for approval across processes: the first invocation
+investigates a claim one turn per step, proposes a refund and exits
+with the run waiting; a later invocation with `-- approve` or
+`-- reject <reason>` delivers the decision and resumes the run to
+completion. A decision delivered before the first invocation is
+buffered and consumed at registration, and a run that waits past its
+timeout escalates at the next plain invocation.
 
 `rig_agent` is a two-stage AI agent (research, then write) structured
 for between-step durability: step 0's research is persisted as queue
@@ -248,12 +258,14 @@ match runtime.signal(&format!("payment:{order_id}"), body).await? {
 ```
 
 Signals are durable in both directions. The waiting step is a scheduled
-job in the store, so the wait survives restarts and costs nothing while
-pending. A signal with no registered waiter is buffered durably under its
-correlation key and consumed by the next waiter registered for it, so a
-signal that arrives before its waiter is not lost;
+job in the store, so the wait survives restarts and occupies no worker
+while pending. A signal with no registered waiter is buffered durably
+under its correlation key and consumed by the next waiter registered for
+it, so a signal that arrives before its waiter is not lost;
 `WorkflowRuntime::clear_signal` discards a buffered signal that is no
-longer wanted.
+longer wanted. A waiting run resumes under the runner hosted by the
+resuming process: the wait survives restarts of the agent, and a runner
+changed while the run waits is the caller's compatibility concern.
 
 Semantics: delivery follows the crate's at-least-once model (the woken
 step can be redelivered and observes the same `Step::signal` value on
@@ -264,8 +276,9 @@ unique to the waiter (include the run id if uniqueness is uncertain). Signals ar
 scoped to the store: the signaller is the same process that hosts the
 runtime, per the single-process design.
 
-See [`examples/signals.rs`](examples/signals.rs) for a runnable approval
-flow covering all three delivery paths (signal, timeout, buffered).
+See [`examples/durable_approvals.rs`](examples/durable_approvals.rs)
+for a runnable approval flow covering all three delivery paths (signal,
+timeout, buffered) across process restarts.
 
 ## Application KV effects
 

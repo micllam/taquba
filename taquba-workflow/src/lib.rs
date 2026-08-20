@@ -221,12 +221,15 @@
 //! ```
 //!
 //! Signals are durable in both directions. The waiting step is a
-//! scheduled job in the store, so the wait survives restarts and costs
-//! nothing while pending. A signal with no registered waiter is buffered
-//! durably under its correlation key and consumed by the next waiter
-//! registered for it, so a signal that arrives before its waiter is not
-//! lost; [`WorkflowRuntime::clear_signal`] discards a buffered signal
-//! that is no longer wanted.
+//! scheduled job in the store, so the wait survives restarts and
+//! occupies no worker while pending. A signal with no registered waiter
+//! is buffered durably under its correlation key and consumed by the
+//! next waiter registered for it, so a signal that arrives before its
+//! waiter is not lost; [`WorkflowRuntime::clear_signal`] discards a
+//! buffered signal that is no longer wanted. A waiting run resumes
+//! under the runner hosted by the resuming process: the wait survives
+//! restarts of the agent, and a runner changed while the run waits is
+//! the caller's compatibility concern.
 //!
 //! Semantics: delivery follows the crate's at-least-once model (the woken
 //! step can be redelivered and observes the same [`Step::signal`] value on
@@ -237,8 +240,9 @@
 //! doubt). Signals are scoped to the store: the signaller is the same
 //! process that hosts the runtime, per the single-process design.
 //!
-//! See `examples/signals.rs` for a runnable approval flow covering all
-//! three delivery paths (signal, timeout, buffered).
+//! See `examples/durable_approvals.rs` for a runnable approval flow
+//! covering all three delivery paths (signal, timeout, buffered) across
+//! process restarts.
 //!
 //! # Application KV effects
 //!

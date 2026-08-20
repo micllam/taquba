@@ -2346,6 +2346,84 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_run_waiting_on_a_signal_survives_a_close_and_reopen() {
+        let store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
+        let open = |store: Arc<dyn taquba::object_store::ObjectStore>| async move {
+            Arc::new(
+                Queue::open_with_options(
+                    store,
+                    "test",
+                    OpenOptions {
+                        clock: Arc::new(MockClock::new(1_700_000_000_000)),
+                        ..OpenOptions::default()
+                    },
+                )
+                .await
+                .unwrap(),
+            )
+        };
+
+        let queue = open(store.clone()).await;
+        let (runtime, _observed, _rx) = signal_probe_runtime(
+            queue.clone(),
+            store.clone(),
+            "approval",
+            Duration::from_secs(3600),
+        );
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let worker = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .run(async move {
+                        let _ = stop_rx.await;
+                    })
+                    .await
+            }
+        });
+        runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        wait_for_scheduled(&queue, 1).await;
+        let _ = stop_tx.send(());
+        worker.await.unwrap().unwrap();
+        drop(runtime);
+        Arc::into_inner(queue)
+            .expect("no other queue references at close")
+            .close()
+            .await
+            .unwrap();
+
+        let queue = open(store.clone()).await;
+        assert_eq!(queue.stats("workflow-steps").await.unwrap().scheduled, 1);
+
+        let (runtime, observed, mut rx) =
+            signal_probe_runtime(queue.clone(), store, "approval", Duration::from_secs(3600));
+        let shutdown = spawn_runtime(runtime.clone());
+
+        let delivery = runtime
+            .signal("approval", b"approved".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(delivery, SignalOutcome::Delivered);
+
+        let terminal = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.status, TerminalStatus::Succeeded);
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            &[Some(b"approved".to_vec())]
+        );
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn signal_timeout_delivers_none() {
         let (queue, store, clock) = fresh_queue_with_mock_clock(1_700_000_000_000).await;
         let (runtime, observed, mut rx) =
