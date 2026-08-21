@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Settlement effects on the failure and cancellation transitions.
+  `Queue::dead_letter_with` applies `SettlementEffects` atomically
+  with the dead-letter transition, exactly as `Queue::ack_with` does
+  with the acknowledgement. `Queue::nack_with` returns the new
+  `NackOutcome` and applies its effects only when the nack exhausts
+  the job's attempts and dead-letters it; a retried nack discards them.
+  `Queue::cancel_with` applies its effects only with a
+  `CancelOutcome::Removed` removal. The worker loops route an error
+  wrapped in the new `FailWith` to `dead_letter_with` or `nack_with`,
+  so a `Worker` can attach effects to a failure without access to the
+  claim.
+
 - Writer-liveness observables on `QueueReader`, for admin tooling that
   must judge whether a writer process is alive before a destructive
   act. `QueueReader::last_store_activity` returns a `StoreActivity`:
@@ -32,6 +44,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   holding no objects at all reports the typed variant; a path holding
   objects whose manifest cannot be read still reports
   `Error::Storage`.
+
+### Changed
+
+- `AckEffects` is renamed `SettlementEffects`, the effects now riding
+  the dead-letter, exhausted-nack and cancellation transitions as well
+  as the acknowledgement. Fields and behaviour are unchanged.
 
 ## [0.11.0] - 2026-08-12
 

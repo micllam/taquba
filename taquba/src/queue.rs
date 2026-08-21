@@ -50,6 +50,19 @@ pub enum CancelOutcome {
     NotFound,
 }
 
+/// Outcome of [`Queue::nack_with`], reflecting which settlement branch
+/// the failure took.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NackOutcome {
+    /// Attempts remained, so the job was re-queued (immediately or
+    /// after backoff) and the effects were discarded.
+    Retried,
+    /// Attempts were exhausted, so the job was dead-lettered and the
+    /// effects were applied. The results align index-wise with the
+    /// effects' enqueues.
+    DeadLettered(Vec<EnqueueResult>),
+}
+
 /// Outcome of [`Queue::wake_scheduled`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeOutcome {
@@ -448,7 +461,7 @@ pub struct EnqueueOptions {
     pub id_override: Option<String>,
 }
 
-/// One enqueue carried by [`AckEffects`].
+/// One enqueue carried by [`SettlementEffects`].
 #[derive(Debug, Clone)]
 pub struct EnqueueRequest {
     /// Queue the job is enqueued on.
@@ -461,12 +474,14 @@ pub struct EnqueueRequest {
     pub options: EnqueueOptions,
 }
 
-/// Effects applied in the same transaction as an acknowledgement via
-/// [`Queue::ack_with`]. Either everything lands (the ack, every
-/// enqueue, every KV change) or nothing does.
+/// Effects applied in the same transaction as a settlement: an
+/// acknowledgement via [`Queue::ack_with`], a dead-letter via
+/// [`Queue::dead_letter_with`] or [`Queue::nack_with`], or a
+/// pending-job removal via [`Queue::cancel_with`]. Either the
+/// settlement and every effect commit together or nothing does.
 #[derive(Debug, Clone, Default)]
-pub struct AckEffects {
-    /// Jobs enqueued atomically with the ack.
+pub struct SettlementEffects {
+    /// Jobs enqueued atomically with the settlement.
     pub enqueues: Vec<EnqueueRequest>,
     /// Writes applied to the caller KV namespace, as in
     /// [`Queue::enqueue_with_kv`]. Values are size-capped at
@@ -604,6 +619,15 @@ struct PreparedJob {
     job: JobRecord,
     key: Vec<u8>,
     id_override_used: bool,
+}
+
+/// [`SettlementEffects`] validated and prepared by [`Queue::prepare_effects`],
+/// awaiting staging into a settlement transaction.
+#[derive(Default)]
+struct PreparedEffects {
+    prepared_jobs: Vec<PreparedJob>,
+    kv_writes: HashMap<Vec<u8>, Vec<u8>>,
+    kv_deletes: Vec<Vec<u8>>,
 }
 
 /// Identity of a job staged by [`Queue::stage_job_writes`], retained
@@ -965,7 +989,7 @@ impl Queue {
     ///
     /// This is the standalone form; to couple a KV write with a queue
     /// transition in one transaction, use [`Self::enqueue_with_kv`] or
-    /// [`AckEffects::kv_writes`] via [`Self::ack_with`].
+    /// [`SettlementEffects::kv_writes`] via [`Self::ack_with`].
     pub async fn kv_put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         validate_kv_value_size(value)?;
         self.db.put(user_scoped_key(key), value).await?;
@@ -1244,30 +1268,94 @@ impl Queue {
         }
     }
 
-    /// Delete the payload objects of [`Self::ack_with`] follow-up jobs
-    /// that no committed record points at: every offloaded one when the
-    /// settlement failed, or the ones whose enqueue downgraded to
-    /// [`EnqueueResult::AlreadyEnqueued`] when it succeeded. `outcome`'s
-    /// results align index-wise with `prepared_jobs`.
+    /// Delete the payload objects of prepared follow-up jobs that no
+    /// committed record points at. `results` aligns index-wise with
+    /// `prepared_jobs`: an [`EnqueueResult::AlreadyEnqueued`] entry
+    /// marks a dedup downgrade whose object is unreferenced. `None`
+    /// means no follow-up record committed (the settlement failed or
+    /// took a branch that discards the effects), so every offloaded
+    /// object is deleted.
     async fn delete_unreferenced_follow_up_payloads(
         &self,
         prepared_jobs: &[PreparedJob],
-        outcome: &Result<Vec<EnqueueResult>>,
+        results: Option<&[EnqueueResult]>,
     ) {
-        match outcome {
-            Ok(results) => {
+        match results {
+            Some(results) => {
                 for (prepared, result) in prepared_jobs.iter().zip(results) {
                     if matches!(result, EnqueueResult::AlreadyEnqueued(_)) {
                         self.delete_payload_object(&prepared.job).await;
                     }
                 }
             }
-            Err(_) => {
+            None => {
                 for prepared in prepared_jobs {
                     self.delete_payload_object(&prepared.job).await;
                 }
             }
         }
+    }
+
+    /// Validate `effects` and prepare them for staging: size-check the
+    /// KV writes, build the follow-up job records and offload their
+    /// payloads. Runs once, before a settlement's transaction loop, so
+    /// the follow-up ids stay stable across conflict retries and a
+    /// committed record never points at an unwritten object. The
+    /// caller must delete the payload objects of prepared jobs that
+    /// ended up without a committed record, via
+    /// [`Self::delete_unreferenced_follow_up_payloads`] or directly.
+    async fn prepare_effects(&self, effects: SettlementEffects) -> Result<PreparedEffects> {
+        for value in effects.kv_writes.values() {
+            validate_kv_value_size(value)?;
+        }
+        let mut prepared_jobs = Vec::with_capacity(effects.enqueues.len());
+        for request in effects.enqueues {
+            let (job, key, id_override_used) =
+                self.prepare_job_record(&request.queue, request.payload, request.options)?;
+            prepared_jobs.push(PreparedJob {
+                job,
+                key,
+                id_override_used,
+            });
+        }
+        self.offload_payloads(prepared_jobs.iter_mut().map(|p| &mut p.job))
+            .await?;
+        Ok(PreparedEffects {
+            prepared_jobs,
+            kv_writes: effects.kv_writes,
+            kv_deletes: effects.kv_deletes,
+        })
+    }
+
+    /// Add prepared effects to a caller-owned settlement transaction.
+    /// Called inside every iteration of the settlement's retry loop.
+    /// A dedup hit downgrades that enqueue to
+    /// [`EnqueueResult::AlreadyEnqueued`] without affecting the rest.
+    /// After the transaction commits, the caller must pass each staged
+    /// value to [`Self::note_staged_job`].
+    async fn stage_effects(
+        &self,
+        txn: &DbTransaction,
+        prepared: &PreparedEffects,
+    ) -> Result<(Vec<EnqueueResult>, Vec<StagedJob>)> {
+        let mut staged = Vec::with_capacity(prepared.prepared_jobs.len());
+        let mut results = Vec::with_capacity(prepared.prepared_jobs.len());
+        for prepared_job in &prepared.prepared_jobs {
+            match self.stage_job_writes(txn, prepared_job).await? {
+                Ok(staged_job) => {
+                    results.push(EnqueueResult::New(staged_job.id.clone()));
+                    staged.push(staged_job);
+                }
+                Err(existing) => results.push(EnqueueResult::AlreadyEnqueued(existing)),
+            }
+        }
+        for (k, v) in &prepared.kv_writes {
+            txn.put(user_scoped_key(k), v)?;
+        }
+        for k in &prepared.kv_deletes {
+            txn.delete(user_scoped_key(k))?;
+        }
+        Ok((results, staged))
     }
 
     /// Persist a prepared [`JobRecord`], optionally checking a dedup index
@@ -1765,7 +1853,7 @@ impl Queue {
     /// [`OpenOptions::default_queue_config`] for an instance-wide default)
     /// to retain completed jobs for a bounded duration.
     pub async fn ack(&self, claim: &Claim) -> Result<()> {
-        self.ack_with(claim, AckEffects::default())
+        self.ack_with(claim, SettlementEffects::default())
             .await
             .map(|_| ())
     }
@@ -1779,7 +1867,7 @@ impl Queue {
     /// fails with [`Error::ClaimLost`] and no effect is applied, so
     /// a follow-up job exists only if this settlement won.
     ///
-    /// Each enqueue in [`AckEffects::enqueues`] behaves exactly like
+    /// Each enqueue in [`SettlementEffects::enqueues`] behaves exactly like
     /// [`Self::enqueue_with`]: a `dedup_key` hit downgrades that
     /// request to [`EnqueueResult::AlreadyEnqueued`] without affecting
     /// the ack or the other effects, and a future `run_at` lands the
@@ -1787,11 +1875,13 @@ impl Queue {
     /// index-wise with `effects.enqueues`. KV writes and deletes
     /// behave like [`Self::enqueue_with_kv`] and [`Self::kv_delete`].
     #[instrument(skip(self, claim, effects), fields(queue = %claim.queue, job_id = %claim.id))]
-    pub async fn ack_with(&self, claim: &Claim, effects: AckEffects) -> Result<Vec<EnqueueResult>> {
+    pub async fn ack_with(
+        &self,
+        claim: &Claim,
+        effects: SettlementEffects,
+    ) -> Result<Vec<EnqueueResult>> {
         let job = claim.job();
-        for value in effects.kv_writes.values() {
-            validate_kv_value_size(value)?;
-        }
+        let prepared = self.prepare_effects(effects).await?;
 
         let timer = crate::obs::start();
         let token = claim.token();
@@ -1811,24 +1901,6 @@ impl Queue {
         } else {
             None
         };
-
-        // Prepare the follow-up jobs from `effects.enqueues` once; their
-        // ids stay stable across transaction-conflict retries, as in the
-        // plain enqueue path. Payload offloads happen here, before the
-        // transaction, so a committed record never points at an
-        // unwritten object.
-        let mut prepared_jobs = Vec::with_capacity(effects.enqueues.len());
-        for request in effects.enqueues {
-            let (follow_up_job, key, id_override_used) =
-                self.prepare_job_record(&request.queue, request.payload, request.options)?;
-            prepared_jobs.push(PreparedJob {
-                job: follow_up_job,
-                key,
-                id_override_used,
-            });
-        }
-        self.offload_payloads(prepared_jobs.iter_mut().map(|p| &mut p.job))
-            .await?;
 
         let outcome: Result<Vec<EnqueueResult>> = async {
             loop {
@@ -1860,23 +1932,7 @@ impl Queue {
                     &[(JobStatus::Claimed, -1), (JobStatus::Done, 1)],
                 )?;
 
-                let mut staged = Vec::with_capacity(prepared_jobs.len());
-                let mut results = Vec::with_capacity(prepared_jobs.len());
-                for prepared in &prepared_jobs {
-                    match self.stage_job_writes(&txn, prepared).await? {
-                        Ok(staged_job) => {
-                            results.push(EnqueueResult::New(staged_job.id.clone()));
-                            staged.push(staged_job);
-                        }
-                        Err(existing) => results.push(EnqueueResult::AlreadyEnqueued(existing)),
-                    }
-                }
-                for (k, v) in &effects.kv_writes {
-                    txn.put(user_scoped_key(k), v)?;
-                }
-                for k in &effects.kv_deletes {
-                    txn.delete(user_scoped_key(k))?;
-                }
+                let (results, staged) = self.stage_effects(&txn, &prepared).await?;
 
                 match txn.commit().await {
                     Ok(_) => {
@@ -1892,8 +1948,11 @@ impl Queue {
         }
         .await;
 
-        self.delete_unreferenced_follow_up_payloads(&prepared_jobs, &outcome)
-            .await;
+        self.delete_unreferenced_follow_up_payloads(
+            &prepared.prepared_jobs,
+            outcome.as_ref().ok().map(|r| r.as_slice()),
+        )
+        .await;
         let results = outcome?;
         // After the commit and token-fenced, so a removal that runs
         // after a re-claim leaves the new claim's entry.
@@ -1919,104 +1978,150 @@ impl Queue {
     /// when the backoff is non-zero, the job is parked in the scheduled key space and
     /// the background scheduler promotes it once the delay has elapsed. With zero
     /// backoff the job goes straight back to pending.
-    #[instrument(skip(self, claim), fields(queue = %claim.queue, job_id = %claim.id))]
     pub async fn nack(&self, claim: &Claim, error: &str) -> Result<()> {
+        self.nack_with(claim, error, SettlementEffects::default())
+            .await
+            .map(|_| ())
+    }
+
+    /// Report failure and apply `effects` in the same transaction when
+    /// the failure dead-letters the job.
+    ///
+    /// Behaves like [`Self::nack`]. While attempts remain the job is
+    /// re-queued, the effects are discarded and the call returns
+    /// [`NackOutcome::Retried`]; a later settlement supplies its own
+    /// effects. Once attempts are exhausted the job is dead-lettered
+    /// and the effects are applied atomically with that transition,
+    /// exactly as in [`Self::ack_with`], and the call returns
+    /// [`NackOutcome::DeadLettered`].
+    #[instrument(skip(self, claim, effects), fields(queue = %claim.queue, job_id = %claim.id))]
+    pub async fn nack_with(
+        &self,
+        claim: &Claim,
+        error: &str,
+        effects: SettlementEffects,
+    ) -> Result<NackOutcome> {
+        let prepared = self.prepare_effects(effects).await?;
         let token = claim.token();
         let (queue, id) = (claim.job().queue.as_str(), claim.job().id.as_str());
 
-        let job = loop {
-            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            // The returned record is the base for the written record;
-            // the claim's copy predates a cancel committed during the
-            // delivery.
-            let mut job = take_claim(&txn, &self.lease_registry, queue, id, token).await?;
-            // Captured before the retry branches clear it on the record.
-            let claimed_at = job.claimed_at;
-            job.last_error = Some(error.to_string());
-            append_attempt(
-                &txn,
-                &job.id,
-                &JobAttempt {
-                    attempt: job.attempts,
-                    claimed_at,
-                    recorded_at: self.now_ms(),
-                    outcome: if job.attempts >= job.max_attempts {
-                        AttemptOutcome::DeadLettered
-                    } else {
-                        AttemptOutcome::Retried
-                    },
-                    error: Some(error.to_string()),
-                },
-            )?;
-
-            if job.attempts >= job.max_attempts {
-                job.status = JobStatus::Dead;
-                job.failed_at = Some(self.now_ms());
-                let dead = dead_key(&job.queue, &job.id);
-                let value = job.stored_bytes()?;
-                put_job_record(&txn, &dead, &job_index_key(&job.id), &value)?;
-                update_stats(
+        type Settled = (JobRecord, Option<Vec<EnqueueResult>>);
+        let settled: Result<Settled> = async {
+            loop {
+                let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+                // The returned record is the base for the written record;
+                // the claim's copy predates a cancel committed during the
+                // delivery.
+                let mut job = take_claim(&txn, &self.lease_registry, queue, id, token).await?;
+                // Captured before the retry branches clear it on the record.
+                let claimed_at = job.claimed_at;
+                job.last_error = Some(error.to_string());
+                append_attempt(
                     &txn,
-                    &job.queue,
-                    &[(JobStatus::Claimed, -1), (JobStatus::Dead, 1)],
+                    &job.id,
+                    &JobAttempt {
+                        attempt: job.attempts,
+                        claimed_at,
+                        recorded_at: self.now_ms(),
+                        outcome: if job.attempts >= job.max_attempts {
+                            AttemptOutcome::DeadLettered
+                        } else {
+                            AttemptOutcome::Retried
+                        },
+                        error: Some(error.to_string()),
+                    },
                 )?;
-                warn!(
-                    queue = %job.queue,
-                    job_id = %job.id,
-                    attempts = job.attempts,
-                    "job dead-lettered"
-                );
-            } else {
-                let cfg = self.queue_config(&job.queue);
-                let backoff =
-                    backoff_delay(job.attempts, cfg.retry_backoff_base, cfg.retry_backoff_max);
-                job.claimed_at = None;
 
-                if backoff.is_zero() {
-                    job.status = JobStatus::Pending;
-                    let priority = job.priority;
-                    let pending = pending_key(&job.queue, priority, &job.id);
+                let staged = if job.attempts >= job.max_attempts {
+                    job.status = JobStatus::Dead;
+                    job.failed_at = Some(self.now_ms());
+                    let dead = dead_key(&job.queue, &job.id);
                     let value = job.stored_bytes()?;
-                    put_job_record(&txn, &pending, &job_index_key(&job.id), &value)?;
+                    put_job_record(&txn, &dead, &job_index_key(&job.id), &value)?;
                     update_stats(
                         &txn,
                         &job.queue,
-                        &[(JobStatus::Pending, 1), (JobStatus::Claimed, -1)],
+                        &[(JobStatus::Claimed, -1), (JobStatus::Dead, 1)],
                     )?;
-                    debug!(
+                    warn!(
                         queue = %job.queue,
                         job_id = %job.id,
                         attempts = job.attempts,
-                        "job re-queued"
+                        "job dead-lettered"
                     );
+                    Some(self.stage_effects(&txn, &prepared).await?)
                 } else {
-                    let run_at = self.now_ms() + backoff.as_millis() as u64;
-                    job.status = JobStatus::Scheduled;
-                    job.run_at = Some(run_at);
-                    let scheduled = scheduled_key(&job.queue, run_at, &job.id);
-                    let value = job.stored_bytes()?;
-                    put_job_record(&txn, &scheduled, &job_index_key(&job.id), &value)?;
-                    update_stats(
-                        &txn,
-                        &job.queue,
-                        &[(JobStatus::Claimed, -1), (JobStatus::Scheduled, 1)],
-                    )?;
-                    debug!(
-                        queue = %job.queue,
-                        job_id = %job.id,
-                        attempts = job.attempts,
-                        backoff_ms = backoff.as_millis() as u64,
-                        "job scheduled for retry"
-                    );
+                    let cfg = self.queue_config(&job.queue);
+                    let backoff =
+                        backoff_delay(job.attempts, cfg.retry_backoff_base, cfg.retry_backoff_max);
+                    job.claimed_at = None;
+
+                    if backoff.is_zero() {
+                        job.status = JobStatus::Pending;
+                        let priority = job.priority;
+                        let pending = pending_key(&job.queue, priority, &job.id);
+                        let value = job.stored_bytes()?;
+                        put_job_record(&txn, &pending, &job_index_key(&job.id), &value)?;
+                        update_stats(
+                            &txn,
+                            &job.queue,
+                            &[(JobStatus::Pending, 1), (JobStatus::Claimed, -1)],
+                        )?;
+                        debug!(
+                            queue = %job.queue,
+                            job_id = %job.id,
+                            attempts = job.attempts,
+                            "job re-queued"
+                        );
+                    } else {
+                        let run_at = self.now_ms() + backoff.as_millis() as u64;
+                        job.status = JobStatus::Scheduled;
+                        job.run_at = Some(run_at);
+                        let scheduled = scheduled_key(&job.queue, run_at, &job.id);
+                        let value = job.stored_bytes()?;
+                        put_job_record(&txn, &scheduled, &job_index_key(&job.id), &value)?;
+                        update_stats(
+                            &txn,
+                            &job.queue,
+                            &[(JobStatus::Claimed, -1), (JobStatus::Scheduled, 1)],
+                        )?;
+                        debug!(
+                            queue = %job.queue,
+                            job_id = %job.id,
+                            attempts = job.attempts,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "job scheduled for retry"
+                        );
+                    }
+                    None
+                };
+
+                match txn.commit().await {
+                    Ok(_) => {
+                        let results = staged.map(|(results, staged_jobs)| {
+                            for staged_job in &staged_jobs {
+                                self.note_staged_job(staged_job);
+                            }
+                            results
+                        });
+                        return Ok((job, results));
+                    }
+                    Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
+                    Err(e) => return Err(e.into()),
                 }
             }
+        }
+        .await;
 
-            match txn.commit().await {
-                Ok(_) => break job,
-                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
-                Err(e) => return Err(e.into()),
-            }
-        };
+        self.delete_unreferenced_follow_up_payloads(
+            &prepared.prepared_jobs,
+            match &settled {
+                Ok((_, Some(results))) => Some(results.as_slice()),
+                _ => None,
+            },
+        )
+        .await;
+        let (job, results) = settled?;
 
         let immediate_retry = matches!(job.status, JobStatus::Pending);
         let became_dead = matches!(job.status, JobStatus::Dead);
@@ -2038,7 +2143,10 @@ impl Queue {
             // Retries exhausted: terminal transition. Wake completion waiters.
             self.completion_notify.notify_waiters();
         }
-        Ok(())
+        match results {
+            Some(results) => Ok(NackOutcome::DeadLettered(results)),
+            None => Ok(NackOutcome::Retried),
+        }
     }
 
     /// Dead-letter a claimed job immediately, regardless of its `attempts`.
@@ -2051,45 +2159,80 @@ impl Queue {
     /// [`worker::run_worker_concurrent`](crate::worker::run_worker_concurrent)
     /// call this automatically when a worker returns
     /// [`worker::PermanentFailure`](crate::worker::PermanentFailure).
-    #[instrument(skip(self, claim), fields(queue = %claim.queue, job_id = %claim.id))]
     pub async fn dead_letter(&self, claim: &Claim, reason: &str) -> Result<()> {
+        self.dead_letter_with(claim, reason, SettlementEffects::default())
+            .await
+            .map(|_| ())
+    }
+
+    /// Dead-letter a claimed job and apply `effects` in the same
+    /// transaction.
+    ///
+    /// Behaves like [`Self::dead_letter`]; the effects behave exactly
+    /// as in [`Self::ack_with`], and the returned results align
+    /// index-wise with the effects' enqueues.
+    #[instrument(skip(self, claim, effects), fields(queue = %claim.queue, job_id = %claim.id))]
+    pub async fn dead_letter_with(
+        &self,
+        claim: &Claim,
+        reason: &str,
+        effects: SettlementEffects,
+    ) -> Result<Vec<EnqueueResult>> {
+        let prepared = self.prepare_effects(effects).await?;
         let token = claim.token();
         let (queue, id) = (claim.job().queue.as_str(), claim.job().id.as_str());
         let failed_at = self.now_ms();
 
-        let job = loop {
-            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            let mut job = take_claim(&txn, &self.lease_registry, queue, id, token).await?;
-            let claimed_at = job.claimed_at;
-            job.last_error = Some(reason.to_string());
-            job.status = JobStatus::Dead;
-            job.failed_at = Some(failed_at);
-            job.claimed_at = None;
-            let dead = dead_key(&job.queue, &job.id);
-            let value = job.stored_bytes()?;
-            put_job_record(&txn, &dead, &job_index_key(&job.id), &value)?;
-            append_attempt(
-                &txn,
-                &job.id,
-                &JobAttempt {
-                    attempt: job.attempts,
-                    claimed_at,
-                    recorded_at: failed_at,
-                    outcome: AttemptOutcome::DeadLettered,
-                    error: Some(reason.to_string()),
-                },
-            )?;
-            update_stats(
-                &txn,
-                &job.queue,
-                &[(JobStatus::Claimed, -1), (JobStatus::Dead, 1)],
-            )?;
-            match txn.commit().await {
-                Ok(_) => break job,
-                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
-                Err(e) => return Err(e.into()),
+        type Settled = (JobRecord, Vec<EnqueueResult>);
+        let settled: Result<Settled> = async {
+            loop {
+                let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+                let mut job = take_claim(&txn, &self.lease_registry, queue, id, token).await?;
+                let claimed_at = job.claimed_at;
+                job.last_error = Some(reason.to_string());
+                job.status = JobStatus::Dead;
+                job.failed_at = Some(failed_at);
+                job.claimed_at = None;
+                let dead = dead_key(&job.queue, &job.id);
+                let value = job.stored_bytes()?;
+                put_job_record(&txn, &dead, &job_index_key(&job.id), &value)?;
+                append_attempt(
+                    &txn,
+                    &job.id,
+                    &JobAttempt {
+                        attempt: job.attempts,
+                        claimed_at,
+                        recorded_at: failed_at,
+                        outcome: AttemptOutcome::DeadLettered,
+                        error: Some(reason.to_string()),
+                    },
+                )?;
+                update_stats(
+                    &txn,
+                    &job.queue,
+                    &[(JobStatus::Claimed, -1), (JobStatus::Dead, 1)],
+                )?;
+                let (results, staged) = self.stage_effects(&txn, &prepared).await?;
+                match txn.commit().await {
+                    Ok(_) => {
+                        for staged_job in &staged {
+                            self.note_staged_job(staged_job);
+                        }
+                        return Ok((job, results));
+                    }
+                    Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
+                    Err(e) => return Err(e.into()),
+                }
             }
-        };
+        }
+        .await;
+
+        self.delete_unreferenced_follow_up_payloads(
+            &prepared.prepared_jobs,
+            settled.as_ref().ok().map(|(_, results)| results.as_slice()),
+        )
+        .await;
+        let (job, results) = settled?;
 
         crate::obs::dead_lettered(&job.queue);
         self.lease_registry.remove(&job.queue, &job.id, token);
@@ -2101,7 +2244,7 @@ impl Queue {
             attempts = job.attempts,
             "job dead-lettered (permanent failure)"
         );
-        Ok(())
+        Ok(results)
     }
 
     /// Return a snapshot of job counts for the given queue.
@@ -2148,6 +2291,11 @@ impl Queue {
     /// remains valid when the job it was taken at leaves the state. The
     /// listing is not a snapshot: a job that changes state between page
     /// reads may appear on no page or on two pages.
+    ///
+    /// A page can hold fewer than `limit` jobs while more remain,
+    /// because a job removed between the key scan and its payload
+    /// fetch is omitted from the page. The listing is exhausted only
+    /// when [`JobPage::next_cursor`] is `None`.
     ///
     /// The pending, claimed and dead key spaces group by queue, so those
     /// scans cover only the requested queue. The scheduled and done
@@ -2421,107 +2569,153 @@ impl Queue {
     /// cannot be safely cancelled mid-await. Watch
     /// [`JobRecord::cancel_token`] in your worker to opt in to early exit.
     pub async fn cancel(&self, id: &str) -> Result<CancelOutcome> {
-        loop {
-            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+        self.cancel_with(id, SettlementEffects::default())
+            .await
+            .map(|(outcome, _)| outcome)
+    }
 
-            let Some((index_key, current_key, mut job)) = get_indexed_job(&txn, id).await? else {
-                txn.rollback();
-                return Ok(CancelOutcome::NotFound);
-            };
+    /// Cancel a job and apply `effects` in the same transaction as its
+    /// removal.
+    ///
+    /// Behaves like [`Self::cancel`]. On [`CancelOutcome::Removed`]
+    /// the effects are applied atomically with the removal, exactly as
+    /// in [`Self::ack_with`], and the returned results align
+    /// index-wise with the effects' enqueues. On every other outcome
+    /// the effects are discarded and the results are empty; a claimed
+    /// job's terminal settlement supplies its own effects.
+    pub async fn cancel_with(
+        &self,
+        id: &str,
+        effects: SettlementEffects,
+    ) -> Result<(CancelOutcome, Vec<EnqueueResult>)> {
+        let prepared = self.prepare_effects(effects).await?;
+        let outcome: Result<(CancelOutcome, Vec<EnqueueResult>)> = async {
+            loop {
+                let txn = self.db.begin(IsolationLevel::Snapshot).await?;
 
-            let (msg, outcome, remove_from_registry) = match job.status {
-                JobStatus::Pending | JobStatus::Scheduled => {
-                    let is_scheduled = matches!(job.status, JobStatus::Scheduled);
-                    txn.delete(&current_key)?;
-                    txn.delete(&index_key)?;
-                    // A nacked job waiting out its backoff has attempt
-                    // history; it is removed with the record.
-                    txn.delete(attempt_history_key(id))?;
-                    if let Some(ref dk) = job.dedup_key {
-                        txn.delete(dedup_index_key(&job.queue, dk))?;
+                let Some((index_key, current_key, mut job)) = get_indexed_job(&txn, id).await?
+                else {
+                    txn.rollback();
+                    return Ok((CancelOutcome::NotFound, Vec::new()));
+                };
+
+                let (msg, outcome, remove_from_registry, staged) = match job.status {
+                    JobStatus::Pending | JobStatus::Scheduled => {
+                        let is_scheduled = matches!(job.status, JobStatus::Scheduled);
+                        txn.delete(&current_key)?;
+                        txn.delete(&index_key)?;
+                        // A nacked job waiting out its backoff has attempt
+                        // history; it is removed with the record.
+                        txn.delete(attempt_history_key(id))?;
+                        if let Some(ref dk) = job.dedup_key {
+                            txn.delete(dedup_index_key(&job.queue, dk))?;
+                        }
+                        if is_scheduled {
+                            update_stats(&txn, &job.queue, &[(JobStatus::Scheduled, -1)])?;
+                        } else {
+                            update_stats(&txn, &job.queue, &[(JobStatus::Pending, -1)])?;
+                        }
+                        let (results, staged) = self.stage_effects(&txn, &prepared).await?;
+                        (
+                            "pending/scheduled job cancelled",
+                            CancelOutcome::Removed,
+                            true,
+                            Some((results, staged)),
+                        )
                     }
-                    if is_scheduled {
-                        update_stats(&txn, &job.queue, &[(JobStatus::Scheduled, -1)])?;
-                    } else {
-                        update_stats(&txn, &job.queue, &[(JobStatus::Pending, -1)])?;
+                    JobStatus::Claimed => {
+                        if job.cancel_requested {
+                            // Persisted flag already set; nothing to commit. We
+                            // still re-fire the in-process token below in case a
+                            // new worker claim missed it.
+                            txn.rollback();
+                            if let Some(token) = self
+                                .claimed_tokens
+                                .lock()
+                                .expect("claimed_tokens mutex poisoned")
+                                .get(id)
+                                .cloned()
+                            {
+                                token.cancel();
+                            }
+                            debug!(job_id = %id, "cancel re-requested on claimed job");
+                            return Ok((CancelOutcome::Requested, Vec::new()));
+                        }
+                        job.cancel_requested = true;
+                        let value = rmp_serde::to_vec_named(&job)?;
+                        txn.put(&current_key, &value)?;
+                        (
+                            "claimed job cancellation requested",
+                            CancelOutcome::Requested,
+                            false,
+                            None,
+                        )
                     }
-                    (
-                        "pending/scheduled job cancelled",
-                        CancelOutcome::Removed,
-                        true,
-                    )
-                }
-                JobStatus::Claimed => {
-                    if job.cancel_requested {
-                        // Persisted flag already set; nothing to commit. We
-                        // still re-fire the in-process token below in case a
-                        // new worker claim missed it.
+                    JobStatus::Done | JobStatus::Dead => {
                         txn.rollback();
-                        if let Some(token) = self
-                            .claimed_tokens
-                            .lock()
-                            .expect("claimed_tokens mutex poisoned")
-                            .get(id)
-                            .cloned()
-                        {
+                        return Ok((CancelOutcome::NotFound, Vec::new()));
+                    }
+                };
+
+                match txn.commit().await {
+                    Ok(_) => {
+                        // Fire (and optionally remove) any in-process token. We
+                        // do this even on the Removed path: in race scenarios
+                        // (lease expired + reaper requeued just before we got
+                        // here), the token of a now-stale claim may still be
+                        // watched by a worker; firing it lets the worker
+                        // observe the cancellation cooperatively.
+                        let token = {
+                            let mut guard = self
+                                .claimed_tokens
+                                .lock()
+                                .expect("claimed_tokens mutex poisoned");
+                            if remove_from_registry {
+                                guard.remove(id)
+                            } else {
+                                guard.get(id).cloned()
+                            }
+                        };
+                        if let Some(token) = token {
                             token.cancel();
                         }
-                        debug!(job_id = %id, "cancel re-requested on claimed job");
-                        return Ok(CancelOutcome::Requested);
-                    }
-                    job.cancel_requested = true;
-                    let value = rmp_serde::to_vec_named(&job)?;
-                    txn.put(&current_key, &value)?;
-                    (
-                        "claimed job cancellation requested",
-                        CancelOutcome::Requested,
-                        false,
-                    )
-                }
-                JobStatus::Done | JobStatus::Dead => {
-                    txn.rollback();
-                    return Ok(CancelOutcome::NotFound);
-                }
-            };
-
-            match txn.commit().await {
-                Ok(_) => {
-                    // Fire (and optionally remove) any in-process token. We
-                    // do this even on the Removed path: in race scenarios
-                    // (lease expired + reaper requeued just before we got
-                    // here), the token of a now-stale claim may still be
-                    // watched by a worker; firing it lets the worker
-                    // observe the cancellation cooperatively.
-                    let token = {
-                        let mut guard = self
-                            .claimed_tokens
-                            .lock()
-                            .expect("claimed_tokens mutex poisoned");
-                        if remove_from_registry {
-                            guard.remove(id)
-                        } else {
-                            guard.get(id).cloned()
+                        let results = match staged {
+                            Some((results, staged_jobs)) => {
+                                for staged_job in &staged_jobs {
+                                    self.note_staged_job(staged_job);
+                                }
+                                results
+                            }
+                            None => Vec::new(),
+                        };
+                        // Removed = terminal (job is gone). Requested = not yet
+                        // terminal; the worker will fire the notify when it
+                        // eventually acks / nacks / dead-letters.
+                        if matches!(outcome, CancelOutcome::Removed) {
+                            // The record is deleted, so its payload object
+                            // (if any) is removed here, after the commit.
+                            self.delete_payload_object(&job).await;
+                            self.completion_notify.notify_waiters();
                         }
-                    };
-                    if let Some(token) = token {
-                        token.cancel();
+                        debug!(job_id = %id, "{msg}");
+                        return Ok((outcome, results));
                     }
-                    // Removed = terminal (job is gone). Requested = not yet
-                    // terminal; the worker will fire the notify when it
-                    // eventually acks / nacks / dead-letters.
-                    if matches!(outcome, CancelOutcome::Removed) {
-                        // The record is deleted, so its payload object
-                        // (if any) is removed here, after the commit.
-                        self.delete_payload_object(&job).await;
-                        self.completion_notify.notify_waiters();
-                    }
-                    debug!(job_id = %id, "{msg}");
-                    return Ok(outcome);
+                    Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
+                    Err(e) => return Err(e.into()),
                 }
-                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
-                Err(e) => return Err(e.into()),
             }
         }
+        .await;
+
+        self.delete_unreferenced_follow_up_payloads(
+            &prepared.prepared_jobs,
+            match &outcome {
+                Ok((CancelOutcome::Removed, results)) => Some(results.as_slice()),
+                _ => None,
+            },
+        )
+        .await;
+        outcome
     }
 
     /// Move a `Scheduled` job to pending immediately, before its `run_at`,
@@ -2986,7 +3180,7 @@ mod tests {
         let q = Queue::open_with_options(store.clone(), "test", opts())
             .await
             .unwrap();
-        let effects = || AckEffects {
+        let effects = || SettlementEffects {
             enqueues: vec![EnqueueRequest {
                 queue: "next".to_string(),
                 payload: b"follow".to_vec(),
@@ -7395,7 +7589,7 @@ mod tests {
         let results = q
             .ack_with(
                 &job,
-                AckEffects {
+                SettlementEffects {
                     enqueues: vec![EnqueueRequest {
                         queue: "next".to_string(),
                         payload: b"second".to_vec(),
@@ -7433,7 +7627,7 @@ mod tests {
         let err = q
             .ack_with(
                 &job,
-                AckEffects {
+                SettlementEffects {
                     enqueues: vec![EnqueueRequest {
                         queue: "next".to_string(),
                         payload: b"x".to_vec(),
@@ -7472,7 +7666,7 @@ mod tests {
         let results = q
             .ack_with(
                 &job,
-                AckEffects {
+                SettlementEffects {
                     enqueues: vec![
                         EnqueueRequest {
                             queue: "next".to_string(),
@@ -7488,7 +7682,7 @@ mod tests {
                             options: EnqueueOptions::default(),
                         },
                     ],
-                    ..AckEffects::default()
+                    ..SettlementEffects::default()
                 },
             )
             .await
@@ -7501,6 +7695,281 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dead_letter_with_applies_enqueue_and_kv_effects_atomically() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        assert!(q.claim("notify", lease).await.unwrap().is_none());
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+
+        let results = q
+            .dead_letter_with(
+                &job,
+                "bad input",
+                SettlementEffects {
+                    enqueues: vec![EnqueueRequest {
+                        queue: "notify".to_string(),
+                        payload: b"failed".to_vec(),
+                        options: EnqueueOptions::default(),
+                    }],
+                    kv_writes: HashMap::from([(b"runs/1".to_vec(), b"failed".to_vec())]),
+                    kv_deletes: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], EnqueueResult::New(_)));
+
+        assert_eq!(q.stats("work").await.unwrap().dead, 1);
+        assert_eq!(q.stats("notify").await.unwrap().pending, 1);
+        assert_eq!(
+            q.kv_get(b"runs/1").await.unwrap().as_deref(),
+            Some(b"failed".as_slice()),
+        );
+        let follow_up = q.claim("notify", lease).await.unwrap().unwrap();
+        assert_eq!(follow_up.payload, b"failed");
+        q.ack(&follow_up).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dead_letter_with_applies_no_effects_when_the_claim_is_gone() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.ack(&job).await.unwrap();
+
+        let err = q
+            .dead_letter_with(
+                &job,
+                "late failure",
+                SettlementEffects {
+                    enqueues: vec![EnqueueRequest {
+                        queue: "notify".to_string(),
+                        payload: b"x".to_vec(),
+                        options: EnqueueOptions::default(),
+                    }],
+                    kv_writes: HashMap::from([(b"k".to_vec(), b"v".to_vec())]),
+                    kv_deletes: Vec::new(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::ClaimLost));
+        assert_eq!(q.stats("notify").await.unwrap().pending, 0);
+        assert!(q.kv_get(b"k").await.unwrap().is_none());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn nack_with_discards_effects_while_attempts_remain() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+
+        let outcome = q
+            .nack_with(
+                &job,
+                "transient",
+                SettlementEffects {
+                    enqueues: vec![EnqueueRequest {
+                        queue: "notify".to_string(),
+                        payload: b"x".to_vec(),
+                        options: EnqueueOptions::default(),
+                    }],
+                    kv_writes: HashMap::from([(b"k".to_vec(), b"v".to_vec())]),
+                    kv_deletes: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, NackOutcome::Retried);
+
+        let stats = q.stats("work").await.unwrap();
+        assert_eq!(stats.scheduled, 1);
+        assert_eq!(stats.dead, 0);
+        assert_eq!(q.stats("notify").await.unwrap().pending, 0);
+        assert!(q.kv_get(b"k").await.unwrap().is_none());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn nack_with_applies_effects_when_it_dead_letters() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        assert!(q.claim("notify", lease).await.unwrap().is_none());
+        q.enqueue_with(
+            "work",
+            b"job".to_vec(),
+            EnqueueOptions {
+                max_attempts: Some(1),
+                ..EnqueueOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+
+        let outcome = q
+            .nack_with(
+                &job,
+                "final failure",
+                SettlementEffects {
+                    enqueues: vec![EnqueueRequest {
+                        queue: "notify".to_string(),
+                        payload: b"failed".to_vec(),
+                        options: EnqueueOptions::default(),
+                    }],
+                    kv_writes: HashMap::from([(b"runs/1".to_vec(), b"failed".to_vec())]),
+                    kv_deletes: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let NackOutcome::DeadLettered(results) = outcome else {
+            panic!("expected a dead-lettering nack, got {outcome:?}");
+        };
+        assert!(matches!(results[0], EnqueueResult::New(_)));
+
+        assert_eq!(q.stats("work").await.unwrap().dead, 1);
+        assert_eq!(q.stats("notify").await.unwrap().pending, 1);
+        assert_eq!(
+            q.kv_get(b"runs/1").await.unwrap().as_deref(),
+            Some(b"failed".as_slice()),
+        );
+        let follow_up = q.claim("notify", lease).await.unwrap().unwrap();
+        assert_eq!(follow_up.payload, b"failed");
+        q.ack(&follow_up).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_with_applies_effects_with_the_removal() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        assert!(q.claim("notify", lease).await.unwrap().is_none());
+        let id = q.enqueue("work", b"job".to_vec()).await.unwrap();
+
+        let (outcome, results) = q
+            .cancel_with(
+                &id,
+                SettlementEffects {
+                    enqueues: vec![EnqueueRequest {
+                        queue: "notify".to_string(),
+                        payload: b"cancelled".to_vec(),
+                        options: EnqueueOptions::default(),
+                    }],
+                    kv_writes: HashMap::new(),
+                    kv_deletes: vec![b"runs/1".to_vec()],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, CancelOutcome::Removed);
+        assert!(matches!(results[0], EnqueueResult::New(_)));
+
+        assert_eq!(q.stats("work").await.unwrap().pending, 0);
+        assert_eq!(q.stats("notify").await.unwrap().pending, 1);
+        assert!(q.get_job(&id).await.unwrap().is_none());
+        let follow_up = q.claim("notify", lease).await.unwrap().unwrap();
+        assert_eq!(follow_up.payload, b"cancelled");
+        q.ack(&follow_up).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_with_discards_effects_on_a_claimed_job() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        let id = q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+
+        let (outcome, results) = q
+            .cancel_with(
+                &id,
+                SettlementEffects {
+                    enqueues: vec![EnqueueRequest {
+                        queue: "notify".to_string(),
+                        payload: b"x".to_vec(),
+                        options: EnqueueOptions::default(),
+                    }],
+                    kv_writes: HashMap::from([(b"k".to_vec(), b"v".to_vec())]),
+                    kv_deletes: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, CancelOutcome::Requested);
+        assert!(results.is_empty());
+        assert_eq!(q.stats("notify").await.unwrap().pending, 0);
+        assert!(q.kv_get(b"k").await.unwrap().is_none());
+
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_with_discards_effects_on_an_unknown_job() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+
+        let (outcome, results) = q
+            .cancel_with(
+                "missing",
+                SettlementEffects {
+                    kv_writes: HashMap::from([(b"k".to_vec(), b"v".to_vec())]),
+                    ..SettlementEffects::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, CancelOutcome::NotFound);
+        assert!(results.is_empty());
+        assert!(q.kv_get(b"k").await.unwrap().is_none());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_with_deletes_the_payload_object_of_a_discarded_follow_up() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+        let id = q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (outcome, _) = q
+            .cancel_with(
+                &id,
+                SettlementEffects {
+                    enqueues: vec![EnqueueRequest {
+                        queue: "notify".to_string(),
+                        payload: vec![1u8; 256],
+                        options: EnqueueOptions::default(),
+                    }],
+                    ..SettlementEffects::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, CancelOutcome::Requested);
+        assert_eq!(
+            object_count(&store, "test-payloads").await,
+            0,
+            "the discarded follow-up's offloaded object is removed"
+        );
+
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn ack_with_schedules_a_future_effect() {
         let q = Queue::open(make_store(), "test").await.unwrap();
         let lease = Duration::from_secs(5);
@@ -7509,7 +7978,7 @@ mod tests {
 
         q.ack_with(
             &job,
-            AckEffects {
+            SettlementEffects {
                 enqueues: vec![EnqueueRequest {
                     queue: "next".to_string(),
                     payload: b"later".to_vec(),
@@ -7518,7 +7987,7 @@ mod tests {
                         ..EnqueueOptions::default()
                     },
                 }],
-                ..AckEffects::default()
+                ..SettlementEffects::default()
             },
         )
         .await
@@ -7819,7 +8288,7 @@ mod tests {
         let results = q
             .ack_with(
                 &job,
-                AckEffects {
+                SettlementEffects {
                     enqueues: vec![EnqueueRequest {
                         queue: "next".to_string(),
                         payload: vec![2u8; 256],
@@ -7828,7 +8297,7 @@ mod tests {
                             ..EnqueueOptions::default()
                         },
                     }],
-                    ..AckEffects::default()
+                    ..SettlementEffects::default()
                 },
             )
             .await
@@ -8289,7 +8758,7 @@ mod tests {
         let results = q
             .ack_with(
                 &job,
-                AckEffects {
+                SettlementEffects {
                     enqueues: vec![
                         EnqueueRequest {
                             queue: "next".to_string(),
@@ -8305,7 +8774,7 @@ mod tests {
                             options: EnqueueOptions::default(),
                         },
                     ],
-                    ..AckEffects::default()
+                    ..SettlementEffects::default()
                 },
             )
             .await

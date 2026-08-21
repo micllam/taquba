@@ -6,8 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use taquba::object_store::ObjectStore;
 use taquba::{
-    AckEffects, Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, JobRecord, JobStatus,
-    LeaseHandle, PermanentFailure, Queue, Worker, WorkerError,
+    Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, JobRecord, JobStatus, LeaseHandle,
+    PermanentFailure, Queue, SettlementEffects, Worker, WorkerError,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -1052,7 +1052,7 @@ impl<R: StepRunner + 'static, H: TerminalHook + 'static> Worker for StepWorker<R
         &self,
         job: &JobRecord,
         lease: &LeaseHandle,
-    ) -> std::result::Result<AckEffects, WorkerError> {
+    ) -> std::result::Result<SettlementEffects, WorkerError> {
         self.inner.process_step(job, lease).await
     }
 }
@@ -1204,7 +1204,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     /// write a terminal marker (if memo retention is enabled), and
     /// return the durable run record's delete plus the
     /// terminal-notification enqueue (when the hook observes this
-    /// outcome) as [`AckEffects`] for the step's acknowledgement
+    /// outcome) as [`SettlementEffects`] for the step's acknowledgement
     /// transaction. The notification job's payload is the committed
     /// outcome and the configured [`TerminalHook`] runs as its worker.
     /// The marker is written *before* the record delete can commit, so
@@ -1218,7 +1218,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         outcome: RunOutcome,
         priority: Option<u32>,
         max_attempts: Option<u32>,
-    ) -> AckEffects {
+    ) -> SettlementEffects {
         self.registry.lock().unwrap().remove(&outcome.run_id);
         if self.memo_retention.is_some()
             && let Err(err) = self
@@ -1246,10 +1246,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         } else {
             Vec::new()
         };
-        AckEffects {
+        SettlementEffects {
             enqueues,
             kv_deletes,
-            ..AckEffects::default()
+            ..SettlementEffects::default()
         }
     }
 
@@ -1261,7 +1261,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     async fn process_notification(
         &self,
         job: &JobRecord,
-    ) -> std::result::Result<AckEffects, WorkerError> {
+    ) -> std::result::Result<SettlementEffects, WorkerError> {
         let outcome: RunOutcome = match rmp_serde::from_slice::<DurableRunOutcome>(&job.payload) {
             Ok(durable) => durable.into(),
             Err(err) => {
@@ -1273,7 +1273,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         let result = self.terminal_hook.on_termination(&outcome, &effects).await;
         let (staged, enqueues) = effects.seal_and_take();
         match result {
-            Ok(()) => Ok(AckEffects {
+            Ok(()) => Ok(SettlementEffects {
                 enqueues,
                 kv_writes: staged.writes,
                 kv_deletes: staged.deletes.into_iter().collect(),
@@ -1463,7 +1463,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         &self,
         job: &JobRecord,
         lease: &LeaseHandle,
-    ) -> std::result::Result<AckEffects, WorkerError> {
+    ) -> std::result::Result<SettlementEffects, WorkerError> {
         if job.headers.contains_key(HEADER_TERMINAL) {
             return self.process_notification(job).await;
         }
@@ -1751,7 +1751,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         payload: Vec<u8>,
         user_headers: &HashMap<String, String>,
         opts: StepEnqueueOpts,
-    ) -> AckEffects {
+    ) -> SettlementEffects {
         self.advance_with_kv(run_id, next_step, payload, user_headers, opts, |_| {
             HashMap::new()
         })
@@ -1769,7 +1769,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         user_headers: &HashMap<String, String>,
         opts: StepEnqueueOpts,
         kv_writes: impl FnOnce(&str) -> HashMap<Vec<u8>, Vec<u8>>,
-    ) -> AckEffects {
+    ) -> SettlementEffects {
         let (request, next_job_id) =
             self.step_enqueue_request(run_id, next_step, payload, user_headers, opts);
         let kv_writes = kv_writes(&next_job_id);
@@ -1779,10 +1779,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             entry.status.current_step = next_step;
             entry.current_job_id = next_job_id;
         }
-        AckEffects {
+        SettlementEffects {
             enqueues: vec![request],
             kv_writes,
-            ..AckEffects::default()
+            ..SettlementEffects::default()
         }
     }
 
@@ -1803,7 +1803,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         base_opts: StepEnqueueOpts,
         correlation_key: &str,
         timeout: Duration,
-    ) -> std::result::Result<AckEffects, WorkerError> {
+    ) -> std::result::Result<SettlementEffects, WorkerError> {
         let wait_key = signal_wait_kv_key(correlation_key);
 
         // One waiter per correlation key: reject a registration while a

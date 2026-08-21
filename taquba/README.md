@@ -31,8 +31,8 @@ separate state layer (typically Postgres).
 - Exponential retry backoff on `nack`.
 - Bounded dead-letter retention with paginated inspection.
 - Atomic batch enqueue.
-- Atomic settlement effects: ack a job and enqueue follow-ups or update
-  caller KV in one transaction.
+- Atomic settlement effects: ack, dead-letter or cancel a job and enqueue
+  follow-ups or update caller KV in one transaction.
 - Worker loop with graceful shutdown and notify-based wakeups (no busy polling).
 
 ## When Taquba fits
@@ -224,9 +224,13 @@ consumes one attempt at its next claim, so `max_attempts` also counts
 hard restarts of a long job.
 
 A worker can implement `Worker::process_with_effects` instead of
-`Worker::process` to return `AckEffects`: follow-up enqueues and caller KV
+`Worker::process` to return `SettlementEffects`: follow-up enqueues and caller KV
 changes the loop applies atomically with the job's acknowledgement via
-`Queue::ack_with`.
+`Queue::ack_with`. A failing worker can attach effects by returning the error
+wrapped in `FailWith`: the loop applies them atomically with a settlement that
+dead-letters the job (`Queue::dead_letter_with` for a `PermanentFailure`, the
+dead-letter branch of `Queue::nack_with` otherwise) and discards them when the
+job is retried.
 
 `run_worker_concurrent` is the same loop processing up to `concurrency`
 jobs in parallel:
@@ -291,6 +295,14 @@ claimed job and, in the same transaction, enqueues follow-up jobs and applies
 caller KV writes and deletes. If the job's lease expired and the claim is
 gone, the call fails and nothing is applied, so a chained job exists only if
 the settlement that created it won.
+
+`Queue::dead_letter_with`, `Queue::nack_with` and `Queue::cancel_with` extend
+it to the failure and cancellation transitions: dead-lettering a job, the
+attempts-exhausted branch of a nack and the removal of a pending or scheduled
+job each apply the same effects atomically with the transition. A worker
+running under the worker loop attaches effects to a failure by returning the
+error wrapped in `FailWith`; the loop applies them with a dead-lettering
+settlement and discards them when the job is retried.
 
 See [`examples/atomic_settlement.rs`](examples/atomic_settlement.rs) for a
 runnable order pipeline built on these primitives.

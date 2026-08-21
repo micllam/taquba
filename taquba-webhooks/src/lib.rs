@@ -56,7 +56,7 @@
 //!
 //! [`webhook_enqueue_request`] builds the enqueue request without
 //! performing it, so a delivery can be staged into a settlement
-//! transaction via [`taquba::AckEffects::enqueues`] and committed
+//! transaction via [`taquba::SettlementEffects::enqueues`] and committed
 //! atomically with an acknowledgement.
 //!
 //! # Delivery semantics
@@ -201,7 +201,7 @@ impl WebhookRequest {
 
 /// Build the [`taquba::EnqueueRequest`] for a webhook delivery without
 /// performing the enqueue, for staging into a settlement transaction via
-/// [`taquba::AckEffects::enqueues`]. [`enqueue_webhook`] is the
+/// [`taquba::SettlementEffects::enqueues`]. [`enqueue_webhook`] is the
 /// standalone form.
 ///
 /// `body` becomes the HTTP request body; `request` is encoded into the

@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 use crate::error::{Error, Result};
 use crate::job::{Claim, JobRecord};
 use crate::lease::LeaseHandle;
-use crate::queue::{AckEffects, Queue};
+use crate::queue::{Queue, SettlementEffects};
 
 /// Boxed error type returned from [`Worker::process`].
 pub type WorkerError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -49,6 +49,49 @@ impl std::fmt::Display for PermanentFailure {
 }
 
 impl std::error::Error for PermanentFailure {}
+
+/// Wrapper error attaching [`SettlementEffects`] to a failure returned from
+/// [`Worker::process`] or [`Worker::process_with_effects`].
+///
+/// The worker loop settles the wrapped error exactly as it would settle
+/// the error unwrapped, and applies `effects` atomically with the
+/// settlement when that settlement dead-letters the job: a wrapped
+/// [`PermanentFailure`] dead-letters through
+/// [`crate::Queue::dead_letter_with`], and any other wrapped error is
+/// reported through [`crate::Queue::nack_with`], whose effects apply
+/// only once the job's attempts are exhausted. Effects on a retried
+/// failure are discarded; attach them on every attempt.
+///
+/// ```rust,ignore
+/// Err(FailWith::new(PermanentFailure::new("bad input"), effects).into())
+/// ```
+#[derive(Debug)]
+pub struct FailWith {
+    /// The failure itself. Settlement routing (dead-letter or retry)
+    /// follows this error.
+    pub error: WorkerError,
+    /// Effects applied atomically with a dead-lettering settlement of
+    /// this failure.
+    pub effects: SettlementEffects,
+}
+
+impl FailWith {
+    /// Attach `effects` to `error`.
+    pub fn new(error: impl Into<WorkerError>, effects: SettlementEffects) -> Self {
+        Self {
+            error: error.into(),
+            effects,
+        }
+    }
+}
+
+impl std::fmt::Display for FailWith {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for FailWith {}
 
 /// Implement this trait to define how a job is processed.
 ///
@@ -103,7 +146,7 @@ pub trait Worker: Send + Sync {
     /// atomically with its acknowledgement.
     ///
     /// Like [`Self::process`], but an `Ok` return supplies
-    /// [`AckEffects`] that the worker loop passes to
+    /// [`SettlementEffects`] that the worker loop passes to
     /// [`crate::Queue::ack_with`], so follow-up enqueues and caller KV
     /// changes land in the same transaction as the ack. Errors behave
     /// exactly as in [`Self::process`].
@@ -111,11 +154,11 @@ pub trait Worker: Send + Sync {
         &self,
         job: &JobRecord,
         lease: &LeaseHandle,
-    ) -> impl Future<Output = std::result::Result<AckEffects, WorkerError>> + Send {
+    ) -> impl Future<Output = std::result::Result<SettlementEffects, WorkerError>> + Send {
         async move {
             self.process(job, lease)
                 .await
-                .map(|()| AckEffects::default())
+                .map(|()| SettlementEffects::default())
         }
     }
 }
@@ -304,10 +347,23 @@ async fn process_and_settle<W: Worker>(
     let lease = queue_handle.lease_handle(&claim);
     let settlement = match worker.process_with_effects(claim.job(), &lease).await {
         Ok(effects) => queue_handle.ack_with(&claim, effects).await.map(|_| ()),
-        Err(e) if e.downcast_ref::<PermanentFailure>().is_some() => {
-            queue_handle.dead_letter(&claim, &e.to_string()).await
+        Err(e) => {
+            let (error, effects) = match e.downcast::<FailWith>() {
+                Ok(wrapped) => (wrapped.error, wrapped.effects),
+                Err(e) => (e, SettlementEffects::default()),
+            };
+            if error.downcast_ref::<PermanentFailure>().is_some() {
+                queue_handle
+                    .dead_letter_with(&claim, &error.to_string(), effects)
+                    .await
+                    .map(|_| ())
+            } else {
+                queue_handle
+                    .nack_with(&claim, &error.to_string(), effects)
+                    .await
+                    .map(|_| ())
+            }
         }
-        Err(e) => queue_handle.nack(&claim, &e.to_string()).await,
     };
     match settlement {
         Ok(()) => {}
@@ -369,19 +425,19 @@ mod tests {
             &self,
             job: &JobRecord,
             _lease: &LeaseHandle,
-        ) -> std::result::Result<AckEffects, WorkerError> {
+        ) -> std::result::Result<SettlementEffects, WorkerError> {
             self.processed.fetch_add(1, Ordering::SeqCst);
             if job.payload == b"first" {
-                Ok(AckEffects {
+                Ok(SettlementEffects {
                     enqueues: vec![crate::queue::EnqueueRequest {
                         queue: job.queue.clone(),
                         payload: b"second".to_vec(),
                         options: crate::queue::EnqueueOptions::default(),
                     }],
-                    ..AckEffects::default()
+                    ..SettlementEffects::default()
                 })
             } else {
-                Ok(AckEffects::default())
+                Ok(SettlementEffects::default())
             }
         }
     }
@@ -544,5 +600,120 @@ mod tests {
             4,
             "a batch claim fills the free capacity without exceeding it",
         );
+    }
+
+    struct EffectfulFailureWorker {
+        permanent: bool,
+        attempts_seen: Arc<AtomicUsize>,
+    }
+
+    impl Worker for EffectfulFailureWorker {
+        async fn process(
+            &self,
+            job: &JobRecord,
+            _lease: &LeaseHandle,
+        ) -> std::result::Result<(), WorkerError> {
+            self.attempts_seen.fetch_add(1, Ordering::SeqCst);
+            let effects = SettlementEffects {
+                enqueues: vec![crate::queue::EnqueueRequest {
+                    queue: "notify".to_string(),
+                    payload: job.payload.clone(),
+                    options: crate::queue::EnqueueOptions::default(),
+                }],
+                ..SettlementEffects::default()
+            };
+            let error: WorkerError = if self.permanent {
+                Box::new(PermanentFailure::new("permanent failure"))
+            } else {
+                "transient failure".into()
+            };
+            Err(Box::new(FailWith::new(error, effects)))
+        }
+    }
+
+    async fn run_one_failing_attempt(queue: &Queue, worker: &EffectfulFailureWorker) {
+        let one_attempt_done = {
+            let seen = worker.attempts_seen.clone();
+            async move {
+                while seen.load(Ordering::SeqCst) < 1 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        };
+        run_worker(
+            queue,
+            "work",
+            worker,
+            Duration::from_millis(50),
+            one_attempt_done,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wrapped_permanent_failure_dead_letters_with_its_effects() {
+        let queue = Queue::open(Arc::new(InMemory::new()), "test")
+            .await
+            .unwrap();
+        queue.enqueue("work", b"job".to_vec()).await.unwrap();
+
+        let worker = EffectfulFailureWorker {
+            permanent: true,
+            attempts_seen: Arc::new(AtomicUsize::new(0)),
+        };
+        run_one_failing_attempt(&queue, &worker).await;
+
+        assert_eq!(queue.stats("work").await.unwrap().dead, 1);
+        assert_eq!(queue.stats("notify").await.unwrap().pending, 1);
+        queue.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wrapped_transient_failure_retries_without_its_effects() {
+        let queue = Queue::open(Arc::new(InMemory::new()), "test")
+            .await
+            .unwrap();
+        queue.enqueue("work", b"job".to_vec()).await.unwrap();
+
+        let worker = EffectfulFailureWorker {
+            permanent: false,
+            attempts_seen: Arc::new(AtomicUsize::new(0)),
+        };
+        run_one_failing_attempt(&queue, &worker).await;
+
+        let stats = queue.stats("work").await.unwrap();
+        assert_eq!(stats.dead, 0);
+        assert_eq!(stats.scheduled + stats.pending, 1);
+        assert_eq!(queue.stats("notify").await.unwrap().pending, 0);
+        queue.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wrapped_transient_failure_on_the_final_attempt_applies_its_effects() {
+        let queue = Queue::open(Arc::new(InMemory::new()), "test")
+            .await
+            .unwrap();
+        queue
+            .enqueue_with(
+                "work",
+                b"job".to_vec(),
+                crate::queue::EnqueueOptions {
+                    max_attempts: Some(1),
+                    ..crate::queue::EnqueueOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let worker = EffectfulFailureWorker {
+            permanent: false,
+            attempts_seen: Arc::new(AtomicUsize::new(0)),
+        };
+        run_one_failing_attempt(&queue, &worker).await;
+
+        assert_eq!(queue.stats("work").await.unwrap().dead, 1);
+        assert_eq!(queue.stats("notify").await.unwrap().pending, 1);
+        queue.close().await.unwrap();
     }
 }

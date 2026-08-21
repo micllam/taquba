@@ -143,9 +143,14 @@
 //! patterns.
 //!
 //! A worker can implement [`Worker::process_with_effects`] instead of
-//! [`Worker::process`] to return [`AckEffects`]: follow-up enqueues and
+//! [`Worker::process`] to return [`SettlementEffects`]: follow-up enqueues and
 //! caller KV changes the loop applies atomically with the job's
-//! acknowledgement via [`Queue::ack_with`].
+//! acknowledgement via [`Queue::ack_with`]. A failing worker can attach
+//! effects by returning the error wrapped in [`FailWith`]: the loop
+//! applies them atomically with a settlement that dead-letters the job
+//! ([`Queue::dead_letter_with`] for a [`PermanentFailure`], the
+//! dead-letter branch of [`Queue::nack_with`] otherwise) and discards
+//! them when the job is retried.
 //!
 //! [`run_worker_concurrent`] is the same loop processing up to
 //! `concurrency` jobs in parallel. It claims jobs in batches sized to
@@ -206,6 +211,16 @@
 //! job's lease expired and the claim is gone, the call fails and
 //! nothing is applied, so a chained job exists only if the settlement
 //! that created it won.
+//!
+//! [`Queue::dead_letter_with`], [`Queue::nack_with`] and
+//! [`Queue::cancel_with`] extend it to the failure and cancellation
+//! transitions: dead-lettering a job, the attempts-exhausted branch of
+//! a nack and the removal of a pending or scheduled job each apply the
+//! same effects atomically with the transition. A worker running under
+//! the worker loop attaches effects to a failure by returning the
+//! error wrapped in [`FailWith`]; the loop applies them with a
+//! dead-lettering settlement and discards them when the job is
+//! retried.
 //!
 //! See `examples/atomic_settlement.rs` for a runnable order pipeline
 //! built on these primitives.
@@ -391,12 +406,14 @@ pub use keys::MAX_QUEUE_NAME_LEN;
 pub use lease::LeaseHandle;
 pub use liveness::{StoreActivity, WriterHeartbeat};
 pub use queue::{
-    AckEffects, CancelOutcome, DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD, EnqueueOptions, EnqueueRequest,
-    EnqueueResult, JobPage, KvPage, MAX_KV_VALUE_SIZE, OpenOptions, PRIORITY_HIGH, PRIORITY_LOW,
-    PRIORITY_NORMAL, Queue, QueueConfig, WaitOutcome, WakeOutcome,
+    CancelOutcome, DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD, EnqueueOptions, EnqueueRequest,
+    EnqueueResult, JobPage, KvPage, MAX_KV_VALUE_SIZE, NackOutcome, OpenOptions, PRIORITY_HIGH,
+    PRIORITY_LOW, PRIORITY_NORMAL, Queue, QueueConfig, SettlementEffects, WaitOutcome, WakeOutcome,
 };
 pub use reader::{QueueReader, ReaderMode, ReaderOptions};
 pub use stats::QueueStats;
-pub use worker::{PermanentFailure, Worker, WorkerError, run_worker, run_worker_concurrent};
+pub use worker::{
+    FailWith, PermanentFailure, Worker, WorkerError, run_worker, run_worker_concurrent,
+};
 
 pub use slatedb::object_store;

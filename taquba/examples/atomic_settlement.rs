@@ -8,7 +8,7 @@
 //   status marker ("received") in one transaction, with a dedup key so
 //   a duplicate submission of the same order collapses onto the
 //   in-flight job.
-// - Processing: the order worker returns `AckEffects` from
+// - Processing: the order worker returns `SettlementEffects` from
 //   `process_with_effects`; the worker loop applies them via
 //   `Queue::ack_with`, so the order's ack, the follow-up confirmation
 //   enqueue, and the status update to "processed" land in the same
@@ -29,8 +29,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use taquba::{
-    AckEffects, EnqueueOptions, EnqueueRequest, EnqueueResult, JobRecord, LeaseHandle, Queue,
-    Worker, WorkerError, object_store::memory::InMemory, run_worker,
+    EnqueueOptions, EnqueueRequest, EnqueueResult, JobRecord, LeaseHandle, Queue,
+    SettlementEffects, Worker, WorkerError, object_store::memory::InMemory, run_worker,
 };
 
 const ORDERS_QUEUE: &str = "orders";
@@ -49,13 +49,13 @@ impl Worker for OrderWorker {
         &self,
         job: &JobRecord,
         _lease: &LeaseHandle,
-    ) -> Result<AckEffects, WorkerError> {
+    ) -> Result<SettlementEffects, WorkerError> {
         let order_id = std::str::from_utf8(&job.payload)?.to_string();
         println!("[orders]        processing order {order_id}");
 
         // ... charge the customer, reserve stock, etc. ...
 
-        let mut effects = AckEffects::default();
+        let mut effects = SettlementEffects::default();
         effects.enqueues.push(EnqueueRequest {
             queue: CONFIRMATIONS_QUEUE.to_string(),
             payload: order_id.clone().into_bytes(),
@@ -77,11 +77,11 @@ impl Worker for ConfirmationWorker {
         &self,
         job: &JobRecord,
         _lease: &LeaseHandle,
-    ) -> Result<AckEffects, WorkerError> {
+    ) -> Result<SettlementEffects, WorkerError> {
         let order_id = std::str::from_utf8(&job.payload)?.to_string();
         println!("[confirmations] confirming order {order_id}");
 
-        let mut effects = AckEffects::default();
+        let mut effects = SettlementEffects::default();
         effects
             .kv_writes
             .insert(status_key(&order_id), b"confirmed".to_vec());

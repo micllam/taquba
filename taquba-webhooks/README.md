@@ -49,7 +49,7 @@ enqueue_webhook(&queue, "webhooks", request, br#"{"event":"ping"}"#.to_vec()).aw
 
 `webhook_enqueue_request` builds the enqueue request without performing it,
 so a delivery can be staged into a settlement transaction via
-`taquba::AckEffects::enqueues` and committed atomically with an
+`taquba::SettlementEffects::enqueues` and committed atomically with an
 acknowledgement.
 
 ## Reserved header keys
