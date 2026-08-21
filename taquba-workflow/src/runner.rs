@@ -54,9 +54,12 @@ pub struct Step {
     /// only reduces cancellation latency for slow steps; it doesn't
     /// change semantics.
     ///
-    /// The token is run-scoped, not step-scoped: once cancelled, every
-    /// subsequent step of the run (including any retry of this one)
-    /// observes `is_cancelled() == true` immediately.
+    /// The token is a child of the delivery's claim token. A re-delivery
+    /// of this step observes `is_cancelled() == true` immediately,
+    /// because the queue re-fires the claim's token from the job's
+    /// persisted cancellation. Cancelling this token leaves the claim's
+    /// token uncancelled, so the runtime does not treat the step as
+    /// externally cancelled.
     pub cancel_token: CancellationToken,
     /// The lease handle for this step's delivery. A long-running runner
     /// calls [`LeaseHandle::ensure_at_least`] at progress points (or

@@ -18,6 +18,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   step-output entries once that run's marker expired. Generated run ids
   are unaffected.
 
+### Fixed
+
+- An external cancellation is no longer lost when the run's in-process
+  registry entry is rebuilt, which happens on every restart. The
+  runtime read cancellation from its own registry entry and created its
+  own token for `Step::cancel_token`, so a run cancelled before a
+  restart resumed and completed normally, discarding the request the
+  queue still held on the job record. The runtime now reads the
+  claim's cancellation token, which `Queue::cancel` fires and a
+  re-claim re-fires from the job's persisted `cancel_requested`, and
+  the runner receives a child of that token so that a runner
+  cancelling its own token is not treated as an external cancellation.
+
 ### Changed
 
 - Run termination is atomic. Every path that settles a run now commits
