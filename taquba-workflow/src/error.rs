@@ -25,6 +25,19 @@ pub enum Error {
     #[error("submission header `{0}` uses the reserved `workflow.*` prefix")]
     ReservedHeaderInSubmit(String),
 
+    /// A caller-supplied [`crate::RunSpec::run_id`] is empty, longer than
+    /// [`crate::MAX_RUN_ID_LEN`] bytes or contains a character outside
+    /// `[A-Za-z0-9_-]`. The run id becomes an object-store path segment
+    /// and a key segment in the queue's key-value namespace, so it is
+    /// restricted to the same character set as a Taquba job id.
+    #[error("invalid run id `{run_id}`: {reason}")]
+    InvalidRunId {
+        /// The rejected run id.
+        run_id: String,
+        /// Which rule the run id broke.
+        reason: &'static str,
+    },
+
     /// A re-submission of an active `run_id` carried `spec.input` bytes
     /// that differ from the original submission's. Reusing a `run_id`
     /// with new input is treated as a programmer error: pick a fresh
@@ -77,6 +90,7 @@ impl Error {
             Self::MissingHeader(_)
             | Self::InvalidStepHeader { .. }
             | Self::ReservedHeaderInSubmit(_)
+            | Self::InvalidRunId { .. }
             | Self::InputMismatch(_)
             | Self::ReservedKvKey(_)
             | Self::ConflictingKvEffect(_)
@@ -98,6 +112,13 @@ mod tests {
     #[test]
     fn workflow_variants_are_permanent() {
         assert!(Error::MissingHeader("workflow.run_id").is_permanent());
+        assert!(
+            Error::InvalidRunId {
+                run_id: String::new(),
+                reason: "run id must not be empty",
+            }
+            .is_permanent()
+        );
         assert!(
             Error::InvalidStepHeader {
                 header: "workflow.step",

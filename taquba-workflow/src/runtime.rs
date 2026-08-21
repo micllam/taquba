@@ -49,6 +49,10 @@ pub const HEADER_SIGNAL_DELIVERED: &str = "workflow.signal_delivered";
 
 const DEDUP_PREFIX: &str = "run:";
 
+/// Maximum length of a caller-supplied [`RunSpec::run_id`], matching the
+/// limit Taquba applies to a caller-supplied job id.
+pub const MAX_RUN_ID_LEN: usize = 128;
+
 /// Prefix for the durable per-run record in Taquba's user KV namespace.
 const RUN_KV_PREFIX: &[u8] = b"workflow/runs/";
 
@@ -94,6 +98,32 @@ fn parse_terminal_kv_key(key: &[u8]) -> Option<(String, u64)> {
     let text = std::str::from_utf8(suffix).ok()?;
     let (ts, run_id) = text.split_once('/')?;
     Some((run_id.to_string(), ts.parse().ok()?))
+}
+
+/// Validate a caller-supplied run id. The run id becomes an object-store
+/// path segment under the memo prefix and a key segment in the queue's
+/// key-value namespace, so it is restricted to the same 1 to
+/// [`MAX_RUN_ID_LEN`] bytes of `[A-Za-z0-9_-]` that Taquba requires of a
+/// caller-supplied job id. An empty run id would resolve to the memo
+/// prefix itself, whose entries the retention sweep would then remove
+/// for every run.
+fn validate_run_id(run_id: &str) -> Result<()> {
+    let reason = if run_id.is_empty() {
+        "run id must not be empty"
+    } else if run_id.len() > MAX_RUN_ID_LEN {
+        "run id exceeds maximum length of 128 bytes"
+    } else if !run_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        "run id must contain only `[A-Za-z0-9_-]`"
+    } else {
+        return Ok(());
+    };
+    Err(Error::InvalidRunId {
+        run_id: run_id.to_string(),
+        reason,
+    })
 }
 
 fn run_kv_key(run_id: &str) -> Vec<u8> {
@@ -374,10 +404,19 @@ struct StepEnqueueOpts {
 /// Spec passed to [`WorkflowRuntime::submit`].
 #[derive(Debug, Clone, Default)]
 pub struct RunSpec {
-    /// Caller-supplied run identifier. If `None`, the runtime generates a
-    /// ULID. The dedup key for the first step job is `run:{run_id}:0`, so
+    /// Caller-supplied run identifier of 1 to [`MAX_RUN_ID_LEN`] bytes of
+    /// `[A-Za-z0-9_-]`; anything else is rejected with
+    /// [`Error::InvalidRunId`]. If `None`, the runtime generates a ULID.
+    /// The dedup key for the first step job is `run:{run_id}:0`, so
     /// re-submitting the same `run_id` while the run is active returns the
     /// existing job rather than creating a duplicate.
+    ///
+    /// A terminated run releases its id for re-submission. The second
+    /// run shares the first run's memo and step-output entries, which is
+    /// what makes a re-submission resume from them, and under
+    /// [`WorkflowRuntimeBuilder::memo_retention`] the first run's marker
+    /// expires against those shared entries even while the second run is
+    /// executing. The second run then re-executes the affected steps.
     pub run_id: Option<String>,
     /// Bytes handed to the runner as the first step's payload.
     pub input: Vec<u8>,
@@ -708,6 +747,9 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// pick a fresh `run_id` for a new run.
     #[instrument(skip(self, spec), fields(run_id))]
     pub async fn submit(&self, spec: RunSpec) -> Result<SubmitOutcome> {
+        if let Some(supplied) = spec.run_id.as_deref() {
+            validate_run_id(supplied)?;
+        }
         let run_id = spec
             .run_id
             .clone()
@@ -4363,6 +4405,96 @@ mod tests {
         assert_eq!(markers[0].1, 10_000 + 30_000);
 
         let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn submit_rejects_an_unusable_run_id() {
+        let (queue, store, _clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue,
+            store,
+            ScriptedRunner::new(vec![]),
+            ChannelHook { tx },
+        )
+        .build();
+
+        for bad in [
+            "",
+            "run/1",
+            "run 1",
+            "run:1",
+            &"a".repeat(MAX_RUN_ID_LEN + 1),
+        ] {
+            let err = runtime
+                .submit(RunSpec {
+                    run_id: Some(bad.to_string()),
+                    input: b"x".to_vec(),
+                    ..Default::default()
+                })
+                .await
+                .expect_err("run id must be rejected");
+            assert!(
+                matches!(err, Error::InvalidRunId { .. }),
+                "unexpected error for `{bad}`: {err}",
+            );
+        }
+
+        let ok = runtime
+            .submit(RunSpec {
+                run_id: Some("a".repeat(MAX_RUN_ID_LEN)),
+                input: b"x".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        assert!(ok.is_ok(), "a run id at the limit must be accepted");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_run_id_cannot_reach_the_retention_sweep() {
+        // An empty run id would resolve to the memo prefix itself, and the
+        // sweep would then remove every run's entries.
+        let (queue, store, clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store.clone(),
+            ScriptedRunner::new(vec![]),
+            ChannelHook { tx },
+        )
+        .memo_retention(Duration::from_secs(60))
+        .build();
+
+        let memos = MemoStore::new(store, "workflow-memo");
+        memos
+            .new_memo("bystander", 0)
+            .put("k", b"expensive")
+            .await
+            .unwrap();
+
+        assert!(
+            runtime
+                .submit(RunSpec {
+                    run_id: Some(String::new()),
+                    input: b"x".to_vec(),
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+        assert!(terminal_markers(&queue).await.is_empty());
+
+        advance(&clock, Duration::from_secs(3_600)).await;
+        runtime
+            .inner
+            .sweep_expired_memos(Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(
+            memos.new_memo("bystander", 0).get("k").await.unwrap(),
+            Some(b"expensive".to_vec()),
+            "an unrelated run's memo entries must survive",
+        );
     }
 
     #[tokio::test(start_paused = true)]

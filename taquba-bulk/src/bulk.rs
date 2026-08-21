@@ -153,7 +153,8 @@ where
 }
 
 /// Closure that derives a stable run id from an input item. Stable ids make
-/// a re-submission resume from cached memo state.
+/// a re-submission resume from cached memo state. See
+/// [`BulkBuilder::key_fn`] for the accepted character set.
 type KeyFn<I> = Box<dyn Fn(&I) -> String + Send + Sync>;
 
 /// Builder for a [`Bulk`] runner. Construct via [`Bulk::builder`].
@@ -181,7 +182,16 @@ impl<P: Pipeline> BulkBuilder<P> {
 
     /// Derive each item's run id from its input. The default is positional
     /// (`item-0`, `item-1`, ...). Supply a key when items have a natural
-    /// identifier so a replay re-uses the right memo state.
+    /// identifier so a replay re-uses the right memo state. Under
+    /// [`taquba_workflow::WorkflowRuntimeBuilder::memo_retention`] that
+    /// re-use is bounded by the first run's retention window, after which
+    /// the replay re-executes the item's steps.
+    ///
+    /// The returned id must satisfy
+    /// [`taquba_workflow::MAX_RUN_ID_LEN`] bytes of `[A-Za-z0-9_-]`;
+    /// [`Bulk::run`] fails the submission otherwise. Encode a natural
+    /// identifier that ranges wider than that, for example a URL or a
+    /// path, as a hash or another restricted form.
     pub fn key_fn(mut self, f: impl Fn(&P::Input) -> String + Send + Sync + 'static) -> Self {
         self.key_fn = Some(Box::new(f));
         self

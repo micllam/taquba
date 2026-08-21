@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `MAX_RUN_ID_LEN` (128) and `Error::InvalidRunId`: a caller-supplied
+  `RunSpec::run_id` must be 1 to 128 bytes of `[A-Za-z0-9_-]`, the same
+  rule Taquba applies to a caller-supplied job id. The run id becomes an
+  object-store path segment under the memo prefix and a key segment in
+  the queue's key-value namespace, and an empty one resolved to the memo
+  prefix itself, so the retention sweep removed every run's memo and
+  step-output entries once that run's marker expired. Generated run ids
+  are unaffected.
+
 ### Changed
 
 - Run termination is atomic. Every path that settles a run now commits

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- A run id produced by `BulkBuilder::key_fn` must be 1 to 128 bytes of
+  `[A-Za-z0-9_-]`, the constraint `taquba-workflow` now applies to every
+  caller-supplied run id. A key function returning a wider identifier,
+  for example a URL or a path, must hash or otherwise restrict it. The
+  default positional ids are unaffected.
+
 ## [0.6.0] - 2026-08-17
 
 ### Changed

@@ -411,12 +411,22 @@
 //! the first unexpired marker.
 //!
 //! Because the sweep is keyed on those terminal markers, and a
-//! terminated run never resumes, it never deletes the memo or replay
-//! entries of an in-flight run that a resume may still read. A resuming
-//! step that finds an entry absent re-executes the work (delivery is
-//! at-least-once regardless), so a missing entry is always safe to
-//! observe rather than a dangling reference: deletion is left
-//! unguarded precisely because every reader tolerates absence.
+//! terminated run never resumes, it does not delete the memo or replay
+//! entries of an in-flight run that a resume may still read, with one
+//! exception given below. A resuming step that finds an entry absent
+//! re-executes the work (delivery is at-least-once regardless), so a
+//! missing entry is always safe to observe rather than a dangling
+//! reference: deletion is left unguarded precisely because every reader
+//! tolerates absence.
+//!
+//! The exception is a re-submitted run id. Entries are addressed by run
+//! id and a terminated run releases its id, so a second run submitted
+//! under that id shares the first run's entries, and the first run's
+//! marker expires against them while the second run may still be
+//! executing. The second run re-executes the affected steps. A run
+//! id's entries are therefore retained from the first run's
+//! termination, and every later run submitted under that id shares
+//! that window.
 //!
 //! Advanced cleanup policies (selective retention, externally-driven
 //! sweeps) can be built on [`taquba::Queue::kv_scan`] over that prefix
@@ -504,8 +514,8 @@ pub use memo::{Memo, MemoStore};
 pub use runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 pub use runtime::{
     HEADER_RUN_ID, HEADER_SIGNAL_DELIVERED, HEADER_SIGNAL_WAIT, HEADER_STEP, HEADER_TERMINAL,
-    RESERVED_HEADER_PREFIX, RESERVED_KV_PREFIX, RunSpec, RunState, RunStatus, SignalOutcome,
-    SubmitOutcome, WorkflowRuntime, WorkflowRuntimeBuilder,
+    MAX_RUN_ID_LEN, RESERVED_HEADER_PREFIX, RESERVED_KV_PREFIX, RunSpec, RunState, RunStatus,
+    SignalOutcome, SubmitOutcome, WorkflowRuntime, WorkflowRuntimeBuilder,
 };
 #[cfg(feature = "webhooks")]
 pub use terminal::WebhookTerminalHook;
