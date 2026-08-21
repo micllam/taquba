@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Run termination is atomic. Every path that settles a run now commits
+  the terminal marker, the durable run record's delete and the terminal
+  notification's enqueue in the same transaction as the settlement,
+  through the `SettlementEffects` that `taquba` applies with a
+  dead-letter, an exhausted nack or a `cancel` that removes a pending
+  job. Previously the three arms that do not acknowledge (a permanent
+  step error, a transient error on the final attempt and a `cancel`
+  that removed a pending step) applied them best-effort after the
+  transition committed, so a crash in that window could lose a
+  notification or leave a run record behind. Exactly-once enqueue of
+  the notification now holds on every worker and cancel path; the
+  reaper and open-time crash recovery settle inside the queue without a
+  worker and still apply no effects.
+
+- Terminal markers move from the object store to the queue's key-value
+  namespace, under the reserved `workflow/terminals/` prefix, keyed by
+  the terminating timestamp ahead of the run id. The retention sweep
+  reads them with `Queue::kv_scan` and its expired set is the start of
+  the range. With retention enabled this removes an object-store round
+  trip from every terminating settlement, and it makes markers readable
+  through `QueueReader::kv_scan`, which requires no access to the memo
+  store that previously held them. Markers written by 0.10 and earlier
+  remain in the object store under `<memo prefix>/terminals/` and are
+  not read: after upgrading, delete that prefix manually, and clear the
+  memo and step-output entries of any run that terminated before the
+  upgrade, since no marker remains to select them for sweeping.
+
+### Removed
+
+- `MemoStore::write_terminal_marker`, `MemoStore::list_terminal_markers`,
+  `MemoStore::list_expired_terminal_markers`,
+  `MemoStore::delete_terminal_marker` and the `TerminalMarker` type.
+  Terminal markers are no longer object-store entries. Custom retention
+  policies read them with `Queue::kv_scan` over `workflow/terminals/`
+  and still clear entries with `MemoStore::clear_memos_for_run`.
+
 ## [0.10.0] - 2026-08-17
 
 ### Added

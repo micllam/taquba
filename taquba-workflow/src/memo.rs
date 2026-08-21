@@ -15,43 +15,30 @@
 //! # Layout
 //!
 //! [`MemoStore`] owns a single object-store prefix and partitions it into
-//! three sub-prefixes:
+//! two sub-prefixes:
 //!
 //! - `<prefix>/memos/<run_id>/<step_number>/<sha256(user_key)>`: memo
 //!   entries written by [`Memo::put`].
 //! - `<prefix>/step-outputs/<run_id>/<step_number>/<sha256(step_payload)>`:
 //!   step-output replay entries written by the workflow runtime when
 //!   enabled.
-//! - `<prefix>/terminals/<(u64::MAX - terminal_at_ms):020>_<run_id>`:
-//!   terminal markers written by [`MemoStore::write_terminal_marker`].
-//!   The leading zero-padded *inverted* millisecond timestamp sorts
-//!   markers newest-first, so every marker older than a cutoff sorts
-//!   after the cutoff's key and
-//!   [`MemoStore::list_expired_terminal_markers`] can reach the
-//!   expired set through `list_with_offset`, whose key-greater-than
-//!   filter is part of the object-store contract (list *order* is
-//!   not). The sweep's listing cost is therefore proportional to the
-//!   number of expired markers, not the total retained.
 //!
 //! # Cleanup
 //!
 //! The [`Memo`] primitive has no lifecycle management of its own.
 //! [`MemoStore::clear_memos_for_run`] removes every memo entry and
-//! step-output replay entry for a given run. [`MemoStore::write_terminal_marker`],
-//! [`MemoStore::list_expired_terminal_markers`], and
-//! [`MemoStore::delete_terminal_marker`] are the building blocks a
-//! caller (typically the workflow runtime) composes into a retention
-//! sweeper; [`MemoStore::list_terminal_markers`] lists every marker
-//! for inspection.
+//! step-output replay entry for a given run. Deciding *which* runs are
+//! eligible is the caller's concern: the workflow runtime records a
+//! terminal marker for each finished run in the queue's key-value
+//! namespace, in the same transaction that settles the run, and its
+//! retention sweep pairs that marker with `clear_memos_for_run`.
 
 use std::sync::Arc;
 
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use taquba::object_store::{
-    Error as ObjectStoreError, ObjectMeta, ObjectStore, ObjectStoreExt, path::Path,
-};
+use taquba::object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, path::Path};
 
 use crate::error::{Error, Result};
 
@@ -59,8 +46,8 @@ use crate::error::{Error, Result};
 /// [`ObjectStore`] and a path prefix. Builds per-step [`Memo`]
 /// views via [`MemoStore::new_memo`].
 ///
-/// Owns the memo, step-output, and terminal-marker sub-prefixes; see
-/// the module docs for the path layout.
+/// Owns the memo and step-output sub-prefixes; see the module docs for
+/// the path layout.
 #[derive(Clone)]
 pub struct MemoStore {
     store: Arc<dyn ObjectStore>,
@@ -79,10 +66,10 @@ impl std::fmt::Debug for MemoStore {
 
 impl MemoStore {
     /// Build a `MemoStore` over the given object store and path prefix.
-    /// Memo entries live under `<prefix>/memos/...` and terminal markers
-    /// under `<prefix>/terminals/...`; the prefix should not overlap
-    /// with the queue's SlateDB path or with any other consumer of the
-    /// same store.
+    /// Memo entries live under `<prefix>/memos/...` and step-output
+    /// replay entries under `<prefix>/step-outputs/...`; the prefix
+    /// should not overlap with the queue's SlateDB path or with any
+    /// other consumer of the same store.
     pub fn new(store: Arc<dyn ObjectStore>, prefix: impl Into<String>) -> Self {
         Self {
             store,
@@ -176,65 +163,6 @@ impl MemoStore {
         .await
     }
 
-    /// Write a terminal marker for `run_id` at `terminal_at_ms`. The
-    /// marker is a zero-byte object whose path encodes both fields so a
-    /// sweeper can decide retention without reading any content.
-    /// Idempotent: a second call with the same `(run_id, terminal_at_ms)`
-    /// overwrites the empty value with another empty value.
-    pub async fn write_terminal_marker(&self, run_id: &str, terminal_at_ms: u64) -> Result<()> {
-        let path = self.terminal_marker_path(run_id, terminal_at_ms);
-        self.store.put(&path, Vec::new().into()).await?;
-        Ok(())
-    }
-
-    /// List every terminal marker currently in the store.
-    ///
-    /// Markers are returned in arbitrary order (object-store list order
-    /// is not guaranteed by the trait); callers that care about
-    /// chronological order should sort by [`TerminalMarker::terminal_at_ms`].
-    /// Markers whose filenames cannot be parsed are skipped with a
-    /// warning rather than failing the whole listing.
-    pub async fn list_terminal_markers(&self) -> Result<Vec<TerminalMarker>> {
-        let prefix = self.terminals_prefix();
-        collect_markers(self.store.list(Some(&prefix)), None).await
-    }
-
-    /// List the terminal markers whose `terminal_at_ms` is strictly
-    /// before `cutoff_ms`.
-    ///
-    /// Marker filenames lead with the inverted timestamp, so every
-    /// expired marker's key is greater than the cutoff's key and the
-    /// listing goes through `list_with_offset`: its key-greater-than
-    /// filter is part of the object-store contract, and stores such as
-    /// S3 and GCS push the offset down, so the cost is proportional to
-    /// the number of expired markers rather than the total retained.
-    /// Markers are returned in arbitrary order; unparseable filenames
-    /// are skipped with a warning.
-    pub async fn list_expired_terminal_markers(
-        &self,
-        cutoff_ms: u64,
-    ) -> Result<Vec<TerminalMarker>> {
-        let prefix = self.terminals_prefix();
-        // A marker at exactly `cutoff_ms` shares the offset's leading
-        // segment and is therefore listed; the parse-side filter in
-        // `collect_markers` keeps the predicate strict.
-        let offset = prefix.clone().join(format!("{:020}", invert_ts(cutoff_ms)));
-        let stream = self.store.list_with_offset(Some(&prefix), &offset);
-        collect_markers(stream, Some(cutoff_ms)).await
-    }
-
-    /// Delete the terminal marker identified by `marker`.
-    ///
-    /// A missing marker (already swept by another pass) is treated as
-    /// success.
-    pub async fn delete_terminal_marker(&self, marker: &TerminalMarker) -> Result<()> {
-        let path = self.terminal_marker_path(&marker.run_id, marker.terminal_at_ms);
-        match self.store.delete(&path).await {
-            Ok(()) | Err(ObjectStoreError::NotFound { .. }) => Ok(()),
-            Err(err) => Err(Error::Store(err)),
-        }
-    }
-
     fn memo_path(&self, run_id: &str, step_number: u32, key: &str) -> Path {
         self.memos_run_prefix(run_id)
             .join(step_number.to_string())
@@ -254,68 +182,6 @@ impl MemoStore {
             .join(step_number.to_string())
             .join(hex_sha256(step_payload))
     }
-
-    fn terminals_prefix(&self) -> Path {
-        Path::from(format!("{}/terminals", self.prefix))
-    }
-
-    fn terminal_marker_path(&self, run_id: &str, terminal_at_ms: u64) -> Path {
-        self.terminals_prefix()
-            .join(format!("{:020}_{run_id}", invert_ts(terminal_at_ms)))
-    }
-}
-
-/// Invert a millisecond timestamp so newer values sort first in the
-/// zero-padded marker filenames. `u64::MAX` is 20 decimal digits, so
-/// every inverted value fits the fixed-width segment and lexicographic
-/// order equals numeric order.
-fn invert_ts(ms: u64) -> u64 {
-    u64::MAX - ms
-}
-
-/// Collect [`TerminalMarker`]s from a marker listing stream. When
-/// `cutoff_ms` is set, only markers with `terminal_at_ms` strictly
-/// below it are kept. Markers whose filenames cannot be parsed are
-/// skipped with a warning rather than failing the listing.
-async fn collect_markers(
-    mut stream: impl Stream<Item = std::result::Result<ObjectMeta, ObjectStoreError>> + Unpin,
-    cutoff_ms: Option<u64>,
-) -> Result<Vec<TerminalMarker>> {
-    let mut out = Vec::new();
-    while let Some(item) = stream.next().await {
-        let meta = item.map_err(Error::Store)?;
-        let Some(name) = meta.location.filename() else {
-            continue;
-        };
-        match parse_terminal_marker_name(name) {
-            Some((terminal_at_ms, run_id))
-                if cutoff_ms.is_none_or(|cutoff| terminal_at_ms < cutoff) =>
-            {
-                out.push(TerminalMarker {
-                    run_id,
-                    terminal_at_ms,
-                });
-            }
-            Some(_) => {}
-            None => {
-                tracing::warn!(
-                    path = %meta.location,
-                    "unparseable terminal marker; skipping",
-                );
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// A terminal marker as returned by [`MemoStore::list_terminal_markers`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TerminalMarker {
-    /// The run this marker belongs to.
-    pub run_id: String,
-    /// Wall-clock millisecond timestamp recorded when the run reached
-    /// its terminal state.
-    pub terminal_at_ms: u64,
 }
 
 /// A view onto a [`MemoStore`] scoped to a specific
@@ -428,16 +294,6 @@ where
 {
     let bytes = rmp_serde::to_vec_named(input)?;
     Ok(format!("content:{}", hex_sha256(&bytes)))
-}
-
-/// Parse a terminal marker filename in the form `<ts:020>_<run_id>`.
-/// Returns `None` if the leading 20 characters are not a base-10
-/// integer or the underscore separator is missing.
-fn parse_terminal_marker_name(name: &str) -> Option<(u64, String)> {
-    let (ts_str, rest) = name.split_at_checked(20)?;
-    let inverted: u64 = ts_str.parse().ok()?;
-    let run_id = rest.strip_prefix('_')?;
-    Some((invert_ts(inverted), run_id.to_string()))
 }
 
 #[cfg(test)]
@@ -714,155 +570,5 @@ mod tests {
             store.new_memo("run-suffix", 0).get("k").await.unwrap(),
             Some(b"long".to_vec()),
         );
-    }
-
-    #[tokio::test]
-    async fn write_terminal_marker_then_list_returns_it() {
-        let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        store
-            .write_terminal_marker("run-1", 1_700_000_000_000)
-            .await
-            .unwrap();
-
-        let terminals = store.list_terminal_markers().await.unwrap();
-        assert_eq!(terminals.len(), 1);
-        assert_eq!(terminals[0].run_id, "run-1");
-        assert_eq!(terminals[0].terminal_at_ms, 1_700_000_000_000);
-    }
-
-    #[tokio::test]
-    async fn list_expired_terminal_markers_honours_a_strict_cutoff() {
-        let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        store.write_terminal_marker("run-old", 1_000).await.unwrap();
-        store
-            .write_terminal_marker("run-edge", 2_000)
-            .await
-            .unwrap();
-        store.write_terminal_marker("run-new", 3_000).await.unwrap();
-
-        let expired = store.list_expired_terminal_markers(2_000).await.unwrap();
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].run_id, "run-old");
-        assert_eq!(expired[0].terminal_at_ms, 1_000);
-
-        assert!(
-            store
-                .list_expired_terminal_markers(1_000)
-                .await
-                .unwrap()
-                .is_empty(),
-        );
-        assert_eq!(
-            store
-                .list_expired_terminal_markers(3_001)
-                .await
-                .unwrap()
-                .len(),
-            3
-        );
-    }
-
-    #[tokio::test]
-    async fn list_terminal_markers_is_empty_when_none_written() {
-        let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        let terminals = store.list_terminal_markers().await.unwrap();
-        assert!(terminals.is_empty());
-    }
-
-    #[tokio::test]
-    async fn list_terminal_markers_returns_all() {
-        let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        store.write_terminal_marker("run-a", 1_000).await.unwrap();
-        store.write_terminal_marker("run-b", 2_000).await.unwrap();
-        store.write_terminal_marker("run-c", 3_000).await.unwrap();
-
-        let mut terminals = store.list_terminal_markers().await.unwrap();
-        terminals.sort_by_key(|t| t.terminal_at_ms);
-        assert_eq!(
-            terminals,
-            vec![
-                TerminalMarker {
-                    run_id: "run-a".into(),
-                    terminal_at_ms: 1_000
-                },
-                TerminalMarker {
-                    run_id: "run-b".into(),
-                    terminal_at_ms: 2_000
-                },
-                TerminalMarker {
-                    run_id: "run-c".into(),
-                    terminal_at_ms: 3_000
-                },
-            ],
-        );
-    }
-
-    #[tokio::test]
-    async fn delete_terminal_marker_removes_only_the_named_one() {
-        let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        store.write_terminal_marker("run-a", 1_000).await.unwrap();
-        store.write_terminal_marker("run-b", 2_000).await.unwrap();
-
-        store
-            .delete_terminal_marker(&TerminalMarker {
-                run_id: "run-a".into(),
-                terminal_at_ms: 1_000,
-            })
-            .await
-            .unwrap();
-
-        let terminals = store.list_terminal_markers().await.unwrap();
-        assert_eq!(terminals.len(), 1);
-        assert_eq!(terminals[0].run_id, "run-b");
-    }
-
-    #[tokio::test]
-    async fn delete_terminal_marker_succeeds_on_missing() {
-        let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        store
-            .delete_terminal_marker(&TerminalMarker {
-                run_id: "nope".into(),
-                terminal_at_ms: 1_000,
-            })
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn delete_terminal_marker_is_idempotent() {
-        // A second delete of an already-deleted marker is the path
-        // a crash-and-retry sweeper takes when it recovers mid-cleanup;
-        // both deletes must succeed.
-        let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        let marker = TerminalMarker {
-            run_id: "run-1".into(),
-            terminal_at_ms: 1_000,
-        };
-        store
-            .write_terminal_marker(&marker.run_id, marker.terminal_at_ms)
-            .await
-            .unwrap();
-        store.delete_terminal_marker(&marker).await.unwrap();
-        store.delete_terminal_marker(&marker).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn terminal_markers_and_memos_do_not_collide() {
-        let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        store.new_memo("run-1", 0).put("k", b"v").await.unwrap();
-        store.write_terminal_marker("run-1", 1_000).await.unwrap();
-
-        // Memo survives terminal marking.
-        assert_eq!(
-            store.new_memo("run-1", 0).get("k").await.unwrap(),
-            Some(b"v".to_vec()),
-        );
-        // Terminal marker survives memo writes.
-        let terminals = store.list_terminal_markers().await.unwrap();
-        assert_eq!(terminals.len(), 1);
-        // clear_memos_for_run does not touch terminal markers.
-        store.clear_memos_for_run("run-1").await.unwrap();
-        let terminals = store.list_terminal_markers().await.unwrap();
-        assert_eq!(terminals.len(), 1);
     }
 }

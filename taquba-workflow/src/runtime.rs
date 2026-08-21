@@ -6,8 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use taquba::object_store::ObjectStore;
 use taquba::{
-    Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, JobRecord, JobStatus, LeaseHandle,
-    PermanentFailure, Queue, SettlementEffects, Worker, WorkerError,
+    Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, FailWith, JobRecord, JobStatus,
+    LeaseHandle, PermanentFailure, Queue, SettlementEffects, Worker, WorkerError,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -64,6 +64,37 @@ const SIGNAL_BUF_KV_PREFIX: &[u8] = b"workflow/signal-buf/";
 /// a signal consumed on the waiter's behalf, read when that step is
 /// claimed and deleted with its settlement.
 const SIGNAL_DELIVERED_KV_PREFIX: &[u8] = b"workflow/signal-delivered/";
+
+/// Prefix for the durable terminal marker: the time-ordered index of
+/// runs that have reached a terminal state, read by the memo-retention
+/// sweep. Written only when [`WorkflowRuntimeBuilder::memo_retention`]
+/// is set, in the same transaction that settles the run.
+const TERMINAL_KV_PREFIX: &[u8] = b"workflow/terminals/";
+
+/// Terminal markers read per page by the memo-retention sweep.
+const SWEEP_PAGE_SIZE: usize = 256;
+
+/// Key of the terminal marker for `run_id`, terminated at
+/// `terminal_at_ms`. The zero-padded timestamp leads the suffix, so a
+/// prefix scan returns markers oldest first and the sweep's expired set
+/// is the front of the range. The value is empty: both fields are in
+/// the key.
+fn terminal_kv_key(run_id: &str, terminal_at_ms: u64) -> Vec<u8> {
+    let mut k = Vec::from(TERMINAL_KV_PREFIX);
+    k.extend_from_slice(format!("{terminal_at_ms:020}/").as_bytes());
+    k.extend_from_slice(run_id.as_bytes());
+    k
+}
+
+/// Parse a terminal marker key produced by [`terminal_kv_key`] back
+/// into its `(run_id, terminal_at_ms)` pair. Returns `None` for a key
+/// that does not match the layout, which the sweep skips.
+fn parse_terminal_kv_key(key: &[u8]) -> Option<(String, u64)> {
+    let suffix = key.strip_prefix(TERMINAL_KV_PREFIX)?;
+    let text = std::str::from_utf8(suffix).ok()?;
+    let (ts, run_id) = text.split_once('/')?;
+    Some((run_id.to_string(), ts.parse().ok()?))
+}
 
 fn run_kv_key(run_id: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(RUN_KV_PREFIX.len() + run_id.len());
@@ -839,9 +870,11 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// The run terminates as [`TerminalStatus::Cancelled`] and its
     /// notification job is enqueued for the terminal hook:
     ///
-    /// - **Pending / scheduled step**: the queued step job is cancelled
-    ///   in Taquba and the notification is enqueued before this call
-    ///   returns; the hook runs from a worker afterwards.
+    /// - **Pending / scheduled step**: the queued step job is removed
+    ///   and the notification enqueued in one transaction before this
+    ///   call returns; the hook runs from a worker afterwards. A run
+    ///   whose step is already claimed keeps its durable state until
+    ///   the worker settles it.
     /// - **Running step**: cancellation is delivered to the runner via
     ///   [`Step::cancel_token`]; runners that watch the token short-circuit
     ///   immediately. Runners that ignore the token are allowed to run to
@@ -876,24 +909,28 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             )
         };
 
-        match self.inner.queue.cancel(&job_id).await? {
+        // `error` is `None`: external cancellation supplies no reason at
+        // the API level. The effects are built before the outcome is
+        // known; the queue applies them only on `Removed`.
+        let effects = self.inner.terminate_collecting_effects(
+            &RunOutcome {
+                run_id: run_id.to_string(),
+                status: TerminalStatus::Cancelled,
+                result: None,
+                error: None,
+                headers,
+                final_step: current_step,
+            },
+            None,
+            None,
+        );
+        match self.inner.queue.cancel_with(&job_id, effects).await?.0 {
             taquba::CancelOutcome::Removed => {
                 // Job was Pending/Scheduled and is now removed; no worker
-                // will ever see it. Terminate here. `error` is `None`:
-                // external cancellation carries no reason at the API level.
-                self.inner
-                    .terminate(
-                        RunOutcome {
-                            run_id: run_id.to_string(),
-                            status: TerminalStatus::Cancelled,
-                            result: None,
-                            error: None,
-                            headers,
-                            final_step: current_step,
-                        },
-                        None,
-                    )
-                    .await;
+                // will ever see it. The marker, the record delete and the
+                // notification committed with the removal, leaving only
+                // process state to remove.
+                self.inner.forget_run(run_id);
             }
             taquba::CancelOutcome::Requested => {
                 // Worker is processing the step. The worker reads our own
@@ -1164,76 +1201,37 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         })
     }
 
-    /// Settle a run into its terminal state where no acknowledgement
-    /// transaction exists to apply the effects (the pending-step path
-    /// of [`WorkflowRuntime::cancel`], and worker paths that
-    /// dead-letter or nack). Applies the effects of
-    /// [`Self::terminate_collecting_effects`] directly, best-effort: a
-    /// failure is logged but does not affect the already-running
-    /// cleanup of *this* run. The notification enqueue runs before the
-    /// record delete, so a partial failure prefers losing the record
-    /// cleanup over losing the notification.
-    async fn terminate(&self, outcome: RunOutcome, priority: Option<u32>) {
-        let run_id = outcome.run_id.clone();
-        let effects = self
-            .terminate_collecting_effects(outcome, priority, None)
-            .await;
-        for request in effects.enqueues {
-            if let Err(err) = self
-                .queue
-                .enqueue_with(&request.queue, request.payload, request.options)
-                .await
-            {
-                warn!(
-                    run_id = %run_id,
-                    "failed to enqueue the terminal notification: {err}"
-                );
-            }
-        }
-        for key in &effects.kv_deletes {
-            if let Err(err) = self.queue.kv_delete(key).await {
-                warn!(
-                    run_id = %run_id,
-                    "failed to clear durable run record: {err}"
-                );
-            }
-        }
-    }
-
-    /// Settle a run into its terminal state: drop its registry entry,
-    /// write a terminal marker (if memo retention is enabled), and
-    /// return the durable run record's delete plus the
-    /// terminal-notification enqueue (when the hook observes this
-    /// outcome) as [`SettlementEffects`] for the step's acknowledgement
-    /// transaction. The notification job's payload is the committed
-    /// outcome and the configured [`TerminalHook`] runs as its worker.
-    /// The marker is written *before* the record delete can commit, so
-    /// a crash between the two leaves the marker around to drive memo
-    /// cleanup; losing the marker is worse than leaving a stale run
-    /// record (which only blocks one future submit). A settlement that
-    /// fails redelivers the step, which re-terminates and rebuilds the
-    /// same effects.
-    async fn terminate_collecting_effects(
+    /// Settle a run into its terminal state: return the durable run
+    /// record's delete, the terminal marker's write (when memo
+    /// retention is enabled) and the terminal-notification enqueue
+    /// (when the hook observes this outcome) as [`SettlementEffects`]
+    /// for the settlement transaction. The notification job's payload
+    /// is the committed outcome and the configured [`TerminalHook`]
+    /// runs as its worker.
+    ///
+    /// The effects are pure: nothing is written and no state is
+    /// mutated here, so a caller that builds them and then commits a
+    /// non-terminal outcome leaves no trace. Dropping the run's
+    /// registry entry is the caller's own [`Self::forget_run`] call. A
+    /// settlement that fails redelivers the step, which re-terminates
+    /// and rebuilds the same effects.
+    fn terminate_collecting_effects(
         &self,
-        outcome: RunOutcome,
+        outcome: &RunOutcome,
         priority: Option<u32>,
         max_attempts: Option<u32>,
     ) -> SettlementEffects {
-        self.registry.lock().unwrap().remove(&outcome.run_id);
-        if self.memo_retention.is_some()
-            && let Err(err) = self
-                .memo_store
-                .write_terminal_marker(&outcome.run_id, self.clock.now_ms())
-                .await
-        {
-            warn!(
-                run_id = %outcome.run_id,
-                "failed to write terminal marker: {err}"
-            );
-        }
         let kv_deletes = vec![run_kv_key(&outcome.run_id)];
-        let enqueues = if self.terminal_hook.observes(&outcome) {
-            match self.notification_enqueue_request(&outcome, priority, max_attempts) {
+        let kv_writes = if self.memo_retention.is_some() {
+            HashMap::from([(
+                terminal_kv_key(&outcome.run_id, self.clock.now_ms()),
+                Vec::new(),
+            )])
+        } else {
+            HashMap::new()
+        };
+        let enqueues = if self.terminal_hook.observes(outcome) {
+            match self.notification_enqueue_request(outcome, priority, max_attempts) {
                 Ok(request) => vec![request],
                 Err(err) => {
                     warn!(
@@ -1248,9 +1246,21 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         };
         SettlementEffects {
             enqueues,
+            kv_writes,
             kv_deletes,
-            ..SettlementEffects::default()
         }
+    }
+
+    /// Remove the run's registry entry as part of terminating it.
+    /// Process state only: a missed removal reports an already-terminal
+    /// run as active until the process restarts, while an early removal
+    /// strands a run that is still retrying. Worker paths necessarily
+    /// call this before the settlement commits, and a settlement that
+    /// then fails redelivers the step, whose
+    /// [`Self::registry_mark_running`] rebuilds the entry without its
+    /// previous `cancel_requested` flag.
+    fn forget_run(&self, run_id: &str) {
+        self.registry.lock().unwrap().remove(run_id);
     }
 
     /// Process a terminal-notification job: decode the committed
@@ -1322,32 +1332,51 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         let now_ms = self.clock.now_ms();
         let retention_ms = retention.as_millis() as u64;
         let cutoff = now_ms.saturating_sub(retention_ms);
-        let markers = self
-            .memo_store
-            .list_expired_terminal_markers(cutoff)
-            .await?;
         let mut cleared = 0usize;
-        for marker in markers {
-            if let Err(err) = self.memo_store.clear_memos_for_run(&marker.run_id).await {
-                warn!(
-                    run_id = %marker.run_id,
-                    "clear_memos_for_run failed during sweep: {err}",
-                );
-                continue;
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let page = self
+                .queue
+                .kv_scan(TERMINAL_KV_PREFIX, cursor.as_deref(), SWEEP_PAGE_SIZE)
+                .await?;
+            let exhausted = page.next_cursor.is_none();
+            cursor = page.next_cursor;
+            for (key, _) in page.entries {
+                let Some((run_id, terminal_at_ms)) = parse_terminal_kv_key(&key) else {
+                    warn!(
+                        key = %String::from_utf8_lossy(&key),
+                        "unparseable terminal marker; skipping",
+                    );
+                    continue;
+                };
+                // Markers sort by timestamp, so the first unexpired one
+                // ends the sweep: everything after it is newer.
+                if terminal_at_ms >= cutoff {
+                    return Ok(cleared);
+                }
+                if let Err(err) = self.memo_store.clear_memos_for_run(&run_id).await {
+                    warn!(
+                        run_id = %run_id,
+                        "clear_memos_for_run failed during sweep: {err}",
+                    );
+                    continue;
+                }
+                // Memos first, marker second: a failure here leaves the
+                // marker for the next pass, whose `clear_memos_for_run`
+                // is a no-op on the now-empty run prefix.
+                if let Err(err) = self.queue.kv_delete(&key).await {
+                    warn!(
+                        run_id = %run_id,
+                        "terminal marker delete failed during sweep: {err}",
+                    );
+                    continue;
+                }
+                cleared += 1;
             }
-            if let Err(err) = self.memo_store.delete_terminal_marker(&marker).await {
-                warn!(
-                    run_id = %marker.run_id,
-                    "delete_terminal_marker failed during sweep: {err}",
-                );
-                // Memos are gone but the marker remains; the next pass
-                // will retry the marker delete (clear_memos_for_run is
-                // a no-op on the now-empty run prefix).
-                continue;
+            if exhausted {
+                return Ok(cleared);
             }
-            cleared += 1;
         }
-        Ok(cleared)
     }
 
     /// Transition the entry for `run_id` into [`RunState::Running`] for
@@ -1581,9 +1610,9 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         //    retries and permanent dead-letters), with `error: None` so
         //    consumers can distinguish external vs. runner-issued cancel.
         let settled = match outcome {
-            Ok(StepOutcome::Cancel { reason }) => Ok(self
-                .terminate_collecting_effects(
-                    RunOutcome {
+            Ok(StepOutcome::Cancel { reason }) => {
+                let effects = self.terminate_collecting_effects(
+                    &RunOutcome {
                         run_id: run_id.clone(),
                         status: TerminalStatus::Cancelled,
                         result: None,
@@ -1593,11 +1622,13 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     },
                     Some(job.priority),
                     Some(job.max_attempts),
-                )
-                .await),
-            _ if external_cancel => Ok(self
-                .terminate_collecting_effects(
-                    RunOutcome {
+                );
+                self.forget_run(&run_id);
+                Ok(effects)
+            }
+            _ if external_cancel => {
+                let effects = self.terminate_collecting_effects(
+                    &RunOutcome {
                         run_id: run_id.clone(),
                         status: TerminalStatus::Cancelled,
                         result: None,
@@ -1607,8 +1638,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     },
                     Some(job.priority),
                     Some(job.max_attempts),
-                )
-                .await),
+                );
+                self.forget_run(&run_id);
+                Ok(effects)
+            }
             Ok(StepOutcome::Continue { payload, when }) => match when {
                 Trigger::Immediate => Ok(self
                     .advance(
@@ -1645,9 +1678,9 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     .await
                 }
             },
-            Ok(StepOutcome::Succeed { result }) => Ok(self
-                .terminate_collecting_effects(
-                    RunOutcome {
+            Ok(StepOutcome::Succeed { result }) => {
+                let effects = self.terminate_collecting_effects(
+                    &RunOutcome {
                         run_id: run_id.clone(),
                         status: TerminalStatus::Succeeded,
                         result: Some(result),
@@ -1657,33 +1690,35 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     },
                     Some(job.priority),
                     Some(job.max_attempts),
-                )
-                .await),
+                );
+                self.forget_run(&run_id);
+                Ok(effects)
+            }
             Ok(StepOutcome::Fail { reason }) => {
                 // Runner verdict: workflow failed but the step itself ran
                 // cleanly. Ack the step (no dead-letter); the run
                 // terminates as `Failed`.
-                Ok(self
-                    .terminate_collecting_effects(
-                        RunOutcome {
-                            run_id: run_id.clone(),
-                            status: TerminalStatus::Failed,
-                            result: None,
-                            error: Some(reason),
-                            headers: user_headers,
-                            final_step: step_number,
-                        },
-                        Some(job.priority),
-                        Some(job.max_attempts),
-                    )
-                    .await)
+                let effects = self.terminate_collecting_effects(
+                    &RunOutcome {
+                        run_id: run_id.clone(),
+                        status: TerminalStatus::Failed,
+                        result: None,
+                        error: Some(reason),
+                        headers: user_headers,
+                        final_step: step_number,
+                    },
+                    Some(job.priority),
+                    Some(job.max_attempts),
+                );
+                self.forget_run(&run_id);
+                Ok(effects)
             }
             Err(StepError {
                 message,
                 kind: StepErrorKind::Permanent,
             }) => {
-                self.terminate(
-                    RunOutcome {
+                let effects = self.terminate_collecting_effects(
+                    &RunOutcome {
                         run_id: run_id.clone(),
                         status: TerminalStatus::Failed,
                         result: None,
@@ -1692,20 +1727,22 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                         final_step: step_number,
                     },
                     Some(job.priority),
-                )
-                .await;
-                Err(PermanentFailure::new(message).into())
+                    None,
+                );
+                self.forget_run(&run_id);
+                Err(FailWith::new(PermanentFailure::new(message), effects).into())
             }
             Err(StepError {
                 message,
                 kind: StepErrorKind::Transient,
             }) => {
-                // Last attempt: this nack will dead-letter. Terminate the
-                // run now, while the registry entry and headers are in
-                // hand.
+                // Last attempt: this nack will dead-letter. Build the
+                // effects while the registry entry and headers are in
+                // hand; `nack_with` decides whether they apply. The
+                // attempts test applies only to the registry removal.
                 if job.attempts >= job.max_attempts {
-                    self.terminate(
-                        RunOutcome {
+                    let effects = self.terminate_collecting_effects(
+                        &RunOutcome {
                             run_id: run_id.clone(),
                             status: TerminalStatus::Failed,
                             result: None,
@@ -1714,8 +1751,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                             final_step: step_number,
                         },
                         Some(job.priority),
-                    )
-                    .await;
+                        None,
+                    );
+                    self.forget_run(&run_id);
+                    return Err(FailWith::new(WorkerError::from(message), effects).into());
                 }
                 Err(message.into())
             }
@@ -1819,8 +1858,8 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     let message = format!(
                         "a waiter is already registered for correlation key `{correlation_key}`"
                     );
-                    self.terminate(
-                        RunOutcome {
+                    let effects = self.terminate_collecting_effects(
+                        &RunOutcome {
                             run_id: run_id.to_string(),
                             status: TerminalStatus::Failed,
                             result: None,
@@ -1829,9 +1868,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                             final_step: next_step.saturating_sub(1),
                         },
                         base_opts.priority,
-                    )
-                    .await;
-                    return Err(PermanentFailure::new(message).into());
+                        None,
+                    );
+                    self.forget_run(run_id);
+                    return Err(FailWith::new(PermanentFailure::new(message), effects).into());
                 }
             }
             Ok(None) => {}
@@ -1974,6 +2014,19 @@ mod tests {
         }
     }
 
+    /// Every terminal marker in the queue's KV namespace, as
+    /// `(run_id, terminal_at_ms)` pairs in key order (oldest first).
+    async fn terminal_markers(queue: &Queue) -> Vec<(String, u64)> {
+        let page = queue
+            .kv_scan(TERMINAL_KV_PREFIX, None, 1_000)
+            .await
+            .unwrap();
+        page.entries
+            .iter()
+            .map(|(key, _)| parse_terminal_kv_key(key).expect("well-formed marker key"))
+            .collect()
+    }
+
     async fn fresh_queue() -> (Arc<Queue>, Arc<dyn taquba::object_store::ObjectStore>) {
         let store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
         let queue = Arc::new(Queue::open(store.clone(), "test").await.unwrap());
@@ -2010,6 +2063,36 @@ mod tests {
     async fn advance(clock: &MockClock, by: Duration) {
         clock.advance(by);
         tokio::time::advance(by).await;
+    }
+
+    /// [`fresh_queue_fast_retry`] with a [`MockClock`] wired in, for
+    /// multi-attempt tests that read the clock's value as well as
+    /// depending on retries being prompt.
+    async fn fresh_queue_fast_retry_with_mock_clock(
+        initial_ms: u64,
+    ) -> (
+        Arc<Queue>,
+        Arc<dyn taquba::object_store::ObjectStore>,
+        MockClock,
+    ) {
+        let clock = MockClock::new(initial_ms);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            default_queue_config: QueueConfig {
+                retry_backoff_base: Duration::ZERO,
+                ..QueueConfig::default()
+            },
+            reaper_interval: Duration::from_millis(50),
+            scheduler_interval: Duration::from_millis(50),
+            ..OpenOptions::default()
+        };
+        let store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
+        let queue = Arc::new(
+            Queue::open_with_options(store.clone(), "test", opts)
+                .await
+                .unwrap(),
+        );
+        (queue, store, clock)
     }
 
     /// Queue with zero retry backoff and a tight reaper, so multi-attempt
@@ -2716,21 +2799,11 @@ mod tests {
         assert_eq!(outcome.error.as_deref(), Some("nope"));
         assert!(runtime.status(&handle.run_id).await.is_none());
 
-        // Permanent runner errors *do* dead-letter the step. The hook
-        // fires before the loop's dead_letter call lands, so wait for
-        // the record rather than asserting immediately.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            let stats = queue.stats("workflow-steps").await.unwrap();
-            if stats.dead == 1 {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "permanent error should dead-letter",
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // Permanent runner errors *do* dead-letter the step, and the
+        // notification the hook ran from was enqueued by that same
+        // dead-letter transaction, so the record is already visible.
+        let stats = queue.stats("workflow-steps").await.unwrap();
+        assert_eq!(stats.dead, 1, "permanent error should dead-letter");
 
         let _ = shutdown.send(());
     }
@@ -4174,10 +4247,9 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let memos = MemoStore::new(store, "workflow-memo");
-        let markers = memos.list_terminal_markers().await.unwrap();
+        let markers = terminal_markers(&runtime.inner.queue).await;
         assert_eq!(markers.len(), 1);
-        assert_eq!(markers[0].run_id, handle.run_id);
+        assert_eq!(markers[0].0, handle.run_id);
 
         let _ = shutdown.send(());
     }
@@ -4209,8 +4281,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let memos = MemoStore::new(store, "workflow-memo");
-        assert!(memos.list_terminal_markers().await.unwrap().is_empty());
+        assert!(terminal_markers(&runtime.inner.queue).await.is_empty());
 
         let _ = shutdown.send(());
     }
@@ -4246,10 +4317,9 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.status, TerminalStatus::Failed);
 
-        let memos = MemoStore::new(store, "workflow-memo");
-        let markers = memos.list_terminal_markers().await.unwrap();
+        let markers = terminal_markers(&runtime.inner.queue).await;
         assert_eq!(markers.len(), 1);
-        assert_eq!(markers[0].run_id, handle.run_id);
+        assert_eq!(markers[0].0, handle.run_id);
 
         let _ = shutdown.send(());
     }
@@ -4286,14 +4356,299 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let memos = MemoStore::new(store, "workflow-memo");
-        let markers = memos.list_terminal_markers().await.unwrap();
+        let markers = terminal_markers(&runtime.inner.queue).await;
         assert_eq!(markers.len(), 1);
-        // MockClock only moves on explicit advance/set, so the value
-        // terminate() reads is exactly the post-advance clock.
-        assert_eq!(markers[0].terminal_at_ms, 10_000 + 30_000);
+        // MockClock only moves on explicit advance/set, so the value the
+        // effects builder reads is exactly the post-advance clock.
+        assert_eq!(markers[0].1, 10_000 + 30_000);
 
         let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_a_pending_run_commits_its_terminal_marker() {
+        struct UnreachableRunner;
+        impl StepRunner for UnreachableRunner {
+            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                unreachable!("worker must not claim the cancelled step");
+            }
+        }
+
+        let (queue, store, _clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store.clone(),
+            UnreachableRunner,
+            ChannelHook { tx },
+        )
+        .memo_retention(Duration::from_secs(60))
+        .build();
+        // No worker loop: the step stays Pending, so `cancel` takes the
+        // `Removed` arm and its effects commit with the removal.
+
+        let handle = runtime
+            .submit(RunSpec {
+                input: b"x".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(runtime.cancel(&handle.run_id).await.unwrap());
+
+        let markers = terminal_markers(&queue).await;
+        assert_eq!(markers, vec![(handle.run_id.clone(), 10_000)]);
+        assert_eq!(
+            queue.kv_get(&run_kv_key(&handle.run_id)).await.unwrap(),
+            None,
+            "the run record's delete commits in the same transaction",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_a_running_step_writes_no_terminal_marker_until_it_settles() {
+        // The `Requested` arm: the queue must discard the effects, since
+        // a marker written here would mark a still-executing run.
+        struct GatedRunner {
+            claimed: Arc<tokio::sync::Notify>,
+            gate: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        }
+        impl StepRunner for GatedRunner {
+            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                self.claimed.notify_one();
+                let rx = self.gate.lock().await.take().expect("gate consumed twice");
+                let _ = rx.await;
+                Ok(StepOutcome::Succeed {
+                    result: b"done".to_vec(),
+                })
+            }
+        }
+
+        let (queue, store, _clock) = fresh_queue_with_mock_clock(10_000).await;
+        let claimed = Arc::new(tokio::sync::Notify::new());
+        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store.clone(),
+            GatedRunner {
+                claimed: claimed.clone(),
+                gate: tokio::sync::Mutex::new(Some(gate_rx)),
+            },
+            ChannelHook { tx },
+        )
+        .memo_retention(Duration::from_secs(60))
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        let handle = runtime
+            .submit(RunSpec {
+                input: b"x".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), claimed.notified())
+            .await
+            .expect("runner reached gate");
+
+        assert!(runtime.cancel(&handle.run_id).await.unwrap());
+        assert!(
+            terminal_markers(&queue).await.is_empty(),
+            "a run still executing its step must have no terminal marker",
+        );
+        assert!(
+            queue
+                .kv_get(&run_kv_key(&handle.run_id))
+                .await
+                .unwrap()
+                .is_some(),
+            "the run record must survive a cancel the worker has to finish",
+        );
+
+        let _ = gate_tx.send(());
+        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("hook fired")
+            .expect("hook channel open");
+        assert_eq!(outcome.status, TerminalStatus::Cancelled);
+        assert_eq!(
+            terminal_markers(&queue).await,
+            vec![(handle.run_id.clone(), 10_000)],
+            "the worker's settlement writes it",
+        );
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_permanent_step_error_commits_its_terminal_marker() {
+        struct FailingRunner;
+        impl StepRunner for FailingRunner {
+            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                Err(StepError::permanent("nope"))
+            }
+        }
+
+        let (queue, store, _clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store.clone(),
+            FailingRunner,
+            ChannelHook { tx },
+        )
+        .memo_retention(Duration::from_secs(60))
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        let handle = runtime
+            .submit(RunSpec {
+                input: b"x".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.status, TerminalStatus::Failed);
+
+        // The notification exists only because the dead-letter committed,
+        // so the marker and the dead job are already observable.
+        assert_eq!(
+            terminal_markers(&queue).await,
+            vec![(handle.run_id.clone(), 10_000)],
+        );
+        assert_eq!(queue.stats("workflow-steps").await.unwrap().dead, 1);
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retrying_step_error_commits_no_terminal_marker() {
+        // A transient failure with attempts left nacks for retry, and
+        // `nack_with` discards the effects on that branch.
+        struct FlakyRunner {
+            attempts: Arc<std::sync::atomic::AtomicUsize>,
+            clock: MockClock,
+        }
+        impl StepRunner for FlakyRunner {
+            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                if self
+                    .attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    == 0
+                {
+                    return Err(StepError::transient("flaky"));
+                }
+                // Separate the two settlements in clock time before the
+                // succeeding one: a marker wrongly written for the retry
+                // would otherwise share this one's key and go unobserved.
+                self.clock.advance(Duration::from_secs(1));
+                Ok(StepOutcome::Succeed {
+                    result: b"done".to_vec(),
+                })
+            }
+        }
+
+        let (queue, store, clock) = fresh_queue_fast_retry_with_mock_clock(10_000).await;
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store.clone(),
+            FlakyRunner {
+                attempts: attempts.clone(),
+                clock: clock.clone(),
+            },
+            ChannelHook { tx },
+        )
+        .memo_retention(Duration::from_secs(60))
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        let handle = runtime
+            .submit(RunSpec {
+                input: b"x".to_vec(),
+                max_attempts_per_step: Some(3),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // Exactly one marker, stamped after the retry's clock advance:
+        // the retry produced none, the success did.
+        let markers = terminal_markers(&queue).await;
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].0, handle.run_id);
+        assert_eq!(markers[0].1, 11_000);
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_sweep_clears_only_markers_older_than_the_cutoff() {
+        // Markers sort by timestamp, so the sweep scans from the start
+        // of the range and returns at the first unexpired marker.
+        let (queue, store, _clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store.clone(),
+            ScriptedRunner::new(vec![]),
+            ChannelHook { tx },
+        )
+        .memo_retention(Duration::from_secs(1))
+        .build();
+
+        let memos = MemoStore::new(store, "workflow-memo");
+        for (run_id, at_ms) in [("old", 1_000u64), ("young", 9_500u64)] {
+            memos.new_memo(run_id, 0).put("k", b"v").await.unwrap();
+            queue
+                .kv_put(&terminal_kv_key(run_id, at_ms), b"")
+                .await
+                .unwrap();
+        }
+
+        // Clock at 10_000 with 1s retention: cutoff 9_000.
+        let cleared = runtime
+            .inner
+            .sweep_expired_memos(Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(cleared, 1);
+
+        let remaining = terminal_markers(&queue).await;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, "young");
+        assert_eq!(memos.new_memo("old", 0).get("k").await.unwrap(), None);
+        assert_eq!(
+            memos.new_memo("young", 0).get("k").await.unwrap(),
+            Some(b"v".to_vec()),
+        );
+    }
+
+    #[test]
+    fn terminal_marker_keys_sort_oldest_first_and_round_trip() {
+        let old = terminal_kv_key("run-b", 1_000);
+        let young = terminal_kv_key("run-a", 2_000);
+        assert!(
+            old < young,
+            "ordering must follow the timestamp ahead of the id"
+        );
+        assert_eq!(
+            parse_terminal_kv_key(&young),
+            Some(("run-a".to_string(), 2_000)),
+        );
+        assert_eq!(parse_terminal_kv_key(b"workflow/runs/run-a"), None);
     }
 
     /// Yield up to `iters` times waiting for `cond` to become true.
@@ -4352,8 +4707,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        let memos = MemoStore::new(store, "workflow-memo");
-        let markers = memos.list_terminal_markers().await.unwrap();
+        let markers = terminal_markers(&runtime.inner.queue).await;
         assert_eq!(markers.len(), 1, "boundary marker must not be swept");
 
         let _ = shutdown.send(());
@@ -4402,7 +4756,7 @@ mod tests {
         advance(&clock, Duration::from_millis(300)).await;
 
         let cleared = yield_until(50, || async {
-            memos.list_terminal_markers().await.unwrap().is_empty()
+            terminal_markers(&runtime.inner.queue).await.is_empty()
         })
         .await;
         assert!(cleared, "sweeper did not clear the expired marker");

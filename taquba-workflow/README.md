@@ -431,13 +431,21 @@ let runtime = WorkflowRuntime::builder(queue, store, runner, hook)
     .build();
 ```
 
-When retention is set, the runtime writes a small terminal marker for
+When retention is set, the runtime records a small terminal marker for
 every terminal state (Succeeded, Failed, Cancelled) and
-`WorkflowRuntime::run` spawns a background sweeper that lists those
+`WorkflowRuntime::run` spawns a background sweeper that reads those
 markers and clears the memo entries, step-output replay entries, and
 marker for any run whose marker is older than the retention window. The
 first sweep fires on startup so a restarted process catches markers left
 behind by an earlier one.
+
+A marker is a key under `workflow/terminals/` in the queue's key-value
+namespace, written in the same transaction that settles the run. It
+therefore exists exactly when the run's terminal outcome committed: a
+settlement that does not commit leaves no marker, and no path writes one
+for a run that is still executing. The terminating timestamp precedes
+the run id in the key, so the sweep reads the expired set from the start
+of the range and stops at the first unexpired marker.
 
 Because the sweep is keyed on those terminal markers, and a terminated
 run never resumes, it never deletes the memo or replay entries of an
@@ -448,9 +456,9 @@ dangling reference: deletion is left unguarded precisely because every
 reader tolerates absence.
 
 Advanced cleanup policies (selective retention, externally-driven
-sweeps) can be built directly on `MemoStore::list_terminal_markers`,
-`MemoStore::clear_memos_for_run`, and `MemoStore::delete_terminal_marker`
-without configuring `WorkflowRuntimeBuilder::memo_retention`.
+sweeps) can be built on `Queue::kv_scan` over that prefix and
+`MemoStore::clear_memos_for_run`, without configuring
+`WorkflowRuntimeBuilder::memo_retention`.
 
 ## Time injection
 
@@ -526,9 +534,14 @@ notification job for that run. `NoopTerminalHook` observes nothing, so
 runs terminate with no notification cost.
 
 Runs terminated without an acknowledging settlement (an external
-cancellation of a pending step, a step that dead-letters) enqueue the
-notification on its own after the terminal transition commits, so a
-crash between the two can lose or duplicate that notification.
+cancellation of a pending step, a step that dead-letters) settle their
+notification the same way: the effects are applied by the dead-letter,
+by the attempts-exhausting nack or by the cancellation's removal, so the
+notification job is created exactly once on every worker and
+cancellation path. Two terminations occur outside any settlement the
+runtime performs and therefore produce no notification: a job the reaper
+dead-letters after its lease expires past the attempt limit, and one
+dead-lettered during crash recovery when the queue is opened.
 
 `WebhookTerminalHook` (behind the `webhooks` feature) delivers HTTP
 callbacks via `taquba-webhooks`, staging the delivery enqueue as a
