@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `Bulk::run` and `Bulk::run_with_shutdown` stop the worker and wait
+  for it to exit before returning a submission error. The worker
+  outlived the call, kept processing the items submitted before the
+  error and overlapped with the worker of a subsequent run.
+
 ### Changed
 
 - A run id produced by `BulkBuilder::key_fn` must be 1 to 128 bytes of

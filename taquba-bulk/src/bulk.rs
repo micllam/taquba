@@ -329,6 +329,10 @@ impl<P: Pipeline> Bulk<P> {
     /// returned report reflects whatever completed before the drain. Items
     /// still in flight keep their durable state and memo entries, so a later
     /// run resumes them.
+    ///
+    /// A submission error stops the worker and returns after it has
+    /// exited. Items submitted before the error keep their durable state
+    /// and are resumed by a later run over the same inputs.
     pub async fn run_with_shutdown<I, S>(&self, inputs: I, shutdown: S) -> Result<BulkReport>
     where
         I: IntoIterator<Item = P::Input>,
@@ -347,7 +351,20 @@ impl<P: Pipeline> Bulk<P> {
             })
         };
 
-        let expected = self.submit_all(inputs).await?;
+        let submitted = self.submit_all(inputs).await;
+        let expected = match submitted {
+            Ok(expected) => expected,
+            Err(err) => {
+                // Stop the worker before reporting the error so that no
+                // task outlives this call.
+                stop.cancel();
+                let _ = worker.await;
+                if let Err(flush_err) = self.sink.flush() {
+                    warn!(error = %flush_err, "sink flush failed after a submission error");
+                }
+                return Err(err);
+            }
+        };
         {
             let mut state = self.shared.state.lock().unwrap();
             state.total = expected;
@@ -639,6 +656,46 @@ mod tests {
             .collect();
         assert!(ids.contains(&"n-5".to_string()));
         assert!(ids.contains(&"n-7".to_string()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rejected_run_id_stops_the_worker_before_returning() {
+        let (queue, store) = fresh().await;
+        let bulk = Bulk::builder(queue, store, Doubler)
+            .key_fn(|item| {
+                if item.n == 3 {
+                    "a/b".to_string()
+                } else {
+                    format!("n-{}", item.n)
+                }
+            })
+            .poll_interval(Duration::from_millis(10))
+            .build();
+
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let alive_before = metrics.num_alive_tasks();
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            bulk.run(vec![Item { n: 1 }, Item { n: 2 }, Item { n: 3 }]),
+        )
+        .await
+        .expect("run finished in time")
+        .expect_err("an invalid run id fails the submission");
+        assert!(
+            matches!(
+                err,
+                Error::Workflow(taquba_workflow::Error::InvalidRunId { .. })
+            ),
+            "unexpected error: {err}",
+        );
+
+        let settled = tokio::time::timeout(Duration::from_secs(5), async {
+            while metrics.num_alive_tasks() > alive_before {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(settled.is_ok(), "the worker task outlived the failed run");
     }
 
     #[tokio::test]
