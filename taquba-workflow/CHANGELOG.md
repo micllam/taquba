@@ -46,12 +46,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the notification now holds on every worker and cancel path; the
   reaper and open-time crash recovery settle inside the queue without a
   worker and still apply no effects.
-
 - Terminal markers move from the object store to the queue's key-value
   namespace, under the reserved `workflow/terminals/` prefix, keyed by
   the terminating timestamp ahead of the run id. The retention sweep
   reads them with `Queue::kv_scan` and its expired set is the start of
-  the range. With retention enabled this removes an object-store round
+  the range; a marker under the prefix that does not parse, or whose
+  run id is not a valid run id, is deleted without clearing any
+  entries. With retention enabled this removes an object-store round
   trip from every terminating settlement, and it makes markers readable
   through `QueueReader::kv_scan`, which requires no access to the memo
   store that previously held them. Markers written by 0.10 and earlier
@@ -59,6 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not read: after upgrading, delete that prefix manually, and clear the
   memo and step-output entries of any run that terminated before the
   upgrade, since no marker remains to select them for sweeping.
+- `MemoStore::clear_memos_for_run` fails with `Error::InvalidRunId` for
+  an invalid run id. An empty run id resolved to the memo prefix itself
+  and cleared every run's entries.
 
 ### Removed
 

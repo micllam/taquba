@@ -92,7 +92,8 @@ fn terminal_kv_key(run_id: &str, terminal_at_ms: u64) -> Vec<u8> {
 
 /// Parse a terminal marker key produced by [`terminal_kv_key`] back
 /// into its `(run_id, terminal_at_ms)` pair. Returns `None` for a key
-/// that does not match the layout, which the sweep skips.
+/// that does not match the layout. The run id is not validated here;
+/// the sweep validates it before clearing entries under it.
 fn parse_terminal_kv_key(key: &[u8]) -> Option<(String, u64)> {
     let suffix = key.strip_prefix(TERMINAL_KV_PREFIX)?;
     let text = std::str::from_utf8(suffix).ok()?;
@@ -107,7 +108,7 @@ fn parse_terminal_kv_key(key: &[u8]) -> Option<(String, u64)> {
 /// caller-supplied job id. An empty run id would resolve to the memo
 /// prefix itself, whose entries the retention sweep would then remove
 /// for every run.
-fn validate_run_id(run_id: &str) -> Result<()> {
+pub(crate) fn validate_run_id(run_id: &str) -> Result<()> {
     let reason = if run_id.is_empty() {
         "run id must not be empty"
     } else if run_id.len() > MAX_RUN_ID_LEN {
@@ -1379,11 +1380,21 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             let exhausted = page.next_cursor.is_none();
             cursor = page.next_cursor;
             for (key, _) in page.entries {
-                let Some((run_id, terminal_at_ms)) = parse_terminal_kv_key(&key) else {
+                let parsed = parse_terminal_kv_key(&key)
+                    .filter(|(run_id, _)| validate_run_id(run_id).is_ok());
+                let Some((run_id, terminal_at_ms)) = parsed else {
+                    // An empty run id resolves to the memo prefix itself, so
+                    // nothing is cleared under a marker that fails to parse.
                     warn!(
                         key = %String::from_utf8_lossy(&key),
-                        "unparseable terminal marker; skipping",
+                        "malformed terminal marker; deleting without clearing memos",
                     );
+                    if let Err(err) = self.queue.kv_delete(&key).await {
+                        warn!(
+                            key = %String::from_utf8_lossy(&key),
+                            "malformed terminal marker delete failed during sweep: {err}",
+                        );
+                    }
                     continue;
                 };
                 // Markers sort by timestamp, so the first unexpired one
@@ -1421,8 +1432,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     /// concurrent [`WorkflowRuntime::cancel`] can target it. Creates a
     /// fresh entry if the run is unknown to this runtime (e.g. after a
     /// restart on another runtime, where the worker first learns of the
-    /// run by claiming its step). Returns the entry's
-    /// [`CancellationToken`] for cloning into the in-flight [`Step`].
+    /// run by claiming its step).
     fn registry_mark_running(
         &self,
         run_id: &str,
@@ -2723,6 +2733,19 @@ mod tests {
                 .as_deref()
                 .is_some_and(|e| e.contains("already registered"))
         );
+        assert_eq!(
+            queue.stats("workflow-steps").await.unwrap().dead,
+            1,
+            "the rejected registration dead-letters run-b's step",
+        );
+        assert!(
+            queue.kv_get(&run_kv_key("run-b")).await.unwrap().is_none(),
+            "the run record delete rides the dead-letter",
+        );
+        assert!(
+            queue.kv_get(&run_kv_key("run-a")).await.unwrap().is_some(),
+            "the waiting run keeps its record",
+        );
 
         let _ = shutdown.send(());
     }
@@ -3569,17 +3592,18 @@ mod tests {
         let calls = Arc::new(AtomicU32::new(0));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
-            queue,
+            queue.clone(),
             store.clone(),
             AlwaysTransient {
                 calls: calls.clone(),
             },
             ChannelHook { tx },
         )
+        .memo_retention(Duration::from_secs(60))
         .build();
         let shutdown = spawn_runtime(runtime.clone());
 
-        runtime
+        let handle = runtime
             .submit(RunSpec {
                 input: b"x".to_vec(),
                 max_attempts_per_step: Some(max_attempts),
@@ -3604,6 +3628,27 @@ mod tests {
         // Settle window: assert no duplicate hook fires after the terminal one.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err(), "hook fired more than once");
+
+        // The notification job was enqueued with the exhausted nack, so
+        // its effects are committed once the hook fires.
+        assert_eq!(queue.stats("workflow-steps").await.unwrap().dead, 1);
+        assert!(
+            queue
+                .kv_get(&run_kv_key(&handle.run_id))
+                .await
+                .unwrap()
+                .is_none(),
+            "the run record delete rides the exhausted nack",
+        );
+        assert_eq!(
+            terminal_markers(&queue)
+                .await
+                .iter()
+                .filter(|(run_id, _)| *run_id == handle.run_id)
+                .count(),
+            1,
+            "the terminal marker rides the exhausted nack",
+        );
 
         let _ = shutdown.send(());
     }
@@ -4567,6 +4612,127 @@ mod tests {
             Some(b"expensive".to_vec()),
             "an unrelated run's memo entries must survive",
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_marker_with_an_empty_run_id_is_deleted_without_clearing_memos() {
+        let (queue, store, clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store.clone(),
+            ScriptedRunner::new(vec![]),
+            ChannelHook { tx },
+        )
+        .memo_retention(Duration::from_secs(60))
+        .build();
+
+        let memos = MemoStore::new(store, "workflow-memo");
+        memos
+            .new_memo("bystander", 0)
+            .put("k", b"expensive")
+            .await
+            .unwrap();
+        let marker = terminal_kv_key("", 0);
+        queue.kv_put(&marker, b"").await.unwrap();
+
+        advance(&clock, Duration::from_secs(3_600)).await;
+        runtime
+            .inner
+            .sweep_expired_memos(Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(
+            memos.new_memo("bystander", 0).get("k").await.unwrap(),
+            Some(b"expensive".to_vec()),
+            "an unrelated run's memo entries must survive",
+        );
+        assert!(
+            queue.kv_get(&marker).await.unwrap().is_none(),
+            "the marker is removed rather than retried on every sweep",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_malformed_terminal_marker_is_deleted_by_the_sweep() {
+        let (queue, store, clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            ScriptedRunner::new(vec![]),
+            ChannelHook { tx },
+        )
+        .memo_retention(Duration::from_secs(60))
+        .build();
+
+        let mut malformed = Vec::from(TERMINAL_KV_PREFIX);
+        malformed.extend_from_slice(b"not-a-timestamp");
+        queue.kv_put(&malformed, b"").await.unwrap();
+
+        advance(&clock, Duration::from_secs(3_600)).await;
+        runtime
+            .inner
+            .sweep_expired_memos(Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(queue.kv_get(&malformed).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn clear_memos_for_run_rejects_an_empty_run_id() {
+        let store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
+        let memos = MemoStore::new(store, "workflow-memo");
+        memos
+            .new_memo("bystander", 0)
+            .put("k", b"expensive")
+            .await
+            .unwrap();
+        assert!(matches!(
+            memos.clear_memos_for_run("").await,
+            Err(Error::InvalidRunId { .. })
+        ));
+        assert_eq!(
+            memos.new_memo("bystander", 0).get("k").await.unwrap(),
+            Some(b"expensive".to_vec()),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_notification_job_creates_no_registry_entry() {
+        let (queue, store) = fresh_queue().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue,
+            store,
+            ScriptedRunner::new(vec![StepOutcome::Succeed {
+                result: b"done".to_vec(),
+            }]),
+            ChannelHook { tx },
+        )
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                input: b"x".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // The hook runs as the notification job's worker, so an entry
+        // created by that job's dispatch is visible once the hook fires.
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("hook fired in time")
+            .expect("hook channel open");
+        assert!(
+            runtime.inner.registry.lock().unwrap().is_empty(),
+            "a notification job must not touch the run registry",
+        );
+
+        let _ = shutdown.send(());
     }
 
     #[tokio::test(start_paused = true)]

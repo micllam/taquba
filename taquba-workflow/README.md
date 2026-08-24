@@ -192,8 +192,8 @@ Call `WorkflowRuntime::cancel(run_id)` to cancel an active run from
 outside the runner:
 
 - If the current step is **pending or scheduled**, the queued step job is
-  removed and the terminal hook fires from the `cancel` call before it
-  returns.
+  removed and the run's notification job is enqueued before the `cancel`
+  call returns.
 - If the current step is **running**, cancellation is delivered via
   `Step::cancel_token` (a `tokio_util::sync::CancellationToken`).
   Runners that watch the token can short-circuit immediately:
@@ -210,9 +210,9 @@ outside the runner:
   Runners that ignore the token are allowed to run to completion (futures
   cannot be safely aborted mid-step). In both cases the runner's
   `StepOutcome` is discarded, any pending transient retry is suppressed,
-  and the worker fires the terminal hook with `Cancelled` once the step
-  returns. Watching the token only reduces cancellation latency for slow
-  steps; it doesn't change semantics.
+  and the worker settles the run as `Cancelled` once the step returns.
+  Watching the token only reduces cancellation latency for slow steps;
+  it doesn't change semantics.
 
 While termination is in flight, `WorkflowRuntime::status` reports a
 `RunState::Cancelling` overlay until the entry is dropped.

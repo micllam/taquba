@@ -107,8 +107,10 @@ impl MemoStore {
     /// `run_id`. Returns the number of entries removed. Errors during
     /// individual deletes are logged (best-effort cleanup) but do not
     /// stop the sweep; an aggregated error is returned only if a list
-    /// operation fails.
+    /// operation fails. Fails with [`Error::InvalidRunId`] for an invalid
+    /// run id; an empty one would resolve to the memo prefix itself.
     pub async fn clear_memos_for_run(&self, run_id: &str) -> Result<usize> {
+        crate::runtime::validate_run_id(run_id)?;
         let memo_deleted = self
             .clear_prefix(run_id, self.memos_run_prefix(run_id), "memo")
             .await?;
