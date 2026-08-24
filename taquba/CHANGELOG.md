@@ -20,7 +20,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrapped in the new `FailWith` to `dead_letter_with` or `nack_with`,
   so a `Worker` can attach effects to a failure without access to the
   claim.
-
 - Writer-liveness observables on `QueueReader`, for admin tooling that
   must judge whether a writer process is alive before a destructive
   act. `QueueReader::last_store_activity` returns a `StoreActivity`:
@@ -44,12 +43,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   holding no objects at all reports the typed variant; a path holding
   objects whose manifest cannot be read still reports
   `Error::Storage`.
+- `Error::ConflictingKvEffect`: a `SettlementEffects` value naming the
+  same key in both `kv_writes` and `kv_deletes` is rejected before the
+  settlement transaction begins. The delete silently took precedence.
 
 ### Changed
 
 - `AckEffects` is renamed `SettlementEffects`, the effects now riding
   the dead-letter, exhausted-nack and cancellation transitions as well
   as the acknowledgement. Fields and behaviour are unchanged.
+
+### Fixed
+
+- A nack that exhausts the job's attempts clears `claimed_at` on the
+  dead record, as `dead_letter` does.
 
 ## [0.11.0] - 2026-08-12
 

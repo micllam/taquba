@@ -478,7 +478,12 @@ pub struct EnqueueRequest {
 /// acknowledgement via [`Queue::ack_with`], a dead-letter via
 /// [`Queue::dead_letter_with`] or [`Queue::nack_with`], or a
 /// pending-job removal via [`Queue::cancel_with`]. Either the
-/// settlement and every effect commit together or nothing does.
+/// settlement and every effect commit together or nothing does. A
+/// branch that applies no effects ([`Queue::nack_with`] while attempts
+/// remain, [`Queue::cancel_with`] other than
+/// [`CancelOutcome::Removed`]) commits without them. A key named in
+/// both `kv_writes` and `kv_deletes` is rejected with
+/// [`Error::ConflictingKvEffect`].
 #[derive(Debug, Clone, Default)]
 pub struct SettlementEffects {
     /// Jobs enqueued atomically with the settlement.
@@ -1308,6 +1313,13 @@ impl Queue {
         for value in effects.kv_writes.values() {
             validate_kv_value_size(value)?;
         }
+        if let Some(key) = effects
+            .kv_deletes
+            .iter()
+            .find(|k| effects.kv_writes.contains_key(*k))
+        {
+            return Err(Error::ConflictingKvEffect { key: key.clone() });
+        }
         let mut prepared_jobs = Vec::with_capacity(effects.enqueues.len());
         for request in effects.enqueues {
             let (job, key, id_override_used) =
@@ -2035,6 +2047,7 @@ impl Queue {
                 let staged = if job.attempts >= job.max_attempts {
                     job.status = JobStatus::Dead;
                     job.failed_at = Some(self.now_ms());
+                    job.claimed_at = None;
                     let dead = dead_key(&job.queue, &job.id);
                     let value = job.stored_bytes()?;
                     put_job_record(&txn, &dead, &job_index_key(&job.id), &value)?;
@@ -2157,8 +2170,8 @@ impl Queue {
     /// a backoff: the job goes straight to the dead-letter set.
     /// [`worker::run_worker`](crate::worker::run_worker) and
     /// [`worker::run_worker_concurrent`](crate::worker::run_worker_concurrent)
-    /// call this automatically when a worker returns
-    /// [`worker::PermanentFailure`](crate::worker::PermanentFailure).
+    /// dead-letter through [`Self::dead_letter_with`] when a worker
+    /// returns [`worker::PermanentFailure`](crate::worker::PermanentFailure).
     pub async fn dead_letter(&self, claim: &Claim, reason: &str) -> Result<()> {
         self.dead_letter_with(claim, reason, SettlementEffects::default())
             .await
@@ -7966,6 +7979,146 @@ mod tests {
         );
 
         q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_key_both_written_and_deleted_is_rejected_before_the_settlement() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let effects = SettlementEffects {
+            kv_writes: HashMap::from([(b"k".to_vec(), b"v".to_vec())]),
+            kv_deletes: vec![b"k".to_vec()],
+            ..SettlementEffects::default()
+        };
+        let err = q.ack_with(&job, effects.clone()).await.unwrap_err();
+        assert!(matches!(err, Error::ConflictingKvEffect { ref key } if key == b"k"));
+        assert!(q.kv_get(b"k").await.unwrap().is_none());
+        assert_eq!(
+            q.stats("work").await.unwrap().claimed,
+            1,
+            "the claim is untouched"
+        );
+
+        let err = q.nack_with(&job, "e", effects.clone()).await.unwrap_err();
+        assert!(matches!(err, Error::ConflictingKvEffect { .. }));
+        let err = q.dead_letter_with(&job, "e", effects).await.unwrap_err();
+        assert!(matches!(err, Error::ConflictingKvEffect { .. }));
+
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_nack_clears_claimed_at_on_the_dead_record() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let id = q
+            .enqueue_with(
+                "work",
+                b"job".to_vec(),
+                EnqueueOptions {
+                    max_attempts: Some(1),
+                    ..EnqueueOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(job.claimed_at.is_some());
+
+        q.nack(&job, "fatal").await.unwrap();
+        let dead = q.get_job(&id).await.unwrap().unwrap();
+        assert_eq!(dead.status, JobStatus::Dead);
+        assert!(dead.claimed_at.is_none());
+        q.close().await.unwrap();
+    }
+
+    fn offloaded_follow_up() -> SettlementEffects {
+        SettlementEffects {
+            enqueues: vec![EnqueueRequest {
+                queue: "notify".to_string(),
+                payload: vec![1u8; 256],
+                options: EnqueueOptions::default(),
+            }],
+            ..SettlementEffects::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn nack_with_deletes_the_payload_object_of_a_discarded_follow_up() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let outcome = q
+            .nack_with(&job, "transient", offloaded_follow_up())
+            .await
+            .unwrap();
+        assert_eq!(outcome, NackOutcome::Retried);
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lost_claim_deletes_the_payload_object_of_a_prepared_follow_up() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.ack(&job).await.unwrap();
+
+        let err = q
+            .dead_letter_with(&job, "late", offloaded_follow_up())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::ClaimLost));
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
+
+        let err = q
+            .nack_with(&job, "late", offloaded_follow_up())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::ClaimLost));
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_with_deletes_the_payload_object_when_the_job_is_unknown() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        let (outcome, _) = q
+            .cancel_with("no-such-job", offloaded_follow_up())
+            .await
+            .unwrap();
+        assert_eq!(outcome, CancelOutcome::NotFound);
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
         q.close().await.unwrap();
     }
 

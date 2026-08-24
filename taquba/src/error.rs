@@ -47,6 +47,15 @@ pub enum Error {
     #[error("job cancellation has been requested")]
     CancelRequested,
 
+    /// A [`crate::SettlementEffects`] value names the same key in both
+    /// `kv_writes` and `kv_deletes`. The effects are rejected before the
+    /// settlement transaction begins.
+    #[error("kv key {key:?} is both written and deleted by one settlement")]
+    ConflictingKvEffect {
+        /// The key named on both sides.
+        key: Vec<u8>,
+    },
+
     /// A value passed to [`crate::Queue::enqueue_with_kv`] exceeded the
     /// configured maximum size for the user KV namespace. The cap is
     /// enforced at the API boundary to keep bulk payload out of the LSM
@@ -142,6 +151,7 @@ impl Error {
             | Self::ClaimLost
             | Self::CancelRequested
             | Self::KvValueTooLarge { .. }
+            | Self::ConflictingKvEffect { .. }
             | Self::InvalidId { .. }
             | Self::DuplicateJobId { .. }
             | Self::InvalidQueueName { .. }
@@ -165,6 +175,7 @@ mod tests {
         assert!(Error::ClaimLost.is_permanent());
         assert!(Error::CancelRequested.is_permanent());
         assert!(Error::KvValueTooLarge { size: 10, max: 5 }.is_permanent());
+        assert!(Error::ConflictingKvEffect { key: b"k".to_vec() }.is_permanent());
         assert!(
             Error::InvalidId {
                 id: "bad:id".into(),

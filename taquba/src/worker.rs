@@ -91,7 +91,11 @@ impl std::fmt::Display for FailWith {
     }
 }
 
-impl std::error::Error for FailWith {}
+impl std::error::Error for FailWith {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
 
 /// Implement this trait to define how a job is processed.
 ///
@@ -666,6 +670,25 @@ mod tests {
 
         assert_eq!(queue.stats("work").await.unwrap().dead, 1);
         assert_eq!(queue.stats("notify").await.unwrap().pending, 1);
+        queue.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wrapped_permanent_failure_settles_as_the_unwrapped_error_does() {
+        let queue = Queue::open(Arc::new(InMemory::new()), "test")
+            .await
+            .unwrap();
+        let id = queue.enqueue("work", b"job".to_vec()).await.unwrap();
+
+        let worker = EffectfulFailureWorker {
+            permanent: true,
+            attempts_seen: Arc::new(AtomicUsize::new(0)),
+        };
+        run_one_failing_attempt(&queue, &worker).await;
+
+        let dead = queue.get_job(&id).await.unwrap().unwrap();
+        assert_eq!(dead.attempts, 1, "a wrapped failure consumes one attempt");
+        assert_eq!(dead.last_error.as_deref(), Some("permanent failure"));
         queue.close().await.unwrap();
     }
 
