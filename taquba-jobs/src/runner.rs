@@ -371,14 +371,7 @@ async fn run_typed<J: Job>(
         )))
     })?;
 
-    let cancel_token = job.cancel_token.clone().unwrap_or_default();
-    let ctx = JobContext::new(
-        submitter,
-        &job.id,
-        job.attempts,
-        cancel_token,
-        lease.clone(),
-    );
+    let ctx = JobContext::new(submitter, &job.id, job.attempts, lease.clone());
 
     tracing::info!(
         job_id = %job.id,

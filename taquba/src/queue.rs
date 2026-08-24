@@ -41,7 +41,7 @@ pub enum CancelOutcome {
     Removed,
     /// The job was `Claimed`; the cancellation has been requested via the
     /// persisted [`JobRecord::cancel_requested`] flag and the in-process
-    /// [`JobRecord::cancel_token`] has been fired. The worker is still
+    /// [`Claim::cancel_token`] has been fired. The worker is still
     /// running and will eventually `ack` / `nack` / `dead_letter` the
     /// job according to its own logic.
     Requested,
@@ -545,7 +545,6 @@ pub struct Queue {
     /// `Queue::cancel` fires the token while the job is `Claimed`; the
     /// persisted `cancel_requested` flag carries the request across
     /// reaper-driven requeues and re-claims.
-    claimed_tokens: Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
     /// Per-queue async mutex held across the claim transaction.
     /// Same-queue claim attempts serialise on this mutex rather than
     /// resolving via SlateDB's transaction-conflict retry. The lock
@@ -762,7 +761,6 @@ impl Queue {
             default_queue_config: opts.default_queue_config,
             queue_configs: opts.queue_configs,
             clock: opts.clock,
-            claimed_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             claim_locks: std::sync::Mutex::new(HashMap::new()),
             claim_cursor,
             lease_registry,
@@ -795,32 +793,6 @@ impl Queue {
         }
     }
 
-    /// Register a freshly-claimed job's cancellation token. Called from
-    /// every `claim*` path after the transaction commits. The token is
-    /// fired immediately if `cancel_requested` was already persisted;
-    /// this handles the case where `Queue::cancel` ran during a previous
-    /// lease that subsequently expired and was reaped back to pending.
-    fn install_cancel_token(&self, job: &mut JobRecord) {
-        let token = tokio_util::sync::CancellationToken::new();
-        if job.cancel_requested {
-            token.cancel();
-        }
-        self.claimed_tokens
-            .lock()
-            .expect("claimed_tokens mutex poisoned")
-            .insert(job.id.clone(), token.clone());
-        job.cancel_token = Some(token);
-    }
-
-    /// Drop a claimed job's token. Called from `ack` / `nack` / `dead_letter`
-    /// once the claim is settled.
-    fn clear_cancel_token(&self, job_id: &str) {
-        self.claimed_tokens
-            .lock()
-            .expect("claimed_tokens mutex poisoned")
-            .remove(job_id);
-    }
-
     pub(crate) fn queue_config(&self, queue: &str) -> &QueueConfig {
         self.queue_configs
             .get(queue)
@@ -832,18 +804,20 @@ impl Queue {
         self.queue_config(queue).lease_duration
     }
 
-    /// Build the lease capability for a claim, which the worker loop
-    /// passes to [`Worker::process`](crate::worker::Worker::process).
-    /// The handle extends the lease but cannot settle the job, so user
-    /// code never holds a claim and a queue together.
-    pub(crate) fn lease_handle(&self, claim: &Claim) -> crate::lease::LeaseHandle {
+    /// Build the lease handle for a claim: the capability the worker
+    /// loops pass to [`Worker::process`](crate::worker::Worker::process).
+    /// The handle extends the lease and exposes the claim's cancellation
+    /// token but cannot settle the job, so a handler never holds a claim
+    /// and a queue together. Callers running `Worker::process` from
+    /// their own claim loop build the handle here.
+    pub fn lease_handle(&self, claim: &Claim) -> crate::lease::LeaseHandle {
         crate::lease::LeaseHandle::new(
             self.lease_registry.clone(),
             self.clock.clone(),
             claim.queue.clone(),
             claim.id.clone(),
             claim.token(),
-            claim.job().cancel_token.clone(),
+            claim.cancel_token().clone(),
         )
     }
 
@@ -1780,16 +1754,29 @@ impl Queue {
 
                 txn.delete(&kv.key)?;
                 put_job_record(&txn, &claimed, &job_index_key(&job.id), &value)?;
+                // A cancellation requested during an earlier claim of
+                // the job is persisted on the record and fires this
+                // claim's token immediately.
+                let cancel = tokio_util::sync::CancellationToken::new();
+                if job.cancel_requested {
+                    cancel.cancel();
+                }
                 // Registered before the commit, so a failed commit
                 // leaves a stale entry, discarded when due; a missing
                 // entry would leave the claim invisible to the reaper
-                // until the next open.
-                self.lease_registry
-                    .insert(&job.queue, &job.id, lease_expires_at, token);
+                // until the next open, and a cancellation racing the
+                // commit would find no token to fire.
+                self.lease_registry.insert(
+                    &job.queue,
+                    &job.id,
+                    lease_expires_at,
+                    token,
+                    cancel.clone(),
+                );
                 if let Some(dk) = dedup_key_to_release.as_deref() {
                     txn.delete(dedup_index_key(&job.queue, dk))?;
                 }
-                jobs.push(Claim::new(job, token));
+                jobs.push(Claim::new(job, token, cancel));
             }
             let count = jobs.len() as i64;
             update_stats(
@@ -1798,19 +1785,6 @@ impl Queue {
                 &[(JobStatus::Pending, -count), (JobStatus::Claimed, count)],
             )?;
 
-            // Register cancellation tokens *before* committing. Once the
-            // commit lands, the jobs are observable as `Claimed` and a
-            // concurrent `request_cancel` will look up its token in
-            // `claimed_tokens` to fire it. If we registered the token only
-            // *after* the commit, a `request_cancel` racing that window
-            // would find nothing, persist `cancel_requested = true`, and
-            // the worker's live token would never fire => the cancellation
-            // would be silently lost until the lease expired. Registering
-            // first closes that window; on a commit conflict we unregister
-            // and retry.
-            for claim in &mut jobs {
-                self.install_cancel_token(claim.job_mut());
-            }
             // Claims commit without awaiting WAL durability. The claimed
             // state only matters across a restart, where either version
             // of it recovers: a claim lost with the unflushed WAL leaves
@@ -1841,17 +1815,9 @@ impl Queue {
                 }
                 Err(e) if e.kind() == slatedb::ErrorKind::Transaction => {
                     warn!(queue = queue, "claim transaction conflict, retrying");
-                    for claim in &jobs {
-                        self.clear_cancel_token(&claim.id);
-                    }
                     continue;
                 }
-                Err(e) => {
-                    for claim in &jobs {
-                        self.clear_cancel_token(&claim.id);
-                    }
-                    return Err(e.into());
-                }
+                Err(e) => return Err(e.into()),
             }
         }
     }
@@ -1978,7 +1944,6 @@ impl Queue {
         }
 
         crate::obs::completed(&job.queue, timer);
-        self.clear_cancel_token(&job.id);
         self.completion_notify.notify_waiters();
         debug!(queue = %job.queue, job_id = %job.id, "job acked");
         Ok(results)
@@ -2144,7 +2109,6 @@ impl Queue {
             crate::obs::nacked(&job.queue);
         }
         self.lease_registry.remove(&job.queue, &job.id, token);
-        self.clear_cancel_token(&job.id);
         if immediate_retry {
             // The backoff path needs no insert note here: the
             // scheduler records the insert itself when it promotes the
@@ -2249,7 +2213,6 @@ impl Queue {
 
         crate::obs::dead_lettered(&job.queue);
         self.lease_registry.remove(&job.queue, &job.id, token);
-        self.clear_cancel_token(&job.id);
         self.completion_notify.notify_waiters();
         warn!(
             queue = %job.queue,
@@ -2427,7 +2390,7 @@ impl Queue {
     #[instrument(skip(self, claim), fields(queue = %claim.queue, job_id = %claim.id))]
     pub fn renew_lease(&self, claim: &Claim, extension: Duration) -> Result<u64> {
         let job = claim.job();
-        if job.cancel_token.as_ref().is_some_and(|t| t.is_cancelled()) {
+        if claim.cancel_token().is_cancelled() {
             return Err(Error::CancelRequested);
         }
         let new_expiry = self.now_ms() + extension.as_millis() as u64;
@@ -2570,17 +2533,18 @@ impl Queue {
     /// - **`Claimed` (a worker is processing it)**: persists a
     ///   `cancel_requested` flag on the job record and fires the
     ///   in-process [`tokio_util::sync::CancellationToken`] exposed on
-    ///   [`JobRecord::cancel_token`]. Returns
-    ///   [`CancelOutcome::Requested`]. Workers that `select!` on the
-    ///   token can short-circuit cooperatively; workers that ignore it
-    ///   run to completion. The persisted flag ensures that if the
-    ///   worker's lease expires and the reaper requeues the job, the
-    ///   next claim's token starts pre-cancelled.
+    ///   [`Claim::cancel_token`] and
+    ///   [`LeaseHandle::cancel_token`](crate::LeaseHandle::cancel_token).
+    ///   Returns [`CancelOutcome::Requested`]. Workers that `select!`
+    ///   on the token can short-circuit cooperatively; workers that
+    ///   ignore it run to completion. The persisted flag ensures that
+    ///   if the worker's lease expires and the reaper requeues the job,
+    ///   the next claim's token starts pre-cancelled.
     /// - **`Done` / `Dead` / unknown**: returns [`CancelOutcome::NotFound`].
     ///
     /// Cooperative cancellation does not abort a running worker; futures
-    /// cannot be safely cancelled mid-await. Watch
-    /// [`JobRecord::cancel_token`] in your worker to opt in to early exit.
+    /// cannot be safely cancelled mid-await. A worker observes the token
+    /// to exit early.
     pub async fn cancel(&self, id: &str) -> Result<CancelOutcome> {
         self.cancel_with(id, SettlementEffects::default())
             .await
@@ -2612,7 +2576,7 @@ impl Queue {
                     return Ok((CancelOutcome::NotFound, Vec::new()));
                 };
 
-                let (msg, outcome, remove_from_registry, staged) = match job.status {
+                let (msg, outcome, staged) = match job.status {
                     JobStatus::Pending | JobStatus::Scheduled => {
                         let is_scheduled = matches!(job.status, JobStatus::Scheduled);
                         txn.delete(&current_key)?;
@@ -2632,25 +2596,16 @@ impl Queue {
                         (
                             "pending/scheduled job cancelled",
                             CancelOutcome::Removed,
-                            true,
                             Some((results, staged)),
                         )
                     }
                     JobStatus::Claimed => {
                         if job.cancel_requested {
-                            // Persisted flag already set; nothing to commit. We
-                            // still re-fire the in-process token below in case a
-                            // new worker claim missed it.
+                            // The flag is already persisted. The token
+                            // is fired again because a re-claim since
+                            // the first request holds a fresh one.
                             txn.rollback();
-                            if let Some(token) = self
-                                .claimed_tokens
-                                .lock()
-                                .expect("claimed_tokens mutex poisoned")
-                                .get(id)
-                                .cloned()
-                            {
-                                token.cancel();
-                            }
+                            self.lease_registry.cancel(&job.queue, id);
                             debug!(job_id = %id, "cancel re-requested on claimed job");
                             return Ok((CancelOutcome::Requested, Vec::new()));
                         }
@@ -2660,7 +2615,6 @@ impl Queue {
                         (
                             "claimed job cancellation requested",
                             CancelOutcome::Requested,
-                            false,
                             None,
                         )
                     }
@@ -2672,26 +2626,11 @@ impl Queue {
 
                 match txn.commit().await {
                     Ok(_) => {
-                        // Fire (and optionally remove) any in-process token. We
-                        // do this even on the Removed path: in race scenarios
-                        // (lease expired + reaper requeued just before we got
-                        // here), the token of a now-stale claim may still be
-                        // watched by a worker; firing it lets the worker
-                        // observe the cancellation cooperatively.
-                        let token = {
-                            let mut guard = self
-                                .claimed_tokens
-                                .lock()
-                                .expect("claimed_tokens mutex poisoned");
-                            if remove_from_registry {
-                                guard.remove(id)
-                            } else {
-                                guard.get(id).cloned()
-                            }
-                        };
-                        if let Some(token) = token {
-                            token.cancel();
-                        }
+                        // Fired on the Removed path as well: the
+                        // worker of a claim the reaper requeued just
+                        // before this call may still observe the token.
+                        // That claim's end removes the entry.
+                        self.lease_registry.cancel(&job.queue, id);
                         let results = match staged {
                             Some((results, staged_jobs)) => {
                                 for staged_job in &staged_jobs {
@@ -6076,8 +6015,13 @@ mod tests {
         // begun inside that lag passes the token check and conflicts
         // with nothing. Recreate the lagging entry and require the
         // in-transaction record read to reject the settlement.
-        q.lease_registry
-            .insert("work", &claim.id, clock.now_ms() + 30_000, claim.token());
+        q.lease_registry.insert(
+            "work",
+            &claim.id,
+            clock.now_ms() + 30_000,
+            claim.token(),
+            claim.cancel_token().clone(),
+        );
         assert!(matches!(
             q.nack(&claim, "late failure").await,
             Err(Error::ClaimLost)
@@ -6351,7 +6295,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let token = job.cancel_token.clone().expect("claim returned a token");
+        let token = job.cancel_token().clone();
         assert!(!token.is_cancelled());
 
         // Cooperative cancel: token fires, persisted flag is set.
@@ -6403,7 +6347,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let first_token = job1.cancel_token.clone().unwrap();
+        let first_token = job1.cancel_token().clone();
         assert_eq!(q.cancel(&job1.id).await.unwrap(), CancelOutcome::Requested,);
         assert!(first_token.is_cancelled());
         assert!(
@@ -6422,16 +6366,74 @@ mod tests {
             .unwrap();
         assert_eq!(job1.id, job2.id);
         assert!(job2.cancel_requested);
-        let second_token = job2
-            .cancel_token
-            .clone()
-            .expect("re-claim returned a token");
         assert!(
-            second_token.is_cancelled(),
+            job2.cancel_token().is_cancelled(),
             "re-claim should surface a pre-cancelled token",
         );
 
         q.ack(&job2).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reaped_claim_leaves_no_cancel_token_entry() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            reaper_interval: Duration::from_secs(3600),
+            ..no_backoff_opts()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let claim = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let token = claim.cancel_token().clone();
+
+        clock.advance(Duration::from_secs(31));
+        q.reap_now().await.unwrap();
+        assert!(q.lease_registry.current("work", &id).is_none());
+        assert!(!q.lease_registry.cancel("work", &id));
+        assert!(!token.is_cancelled());
+
+        // The requeued job holds no entry to fire.
+        assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Removed);
+        assert_eq!(q.lease_registry.len(), 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reclaim_after_a_nack_is_cancellable() {
+        let q = Queue::open_with_options(make_store(), "test", no_backoff_opts())
+            .await
+            .unwrap();
+
+        let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let first = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let first_token = first.cancel_token().clone();
+        q.nack(&first, "transient").await.unwrap();
+
+        let second = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!second.cancel_token().is_cancelled());
+
+        assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Requested);
+        assert!(second.cancel_token().is_cancelled());
+        assert!(!first_token.is_cancelled());
+
+        q.ack(&second).await.unwrap();
         q.close().await.unwrap();
     }
 
@@ -6465,11 +6467,7 @@ mod tests {
             .unwrap();
         assert!(reclaim.cancel_requested);
         assert!(
-            reclaim
-                .cancel_token
-                .clone()
-                .expect("re-claim returned a token")
-                .is_cancelled(),
+            reclaim.cancel_token().is_cancelled(),
             "the re-claim must surface a pre-cancelled token",
         );
 
@@ -6510,7 +6508,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let token = job.cancel_token.clone().unwrap();
+        let token = job.cancel_token().clone();
 
         // External cooperative cancel.
         assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Requested);

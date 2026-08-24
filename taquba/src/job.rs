@@ -106,34 +106,18 @@ pub struct JobRecord {
     pub failed_at: Option<u64>,
     /// Whether [`Queue::cancel`](crate::Queue::cancel) has been called while
     /// this job was `Claimed`. Persisted so that a re-claim after lease
-    /// expiry surfaces a pre-cancelled [`Self::cancel_token`] instead of
+    /// expiry surfaces a pre-cancelled [`Claim::cancel_token`] instead of
     /// resetting state silently.
     ///
-    /// Workers do not need to read this directly; they should watch
-    /// [`Self::cancel_token`] instead.
+    /// Workers do not need to read this directly; they observe
+    /// cancellation through [`Claim::cancel_token`] or
+    /// [`LeaseHandle::cancel_token`](crate::LeaseHandle::cancel_token).
     #[serde(default, skip_serializing_if = "is_false")]
     pub cancel_requested: bool,
-    /// In-process cooperative cancellation token. Populated when the job
-    /// is returned from any `Queue::claim*` call and `None` for jobs read
-    /// via [`Queue::get_job`](crate::Queue::get_job),
-    /// [`Queue::dead_jobs`](crate::Queue::dead_jobs), or any other
-    /// non-claim path.
-    ///
-    /// Workers may `select!` on this token to short-circuit when an
-    /// external [`Queue::cancel`](crate::Queue::cancel) fires. Acks
-    /// normally to clear the job; the queue treats cancellation as a
-    /// request, never as a forced abort.
-    ///
-    /// Not persisted: `tokio_util::sync::CancellationToken` is an
-    /// in-process primitive. After a worker crashes and the reaper
-    /// requeues the job, the next claim creates a fresh token (which is
-    /// immediately fired if [`Self::cancel_requested`] is `true`).
-    #[serde(skip, default)]
-    pub cancel_token: Option<CancellationToken>,
 }
 
-/// A held claim on a job: the record as it was delivered, plus the token
-/// identifying this delivery.
+/// A held claim on a job: the record as it was delivered, the token
+/// identifying this delivery and the delivery's cancellation token.
 ///
 /// Produced only by the `Queue::claim*` calls, and required by
 /// [`Queue::ack`](crate::Queue::ack),
@@ -176,15 +160,27 @@ pub struct JobRecord {
 pub struct Claim {
     job: JobRecord,
     token: u64,
+    cancel: CancellationToken,
 }
 
 impl Claim {
-    pub(crate) fn new(job: JobRecord, token: u64) -> Self {
-        Claim { job, token }
+    pub(crate) fn new(job: JobRecord, token: u64, cancel: CancellationToken) -> Self {
+        Claim { job, token, cancel }
     }
 
     pub(crate) fn token(&self) -> u64 {
         self.token
+    }
+
+    /// The delivery's cooperative cancellation token, fired by
+    /// [`Queue::cancel`](crate::Queue::cancel) while this claim holds
+    /// the job, and already fired when the job was re-claimed with
+    /// [`JobRecord::cancel_requested`] persisted.
+    ///
+    /// A caller may `select!` on it to stop early and settle the job as
+    /// usual. The token is in-process state and is not persisted.
+    pub fn cancel_token(&self) -> &CancellationToken {
+        &self.cancel
     }
 
     pub(crate) fn job_mut(&mut self) -> &mut JobRecord {
@@ -242,7 +238,6 @@ impl JobRecord {
             completed_at: None,
             failed_at: None,
             cancel_requested: false,
-            cancel_token: None,
         }
     }
 
@@ -288,7 +283,6 @@ impl JobRecord {
             completed_at: self.completed_at,
             failed_at: self.failed_at,
             cancel_requested: self.cancel_requested,
-            cancel_token: self.cancel_token.clone(),
         }
     }
 }

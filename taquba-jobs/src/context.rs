@@ -39,7 +39,6 @@ pub struct JobContext<'a> {
     submitter: &'a Submitter,
     job_id: &'a str,
     attempt: u32,
-    cancel_token: CancellationToken,
     lease: LeaseHandle,
 }
 
@@ -48,14 +47,12 @@ impl<'a> JobContext<'a> {
         submitter: &'a Submitter,
         job_id: &'a str,
         attempt: u32,
-        cancel_token: CancellationToken,
         lease: LeaseHandle,
     ) -> Self {
         Self {
             submitter,
             job_id,
             attempt,
-            cancel_token,
             lease,
         }
     }
@@ -102,7 +99,7 @@ impl<'a> JobContext<'a> {
     /// cooperative: a handler that ignores the token simply runs to
     /// completion.
     pub fn cancel_token(&self) -> &CancellationToken {
-        &self.cancel_token
+        self.lease.cancel_token()
     }
 
     /// The lease handle for this delivery.

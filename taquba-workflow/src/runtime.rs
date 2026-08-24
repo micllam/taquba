@@ -1559,7 +1559,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         // again from the job's persisted `cancel_requested`. The runner
         // receives a child, so a runner firing its own token is not
         // treated as an external cancellation below.
-        let claim_cancel = job.cancel_token.clone().unwrap_or_default();
+        let claim_cancel = lease.cancel_token().clone();
         let cancel_token = claim_cancel.child_token();
 
         let (step_signal, signal_kv_deletes) =
@@ -3751,7 +3751,7 @@ mod tests {
 
         let effects = after
             .inner
-            .process_step(&claim, &LeaseHandle::detached())
+            .process_step(&claim, &queue.lease_handle(&claim))
             .await
             .unwrap();
         queue.ack_with(&claim, effects).await.unwrap();
@@ -5677,7 +5677,7 @@ mod tests {
         // Succeeded notification is dropped with them.
         let _ = runtime
             .inner
-            .process_step(&job, &LeaseHandle::detached())
+            .process_step(&job, &queue.lease_handle(&job))
             .await
             .unwrap();
 
@@ -5688,7 +5688,7 @@ mod tests {
             let queue = queue.clone();
             tokio::spawn(async move {
                 let effects = inner
-                    .process_step(&job, &LeaseHandle::detached())
+                    .process_step(&job, &queue.lease_handle(&job))
                     .await
                     .unwrap();
                 queue.ack_with(&job, effects).await.unwrap();

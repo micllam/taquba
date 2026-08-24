@@ -46,17 +46,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Error::ConflictingKvEffect`: a `SettlementEffects` value naming the
   same key in both `kv_writes` and `kv_deletes` is rejected before the
   settlement transaction begins. The delete silently took precedence.
+- `Queue::lease_handle` builds the `LeaseHandle` for a held `Claim`,
+  for callers that run `Worker::process` from their own claim loop.
 
 ### Changed
 
 - `AckEffects` is renamed `SettlementEffects`, the effects now riding
   the dead-letter, exhausted-nack and cancellation transitions as well
   as the acknowledgement. Fields and behaviour are unchanged.
+- `JobRecord::cancel_token` is removed. The cooperative cancellation
+  token is exposed as `Claim::cancel_token` for callers holding a claim
+  and as `LeaseHandle::cancel_token` inside `Worker::process`, both
+  non-optional. The token of a `LeaseHandle::detached` handle is never
+  fired.
 
 ### Fixed
 
 - A nack that exhausts the job's attempts clears `claimed_at` on the
   dead record, as `dead_letter` does.
+- A job re-claimed between a settlement's commit and its cleanup lost
+  its cancellation token, so a later `Queue::cancel` persisted the
+  request without firing it and the worker observed the cancellation
+  only after its lease expired. The reaper retained the token of every
+  claim it requeued.
 
 ## [0.11.0] - 2026-08-12
 

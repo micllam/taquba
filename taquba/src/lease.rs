@@ -14,20 +14,22 @@ use crate::lease_registry::LeaseRegistry;
 /// that runs to its declared bound still has lease left to settle in.
 pub(crate) const SETTLEMENT_MARGIN: Duration = Duration::from_secs(5);
 
-/// A handle on one claim's lease, passed to [`crate::Worker::process`]
-/// by the worker loop.
+/// A handle on one claim's lease and cancellation token, passed to
+/// [`crate::Worker::process`] by the worker loop.
 ///
-/// The handle extends the lease without exposing the claim or the
-/// queue, so a handler can prevent lease expiry during a long delivery
-/// but cannot settle its own job. It is cheap to clone; clones refer to
-/// the same lease.
+/// The handle extends the lease and exposes the delivery's cancellation
+/// token without exposing the claim or the queue, so a handler can
+/// prevent lease expiry during a long delivery and observe an external
+/// [`crate::Queue::cancel`], but cannot settle its own job. It is cheap
+/// to clone; clones refer to the same lease.
 ///
 /// [`LeaseHandle::detached`] builds a handle bound to no queue, whose
-/// calls succeed without effect, so handler types stay constructible in
-/// unit tests.
+/// calls succeed without effect and whose token is never fired, so
+/// handler types stay constructible in unit tests.
 #[derive(Clone)]
 pub struct LeaseHandle {
     inner: Option<Inner>,
+    cancel: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -37,7 +39,6 @@ struct Inner {
     queue: String,
     id: String,
     token: u64,
-    cancel: Option<CancellationToken>,
 }
 
 impl LeaseHandle {
@@ -47,7 +48,7 @@ impl LeaseHandle {
         queue: String,
         id: String,
         token: u64,
-        cancel: Option<CancellationToken>,
+        cancel: CancellationToken,
     ) -> Self {
         Self {
             inner: Some(Inner {
@@ -56,15 +57,30 @@ impl LeaseHandle {
                 queue,
                 id,
                 token,
-                cancel,
             }),
+            cancel,
         }
     }
 
-    /// A handle bound to no lease. Every call succeeds without effect.
-    /// For constructing handler-facing types in unit tests.
+    /// A handle bound to no lease. Every call succeeds without effect
+    /// and the cancellation token is never fired. For constructing
+    /// handler-facing types in unit tests.
     pub fn detached() -> Self {
-        Self { inner: None }
+        Self {
+            inner: None,
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    /// The delivery's cooperative cancellation token, fired by
+    /// [`crate::Queue::cancel`] while the delivery's claim holds the
+    /// job, and already fired when the job was re-claimed with
+    /// [`crate::JobRecord::cancel_requested`] persisted.
+    ///
+    /// A handler may `select!` on it to stop early and return as
+    /// usual.
+    pub fn cancel_token(&self) -> &CancellationToken {
+        &self.cancel
     }
 
     /// Ensure the lease lasts at least `remaining` from now, extending
@@ -85,7 +101,7 @@ impl LeaseHandle {
         let Some(inner) = &self.inner else {
             return Ok(());
         };
-        if inner.cancel.as_ref().is_some_and(|t| t.is_cancelled()) {
+        if self.cancel.is_cancelled() {
             return Err(Error::CancelRequested);
         }
         let needed = inner.clock.now_ms()
@@ -133,20 +149,21 @@ mod tests {
     fn a_detached_handle_succeeds_without_effect() {
         let handle = LeaseHandle::detached();
         assert!(handle.ensure_at_least(Duration::from_secs(600)).is_ok());
+        assert!(!handle.cancel_token().is_cancelled());
     }
 
     #[test]
     fn ensure_at_least_extends_only_when_short() {
         let registry = LeaseRegistry::new();
         let clock = MockClock::new(1_000_000);
-        registry.insert("q", "a", 1_030_000, 7);
+        registry.insert("q", "a", 1_030_000, 7, CancellationToken::new());
         let handle = LeaseHandle::new(
             registry.clone(),
             Arc::new(clock.clone()),
             "q".into(),
             "a".into(),
             7,
-            None,
+            CancellationToken::new(),
         );
 
         // Covered: 10s + margin fits inside the 30s lease.
@@ -163,14 +180,14 @@ mod tests {
     fn ensure_at_least_fails_once_the_claim_ended() {
         let registry = LeaseRegistry::new();
         let clock = MockClock::new(1_000_000);
-        registry.insert("q", "a", 1_030_000, 7);
+        registry.insert("q", "a", 1_030_000, 7, CancellationToken::new());
         let handle = LeaseHandle::new(
             registry.clone(),
             Arc::new(clock.clone()),
             "q".into(),
             "a".into(),
             7,
-            None,
+            CancellationToken::new(),
         );
 
         registry.remove("q", "a", 7);
@@ -180,7 +197,7 @@ mod tests {
         ));
 
         // A re-claim of the same job is a different token.
-        registry.insert("q", "a", 1_030_000, 8);
+        registry.insert("q", "a", 1_030_000, 8, CancellationToken::new());
         assert!(matches!(
             handle.ensure_at_least(Duration::from_secs(10)),
             Err(Error::ClaimLost)
@@ -191,7 +208,7 @@ mod tests {
     fn ensure_at_least_is_refused_once_cancellation_is_requested() {
         let registry = LeaseRegistry::new();
         let clock = MockClock::new(1_000_000);
-        registry.insert("q", "a", 1_030_000, 7);
+        registry.insert("q", "a", 1_030_000, 7, CancellationToken::new());
         let cancel = CancellationToken::new();
         let handle = LeaseHandle::new(
             registry.clone(),
@@ -199,7 +216,7 @@ mod tests {
             "q".into(),
             "a".into(),
             7,
-            Some(cancel.clone()),
+            cancel.clone(),
         );
 
         handle.ensure_at_least(Duration::from_secs(60)).unwrap();

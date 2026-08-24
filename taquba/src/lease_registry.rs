@@ -1,5 +1,5 @@
 //! In-memory registry of claimed jobs' leases: the authoritative source
-//! of every claim's current expiry and claim token.
+//! of every claim's current expiry, claim token and cancellation token.
 //!
 //! Lease state is process state, not durable state. The queue is
 //! single-writer and single-process, so every path that consults or
@@ -20,6 +20,13 @@
 //! after a re-claim of the same job cannot delete the new claim's
 //! entry.
 //!
+//! The entry also holds the claim's cancellation token, fired by
+//! [`Queue::cancel`](crate::Queue::cancel) through the registry. The
+//! token is registered before the claim commits, so a cancellation
+//! racing the commit finds it, and is removed with the entry, so a
+//! settlement's cleanup cannot discard the token of a later claim of
+//! the same job.
+//!
 //! The reaper examines due entries in place: [`LeaseRegistry::take_due`]
 //! marks entries and leaves them in the registry, and a marked entry
 //! refuses renewal. Renewal and the reaper share no durable key, so no
@@ -29,6 +36,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
+
+use tokio_util::sync::CancellationToken;
 
 /// A due lease the reaper has marked and is examining.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -42,6 +51,9 @@ pub(crate) struct DueLease {
 struct Entry {
     expires_at: u64,
     token: u64,
+    /// The claim's cooperative cancellation token, fired by
+    /// [`LeaseRegistry::cancel`].
+    cancel: CancellationToken,
     /// Set once the reaper has taken the entry as due. A marked entry
     /// refuses renewal and leaves the registry only through removal.
     reaping: bool,
@@ -70,11 +82,18 @@ impl LeaseRegistry {
         Self::default()
     }
 
-    /// Record a claim's lease, replacing any previous entry for the
-    /// job. Called before the transaction writing the claim commits, so
-    /// a failed commit leaves a stale entry, discarded when it comes
-    /// due.
-    pub(crate) fn insert(&self, queue: &str, id: &str, expires_at: u64, token: u64) {
+    /// Record a claim's lease and cancellation token, replacing any
+    /// previous entry for the job. Called before the transaction
+    /// writing the claim commits, so a failed commit leaves a stale
+    /// entry, discarded when it comes due.
+    pub(crate) fn insert(
+        &self,
+        queue: &str,
+        id: &str,
+        expires_at: u64,
+        token: u64,
+        cancel: CancellationToken,
+    ) {
         let mut inner = self.lock();
         let key = (queue.to_string(), id.to_string());
         if let Some(old) = inner.by_job.get(&key) {
@@ -91,6 +110,7 @@ impl LeaseRegistry {
             Entry {
                 expires_at,
                 token,
+                cancel,
                 reaping: false,
             },
         );
@@ -128,6 +148,26 @@ impl LeaseRegistry {
             .by_job
             .get(&(queue.to_string(), id.to_string()))
             .map(|e| (e.expires_at, e.token))
+    }
+
+    /// Fire the cancellation token of the claim currently holding the
+    /// job. Returns `false` when the job holds no lease. The entry
+    /// remains; a claim ends through a settlement or the reaper.
+    pub(crate) fn cancel(&self, queue: &str, id: &str) -> bool {
+        // Fired outside the lock: firing wakes waiters, and a waiter
+        // must be free to read the registry.
+        let token = self
+            .lock()
+            .by_job
+            .get(&(queue.to_string(), id.to_string()))
+            .map(|entry| entry.cancel.clone());
+        match token {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Return every entry due at or before `now`, soonest first,
@@ -204,9 +244,9 @@ mod tests {
     #[test]
     fn take_due_returns_expired_entries_soonest_first_and_leaves_them_in_place() {
         let registry = LeaseRegistry::new();
-        registry.insert("q", "c", 30, 3);
-        registry.insert("q", "a", 10, 1);
-        registry.insert("q", "b", 20, 2);
+        registry.insert("q", "c", 30, 3, CancellationToken::new());
+        registry.insert("q", "a", 10, 1, CancellationToken::new());
+        registry.insert("q", "b", 20, 2, CancellationToken::new());
 
         let due = registry.take_due(20);
         let ids: Vec<_> = due.iter().map(|d| d.id.as_str()).collect();
@@ -217,7 +257,7 @@ mod tests {
     #[test]
     fn take_due_leaves_future_entries_unmarked() {
         let registry = LeaseRegistry::new();
-        registry.insert("q", "a", 100, 1);
+        registry.insert("q", "a", 100, 1, CancellationToken::new());
         assert!(registry.take_due(99).is_empty());
         assert!(registry.renew("q", "a", 1, 200));
     }
@@ -225,7 +265,7 @@ mod tests {
     #[test]
     fn a_renewal_moves_the_entry_in_expiry_order() {
         let registry = LeaseRegistry::new();
-        registry.insert("q", "a", 10, 1);
+        registry.insert("q", "a", 10, 1, CancellationToken::new());
         assert!(registry.renew("q", "a", 1, 40));
 
         assert!(registry.take_due(10).is_empty());
@@ -237,7 +277,7 @@ mod tests {
     #[test]
     fn a_renewal_to_an_unchanged_expiry_keeps_the_entry() {
         let registry = LeaseRegistry::new();
-        registry.insert("q", "a", 10, 1);
+        registry.insert("q", "a", 10, 1, CancellationToken::new());
         assert!(registry.renew("q", "a", 1, 10));
         assert!(registry.contains("q", "a", 10));
         assert_eq!(registry.take_due(10).len(), 1);
@@ -246,7 +286,7 @@ mod tests {
     #[test]
     fn renewal_is_refused_for_a_stale_token_and_for_a_marked_entry() {
         let registry = LeaseRegistry::new();
-        registry.insert("q", "a", 10, 1);
+        registry.insert("q", "a", 10, 1, CancellationToken::new());
         assert!(!registry.renew("q", "a", 2, 40));
         assert!(!registry.renew("q", "missing", 1, 40));
 
@@ -257,7 +297,7 @@ mod tests {
     #[test]
     fn removal_is_fenced_on_the_token() {
         let registry = LeaseRegistry::new();
-        registry.insert("q", "a", 10, 1);
+        registry.insert("q", "a", 10, 1, CancellationToken::new());
         registry.remove("q", "a", 2);
         assert_eq!(registry.len(), 1);
         registry.remove("q", "a", 1);
@@ -265,10 +305,38 @@ mod tests {
     }
 
     #[test]
+    fn cancel_fires_the_current_claims_token_and_keeps_the_entry() {
+        let registry = LeaseRegistry::new();
+        let cancel = CancellationToken::new();
+        registry.insert("q", "a", 10, 1, cancel.clone());
+
+        assert!(registry.cancel("q", "a"));
+        assert!(cancel.is_cancelled());
+        assert_eq!(registry.len(), 1);
+        assert!(!registry.cancel("q", "missing"));
+    }
+
+    #[test]
+    fn a_fenced_removal_after_a_reclaim_leaves_the_new_claim_cancellable() {
+        let registry = LeaseRegistry::new();
+        let first = CancellationToken::new();
+        let second = CancellationToken::new();
+        registry.insert("q", "a", 10, 1, first.clone());
+        // The re-claim registers before the first claim's settlement
+        // reaches its removal.
+        registry.insert("q", "a", 40, 2, second.clone());
+        registry.remove("q", "a", 1);
+
+        assert!(registry.cancel("q", "a"));
+        assert!(second.is_cancelled());
+        assert!(!first.is_cancelled());
+    }
+
+    #[test]
     fn insert_replaces_a_stale_entry_for_the_same_job() {
         let registry = LeaseRegistry::new();
-        registry.insert("q", "a", 10, 1);
-        registry.insert("q", "a", 30, 2);
+        registry.insert("q", "a", 10, 1, CancellationToken::new());
+        registry.insert("q", "a", 30, 2, CancellationToken::new());
         assert_eq!(registry.len(), 1);
         assert!(registry.take_due(10).is_empty());
         assert_eq!(registry.take_due(30).len(), 1);

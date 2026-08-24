@@ -298,7 +298,7 @@ async fn requeue_job(
 struct EmailWorker;
 
 impl Worker for EmailWorker {
-    async fn process(&self, job: &JobRecord, _lease: &LeaseHandle) -> Result<(), WorkerError> {
+    async fn process(&self, job: &JobRecord, lease: &LeaseHandle) -> Result<(), WorkerError> {
         if job.payload.starts_with(b"boom") {
             return Err(PermanentFailure::new("simulated permanent SMTP rejection").into());
         }
@@ -313,18 +313,13 @@ impl Worker for EmailWorker {
         }
         // Simulate slow work so claimed jobs are observable and a cancel
         // has a live claim to target.
-        let work = tokio::time::sleep(Duration::from_secs(3));
-        if let Some(token) = &job.cancel_token {
-            tokio::select! {
-                _ = token.cancelled() => {
-                    // Cancellation is cooperative: stop early, ack normally.
-                    println!("worker: job {} cancelled by operator, acking early", job.id);
-                    return Ok(());
-                }
-                _ = work => {}
+        tokio::select! {
+            _ = lease.cancel_token().cancelled() => {
+                // Cancellation is cooperative: stop early, ack normally.
+                println!("worker: job {} cancelled by operator, acking early", job.id);
+                return Ok(());
             }
-        } else {
-            work.await;
+            _ = tokio::time::sleep(Duration::from_secs(3)) => {}
         }
         println!("worker: job {} sent", job.id);
         Ok(())
