@@ -540,11 +540,6 @@ pub struct Queue {
     default_queue_config: QueueConfig,
     queue_configs: HashMap<String, QueueConfig>,
     clock: Arc<dyn Clock>,
-    /// In-process cancellation tokens for currently claimed jobs. Populated
-    /// by every `claim*` path, cleared on `ack` / `nack` / `dead_letter`.
-    /// `Queue::cancel` fires the token while the job is `Claimed`; the
-    /// persisted `cancel_requested` flag carries the request across
-    /// reaper-driven requeues and re-claims.
     /// Per-queue async mutex held across the claim transaction.
     /// Same-queue claim attempts serialise on this mutex rather than
     /// resolving via SlateDB's transaction-conflict retry. The lock
