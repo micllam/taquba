@@ -1702,50 +1702,9 @@ impl Queue {
             None
         };
 
-        let outcome: Result<Vec<EnqueueResult>> = async {
-            loop {
-                let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
-                take_claim(&txn, &self.core.lease_registry, &job.queue, &job.id, token).await?;
-                if let Some((ref done_k, ref done_v)) = done_record {
-                    put_job_record(&txn, done_k, &job_index_key(&job.id), done_v)?;
-                    append_attempt(
-                        &txn,
-                        &job.id,
-                        &JobAttempt {
-                            attempt: job.attempts,
-                            claimed_at: job.claimed_at,
-                            recorded_at: self.now_ms(),
-                            outcome: AttemptOutcome::Completed,
-                            error: None,
-                        },
-                    )?;
-                } else {
-                    // Default: drop the index pointer too; the ID is no longer
-                    // findable via get_job, but the queue stays small. The
-                    // attempt history shares the record's lifetime.
-                    txn.delete(job_index_key(&job.id))?;
-                    txn.delete(attempt_history_key(&job.id))?;
-                }
-                update_stats(
-                    &txn,
-                    &job.queue,
-                    &[(JobStatus::Claimed, -1), (JobStatus::Done, 1)],
-                )?;
-
-                let (results, staged) = self.stage_effects(&txn, &prepared).await?;
-
-                match commit(txn, Durability::Awaited).await? {
-                    Commit::Committed => {
-                        for staged_job in &staged {
-                            self.note_staged_job(staged_job);
-                        }
-                        return Ok(results);
-                    }
-                    Commit::Conflict => continue,
-                }
-            }
-        }
-        .await;
+        let outcome = self
+            .ack_txn(job, token, done_record.as_ref(), &prepared)
+            .await;
 
         self.finish_effects(prepared, outcome.as_ref().ok().map(|r| r.as_slice()))
             .await;
@@ -1807,81 +1766,7 @@ impl Queue {
         let token = claim.token();
         let (queue, id) = (claim.job().queue.as_str(), claim.job().id.as_str());
 
-        type Settled = (JobRecord, Option<Vec<EnqueueResult>>);
-        let settled: Result<Settled> = async {
-            loop {
-                let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
-                // The returned record is the base for the written record;
-                // the claim's copy predates a cancel committed during the
-                // delivery.
-                let mut job = take_claim(&txn, &self.core.lease_registry, queue, id, token).await?;
-
-                let staged = if job.attempts >= job.max_attempts {
-                    stage_dead_letter(&txn, &mut job, self.now_ms(), error)?;
-                    Some(self.stage_effects(&txn, &prepared).await?)
-                } else {
-                    job.last_error = Some(error.to_string());
-                    append_attempt(
-                        &txn,
-                        &job.id,
-                        &JobAttempt {
-                            attempt: job.attempts,
-                            claimed_at: job.claimed_at.take(),
-                            recorded_at: self.now_ms(),
-                            outcome: AttemptOutcome::Retried,
-                            error: Some(error.to_string()),
-                        },
-                    )?;
-                    let cfg = self.queue_config(&job.queue);
-                    let backoff =
-                        backoff_delay(job.attempts, cfg.retry_backoff_base, cfg.retry_backoff_max);
-
-                    if backoff.is_zero() {
-                        stage_to_pending(&txn, &mut job, JobStatus::Claimed)?;
-                        debug!(
-                            queue = %job.queue,
-                            job_id = %job.id,
-                            attempts = job.attempts,
-                            "job re-queued"
-                        );
-                    } else {
-                        let run_at = self.now_ms() + backoff.as_millis() as u64;
-                        job.status = JobStatus::Scheduled;
-                        job.run_at = Some(run_at);
-                        let scheduled = scheduled_key(&job.queue, run_at, &job.id);
-                        let value = job.stored_bytes()?;
-                        put_job_record(&txn, &scheduled, &job_index_key(&job.id), &value)?;
-                        update_stats(
-                            &txn,
-                            &job.queue,
-                            &[(JobStatus::Claimed, -1), (JobStatus::Scheduled, 1)],
-                        )?;
-                        debug!(
-                            queue = %job.queue,
-                            job_id = %job.id,
-                            attempts = job.attempts,
-                            backoff_ms = backoff.as_millis() as u64,
-                            "job scheduled for retry"
-                        );
-                    }
-                    None
-                };
-
-                match commit(txn, Durability::Awaited).await? {
-                    Commit::Committed => {
-                        let results = staged.map(|(results, staged_jobs)| {
-                            for staged_job in &staged_jobs {
-                                self.note_staged_job(staged_job);
-                            }
-                            results
-                        });
-                        return Ok((job, results));
-                    }
-                    Commit::Conflict => continue,
-                }
-            }
-        }
-        .await;
+        let settled = self.nack_txn(queue, id, token, error, &prepared).await;
 
         self.finish_effects(
             prepared,
@@ -1956,25 +1841,9 @@ impl Queue {
         let (queue, id) = (claim.job().queue.as_str(), claim.job().id.as_str());
         let failed_at = self.now_ms();
 
-        type Settled = (JobRecord, Vec<EnqueueResult>);
-        let settled: Result<Settled> = async {
-            loop {
-                let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
-                let mut job = take_claim(&txn, &self.core.lease_registry, queue, id, token).await?;
-                stage_dead_letter(&txn, &mut job, failed_at, reason)?;
-                let (results, staged) = self.stage_effects(&txn, &prepared).await?;
-                match commit(txn, Durability::Awaited).await? {
-                    Commit::Committed => {
-                        for staged_job in &staged {
-                            self.note_staged_job(staged_job);
-                        }
-                        return Ok((job, results));
-                    }
-                    Commit::Conflict => continue,
-                }
-            }
-        }
-        .await;
+        let settled = self
+            .dead_letter_txn(queue, id, token, failed_at, reason, &prepared)
+            .await;
 
         self.finish_effects(
             prepared,
@@ -1989,6 +1858,170 @@ impl Queue {
             WaitOutcome::Dead(Box::new(delivered_record(&job, claim)))
         });
         Ok(results)
+    }
+
+    /// The transaction loop of [`Self::ack_with`]: fence the claim,
+    /// write or remove the record, stage the effects and commit.
+    async fn ack_txn(
+        &self,
+        job: &JobRecord,
+        token: u64,
+        done_record: Option<&(Vec<u8>, Vec<u8>)>,
+        prepared: &PreparedEffects,
+    ) -> Result<Vec<EnqueueResult>> {
+        loop {
+            let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
+            take_claim(&txn, &self.core.lease_registry, &job.queue, &job.id, token).await?;
+            if let Some((done_k, done_v)) = done_record {
+                put_job_record(&txn, done_k, &job_index_key(&job.id), done_v)?;
+                append_attempt(
+                    &txn,
+                    &job.id,
+                    &JobAttempt {
+                        attempt: job.attempts,
+                        claimed_at: job.claimed_at,
+                        recorded_at: self.now_ms(),
+                        outcome: AttemptOutcome::Completed,
+                        error: None,
+                    },
+                )?;
+            } else {
+                // Default: drop the index pointer too; the ID is no longer
+                // findable via get_job, but the queue stays small. The
+                // attempt history shares the record's lifetime.
+                txn.delete(job_index_key(&job.id))?;
+                txn.delete(attempt_history_key(&job.id))?;
+            }
+            update_stats(
+                &txn,
+                &job.queue,
+                &[(JobStatus::Claimed, -1), (JobStatus::Done, 1)],
+            )?;
+
+            let (results, staged) = self.stage_effects(&txn, prepared).await?;
+
+            match commit(txn, Durability::Awaited).await? {
+                Commit::Committed => {
+                    for staged_job in &staged {
+                        self.note_staged_job(staged_job);
+                    }
+                    return Ok(results);
+                }
+                Commit::Conflict => continue,
+            }
+        }
+    }
+
+    /// The transaction loop of [`Self::nack_with`]: fence the claim,
+    /// dead-letter or requeue the job and commit. Returns the written
+    /// record and, on the dead-letter branch, the effects' results.
+    async fn nack_txn(
+        &self,
+        queue: &str,
+        id: &str,
+        token: u64,
+        error: &str,
+        prepared: &PreparedEffects,
+    ) -> Result<(JobRecord, Option<Vec<EnqueueResult>>)> {
+        loop {
+            let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
+            // The returned record is the base for the written record;
+            // the claim's copy predates a cancel committed during the
+            // delivery.
+            let mut job = take_claim(&txn, &self.core.lease_registry, queue, id, token).await?;
+
+            let staged = if job.attempts >= job.max_attempts {
+                stage_dead_letter(&txn, &mut job, self.now_ms(), error)?;
+                Some(self.stage_effects(&txn, prepared).await?)
+            } else {
+                job.last_error = Some(error.to_string());
+                append_attempt(
+                    &txn,
+                    &job.id,
+                    &JobAttempt {
+                        attempt: job.attempts,
+                        claimed_at: job.claimed_at.take(),
+                        recorded_at: self.now_ms(),
+                        outcome: AttemptOutcome::Retried,
+                        error: Some(error.to_string()),
+                    },
+                )?;
+                let cfg = self.queue_config(&job.queue);
+                let backoff =
+                    backoff_delay(job.attempts, cfg.retry_backoff_base, cfg.retry_backoff_max);
+
+                if backoff.is_zero() {
+                    stage_to_pending(&txn, &mut job, JobStatus::Claimed)?;
+                    debug!(
+                        queue = %job.queue,
+                        job_id = %job.id,
+                        attempts = job.attempts,
+                        "job re-queued"
+                    );
+                } else {
+                    let run_at = self.now_ms() + backoff.as_millis() as u64;
+                    job.status = JobStatus::Scheduled;
+                    job.run_at = Some(run_at);
+                    let scheduled = scheduled_key(&job.queue, run_at, &job.id);
+                    let value = job.stored_bytes()?;
+                    put_job_record(&txn, &scheduled, &job_index_key(&job.id), &value)?;
+                    update_stats(
+                        &txn,
+                        &job.queue,
+                        &[(JobStatus::Claimed, -1), (JobStatus::Scheduled, 1)],
+                    )?;
+                    debug!(
+                        queue = %job.queue,
+                        job_id = %job.id,
+                        attempts = job.attempts,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "job scheduled for retry"
+                    );
+                }
+                None
+            };
+
+            match commit(txn, Durability::Awaited).await? {
+                Commit::Committed => {
+                    let results = staged.map(|(results, staged_jobs)| {
+                        for staged_job in &staged_jobs {
+                            self.note_staged_job(staged_job);
+                        }
+                        results
+                    });
+                    return Ok((job, results));
+                }
+                Commit::Conflict => continue,
+            }
+        }
+    }
+
+    /// The transaction loop of [`Self::dead_letter_with`]: fence the
+    /// claim, dead-letter the job, stage the effects and commit.
+    async fn dead_letter_txn(
+        &self,
+        queue: &str,
+        id: &str,
+        token: u64,
+        failed_at: u64,
+        reason: &str,
+        prepared: &PreparedEffects,
+    ) -> Result<(JobRecord, Vec<EnqueueResult>)> {
+        loop {
+            let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
+            let mut job = take_claim(&txn, &self.core.lease_registry, queue, id, token).await?;
+            stage_dead_letter(&txn, &mut job, failed_at, reason)?;
+            let (results, staged) = self.stage_effects(&txn, prepared).await?;
+            match commit(txn, Durability::Awaited).await? {
+                Commit::Committed => {
+                    for staged_job in &staged {
+                        self.note_staged_job(staged_job);
+                    }
+                    return Ok((job, results));
+                }
+                Commit::Conflict => continue,
+            }
+        }
     }
 
     /// Return a snapshot of job counts for the given queue.
@@ -2318,99 +2351,7 @@ impl Queue {
         effects: SettlementEffects,
     ) -> Result<(CancelOutcome, Vec<EnqueueResult>)> {
         let prepared = self.prepare_effects(effects).await?;
-        let outcome: Result<(CancelOutcome, Vec<EnqueueResult>)> = async {
-            loop {
-                let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
-
-                let Some((index_key, current_key, mut job)) = get_indexed_job(&txn, id).await?
-                else {
-                    txn.rollback();
-                    return Ok((CancelOutcome::NotFound, Vec::new()));
-                };
-
-                let (msg, outcome, staged) = match job.status {
-                    JobStatus::Pending | JobStatus::Scheduled => {
-                        let is_scheduled = matches!(job.status, JobStatus::Scheduled);
-                        txn.delete(&current_key)?;
-                        txn.delete(&index_key)?;
-                        // A nacked job waiting out its backoff has attempt
-                        // history; it is removed with the record.
-                        txn.delete(attempt_history_key(id))?;
-                        if let Some(ref dk) = job.dedup_key {
-                            txn.delete(dedup_index_key(&job.queue, dk))?;
-                        }
-                        if is_scheduled {
-                            update_stats(&txn, &job.queue, &[(JobStatus::Scheduled, -1)])?;
-                        } else {
-                            update_stats(&txn, &job.queue, &[(JobStatus::Pending, -1)])?;
-                        }
-                        let (results, staged) = self.stage_effects(&txn, &prepared).await?;
-                        (
-                            "pending/scheduled job cancelled",
-                            CancelOutcome::Removed,
-                            Some((results, staged)),
-                        )
-                    }
-                    JobStatus::Claimed => {
-                        if job.cancel_requested {
-                            // The flag is already persisted. The token
-                            // is fired again because a re-claim since
-                            // the first request holds a fresh one.
-                            txn.rollback();
-                            self.core.lease_registry.cancel(&job.queue, id);
-                            debug!(job_id = %id, "cancel re-requested on claimed job");
-                            return Ok((CancelOutcome::Requested, Vec::new()));
-                        }
-                        job.cancel_requested = true;
-                        let value = job.stored_bytes()?;
-                        txn.put(&current_key, &value)?;
-                        (
-                            "claimed job cancellation requested",
-                            CancelOutcome::Requested,
-                            None,
-                        )
-                    }
-                    JobStatus::Done | JobStatus::Dead => {
-                        txn.rollback();
-                        return Ok((CancelOutcome::NotFound, Vec::new()));
-                    }
-                };
-
-                match commit(txn, Durability::Awaited).await? {
-                    Commit::Committed => {
-                        // Fired on the Removed path as well: the
-                        // worker of a claim the reaper requeued just
-                        // before this call may still observe the token.
-                        // That claim's end removes the entry.
-                        self.core.lease_registry.cancel(&job.queue, id);
-                        let results = match staged {
-                            Some((results, staged_jobs)) => {
-                                for staged_job in &staged_jobs {
-                                    self.note_staged_job(staged_job);
-                                }
-                                results
-                            }
-                            None => Vec::new(),
-                        };
-                        // Removed = terminal (job is gone). Requested = not yet
-                        // terminal; the worker's settlement delivers the
-                        // outcome when it acks / nacks / dead-letters.
-                        if matches!(outcome, CancelOutcome::Removed) {
-                            // The record is deleted, so its payload object
-                            // (if any) is removed here, after the commit.
-                            self.core.payload_store.delete_for(&job).await;
-                            self.core
-                                .completion_waiters
-                                .settle(id, || WaitOutcome::Cancelled);
-                        }
-                        debug!(job_id = %id, "{msg}");
-                        return Ok((outcome, results));
-                    }
-                    Commit::Conflict => continue,
-                }
-            }
-        }
-        .await;
+        let outcome = self.cancel_txn(id, &prepared).await;
 
         self.finish_effects(
             prepared,
@@ -2421,6 +2362,105 @@ impl Queue {
         )
         .await;
         outcome
+    }
+
+    /// The transaction loop of [`Self::cancel_with`]: resolve the job,
+    /// apply the transition its state allows and commit, including the
+    /// post-commit notifications of the committed outcome.
+    async fn cancel_txn(
+        &self,
+        id: &str,
+        prepared: &PreparedEffects,
+    ) -> Result<(CancelOutcome, Vec<EnqueueResult>)> {
+        loop {
+            let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
+
+            let Some((index_key, current_key, mut job)) = get_indexed_job(&txn, id).await? else {
+                txn.rollback();
+                return Ok((CancelOutcome::NotFound, Vec::new()));
+            };
+
+            let (msg, outcome, staged) = match job.status {
+                JobStatus::Pending | JobStatus::Scheduled => {
+                    let is_scheduled = matches!(job.status, JobStatus::Scheduled);
+                    txn.delete(&current_key)?;
+                    txn.delete(&index_key)?;
+                    // A nacked job waiting out its backoff has attempt
+                    // history; it is removed with the record.
+                    txn.delete(attempt_history_key(id))?;
+                    if let Some(ref dk) = job.dedup_key {
+                        txn.delete(dedup_index_key(&job.queue, dk))?;
+                    }
+                    if is_scheduled {
+                        update_stats(&txn, &job.queue, &[(JobStatus::Scheduled, -1)])?;
+                    } else {
+                        update_stats(&txn, &job.queue, &[(JobStatus::Pending, -1)])?;
+                    }
+                    let (results, staged) = self.stage_effects(&txn, prepared).await?;
+                    (
+                        "pending/scheduled job cancelled",
+                        CancelOutcome::Removed,
+                        Some((results, staged)),
+                    )
+                }
+                JobStatus::Claimed => {
+                    if job.cancel_requested {
+                        // The flag is already persisted. The token
+                        // is fired again because a re-claim since
+                        // the first request holds a fresh one.
+                        txn.rollback();
+                        self.core.lease_registry.cancel(&job.queue, id);
+                        debug!(job_id = %id, "cancel re-requested on claimed job");
+                        return Ok((CancelOutcome::Requested, Vec::new()));
+                    }
+                    job.cancel_requested = true;
+                    let value = job.stored_bytes()?;
+                    txn.put(&current_key, &value)?;
+                    (
+                        "claimed job cancellation requested",
+                        CancelOutcome::Requested,
+                        None,
+                    )
+                }
+                JobStatus::Done | JobStatus::Dead => {
+                    txn.rollback();
+                    return Ok((CancelOutcome::NotFound, Vec::new()));
+                }
+            };
+
+            match commit(txn, Durability::Awaited).await? {
+                Commit::Committed => {
+                    // Fired on the Removed path as well: the
+                    // worker of a claim the reaper requeued just
+                    // before this call may still observe the token.
+                    // That claim's end removes the entry.
+                    self.core.lease_registry.cancel(&job.queue, id);
+                    let results = match staged {
+                        Some((results, staged_jobs)) => {
+                            for staged_job in &staged_jobs {
+                                self.note_staged_job(staged_job);
+                            }
+                            results
+                        }
+                        None => Vec::new(),
+                    };
+                    // Removed = terminal (job is gone). Requested = not yet
+                    // terminal; the worker's settlement delivers the
+                    // outcome when it acks / nacks / dead-letters.
+                    if matches!(outcome, CancelOutcome::Removed) {
+                        // The record is deleted, so its payload object
+                        // (if any) is removed here, after the commit.
+                        self.core.payload_store.delete_for(&job).await;
+                        self.core
+                            .completion_waiters
+                            .settle(id, || WaitOutcome::Cancelled);
+                    }
+                    debug!(job_id = %id, "{msg}");
+                    return Ok((outcome, results));
+                }
+                Commit::Conflict => continue,
+            }
+        }
     }
 
     /// Move a `Scheduled` job to pending immediately, before its `run_at`,
