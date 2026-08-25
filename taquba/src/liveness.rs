@@ -115,81 +115,73 @@ impl HeartbeatRecord {
     }
 }
 
-/// Commit one beat, awaiting durability so the beat is observable by
-/// readers when the call returns and a fencing failure surfaces to the
-/// caller.
-pub(crate) async fn write_beat(
-    db: &Db,
-    clock: &dyn Clock,
-    counter: u64,
-    interval: Duration,
-    writer_epoch: u64,
-    closed: bool,
-) -> Result<()> {
-    let record = HeartbeatRecord {
-        counter,
-        at_ms: clock.now_ms(),
-        interval_ms: interval.as_millis() as u64,
-        writer_epoch,
-        closed,
-    };
-    let bytes = rmp_serde::to_vec(&record)?;
-    db.put(heartbeat_key(), bytes).await?;
-    Ok(())
-}
-
-/// Read the counter of the stored beat, so a reopening writer
-/// continues the sequence.
-pub(crate) async fn stored_counter(db: &Db) -> Result<u64> {
-    match db.get(heartbeat_key()).await? {
-        Some(bytes) => {
-            let record: HeartbeatRecord = rmp_serde::from_slice(&bytes)?;
-            Ok(record.counter)
-        }
-        None => Ok(0),
-    }
-}
-
 /// Background task committing one beat per interval while the queue is
 /// open. A failed beat is logged at error level and counted; the task
 /// continues, because a fencing failure also fails the queue's own
 /// writes and those surface to callers.
 pub(crate) struct HeartbeatTask {
-    pub(crate) db: Arc<Db>,
-    pub(crate) clock: Arc<dyn Clock>,
-    pub(crate) interval: Duration,
-    pub(crate) next_counter: u64,
-    pub(crate) writer_epoch: u64,
+    db: Arc<Db>,
+    clock: Arc<dyn Clock>,
+    interval: Duration,
+    /// Counter of the next beat. Continues from the stored beat's
+    /// counter, so it increases across writer restarts.
+    next_counter: u64,
+    writer_epoch: u64,
 }
 
 impl HeartbeatTask {
+    /// Build the task for an open store and commit its first beat, so
+    /// an open store with the heartbeat enabled always holds one.
+    pub(crate) async fn start(
+        db: Arc<Db>,
+        clock: Arc<dyn Clock>,
+        interval: Duration,
+    ) -> Result<Self> {
+        let next_counter = match db.get(heartbeat_key()).await? {
+            Some(bytes) => rmp_serde::from_slice::<HeartbeatRecord>(&bytes)?.counter + 1,
+            None => 1,
+        };
+        let mut task = Self {
+            writer_epoch: db.manifest().writer_epoch(),
+            db,
+            clock,
+            interval,
+            next_counter,
+        };
+        task.beat(false).await?;
+        Ok(task)
+    }
+
+    /// Commit one beat, awaiting durability so the beat is observable
+    /// by readers when the call returns. The counter advances even when
+    /// the commit fails: a failed put can still have committed durably,
+    /// and a repeated counter would stall a reader that watches it for
+    /// advance. A gap is harmless; the counter is only required to
+    /// increase.
+    async fn beat(&mut self, closed: bool) -> Result<()> {
+        let record = HeartbeatRecord {
+            counter: self.next_counter,
+            at_ms: self.clock.now_ms(),
+            interval_ms: self.interval.as_millis() as u64,
+            writer_epoch: self.writer_epoch,
+            closed,
+        };
+        self.next_counter += 1;
+        let bytes = rmp_serde::to_vec(&record)?;
+        self.db.put(heartbeat_key(), bytes).await?;
+        Ok(())
+    }
+
     /// Beat until shutdown, then return the task so the closer can
-    /// commit the closing beat with the task's counter.
+    /// commit the closing beat.
     pub(crate) async fn run(mut self, mut ticker: Ticker) -> Self {
         while ticker.tick().await {
-            let counter = self.next_counter;
-            // Advance past the attempted counter even on failure: a
-            // failed put can still have committed durably, and
-            // reusing its counter would make the next beat repeat it,
-            // stalling a reader that watches the counter for advance.
-            // A gap left by a failed beat is harmless; the counter is
-            // only required to increase.
-            self.next_counter += 1;
-            if let Err(e) = write_beat(
-                &self.db,
-                self.clock.as_ref(),
-                counter,
-                self.interval,
-                self.writer_epoch,
-                false,
-            )
-            .await
-            {
+            if let Err(e) = self.beat(false).await {
                 crate::obs::heartbeat_failed();
                 error!(
                     "liveness heartbeat commit failed: {e}; a fencing \
-                             error indicates another process has opened this \
-                             store as its writer"
+                     error indicates another process has opened this \
+                     store as its writer"
                 );
             }
         }
@@ -200,17 +192,8 @@ impl HeartbeatTask {
     /// Commit the closing beat of a clean close. Best-effort: a failure
     /// is logged and counted, leaving the last periodic beat in place,
     /// and the close proceeds.
-    pub(crate) async fn write_closing_beat(self) {
-        if let Err(e) = write_beat(
-            &self.db,
-            self.clock.as_ref(),
-            self.next_counter,
-            self.interval,
-            self.writer_epoch,
-            true,
-        )
-        .await
-        {
+    pub(crate) async fn write_closing_beat(mut self) {
+        if let Err(e) = self.beat(true).await {
             crate::obs::heartbeat_failed();
             warn!("closing liveness beat failed: {e}");
         }

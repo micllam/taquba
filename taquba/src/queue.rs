@@ -709,27 +709,9 @@ impl Queue {
 
         let heartbeat = match opts.liveness_heartbeat {
             Some(interval) => {
-                // The first beat is committed before open returns, so an
-                // open store with the heartbeat enabled always holds one,
-                // and the counter continues from any earlier writer's.
-                let counter = crate::liveness::stored_counter(&db).await? + 1;
-                let writer_epoch = db.manifest().writer_epoch();
-                crate::liveness::write_beat(
-                    &db,
-                    opts.clock.as_ref(),
-                    counter,
-                    interval,
-                    writer_epoch,
-                    false,
-                )
-                .await?;
-                let task = crate::liveness::HeartbeatTask {
-                    db: db.clone(),
-                    clock: opts.clock.clone(),
-                    interval,
-                    next_counter: counter + 1,
-                    writer_epoch,
-                };
+                let task =
+                    crate::liveness::HeartbeatTask::start(db.clone(), opts.clock.clone(), interval)
+                        .await?;
                 Some(BackgroundTask::spawn(interval, |ticker| task.run(ticker)))
             }
             None => None,
