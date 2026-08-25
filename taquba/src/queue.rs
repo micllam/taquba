@@ -1016,12 +1016,7 @@ impl Queue {
         expected: Option<&[u8]>,
         value: &[u8],
     ) -> Result<bool> {
-        if value.len() > MAX_KV_VALUE_SIZE {
-            return Err(Error::KvValueTooLarge {
-                size: value.len(),
-                max: MAX_KV_VALUE_SIZE,
-            });
-        }
+        validate_kv_value_size(value)?;
         let scoped = user_scoped_key(key);
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
@@ -2364,19 +2359,12 @@ impl Queue {
     ///
     /// Returns `None` if the ID was never enqueued or has since been expunged.
     pub async fn get_job(&self, id: &str) -> Result<Option<JobRecord>> {
-        let index_key = job_index_key(id);
         // The index and the record are read from one snapshot.
         let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-        let found = match txn.get(&index_key).await? {
-            None => None,
-            Some(current_key) => match txn.get(&current_key).await? {
-                None => None,
-                Some(bytes) => Some(JobRecord::decode(&current_key, &bytes)?),
-            },
-        };
+        let found = get_indexed_job(&txn, id).await?;
         txn.rollback();
 
-        let Some(mut job) = found else {
+        let Some((index_key, _, mut job)) = found else {
             return Ok(None);
         };
         match self.materialize_payload(&mut job).await {
@@ -2603,66 +2591,60 @@ impl Queue {
     /// All jobs use the queue's configured `max_attempts` and `default_priority`.
     /// Returns the IDs in the same order as `payloads`.
     pub async fn enqueue_batch(&self, queue: &str, payloads: Vec<Vec<u8>>) -> Result<Vec<String>> {
-        validate_queue_name(queue)?;
         if payloads.is_empty() {
             return Ok(Vec::new());
         }
-        let cfg = self.queue_config(queue);
-        let max_attempts = cfg.max_attempts;
-        let priority = cfg.default_priority;
-        let now = self.now_ms();
-
         let timer = crate::obs::start();
 
-        let mut jobs = Vec::with_capacity(payloads.len());
+        let mut prepared = Vec::with_capacity(payloads.len());
         for payload in payloads {
-            let id = self.next_job_id();
-            jobs.push(JobRecord::new_pending(
-                id,
-                queue.to_string(),
-                payload,
-                max_attempts,
-                priority,
-                now,
-            ));
+            let (job, key, id_override_used) =
+                self.prepare_job_record(queue, payload, EnqueueOptions::default())?;
+            prepared.push(PreparedJob {
+                job,
+                key,
+                id_override_used,
+            });
         }
-
-        // Offload oversized payloads before the transaction.
-        self.offload_payloads(jobs.iter_mut()).await?;
+        self.offload_payloads(prepared.iter_mut().map(|p| &mut p.job))
+            .await?;
 
         let write = async {
-            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            let mut ids = Vec::with_capacity(jobs.len());
-            for job in &jobs {
-                let key = pending_key(queue, priority, &job.id);
-                let value = rmp_serde::to_vec_named(job)?;
-                put_job_record(&txn, &key, &job_index_key(&job.id), &value)?;
-                ids.push(job.id.clone());
+            loop {
+                let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+                let mut staged = Vec::with_capacity(prepared.len());
+                for prepared_job in &prepared {
+                    match self.stage_job_writes(&txn, prepared_job).await? {
+                        Ok(staged_job) => staged.push(staged_job),
+                        // Batch jobs have no dedup key.
+                        Err(_) => return Err(Error::InvalidState),
+                    }
+                }
+                match commit(txn, Durability::Awaited).await? {
+                    Commit::Committed => return Ok(staged),
+                    Commit::Conflict => continue,
+                }
             }
-            update_stats(&txn, queue, &[(JobStatus::Pending, ids.len() as i64)])?;
-            txn.commit().await?;
-            Ok::<_, Error>(ids)
         };
-        let ids = match write.await {
-            Ok(ids) => ids,
+        let staged = match write.await {
+            Ok(staged) => staged,
             Err(err) => {
-                for job in &jobs {
-                    self.delete_payload_object(job).await;
+                for prepared_job in &prepared {
+                    self.delete_payload_object(&prepared_job.job).await;
                 }
                 return Err(err);
             }
         };
-        crate::obs::enqueued(queue, ids.len() as u64, timer);
-        // Batch ids are monotonic ULIDs at one priority, so the first id
-        // yields the batch's smallest pending key for the cursor check.
-        if let Some(first_id) = ids.first() {
-            let key = pending_key(queue, priority, first_id);
+        crate::obs::enqueued(queue, staged.len() as u64, timer);
+        // Batch ids are monotonic ULIDs at one priority, so the first
+        // staged job holds the batch's smallest pending key.
+        if let Some(key) = staged.first().and_then(|s| s.pending_key.as_ref()) {
             self.claim_cursor
-                .note_pending_inserts(queue, &key, ids.len());
+                .note_pending_inserts(queue, key, staged.len());
         }
 
-        debug!(queue = queue, count = ids.len(), "batch enqueued");
-        Ok(ids)
+        debug!(queue = queue, count = staged.len(), "batch enqueued");
+        Ok(staged.into_iter().map(|s| s.id).collect())
     }
 
     /// Trigger an immediate reap sweep (primarily useful in tests and tooling).
