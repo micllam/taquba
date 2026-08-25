@@ -15,8 +15,7 @@ use crate::stats::update_stats;
 /// key.
 ///
 /// `index_key` must be [`crate::keys::job_index_key`] of the record's
-/// job id. `value` is the serialized record; a record carrying a
-/// materialized payload must be serialized with
+/// job id. `value` is the record serialized with
 /// [`JobRecord::stored_bytes`](crate::JobRecord::stored_bytes).
 pub(crate) fn put_job_record(
     txn: &DbTransaction,

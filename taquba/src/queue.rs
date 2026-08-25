@@ -1407,7 +1407,7 @@ impl Queue {
             return Err(Error::DuplicateJobId { id: job.id.clone() });
         }
 
-        let value = rmp_serde::to_vec_named(job)?;
+        let value = job.stored_bytes()?;
         put_job_record(txn, key, &job_index_key(&job.id), &value)?;
         if let Some(ref dkey) = dkey {
             txn.put(dkey, job.id.as_bytes())?;
@@ -1702,7 +1702,7 @@ impl Queue {
                 let dedup_key_to_release = job.dedup_key.take();
                 let token = new_claim_token();
                 let claimed = claimed_key(&job.queue, &job.id);
-                let value = rmp_serde::to_vec_named(&job)?;
+                let value = job.stored_bytes()?;
 
                 txn.delete(&kv.key)?;
                 put_job_record(&txn, &claimed, &job_index_key(&job.id), &value)?;
@@ -1820,7 +1820,7 @@ impl Queue {
             done_job.completed_at = Some(completed_at);
             Some((
                 done_key(completed_at, &job.queue, &job.id),
-                rmp_serde::to_vec_named(&done_job)?,
+                done_job.stored_bytes()?,
             ))
         } else {
             None
@@ -2476,7 +2476,7 @@ impl Queue {
                             return Ok((CancelOutcome::Requested, Vec::new()));
                         }
                         job.cancel_requested = true;
-                        let value = rmp_serde::to_vec_named(&job)?;
+                        let value = job.stored_bytes()?;
                         txn.put(&current_key, &value)?;
                         (
                             "claimed job cancellation requested",

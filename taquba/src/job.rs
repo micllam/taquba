@@ -262,16 +262,12 @@ impl JobRecord {
     /// Serialize the record in its stored form: when the payload is
     /// offloaded ([`Self::payload_ref`] is `Some`), the inline payload
     /// is excluded so state transitions never rewrite payload bytes.
-    /// The payload field is restored before returning, so the record
-    /// is unchanged from the caller's perspective.
-    pub(crate) fn stored_bytes(&mut self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    /// Every record write serializes through this method.
+    pub(crate) fn stored_bytes(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
         if self.payload_ref.is_none() {
             return rmp_serde::to_vec_named(self);
         }
-        let payload = std::mem::take(&mut self.payload);
-        let bytes = rmp_serde::to_vec_named(self);
-        self.payload = payload;
-        bytes
+        rmp_serde::to_vec_named(&self.stored_clone())
     }
 
     /// Clone the record in its stored form: identical to [`Clone`]
