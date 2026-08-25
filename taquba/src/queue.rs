@@ -1225,28 +1225,26 @@ impl Queue {
         }
     }
 
-    /// Delete the payload objects of prepared follow-up jobs that no
-    /// committed record points at. `results` aligns index-wise with
-    /// `prepared_jobs`: an [`EnqueueResult::AlreadyEnqueued`] entry
-    /// marks a dedup downgrade whose object is unreferenced. `None`
-    /// means no follow-up record committed (the settlement failed or
-    /// took a branch that discards the effects), so every offloaded
-    /// object is deleted.
-    async fn delete_unreferenced_follow_up_payloads(
-        &self,
-        prepared_jobs: &[PreparedJob],
-        results: Option<&[EnqueueResult]>,
-    ) {
+    /// Release prepared effects once their settlement has ended:
+    /// delete the payload objects of follow-up jobs that no committed
+    /// record points at. `results` aligns index-wise with the prepared
+    /// jobs: an [`EnqueueResult::AlreadyEnqueued`] entry marks a dedup
+    /// downgrade whose object is unreferenced. `None` means no
+    /// follow-up record committed (the settlement failed or took a
+    /// branch that discards the effects), so every offloaded object is
+    /// deleted. Every settlement path ends with this call, on every
+    /// branch.
+    async fn finish_effects(&self, prepared: PreparedEffects, results: Option<&[EnqueueResult]>) {
         match results {
             Some(results) => {
-                for (prepared, result) in prepared_jobs.iter().zip(results) {
+                for (prepared, result) in prepared.prepared_jobs.iter().zip(results) {
                     if matches!(result, EnqueueResult::AlreadyEnqueued(_)) {
                         self.delete_payload_object(&prepared.job).await;
                     }
                 }
             }
             None => {
-                for prepared in prepared_jobs {
+                for prepared in &prepared.prepared_jobs {
                     self.delete_payload_object(&prepared.job).await;
                 }
             }
@@ -1258,9 +1256,8 @@ impl Queue {
     /// payloads. Runs once, before a settlement's transaction loop, so
     /// the follow-up ids stay stable across conflict retries and a
     /// committed record never points at an unwritten object. The
-    /// caller must delete the payload objects of prepared jobs that
-    /// ended up without a committed record, via
-    /// [`Self::delete_unreferenced_follow_up_payloads`] or directly.
+    /// caller passes the result to [`Self::finish_effects`] once the
+    /// settlement has ended.
     async fn prepare_effects(&self, effects: SettlementEffects) -> Result<PreparedEffects> {
         for value in effects.kv_writes.values() {
             validate_kv_value_size(value)?;
@@ -1888,11 +1885,8 @@ impl Queue {
         }
         .await;
 
-        self.delete_unreferenced_follow_up_payloads(
-            &prepared.prepared_jobs,
-            outcome.as_ref().ok().map(|r| r.as_slice()),
-        )
-        .await;
+        self.finish_effects(prepared, outcome.as_ref().ok().map(|r| r.as_slice()))
+            .await;
         let results = outcome?;
         // After the commit and token-fenced, so a removal that runs
         // after a re-claim leaves the new claim's entry.
@@ -2027,8 +2021,8 @@ impl Queue {
         }
         .await;
 
-        self.delete_unreferenced_follow_up_payloads(
-            &prepared.prepared_jobs,
+        self.finish_effects(
+            prepared,
             match &settled {
                 Ok((_, Some(results))) => Some(results.as_slice()),
                 _ => None,
@@ -2118,8 +2112,8 @@ impl Queue {
         }
         .await;
 
-        self.delete_unreferenced_follow_up_payloads(
-            &prepared.prepared_jobs,
+        self.finish_effects(
+            prepared,
             settled.as_ref().ok().map(|(_, results)| results.as_slice()),
         )
         .await;
@@ -2550,8 +2544,8 @@ impl Queue {
         }
         .await;
 
-        self.delete_unreferenced_follow_up_payloads(
-            &prepared.prepared_jobs,
+        self.finish_effects(
+            prepared,
             match &outcome {
                 Ok((CancelOutcome::Removed, results)) => Some(results.as_slice()),
                 _ => None,
