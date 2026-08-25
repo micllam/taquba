@@ -23,13 +23,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use slatedb::Db;
 use tracing::{debug, error, warn};
 
 use crate::background::Ticker;
-use crate::clock::Clock;
 use crate::error::Result;
 use crate::keys::heartbeat_key;
+use crate::queue_core::QueueCore;
 
 /// Store-level activity read from a [`QueueReader`](crate::QueueReader),
 /// with no writer cooperation required.
@@ -120,8 +119,7 @@ impl HeartbeatRecord {
 /// continues, because a fencing failure also fails the queue's own
 /// writes and those surface to callers.
 pub(crate) struct HeartbeatTask {
-    db: Arc<Db>,
-    clock: Arc<dyn Clock>,
+    core: Arc<QueueCore>,
     interval: Duration,
     /// Counter of the next beat. Continues from the stored beat's
     /// counter, so it increases across writer restarts.
@@ -132,19 +130,14 @@ pub(crate) struct HeartbeatTask {
 impl HeartbeatTask {
     /// Build the task for an open store and commit its first beat, so
     /// an open store with the heartbeat enabled always holds one.
-    pub(crate) async fn start(
-        db: Arc<Db>,
-        clock: Arc<dyn Clock>,
-        interval: Duration,
-    ) -> Result<Self> {
-        let next_counter = match db.get(heartbeat_key()).await? {
+    pub(crate) async fn start(core: Arc<QueueCore>, interval: Duration) -> Result<Self> {
+        let next_counter = match core.db.get(heartbeat_key()).await? {
             Some(bytes) => rmp_serde::from_slice::<HeartbeatRecord>(&bytes)?.counter + 1,
             None => 1,
         };
         let mut task = Self {
-            writer_epoch: db.manifest().writer_epoch(),
-            db,
-            clock,
+            writer_epoch: core.db.manifest().writer_epoch(),
+            core,
             interval,
             next_counter,
         };
@@ -161,14 +154,14 @@ impl HeartbeatTask {
     async fn beat(&mut self, closed: bool) -> Result<()> {
         let record = HeartbeatRecord {
             counter: self.next_counter,
-            at_ms: self.clock.now_ms(),
+            at_ms: self.core.now_ms(),
             interval_ms: self.interval.as_millis() as u64,
             writer_epoch: self.writer_epoch,
             closed,
         };
         self.next_counter += 1;
         let bytes = rmp_serde::to_vec(&record)?;
-        self.db.put(heartbeat_key(), bytes).await?;
+        self.core.db.put(heartbeat_key(), bytes).await?;
         Ok(())
     }
 

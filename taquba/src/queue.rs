@@ -24,6 +24,7 @@ use crate::keys::{
 };
 use crate::lease_registry::{LeaseRegistry, Renewal};
 use crate::payload_store::PayloadStore;
+use crate::queue_core::{QueueConfigs, QueueCore};
 use crate::reaper::Reaper;
 use crate::scheduler::Scheduler;
 use crate::stats::{QueueMergeOperator, QueueStats, update_stats};
@@ -528,7 +529,7 @@ pub struct SettlementEffects {
 /// in the same process: SlateDB's single-writer constraint means the queue cannot be
 /// shared across processes.
 pub struct Queue {
-    db: Arc<Db>,
+    core: Arc<QueueCore>,
     reaper: Arc<Reaper>,
     reaper_task: BackgroundTask,
     scheduler: Arc<Scheduler>,
@@ -540,9 +541,6 @@ pub struct Queue {
     /// Stopping returns the task so `close` can commit the closing
     /// beat with the task's counter.
     heartbeat: Option<BackgroundTask<crate::liveness::HeartbeatTask>>,
-    default_queue_config: QueueConfig,
-    queue_configs: HashMap<String, QueueConfig>,
-    clock: Arc<dyn Clock>,
     /// Per-queue async mutex held across the claim transaction.
     /// Same-queue claim attempts serialise on this mutex rather than
     /// resolving via SlateDB's transaction-conflict retry. The lock
@@ -550,21 +548,11 @@ pub struct Queue {
     /// parallel. In-process coordination is sufficient because all
     /// writers to a SlateDB store share one process.
     claim_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Per-queue resume point for the next claim scan.
-    claim_cursor: ClaimCursor,
-    lease_registry: LeaseRegistry,
     /// Source of job ids. Pending keys sort by id within a priority, so
     /// ids must increase with enqueue order, including inside one
     /// millisecond. One generator per store suffices: a store has a
     /// single writer process.
     id_gen: std::sync::Mutex<ulid::Generator>,
-    /// Tasks waiting in [`Self::wait_for_completion`], keyed by job id.
-    /// Every terminal transition (`Done`, `Dead`, removal by
-    /// [`Self::cancel`]) delivers its outcome to the job's waiters.
-    completion_waiters: Arc<CompletionWaiters>,
-    /// Storage for offloaded payload objects. Shared with the reaper,
-    /// whose retention sweeps delete the objects of expired records.
-    payload_store: Arc<PayloadStore>,
     /// Payload size above which enqueues offload; `None` disables.
     payload_offload_threshold: Option<usize>,
 }
@@ -674,41 +662,31 @@ impl Queue {
             builder = builder.with_metrics_recorder(crate::obs::slatedb_recorder());
         }
         let db = Arc::new(builder.build().await?);
-        let completion_waiters = Arc::new(CompletionWaiters::default());
-        let claim_cursor = ClaimCursor::new();
-        restore_cursor_state(&db, &claim_cursor).await?;
+        let core = Arc::new(QueueCore {
+            db,
+            clock: opts.clock,
+            configs: QueueConfigs::new(opts.default_queue_config, opts.queue_configs),
+            claim_cursor: ClaimCursor::new(),
+            lease_registry: LeaseRegistry::new(),
+            completion_waiters: Arc::new(CompletionWaiters::default()),
+            payload_store,
+        });
+        restore_cursor_state(&core).await?;
         // A claimed record found at open belongs to a process that no
         // longer holds the store, so its claim is void and the job is
         // re-queued immediately. Runs after `restore_cursor_state` so
         // each re-queued job's pending insert is recorded against the
         // restored bound.
-        crate::reaper::requeue_interrupted_claims(&db, opts.clock.as_ref(), &claim_cursor).await?;
-        let lease_registry = LeaseRegistry::new();
-        let reaper = Arc::new(Reaper {
-            db: db.clone(),
-            default_queue_config: opts.default_queue_config.clone(),
-            queue_configs: opts.queue_configs.clone(),
-            clock: opts.clock.clone(),
-            completion_waiters: completion_waiters.clone(),
-            claim_cursor: claim_cursor.clone(),
-            payload_store: payload_store.clone(),
-            lease_registry: lease_registry.clone(),
-        });
+        crate::reaper::requeue_interrupted_claims(&core).await?;
+        let reaper = Arc::new(Reaper::new(core.clone()));
         let reaper_task = BackgroundTask::spawn_periodic(opts.reaper_interval, reaper.clone());
-        let scheduler = Arc::new(Scheduler {
-            db: db.clone(),
-            clock: opts.clock.clone(),
-            claim_cursor: claim_cursor.clone(),
-        });
+        let scheduler = Arc::new(Scheduler::new(core.clone()));
         let scheduler_task =
             BackgroundTask::spawn_periodic(opts.scheduler_interval, scheduler.clone());
 
         #[cfg(feature = "metrics")]
         let metrics_sampler = opts.metrics_sample_interval.map(|interval| {
-            let sampler = crate::metrics_sampler::MetricsSampler {
-                db: db.clone(),
-                clock: opts.clock.clone(),
-            };
+            let sampler = crate::metrics_sampler::MetricsSampler::new(core.clone());
             BackgroundTask::spawn_periodic(interval, sampler)
         });
         #[cfg(not(feature = "metrics"))]
@@ -716,31 +694,22 @@ impl Queue {
 
         let heartbeat = match opts.liveness_heartbeat {
             Some(interval) => {
-                let task =
-                    crate::liveness::HeartbeatTask::start(db.clone(), opts.clock.clone(), interval)
-                        .await?;
+                let task = crate::liveness::HeartbeatTask::start(core.clone(), interval).await?;
                 Some(BackgroundTask::spawn(interval, |ticker| task.run(ticker)))
             }
             None => None,
         };
 
         Ok(Self {
-            db,
+            core,
             reaper,
             reaper_task,
             scheduler,
             scheduler_task,
             metrics_sampler,
             heartbeat,
-            default_queue_config: opts.default_queue_config,
-            queue_configs: opts.queue_configs,
-            clock: opts.clock,
             claim_locks: std::sync::Mutex::new(HashMap::new()),
-            claim_cursor,
-            lease_registry,
             id_gen: std::sync::Mutex::new(ulid::Generator::new()),
-            completion_waiters,
-            payload_store,
             payload_offload_threshold: opts.payload_offload_threshold,
         })
     }
@@ -748,7 +717,7 @@ impl Queue {
     /// Current time in milliseconds since the UNIX epoch, as read
     /// from this queue's configured [`Clock`].
     pub(crate) fn now_ms(&self) -> u64 {
-        self.clock.now_ms()
+        self.core.now_ms()
     }
 
     /// Generate a job id without enqueuing anything.
@@ -768,9 +737,7 @@ impl Queue {
     }
 
     pub(crate) fn queue_config(&self, queue: &str) -> &QueueConfig {
-        self.queue_configs
-            .get(queue)
-            .unwrap_or(&self.default_queue_config)
+        self.core.configs.get(queue)
     }
 
     /// Look up the configured lease duration for a queue.
@@ -786,8 +753,8 @@ impl Queue {
     /// their own claim loop build the handle here.
     pub fn lease_handle(&self, claim: &Claim) -> crate::lease::LeaseHandle {
         crate::lease::LeaseHandle::new(
-            self.lease_registry.clone(),
-            self.clock.clone(),
+            self.core.lease_registry.clone(),
+            self.core.clock.clone(),
             claim.queue.clone(),
             claim.id.clone(),
             claim.token(),
@@ -811,7 +778,7 @@ impl Queue {
     /// `Arc` clone so downstream crates can share the same time
     /// source for their own timestamp work.
     pub fn clock(&self) -> Arc<dyn Clock> {
-        self.clock.clone()
+        self.core.clock.clone()
     }
 
     /// Enqueue a job using the queue's configured defaults for everything
@@ -926,7 +893,7 @@ impl Queue {
     /// Caller-supplied keys are internally scoped under a reserved
     /// user key tag and cannot collide with Taquba's internal layout.
     pub async fn kv_get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        crate::read::kv_get(self.db.as_ref(), key).await
+        crate::read::kv_get(self.core.db.as_ref(), key).await
     }
 
     /// Write a value to the user KV namespace.
@@ -945,7 +912,7 @@ impl Queue {
     /// [`SettlementEffects::kv_writes`] via [`Self::ack_with`].
     pub async fn kv_put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         validate_kv_value_size(value)?;
-        self.db.put(user_scoped_key(key), value).await?;
+        self.core.db.put(user_scoped_key(key), value).await?;
         Ok(())
     }
 
@@ -954,7 +921,7 @@ impl Queue {
     /// Caller-supplied keys are internally scoped under a reserved
     /// user key tag and cannot collide with Taquba's internal layout.
     pub async fn kv_delete(&self, key: &[u8]) -> Result<()> {
-        self.db.delete(user_scoped_key(key)).await?;
+        self.core.db.delete(user_scoped_key(key)).await?;
         Ok(())
     }
 
@@ -975,7 +942,7 @@ impl Queue {
     pub async fn kv_compare_delete(&self, key: &[u8], expected: &[u8]) -> Result<bool> {
         let scoped = user_scoped_key(key);
         loop {
-            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+            let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
             match txn.get(&scoped).await? {
                 Some(current) if current.as_ref() == expected => {}
                 _ => {
@@ -1024,7 +991,7 @@ impl Queue {
         validate_kv_value_size(value)?;
         let scoped = user_scoped_key(key);
         loop {
-            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+            let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
             let matched = match (txn.get(&scoped).await?, expected) {
                 (Some(current), Some(e)) => current.as_ref() == e,
                 (None, None) => true,
@@ -1065,11 +1032,11 @@ impl Queue {
         cursor: Option<&[u8]>,
         limit: usize,
     ) -> Result<KvPage> {
-        crate::read::kv_scan(self.db.as_ref(), prefix, cursor, limit).await
+        crate::read::kv_scan(self.core.db.as_ref(), prefix, cursor, limit).await
     }
 
     /// Resolve [`EnqueueOptions`] against the queue's defaults and build
-    /// the [`JobRecord`] + its primary key. Shared by [`Self::enqueue_with`]
+    /// the [`JobRecord`] + its primary key. QueueCore by [`Self::enqueue_with`]
     /// and [`Self::enqueue_with_kv`]; the two methods only diverge in how
     /// they persist the prepared record.
     fn prepare_job_record(
@@ -1137,7 +1104,8 @@ impl Queue {
             return Ok(());
         }
         let payload_ref = Ulid::new().to_string();
-        self.payload_store
+        self.core
+            .payload_store
             .put(&payload_ref, std::mem::take(&mut job.payload))
             .await?;
         job.payload_ref = Some(payload_ref);
@@ -1167,7 +1135,7 @@ impl Queue {
     /// Fetch an offloaded payload into `job.payload`. No-op for records
     /// whose payload is inline.
     async fn materialize_payload(&self, job: &mut JobRecord) -> Result<()> {
-        crate::read::materialize_payload(&self.payload_store, job).await
+        crate::read::materialize_payload(&self.core.payload_store, job).await
     }
 
     /// Fetch the offloaded payloads of `jobs` concurrently, bounding a
@@ -1178,7 +1146,10 @@ impl Queue {
         let fetches = jobs.iter().enumerate().filter_map(|(index, claim)| {
             let job = claim.job();
             job.payload_ref.as_deref().map(|payload_ref| async move {
-                (index, self.payload_store.get(payload_ref, &job.id).await)
+                (
+                    index,
+                    self.core.payload_store.get(payload_ref, &job.id).await,
+                )
             })
         });
         let fetched = futures_util::future::join_all(fetches).await;
@@ -1205,7 +1176,8 @@ impl Queue {
     /// whose payload is gone.
     async fn delete_payload_object(&self, job: &JobRecord) {
         if let Some(ref payload_ref) = job.payload_ref {
-            self.payload_store
+            self.core
+                .payload_store
                 .delete_best_effort(payload_ref, &job.id)
                 .await;
         }
@@ -1349,7 +1321,7 @@ impl Queue {
     ) -> Result<EnqueueResult> {
         let timer = crate::obs::start();
         loop {
-            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+            let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
 
             let staged = match self.stage_job_writes(&txn, prepared).await? {
                 Ok(staged) => staged,
@@ -1427,7 +1399,8 @@ impl Queue {
     /// which records its own insert.
     fn note_staged_job(&self, staged: &StagedJob) {
         if let Some(ref pending_key) = staged.pending_key {
-            self.claim_cursor
+            self.core
+                .claim_cursor
                 .note_pending_insert(&staged.queue, pending_key);
         }
         debug!(queue = %staged.queue, job_id = %staged.id, "job enqueued");
@@ -1458,7 +1431,7 @@ impl Queue {
     /// (another worker may claim it first); follow up with a claim
     /// call and wait again if it returns `None`.
     pub async fn wait_for_jobs_on(&self, queue: &str, max_wait: Duration) {
-        let wakeup = self.claim_cursor.wakeup_for(queue);
+        let wakeup = self.core.claim_cursor.wakeup_for(queue);
         let notified = wakeup.notified();
         tokio::pin!(notified);
         // `enable` consumes a permit left by an insert that landed
@@ -1498,7 +1471,7 @@ impl Queue {
                 // permit another waiter needs, and when a backlog
                 // remains each delivered job should wake one more
                 // worker.
-                self.claim_cursor.wakeup_for(queue).notify_one();
+                self.core.claim_cursor.wakeup_for(queue).notify_one();
                 return Ok(Some(job));
             }
             let now = tokio::time::Instant::now();
@@ -1580,7 +1553,7 @@ impl Queue {
         // claims that have work to do. A stale answer here is safe in
         // both directions; emptiness is only ever revoked by an insert,
         // and a stale "not empty" just falls through to the locked scan.
-        if self.claim_cursor.begin_claim(queue).known_empty {
+        if self.core.claim_cursor.begin_claim(queue).known_empty {
             return Ok(Vec::new());
         }
         let mut jobs = {
@@ -1618,11 +1591,11 @@ impl Queue {
             // before the transaction begins, so any insert the snapshot
             // could miss bumps the epoch after this read and revokes the
             // emptiness recorded below.
-            let scan = self.claim_cursor.begin_claim(queue);
+            let scan = self.core.claim_cursor.begin_claim(queue);
             if scan.known_empty {
                 return Ok(Vec::new());
             }
-            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+            let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
 
             let mut candidates = Vec::new();
             // Set when the scan ran out of pending keys before filling
@@ -1675,7 +1648,7 @@ impl Queue {
                 // (inserts landing behind it move it back), so an empty
                 // bound scan proves the queue is empty without re-walking
                 // the tombstone band from the front.
-                self.claim_cursor.mark_empty(queue, scan.epoch);
+                self.core.claim_cursor.mark_empty(queue, scan.epoch);
                 return Ok(Vec::new());
             }
 
@@ -1718,7 +1691,7 @@ impl Queue {
                 // entry would leave the claim invisible to the reaper
                 // until the next open, and a cancellation racing the
                 // commit would find no token to fire.
-                self.lease_registry.insert(
+                self.core.lease_registry.insert(
                     &job.queue,
                     &job.id,
                     lease_expires_at,
@@ -1745,13 +1718,15 @@ impl Queue {
             // consumed an attempt.
             match commit(txn, Durability::Deferred).await? {
                 Commit::Committed => {
-                    self.claim_cursor.advance(queue, last_pending_key, &scan);
+                    self.core
+                        .claim_cursor
+                        .advance(queue, last_pending_key, &scan);
                     if drained {
                         // The scan ran dry inside this snapshot, so
                         // nothing is left after taking these jobs; record
                         // emptiness so the next poll short-circuits. Any
                         // insert since the epoch read revokes it.
-                        self.claim_cursor.mark_empty(queue, scan.epoch);
+                        self.core.claim_cursor.mark_empty(queue, scan.epoch);
                     }
                     // The claim histogram measures the claim
                     // transaction; offloaded payload fetches happen
@@ -1828,8 +1803,8 @@ impl Queue {
 
         let outcome: Result<Vec<EnqueueResult>> = async {
             loop {
-                let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-                take_claim(&txn, &self.lease_registry, &job.queue, &job.id, token).await?;
+                let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
+                take_claim(&txn, &self.core.lease_registry, &job.queue, &job.id, token).await?;
                 if let Some((ref done_k, ref done_v)) = done_record {
                     put_job_record(&txn, done_k, &job_index_key(&job.id), done_v)?;
                     append_attempt(
@@ -1876,7 +1851,7 @@ impl Queue {
         let results = outcome?;
         // After the commit and token-fenced, so a removal that runs
         // after a re-claim leaves the new claim's entry.
-        self.lease_registry.remove(&job.queue, &job.id, token);
+        self.core.lease_registry.remove(&job.queue, &job.id, token);
 
         // The acked job's record is gone unless a done record was kept;
         // without one, its payload object is removed here, after the
@@ -1886,7 +1861,7 @@ impl Queue {
         }
 
         crate::obs::completed(&job.queue, timer);
-        self.completion_waiters.settle(&job.id, || {
+        self.core.completion_waiters.settle(&job.id, || {
             // The claim's copy carries the payload as delivered to the
             // worker, so the record matches what `get_job` returns.
             let mut delivered = job.clone();
@@ -1934,11 +1909,11 @@ impl Queue {
         type Settled = (JobRecord, Option<Vec<EnqueueResult>>);
         let settled: Result<Settled> = async {
             loop {
-                let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+                let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
                 // The returned record is the base for the written record;
                 // the claim's copy predates a cancel committed during the
                 // delivery.
-                let mut job = take_claim(&txn, &self.lease_registry, queue, id, token).await?;
+                let mut job = take_claim(&txn, &self.core.lease_registry, queue, id, token).await?;
 
                 let staged = if job.attempts >= job.max_attempts {
                     stage_dead_letter(&txn, &mut job, self.now_ms(), error)?;
@@ -2024,17 +1999,19 @@ impl Queue {
         } else {
             crate::obs::nacked(&job.queue);
         }
-        self.lease_registry.remove(&job.queue, &job.id, token);
+        self.core.lease_registry.remove(&job.queue, &job.id, token);
         if immediate_retry {
             // The backoff path needs no insert note here: the
             // scheduler records the insert itself when it promotes the
             // job.
             let pending = pending_key(&job.queue, job.priority, &job.id);
-            self.claim_cursor.note_pending_insert(&job.queue, &pending);
+            self.core
+                .claim_cursor
+                .note_pending_insert(&job.queue, &pending);
         }
         if became_dead {
             // Retries exhausted: terminal transition.
-            self.completion_waiters.settle(&job.id, || {
+            self.core.completion_waiters.settle(&job.id, || {
                 WaitOutcome::Dead(Box::new(delivered_record(&job, claim)))
             });
         }
@@ -2081,8 +2058,8 @@ impl Queue {
         type Settled = (JobRecord, Vec<EnqueueResult>);
         let settled: Result<Settled> = async {
             loop {
-                let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-                let mut job = take_claim(&txn, &self.lease_registry, queue, id, token).await?;
+                let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
+                let mut job = take_claim(&txn, &self.core.lease_registry, queue, id, token).await?;
                 stage_dead_letter(&txn, &mut job, failed_at, reason)?;
                 let (results, staged) = self.stage_effects(&txn, &prepared).await?;
                 match commit(txn, Durability::Awaited).await? {
@@ -2106,8 +2083,8 @@ impl Queue {
         let (job, results) = settled?;
 
         crate::obs::dead_lettered(&job.queue);
-        self.lease_registry.remove(&job.queue, &job.id, token);
-        self.completion_waiters.settle(&job.id, || {
+        self.core.lease_registry.remove(&job.queue, &job.id, token);
+        self.core.completion_waiters.settle(&job.id, || {
             WaitOutcome::Dead(Box::new(delivered_record(&job, claim)))
         });
         Ok(results)
@@ -2115,12 +2092,12 @@ impl Queue {
 
     /// Return a snapshot of job counts for the given queue.
     pub async fn stats(&self, queue: &str) -> Result<QueueStats> {
-        crate::read::stats(self.db.as_ref(), queue).await
+        crate::read::stats(self.core.db.as_ref(), queue).await
     }
 
     /// Return the names of all queues that have ever had at least one job.
     pub async fn list_queues(&self) -> Result<Vec<String>> {
-        crate::read::list_queues(self.db.as_ref()).await
+        crate::read::list_queues(self.core.db.as_ref()).await
     }
 
     /// Return a page of dead-letter jobs for the given queue.
@@ -2137,7 +2114,14 @@ impl Queue {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<JobRecord>> {
-        crate::read::dead_jobs(self.db.as_ref(), &self.payload_store, queue, after, limit).await
+        crate::read::dead_jobs(
+            self.core.db.as_ref(),
+            &self.core.payload_store,
+            queue,
+            after,
+            limit,
+        )
+        .await
     }
 
     /// Return a page of the given queue's jobs in one lifecycle state.
@@ -2176,8 +2160,8 @@ impl Queue {
         limit: usize,
     ) -> Result<JobPage> {
         crate::read::list_jobs(
-            self.db.as_ref(),
-            &self.payload_store,
+            self.core.db.as_ref(),
+            &self.core.payload_store,
             queue,
             status,
             cursor,
@@ -2200,7 +2184,7 @@ impl Queue {
     /// queue without retention therefore removes the history rather than
     /// recording the completed attempt.
     pub async fn attempt_history(&self, id: &str) -> Result<Vec<JobAttempt>> {
-        crate::read::attempt_history(self.db.as_ref(), id).await
+        crate::read::attempt_history(self.core.db.as_ref(), id).await
     }
 
     /// Move a dead-letter job back to the pending queue for a fresh attempt.
@@ -2221,7 +2205,7 @@ impl Queue {
         // start this job afresh.
         job.cancel_requested = false;
 
-        let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+        let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
         txn.get(&dead)
             .await?
             .ok_or_else(|| Error::JobNotFound(job.id.clone()))?;
@@ -2241,7 +2225,9 @@ impl Queue {
             },
         )?;
         txn.commit().await?;
-        self.claim_cursor.note_pending_insert(&job.queue, &pending);
+        self.core
+            .claim_cursor
+            .note_pending_insert(&job.queue, &pending);
 
         debug!(queue = %job.queue, job_id = %job.id, "dead job re-queued");
         Ok(())
@@ -2275,7 +2261,7 @@ impl Queue {
             return Err(Error::CancelRequested);
         }
         let new_expiry = self.now_ms() + extension.as_millis() as u64;
-        if self.lease_registry.renew(
+        if self.core.lease_registry.renew(
             &job.queue,
             &job.id,
             claim.token(),
@@ -2295,7 +2281,8 @@ impl Queue {
     /// when no live lease for the job exists in this process, including
     /// when the job is in any state other than `Claimed`.
     pub fn lease_expiry(&self, queue: &str, id: &str) -> Option<u64> {
-        self.lease_registry
+        self.core
+            .lease_registry
             .current(queue, id)
             .map(|(expires_at, _)| expires_at)
     }
@@ -2335,7 +2322,7 @@ impl Queue {
         // Registered before the storage read: a terminal transition
         // that commits after the read then reaches the registration,
         // and one that commits before it is visible in the read.
-        let mut registration = self.completion_waiters.register(id);
+        let mut registration = self.core.completion_waiters.register(id);
 
         match self.get_job(id).await? {
             Some(job) => match job.status {
@@ -2367,7 +2354,7 @@ impl Queue {
     /// Returns `None` if the ID was never enqueued or has since been expunged.
     pub async fn get_job(&self, id: &str) -> Result<Option<JobRecord>> {
         // The index and the record are read from one snapshot.
-        let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+        let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
         let found = get_indexed_job(&txn, id).await?;
         txn.rollback();
 
@@ -2382,7 +2369,7 @@ impl Queue {
                 // just after that commit's payload-object deletion.
                 // Re-check the index so a job removed in that window
                 // is reported as absent.
-                if self.db.get(&index_key).await?.is_none() {
+                if self.core.db.get(&index_key).await?.is_none() {
                     Ok(None)
                 } else {
                     Err(Error::PayloadMissing { id })
@@ -2434,7 +2421,7 @@ impl Queue {
         let prepared = self.prepare_effects(effects).await?;
         let outcome: Result<(CancelOutcome, Vec<EnqueueResult>)> = async {
             loop {
-                let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+                let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
 
                 let Some((index_key, current_key, mut job)) = get_indexed_job(&txn, id).await?
                 else {
@@ -2471,7 +2458,7 @@ impl Queue {
                             // is fired again because a re-claim since
                             // the first request holds a fresh one.
                             txn.rollback();
-                            self.lease_registry.cancel(&job.queue, id);
+                            self.core.lease_registry.cancel(&job.queue, id);
                             debug!(job_id = %id, "cancel re-requested on claimed job");
                             return Ok((CancelOutcome::Requested, Vec::new()));
                         }
@@ -2496,7 +2483,7 @@ impl Queue {
                         // worker of a claim the reaper requeued just
                         // before this call may still observe the token.
                         // That claim's end removes the entry.
-                        self.lease_registry.cancel(&job.queue, id);
+                        self.core.lease_registry.cancel(&job.queue, id);
                         let results = match staged {
                             Some((results, staged_jobs)) => {
                                 for staged_job in &staged_jobs {
@@ -2513,7 +2500,8 @@ impl Queue {
                             // The record is deleted, so its payload object
                             // (if any) is removed here, after the commit.
                             self.delete_payload_object(&job).await;
-                            self.completion_waiters
+                            self.core
+                                .completion_waiters
                                 .settle(id, || WaitOutcome::Cancelled);
                         }
                         debug!(job_id = %id, "{msg}");
@@ -2565,7 +2553,7 @@ impl Queue {
         wake_payload: Option<Vec<u8>>,
     ) -> Result<WakeOutcome> {
         loop {
-            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+            let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
 
             let Some((_, current_key, mut job)) = get_indexed_job(&txn, id).await? else {
                 txn.rollback();
@@ -2584,7 +2572,9 @@ impl Queue {
 
             match commit(txn, Durability::Awaited).await? {
                 Commit::Committed => {
-                    self.claim_cursor.note_pending_insert(&job.queue, &pending);
+                    self.core
+                        .claim_cursor
+                        .note_pending_insert(&job.queue, &pending);
                     debug!(job_id = %id, queue = %job.queue, "scheduled job woken");
                     return Ok(WakeOutcome::Woken);
                 }
@@ -2618,7 +2608,7 @@ impl Queue {
 
         let write = async {
             loop {
-                let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+                let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
                 let mut staged = Vec::with_capacity(prepared.len());
                 for prepared_job in &prepared {
                     match self.stage_job_writes(&txn, prepared_job).await? {
@@ -2646,7 +2636,8 @@ impl Queue {
         // Batch ids are monotonic ULIDs at one priority, so the first
         // staged job holds the batch's smallest pending key.
         if let Some(key) = staged.first().and_then(|s| s.pending_key.as_ref()) {
-            self.claim_cursor
+            self.core
+                .claim_cursor
                 .note_pending_inserts(queue, key, staged.len());
         }
 
@@ -2685,8 +2676,8 @@ impl Queue {
         {
             task.write_closing_beat().await;
         }
-        persist_cursor_state(&self.db, &self.claim_cursor).await?;
-        self.db.close().await?;
+        persist_cursor_state(&self.core).await?;
+        self.core.db.close().await?;
         Ok(())
     }
 }
@@ -2714,12 +2705,12 @@ async fn get_indexed_job(
 /// after the background tasks have stopped; `close` consumes the
 /// handle, so the exported state cannot change between the export and
 /// the database closing.
-async fn persist_cursor_state(db: &Db, claim_cursor: &ClaimCursor) -> Result<()> {
-    let states = claim_cursor.export();
+async fn persist_cursor_state(core: &QueueCore) -> Result<()> {
+    let states = core.claim_cursor.export();
     if states.is_empty() {
         return Ok(());
     }
-    let txn = db.begin(IsolationLevel::Snapshot).await?;
+    let txn = core.db.begin(IsolationLevel::Snapshot).await?;
     for (queue, state) in states {
         let record = PersistedCursor {
             queue: queue.clone(),
@@ -2739,8 +2730,8 @@ async fn persist_cursor_state(db: &Db, claim_cursor: &ClaimCursor) -> Result<()>
 /// it: once inserts resume the live bound can move behind the
 /// persisted one, so a crash before the delete is durable would leave
 /// a record whose stale bound lets a later open strand jobs behind it.
-async fn restore_cursor_state(db: &Db, claim_cursor: &ClaimCursor) -> Result<()> {
-    let txn = db.begin(IsolationLevel::Snapshot).await?;
+async fn restore_cursor_state(core: &QueueCore) -> Result<()> {
+    let txn = core.db.begin(IsolationLevel::Snapshot).await?;
     let mut records = Vec::new();
     {
         let mut iter = txn.scan_prefix(tag_prefix(KeyTag::Cursor), ..).await?;
@@ -2753,7 +2744,7 @@ async fn restore_cursor_state(db: &Db, claim_cursor: &ClaimCursor) -> Result<()>
         return Ok(());
     }
     for (key, record) in records {
-        claim_cursor.restore(
+        core.claim_cursor.restore(
             &record.queue,
             CursorState {
                 scan_from: record.bound_key.map(|key| ScanFrom {
@@ -5732,8 +5723,15 @@ mod tests {
         q.reap_now().await.unwrap();
 
         for id in [&retried, &doomed] {
-            assert!(q.lease_registry.current("work", id).is_none());
-            assert!(q.db.get(&claimed_key("work", id)).await.unwrap().is_none());
+            assert!(q.core.lease_registry.current("work", id).is_none());
+            assert!(
+                q.core
+                    .db
+                    .get(&claimed_key("work", id))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         }
         let stats = q.stats("work").await.unwrap();
         assert_eq!(stats.claimed, 0);
@@ -5814,7 +5812,7 @@ mod tests {
 
         // The ack removes the lease entry the renewal moved.
         q.ack(&job).await.unwrap();
-        assert!(q.lease_registry.current("work", &job.id).is_none());
+        assert!(q.core.lease_registry.current("work", &job.id).is_none());
         assert!(q.lease_expiry("work", &job.id).is_none());
 
         // Nothing is left to come due, so the reaper requeues nothing,
@@ -5854,7 +5852,7 @@ mod tests {
         // begun inside that lag passes the token check and conflicts
         // with nothing. Recreate the lagging entry and require the
         // in-transaction record read to reject the settlement.
-        q.lease_registry.insert(
+        q.core.lease_registry.insert(
             "work",
             &claim.id,
             clock.now_ms() + 30_000,
@@ -6236,13 +6234,13 @@ mod tests {
 
         clock.advance(Duration::from_secs(31));
         q.reap_now().await.unwrap();
-        assert!(q.lease_registry.current("work", &id).is_none());
-        assert!(!q.lease_registry.cancel("work", &id));
+        assert!(q.core.lease_registry.current("work", &id).is_none());
+        assert!(!q.core.lease_registry.cancel("work", &id));
         assert!(!token.is_cancelled());
 
         // The requeued job holds no entry to fire.
         assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Removed);
-        assert_eq!(q.lease_registry.len(), 0);
+        assert_eq!(q.core.lease_registry.len(), 0);
         q.close().await.unwrap();
     }
 
@@ -6633,13 +6631,13 @@ mod tests {
         // over `NotFound` when the record is gone at the read.
         let q = Queue::open(make_store(), "test").await.unwrap();
         let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
-        let mut registration = q.completion_waiters.register(&id);
+        let mut registration = q.core.completion_waiters.register(&id);
         assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Removed);
         assert!(matches!(
             registration.try_outcome(),
             Some(WaitOutcome::Cancelled)
         ));
-        assert!(q.completion_waiters.inner_is_empty());
+        assert!(q.core.completion_waiters.inner_is_empty());
     }
 
     #[tokio::test]
@@ -7971,11 +7969,11 @@ mod tests {
         q.close().await.unwrap();
 
         let q = Queue::open(store, "test").await.unwrap();
-        let scan = q.claim_cursor.begin_claim("work");
+        let scan = q.core.claim_cursor.begin_claim("work");
         assert!(scan.scan_from.is_some());
         assert!(!scan.known_empty);
         assert!(
-            q.db.get(cursor_key("work")).await.unwrap().is_none(),
+            q.core.db.get(cursor_key("work")).await.unwrap().is_none(),
             "the cursor record is consumed at open",
         );
 
@@ -7997,7 +7995,7 @@ mod tests {
         q.close().await.unwrap();
 
         let q = Queue::open(store, "test").await.unwrap();
-        assert!(q.claim_cursor.begin_claim("work").known_empty);
+        assert!(q.core.claim_cursor.begin_claim("work").known_empty);
 
         q.enqueue("work", b"revives".to_vec()).await.unwrap();
         let job = q.claim("work", lease).await.unwrap().unwrap();
@@ -9317,15 +9315,17 @@ mod tests {
     // Every claimed record must hold a registry entry; a record
     // without one is invisible to the reaper until the next open.
     async fn assert_every_claim_has_a_lease_entry(q: &Queue) {
-        let mut iter =
-            q.db.scan_prefix(tag_prefix(KeyTag::Claimed), ..)
-                .await
-                .unwrap();
+        let mut iter = q
+            .core
+            .db
+            .scan_prefix(tag_prefix(KeyTag::Claimed), ..)
+            .await
+            .unwrap();
         let mut claims = 0;
         while let Some(kv) = iter.next().await.unwrap() {
             let job = JobRecord::decode(&kv.key, &kv.value).unwrap();
             assert!(
-                q.lease_registry.current(&job.queue, &job.id).is_some(),
+                q.core.lease_registry.current(&job.queue, &job.id).is_some(),
                 "no lease entry for {}/{}",
                 job.queue,
                 job.id
@@ -9357,7 +9357,11 @@ mod tests {
 
         let renewed = q.renew_lease(&claims[0], Duration::from_secs(90)).unwrap();
         assert_every_claim_has_a_lease_entry(&q).await;
-        assert!(q.lease_registry.contains("work", &claims[0].id, renewed));
+        assert!(
+            q.core
+                .lease_registry
+                .contains("work", &claims[0].id, renewed)
+        );
 
         q.close().await.unwrap();
     }
@@ -9382,7 +9386,9 @@ mod tests {
         assert_eq!(claims.len(), 2);
 
         // The poisoned record sorts first, both jobs sharing an expiry.
-        q.db.put(claimed_key("work", &poison), b"not messagepack")
+        q.core
+            .db
+            .put(claimed_key("work", &poison), b"not messagepack")
             .await
             .unwrap();
 
@@ -9395,7 +9401,7 @@ mod tests {
         );
         // The poisoned job's entry is kept for a later tick; the
         // healthy job's was removed by its requeue.
-        assert_eq!(q.lease_registry.len(), 1);
+        assert_eq!(q.core.lease_registry.len(), 1);
         q.close().await.unwrap();
     }
 

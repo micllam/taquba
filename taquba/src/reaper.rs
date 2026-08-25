@@ -1,47 +1,29 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use slatedb::{Db, IsolationLevel};
+use slatedb::IsolationLevel;
 use tracing::{debug, warn};
 
 use crate::WaitOutcome;
 use crate::background::Periodic;
-use crate::claim_cursor::ClaimCursor;
-use crate::clock::Clock;
-use crate::completion::CompletionWaiters;
 use crate::error::{Error, Result};
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{
     KeyTag, attempt_history_key, claimed_key, job_index_key, parse_key_timestamp, tag_prefix,
 };
-use crate::lease_registry::{DueLease, LeaseRegistry};
-use crate::payload_store::PayloadStore;
-use crate::queue::QueueConfig;
+use crate::lease_registry::DueLease;
+use crate::queue_core::QueueCore;
 use crate::stats::update_stats;
 use crate::txn::{Commit, Durability, commit, stage_dead_letter, stage_to_pending, write_options};
 
 pub(crate) struct Reaper {
-    pub(crate) db: Arc<Db>,
-    pub(crate) default_queue_config: QueueConfig,
-    pub(crate) queue_configs: HashMap<String, QueueConfig>,
-    pub(crate) clock: Arc<dyn Clock>,
-    pub(crate) completion_waiters: Arc<CompletionWaiters>,
-    pub(crate) claim_cursor: ClaimCursor,
-    pub(crate) payload_store: Arc<PayloadStore>,
-    pub(crate) lease_registry: LeaseRegistry,
+    core: Arc<QueueCore>,
 }
 
 impl Reaper {
-    fn config(&self, queue: &str) -> &QueueConfig {
-        self.queue_configs
-            .get(queue)
-            .unwrap_or(&self.default_queue_config)
-    }
-
-    fn configs(&self) -> impl Iterator<Item = &QueueConfig> {
-        std::iter::once(&self.default_queue_config).chain(self.queue_configs.values())
+    pub(crate) fn new(core: Arc<QueueCore>) -> Self {
+        Self { core }
     }
 }
 
@@ -52,32 +34,29 @@ impl Periodic for Reaper {
     /// of every queue with a retention configured. A sweep error is
     /// logged here; the reap error is returned.
     async fn step(&self) -> Result<()> {
+        let core = &self.core;
         let reaped = self.reap_expired().await;
         // The largest configured `keep_done_jobs`: no done record newer
         // than `now - max_keep_done` is expired on any queue, so the
         // time-ordered done scan stops at the first key past it.
-        let max_keep_done = self.configs().filter_map(|c| c.keep_done_jobs).max();
+        let max_keep_done = core.configs.iter().filter_map(|c| c.keep_done_jobs).max();
         if max_keep_done.is_some()
             && let Err(e) = sweep_expired(
-                &self.db,
-                self.clock.as_ref(),
+                core,
                 JobStatus::Done,
-                &|queue| self.config(queue).keep_done_jobs,
+                &|queue| core.configs.get(queue).keep_done_jobs,
                 max_keep_done,
-                &self.payload_store,
             )
             .await
         {
             warn!("done retention sweep error: {e}");
         }
-        if self.configs().any(|c| c.dead_retention.is_some())
+        if core.configs.iter().any(|c| c.dead_retention.is_some())
             && let Err(e) = sweep_expired(
-                &self.db,
-                self.clock.as_ref(),
+                core,
                 JobStatus::Dead,
-                &|queue| self.config(queue).dead_retention,
+                &|queue| core.configs.get(queue).dead_retention,
                 None,
-                &self.payload_store,
             )
             .await
         {
@@ -90,24 +69,14 @@ impl Periodic for Reaper {
 impl Reaper {
     /// Requeue or dead-letter every claim whose lease has expired.
     pub(crate) async fn reap_expired(&self) -> Result<()> {
-        let due = self.lease_registry.take_due(self.clock.now_ms());
+        let due = self.core.lease_registry.take_due(self.core.now_ms());
 
         // Due entries stay in the registry, marked, while they are
         // examined; each is removed only after its reap commits. A tick
         // that ends early therefore leaves nothing displaced, and the
         // next tick retries whatever remains due.
         for lease in &due {
-            match reap_job(
-                &self.db,
-                self.clock.as_ref(),
-                &self.lease_registry,
-                lease,
-                &self.completion_waiters,
-                &self.claim_cursor,
-                &self.payload_store,
-            )
-            .await
-            {
+            match reap_job(&self.core, lease).await {
                 Ok(()) => {}
                 // A storage failure applies to the remaining entries as
                 // well; end the tick.
@@ -125,15 +94,8 @@ impl Reaper {
     }
 }
 
-async fn reap_job(
-    db: &Db,
-    clock: &dyn Clock,
-    registry: &LeaseRegistry,
-    lease: &DueLease,
-    completion_waiters: &CompletionWaiters,
-    claim_cursor: &ClaimCursor,
-    payload_store: &PayloadStore,
-) -> Result<()> {
+async fn reap_job(core: &QueueCore, lease: &DueLease) -> Result<()> {
+    let registry = &core.lease_registry;
     let DueLease {
         queue, id, token, ..
     } = lease;
@@ -141,7 +103,7 @@ async fn reap_job(
     let claimed_key_bytes = claimed_key(queue, id);
 
     loop {
-        let txn = db.begin(IsolationLevel::Snapshot).await?;
+        let txn = core.db.begin(IsolationLevel::Snapshot).await?;
 
         // A settlement removes the entry after its commit; an entry
         // that is gone or belongs to a new claim leaves nothing to
@@ -175,7 +137,7 @@ async fn reap_job(
         let end = stage_unsettled_claim_end(
             &txn,
             &mut job,
-            clock.now_ms(),
+            core.now_ms(),
             AttemptOutcome::LeaseExpired,
             "lease expired",
         )?;
@@ -190,22 +152,25 @@ async fn reap_job(
                 registry.remove(queue, id, token);
                 match end {
                     ClaimEnd::Requeued { pending_key } => {
-                        claim_cursor.note_pending_insert(&job.queue, &pending_key);
+                        core.claim_cursor
+                            .note_pending_insert(&job.queue, &pending_key);
                         crate::obs::reaped(&job.queue, 1);
                     }
                     ClaimEnd::DeadLettered => {
                         crate::obs::dead_lettered(&job.queue);
-                        if completion_waiters.has_waiters(id) {
+                        if core.completion_waiters.has_waiters(id) {
                             // Delivered in the form `get_job` returns; a
                             // failed payload fetch leaves the stored form.
                             let mut delivered = job.clone();
-                            if let Err(e) =
-                                crate::read::materialize_payload(payload_store, &mut delivered)
-                                    .await
+                            if let Err(e) = crate::read::materialize_payload(
+                                &core.payload_store,
+                                &mut delivered,
+                            )
+                            .await
                             {
                                 warn!(queue = %queue, job_id = %id, error = %e, "payload of a dead-lettered job could not be fetched for its waiters");
                             }
-                            completion_waiters
+                            core.completion_waiters
                                 .settle(id, || WaitOutcome::Dead(Box::new(delivered)));
                         }
                     }
@@ -226,7 +191,7 @@ enum ClaimEnd {
 
 /// Stage the transition of a claimed job whose claim ended without a
 /// settlement: back to pending, or to the dead-letter set once its
-/// attempts are exhausted. Shared by the reaper and the open-time
+/// attempts are exhausted. QueueCore by the reaper and the open-time
 /// requeue; `error` names the cause in the history and log entries.
 fn stage_unsettled_claim_end(
     txn: &slatedb::DbTransaction,
@@ -276,13 +241,9 @@ fn stage_unsettled_claim_end(
 /// Runs after the claim cursor is restored, and notes each re-queued
 /// job's pending key, which sorts behind the restored clean-close
 /// bound.
-pub(crate) async fn requeue_interrupted_claims(
-    db: &Db,
-    clock: &dyn Clock,
-    claim_cursor: &ClaimCursor,
-) -> Result<()> {
+pub(crate) async fn requeue_interrupted_claims(core: &QueueCore) -> Result<()> {
     let mut interrupted: Vec<JobRecord> = Vec::new();
-    let mut iter = db.scan_prefix(tag_prefix(KeyTag::Claimed), ..).await?;
+    let mut iter = core.db.scan_prefix(tag_prefix(KeyTag::Claimed), ..).await?;
     while let Some(kv) = iter.next().await? {
         match JobRecord::decode(&kv.key, &kv.value) {
             Ok(job) => interrupted.push(job),
@@ -294,11 +255,11 @@ pub(crate) async fn requeue_interrupted_claims(
     drop(iter);
 
     for mut job in interrupted {
-        let txn = db.begin(IsolationLevel::Snapshot).await?;
+        let txn = core.db.begin(IsolationLevel::Snapshot).await?;
         let end = stage_unsettled_claim_end(
             &txn,
             &mut job,
-            clock.now_ms(),
+            core.now_ms(),
             AttemptOutcome::Interrupted,
             "claim interrupted by process exit",
         )?;
@@ -310,7 +271,8 @@ pub(crate) async fn requeue_interrupted_claims(
         txn.commit_with_options(&write_options(Durability::Deferred))
             .await?;
         if let ClaimEnd::Requeued { pending_key } = end {
-            claim_cursor.note_pending_insert(&job.queue, &pending_key);
+            core.claim_cursor
+                .note_pending_insert(&job.queue, &pending_key);
         }
     }
     Ok(())
@@ -328,23 +290,21 @@ pub(crate) async fn requeue_interrupted_claims(
 /// queue, so the dead scan reads the whole key space and ignores
 /// `max_retention`.
 async fn sweep_expired(
-    db: &Db,
-    clock: &dyn Clock,
+    core: &QueueCore,
     status: JobStatus,
     retention_for: &(dyn Fn(&str) -> Option<Duration> + Sync),
     max_retention: Option<Duration>,
-    payload_store: &PayloadStore,
 ) -> Result<()> {
     let (tag, min_cutoff) = match status {
         JobStatus::Done => (KeyTag::Done, max_retention),
         JobStatus::Dead => (KeyTag::Dead, None),
         _ => return Err(Error::InvalidState),
     };
-    let now = clock.now_ms();
+    let now = core.now_ms();
     let min_cutoff = min_cutoff.map(|r| now.saturating_sub(r.as_millis() as u64));
 
     let mut victims: Vec<(Vec<u8>, String, String, Option<String>)> = Vec::new();
-    let mut iter = db.scan_prefix(tag_prefix(tag), ..).await?;
+    let mut iter = core.db.scan_prefix(tag_prefix(tag), ..).await?;
     while let Some(kv) = iter.next().await? {
         if let Some(min_cutoff) = min_cutoff {
             let Some(terminal_at_in_key) = parse_key_timestamp(&kv.key, tag) else {
@@ -379,15 +339,7 @@ async fn sweep_expired(
         // `QueueStats::dead` counts the live dead-letter records; the
         // done counter counts completions and is not decremented.
         let dead_stats_queue = matches!(status, JobStatus::Dead).then_some(queue.as_str());
-        sweep_victim(
-            db,
-            payload_store,
-            &key,
-            &id,
-            payload_ref.as_deref(),
-            dead_stats_queue,
-        )
-        .await?;
+        sweep_victim(core, &key, &id, payload_ref.as_deref(), dead_stats_queue).await?;
     }
     Ok(())
 }
@@ -406,14 +358,13 @@ async fn sweep_expired(
 /// crash in between leaves an orphaned object, never a live record
 /// whose payload is gone.
 async fn sweep_victim(
-    db: &Db,
-    payload_store: &PayloadStore,
+    core: &QueueCore,
     key: &[u8],
     id: &str,
     payload_ref: Option<&str>,
     dead_stats_queue: Option<&str>,
 ) -> Result<()> {
-    let txn = db.begin(IsolationLevel::Snapshot).await?;
+    let txn = core.db.begin(IsolationLevel::Snapshot).await?;
     let existed = txn.get(key).await?.is_some();
     if existed {
         txn.delete(key)?;
@@ -428,7 +379,7 @@ async fn sweep_victim(
         Commit::Conflict => return Ok(()),
     }
     if existed && let Some(payload_ref) = payload_ref {
-        payload_store.delete_best_effort(payload_ref, id).await;
+        core.payload_store.delete_best_effort(payload_ref, id).await;
     }
     Ok(())
 }

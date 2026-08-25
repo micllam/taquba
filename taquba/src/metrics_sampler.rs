@@ -11,29 +11,33 @@
 use std::sync::Arc;
 
 use crate::background::Periodic;
-use crate::clock::Clock;
 use crate::error::Result;
 use crate::job::JobRecord;
 use crate::keys::pending_prefix;
+use crate::queue_core::QueueCore;
 use crate::read::{list_queues, stats};
-use slatedb::Db;
-
 pub(crate) struct MetricsSampler {
-    pub(crate) db: Arc<Db>,
-    pub(crate) clock: Arc<dyn Clock>,
+    core: Arc<QueueCore>,
+}
+
+impl MetricsSampler {
+    pub(crate) fn new(core: Arc<QueueCore>) -> Self {
+        Self { core }
+    }
 }
 
 impl Periodic for MetricsSampler {
     const NAME: &'static str = "metrics sampler";
 
     async fn step(&self) -> Result<()> {
-        sample(&self.db, self.clock.as_ref()).await
+        sample(&self.core).await
     }
 }
 
 /// Read each queue's depth and oldest-pending age once and set the gauges.
-async fn sample(db: &Db, clock: &dyn Clock) -> Result<()> {
-    let now = clock.now_ms();
+async fn sample(core: &QueueCore) -> Result<()> {
+    let db = core.db.as_ref();
+    let now = core.now_ms();
     for queue in list_queues(db).await? {
         let stats = stats(db, &queue).await?;
         crate::obs::set_depth(&queue, stats.pending, stats.claimed);

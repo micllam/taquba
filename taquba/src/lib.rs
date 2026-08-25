@@ -394,6 +394,7 @@ mod metrics_sampler;
 mod obs;
 mod payload_store;
 mod queue;
+mod queue_core;
 mod read;
 mod reader;
 mod reaper;
