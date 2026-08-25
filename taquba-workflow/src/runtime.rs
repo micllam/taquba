@@ -823,14 +823,12 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         let mut headers = spec.headers.clone();
         headers.insert(HEADER_RUN_ID.to_string(), run_id.to_string());
         headers.insert(HEADER_STEP.to_string(), "0".to_string());
-        let enqueue_opts = EnqueueOptions {
-            headers,
-            run_at: None,
-            priority: spec.priority,
-            max_attempts: spec.max_attempts_per_step,
-            dedup_key: Some(format!("{DEDUP_PREFIX}{run_id}:0")),
-            ..EnqueueOptions::default()
-        };
+        let enqueue_opts = EnqueueOptions::default()
+            .headers(headers)
+            .run_at(None)
+            .priority(spec.priority)
+            .max_attempts(spec.max_attempts_per_step)
+            .dedup_key(Some(format!("{DEDUP_PREFIX}{run_id}:0")));
 
         let record_bytes = rmp_serde::to_vec_named(&DurableRunRecord {
             run_id: run_id.to_string(),
@@ -1176,14 +1174,13 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         let request = EnqueueRequest {
             queue: self.queue_name.clone(),
             payload,
-            options: EnqueueOptions {
-                headers,
-                run_at: opts.run_at,
-                priority: opts.priority,
-                max_attempts: opts.max_attempts,
-                dedup_key: Some(format!("{DEDUP_PREFIX}{run_id}:{step_number}")),
-                id_override: Some(job_id.clone()),
-            },
+            options: EnqueueOptions::default()
+                .headers(headers)
+                .run_at(opts.run_at)
+                .priority(opts.priority)
+                .max_attempts(opts.max_attempts)
+                .dedup_key(Some(format!("{DEDUP_PREFIX}{run_id}:{step_number}")))
+                .id_override(Some(job_id.clone())),
         };
         (request, job_id)
     }
@@ -1229,13 +1226,11 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         Ok(EnqueueRequest {
             queue: self.queue_name.clone(),
             payload,
-            options: EnqueueOptions {
-                headers,
-                priority,
-                max_attempts,
-                dedup_key: Some(format!("{DEDUP_PREFIX}{}:terminal", outcome.run_id)),
-                ..EnqueueOptions::default()
-            },
+            options: EnqueueOptions::default()
+                .headers(headers)
+                .priority(priority)
+                .max_attempts(max_attempts)
+                .dedup_key(Some(format!("{DEDUP_PREFIX}{}:terminal", outcome.run_id))),
         })
     }
 
@@ -1282,11 +1277,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         } else {
             Vec::new()
         };
-        SettlementEffects {
-            enqueues,
-            kv_writes,
-            kv_deletes,
-        }
+        SettlementEffects::default()
+            .enqueues(enqueues)
+            .kv_writes(kv_writes)
+            .kv_deletes(kv_deletes)
     }
 
     /// Remove the run's registry entry as part of terminating it.
@@ -1321,11 +1315,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         let result = self.terminal_hook.on_termination(&outcome, &effects).await;
         let (staged, enqueues) = effects.seal_and_take();
         match result {
-            Ok(()) => Ok(SettlementEffects {
-                enqueues,
-                kv_writes: staged.writes,
-                kv_deletes: staged.deletes.into_iter().collect(),
-            }),
+            Ok(()) => Ok(SettlementEffects::default()
+                .enqueues(enqueues)
+                .kv_writes(staged.writes)
+                .kv_deletes(staged.deletes.into_iter().collect())),
             Err(StepError {
                 message,
                 kind: StepErrorKind::Permanent,
@@ -1871,11 +1864,9 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             entry.status.current_step = next_step;
             entry.current_job_id = next_job_id;
         }
-        SettlementEffects {
-            enqueues: vec![request],
-            kv_writes,
-            ..SettlementEffects::default()
-        }
+        SettlementEffects::default()
+            .enqueues(vec![request])
+            .kv_writes(kv_writes)
     }
 
     /// Build the effects that advance the run to a step that waits for a
@@ -2097,10 +2088,7 @@ mod tests {
         MockClock,
     ) {
         let clock = MockClock::new(initial_ms);
-        let opts = OpenOptions {
-            clock: Arc::new(clock.clone()),
-            ..OpenOptions::default()
-        };
+        let opts = OpenOptions::default().clock(Arc::new(clock.clone()));
         let store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
         let queue = Arc::new(
             Queue::open_with_options(store.clone(), "test", opts)
@@ -2129,16 +2117,11 @@ mod tests {
         MockClock,
     ) {
         let clock = MockClock::new(initial_ms);
-        let opts = OpenOptions {
-            clock: Arc::new(clock.clone()),
-            default_queue_config: QueueConfig {
-                retry_backoff_base: Duration::ZERO,
-                ..QueueConfig::default()
-            },
-            reaper_interval: Duration::from_millis(50),
-            scheduler_interval: Duration::from_millis(50),
-            ..OpenOptions::default()
-        };
+        let opts = OpenOptions::default()
+            .clock(Arc::new(clock.clone()))
+            .default_queue_config(QueueConfig::default().retry_backoff_base(Duration::ZERO))
+            .reaper_interval(Duration::from_millis(50))
+            .scheduler_interval(Duration::from_millis(50));
         let store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
         let queue = Arc::new(
             Queue::open_with_options(store.clone(), "test", opts)
@@ -2151,15 +2134,10 @@ mod tests {
     /// Queue with zero retry backoff and a tight reaper, so multi-attempt
     /// tests run in well under a second.
     async fn fresh_queue_fast_retry() -> (Arc<Queue>, Arc<dyn taquba::object_store::ObjectStore>) {
-        let opts = OpenOptions {
-            default_queue_config: QueueConfig {
-                retry_backoff_base: Duration::ZERO,
-                ..QueueConfig::default()
-            },
-            reaper_interval: Duration::from_millis(50),
-            scheduler_interval: Duration::from_millis(50),
-            ..OpenOptions::default()
-        };
+        let opts = OpenOptions::default()
+            .default_queue_config(QueueConfig::default().retry_backoff_base(Duration::ZERO))
+            .reaper_interval(Duration::from_millis(50))
+            .scheduler_interval(Duration::from_millis(50));
         let store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
         let queue = Arc::new(
             Queue::open_with_options(store.clone(), "test", opts)
@@ -2489,10 +2467,7 @@ mod tests {
                 Queue::open_with_options(
                     store,
                     "test",
-                    OpenOptions {
-                        clock: Arc::new(MockClock::new(1_700_000_000_000)),
-                        ..OpenOptions::default()
-                    },
+                    OpenOptions::default().clock(Arc::new(MockClock::new(1_700_000_000_000))),
                 )
                 .await
                 .unwrap(),

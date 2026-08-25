@@ -232,10 +232,7 @@ pub fn webhook_enqueue_request(
     EnqueueRequest {
         queue: target_queue.to_string(),
         payload: body,
-        options: EnqueueOptions {
-            headers: job_headers,
-            ..Default::default()
-        },
+        options: EnqueueOptions::default().headers(job_headers),
     }
 }
 

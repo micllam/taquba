@@ -15,14 +15,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Disable retry backoff so the demo can re-claim a nacked job immediately.
     // In production the default exponential backoff (1s base, 5min cap) will park
     // failed jobs in the scheduled space until their delay elapses.
-    let opts = OpenOptions {
-        default_queue_config: QueueConfig {
-            retry_backoff_base: Duration::ZERO,
-            retry_backoff_max: Duration::ZERO,
-            ..QueueConfig::default()
-        },
-        ..OpenOptions::default()
-    };
+    let opts = OpenOptions::default().default_queue_config(
+        QueueConfig::default()
+            .retry_backoff_base(Duration::ZERO)
+            .retry_backoff_max(Duration::ZERO),
+    );
     let q = Queue::open_with_options(store, "demo", opts).await?;
 
     let id_a = q.enqueue("tasks", b"task A".to_vec()).await?;
@@ -32,10 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enqueue_with(
             "tasks",
             b"task C".to_vec(),
-            EnqueueOptions {
-                max_attempts: Some(1),
-                ..Default::default()
-            },
+            EnqueueOptions::default().max_attempts(Some(1)),
         )
         .await?;
 

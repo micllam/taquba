@@ -238,11 +238,9 @@ pub(crate) fn backoff_delay(attempts: u32, base: Duration, max: Duration) -> Dur
 /// Construct via [`QueueConfig::default`] and override as required:
 ///
 /// ```ignore
-/// QueueConfig {
-///     max_attempts: 10,
-///     ..QueueConfig::default()
-/// }
+/// QueueConfig::default().max_attempts(10)
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct QueueConfig {
     /// Maximum delivery attempts before a job is dead-lettered. Attempts
@@ -277,6 +275,57 @@ pub struct QueueConfig {
     pub dead_retention: Option<Duration>,
 }
 
+impl QueueConfig {
+    /// Set [`Self::max_attempts`].
+    #[must_use]
+    pub fn max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = max_attempts;
+        self
+    }
+
+    /// Set [`Self::lease_duration`].
+    #[must_use]
+    pub fn lease_duration(mut self, lease_duration: Duration) -> Self {
+        self.lease_duration = lease_duration;
+        self
+    }
+
+    /// Set [`Self::default_priority`].
+    #[must_use]
+    pub fn default_priority(mut self, default_priority: u32) -> Self {
+        self.default_priority = default_priority;
+        self
+    }
+
+    /// Set [`Self::retry_backoff_base`].
+    #[must_use]
+    pub fn retry_backoff_base(mut self, retry_backoff_base: Duration) -> Self {
+        self.retry_backoff_base = retry_backoff_base;
+        self
+    }
+
+    /// Set [`Self::retry_backoff_max`].
+    #[must_use]
+    pub fn retry_backoff_max(mut self, retry_backoff_max: Duration) -> Self {
+        self.retry_backoff_max = retry_backoff_max;
+        self
+    }
+
+    /// Set [`Self::keep_done_jobs`].
+    #[must_use]
+    pub fn keep_done_jobs(mut self, keep_done_jobs: impl Into<Option<Duration>>) -> Self {
+        self.keep_done_jobs = keep_done_jobs.into();
+        self
+    }
+
+    /// Set [`Self::dead_retention`].
+    #[must_use]
+    pub fn dead_retention(mut self, dead_retention: impl Into<Option<Duration>>) -> Self {
+        self.dead_retention = dead_retention.into();
+        self
+    }
+}
+
 impl Default for QueueConfig {
     fn default() -> Self {
         Self {
@@ -292,6 +341,7 @@ impl Default for QueueConfig {
 }
 
 /// Configuration for opening a [`Queue`] instance.
+#[non_exhaustive]
 pub struct OpenOptions {
     /// How often the background reaper scans for expired leases. Defaults to 5s.
     /// The same loop also performs done- and dead-job retention sweeps.
@@ -377,6 +427,98 @@ pub struct OpenOptions {
     pub payload_path: Option<String>,
 }
 
+impl OpenOptions {
+    /// Set [`Self::reaper_interval`].
+    #[must_use]
+    pub fn reaper_interval(mut self, reaper_interval: Duration) -> Self {
+        self.reaper_interval = reaper_interval;
+        self
+    }
+
+    /// Set [`Self::scheduler_interval`].
+    #[must_use]
+    pub fn scheduler_interval(mut self, scheduler_interval: Duration) -> Self {
+        self.scheduler_interval = scheduler_interval;
+        self
+    }
+
+    /// Set [`Self::default_queue_config`].
+    #[must_use]
+    pub fn default_queue_config(mut self, default_queue_config: QueueConfig) -> Self {
+        self.default_queue_config = default_queue_config;
+        self
+    }
+
+    /// Set the configuration of one queue in [`Self::queue_configs`].
+    #[must_use]
+    pub fn queue_config(mut self, queue: impl Into<String>, config: QueueConfig) -> Self {
+        self.queue_configs.insert(queue.into(), config);
+        self
+    }
+
+    /// Set [`Self::queue_configs`].
+    #[must_use]
+    pub fn queue_configs(mut self, queue_configs: HashMap<String, QueueConfig>) -> Self {
+        self.queue_configs = queue_configs;
+        self
+    }
+
+    /// Set [`Self::clock`].
+    #[must_use]
+    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Set [`Self::flush_interval`].
+    #[must_use]
+    pub fn flush_interval(mut self, flush_interval: impl Into<Option<Duration>>) -> Self {
+        self.flush_interval = flush_interval.into();
+        self
+    }
+
+    /// Set [`Self::metrics_sample_interval`].
+    #[must_use]
+    pub fn metrics_sample_interval(
+        mut self,
+        metrics_sample_interval: impl Into<Option<Duration>>,
+    ) -> Self {
+        self.metrics_sample_interval = metrics_sample_interval.into();
+        self
+    }
+
+    /// Set [`Self::liveness_heartbeat`].
+    #[must_use]
+    pub fn liveness_heartbeat(mut self, liveness_heartbeat: impl Into<Option<Duration>>) -> Self {
+        self.liveness_heartbeat = liveness_heartbeat.into();
+        self
+    }
+
+    /// Set [`Self::payload_offload_threshold`].
+    #[must_use]
+    pub fn payload_offload_threshold(
+        mut self,
+        payload_offload_threshold: impl Into<Option<usize>>,
+    ) -> Self {
+        self.payload_offload_threshold = payload_offload_threshold.into();
+        self
+    }
+
+    /// Set [`Self::payload_store`].
+    #[must_use]
+    pub fn payload_store(mut self, payload_store: impl Into<Option<Arc<dyn ObjectStore>>>) -> Self {
+        self.payload_store = payload_store.into();
+        self
+    }
+
+    /// Set [`Self::payload_path`].
+    #[must_use]
+    pub fn payload_path(mut self, payload_path: impl Into<Option<String>>) -> Self {
+        self.payload_path = payload_path.into();
+        self
+    }
+}
+
 impl Default for OpenOptions {
     fn default() -> Self {
         Self {
@@ -405,11 +547,9 @@ impl Default for OpenOptions {
 /// use std::time::{Duration, SystemTime};
 /// use taquba::EnqueueOptions;
 ///
-/// let opts = EnqueueOptions {
-///     run_at: Some(SystemTime::now() + Duration::from_secs(60)),
-///     ..EnqueueOptions::default()
-/// };
+/// let opts = EnqueueOptions::default().run_at(SystemTime::now() + Duration::from_secs(60));
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct EnqueueOptions {
     /// Override the queue's default `max_attempts` for just this job.
@@ -456,6 +596,57 @@ pub struct EnqueueOptions {
     pub id_override: Option<String>,
 }
 
+impl EnqueueOptions {
+    /// Set [`Self::max_attempts`].
+    #[must_use]
+    pub fn max_attempts(mut self, max_attempts: impl Into<Option<u32>>) -> Self {
+        self.max_attempts = max_attempts.into();
+        self
+    }
+
+    /// Set [`Self::priority`].
+    #[must_use]
+    pub fn priority(mut self, priority: impl Into<Option<u32>>) -> Self {
+        self.priority = priority.into();
+        self
+    }
+
+    /// Set [`Self::run_at`].
+    #[must_use]
+    pub fn run_at(mut self, run_at: impl Into<Option<std::time::SystemTime>>) -> Self {
+        self.run_at = run_at.into();
+        self
+    }
+
+    /// Set [`Self::dedup_key`].
+    #[must_use]
+    pub fn dedup_key(mut self, dedup_key: impl Into<Option<String>>) -> Self {
+        self.dedup_key = dedup_key.into();
+        self
+    }
+
+    /// Set [`Self::headers`].
+    #[must_use]
+    pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// Set one entry of [`Self::headers`].
+    #[must_use]
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(name.into(), value.into());
+        self
+    }
+
+    /// Set [`Self::id_override`].
+    #[must_use]
+    pub fn id_override(mut self, id_override: impl Into<Option<String>>) -> Self {
+        self.id_override = id_override.into();
+        self
+    }
+}
+
 /// One enqueue carried by [`SettlementEffects`].
 #[derive(Debug, Clone)]
 pub struct EnqueueRequest {
@@ -479,6 +670,7 @@ pub struct EnqueueRequest {
 /// [`CancelOutcome::Removed`]) commits without them. A key named in
 /// both `kv_writes` and `kv_deletes` is rejected with
 /// [`Error::ConflictingKvEffect`].
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct SettlementEffects {
     /// Jobs enqueued atomically with the settlement.
@@ -489,6 +681,50 @@ pub struct SettlementEffects {
     pub kv_writes: HashMap<Vec<u8>, Vec<u8>>,
     /// Keys deleted from the caller KV namespace.
     pub kv_deletes: Vec<Vec<u8>>,
+}
+
+impl SettlementEffects {
+    /// Set [`Self::enqueues`].
+    #[must_use]
+    pub fn enqueues(mut self, enqueues: Vec<EnqueueRequest>) -> Self {
+        self.enqueues = enqueues;
+        self
+    }
+
+    /// Add one request to [`Self::enqueues`].
+    #[must_use]
+    pub fn enqueue(mut self, request: EnqueueRequest) -> Self {
+        self.enqueues.push(request);
+        self
+    }
+
+    /// Set [`Self::kv_writes`].
+    #[must_use]
+    pub fn kv_writes(mut self, kv_writes: HashMap<Vec<u8>, Vec<u8>>) -> Self {
+        self.kv_writes = kv_writes;
+        self
+    }
+
+    /// Add one write to [`Self::kv_writes`].
+    #[must_use]
+    pub fn kv_put(mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
+        self.kv_writes.insert(key.into(), value.into());
+        self
+    }
+
+    /// Set [`Self::kv_deletes`].
+    #[must_use]
+    pub fn kv_deletes(mut self, kv_deletes: Vec<Vec<u8>>) -> Self {
+        self.kv_deletes = kv_deletes;
+        self
+    }
+
+    /// Add one key to [`Self::kv_deletes`].
+    #[must_use]
+    pub fn kv_delete(mut self, key: impl Into<Vec<u8>>) -> Self {
+        self.kv_deletes.push(key.into());
+        self
+    }
 }
 
 /// A durable task queue backed by object storage.
@@ -742,12 +978,11 @@ impl Queue {
     /// # async fn ex(q: &taquba::Queue) -> taquba::Result<()> {
     /// use taquba::{EnqueueOptions, PRIORITY_HIGH};
     ///
-    /// q.enqueue_with("email", b"to=alice".to_vec(), EnqueueOptions {
-    ///     priority: Some(PRIORITY_HIGH),
-    ///     run_at: Some(SystemTime::now() + Duration::from_secs(300)),
-    ///     dedup_key: Some("welcome:user-42".to_string()),
-    ///     ..EnqueueOptions::default()
-    /// }).await?;
+    /// let opts = EnqueueOptions::default()
+    ///     .priority(PRIORITY_HIGH)
+    ///     .run_at(SystemTime::now() + Duration::from_secs(300))
+    ///     .dedup_key("welcome:user-42".to_string());
+    /// q.enqueue_with("email", b"to=alice".to_vec(), opts).await?;
     /// # Ok(()) }
     /// ```
     ///
@@ -800,10 +1035,7 @@ impl Queue {
     /// let outcome = q.enqueue_with_kv(
     ///     "workflow-steps",
     ///     b"step-0-payload".to_vec(),
-    ///     EnqueueOptions {
-    ///         dedup_key: Some("run:abc:0".to_string()),
-    ///         ..Default::default()
-    ///     },
+    ///     EnqueueOptions::default().dedup_key("run:abc:0".to_string()),
     ///     kv,
     /// ).await?;
     /// match outcome {

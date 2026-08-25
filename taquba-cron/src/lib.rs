@@ -494,13 +494,11 @@ impl CronScheduler {
         let fire_ms = fire_at.timestamp_millis();
         let mut headers = entry.headers.clone();
         headers.insert(FIRE_MS_HEADER.to_string(), fire_ms.to_string());
-        let opts = EnqueueOptions {
-            dedup_key: Some(format!("cron:{}:{}", entry.name, fire_ms)),
-            headers,
-            priority: entry.priority,
-            max_attempts: entry.max_attempts,
-            ..Default::default()
-        };
+        let opts = EnqueueOptions::default()
+            .dedup_key(Some(format!("cron:{}:{}", entry.name, fire_ms)))
+            .headers(headers)
+            .priority(entry.priority)
+            .max_attempts(entry.max_attempts);
         if entry.backfill.is_some() {
             let key = watermark_key(&entry.name);
             let value = fire_ms.to_string().into_bytes();
@@ -540,10 +538,7 @@ mod tests {
         let queue = Queue::open_with_options(
             Arc::new(InMemory::new()),
             "test",
-            taquba::OpenOptions {
-                clock: clock.clone(),
-                ..Default::default()
-            },
+            taquba::OpenOptions::default().clock(clock.clone()),
         )
         .await
         .unwrap();
@@ -792,10 +787,7 @@ mod tests {
         q.enqueue_with(
             "out",
             b"x".to_vec(),
-            EnqueueOptions {
-                dedup_key: Some(format!("cron:minutely:{}", ms(fire_at))),
-                ..Default::default()
-            },
+            EnqueueOptions::default().dedup_key(Some(format!("cron:minutely:{}", ms(fire_at)))),
         )
         .await
         .unwrap();

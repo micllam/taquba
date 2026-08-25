@@ -136,18 +136,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Queue::open_with_options(
             store.clone(),
             "bench-db",
-            OpenOptions {
-                default_queue_config: QueueConfig {
-                    keep_done_jobs: None,
-                    // Zero backoff: a retried item goes straight back to
-                    // pending, so the measured resume cost is the replay
-                    // itself, not the backoff wait.
-                    retry_backoff_base: Duration::ZERO,
-                    ..QueueConfig::default()
-                },
-                flush_interval: Some(Duration::from_millis(flush_interval_ms)),
-                ..OpenOptions::default()
-            },
+            OpenOptions::default()
+                .default_queue_config(
+                    QueueConfig::default()
+                        .keep_done_jobs(None)
+                        // Zero backoff: a retried item goes straight back to
+                        // pending, so the measured resume cost is the replay
+                        // itself, not the backoff wait.
+                        .retry_backoff_base(Duration::ZERO),
+                )
+                .flush_interval(Some(Duration::from_millis(flush_interval_ms))),
         )
         .await?,
     );

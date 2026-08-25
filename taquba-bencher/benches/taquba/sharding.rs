@@ -56,14 +56,9 @@ use taquba_bencher::{env_var, init_tracing, store_from_env};
 const QUEUE_NAME: &str = "bench";
 
 fn open_options(flush_interval_ms: u64) -> OpenOptions {
-    OpenOptions {
-        default_queue_config: QueueConfig {
-            keep_done_jobs: None,
-            ..QueueConfig::default()
-        },
-        flush_interval: Some(Duration::from_millis(flush_interval_ms)),
-        ..OpenOptions::default()
-    }
+    OpenOptions::default()
+        .default_queue_config(QueueConfig::default().keep_done_jobs(None))
+        .flush_interval(Some(Duration::from_millis(flush_interval_ms)))
 }
 
 #[tokio::main(flavor = "multi_thread")]

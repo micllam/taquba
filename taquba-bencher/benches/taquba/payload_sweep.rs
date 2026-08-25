@@ -106,14 +106,9 @@ async fn run_one(
         Queue::open_with_options(
             store,
             &db_path,
-            OpenOptions {
-                default_queue_config: QueueConfig {
-                    keep_done_jobs: None,
-                    ..QueueConfig::default()
-                },
-                flush_interval: Some(Duration::from_millis(flush_ms)),
-                ..OpenOptions::default()
-            },
+            OpenOptions::default()
+                .default_queue_config(QueueConfig::default().keep_done_jobs(None))
+                .flush_interval(Some(Duration::from_millis(flush_ms))),
         )
         .await?,
     );

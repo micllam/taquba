@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Built against the `taquba` option setters: `OpenOptions`,
+  `QueueConfig`, `EnqueueOptions` and `SettlementEffects` are
+  `#[non_exhaustive]` in `taquba` and are constructed through their
+  setters here and in the documentation examples. Callers that build
+  these types for a queue shared with this crate migrate the same way.
 - Every enqueued job carries the header `cron.fire_ms` (`FIRE_MS_HEADER`)
   which stores its firing time as milliseconds since the Unix epoch.
   Header names with the `cron.` prefix (`RESERVED_HEADER_PREFIX`) are

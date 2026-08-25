@@ -140,23 +140,16 @@
 //! [`taquba::OpenOptions::queue_configs`] on the same string.
 //!
 //! ```no_run
-//! # use std::collections::HashMap;
 //! # use std::sync::Arc;
 //! # use std::time::Duration;
 //! # use taquba::{OpenOptions, Queue, QueueConfig, object_store::memory::InMemory};
 //! # use taquba_jobs::JobRunner;
 //! # async fn run() -> taquba_jobs::Result<()> {
 //! let store = Arc::new(InMemory::new());
-//! let opts = OpenOptions {
-//!     queue_configs: HashMap::from([(
-//!         "background-jobs".to_string(),
-//!         QueueConfig {
-//!             keep_done_jobs: Some(Duration::from_secs(60 * 60)),
-//!             ..QueueConfig::default()
-//!         },
-//!     )]),
-//!     ..OpenOptions::default()
-//! };
+//! let opts = OpenOptions::default().queue_config(
+//!     "background-jobs",
+//!     QueueConfig::default().keep_done_jobs(Duration::from_secs(60 * 60)),
+//! );
 //! let queue = Arc::new(Queue::open_with_options(store.clone(), "db", opts).await?);
 //! let runner = JobRunner::builder(queue, store)
 //!     .queue_name("background-jobs") // same string as in queue_configs

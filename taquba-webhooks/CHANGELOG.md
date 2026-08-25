@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Built against the `taquba` option setters: `OpenOptions`,
+  `QueueConfig`, `EnqueueOptions` and `SettlementEffects` are
+  `#[non_exhaustive]` in `taquba` and are constructed through their
+  setters here and in the documentation examples. Callers that build
+  these types for a queue shared with this crate migrate the same way.
+
 ## [0.7.0] - 2026-08-17
 
 ### Added

@@ -212,11 +212,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut opts = OpenOptions::default();
     opts.queue_configs.insert(
         "docs".to_string(),
-        QueueConfig {
-            retry_backoff_base: Duration::from_millis(50),
-            retry_backoff_max: Duration::from_millis(50),
-            ..QueueConfig::default()
-        },
+        QueueConfig::default()
+            .retry_backoff_base(Duration::from_millis(50))
+            .retry_backoff_max(Duration::from_millis(50)),
     );
     let store = Arc::new(InMemory::new());
     let queue = Arc::new(Queue::open_with_options(store.clone(), "db", opts).await?);

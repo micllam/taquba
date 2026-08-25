@@ -49,7 +49,6 @@
 //! [`taquba::OpenOptions::queue_configs`] on the same string.
 //!
 //! ```no_run
-//! # use std::collections::HashMap;
 //! # use std::sync::Arc;
 //! # use std::time::Duration;
 //! # use taquba::{OpenOptions, Queue, QueueConfig, object_store::memory::InMemory};
@@ -62,16 +61,10 @@
 //! # }
 //! # async fn run() -> taquba_workflow::Result<()> {
 //! let store = Arc::new(InMemory::new());
-//! let opts = OpenOptions {
-//!     queue_configs: HashMap::from([(
-//!         "agent-runs".to_string(),
-//!         QueueConfig {
-//!             keep_done_jobs: Some(Duration::from_secs(24 * 60 * 60)),
-//!             ..QueueConfig::default()
-//!         },
-//!     )]),
-//!     ..OpenOptions::default()
-//! };
+//! let opts = OpenOptions::default().queue_config(
+//!     "agent-runs",
+//!     QueueConfig::default().keep_done_jobs(Duration::from_secs(24 * 60 * 60)),
+//! );
 //! let queue = Arc::new(Queue::open_with_options(store.clone(), "db", opts).await?);
 //! let runtime = WorkflowRuntime::builder(queue, store, EchoRunner, NoopTerminalHook)
 //!     .queue_name("agent-runs") // same string as in queue_configs
@@ -447,10 +440,7 @@
 //!
 //! ```rust,ignore
 //! let clock = MockClock::new(1_700_000_000_000);
-//! let opts = OpenOptions {
-//!     clock: Arc::new(clock.clone()),
-//!     ..OpenOptions::default()
-//! };
+//! let opts = OpenOptions::default().clock(Arc::new(clock.clone()));
 //! let queue = Queue::open_with_options(store.clone(), "db", opts).await?;
 //! let runtime = WorkflowRuntime::builder(queue, store, runner, hook).build();
 //! // `runtime` reads the same clock as `queue`; `clock.advance(...)`

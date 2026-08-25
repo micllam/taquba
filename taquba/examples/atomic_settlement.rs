@@ -96,10 +96,7 @@ async fn submit_order(q: &Queue, order_id: &str) -> taquba::Result<()> {
         .enqueue_with_kv(
             ORDERS_QUEUE,
             order_id.as_bytes().to_vec(),
-            EnqueueOptions {
-                dedup_key: Some(format!("order:{order_id}")),
-                ..EnqueueOptions::default()
-            },
+            EnqueueOptions::default().dedup_key(Some(format!("order:{order_id}"))),
             kv,
         )
         .await?;

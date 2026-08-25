@@ -345,10 +345,7 @@ async fn spawn_demo_traffic(q: &Arc<Queue>) -> Result<(), taquba::Error> {
     q.enqueue_with(
         "reports",
         b"report: quarterly-rollup".to_vec(),
-        EnqueueOptions {
-            run_at: Some(SystemTime::now() + Duration::from_secs(24 * 3600)),
-            ..Default::default()
-        },
+        EnqueueOptions::default().run_at(Some(SystemTime::now() + Duration::from_secs(24 * 3600))),
     )
     .await?;
 
@@ -400,15 +397,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut opts = OpenOptions::default();
     opts.queue_configs.insert(
         "emails".to_string(),
-        QueueConfig {
-            max_attempts: 3,
-            retry_backoff_base: Duration::from_millis(500),
+        QueueConfig::default()
+            .max_attempts(3)
+            .retry_backoff_base(Duration::from_millis(500))
             // Retain done records for an hour, so a completed job's record
             // and attempt history stay inspectable instead of being
             // removed on ack.
-            keep_done_jobs: Some(Duration::from_secs(3600)),
-            ..QueueConfig::default()
-        },
+            .keep_done_jobs(Some(Duration::from_secs(3600))),
     );
     let q =
         Arc::new(Queue::open_with_options(Arc::new(InMemory::new()), "admin-demo", opts).await?);

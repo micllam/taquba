@@ -46,6 +46,7 @@ pub enum ReaderMode {
 }
 
 /// Options for [`QueueReader::open_with_options`].
+#[non_exhaustive]
 #[derive(Clone)]
 pub struct ReaderOptions {
     /// How the reader follows the writer's state. Defaults to
@@ -69,6 +70,43 @@ pub struct ReaderOptions {
     /// writer's [`OpenOptions::payload_path`](crate::OpenOptions::payload_path);
     /// `None` (the default) uses `"{path}-payloads"`.
     pub payload_path: Option<String>,
+}
+
+impl ReaderOptions {
+    /// Set [`Self::mode`].
+    #[must_use]
+    pub fn mode(mut self, mode: ReaderMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Set [`Self::manifest_poll_interval`].
+    #[must_use]
+    pub fn manifest_poll_interval(mut self, manifest_poll_interval: Duration) -> Self {
+        self.manifest_poll_interval = manifest_poll_interval;
+        self
+    }
+
+    /// Set [`Self::checkpoint_lifetime`].
+    #[must_use]
+    pub fn checkpoint_lifetime(mut self, checkpoint_lifetime: Duration) -> Self {
+        self.checkpoint_lifetime = checkpoint_lifetime;
+        self
+    }
+
+    /// Set [`Self::payload_store`].
+    #[must_use]
+    pub fn payload_store(mut self, payload_store: impl Into<Option<Arc<dyn ObjectStore>>>) -> Self {
+        self.payload_store = payload_store.into();
+        self
+    }
+
+    /// Set [`Self::payload_path`].
+    #[must_use]
+    pub fn payload_path(mut self, payload_path: impl Into<Option<String>>) -> Self {
+        self.payload_path = payload_path.into();
+        self
+    }
 }
 
 impl Default for ReaderOptions {

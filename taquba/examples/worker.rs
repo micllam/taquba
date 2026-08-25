@@ -55,15 +55,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut opts = OpenOptions::default();
     opts.queue_configs.insert(
         "jobs".to_string(),
-        QueueConfig {
-            max_attempts: 3,
-            lease_duration: Duration::from_secs(10),
+        QueueConfig::default()
+            .max_attempts(3)
+            .lease_duration(Duration::from_secs(10))
             // Tight backoff so the demo runs quickly while still exercising the
             // scheduled-retry path that production deployments rely on.
-            retry_backoff_base: Duration::from_millis(50),
-            retry_backoff_max: Duration::from_millis(50),
-            ..QueueConfig::default()
-        },
+            .retry_backoff_base(Duration::from_millis(50))
+            .retry_backoff_max(Duration::from_millis(50)),
     );
 
     let q = Arc::new(Queue::open_with_options(Arc::new(InMemory::new()), "demo", opts).await?);

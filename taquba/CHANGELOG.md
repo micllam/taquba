@@ -52,6 +52,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `OpenOptions`, `QueueConfig`, `EnqueueOptions`,
+  `ReaderOptions` and `SettlementEffects` are `#[non_exhaustive]`, so
+  they can no longer be built with struct-literal syntax outside the
+  crate; each gains chainable setters (one per field, taking the field's
+  type or, for `Option` fields, anything `Into<Option<T>>`), plus
+  `OpenOptions::queue_config`, `EnqueueOptions::header`,
+  `SettlementEffects::enqueue`, `SettlementEffects::kv_put` and
+  `SettlementEffects::kv_delete` for single entries. Fields stay public
+  for reads and assignment. A field added later is no longer a breaking
+  change.
 - **Breaking (storage):** `JobRecord::status` is no longer part of the
   stored record value; it is derived from the key space a record is
   read from, which was already the authoritative state.

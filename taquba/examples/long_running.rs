@@ -61,18 +61,12 @@ async fn external_call() -> Result<(), WorkerError> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut opts = OpenOptions {
-        // Frequent reaper ticks, so an expired lease would be noticed
-        // well within the demo's runtime.
-        reaper_interval: Duration::from_millis(500),
-        ..OpenOptions::default()
-    };
+    // Frequent reaper ticks, so an expired lease would be noticed
+    // well within the demo's runtime.
+    let mut opts = OpenOptions::default().reaper_interval(Duration::from_millis(500));
     opts.queue_configs.insert(
         "work".to_string(),
-        QueueConfig {
-            lease_duration: LEASE,
-            ..QueueConfig::default()
-        },
+        QueueConfig::default().lease_duration(LEASE),
     );
     let q = Arc::new(Queue::open_with_options(Arc::new(InMemory::new()), "demo", opts).await?);
 

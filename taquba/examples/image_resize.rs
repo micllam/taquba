@@ -64,12 +64,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut opts = OpenOptions::default();
     opts.queue_configs.insert(
         "resize".to_string(),
-        QueueConfig {
-            max_attempts: 3,
-            lease_duration: Duration::from_secs(30),
-            default_priority: PRIORITY_NORMAL,
-            ..QueueConfig::default()
-        },
+        QueueConfig::default()
+            .max_attempts(3)
+            .lease_duration(Duration::from_secs(30))
+            .default_priority(PRIORITY_NORMAL),
     );
 
     // To use S3 or MinIO instead of memory, swap InMemory for an S3Builder:
@@ -93,10 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         q.enqueue_with(
             "resize",
             task.encode(),
-            EnqueueOptions {
-                priority: Some(PRIORITY_HIGH),
-                ..Default::default()
-            },
+            EnqueueOptions::default().priority(Some(PRIORITY_HIGH)),
         )
         .await?;
     }
@@ -123,10 +118,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     q.enqueue_with(
         "resize",
         task.encode(),
-        EnqueueOptions {
-            run_at: Some(std::time::SystemTime::now() + Duration::from_millis(1)),
-            ..Default::default()
-        },
+        EnqueueOptions::default().run_at(Some(
+            std::time::SystemTime::now() + Duration::from_millis(1),
+        )),
     )
     .await?;
 

@@ -205,15 +205,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Queue::open_with_options(
             store,
             "bench-db",
-            OpenOptions {
-                default_queue_config: QueueConfig {
-                    keep_done_jobs: None,
-                    ..QueueConfig::default()
-                },
-                flush_interval: Some(Duration::from_millis(flush_interval_ms)),
-                metrics_sample_interval: taquba_bencher::metrics_sample_interval(),
-                ..OpenOptions::default()
-            },
+            OpenOptions::default()
+                .default_queue_config(QueueConfig::default().keep_done_jobs(None))
+                .flush_interval(Some(Duration::from_millis(flush_interval_ms)))
+                .metrics_sample_interval(taquba_bencher::metrics_sample_interval()),
         )
         .await?,
     );

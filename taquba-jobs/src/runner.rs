@@ -189,14 +189,12 @@ impl Submitter {
         headers.insert(JOB_TYPE_HEADER.to_string(), J::NAME.to_string());
 
         let dedup_key = job.idempotency_key();
-        let enqueue_opts = EnqueueOptions {
-            max_attempts: opts.max_attempts.or_else(|| job.max_attempts()),
-            priority: opts.priority,
-            run_at: opts.run_at,
-            dedup_key: dedup_key.clone(),
-            headers,
-            ..EnqueueOptions::default()
-        };
+        let enqueue_opts = EnqueueOptions::default()
+            .max_attempts(opts.max_attempts.or_else(|| job.max_attempts()))
+            .priority(opts.priority)
+            .run_at(opts.run_at)
+            .dedup_key(dedup_key.clone())
+            .headers(headers);
 
         let (id, newly_submitted) = match dedup_key {
             Some(idem_key) => {
@@ -274,10 +272,7 @@ impl Submitter {
             job_id: id.clone(),
         })?;
         let kv_writes = HashMap::from([(kv_key.clone(), record_bytes)]);
-        let enqueue_opts = EnqueueOptions {
-            id_override: Some(id.clone()),
-            ..enqueue_opts
-        };
+        let enqueue_opts = enqueue_opts.id_override(Some(id.clone()));
 
         let result = self
             .queue
@@ -1059,10 +1054,7 @@ mod tests {
         cfg: QueueConfig,
     ) -> (Arc<Queue>, Arc<dyn ObjectStore>) {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let opts = OpenOptions {
-            default_queue_config: cfg,
-            ..OpenOptions::default()
-        };
+        let opts = OpenOptions::default().default_queue_config(cfg);
         let queue = Arc::new(
             Queue::open_with_options(store.clone(), name, opts)
                 .await
@@ -1080,13 +1072,11 @@ mod tests {
         cfg: QueueConfig,
     ) -> (Arc<Queue>, Arc<dyn ObjectStore>) {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let opts = OpenOptions {
-            clock: Arc::new(clock),
-            scheduler_interval: Duration::from_millis(10),
-            reaper_interval: Duration::from_millis(10),
-            default_queue_config: cfg,
-            ..OpenOptions::default()
-        };
+        let opts = OpenOptions::default()
+            .clock(Arc::new(clock))
+            .scheduler_interval(Duration::from_millis(10))
+            .reaper_interval(Duration::from_millis(10))
+            .default_queue_config(cfg);
         let queue = Arc::new(
             Queue::open_with_options(store.clone(), name, opts)
                 .await
@@ -1278,10 +1268,7 @@ mod tests {
         // failure writes its outcome blob on the first (and only) attempt.
         let (queue, store) = open_queue_with_config(
             "test-cached-failure",
-            QueueConfig {
-                max_attempts: 1,
-                ..QueueConfig::default()
-            },
+            QueueConfig::default().max_attempts(1),
         )
         .await;
         let mut runner = JobRunner::builder(queue, store).build();
@@ -1428,11 +1415,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn transient_failure_exhausts_retries_and_dead_letters() {
-        let cfg = QueueConfig {
-            max_attempts: 2,
-            retry_backoff_base: Duration::ZERO,
-            ..QueueConfig::default()
-        };
+        let cfg = QueueConfig::default()
+            .max_attempts(2)
+            .retry_backoff_base(Duration::ZERO);
         let (queue, store) = open_queue_with_config("test-transient-exhaust", cfg).await;
         let mut runner = JobRunner::builder(queue, store).build();
         runner.register::<AlwaysFailsTransient>();
@@ -1526,12 +1511,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn fan_out_from_handler_runs_children() {
         // Long lease + single attempt.
-        let cfg = QueueConfig {
-            lease_duration: Duration::from_secs(300),
-            max_attempts: 1,
-            retry_backoff_base: Duration::ZERO,
-            ..QueueConfig::default()
-        };
+        let cfg = QueueConfig::default()
+            .lease_duration(Duration::from_secs(300))
+            .max_attempts(1)
+            .retry_backoff_base(Duration::ZERO);
         let (queue, store) = open_queue_with_config("test-fanout", cfg).await;
         let counter = Arc::new(AtomicU32::new(0));
         let mut runner = JobRunner::builder(queue, store)
@@ -1611,12 +1594,10 @@ mod tests {
     async fn lease_expiry_triggers_reaper_requeue() {
         let t0_ms = 1_700_000_000_000_u64;
         let clock = MockClock::new(t0_ms);
-        let cfg = QueueConfig {
-            lease_duration: Duration::from_secs(10),
-            max_attempts: 5,
-            retry_backoff_base: Duration::ZERO,
-            ..QueueConfig::default()
-        };
+        let cfg = QueueConfig::default()
+            .lease_duration(Duration::from_secs(10))
+            .max_attempts(5)
+            .retry_backoff_base(Duration::ZERO);
         let (queue, store) = open_queue_with_clock("test-lease", clock.clone(), cfg).await;
         let attempts = Arc::new(AtomicU32::new(0));
         let mut runner = JobRunner::builder(queue, store)
@@ -1720,14 +1701,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn terminal_marker_written_for_terminal_failures_too() {
         let queue_name = "test-retention-failure";
-        let (queue, store) = open_queue_with_config(
-            queue_name,
-            QueueConfig {
-                max_attempts: 1,
-                ..QueueConfig::default()
-            },
-        )
-        .await;
+        let (queue, store) =
+            open_queue_with_config(queue_name, QueueConfig::default().max_attempts(1)).await;
         let mut runner = JobRunner::builder(queue, store.clone())
             .queue_name(queue_name)
             .result_retention(Duration::from_secs(60))

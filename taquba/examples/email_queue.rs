@@ -80,21 +80,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     opts.queue_configs.insert(
         "transactional".to_string(),
-        QueueConfig {
-            max_attempts: 5,
-            lease_duration: Duration::from_secs(30),
-            default_priority: PRIORITY_HIGH,
-            ..QueueConfig::default()
-        },
+        QueueConfig::default()
+            .max_attempts(5)
+            .lease_duration(Duration::from_secs(30))
+            .default_priority(PRIORITY_HIGH),
     );
     opts.queue_configs.insert(
         "marketing".to_string(),
-        QueueConfig {
-            max_attempts: 2,
-            lease_duration: Duration::from_secs(60),
-            default_priority: PRIORITY_LOW,
-            ..QueueConfig::default()
-        },
+        QueueConfig::default()
+            .max_attempts(2)
+            .lease_duration(Duration::from_secs(60))
+            .default_priority(PRIORITY_LOW),
     );
 
     // To use S3 or MinIO instead of memory, swap InMemory for an S3Builder:
@@ -142,10 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     q.enqueue_with(
         "marketing",
         encode("vip@example.com", "Your exclusive early access"),
-        EnqueueOptions {
-            priority: Some(PRIORITY_NORMAL),
-            ..Default::default()
-        },
+        EnqueueOptions::default().priority(Some(PRIORITY_NORMAL)),
     )
     .await?;
 

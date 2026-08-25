@@ -140,15 +140,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Queue::open_with_options(
             store.clone(),
             "workflow",
-            OpenOptions {
-                reaper_interval: Duration::from_secs(1),
-                default_queue_config: QueueConfig {
-                    lease_duration: LEASE,
-                    max_attempts: 100,
-                    ..QueueConfig::default()
-                },
-                ..OpenOptions::default()
-            },
+            OpenOptions::default()
+                .reaper_interval(Duration::from_secs(1))
+                .default_queue_config(
+                    QueueConfig::default()
+                        .lease_duration(LEASE)
+                        .max_attempts(100),
+                ),
         )
         .await?,
     );

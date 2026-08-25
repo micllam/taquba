@@ -80,16 +80,11 @@ const WATCHER_TICK: Duration = Duration::from_secs(1);
 const IDLE_BACKOFF: Duration = Duration::from_millis(2);
 
 fn open_options(flush_interval_ms: u64, reaper_interval: Duration) -> OpenOptions {
-    OpenOptions {
-        default_queue_config: QueueConfig {
-            keep_done_jobs: None,
-            ..QueueConfig::default()
-        },
-        flush_interval: Some(Duration::from_millis(flush_interval_ms)),
-        reaper_interval,
-        metrics_sample_interval: taquba_bencher::metrics_sample_interval(),
-        ..OpenOptions::default()
-    }
+    OpenOptions::default()
+        .default_queue_config(QueueConfig::default().keep_done_jobs(None))
+        .flush_interval(Some(Duration::from_millis(flush_interval_ms)))
+        .reaper_interval(reaper_interval)
+        .metrics_sample_interval(taquba_bencher::metrics_sample_interval())
 }
 
 #[tokio::main(flavor = "multi_thread")]

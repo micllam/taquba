@@ -90,14 +90,9 @@ const HISTORY_CLAIM_BATCH: usize = 64;
 const HISTORY_ENQUEUE_BATCH: usize = 1_000;
 
 fn open_options(flush_interval_ms: u64) -> OpenOptions {
-    OpenOptions {
-        default_queue_config: QueueConfig {
-            keep_done_jobs: None,
-            ..QueueConfig::default()
-        },
-        flush_interval: Some(Duration::from_millis(flush_interval_ms)),
-        ..OpenOptions::default()
-    }
+    OpenOptions::default()
+        .default_queue_config(QueueConfig::default().keep_done_jobs(None))
+        .flush_interval(Some(Duration::from_millis(flush_interval_ms)))
 }
 
 /// Build the on-disk history a restart will see: enqueue and drain

@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Built against the `taquba` option setters: `OpenOptions`,
+  `QueueConfig`, `EnqueueOptions` and `SettlementEffects` are
+  `#[non_exhaustive]` in `taquba` and are constructed through their
+  setters here and in the documentation examples. Callers that build
+  these types for a queue shared with this crate migrate the same way.
 - Run termination is atomic. Every path that settles a run now commits
   the terminal marker, the durable run record's delete and the terminal
   notification's enqueue in the same transaction as the settlement,
