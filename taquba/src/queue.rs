@@ -22,7 +22,7 @@ use crate::keys::{
     dedup_index_key, done_key, job_index_key, pending_key, pending_prefix, scheduled_key,
     tag_prefix, user_scoped_key,
 };
-use crate::lease_registry::LeaseRegistry;
+use crate::lease_registry::{LeaseRegistry, Renewal};
 use crate::payload_store::PayloadStore;
 use crate::reaper::{Reaper, reap_expired};
 use crate::scheduler::{Scheduler, promote_due_jobs};
@@ -2270,13 +2270,15 @@ impl Queue {
             return Err(Error::CancelRequested);
         }
         let new_expiry = self.now_ms() + extension.as_millis() as u64;
-        if !self
-            .lease_registry
-            .renew(&job.queue, &job.id, claim.token(), new_expiry)
-        {
-            return Err(Error::ClaimLost);
+        if self.lease_registry.renew(
+            &job.queue,
+            &job.id,
+            claim.token(),
+            new_expiry,
+            Renewal::Set,
+        )? {
+            crate::obs::renewed(&job.queue);
         }
-        crate::obs::renewed(&job.queue);
         debug!(queue = %job.queue, job_id = %job.id, new_expiry, "lease renewed");
         Ok(new_expiry)
     }

@@ -39,6 +39,19 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio_util::sync::CancellationToken;
 
+use crate::error::{Error, Result};
+
+/// How [`LeaseRegistry::renew`] applies the requested expiry.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Renewal {
+    /// Set the expiry to the requested value, which may shorten the
+    /// lease.
+    Set,
+    /// Raise the expiry to the requested value when the lease ends
+    /// sooner; a lease that already lasts longer is unchanged.
+    Extend,
+}
+
 /// A due lease the reaper has marked and is examining.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct DueLease {
@@ -116,17 +129,30 @@ impl LeaseRegistry {
         );
     }
 
-    /// Set the lease's expiry to `expires_at`. Returns `false`, leaving
-    /// the registry unchanged, when the job holds no lease, the lease
+    /// Apply `expires_at` to the lease per `mode`. Returns whether the
+    /// expiry changed. Fails with [`Error::ClaimLost`], leaving the
+    /// registry unchanged, when the job holds no lease, the lease
     /// belongs to a different claim or the reaper has already taken the
     /// entry as due.
-    pub(crate) fn renew(&self, queue: &str, id: &str, token: u64, expires_at: u64) -> bool {
+    pub(crate) fn renew(
+        &self,
+        queue: &str,
+        id: &str,
+        token: u64,
+        expires_at: u64,
+        mode: Renewal,
+    ) -> Result<bool> {
         let mut inner = self.lock();
         let key = (queue.to_string(), id.to_string());
         let old_expires = match inner.by_job.get(&key) {
             Some(e) if e.token == token && !e.reaping => e.expires_at,
-            _ => return false,
+            _ => return Err(Error::ClaimLost),
         };
+        if old_expires == expires_at
+            || (matches!(mode, Renewal::Extend) && old_expires > expires_at)
+        {
+            return Ok(false);
+        }
         inner
             .by_expiry
             .remove(&(old_expires, key.0.clone(), key.1.clone()));
@@ -138,7 +164,7 @@ impl LeaseRegistry {
             .get_mut(&key)
             .expect("entry present above")
             .expires_at = expires_at;
-        true
+        Ok(true)
     }
 
     /// The job's current expiry and claim token, or `None` when it
@@ -259,14 +285,14 @@ mod tests {
         let registry = LeaseRegistry::new();
         registry.insert("q", "a", 100, 1, CancellationToken::new());
         assert!(registry.take_due(99).is_empty());
-        assert!(registry.renew("q", "a", 1, 200));
+        assert!(registry.renew("q", "a", 1, 200, Renewal::Set).is_ok());
     }
 
     #[test]
     fn a_renewal_moves_the_entry_in_expiry_order() {
         let registry = LeaseRegistry::new();
         registry.insert("q", "a", 10, 1, CancellationToken::new());
-        assert!(registry.renew("q", "a", 1, 40));
+        assert!(registry.renew("q", "a", 1, 40, Renewal::Set).is_ok());
 
         assert!(registry.take_due(10).is_empty());
         let due = registry.take_due(40);
@@ -278,7 +304,10 @@ mod tests {
     fn a_renewal_to_an_unchanged_expiry_keeps_the_entry() {
         let registry = LeaseRegistry::new();
         registry.insert("q", "a", 10, 1, CancellationToken::new());
-        assert!(registry.renew("q", "a", 1, 10));
+        assert_eq!(
+            registry.renew("q", "a", 1, 10, Renewal::Set).ok(),
+            Some(false)
+        );
         assert!(registry.contains("q", "a", 10));
         assert_eq!(registry.take_due(10).len(), 1);
     }
@@ -287,11 +316,11 @@ mod tests {
     fn renewal_is_refused_for_a_stale_token_and_for_a_marked_entry() {
         let registry = LeaseRegistry::new();
         registry.insert("q", "a", 10, 1, CancellationToken::new());
-        assert!(!registry.renew("q", "a", 2, 40));
-        assert!(!registry.renew("q", "missing", 1, 40));
+        assert!(registry.renew("q", "a", 2, 40, Renewal::Set).is_err());
+        assert!(registry.renew("q", "missing", 1, 40, Renewal::Set).is_err());
 
         assert_eq!(registry.take_due(10).len(), 1);
-        assert!(!registry.renew("q", "a", 1, 40));
+        assert!(registry.renew("q", "a", 1, 40, Renewal::Set).is_err());
     }
 
     #[test]
