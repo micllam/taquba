@@ -2,7 +2,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use slatedb::IsolationLevel;
 use tokio::sync::Notify;
+
+use crate::error::Result;
+use crate::keys::{KeyTag, cursor_key, tag_prefix};
+use crate::queue_core::QueueCore;
 
 /// Upper bound on wakeups issued for one batch of inserts. Beyond the
 /// cap, woken workers drain the backlog by looping on claim, and
@@ -291,6 +296,84 @@ impl ClaimCursor {
             .claim_lock
             .clone()
     }
+}
+
+/// On-disk form of one queue's claim-scan state, stored under
+/// [`cursor_key`]. Written only by a clean
+/// [`Queue::close`](crate::Queue::close); the next open deletes the
+/// record before it accepts any call, so a record is never observed
+/// after the state it describes could have changed.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedCursor {
+    /// Queue the state belongs to; stored in the record so the
+    /// reader does not parse it out of the key.
+    queue: String,
+    /// Scan bound key, when one was established.
+    bound_key: Option<Vec<u8>>,
+    /// Whether the bound key itself may be live.
+    bound_inclusive: bool,
+    /// Whether a full scan had proven the queue empty at close.
+    known_empty: bool,
+}
+
+/// Write each queue's claim-scan state under its cursor key. Runs
+/// after the background tasks have stopped; `close` consumes the
+/// handle, so the exported state cannot change between the export and
+/// the database closing.
+pub(crate) async fn persist_cursor_state(core: &QueueCore) -> Result<()> {
+    let states = core.claim_cursor.export();
+    if states.is_empty() {
+        return Ok(());
+    }
+    let txn = core.db.begin(IsolationLevel::Snapshot).await?;
+    for (queue, state) in states {
+        let record = PersistedCursor {
+            queue: queue.clone(),
+            bound_key: state.scan_from.as_ref().map(|sf| sf.key.to_vec()),
+            bound_inclusive: state.scan_from.is_some_and(|sf| sf.inclusive),
+            known_empty: state.known_empty,
+        };
+        txn.put(cursor_key(&queue), &rmp_serde::to_vec_named(&record)?)?;
+    }
+    txn.commit().await?;
+    Ok(())
+}
+
+/// Restore the claim cursor from cursor records persisted by the
+/// previous clean close, then durably delete them before the queue
+/// accepts any call. A record is valid only as of the close that wrote
+/// it: once inserts resume the live bound can move behind the
+/// persisted one, so a crash before the delete is durable would leave
+/// a record whose stale bound makes a later open skip the jobs behind
+/// it.
+pub(crate) async fn restore_cursor_state(core: &QueueCore) -> Result<()> {
+    let txn = core.db.begin(IsolationLevel::Snapshot).await?;
+    let mut records = Vec::new();
+    {
+        let mut iter = txn.scan_prefix(tag_prefix(KeyTag::Cursor), ..).await?;
+        while let Some(kv) = iter.next().await? {
+            let record: PersistedCursor = rmp_serde::from_slice(&kv.value)?;
+            records.push((kv.key, record));
+        }
+    }
+    if records.is_empty() {
+        return Ok(());
+    }
+    for (key, record) in records {
+        core.claim_cursor.restore(
+            &record.queue,
+            CursorState {
+                scan_from: record.bound_key.map(|key| ScanFrom {
+                    key: Bytes::from(key),
+                    inclusive: record.bound_inclusive,
+                }),
+                known_empty: record.known_empty,
+            },
+        );
+        txn.delete(&key)?;
+    }
+    txn.commit().await?;
+    Ok(())
 }
 
 #[cfg(test)]

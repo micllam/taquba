@@ -11,16 +11,15 @@ use tracing::{debug, instrument, warn};
 use ulid::Ulid;
 
 use crate::background::BackgroundTask;
-use crate::claim_cursor::{ClaimCursor, CursorState, ScanFrom};
+use crate::claim_cursor::ClaimCursor;
 use crate::clock::{Clock, default_clock};
 use crate::completion::CompletionWaiters;
 use crate::error::{Error, Result};
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{Claim, JobRecord, JobStatus};
 use crate::keys::{
-    KeyTag, MAX_QUEUE_NAME_LEN, attempt_history_key, claimed_key, cursor_key, dead_key,
-    dedup_index_key, job_index_key, pending_key, pending_prefix, scheduled_key, tag_prefix,
-    user_scoped_key,
+    MAX_QUEUE_NAME_LEN, attempt_history_key, claimed_key, dead_key, dedup_index_key, job_index_key,
+    pending_key, pending_prefix, scheduled_key, user_scoped_key,
 };
 use crate::lease_registry::{LeaseRegistry, Renewal};
 use crate::payload_store::PayloadStore;
@@ -30,7 +29,8 @@ use crate::scheduler::Scheduler;
 use crate::stats::{QueueMergeOperator, QueueStats, update_stats};
 use crate::txn::ClaimEnd;
 use crate::txn::{
-    Commit, Durability, commit, put_job_record, stage_claim_end, stage_to_pending, take_claim,
+    Commit, Durability, commit, get_indexed_job, put_job_record, stage_claim_end, stage_to_pending,
+    take_claim,
 };
 
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
@@ -111,23 +111,6 @@ pub const PRIORITY_HIGH: u32 = 100;
 pub const PRIORITY_NORMAL: u32 = 1_000;
 /// Low-priority bucket. Jobs at this priority are dequeued after high and normal.
 pub const PRIORITY_LOW: u32 = 10_000;
-
-/// On-disk form of one queue's claim-scan state, stored under
-/// [`cursor_key`]. Written only by a clean [`Queue::close`]; the next
-/// open deletes the record before serving traffic, so a record is
-/// never observed after the state it describes could have changed.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PersistedCursor {
-    /// Queue the state belongs to; carried in the record so the
-    /// reader does not parse it out of the key.
-    queue: String,
-    /// Scan bound key, when one was established.
-    bound_key: Option<Vec<u8>>,
-    /// Whether the bound key itself may be live.
-    bound_inclusive: bool,
-    /// Whether a full scan had proven the queue empty at close.
-    known_empty: bool,
-}
 
 /// Maximum size of a single value in the user KV namespace.
 ///
@@ -681,7 +664,7 @@ impl Queue {
             completion_waiters: Arc::new(CompletionWaiters::default()),
             payload_store,
         });
-        restore_cursor_state(&core).await?;
+        crate::claim_cursor::restore_cursor_state(&core).await?;
         // A claimed record found at open belongs to a process that no
         // longer holds the store, so its claim is void and the job is
         // re-queued immediately. Runs after `restore_cursor_state` so
@@ -2454,94 +2437,17 @@ impl Queue {
         {
             task.write_closing_beat().await;
         }
-        persist_cursor_state(&self.core).await?;
+        crate::claim_cursor::persist_cursor_state(&self.core).await?;
         self.core.db.close().await?;
         Ok(())
     }
-}
-
-/// Resolve a job id through its index entry within `txn`: returns the
-/// index key, the record's current key and the decoded record, or
-/// `None` when the id is not indexed or the indexed key holds no
-/// record.
-async fn get_indexed_job(
-    txn: &DbTransaction,
-    id: &str,
-) -> Result<Option<(Vec<u8>, Bytes, JobRecord)>> {
-    let index_key = job_index_key(id);
-    let Some(current_key) = txn.get(&index_key).await? else {
-        return Ok(None);
-    };
-    let Some(bytes) = txn.get(&current_key).await? else {
-        return Ok(None);
-    };
-    let job = JobRecord::decode(&current_key, &bytes)?;
-    Ok(Some((index_key, current_key, job)))
-}
-
-/// Write each queue's claim-scan state under its cursor key. Runs
-/// after the background tasks have stopped; `close` consumes the
-/// handle, so the exported state cannot change between the export and
-/// the database closing.
-async fn persist_cursor_state(core: &QueueCore) -> Result<()> {
-    let states = core.claim_cursor.export();
-    if states.is_empty() {
-        return Ok(());
-    }
-    let txn = core.db.begin(IsolationLevel::Snapshot).await?;
-    for (queue, state) in states {
-        let record = PersistedCursor {
-            queue: queue.clone(),
-            bound_key: state.scan_from.as_ref().map(|sf| sf.key.to_vec()),
-            bound_inclusive: state.scan_from.is_some_and(|sf| sf.inclusive),
-            known_empty: state.known_empty,
-        };
-        txn.put(cursor_key(&queue), &rmp_serde::to_vec_named(&record)?)?;
-    }
-    txn.commit().await?;
-    Ok(())
-}
-
-/// Restore the claim cursor from cursor records persisted by the
-/// previous clean close, then durably delete them before the queue
-/// serves traffic. A record is valid only as of the close that wrote
-/// it: once inserts resume the live bound can move behind the
-/// persisted one, so a crash before the delete is durable would leave
-/// a record whose stale bound lets a later open strand jobs behind it.
-async fn restore_cursor_state(core: &QueueCore) -> Result<()> {
-    let txn = core.db.begin(IsolationLevel::Snapshot).await?;
-    let mut records = Vec::new();
-    {
-        let mut iter = txn.scan_prefix(tag_prefix(KeyTag::Cursor), ..).await?;
-        while let Some(kv) = iter.next().await? {
-            let record: PersistedCursor = rmp_serde::from_slice(&kv.value)?;
-            records.push((kv.key, record));
-        }
-    }
-    if records.is_empty() {
-        return Ok(());
-    }
-    for (key, record) in records {
-        core.claim_cursor.restore(
-            &record.queue,
-            CursorState {
-                scan_from: record.bound_key.map(|key| ScanFrom {
-                    key: Bytes::from(key),
-                    inclusive: record.bound_inclusive,
-                }),
-                known_empty: record.known_empty,
-            },
-        );
-        txn.delete(&key)?;
-    }
-    txn.commit().await?;
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::clock::MockClock;
+    use crate::keys::{KeyTag, cursor_key, tag_prefix};
     use crate::lease::LeaseHandle;
     use slatedb::object_store::memory::InMemory;
 

@@ -1,4 +1,5 @@
 //! Transaction helpers shared by the queue, reaper and scheduler.
+use bytes::Bytes;
 use slatedb::DbTransaction;
 use slatedb::config::WriteOptions;
 
@@ -28,6 +29,25 @@ pub(crate) fn put_job_record(
     txn.put(key, value)?;
     txn.put(index_key, key)?;
     Ok(())
+}
+
+/// Resolve a job id through its index entry within `txn`: returns the
+/// index key, the record's current key and the decoded record, or
+/// `None` when the id is not indexed or the indexed key holds no
+/// record.
+pub(crate) async fn get_indexed_job(
+    txn: &DbTransaction,
+    id: &str,
+) -> Result<Option<(Vec<u8>, Bytes, JobRecord)>> {
+    let index_key = job_index_key(id);
+    let Some(current_key) = txn.get(&index_key).await? else {
+        return Ok(None);
+    };
+    let Some(bytes) = txn.get(&current_key).await? else {
+        return Ok(None);
+    };
+    let job = JobRecord::decode(&current_key, &bytes)?;
+    Ok(Some((index_key, current_key, job)))
 }
 
 /// Verify that the job still holds the claim `token` identifies, stage
