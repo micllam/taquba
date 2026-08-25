@@ -509,12 +509,18 @@ pub struct SettlementEffects {
 ///
 /// # Background tasks
 ///
-/// Two background tasks run while the queue is open:
+/// Background tasks run while the queue is open:
 ///
-/// - **Reaper**: scans for jobs whose lease has expired and re-queues them so they
-///   are retried by another worker. Interval is configurable via [`OpenOptions::reaper_interval`].
-/// - **Scheduler**: promotes jobs whose `run_at` time has passed from the scheduled
-///   state to pending. Interval is configurable via [`OpenOptions::scheduler_interval`].
+/// - **Reaper**: re-queues or dead-letters jobs whose lease has expired and
+///   runs the done and dead-letter retention sweeps
+///   ([`OpenOptions::reaper_interval`]).
+/// - **Scheduler**: promotes jobs whose `run_at` has passed from the
+///   scheduled state to pending ([`OpenOptions::scheduler_interval`]).
+/// - **Metrics sampler**, when [`OpenOptions::metrics_sample_interval`] is
+///   set: emits per-queue depth and oldest-pending-age gauges.
+/// - **Liveness heartbeat**, when [`OpenOptions::liveness_heartbeat`] is
+///   set: commits a beat that a [`QueueReader`](crate::QueueReader) reads
+///   from another process.
 ///
 /// # Concurrency
 ///
@@ -550,10 +556,9 @@ pub struct Queue {
     /// millisecond. One generator per store suffices: a store has a
     /// single writer process.
     id_gen: std::sync::Mutex<ulid::Generator>,
-    /// Wakeup fired whenever any job reaches a terminal state: `Done`
-    /// (acked, kept or not), `Dead` (dead-lettered by worker, exhausted
-    /// retry, or reaper), or `Pending` / `Scheduled` jobs removed via
-    /// [`Self::cancel`]. Drives [`Self::wait_for_completion`].
+    /// Tasks waiting in [`Self::wait_for_completion`], keyed by job id.
+    /// Every terminal transition (`Done`, `Dead`, removal by
+    /// [`Self::cancel`]) delivers its outcome to the job's waiters.
     completion_waiters: Arc<CompletionWaiters>,
     /// Storage for offloaded payload objects. Shared with the reaper,
     /// whose retention sweeps delete the objects of expired records.

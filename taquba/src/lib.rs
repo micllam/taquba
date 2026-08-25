@@ -332,13 +332,18 @@
 //!
 //! # Background tasks
 //!
-//! [`Queue::open`] spawns two background tokio tasks for the lifetime of the
+//! [`Queue::open`] spawns background tokio tasks for the lifetime of the
 //! handle:
 //!
 //! - **Reaper** - re-queues jobs whose lease expired and runs the done /
 //!   dead-letter retention sweeps (interval: [`OpenOptions::reaper_interval`]).
 //! - **Scheduler** - promotes scheduled jobs whose `run_at` has passed
 //!   (interval: [`OpenOptions::scheduler_interval`]).
+//! - **Metrics sampler** - emits depth and oldest-pending-age gauges, only
+//!   when [`OpenOptions::metrics_sample_interval`] is set.
+//! - **Liveness heartbeat** - commits a beat readable by a [`QueueReader`]
+//!   from another process, only when [`OpenOptions::liveness_heartbeat`]
+//!   is set.
 //!
 //! Opening a queue also re-queues every job left claimed by a previous
 //! process: crash recovery happens at open, and lease expiry detects a
