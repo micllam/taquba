@@ -618,6 +618,16 @@ struct PreparedEffects {
     kv_deletes: Vec<Vec<u8>>,
 }
 
+/// Effects staged into a settlement transaction by
+/// [`Queue::stage_effects`], retained for the work that follows the
+/// commit.
+struct StagedEffects {
+    /// One result per prepared enqueue, in order.
+    results: Vec<EnqueueResult>,
+    /// The enqueues that staged a new record.
+    jobs: Vec<StagedJob>,
+}
+
 /// Identity of a job staged by [`Queue::stage_job_writes`], retained
 /// for post-commit bookkeeping.
 struct StagedJob {
@@ -1163,13 +1173,13 @@ impl Queue {
     /// Called inside every iteration of the settlement's retry loop.
     /// A dedup hit downgrades that enqueue to
     /// [`EnqueueResult::AlreadyEnqueued`] without affecting the rest.
-    /// After the transaction commits, the caller must pass each staged
-    /// value to [`Self::note_staged_job`].
+    /// After the transaction commits, the caller passes the result to
+    /// [`Self::note_staged_effects`].
     async fn stage_effects(
         &self,
         txn: &DbTransaction,
         prepared: &PreparedEffects,
-    ) -> Result<(Vec<EnqueueResult>, Vec<StagedJob>)> {
+    ) -> Result<StagedEffects> {
         let mut staged = Vec::with_capacity(prepared.prepared_jobs.len());
         let mut results = Vec::with_capacity(prepared.prepared_jobs.len());
         for prepared_job in &prepared.prepared_jobs {
@@ -1187,7 +1197,19 @@ impl Queue {
         for k in &prepared.kv_deletes {
             txn.delete(user_scoped_key(k))?;
         }
-        Ok((results, staged))
+        Ok(StagedEffects {
+            results,
+            jobs: staged,
+        })
+    }
+
+    /// Record the staged jobs after the commit and return their enqueue
+    /// results.
+    fn note_staged_effects(&self, staged: StagedEffects) -> Vec<EnqueueResult> {
+        for staged_job in &staged.jobs {
+            self.note_staged_job(staged_job);
+        }
+        staged.results
     }
 
     /// Persist a prepared [`JobRecord`], optionally checking a dedup index
@@ -1899,15 +1921,10 @@ impl Queue {
                 &[(JobStatus::Claimed, -1), (JobStatus::Done, 1)],
             )?;
 
-            let (results, staged) = self.stage_effects(&txn, prepared).await?;
+            let staged = self.stage_effects(&txn, prepared).await?;
 
             match commit(txn, Durability::Awaited).await? {
-                Commit::Committed => {
-                    for staged_job in &staged {
-                        self.note_staged_job(staged_job);
-                    }
-                    return Ok(results);
-                }
+                Commit::Committed => return Ok(self.note_staged_effects(staged)),
                 Commit::Conflict => continue,
             }
         }
@@ -1985,13 +2002,7 @@ impl Queue {
 
             match commit(txn, Durability::Awaited).await? {
                 Commit::Committed => {
-                    let results = staged.map(|(results, staged_jobs)| {
-                        for staged_job in &staged_jobs {
-                            self.note_staged_job(staged_job);
-                        }
-                        results
-                    });
-                    return Ok((job, results));
+                    return Ok((job, staged.map(|s| self.note_staged_effects(s))));
                 }
                 Commit::Conflict => continue,
             }
@@ -2013,14 +2024,9 @@ impl Queue {
             let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
             let mut job = take_claim(&txn, &self.core.lease_registry, queue, id, token).await?;
             stage_dead_letter(&txn, &mut job, failed_at, reason)?;
-            let (results, staged) = self.stage_effects(&txn, prepared).await?;
+            let staged = self.stage_effects(&txn, prepared).await?;
             match commit(txn, Durability::Awaited).await? {
-                Commit::Committed => {
-                    for staged_job in &staged {
-                        self.note_staged_job(staged_job);
-                    }
-                    return Ok((job, results));
-                }
+                Commit::Committed => return Ok((job, self.note_staged_effects(staged))),
                 Commit::Conflict => continue,
             }
         }
@@ -2398,11 +2404,11 @@ impl Queue {
                     } else {
                         update_stats(&txn, &job.queue, &[(JobStatus::Pending, -1)])?;
                     }
-                    let (results, staged) = self.stage_effects(&txn, prepared).await?;
+                    let staged = self.stage_effects(&txn, prepared).await?;
                     (
                         "pending/scheduled job cancelled",
                         CancelOutcome::Removed,
-                        Some((results, staged)),
+                        Some(staged),
                     )
                 }
                 JobStatus::Claimed => {
@@ -2437,15 +2443,9 @@ impl Queue {
                     // before this call may still observe the token.
                     // That claim's end removes the entry.
                     self.core.lease_registry.cancel(&job.queue, id);
-                    let results = match staged {
-                        Some((results, staged_jobs)) => {
-                            for staged_job in &staged_jobs {
-                                self.note_staged_job(staged_job);
-                            }
-                            results
-                        }
-                        None => Vec::new(),
-                    };
+                    let results = staged
+                        .map(|s| self.note_staged_effects(s))
+                        .unwrap_or_default();
                     // Removed = terminal (job is gone). Requested = not yet
                     // terminal; the worker's settlement delivers the
                     // outcome when it acks / nacks / dead-letters.
