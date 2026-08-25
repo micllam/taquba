@@ -6,7 +6,7 @@ use slatedb::{Db, IsolationLevel};
 use tracing::{debug, warn};
 
 use crate::WaitOutcome;
-use crate::background::Ticker;
+use crate::background::Periodic;
 use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
 use crate::completion::CompletionWaiters;
@@ -34,80 +34,61 @@ pub(crate) struct Reaper {
 }
 
 impl Reaper {
-    pub(crate) async fn run(self, mut ticker: Ticker) {
-        let Reaper {
-            db,
-            default_queue_config,
-            queue_configs,
-            clock,
-            completion_waiters,
-            claim_cursor,
-            payload_store,
-            lease_registry,
-        } = self;
+    fn config(&self, queue: &str) -> &QueueConfig {
+        self.queue_configs
+            .get(queue)
+            .unwrap_or(&self.default_queue_config)
+    }
 
-        let any_keep_done = default_queue_config.keep_done_jobs.is_some()
-            || queue_configs.values().any(|c| c.keep_done_jobs.is_some());
-        let any_dead_retention = default_queue_config.dead_retention.is_some()
-            || queue_configs.values().any(|c| c.dead_retention.is_some());
+    fn configs(&self) -> impl Iterator<Item = &QueueConfig> {
+        std::iter::once(&self.default_queue_config).chain(self.queue_configs.values())
+    }
+}
 
-        // Largest configured `keep_done_jobs` across every queue (named
-        // and default). Any done record whose `completed_at` is
-        // newer than `now - max_keep_done` cannot be expired for any
-        // queue, so the time-ordered done scan can stop the first
-        // time it sees a key past that threshold.
-        let max_keep_done: Option<Duration> = default_queue_config
-            .keep_done_jobs
-            .into_iter()
-            .chain(queue_configs.values().filter_map(|c| c.keep_done_jobs))
-            .max();
+impl Periodic for Reaper {
+    const NAME: &'static str = "lease reaper";
 
-        let keep_done_for = |queue: &str| -> Option<Duration> {
-            queue_configs
-                .get(queue)
-                .unwrap_or(&default_queue_config)
-                .keep_done_jobs
-        };
-        let dead_retention_for = |queue: &str| -> Option<Duration> {
-            queue_configs
-                .get(queue)
-                .unwrap_or(&default_queue_config)
-                .dead_retention
-        };
-
-        while ticker.tick().await {
-            if let Err(e) = reap_expired(
-                &db,
-                clock.as_ref(),
-                &completion_waiters,
-                &claim_cursor,
-                &lease_registry,
-                &payload_store,
+    /// Reap expired leases, then run the done and dead retention sweeps
+    /// of every queue with a retention configured. A sweep error is
+    /// logged here; the reap error is returned.
+    async fn step(&self) -> Result<()> {
+        let reaped = reap_expired(
+            &self.db,
+            self.clock.as_ref(),
+            &self.completion_waiters,
+            &self.claim_cursor,
+            &self.lease_registry,
+            &self.payload_store,
+        )
+        .await;
+        // The largest configured `keep_done_jobs`: no done record newer
+        // than `now - max_keep_done` is expired on any queue, so the
+        // time-ordered done scan stops at the first key past it.
+        let max_keep_done = self.configs().filter_map(|c| c.keep_done_jobs).max();
+        if max_keep_done.is_some()
+            && let Err(e) = sweep_done(
+                &self.db,
+                self.clock.as_ref(),
+                &|queue| self.config(queue).keep_done_jobs,
+                max_keep_done,
+                &self.payload_store,
             )
             .await
-            {
-                warn!("lease reaper error: {e}");
-            }
-            if any_keep_done
-                && let Err(e) = sweep_done(
-                    &db,
-                    clock.as_ref(),
-                    &keep_done_for,
-                    max_keep_done,
-                    &payload_store,
-                )
-                .await
-            {
-                warn!("done retention sweep error: {e}");
-            }
-            if any_dead_retention
-                && let Err(e) =
-                    sweep_dead(&db, clock.as_ref(), &dead_retention_for, &payload_store).await
-            {
-                warn!("dead retention sweep error: {e}");
-            }
+        {
+            warn!("done retention sweep error: {e}");
         }
-        debug!("lease reaper stopped");
+        if self.configs().any(|c| c.dead_retention.is_some())
+            && let Err(e) = sweep_dead(
+                &self.db,
+                self.clock.as_ref(),
+                &|queue| self.config(queue).dead_retention,
+                &self.payload_store,
+            )
+            .await
+        {
+            warn!("dead retention sweep error: {e}");
+        }
+        reaped
     }
 }
 

@@ -6,7 +6,19 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing::error;
+use tracing::{debug, error, warn};
+
+use crate::error::Result;
+
+/// A unit of work run once per tick by [`BackgroundTask::spawn_periodic`].
+pub(crate) trait Periodic: Send + Sync + 'static {
+    /// Name used in the task's log lines.
+    const NAME: &'static str;
+
+    /// Run one tick. An error is logged at warn level and the task
+    /// continues.
+    fn step(&self) -> impl Future<Output = Result<()>> + Send;
+}
 
 /// A spawned task stopped by [`BackgroundTask::stop`]. The task is
 /// given a [`Ticker`] and runs until the ticker reports shutdown,
@@ -45,6 +57,21 @@ impl<T: Send + 'static> BackgroundTask<T> {
                 None
             }
         }
+    }
+}
+
+impl BackgroundTask {
+    /// Spawn `task` so that its [`Periodic::step`] runs once per
+    /// `interval` until shutdown.
+    pub(crate) fn spawn_periodic<P: Periodic>(interval: Duration, task: P) -> BackgroundTask {
+        BackgroundTask::spawn(interval, |mut ticker| async move {
+            while ticker.tick().await {
+                if let Err(e) = task.step().await {
+                    warn!("{} error: {e}", P::NAME);
+                }
+            }
+            debug!("{} stopped", P::NAME);
+        })
     }
 }
 

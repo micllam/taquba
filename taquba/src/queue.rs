@@ -687,14 +687,13 @@ impl Queue {
             payload_store: payload_store.clone(),
             lease_registry: lease_registry.clone(),
         };
-        let reaper = BackgroundTask::spawn(opts.reaper_interval, |ticker| reaper.run(ticker));
+        let reaper = BackgroundTask::spawn_periodic(opts.reaper_interval, reaper);
         let scheduler = Scheduler {
             db: db.clone(),
             clock: opts.clock.clone(),
             claim_cursor: claim_cursor.clone(),
         };
-        let scheduler =
-            BackgroundTask::spawn(opts.scheduler_interval, |ticker| scheduler.run(ticker));
+        let scheduler = BackgroundTask::spawn_periodic(opts.scheduler_interval, scheduler);
 
         #[cfg(feature = "metrics")]
         let metrics_sampler = opts.metrics_sample_interval.map(|interval| {
@@ -702,7 +701,7 @@ impl Queue {
                 db: db.clone(),
                 clock: opts.clock.clone(),
             };
-            BackgroundTask::spawn(interval, |ticker| sampler.run(ticker))
+            BackgroundTask::spawn_periodic(interval, sampler)
         });
         #[cfg(not(feature = "metrics"))]
         let metrics_sampler: Option<BackgroundTask> = None;
@@ -2690,11 +2689,11 @@ impl Queue {
     /// closed is committed best-effort, so readers can distinguish
     /// this close from a writer that stopped beating.
     pub async fn close(self) -> Result<()> {
-        self.reaper.stop().await;
-        self.scheduler.stop().await;
-        if let Some(sampler) = self.metrics_sampler {
-            sampler.stop().await;
-        }
+        tokio::join!(self.reaper.stop(), self.scheduler.stop(), async {
+            if let Some(sampler) = self.metrics_sampler {
+                sampler.stop().await;
+            }
+        });
         if let Some(heartbeat) = self.heartbeat
             && let Some(task) = heartbeat.stop().await
         {

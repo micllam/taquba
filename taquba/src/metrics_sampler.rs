@@ -10,30 +10,24 @@
 
 use std::sync::Arc;
 
-use slatedb::Db;
-use tracing::{debug, warn};
-
-use crate::background::Ticker;
+use crate::background::Periodic;
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::job::JobRecord;
 use crate::keys::pending_prefix;
 use crate::read::{list_queues, stats};
+use slatedb::Db;
 
 pub(crate) struct MetricsSampler {
     pub(crate) db: Arc<Db>,
     pub(crate) clock: Arc<dyn Clock>,
 }
 
-impl MetricsSampler {
-    pub(crate) async fn run(self, mut ticker: Ticker) {
-        let MetricsSampler { db, clock } = self;
-        while ticker.tick().await {
-            if let Err(e) = sample(&db, clock.as_ref()).await {
-                warn!("metrics sampler error: {e}");
-            }
-        }
-        debug!("metrics sampler stopped");
+impl Periodic for MetricsSampler {
+    const NAME: &'static str = "metrics sampler";
+
+    async fn step(&self) -> Result<()> {
+        sample(&self.db, self.clock.as_ref()).await
     }
 }
 

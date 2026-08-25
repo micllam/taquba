@@ -274,9 +274,7 @@ where
     'main: loop {
         // Reap completed tasks (non-blocking) and log any panics.
         while let Some(result) = set.try_join_next() {
-            if let Err(e) = result {
-                warn!(queue = queue, "worker task panicked: {e}");
-            }
+            note_task_result(queue, result);
         }
 
         // If at capacity, wait for one slot to free up. Shutdown can interrupt
@@ -287,8 +285,8 @@ where
                 biased;
                 _ = &mut shutdown => break 'main,
                 r = set.join_next() => {
-                    if let Some(Err(e)) = r {
-                        warn!(queue = queue, "worker task panicked: {e}");
+                    if let Some(result) = r {
+                        note_task_result(queue, result);
                     }
                 }
             }
@@ -328,11 +326,17 @@ where
         "draining workers on shutdown"
     );
     while let Some(result) = set.join_next().await {
-        if let Err(e) = result {
-            warn!(queue = queue, "worker task panicked during drain: {e}");
-        }
+        note_task_result(queue, result);
     }
     Ok(())
+}
+
+/// Log a spawned worker task that ended by panic. A settlement failure
+/// is logged by the task itself.
+fn note_task_result(queue: &str, result: std::result::Result<(), tokio::task::JoinError>) {
+    if let Err(e) = result {
+        warn!(queue = queue, "worker task panicked: {e}");
+    }
 }
 
 /// Process one claimed job and apply its settlement (ack with effects,

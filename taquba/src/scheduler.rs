@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use slatedb::{Db, IsolationLevel};
-use tracing::{debug, warn};
+use tracing::debug;
 
-use crate::background::Ticker;
+use crate::background::Periodic;
 use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
 use crate::error::Result;
@@ -17,19 +17,11 @@ pub(crate) struct Scheduler {
     pub(crate) claim_cursor: ClaimCursor,
 }
 
-impl Scheduler {
-    pub(crate) async fn run(self, mut ticker: Ticker) {
-        let Scheduler {
-            db,
-            clock,
-            claim_cursor,
-        } = self;
-        while ticker.tick().await {
-            if let Err(e) = promote_due_jobs(&db, clock.as_ref(), &claim_cursor).await {
-                warn!("scheduled job promoter error: {e}");
-            }
-        }
-        debug!("scheduled job promoter stopped");
+impl Periodic for Scheduler {
+    const NAME: &'static str = "scheduled job promoter";
+
+    async fn step(&self) -> Result<()> {
+        promote_due_jobs(&self.db, self.clock.as_ref(), &self.claim_cursor).await
     }
 }
 
