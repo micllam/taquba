@@ -24,8 +24,8 @@ use crate::keys::{
 };
 use crate::lease_registry::{LeaseRegistry, Renewal};
 use crate::payload_store::PayloadStore;
-use crate::reaper::{Reaper, reap_expired};
-use crate::scheduler::{Scheduler, promote_due_jobs};
+use crate::reaper::Reaper;
+use crate::scheduler::Scheduler;
 use crate::stats::{QueueMergeOperator, QueueStats, update_stats};
 use crate::txn::{
     Commit, Durability, commit, put_job_record, stage_dead_letter, stage_to_pending, take_claim,
@@ -529,8 +529,10 @@ pub struct SettlementEffects {
 /// shared across processes.
 pub struct Queue {
     db: Arc<Db>,
-    reaper: BackgroundTask,
-    scheduler: BackgroundTask,
+    reaper: Arc<Reaper>,
+    reaper_task: BackgroundTask,
+    scheduler: Arc<Scheduler>,
+    scheduler_task: BackgroundTask,
     /// `Some` only when built with the `metrics` feature and
     /// `OpenOptions::metrics_sample_interval` was set.
     metrics_sampler: Option<BackgroundTask>,
@@ -682,7 +684,7 @@ impl Queue {
         // restored bound.
         crate::reaper::requeue_interrupted_claims(&db, opts.clock.as_ref(), &claim_cursor).await?;
         let lease_registry = LeaseRegistry::new();
-        let reaper = Reaper {
+        let reaper = Arc::new(Reaper {
             db: db.clone(),
             default_queue_config: opts.default_queue_config.clone(),
             queue_configs: opts.queue_configs.clone(),
@@ -691,14 +693,15 @@ impl Queue {
             claim_cursor: claim_cursor.clone(),
             payload_store: payload_store.clone(),
             lease_registry: lease_registry.clone(),
-        };
-        let reaper = BackgroundTask::spawn_periodic(opts.reaper_interval, reaper);
-        let scheduler = Scheduler {
+        });
+        let reaper_task = BackgroundTask::spawn_periodic(opts.reaper_interval, reaper.clone());
+        let scheduler = Arc::new(Scheduler {
             db: db.clone(),
             clock: opts.clock.clone(),
             claim_cursor: claim_cursor.clone(),
-        };
-        let scheduler = BackgroundTask::spawn_periodic(opts.scheduler_interval, scheduler);
+        });
+        let scheduler_task =
+            BackgroundTask::spawn_periodic(opts.scheduler_interval, scheduler.clone());
 
         #[cfg(feature = "metrics")]
         let metrics_sampler = opts.metrics_sample_interval.map(|interval| {
@@ -724,7 +727,9 @@ impl Queue {
         Ok(Self {
             db,
             reaper,
+            reaper_task,
             scheduler,
+            scheduler_task,
             metrics_sampler,
             heartbeat,
             default_queue_config: opts.default_queue_config,
@@ -2651,20 +2656,12 @@ impl Queue {
 
     /// Trigger an immediate reap sweep (primarily useful in tests and tooling).
     pub async fn reap_now(&self) -> Result<()> {
-        reap_expired(
-            &self.db,
-            self.clock.as_ref(),
-            &self.completion_waiters,
-            &self.claim_cursor,
-            &self.lease_registry,
-            &self.payload_store,
-        )
-        .await
+        self.reaper.reap_expired().await
     }
 
     /// Trigger an immediate scheduled-job promotion sweep (primarily useful in tests).
     pub async fn promote_scheduled_now(&self) -> Result<()> {
-        promote_due_jobs(&self.db, self.clock.as_ref(), &self.claim_cursor).await
+        self.scheduler.promote_due_jobs().await
     }
 
     /// Shut down the background reaper and scheduler, persist each
@@ -2678,7 +2675,7 @@ impl Queue {
     /// closed is committed best-effort, so readers can distinguish
     /// this close from a writer that stopped beating.
     pub async fn close(self) -> Result<()> {
-        tokio::join!(self.reaper.stop(), self.scheduler.stop(), async {
+        tokio::join!(self.reaper_task.stop(), self.scheduler_task.stop(), async {
             if let Some(sampler) = self.metrics_sampler {
                 sampler.stop().await;
             }

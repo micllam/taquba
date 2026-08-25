@@ -52,15 +52,7 @@ impl Periodic for Reaper {
     /// of every queue with a retention configured. A sweep error is
     /// logged here; the reap error is returned.
     async fn step(&self) -> Result<()> {
-        let reaped = reap_expired(
-            &self.db,
-            self.clock.as_ref(),
-            &self.completion_waiters,
-            &self.claim_cursor,
-            &self.lease_registry,
-            &self.payload_store,
-        )
-        .await;
+        let reaped = self.reap_expired().await;
         // The largest configured `keep_done_jobs`: no done record newer
         // than `now - max_keep_done` is expired on any queue, so the
         // time-ordered done scan stops at the first key past it.
@@ -95,48 +87,42 @@ impl Periodic for Reaper {
     }
 }
 
-/// Requeue or dead-letter every claim whose lease has expired.
-pub(crate) async fn reap_expired(
-    db: &Db,
-    clock: &dyn Clock,
-    completion_waiters: &CompletionWaiters,
-    claim_cursor: &ClaimCursor,
-    lease_registry: &LeaseRegistry,
-    payload_store: &PayloadStore,
-) -> Result<()> {
-    let now = clock.now_ms();
-    let due = lease_registry.take_due(now);
+impl Reaper {
+    /// Requeue or dead-letter every claim whose lease has expired.
+    pub(crate) async fn reap_expired(&self) -> Result<()> {
+        let due = self.lease_registry.take_due(self.clock.now_ms());
 
-    // Due entries stay in the registry, marked, while they are
-    // examined; each is removed only after its reap commits. A tick
-    // that ends early therefore leaves nothing displaced, and the next
-    // tick retries whatever remains due.
-    for lease in &due {
-        match reap_job(
-            db,
-            clock,
-            lease_registry,
-            lease,
-            completion_waiters,
-            claim_cursor,
-            payload_store,
-        )
-        .await
-        {
-            Ok(()) => {}
-            // A storage failure applies to the remaining entries as
-            // well; end the tick.
-            Err(e @ Error::Storage(_)) => return Err(e),
-            // Any other error, an undecodable record for example, is
-            // specific to this job. Its entry stays marked for the next
-            // tick and must not block the entries behind it.
-            Err(e) => {
-                warn!(queue = %lease.queue, job_id = %lease.id, "reaping expired lease failed: {e}");
+        // Due entries stay in the registry, marked, while they are
+        // examined; each is removed only after its reap commits. A tick
+        // that ends early therefore leaves nothing displaced, and the
+        // next tick retries whatever remains due.
+        for lease in &due {
+            match reap_job(
+                &self.db,
+                self.clock.as_ref(),
+                &self.lease_registry,
+                lease,
+                &self.completion_waiters,
+                &self.claim_cursor,
+                &self.payload_store,
+            )
+            .await
+            {
+                Ok(()) => {}
+                // A storage failure applies to the remaining entries as
+                // well; end the tick.
+                Err(e @ Error::Storage(_)) => return Err(e),
+                // Any other error, an undecodable record for example, is
+                // specific to this job. Its entry stays marked for the next
+                // tick and must not block the entries behind it.
+                Err(e) => {
+                    warn!(queue = %lease.queue, job_id = %lease.id, "reaping expired lease failed: {e}");
+                }
             }
         }
-    }
 
-    Ok(())
+        Ok(())
+    }
 }
 
 async fn reap_job(

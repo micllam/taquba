@@ -2,6 +2,7 @@
 //! signal, and the periodic tick every such task runs on.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -18,6 +19,14 @@ pub(crate) trait Periodic: Send + Sync + 'static {
     /// Run one tick. An error is logged at warn level and the task
     /// continues.
     fn step(&self) -> impl Future<Output = Result<()>> + Send;
+}
+
+impl<P: Periodic> Periodic for Arc<P> {
+    const NAME: &'static str = P::NAME;
+
+    fn step(&self) -> impl Future<Output = Result<()>> + Send {
+        P::step(self)
+    }
 }
 
 /// A spawned task stopped by [`BackgroundTask::stop`]. The task is

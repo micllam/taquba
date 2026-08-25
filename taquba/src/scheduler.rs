@@ -21,17 +21,21 @@ impl Periodic for Scheduler {
     const NAME: &'static str = "scheduled job promoter";
 
     async fn step(&self) -> Result<()> {
+        self.promote_due_jobs().await
+    }
+}
+
+impl Scheduler {
+    /// Move every job whose `run_at` has passed from the scheduled key
+    /// space into the pending key space.
+    pub(crate) async fn promote_due_jobs(&self) -> Result<()> {
         promote_due_jobs(&self.db, self.clock.as_ref(), &self.claim_cursor).await
     }
 }
 
 /// Scan the scheduled key space and move any job whose `run_at` has passed
 /// into the pending key space so workers can claim it.
-pub(crate) async fn promote_due_jobs(
-    db: &Db,
-    clock: &dyn Clock,
-    claim_cursor: &ClaimCursor,
-) -> Result<()> {
+async fn promote_due_jobs(db: &Db, clock: &dyn Clock, claim_cursor: &ClaimCursor) -> Result<()> {
     let now = clock.now_ms();
     let mut due_keys = Vec::new();
 
