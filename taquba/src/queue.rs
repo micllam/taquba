@@ -1189,18 +1189,15 @@ impl Queue {
     /// the fetches. Jobs with inline payloads are untouched. On a fetch
     /// failure, one error is returned after every fetch has settled.
     async fn materialize_payloads(&self, jobs: &mut [Claim]) -> Result<()> {
-        let mut fetches = tokio::task::JoinSet::new();
-        for (index, job) in jobs.iter().map(|c| c.job()).enumerate() {
-            if let Some(ref payload_ref) = job.payload_ref {
-                let store = self.payload_store.clone();
-                let payload_ref = payload_ref.clone();
-                let id = job.id.clone();
-                fetches.spawn(async move { (index, store.get(&payload_ref, &id).await) });
-            }
-        }
+        let fetches = jobs.iter().enumerate().filter_map(|(index, claim)| {
+            let job = claim.job();
+            job.payload_ref.as_deref().map(|payload_ref| async move {
+                (index, self.payload_store.get(payload_ref, &job.id).await)
+            })
+        });
+        let fetched = futures_util::future::join_all(fetches).await;
         let mut first_err = None;
-        while let Some(joined) = fetches.join_next().await {
-            let (index, result) = joined.expect("payload fetch task panicked");
+        for (index, result) in fetched {
             match result {
                 Ok(payload) => jobs[index].job_mut().payload = payload,
                 Err(err) => {
