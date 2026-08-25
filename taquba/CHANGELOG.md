@@ -51,6 +51,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `WaitOutcome` names the terminal transition instead of
+  wrapping an optional record: `Completed(Option<Box<JobRecord>>)` is
+  replaced by `Done(Box<JobRecord>)` (acknowledged),
+  `Dead(Box<JobRecord>)` (dead-lettered by a worker, an exhausted nack
+  or the reaper) and `Cancelled` (removed by `cancel` before it was
+  claimed). Under the default configuration `Completed(None)` could
+  not distinguish an acknowledged job from a cancelled one.
+  `Queue::wait_for_completion` now receives the outcome from the
+  settlement itself rather than re-reading the job after a wake-up, so
+  a transition observed while waiting always delivers the final record
+  with its payload inline, whether or not the queue retains it; the
+  retention matrix governs only a job that was terminal before the
+  call. A terminal transition wakes only the tasks waiting on that
+  job. `WaitOutcome` is `Clone`.
 - `AckEffects` is renamed `SettlementEffects`, the effects now riding
   the dead-letter, exhausted-nack and cancellation transitions as well
   as the acknowledgement. Fields and behaviour are unchanged.

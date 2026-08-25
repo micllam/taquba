@@ -375,6 +375,7 @@
 
 mod claim_cursor;
 mod clock;
+mod completion;
 mod error;
 mod history;
 mod job;

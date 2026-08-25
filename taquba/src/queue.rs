@@ -14,6 +14,7 @@ use ulid::Ulid;
 
 use crate::claim_cursor::{ClaimCursor, CursorState, ScanFrom};
 use crate::clock::{Clock, default_clock};
+use crate::completion::CompletionWaiters;
 use crate::error::{Error, Result};
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{Claim, JobRecord, JobStatus};
@@ -559,7 +560,7 @@ pub struct Queue {
     /// (acked, kept or not), `Dead` (dead-lettered by worker, exhausted
     /// retry, or reaper), or `Pending` / `Scheduled` jobs removed via
     /// [`Self::cancel`]. Drives [`Self::wait_for_completion`].
-    completion_notify: Arc<tokio::sync::Notify>,
+    completion_waiters: Arc<CompletionWaiters>,
     /// Storage for offloaded payload objects. Shared with the reaper,
     /// whose retention sweeps delete the objects of expired records.
     payload_store: Arc<PayloadStore>,
@@ -567,44 +568,45 @@ pub struct Queue {
     payload_offload_threshold: Option<usize>,
 }
 
+/// The record a settlement delivers to completion waiters: the stored
+/// record with the payload the claim carried, so an offloaded payload is
+/// inline as `get_job` returns it.
+fn delivered_record(stored: &JobRecord, claim: &Claim) -> JobRecord {
+    let mut delivered = stored.clone();
+    if delivered.payload_ref.is_some() {
+        delivered.payload = claim.job().payload.clone();
+    }
+    delivered
+}
+
 /// Outcome of [`Queue::wait_for_completion`].
 ///
-/// The terminal-record case (`Completed(Some(record))`) carries the
-/// final [`JobRecord`] when taquba retained one on the way out.
-/// `Completed(None)` means the job terminated but no record survived
-/// the transition. It depends on both the kind of transition and the
-/// queue's configuration:
+/// The terminal variants name the transition that ended the job. A
+/// transition observed while waiting delivers the final [`JobRecord`]
+/// as the settlement wrote it, with the payload inline, whether or not
+/// the queue retains the record afterwards:
 ///
-/// | Transition                                         | Retained?                                   |
-/// |----------------------------------------------------|---------------------------------------------|
-/// | Worker `ack` (success)                             | Only if [`QueueConfig::keep_done_jobs`] is set |
-/// | Worker `nack` past `max_attempts` (Dead)           | Always                                      |
-/// | Worker [`Queue::dead_letter`] (permanent failure)  | Always                                      |
-/// | Reaper dead-letter (lease expired past max_attempts) | Always                                    |
-/// | [`Queue::cancel`] removing a `Pending`/`Scheduled` job | Never                                    |
+/// | Transition                                             | Outcome |
+/// |--------------------------------------------------------|---------|
+/// | Worker `ack` (success)                                 | `Done(record)` |
+/// | Worker `nack` past `max_attempts`                      | `Dead(record)` |
+/// | Worker [`Queue::dead_letter`] (permanent failure)      | `Dead(record)` |
+/// | Reaper dead-letter (lease expired past `max_attempts`) | `Dead(record)` |
+/// | [`Queue::cancel`] removing a `Pending`/`Scheduled` job | `Cancelled` |
 ///
-/// # Disambiguating `Completed(None)`
-///
-/// With the default configuration, `Completed(None)` is reachable from
-/// **two** distinct paths: a successful `ack` whose record was deleted,
-/// and a Pending/Scheduled cancellation. Callers that need to tell them
-/// apart should set [`QueueConfig::keep_done_jobs`]. That option keeps
-/// successful records around for a bounded retention window, which,
-/// beyond resolving the ambiguity, also lets the caller inspect
-/// `last_error`, `completed_at`, `attempts`, and the original `payload`
-/// on every successful run, not just the final status.
-///
-/// Most callers don't need to distinguish: they enqueued the job
-/// themselves and know they didn't cancel it, so `Completed(None)`
-/// unambiguously means "succeeded, record not kept".
-#[derive(Debug)]
+/// A job that was already terminal when the call began is reported
+/// from its retained record (`Done` only under
+/// [`QueueConfig::keep_done_jobs`], `Dead` always); a job whose record
+/// was deleted before the call began is `NotFound`.
+#[derive(Debug, Clone)]
 pub enum WaitOutcome {
-    /// The job reached a terminal state (`Done`, `Dead`, or removed
-    /// via `cancel`) while the call was waiting, or was already
-    /// terminal on entry. The inner is `Some` only when taquba kept
-    /// the terminal record; see the type-level doc for the retention
-    /// matrix.
-    Completed(Option<Box<JobRecord>>),
+    /// The job was acknowledged.
+    Done(Box<JobRecord>),
+    /// The job was dead-lettered. The dead record is always kept.
+    Dead(Box<JobRecord>),
+    /// The job was removed by [`Queue::cancel`] before it was claimed.
+    /// No record survives the removal.
+    Cancelled,
     /// The wait elapsed before the job reached a terminal state. The
     /// job is still pending, scheduled, or claimed somewhere.
     TimedOut,
@@ -671,7 +673,7 @@ impl Queue {
             builder = builder.with_metrics_recorder(crate::obs::slatedb_recorder());
         }
         let db = Arc::new(builder.build().await?);
-        let completion_notify = Arc::new(tokio::sync::Notify::new());
+        let completion_waiters = Arc::new(CompletionWaiters::default());
         let claim_cursor = ClaimCursor::new();
         restore_cursor_state(&db, &claim_cursor).await?;
         // A claimed record found at open belongs to a process that no
@@ -688,7 +690,7 @@ impl Queue {
             default_queue_config: opts.default_queue_config.clone(),
             queue_configs: opts.queue_configs.clone(),
             clock: opts.clock.clone(),
-            completion_notify: completion_notify.clone(),
+            completion_waiters: completion_waiters.clone(),
             claim_cursor: claim_cursor.clone(),
             payload_store: payload_store.clone(),
             lease_registry: lease_registry.clone(),
@@ -760,7 +762,7 @@ impl Queue {
             claim_cursor,
             lease_registry,
             id_gen: std::sync::Mutex::new(ulid::Generator::new()),
-            completion_notify,
+            completion_waiters,
             payload_store,
             payload_offload_threshold: opts.payload_offload_threshold,
         })
@@ -1859,8 +1861,8 @@ impl Queue {
         let timer = crate::obs::start();
         let token = claim.token();
         let keep_done = self.queue_keep_done_jobs(&job.queue).is_some();
+        let completed_at = self.now_ms();
         let done_record = if keep_done {
-            let completed_at = self.now_ms();
             // Stored form: an offloaded payload stays in its object, which
             // is retained with the done record and deleted by the
             // retention sweep.
@@ -1939,7 +1941,14 @@ impl Queue {
         }
 
         crate::obs::completed(&job.queue, timer);
-        self.completion_notify.notify_waiters();
+        self.completion_waiters.settle(&job.id, || {
+            // The claim's copy carries the payload as delivered to the
+            // worker, so the record matches what `get_job` returns.
+            let mut delivered = job.clone();
+            delivered.status = JobStatus::Done;
+            delivered.completed_at = Some(completed_at);
+            WaitOutcome::Done(Box::new(delivered))
+        });
         debug!(queue = %job.queue, job_id = %job.id, "job acked");
         Ok(results)
     }
@@ -2112,8 +2121,10 @@ impl Queue {
             self.claim_cursor.note_pending_insert(&job.queue, &pending);
         }
         if became_dead {
-            // Retries exhausted: terminal transition. Wake completion waiters.
-            self.completion_notify.notify_waiters();
+            // Retries exhausted: terminal transition.
+            self.completion_waiters.settle(&job.id, || {
+                WaitOutcome::Dead(Box::new(delivered_record(&job, claim)))
+            });
         }
         match results {
             Some(results) => Ok(NackOutcome::DeadLettered(results)),
@@ -2208,7 +2219,9 @@ impl Queue {
 
         crate::obs::dead_lettered(&job.queue);
         self.lease_registry.remove(&job.queue, &job.id, token);
-        self.completion_notify.notify_waiters();
+        self.completion_waiters.settle(&job.id, || {
+            WaitOutcome::Dead(Box::new(delivered_record(&job, claim)))
+        });
         warn!(
             queue = %job.queue,
             job_id = %job.id,
@@ -2417,20 +2430,19 @@ impl Queue {
     ///
     /// Wake-up is notification-based: every terminal transition in the
     /// queue (`ack`, `nack` past `max_attempts`, `dead_letter`,
-    /// `cancel`-Removed, reaper dead-letter) fires a shared
-    /// [`tokio::sync::Notify`] that this method listens on. There is no
-    /// per-job polling. Transient transitions (a `nack` that re-queues
-    /// for retry, the reaper re-queuing an expired lease, the scheduler
-    /// promoting a scheduled job) do **not** wake the wait: they are
-    /// not terminal.
+    /// `cancel`-Removed, reaper dead-letter) delivers its outcome to the
+    /// tasks waiting on that job. There is no per-job polling.
+    /// Transient transitions (a `nack` that re-queues for retry, the
+    /// reaper re-queuing an expired lease, the scheduler promoting a
+    /// scheduled job) do **not** wake the wait: they are not terminal.
     ///
-    /// See [`WaitOutcome`] for the full retention matrix that determines
-    /// whether `Completed` carries a record.
+    /// See [`WaitOutcome`] for the transition each variant reports and
+    /// whether it carries a record.
     ///
     /// # Multiple waiters per job
     ///
     /// Several tasks may wait on the same job ID concurrently; each
-    /// receives an equivalent outcome when the terminal transition fires.
+    /// receives the same outcome when the terminal transition fires.
     ///
     /// # Already-terminal jobs
     ///
@@ -2445,42 +2457,33 @@ impl Queue {
     /// being worked in process B is not supported; taquba is
     /// single-process by design.
     pub async fn wait_for_completion(&self, id: &str, timeout: Duration) -> Result<WaitOutcome> {
-        // Single loop. First iteration distinguishes `NotFound` (the
-        // job ID was never present) from `Completed(None)` (the job
-        // terminated while we waited and was not retained); subsequent
-        // iterations treat `get_job == None` as the latter.
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut first = true;
-        loop {
-            // Subscribe *before* the storage check, and `enable()` the
-            // future so it is registered as a waiter immediately.
-            // `notify_waiters()` only wakes already-registered waiters; a
-            // `Notified` that has merely been constructed (but not polled
-            // or enabled) is *not* registered, so a terminal transition
-            // racing the `get_job` await below would otherwise be missed
-            // and the call would stall until `timeout`.
-            let notified = self.completion_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
+        // Registered before the storage read: a terminal transition
+        // that commits after the read then reaches the registration,
+        // and one that commits before it is visible in the read.
+        let mut registration = self.completion_waiters.register(id);
 
-            match self.get_job(id).await? {
-                None if first => return Ok(WaitOutcome::NotFound),
-                None => return Ok(WaitOutcome::Completed(None)),
-                Some(job) if matches!(job.status, JobStatus::Done | JobStatus::Dead) => {
-                    return Ok(WaitOutcome::Completed(Some(Box::new(job))));
-                }
-                Some(_) => {}
+        match self.get_job(id).await? {
+            Some(job) => match job.status {
+                JobStatus::Done => return Ok(WaitOutcome::Done(Box::new(job))),
+                JobStatus::Dead => return Ok(WaitOutcome::Dead(Box::new(job))),
+                _ => {}
+            },
+            // A transition that removed the record between the
+            // registration and the read has delivered its outcome, or
+            // is about to; the registration is consulted before the ID
+            // is reported absent.
+            None => {
+                return Ok(registration.try_outcome().unwrap_or(WaitOutcome::NotFound));
             }
-            first = false;
+        }
 
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Ok(WaitOutcome::TimedOut);
+        tokio::select! {
+            delivered = registration.receiver() => {
+                // The sender is consumed only by a settlement, so the
+                // channel cannot close without an outcome.
+                Ok(delivered.unwrap_or(WaitOutcome::TimedOut))
             }
-            tokio::select! {
-                _ = &mut notified => {}
-                _ = tokio::time::sleep(remaining) => return Ok(WaitOutcome::TimedOut),
-            }
+            _ = tokio::time::sleep(timeout) => Ok(WaitOutcome::TimedOut),
         }
     }
 
@@ -2636,13 +2639,14 @@ impl Queue {
                             None => Vec::new(),
                         };
                         // Removed = terminal (job is gone). Requested = not yet
-                        // terminal; the worker will fire the notify when it
-                        // eventually acks / nacks / dead-letters.
+                        // terminal; the worker's settlement delivers the
+                        // outcome when it acks / nacks / dead-letters.
                         if matches!(outcome, CancelOutcome::Removed) {
                             // The record is deleted, so its payload object
                             // (if any) is removed here, after the commit.
                             self.delete_payload_object(&job).await;
-                            self.completion_notify.notify_waiters();
+                            self.completion_waiters
+                                .settle(id, || WaitOutcome::Cancelled);
                         }
                         debug!(job_id = %id, "{msg}");
                         return Ok((outcome, results));
@@ -2804,9 +2808,10 @@ impl Queue {
         reap_expired(
             &self.db,
             self.clock.as_ref(),
-            &self.completion_notify,
+            &self.completion_waiters,
             &self.claim_cursor,
             &self.lease_registry,
+            &self.payload_store,
         )
         .await
     }
@@ -6520,6 +6525,14 @@ mod tests {
         q.close().await.unwrap();
     }
 
+    /// Poll `fut` once with a no-op waker. A pending result shows the
+    /// future reached its first await, which for `wait_for_completion`
+    /// is past the waiter registration.
+    fn poll_once<F: std::future::Future>(fut: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        fut.poll(&mut cx)
+    }
+
     #[tokio::test]
     async fn test_wait_for_completion_unknown_id_is_not_found() {
         let q = Queue::open(make_store(), "test").await.unwrap();
@@ -6531,12 +6544,12 @@ mod tests {
         q.close().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_wait_for_completion_pending_times_out() {
         let q = Queue::open(make_store(), "test").await.unwrap();
         let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
         let outcome = q
-            .wait_for_completion(&id, Duration::from_millis(100))
+            .wait_for_completion(&id, Duration::from_secs(60))
             .await
             .unwrap();
         assert!(matches!(outcome, WaitOutcome::TimedOut), "{outcome:?}");
@@ -6545,23 +6558,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_for_completion_wakes_on_ack() {
-        // Default config does not keep done jobs: ack deletes the record.
-        // Caller still sees `Completed` because the wait observes the
-        // index entry disappearing.
-        let q = Arc::new(Queue::open(make_store(), "test").await.unwrap());
+        // Default retention deletes the record on ack; the waiter
+        // receives it from the settlement.
+        let q = Queue::open(make_store(), "test").await.unwrap();
         let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
 
-        let waiter_q = q.clone();
-        let waiter_id = id.clone();
-        let waiter = tokio::spawn(async move {
-            waiter_q
-                .wait_for_completion(&waiter_id, Duration::from_secs(5))
-                .await
-                .unwrap()
-        });
+        let waiter = q.wait_for_completion(&id, Duration::from_secs(5));
+        tokio::pin!(waiter);
+        assert!(poll_once(waiter.as_mut()).is_pending());
 
-        // Give the waiter a moment to subscribe.
-        tokio::time::sleep(Duration::from_millis(50)).await;
         let job = q
             .claim("work", Duration::from_secs(30))
             .await
@@ -6569,122 +6574,73 @@ mod tests {
             .unwrap();
         q.ack(&job).await.unwrap();
 
-        // Default ack deletes the record outright, so no inner record.
-        assert!(
-            matches!(waiter.await.unwrap(), WaitOutcome::Completed(None)),
-            "expected Completed(None) on default ack",
-        );
+        match waiter.await.unwrap() {
+            WaitOutcome::Done(record) => {
+                assert_eq!(record.id, id);
+                assert_eq!(record.status, JobStatus::Done);
+                assert!(record.completed_at.is_some());
+                assert_eq!(record.payload, b"payload");
+            }
+            other => panic!("expected Done(record), got {other:?}"),
+        }
         assert!(q.get_job(&id).await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn test_wait_for_completion_with_kept_done_jobs() {
-        // When `keep_done_jobs` is set, the terminal `Done` record is
-        // retrievable via `get_job` after the wait returns.
-        let base = no_backoff_opts();
+    async fn test_wait_for_completion_wakes_on_exhausted_nack() {
         let opts = OpenOptions {
             default_queue_config: QueueConfig {
-                keep_done_jobs: Some(Duration::from_secs(60)),
-                ..base.default_queue_config.clone()
+                max_attempts: 1,
+                ..QueueConfig::default()
             },
-            ..base
+            ..OpenOptions::default()
         };
-        let q = Arc::new(
-            Queue::open_with_options(make_store(), "test", opts)
-                .await
-                .unwrap(),
-        );
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
         let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
 
-        let waiter_q = q.clone();
-        let waiter_id = id.clone();
-        let waiter = tokio::spawn(async move {
-            waiter_q
-                .wait_for_completion(&waiter_id, Duration::from_secs(5))
-                .await
-                .unwrap()
-        });
+        let waiter = q.wait_for_completion(&id, Duration::from_secs(5));
+        tokio::pin!(waiter);
+        assert!(poll_once(waiter.as_mut()).is_pending());
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
         let job = q
             .claim("work", Duration::from_secs(30))
             .await
             .unwrap()
             .unwrap();
-        q.ack(&job).await.unwrap();
+        q.nack(&job, "transient").await.unwrap();
 
         match waiter.await.unwrap() {
-            WaitOutcome::Completed(Some(record)) => {
-                assert_eq!(record.id, id);
-                assert_eq!(record.status, JobStatus::Done);
-            }
-            other => panic!("expected Completed(Some(Done)), got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_wait_for_completion_wakes_on_dead_letter() {
-        let q = Arc::new(Queue::open(make_store(), "test").await.unwrap());
-        let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
-
-        let waiter_q = q.clone();
-        let waiter_id = id.clone();
-        let waiter = tokio::spawn(async move {
-            waiter_q
-                .wait_for_completion(&waiter_id, Duration::from_secs(5))
-                .await
-                .unwrap()
-        });
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let job = q
-            .claim("work", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        q.dead_letter(&job, "permanent").await.unwrap();
-
-        match waiter.await.unwrap() {
-            WaitOutcome::Completed(Some(record)) => {
+            WaitOutcome::Dead(record) => {
                 assert_eq!(record.id, id);
                 assert_eq!(record.status, JobStatus::Dead);
-                assert_eq!(record.last_error.as_deref(), Some("permanent"));
+                assert_eq!(record.last_error.as_deref(), Some("transient"));
             }
-            other => panic!("expected Completed(Some(Dead)), got {other:?}"),
+            other => panic!("expected Dead(record), got {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn test_wait_for_completion_wakes_on_cancel_removed() {
-        let q = Arc::new(Queue::open(make_store(), "test").await.unwrap());
+        let q = Queue::open(make_store(), "test").await.unwrap();
         let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
 
-        let waiter_q = q.clone();
-        let waiter_id = id.clone();
-        let waiter = tokio::spawn(async move {
-            waiter_q
-                .wait_for_completion(&waiter_id, Duration::from_secs(5))
-                .await
-                .unwrap()
-        });
+        let waiter = q.wait_for_completion(&id, Duration::from_secs(5));
+        tokio::pin!(waiter);
+        assert!(poll_once(waiter.as_mut()).is_pending());
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Removed);
 
-        // Cancel of Pending removes the record outright.
-        assert!(
-            matches!(waiter.await.unwrap(), WaitOutcome::Completed(None)),
-            "expected Completed(None) after Pending cancel",
-        );
+        assert!(matches!(waiter.await.unwrap(), WaitOutcome::Cancelled));
         assert!(q.get_job(&id).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn test_wait_for_completion_does_not_wake_on_cancel_requested() {
-        // A `Claimed` cancel fires the token but the job is still in flight;
-        // `wait_for_completion` should keep waiting until the worker
-        // actually settles the claim.
-        let q = Arc::new(Queue::open(make_store(), "test").await.unwrap());
+        // A `Claimed` cancel fires the token but the job is still in
+        // flight; the wait continues until the worker settles the claim.
+        let q = Queue::open(make_store(), "test").await.unwrap();
         q.enqueue("work", b"payload".to_vec()).await.unwrap();
         let job = q
             .claim("work", Duration::from_secs(30))
@@ -6693,29 +6649,19 @@ mod tests {
             .unwrap();
         let id = job.id.clone();
 
-        let waiter_q = q.clone();
-        let waiter_id = id.clone();
-        let waiter = tokio::spawn(async move {
-            waiter_q
-                .wait_for_completion(&waiter_id, Duration::from_millis(200))
-                .await
-                .unwrap()
-        });
+        let waiter = q.wait_for_completion(&id, Duration::from_secs(5));
+        tokio::pin!(waiter);
+        assert!(poll_once(waiter.as_mut()).is_pending());
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Requested);
+        assert!(poll_once(waiter.as_mut()).is_pending());
 
-        assert!(
-            matches!(waiter.await.unwrap(), WaitOutcome::TimedOut),
-            "claimed cancel should not wake the completion waiter",
-        );
         q.ack(&job).await.unwrap();
+        assert!(matches!(waiter.await.unwrap(), WaitOutcome::Done(_)));
     }
 
     #[tokio::test]
     async fn test_wait_for_completion_returns_immediately_when_already_terminal() {
-        // Job is already Dead before any waiter calls in. The pre-check
-        // path should return Completed(Some(Dead)) without subscribing.
         let q = Queue::open(make_store(), "test").await.unwrap();
         q.enqueue("work", b"payload".to_vec()).await.unwrap();
         let job = q
@@ -6726,40 +6672,32 @@ mod tests {
         let id = job.id.clone();
         q.dead_letter(&job, "permanent").await.unwrap();
 
-        // Even with a zero timeout, the already-terminal case must return.
         match q
             .wait_for_completion(&id, Duration::from_millis(0))
             .await
             .unwrap()
         {
-            WaitOutcome::Completed(Some(record)) => {
+            WaitOutcome::Dead(record) => {
                 assert_eq!(record.id, id);
                 assert_eq!(record.status, JobStatus::Dead);
             }
-            other => panic!("expected Completed(Some(Dead)), got {other:?}"),
+            other => panic!("expected Dead(record), got {other:?}"),
         }
         q.close().await.unwrap();
     }
 
     #[tokio::test]
     async fn test_wait_for_completion_fan_out_to_multiple_waiters() {
-        // Several waiters on the same job all wake on a single terminal
-        // transition.
-        let q = Arc::new(Queue::open(make_store(), "test").await.unwrap());
+        let q = Queue::open(make_store(), "test").await.unwrap();
         let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
 
         let mut waiters = Vec::new();
         for _ in 0..4 {
-            let q = q.clone();
-            let id = id.clone();
-            waiters.push(tokio::spawn(async move {
-                q.wait_for_completion(&id, Duration::from_secs(5))
-                    .await
-                    .unwrap()
-            }));
+            let mut waiter = Box::pin(q.wait_for_completion(&id, Duration::from_secs(5)));
+            assert!(poll_once(waiter.as_mut()).is_pending());
+            waiters.push(waiter);
         }
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
         let job = q
             .claim("work", Duration::from_secs(30))
             .await
@@ -6769,62 +6707,100 @@ mod tests {
 
         for waiter in waiters {
             match waiter.await.unwrap() {
-                WaitOutcome::Completed(Some(record)) => {
+                WaitOutcome::Dead(record) => {
                     assert_eq!(record.id, id);
                     assert_eq!(record.status, JobStatus::Dead);
+                    assert_eq!(record.last_error.as_deref(), Some("permanent"));
                 }
-                other => panic!("waiter saw {other:?}, expected Completed(Some(Dead))"),
+                other => panic!("waiter saw {other:?}, expected Dead(record)"),
             }
         }
     }
 
     #[tokio::test]
-    async fn test_wait_for_completion_wakes_on_reaper_dead_letter() {
-        // Disable auto-reaper so we control the timing precisely.
+    async fn test_wait_for_completion_delivers_offloaded_payloads_inline() {
+        // Covers the three settlements that hold a stored record: ack,
+        // worker dead-letter and reaper dead-letter.
+        let clock = Arc::new(MockClock::new(1_000_000));
         let opts = OpenOptions {
             reaper_interval: Duration::from_secs(3600),
+            clock: clock.clone(),
             default_queue_config: QueueConfig {
                 max_attempts: 1,
-                retry_backoff_base: Duration::ZERO,
-                retry_backoff_max: Duration::ZERO,
-                ..QueueConfig::default()
+                ..offload_opts().default_queue_config
             },
-            ..OpenOptions::default()
+            ..offload_opts()
         };
-        let q = Arc::new(
-            Queue::open_with_options(make_store(), "test", opts)
-                .await
-                .unwrap(),
-        );
-        q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+        let payload = vec![7u8; 256];
+
+        let id = q.enqueue("work", payload.clone()).await.unwrap();
+        let waiter = q.wait_for_completion(&id, Duration::from_secs(5));
+        tokio::pin!(waiter);
+        assert!(poll_once(waiter.as_mut()).is_pending());
         let job = q
-            .claim("work", Duration::from_millis(10))
+            .claim("work", Duration::from_secs(10))
             .await
             .unwrap()
             .unwrap();
-        let id = job.id.clone();
-        drop(job);
-
-        let waiter_q = q.clone();
-        let waiter_id = id.clone();
-        let waiter = tokio::spawn(async move {
-            waiter_q
-                .wait_for_completion(&waiter_id, Duration::from_secs(5))
-                .await
-                .unwrap()
-        });
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        q.reap_now().await.unwrap();
-
+        assert!(job.payload_ref.is_some());
+        q.ack(&job).await.unwrap();
         match waiter.await.unwrap() {
-            WaitOutcome::Completed(Some(record)) => {
-                assert_eq!(record.id, id);
-                assert_eq!(record.status, JobStatus::Dead);
+            WaitOutcome::Done(record) => assert_eq!(record.payload, payload),
+            other => panic!("expected Done(record), got {other:?}"),
+        }
+
+        let id = q.enqueue("work", payload.clone()).await.unwrap();
+        let waiter = q.wait_for_completion(&id, Duration::from_secs(5));
+        tokio::pin!(waiter);
+        assert!(poll_once(waiter.as_mut()).is_pending());
+        let job = q
+            .claim("work", Duration::from_secs(10))
+            .await
+            .unwrap()
+            .unwrap();
+        q.dead_letter(&job, "permanent").await.unwrap();
+        match waiter.await.unwrap() {
+            WaitOutcome::Dead(record) => assert_eq!(record.payload, payload),
+            other => panic!("expected Dead(record), got {other:?}"),
+        }
+
+        let id = q.enqueue("work", payload.clone()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(10))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(job);
+        let waiter = q.wait_for_completion(&id, Duration::from_secs(5));
+        tokio::pin!(waiter);
+        assert!(poll_once(waiter.as_mut()).is_pending());
+        clock.advance(Duration::from_secs(11));
+        q.reap_now().await.unwrap();
+        match waiter.await.unwrap() {
+            WaitOutcome::Dead(record) => {
+                assert_eq!(record.payload, payload);
                 assert_eq!(record.last_error.as_deref(), Some("lease expired"));
             }
-            other => panic!("expected Completed(Some(Dead)), got {other:?}"),
+            other => panic!("expected Dead(record), got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_completion_reports_a_removal_that_races_the_read() {
+        // An outcome delivered after the registration takes precedence
+        // over `NotFound` when the record is gone at the read.
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let mut registration = q.completion_waiters.register(&id);
+        assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Removed);
+        assert!(matches!(
+            registration.try_outcome(),
+            Some(WaitOutcome::Cancelled)
+        ));
+        assert!(q.completion_waiters.inner_is_empty());
     }
 
     #[tokio::test]

@@ -195,13 +195,15 @@ impl<J: Job> JobHandle<J> {
                 Some(outcome) => Ok(Some(outcome)),
                 None => Err(Error::JobNotFound(self.id.clone())),
             },
-            WaitOutcome::Completed(record) => {
+            terminal @ (WaitOutcome::Done(_) | WaitOutcome::Dead(_) | WaitOutcome::Cancelled) => {
                 if let Some(outcome) = self.fetch_result().await? {
                     return Ok(Some(outcome));
                 }
-                let message = record
-                    .and_then(|record| record.last_error.clone())
-                    .unwrap_or_else(|| "job terminated without recording a result".to_string());
+                let message = match terminal {
+                    WaitOutcome::Done(record) | WaitOutcome::Dead(record) => record.last_error,
+                    _ => None,
+                }
+                .unwrap_or_else(|| "job terminated without recording a result".to_string());
                 Ok(Some(Err(JobError {
                     kind: ErrorKind::Transient,
                     message,

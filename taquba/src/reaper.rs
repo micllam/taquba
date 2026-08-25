@@ -4,11 +4,13 @@ use std::time::Duration;
 
 use slatedb::config::WriteOptions;
 use slatedb::{Db, IsolationLevel};
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 use tracing::{debug, warn};
 
+use crate::WaitOutcome;
 use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
+use crate::completion::CompletionWaiters;
 use crate::error::{Error, Result};
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{JobRecord, JobStatus};
@@ -28,7 +30,7 @@ pub(crate) struct Reaper {
     pub(crate) default_queue_config: QueueConfig,
     pub(crate) queue_configs: HashMap<String, QueueConfig>,
     pub(crate) clock: Arc<dyn Clock>,
-    pub(crate) completion_notify: Arc<Notify>,
+    pub(crate) completion_waiters: Arc<CompletionWaiters>,
     pub(crate) claim_cursor: ClaimCursor,
     pub(crate) payload_store: Arc<PayloadStore>,
     pub(crate) lease_registry: LeaseRegistry,
@@ -42,7 +44,7 @@ impl Reaper {
             default_queue_config,
             queue_configs,
             clock,
-            completion_notify,
+            completion_waiters,
             claim_cursor,
             payload_store,
             lease_registry,
@@ -84,9 +86,10 @@ impl Reaper {
                         reap_expired(
                             &db,
                             clock.as_ref(),
-                            &completion_notify,
+                            &completion_waiters,
                             &claim_cursor,
                             &lease_registry,
+                            &payload_store,
                         )
                         .await
                     {
@@ -116,9 +119,10 @@ impl Reaper {
 pub(crate) async fn reap_expired(
     db: &Db,
     clock: &dyn Clock,
-    completion_notify: &Notify,
+    completion_waiters: &CompletionWaiters,
     claim_cursor: &ClaimCursor,
     lease_registry: &LeaseRegistry,
+    payload_store: &PayloadStore,
 ) -> Result<()> {
     let now = clock.now_ms();
     let due = lease_registry.take_due(now);
@@ -133,8 +137,9 @@ pub(crate) async fn reap_expired(
             clock,
             lease_registry,
             lease,
-            completion_notify,
+            completion_waiters,
             claim_cursor,
+            payload_store,
         )
         .await
         {
@@ -159,8 +164,9 @@ async fn reap_job(
     clock: &dyn Clock,
     registry: &LeaseRegistry,
     lease: &DueLease,
-    completion_notify: &Notify,
+    completion_waiters: &CompletionWaiters,
     claim_cursor: &ClaimCursor,
+    payload_store: &PayloadStore,
 ) -> Result<()> {
     let DueLease {
         queue, id, token, ..
@@ -227,7 +233,19 @@ async fn reap_job(
                     }
                     ClaimEnd::DeadLettered => {
                         crate::obs::dead_lettered(&job.queue);
-                        completion_notify.notify_waiters();
+                        if completion_waiters.has_waiters(id) {
+                            // Delivered in the form `get_job` returns; a
+                            // failed payload fetch leaves the stored form.
+                            let mut delivered = job.clone();
+                            if let Err(e) =
+                                crate::read::materialize_payload(payload_store, &mut delivered)
+                                    .await
+                            {
+                                warn!(queue = %queue, job_id = %id, error = %e, "payload of a dead-lettered job could not be fetched for its waiters");
+                            }
+                            completion_waiters
+                                .settle(id, || WaitOutcome::Dead(Box::new(delivered)));
+                        }
                     }
                 }
                 return Ok(());
