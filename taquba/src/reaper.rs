@@ -66,9 +66,10 @@ impl Periodic for Reaper {
         // time-ordered done scan stops at the first key past it.
         let max_keep_done = self.configs().filter_map(|c| c.keep_done_jobs).max();
         if max_keep_done.is_some()
-            && let Err(e) = sweep_done(
+            && let Err(e) = sweep_expired(
                 &self.db,
                 self.clock.as_ref(),
+                JobStatus::Done,
                 &|queue| self.config(queue).keep_done_jobs,
                 max_keep_done,
                 &self.payload_store,
@@ -78,10 +79,12 @@ impl Periodic for Reaper {
             warn!("done retention sweep error: {e}");
         }
         if self.configs().any(|c| c.dead_retention.is_some())
-            && let Err(e) = sweep_dead(
+            && let Err(e) = sweep_expired(
                 &self.db,
                 self.clock.as_ref(),
+                JobStatus::Dead,
                 &|queue| self.config(queue).dead_retention,
+                None,
                 &self.payload_store,
             )
             .await
@@ -327,108 +330,76 @@ pub(crate) async fn requeue_interrupted_claims(
     Ok(())
 }
 
-/// Delete done jobs whose retention window has expired. The window is
-/// resolved per-record by looking up the job's queue via `keep_done_for`.
-/// Records on queues with `keep_done_jobs = None` are skipped.
+/// Delete the records of `status` (`Done` or `Dead`) whose retention
+/// window has expired. The window is resolved per record from the
+/// job's queue via `retention_for`; records on queues without a
+/// window are skipped.
 ///
-/// Done keys are sorted globally by `completed_at` (see
-/// [`crate::keys::done_key`]), so once the scan hits a key whose
-/// timestamp is newer than `now - max_keep_done`, no remaining record
-/// can be expired for any queue and the loop breaks. The per-record
-/// queue-specific retention check still runs below the threshold to
-/// honour mixed retention values across queues.
-async fn sweep_done(
+/// Done keys lead with `completed_at` (see [`crate::keys::done_key`]),
+/// so `max_retention`, the largest window configured on any queue,
+/// ends the done scan at the first key newer than `now - max_retention`:
+/// no later record can be expired for any queue. Dead keys group by
+/// queue, so the dead scan reads the whole key space and ignores
+/// `max_retention`.
+async fn sweep_expired(
     db: &Db,
     clock: &dyn Clock,
-    keep_done_for: &(dyn Fn(&str) -> Option<Duration> + Sync),
-    max_keep_done: Option<Duration>,
+    status: JobStatus,
+    retention_for: &(dyn Fn(&str) -> Option<Duration> + Sync),
+    max_retention: Option<Duration>,
     payload_store: &PayloadStore,
 ) -> Result<()> {
+    let (tag, min_cutoff) = match status {
+        JobStatus::Done => (KeyTag::Done, max_retention),
+        JobStatus::Dead => (KeyTag::Dead, None),
+        _ => return Err(Error::InvalidState),
+    };
     let now = clock.now_ms();
-    let min_cutoff = max_keep_done.map(|r| now.saturating_sub(r.as_millis() as u64));
+    let min_cutoff = min_cutoff.map(|r| now.saturating_sub(r.as_millis() as u64));
 
-    let mut victims: Vec<(Vec<u8>, String, Option<String>)> = Vec::new();
-    let mut iter = db.scan_prefix(tag_prefix(KeyTag::Done), ..).await?;
+    let mut victims: Vec<(Vec<u8>, String, String, Option<String>)> = Vec::new();
+    let mut iter = db.scan_prefix(tag_prefix(tag), ..).await?;
     while let Some(kv) = iter.next().await? {
-        // Done keys lead with `completed_at`, so the scan is sorted globally
-        // by completion time.
         if let Some(min_cutoff) = min_cutoff {
-            let Some(completed_at_in_key) = parse_key_timestamp(&kv.key, KeyTag::Done) else {
+            let Some(terminal_at_in_key) = parse_key_timestamp(&kv.key, tag) else {
                 continue;
             };
-            if completed_at_in_key >= min_cutoff {
+            if terminal_at_in_key >= min_cutoff {
                 break;
             }
         }
 
-        let job = match JobRecord::decode(&kv.key, &kv.value) {
-            Ok(j) => j,
-            Err(_) => continue,
-        };
-        let Some(completed_at) = job.completed_at else {
+        let Ok(job) = JobRecord::decode(&kv.key, &kv.value) else {
             continue;
         };
-        let Some(retention) = keep_done_for(&job.queue) else {
+        let terminal_at = match status {
+            JobStatus::Done => job.completed_at,
+            _ => job.failed_at,
+        };
+        let Some(terminal_at) = terminal_at else {
             continue;
         };
-        let cutoff = now.saturating_sub(retention.as_millis() as u64);
-        if completed_at < cutoff {
-            victims.push((kv.key.to_vec(), job.id.clone(), job.payload_ref.clone()));
-        }
-    }
-    drop(iter);
-
-    for (key, id, payload_ref) in victims {
-        sweep_victim(db, payload_store, &key, &id, payload_ref.as_deref(), None).await?;
-    }
-    Ok(())
-}
-
-/// Delete dead-letter jobs whose retention window has expired. The window
-/// is resolved per-record by looking up the job's queue via
-/// `dead_retention_for`. Records on queues with `dead_retention = None`
-/// are skipped.
-async fn sweep_dead(
-    db: &Db,
-    clock: &dyn Clock,
-    dead_retention_for: &(dyn Fn(&str) -> Option<Duration> + Sync),
-    payload_store: &PayloadStore,
-) -> Result<()> {
-    let now = clock.now_ms();
-
-    let mut victims: Vec<(Vec<u8>, String, String, Option<String>)> = Vec::new();
-    let mut iter = db.scan_prefix(tag_prefix(KeyTag::Dead), ..).await?;
-    while let Some(kv) = iter.next().await? {
-        let job = match JobRecord::decode(&kv.key, &kv.value) {
-            Ok(j) => j,
-            Err(_) => continue,
-        };
-        let Some(failed_at) = job.failed_at else {
-            continue;
-        };
-        let Some(retention) = dead_retention_for(&job.queue) else {
+        let Some(retention) = retention_for(&job.queue) else {
             continue;
         };
         let cutoff = now.saturating_sub(retention.as_millis() as u64);
-        if failed_at < cutoff {
-            victims.push((
-                kv.key.to_vec(),
-                job.queue.clone(),
-                job.id.clone(),
-                job.payload_ref.clone(),
-            ));
+        if terminal_at < cutoff {
+            victims.push((kv.key.to_vec(), job.queue, job.id, job.payload_ref));
         }
     }
     drop(iter);
 
     for (key, queue, id, payload_ref) in victims {
+        // `QueueStats::dead` counts the live dead-letter records; the
+        // done counter counts completions and is not decremented.
+        let dead_stats_queue = matches!(status, JobStatus::Dead).then_some(queue.as_str());
         sweep_victim(
             db,
             payload_store,
             &key,
             &id,
             payload_ref.as_deref(),
-            Some(&queue),
+            dead_stats_queue,
         )
         .await?;
     }
