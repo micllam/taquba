@@ -19,8 +19,8 @@ use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{Claim, JobRecord, JobStatus};
 use crate::keys::{
     KeyTag, MAX_QUEUE_NAME_LEN, attempt_history_key, claimed_key, cursor_key, dead_key,
-    dedup_index_key, done_key, job_index_key, pending_key, pending_prefix, scheduled_key,
-    tag_prefix, user_scoped_key,
+    dedup_index_key, job_index_key, pending_key, pending_prefix, scheduled_key, tag_prefix,
+    user_scoped_key,
 };
 use crate::lease_registry::{LeaseRegistry, Renewal};
 use crate::payload_store::PayloadStore;
@@ -28,8 +28,9 @@ use crate::queue_core::{QueueConfigs, QueueCore};
 use crate::reaper::Reaper;
 use crate::scheduler::Scheduler;
 use crate::stats::{QueueMergeOperator, QueueStats, update_stats};
+use crate::txn::ClaimEnd;
 use crate::txn::{
-    Commit, Durability, commit, put_job_record, stage_dead_letter, stage_to_pending, take_claim,
+    Commit, Durability, commit, put_job_record, stage_claim_end, stage_to_pending, take_claim,
 };
 
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
@@ -555,17 +556,6 @@ pub struct Queue {
     id_gen: std::sync::Mutex<ulid::Generator>,
 }
 
-/// The record a settlement delivers to completion waiters: the stored
-/// record with the payload the claim carried, so an offloaded payload is
-/// inline as `get_job` returns it.
-fn delivered_record(stored: &JobRecord, claim: &Claim) -> JobRecord {
-    let mut delivered = stored.clone();
-    if delivered.payload_ref.is_some() {
-        delivered.payload = claim.job().payload.clone();
-    }
-    delivered
-}
-
 /// Outcome of [`Queue::wait_for_completion`].
 ///
 /// The terminal variants name the transition that ended the job. A
@@ -616,6 +606,17 @@ struct PreparedEffects {
     prepared_jobs: Vec<PreparedJob>,
     kv_writes: HashMap<Vec<u8>, Vec<u8>>,
     kv_deletes: Vec<Vec<u8>>,
+}
+
+/// The committed outcome of [`Queue::settle_claim`]'s transaction.
+struct SettledClaim<'e> {
+    /// The record as written.
+    job: JobRecord,
+    end: ClaimEnd<'e>,
+    /// The pending key when the job returned to pending.
+    pending_key: Option<Vec<u8>>,
+    /// The effects' results; `None` when the transition discarded them.
+    results: Option<Vec<EnqueueResult>>,
 }
 
 /// Effects staged into a settlement transaction by
@@ -1706,56 +1707,14 @@ impl Queue {
         claim: &Claim,
         effects: SettlementEffects,
     ) -> Result<Vec<EnqueueResult>> {
-        let job = claim.job();
-        let prepared = self.prepare_effects(effects).await?;
-
         let timer = crate::obs::start();
-        let token = claim.token();
-        let keep_done = self.queue_keep_done_jobs(&job.queue).is_some();
-        let completed_at = self.now_ms();
-        let done_record = if keep_done {
-            // Stored form: an offloaded payload stays in its object, which
-            // is retained with the done record and deleted by the
-            // retention sweep.
-            let mut done_job = job.stored_clone();
-            done_job.completed_at = Some(completed_at);
-            Some((
-                done_key(completed_at, &job.queue, &job.id),
-                done_job.stored_bytes()?,
-            ))
-        } else {
-            None
-        };
-
-        let outcome = self
-            .ack_txn(job, token, completed_at, done_record.as_ref(), &prepared)
-            .await;
-
-        self.finish_effects(prepared, outcome.as_ref().ok().map(|r| r.as_slice()))
-            .await;
-        let results = outcome?;
-        // After the commit and token-fenced, so a removal that runs
-        // after a re-claim leaves the new claim's entry.
-        self.core.lease_registry.remove(&job.queue, &job.id, token);
-
-        // The acked job's record is gone unless a done record was kept;
-        // without one, its payload object is removed here, after the
-        // commit.
-        if !keep_done {
-            self.core.payload_store.delete_for(job).await;
-        }
-
+        let keep = self.queue_keep_done_jobs(&claim.queue).is_some();
+        let (job, results) = self
+            .settle_claim(claim, effects, |_, _| ClaimEnd::Done { keep })
+            .await?;
         crate::obs::completed(&job.queue, timer);
-        self.core.completion_waiters.settle(&job.id, || {
-            // The claim's copy carries the payload as delivered to the
-            // worker, so the record matches what `get_job` returns.
-            let mut delivered = job.clone();
-            delivered.status = JobStatus::Done;
-            delivered.completed_at = Some(completed_at);
-            WaitOutcome::Done(Box::new(delivered))
-        });
         debug!(queue = %job.queue, job_id = %job.id, "job acked");
-        Ok(results)
+        Ok(results.unwrap_or_default())
     }
 
     /// Report failure. Re-queues if attempts < max_attempts, otherwise dead-letters.
@@ -1787,48 +1746,33 @@ impl Queue {
         error: &str,
         effects: SettlementEffects,
     ) -> Result<NackOutcome> {
-        let prepared = self.prepare_effects(effects).await?;
-        let token = claim.token();
-        let (queue, id) = (claim.job().queue.as_str(), claim.job().id.as_str());
-
-        let settled = self.nack_txn(queue, id, token, error, &prepared).await;
-
-        self.finish_effects(
-            prepared,
-            match &settled {
-                Ok((_, Some(results))) => Some(results.as_slice()),
-                _ => None,
-            },
-        )
-        .await;
-        let (job, results) = settled?;
-
-        let immediate_retry = matches!(job.status, JobStatus::Pending);
-        let became_dead = matches!(job.status, JobStatus::Dead);
-        if became_dead {
-            crate::obs::dead_lettered(&job.queue);
-        } else {
-            crate::obs::nacked(&job.queue);
-        }
-        self.core.lease_registry.remove(&job.queue, &job.id, token);
-        if immediate_retry {
-            // The backoff path needs no insert note here: the
-            // scheduler records the insert itself when it promotes the
-            // job.
-            let pending = pending_key(&job.queue, job.priority, &job.id);
-            self.core
-                .claim_cursor
-                .note_pending_insert(&job.queue, &pending);
-        }
-        if became_dead {
-            // Retries exhausted: terminal transition.
-            self.core.completion_waiters.settle(&job.id, || {
-                WaitOutcome::Dead(Box::new(delivered_record(&job, claim)))
-            });
-        }
+        let (job, results) = self
+            .settle_claim(claim, effects, |stored, now| {
+                if stored.attempts >= stored.max_attempts {
+                    return ClaimEnd::Dead { error };
+                }
+                let cfg = self.queue_config(&stored.queue);
+                let backoff = backoff_delay(
+                    stored.attempts,
+                    cfg.retry_backoff_base,
+                    cfg.retry_backoff_max,
+                );
+                ClaimEnd::Retry {
+                    run_at: (!backoff.is_zero()).then(|| now + backoff.as_millis() as u64),
+                    outcome: AttemptOutcome::Retried,
+                    error: Some(error),
+                }
+            })
+            .await?;
         match results {
-            Some(results) => Ok(NackOutcome::DeadLettered(results)),
-            None => Ok(NackOutcome::Retried),
+            Some(results) => {
+                crate::obs::dead_lettered(&job.queue);
+                Ok(NackOutcome::DeadLettered(results))
+            }
+            None => {
+                crate::obs::nacked(&job.queue);
+                Ok(NackOutcome::Retried)
+            }
         }
     }
 
@@ -1861,178 +1805,77 @@ impl Queue {
         reason: &str,
         effects: SettlementEffects,
     ) -> Result<Vec<EnqueueResult>> {
+        let (job, results) = self
+            .settle_claim(claim, effects, |_, _| ClaimEnd::Dead { error: reason })
+            .await?;
+        crate::obs::dead_lettered(&job.queue);
+        Ok(results.unwrap_or_default())
+    }
+
+    /// The settlement of a claim, shared by [`Self::ack_with`],
+    /// [`Self::nack_with`] and [`Self::dead_letter_with`]. The effects
+    /// are prepared once before the retry loop. Every iteration fences
+    /// the claim, chooses the transition from the stored record and
+    /// the current time with `end_for`, stages it and, when the
+    /// transition is terminal, stages the effects. Returns the written
+    /// record and the effects' results, `None` when the transition
+    /// discarded them.
+    async fn settle_claim<'e>(
+        &self,
+        claim: &Claim,
+        effects: SettlementEffects,
+        end_for: impl Fn(&JobRecord, u64) -> ClaimEnd<'e>,
+    ) -> Result<(JobRecord, Option<Vec<EnqueueResult>>)> {
         let prepared = self.prepare_effects(effects).await?;
         let token = claim.token();
-        let (queue, id) = (claim.job().queue.as_str(), claim.job().id.as_str());
-        let failed_at = self.now_ms();
+        let (queue, id) = (claim.queue.as_str(), claim.id.as_str());
 
-        let settled = self
-            .dead_letter_txn(queue, id, token, failed_at, reason, &prepared)
-            .await;
+        let settled: Result<SettledClaim<'e>> = async {
+            loop {
+                let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
+                // The returned record is the base for the written
+                // record; the claim's copy predates a cancel committed
+                // during the delivery.
+                let mut job = take_claim(&txn, &self.core.lease_registry, queue, id, token).await?;
+                let now = self.now_ms();
+                let end = end_for(&job, now);
+                let pending_key = stage_claim_end(&txn, &mut job, &end, now)?;
+                let staged = if end.is_terminal() {
+                    Some(self.stage_effects(&txn, &prepared).await?)
+                } else {
+                    None
+                };
+                match commit(txn, Durability::Awaited).await? {
+                    Commit::Committed => {
+                        return Ok(SettledClaim {
+                            job,
+                            end,
+                            pending_key,
+                            results: staged.map(|s| self.note_staged_effects(s)),
+                        });
+                    }
+                    Commit::Conflict => continue,
+                }
+            }
+        }
+        .await;
 
         self.finish_effects(
             prepared,
-            settled.as_ref().ok().map(|(_, results)| results.as_slice()),
+            settled.as_ref().ok().and_then(|s| s.results.as_deref()),
         )
         .await;
-        let (job, results) = settled?;
-
-        crate::obs::dead_lettered(&job.queue);
-        self.core.lease_registry.remove(&job.queue, &job.id, token);
-        self.core.completion_waiters.settle(&job.id, || {
-            WaitOutcome::Dead(Box::new(delivered_record(&job, claim)))
-        });
-        Ok(results)
-    }
-
-    /// The transaction loop of [`Self::ack_with`]: fence the claim,
-    /// write or remove the record, stage the effects and commit.
-    async fn ack_txn(
-        &self,
-        job: &JobRecord,
-        token: u64,
-        completed_at: u64,
-        done_record: Option<&(Vec<u8>, Vec<u8>)>,
-        prepared: &PreparedEffects,
-    ) -> Result<Vec<EnqueueResult>> {
-        loop {
-            let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
-            take_claim(&txn, &self.core.lease_registry, &job.queue, &job.id, token).await?;
-            if let Some((done_k, done_v)) = done_record {
-                put_job_record(&txn, done_k, &job_index_key(&job.id), done_v)?;
-                append_attempt(
-                    &txn,
-                    &job.id,
-                    &JobAttempt {
-                        attempt: job.attempts,
-                        claimed_at: job.claimed_at,
-                        recorded_at: completed_at,
-                        outcome: AttemptOutcome::Completed,
-                        error: None,
-                    },
-                )?;
-            } else {
-                // Default: drop the index pointer too; the ID is no longer
-                // findable via get_job, but the queue stays small. The
-                // attempt history shares the record's lifetime.
-                txn.delete(job_index_key(&job.id))?;
-                txn.delete(attempt_history_key(&job.id))?;
-            }
-            update_stats(
-                &txn,
-                &job.queue,
-                &[(JobStatus::Claimed, -1), (JobStatus::Done, 1)],
-            )?;
-
-            let staged = self.stage_effects(&txn, prepared).await?;
-
-            match commit(txn, Durability::Awaited).await? {
-                Commit::Committed => return Ok(self.note_staged_effects(staged)),
-                Commit::Conflict => continue,
-            }
-        }
-    }
-
-    /// The transaction loop of [`Self::nack_with`]: fence the claim,
-    /// dead-letter or requeue the job and commit. Returns the written
-    /// record and, on the dead-letter branch, the effects' results.
-    async fn nack_txn(
-        &self,
-        queue: &str,
-        id: &str,
-        token: u64,
-        error: &str,
-        prepared: &PreparedEffects,
-    ) -> Result<(JobRecord, Option<Vec<EnqueueResult>>)> {
-        loop {
-            let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
-            // The returned record is the base for the written record;
-            // the claim's copy predates a cancel committed during the
-            // delivery.
-            let mut job = take_claim(&txn, &self.core.lease_registry, queue, id, token).await?;
-            let now = self.now_ms();
-
-            let staged = if job.attempts >= job.max_attempts {
-                stage_dead_letter(&txn, &mut job, now, error)?;
-                Some(self.stage_effects(&txn, prepared).await?)
-            } else {
-                job.last_error = Some(error.to_string());
-                append_attempt(
-                    &txn,
-                    &job.id,
-                    &JobAttempt {
-                        attempt: job.attempts,
-                        claimed_at: job.claimed_at.take(),
-                        recorded_at: now,
-                        outcome: AttemptOutcome::Retried,
-                        error: Some(error.to_string()),
-                    },
-                )?;
-                let cfg = self.queue_config(&job.queue);
-                let backoff =
-                    backoff_delay(job.attempts, cfg.retry_backoff_base, cfg.retry_backoff_max);
-
-                if backoff.is_zero() {
-                    stage_to_pending(&txn, &mut job, JobStatus::Claimed)?;
-                    debug!(
-                        queue = %job.queue,
-                        job_id = %job.id,
-                        attempts = job.attempts,
-                        "job re-queued"
-                    );
-                } else {
-                    let run_at = now + backoff.as_millis() as u64;
-                    job.status = JobStatus::Scheduled;
-                    job.run_at = Some(run_at);
-                    let scheduled = scheduled_key(&job.queue, run_at, &job.id);
-                    let value = job.stored_bytes()?;
-                    put_job_record(&txn, &scheduled, &job_index_key(&job.id), &value)?;
-                    update_stats(
-                        &txn,
-                        &job.queue,
-                        &[(JobStatus::Claimed, -1), (JobStatus::Scheduled, 1)],
-                    )?;
-                    debug!(
-                        queue = %job.queue,
-                        job_id = %job.id,
-                        attempts = job.attempts,
-                        backoff_ms = backoff.as_millis() as u64,
-                        "job scheduled for retry"
-                    );
-                }
-                None
-            };
-
-            match commit(txn, Durability::Awaited).await? {
-                Commit::Committed => {
-                    return Ok((job, staged.map(|s| self.note_staged_effects(s))));
-                }
-                Commit::Conflict => continue,
-            }
-        }
-    }
-
-    /// The transaction loop of [`Self::dead_letter_with`]: fence the
-    /// claim, dead-letter the job, stage the effects and commit.
-    async fn dead_letter_txn(
-        &self,
-        queue: &str,
-        id: &str,
-        token: u64,
-        failed_at: u64,
-        reason: &str,
-        prepared: &PreparedEffects,
-    ) -> Result<(JobRecord, Vec<EnqueueResult>)> {
-        loop {
-            let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
-            let mut job = take_claim(&txn, &self.core.lease_registry, queue, id, token).await?;
-            stage_dead_letter(&txn, &mut job, failed_at, reason)?;
-            let staged = self.stage_effects(&txn, prepared).await?;
-            match commit(txn, Durability::Awaited).await? {
-                Commit::Committed => return Ok((job, self.note_staged_effects(staged))),
-                Commit::Conflict => continue,
-            }
-        }
+        let settled = settled?;
+        self.core
+            .finish_claim_end(
+                &settled.job,
+                &settled.end,
+                token,
+                settled.pending_key.as_deref(),
+                Some(claim),
+            )
+            .await;
+        Ok((settled.job, settled.results))
     }
 
     /// Return a snapshot of job counts for the given queue.
@@ -6244,6 +6087,38 @@ mod tests {
         );
 
         q.ack(&reclaim).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancel_requested_during_the_delivery_survives_onto_a_kept_done_record() {
+        let opts = OpenOptions {
+            default_queue_config: QueueConfig {
+                keep_done_jobs: Some(Duration::from_secs(60)),
+                ..QueueConfig::default()
+            },
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let claim = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Requested);
+
+        q.ack(&claim).await.unwrap();
+
+        let done = q.get_job(&id).await.unwrap().unwrap();
+        assert_eq!(done.status, JobStatus::Done);
+        assert!(
+            done.cancel_requested,
+            "the done record is written from the stored record, not the claim's copy",
+        );
         q.close().await.unwrap();
     }
 

@@ -2,12 +2,14 @@
 use slatedb::DbTransaction;
 use slatedb::config::WriteOptions;
 
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{JobRecord, JobStatus};
-use crate::keys::{claimed_key, dead_key, job_index_key, pending_key};
+use crate::keys::{
+    attempt_history_key, claimed_key, dead_key, done_key, job_index_key, pending_key, scheduled_key,
+};
 use crate::lease_registry::LeaseRegistry;
 use crate::stats::update_stats;
 
@@ -108,7 +110,7 @@ pub(crate) async fn commit(txn: DbTransaction, durability: Durability) -> Result
 /// record is rewritten under its dead key with `error` as its last
 /// error, a `DeadLettered` attempt is appended and the stats are
 /// adjusted. The caller has staged the deletion of the claimed key.
-pub(crate) fn stage_dead_letter(
+fn stage_dead_letter(
     txn: &DbTransaction,
     job: &mut JobRecord,
     now: u64,
@@ -167,4 +169,133 @@ pub(crate) fn stage_to_pending(
     put_job_record(txn, &pending, &job_index_key(&job.id), &value)?;
     update_stats(txn, &job.queue, &[(JobStatus::Pending, 1), (from, -1)])?;
     Ok(pending)
+}
+
+/// The transition that ends a claim, chosen by the settling path from
+/// the stored record read inside its transaction.
+pub(crate) enum ClaimEnd<'a> {
+    /// The job completed. With `keep` a done record is written;
+    /// otherwise the record, its index entry and its attempt history
+    /// are removed.
+    Done { keep: bool },
+    /// The job returns to the queue: to pending immediately, or to the
+    /// scheduled key space when `run_at` is set. `error`, when present,
+    /// is recorded on the job and in its attempt history.
+    Retry {
+        run_at: Option<u64>,
+        outcome: AttemptOutcome,
+        error: Option<&'a str>,
+    },
+    /// The job is dead-lettered.
+    Dead { error: &'a str },
+}
+
+impl ClaimEnd<'_> {
+    /// Whether the transition ends the job rather than returning it
+    /// to the queue.
+    pub(crate) fn is_terminal(&self) -> bool {
+        !matches!(self, Self::Retry { .. })
+    }
+}
+
+/// Stage the transition that ends a claim. The caller has read the
+/// stored record and staged the deletion of its claimed key; on return
+/// `job` is the record as written. Returns the pending key when the
+/// job returned to pending, for the caller to record after the commit.
+pub(crate) fn stage_claim_end(
+    txn: &DbTransaction,
+    job: &mut JobRecord,
+    end: &ClaimEnd<'_>,
+    now: u64,
+) -> Result<Option<Vec<u8>>> {
+    match *end {
+        ClaimEnd::Done { keep } => {
+            job.status = JobStatus::Done;
+            job.completed_at = Some(now);
+            if keep {
+                append_attempt(
+                    txn,
+                    &job.id,
+                    &JobAttempt {
+                        attempt: job.attempts,
+                        claimed_at: job.claimed_at,
+                        recorded_at: now,
+                        outcome: AttemptOutcome::Completed,
+                        error: None,
+                    },
+                )?;
+                let value = job.stored_bytes()?;
+                put_job_record(
+                    txn,
+                    &done_key(now, &job.queue, &job.id),
+                    &job_index_key(&job.id),
+                    &value,
+                )?;
+            } else {
+                // The attempt history shares the record's lifetime.
+                txn.delete(job_index_key(&job.id))?;
+                txn.delete(attempt_history_key(&job.id))?;
+            }
+            update_stats(
+                txn,
+                &job.queue,
+                &[(JobStatus::Claimed, -1), (JobStatus::Done, 1)],
+            )?;
+            Ok(None)
+        }
+        ClaimEnd::Retry {
+            run_at,
+            outcome,
+            error,
+        } => {
+            let claimed_at = job.claimed_at.take();
+            if let Some(error) = error {
+                job.last_error = Some(error.to_string());
+            }
+            append_attempt(
+                txn,
+                &job.id,
+                &JobAttempt {
+                    attempt: job.attempts,
+                    claimed_at,
+                    recorded_at: now,
+                    outcome,
+                    error: error.map(str::to_string),
+                },
+            )?;
+            let pending = match run_at {
+                None => Some(stage_to_pending(txn, job, JobStatus::Claimed)?),
+                Some(run_at) => {
+                    job.status = JobStatus::Scheduled;
+                    job.run_at = Some(run_at);
+                    let value = job.stored_bytes()?;
+                    put_job_record(
+                        txn,
+                        &scheduled_key(&job.queue, run_at, &job.id),
+                        &job_index_key(&job.id),
+                        &value,
+                    )?;
+                    update_stats(
+                        txn,
+                        &job.queue,
+                        &[(JobStatus::Claimed, -1), (JobStatus::Scheduled, 1)],
+                    )?;
+                    None
+                }
+            };
+            debug!(
+                queue = %job.queue,
+                job_id = %job.id,
+                attempts = job.attempts,
+                outcome = ?outcome,
+                run_at,
+                "job returned to the queue"
+            );
+            Ok(pending)
+        }
+        ClaimEnd::Dead { error } => {
+            stage_dead_letter(txn, job, now, error)?;
+            Ok(None)
+        }
+    }
 }

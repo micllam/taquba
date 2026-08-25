@@ -85,6 +85,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `recorded_at` equals the `completed_at` of the done record, the
   `failed_at` of the dead record or the base of the retry `run_at`,
   where it was previously read separately and could trail them.
+- `Queue::ack` writes the retained done record from the stored claimed
+  record, as every other settlement does, so a `cancel_requested`
+  persisted during the delivery appears on the done record; it was
+  previously written from the claim's copy and lost the flag.
 
 ### Fixed
 

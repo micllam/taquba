@@ -4,10 +4,9 @@ use std::time::Duration;
 use slatedb::IsolationLevel;
 use tracing::{debug, warn};
 
-use crate::WaitOutcome;
 use crate::background::Periodic;
 use crate::error::{Error, Result};
-use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
+use crate::history::AttemptOutcome;
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{
     KeyTag, attempt_history_key, claimed_key, job_index_key, parse_key_timestamp, tag_prefix,
@@ -15,7 +14,7 @@ use crate::keys::{
 use crate::lease_registry::DueLease;
 use crate::queue_core::QueueCore;
 use crate::stats::update_stats;
-use crate::txn::{Commit, Durability, commit, stage_dead_letter, stage_to_pending, write_options};
+use crate::txn::{ClaimEnd, Commit, Durability, commit, stage_claim_end, write_options};
 
 pub(crate) struct Reaper {
     core: Arc<QueueCore>,
@@ -134,13 +133,9 @@ async fn reap_job(core: &QueueCore, lease: &DueLease) -> Result<()> {
         };
 
         let mut job = JobRecord::decode(&claimed_key_bytes, &raw)?;
-        let end = stage_unsettled_claim_end(
-            &txn,
-            &mut job,
-            core.now_ms(),
-            AttemptOutcome::LeaseExpired,
-            "lease expired",
-        )?;
+        txn.delete(&claimed_key_bytes)?;
+        let end = unsettled_claim_end(&job, AttemptOutcome::LeaseExpired, "lease expired");
+        let pending_key = stage_claim_end(&txn, &mut job, &end, core.now_ms())?;
 
         // The commit does not await WAL durability: each expired claim
         // is its own transaction, so awaiting the flush would serialise
@@ -149,26 +144,12 @@ async fn reap_job(core: &QueueCore, lease: &DueLease) -> Result<()> {
         // next open.
         match commit(txn, Durability::Deferred).await? {
             Commit::Committed => {
-                registry.remove(queue, id, token);
-                match end {
-                    ClaimEnd::Requeued { pending_key } => {
-                        core.claim_cursor
-                            .note_pending_insert(&job.queue, &pending_key);
-                        crate::obs::reaped(&job.queue, 1);
-                    }
-                    ClaimEnd::DeadLettered => {
-                        crate::obs::dead_lettered(&job.queue);
-                        if core.completion_waiters.has_waiters(id) {
-                            // Delivered in the form `get_job` returns; a
-                            // failed payload fetch leaves the stored form.
-                            let mut delivered = job.clone();
-                            if let Err(e) = core.payload_store.materialize(&mut delivered).await {
-                                warn!(queue = %queue, job_id = %id, error = %e, "payload of a dead-lettered job could not be fetched for its waiters");
-                            }
-                            core.completion_waiters
-                                .settle(id, || WaitOutcome::Dead(Box::new(delivered)));
-                        }
-                    }
+                core.finish_claim_end(&job, &end, token, pending_key.as_deref(), None)
+                    .await;
+                if end.is_terminal() {
+                    crate::obs::dead_lettered(&job.queue);
+                } else {
+                    crate::obs::reaped(&job.queue, 1);
                 }
                 return Ok(());
             }
@@ -178,51 +159,23 @@ async fn reap_job(core: &QueueCore, lease: &DueLease) -> Result<()> {
     }
 }
 
-/// How an unsettled claim's job left the claimed state.
-enum ClaimEnd {
-    Requeued { pending_key: Vec<u8> },
-    DeadLettered,
-}
-
-/// Stage the transition of a claimed job whose claim ended without a
-/// settlement: back to pending, or to the dead-letter set once its
-/// attempts are exhausted. Shared by the reaper and the open-time
-/// requeue; `error` names the cause in the history and log entries.
-fn stage_unsettled_claim_end(
-    txn: &slatedb::DbTransaction,
-    job: &mut JobRecord,
-    now: u64,
+/// The transition for a claim that ends without a settlement: the
+/// job is dead-lettered once its attempts are exhausted and otherwise
+/// returns to pending without a backoff. Shared by the reaper and the
+/// open-time recovery of interrupted claims.
+fn unsettled_claim_end<'a>(
+    job: &JobRecord,
     outcome: AttemptOutcome,
-    error: &str,
-) -> Result<ClaimEnd> {
-    txn.delete(claimed_key(&job.queue, &job.id))?;
-
+    error: &'a str,
+) -> ClaimEnd<'a> {
     if job.attempts >= job.max_attempts {
-        stage_dead_letter(txn, job, now, error)?;
-        Ok(ClaimEnd::DeadLettered)
+        ClaimEnd::Dead { error }
     } else {
-        let claimed_at = job.claimed_at.take();
-        let pending = stage_to_pending(txn, job, JobStatus::Claimed)?;
-        append_attempt(
-            txn,
-            &job.id,
-            &JobAttempt {
-                attempt: job.attempts,
-                claimed_at,
-                recorded_at: now,
-                outcome,
-                error: None,
-            },
-        )?;
-        debug!(
-            queue = %job.queue,
-            job_id = %job.id,
-            attempts = job.attempts,
-            "{error}: job re-queued"
-        );
-        Ok(ClaimEnd::Requeued {
-            pending_key: pending,
-        })
+        ClaimEnd::Retry {
+            run_at: None,
+            outcome,
+            error: None,
+        }
     }
 }
 
@@ -251,13 +204,13 @@ pub(crate) async fn requeue_interrupted_claims(core: &QueueCore) -> Result<()> {
 
     for mut job in interrupted {
         let txn = core.db.begin(IsolationLevel::Snapshot).await?;
-        let end = stage_unsettled_claim_end(
-            &txn,
-            &mut job,
-            core.now_ms(),
+        txn.delete(claimed_key(&job.queue, &job.id))?;
+        let end = unsettled_claim_end(
+            &job,
             AttemptOutcome::Interrupted,
             "claim interrupted by process exit",
-        )?;
+        );
+        let pending_key = stage_claim_end(&txn, &mut job, &end, core.now_ms())?;
         // The commit does not await WAL durability: awaiting the flush
         // would serialise the open at one job per flush interval, and a
         // requeue lost in a crash is redone by the next open from the
@@ -265,7 +218,7 @@ pub(crate) async fn requeue_interrupted_claims(core: &QueueCore) -> Result<()> {
         // so a commit error surfaces to the caller and fails the open.
         txn.commit_with_options(&write_options(Durability::Deferred))
             .await?;
-        if let ClaimEnd::Requeued { pending_key } = end {
+        if let Some(pending_key) = pending_key {
             core.claim_cursor
                 .note_pending_insert(&job.queue, &pending_key);
         }
