@@ -541,13 +541,6 @@ pub struct Queue {
     /// Stopping returns the task so `close` can commit the closing
     /// beat with the task's counter.
     heartbeat: Option<BackgroundTask<crate::liveness::HeartbeatTask>>,
-    /// Per-queue async mutex held across the claim transaction.
-    /// Same-queue claim attempts serialise on this mutex rather than
-    /// resolving via SlateDB's transaction-conflict retry. The lock
-    /// is per-queue, so different queues' claim paths still run in
-    /// parallel. In-process coordination is sufficient because all
-    /// writers to a SlateDB store share one process.
-    claim_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Source of job ids. Pending keys sort by id within a priority, so
     /// ids must increase with enqueue order, including inside one
     /// millisecond. One generator per store suffices: a store has a
@@ -708,7 +701,6 @@ impl Queue {
             scheduler_task,
             metrics_sampler,
             heartbeat,
-            claim_locks: std::sync::Mutex::new(HashMap::new()),
             id_gen: std::sync::Mutex::new(ulid::Generator::new()),
             payload_offload_threshold: opts.payload_offload_threshold,
         })
@@ -1412,15 +1404,6 @@ impl Queue {
         self.claim(queue, lease_duration).await
     }
 
-    /// Returns the per-queue async mutex guarding [`Self::claim`] for
-    /// `queue`, creating it on first access.
-    fn claim_lock_for(&self, queue: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self.claim_locks.lock().unwrap();
-        map.entry(queue.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    }
-
     /// Block up to `max_wait` for a job to become claimable on `queue`.
     ///
     /// The wakeup is queue-scoped and delivered to one waiter per
@@ -1557,7 +1540,7 @@ impl Queue {
             return Ok(Vec::new());
         }
         let mut jobs = {
-            let lock = self.claim_lock_for(queue);
+            let lock = self.core.claim_cursor.claim_lock_for(queue);
             let _guard = lock.lock().await;
             self.claim_batch_locked(queue, max_jobs, lease_duration)
                 .await?

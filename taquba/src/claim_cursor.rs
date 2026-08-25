@@ -10,8 +10,8 @@ use tokio::sync::Notify;
 /// waiting, so extra calls would be wasted work.
 const MAX_INSERT_WAKEUPS: usize = 64;
 
-/// Per-queue in-memory claim-scan state: a scan-start bound and a
-/// pending-insert epoch.
+/// Per-queue in-process claim state: a scan-start bound, a
+/// pending-insert epoch, the insert wakeup and the claim lock.
 ///
 /// The scan-start bound is the position the next claim scans from,
 /// skipping the tombstone band left by previously claimed (and
@@ -71,6 +71,10 @@ struct QueueClaimState {
     /// `notify_one`, waking one waiting worker per job instead of the
     /// whole pool.
     wakeup: Arc<Notify>,
+    /// Held across the queue's claim transaction, so same-queue claim
+    /// attempts serialise here in place of a transaction-conflict
+    /// retry. Per queue, so different queues' claims run in parallel.
+    claim_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Snapshot of one queue's claim-scan state, taken at the start of a
@@ -274,6 +278,17 @@ impl ClaimCursor {
             .entry(queue.to_string())
             .or_default()
             .wakeup
+            .clone()
+    }
+
+    /// The mutex a claim on `queue` holds across its scan and commit.
+    pub(crate) fn claim_lock_for(&self, queue: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .entry(queue.to_string())
+            .or_default()
+            .claim_lock
             .clone()
     }
 }
