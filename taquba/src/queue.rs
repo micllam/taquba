@@ -218,6 +218,13 @@ impl EnqueueResult {
             Self::New(id) | Self::AlreadyEnqueued(id) => id,
         }
     }
+
+    /// The id of the underlying job, by value.
+    pub fn into_id(self) -> String {
+        match self {
+            Self::New(id) | Self::AlreadyEnqueued(id) => id,
+        }
+    }
 }
 
 /// Generate a claim token. A ULID's low 64 bits fall inside its 80-bit
@@ -814,12 +821,9 @@ impl Queue {
         opts: EnqueueOptions,
     ) -> Result<String> {
         let (job, key, id_override_used) = self.prepare_job_record(queue, payload, opts)?;
-        match self
-            .write_job(job, key, id_override_used, HashMap::new())
-            .await?
-        {
-            EnqueueResult::New(id) | EnqueueResult::AlreadyEnqueued(id) => Ok(id),
-        }
+        self.write_job(job, key, id_override_used, HashMap::new())
+            .await
+            .map(EnqueueResult::into_id)
     }
 
     /// Enqueue a job AND apply a set of writes to the user KV namespace
@@ -930,22 +934,8 @@ impl Queue {
     /// where an unconditional [`Self::kv_delete`] could delete a newer
     /// value than the one read.
     pub async fn kv_compare_delete(&self, key: &[u8], expected: &[u8]) -> Result<bool> {
-        let scoped = user_scoped_key(key);
-        loop {
-            let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
-            match txn.get(&scoped).await? {
-                Some(current) if current.as_ref() == expected => {}
-                _ => {
-                    txn.rollback();
-                    return Ok(false);
-                }
-            }
-            txn.delete(&scoped)?;
-            match commit(txn, Durability::Awaited).await? {
-                Commit::Committed => return Ok(true),
-                Commit::Conflict => continue,
-            }
-        }
+        self.kv_compare_then(key, Some(expected), |txn, scoped| txn.delete(scoped))
+            .await
     }
 
     /// Write a value to the user KV namespace only if its current state
@@ -979,6 +969,20 @@ impl Queue {
         value: &[u8],
     ) -> Result<bool> {
         validate_kv_value_size(value)?;
+        self.kv_compare_then(key, expected, |txn, scoped| txn.put(scoped, value))
+            .await
+    }
+
+    /// Compare the current state of the user KV key against `expected`
+    /// (`None` requires absence) and, when it matches, stage `write` in
+    /// the same transaction and commit durably. Returns whether the
+    /// state matched; conflicts are retried.
+    async fn kv_compare_then(
+        &self,
+        key: &[u8],
+        expected: Option<&[u8]>,
+        write: impl Fn(&DbTransaction, &[u8]) -> std::result::Result<(), slatedb::Error>,
+    ) -> Result<bool> {
         let scoped = user_scoped_key(key);
         loop {
             let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
@@ -991,7 +995,7 @@ impl Queue {
                 txn.rollback();
                 return Ok(false);
             }
-            txn.put(&scoped, value)?;
+            write(&txn, &scoped)?;
             match commit(txn, Durability::Awaited).await? {
                 Commit::Committed => return Ok(true),
                 Commit::Conflict => continue,
@@ -1339,10 +1343,7 @@ impl Queue {
         // immediately instead of sleeping past an already-available
         // job.
         notified.as_mut().enable();
-        tokio::select! {
-            _ = &mut notified => {}
-            _ = tokio::time::sleep(max_wait) => {}
-        }
+        let _ = tokio::time::timeout(max_wait, notified).await;
     }
 
     /// Claim the next pending job, waiting up to `max_wait` for one to appear.
@@ -2239,13 +2240,11 @@ impl Queue {
             }
         }
 
-        tokio::select! {
-            delivered = registration.receiver() => {
-                // The sender is consumed only by a settlement, so the
-                // channel cannot close without an outcome.
-                Ok(delivered.unwrap_or(WaitOutcome::TimedOut))
-            }
-            _ = tokio::time::sleep(timeout) => Ok(WaitOutcome::TimedOut),
+        match tokio::time::timeout(timeout, registration.receiver()).await {
+            // The sender is consumed only by a settlement, so the
+            // channel cannot close without an outcome.
+            Ok(delivered) => Ok(delivered.unwrap_or(WaitOutcome::TimedOut)),
+            Err(_) => Ok(WaitOutcome::TimedOut),
         }
     }
 

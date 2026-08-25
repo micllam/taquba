@@ -2,6 +2,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
@@ -384,15 +385,12 @@ async fn process_and_settle<W: Worker>(
     }
 }
 
-/// Non-blocking peek at a pinned shutdown future. Returns true if the future
-/// has already resolved, false otherwise. Used to honour shutdown between jobs
-/// without putting `process` inside a `select!` (which would cancel it if the
-/// shutdown signal landed while a claim was in flight).
+/// Whether the pinned shutdown future has resolved, polled without
+/// waiting. Used to honour shutdown between jobs without putting
+/// `process` inside a `select!`, which would cancel it if the shutdown
+/// signal arrived while a claim was in flight.
 fn check_shutdown<F: Future<Output = ()>>(shutdown: std::pin::Pin<&mut F>) -> bool {
-    use std::task::{Context, Poll};
-    let waker = std::task::Waker::noop();
-    let mut cx = Context::from_waker(waker);
-    matches!(shutdown.poll(&mut cx), Poll::Ready(()))
+    shutdown.now_or_never().is_some()
 }
 
 #[cfg(test)]

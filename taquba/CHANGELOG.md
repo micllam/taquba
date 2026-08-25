@@ -48,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   settlement transaction begins. The delete silently took precedence.
 - `Queue::lease_handle` builds the `LeaseHandle` for a held `Claim`,
   for callers that run `Worker::process` from their own claim loop.
+- `EnqueueResult::into_id`, the by-value form of `EnqueueResult::id`.
 
 ### Changed
 
