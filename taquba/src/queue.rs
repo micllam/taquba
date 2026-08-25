@@ -546,8 +546,6 @@ pub struct Queue {
     /// millisecond. One generator per store suffices: a store has a
     /// single writer process.
     id_gen: std::sync::Mutex<ulid::Generator>,
-    /// Payload size above which enqueues offload; `None` disables.
-    payload_offload_threshold: Option<usize>,
 }
 
 /// The record a settlement delivers to completion waiters: the stored
@@ -641,6 +639,7 @@ impl Queue {
             opts.payload_store.unwrap_or_else(|| object_store.clone()),
             opts.payload_path
                 .unwrap_or_else(|| format!("{path}-payloads")),
+            opts.payload_offload_threshold,
         ));
         let mut settings = Settings::default();
         if let Some(flush_interval) = opts.flush_interval {
@@ -702,7 +701,6 @@ impl Queue {
             metrics_sampler,
             heartbeat,
             id_gen: std::sync::Mutex::new(ulid::Generator::new()),
-            payload_offload_threshold: opts.payload_offload_threshold,
         })
     }
 
@@ -1080,99 +1078,16 @@ impl Queue {
         Ok((job, key, id_override_used))
     }
 
-    /// Offload `job`'s payload when it exceeds the configured threshold:
-    /// the payload is written once as an object named by a newly
-    /// generated ULID, [`JobRecord::payload_ref`] is set and the inline
-    /// payload is emptied. Runs before the transaction that writes the
-    /// record, so a committed record never points at an unwritten
-    /// object. The object name is unique to this enqueue attempt, so it
-    /// cannot overwrite another job's object, including when a
-    /// duplicate-id enqueue is later rejected.
-    async fn offload_payload(&self, job: &mut JobRecord) -> Result<()> {
-        let Some(threshold) = self.payload_offload_threshold else {
-            return Ok(());
-        };
-        if job.payload.len() <= threshold {
-            return Ok(());
-        }
-        let payload_ref = Ulid::new().to_string();
-        self.core
-            .payload_store
-            .put(&payload_ref, std::mem::take(&mut job.payload))
-            .await?;
-        job.payload_ref = Some(payload_ref);
-        Ok(())
-    }
-
-    /// Offload every oversized payload in `jobs`, in order. On a
-    /// failure the objects already written for earlier entries are
-    /// deleted (no record points at them yet) and the error is
-    /// returned.
-    async fn offload_payloads<'a, I>(&self, jobs: I) -> Result<()>
-    where
-        I: IntoIterator<Item = &'a mut JobRecord>,
-    {
-        let mut jobs: Vec<&mut JobRecord> = jobs.into_iter().collect();
-        for i in 0..jobs.len() {
-            if let Err(err) = self.offload_payload(&mut *jobs[i]).await {
-                for job in &jobs[..i] {
-                    self.delete_payload_object(job).await;
-                }
-                return Err(err);
-            }
-        }
-        Ok(())
-    }
-
-    /// Fetch an offloaded payload into `job.payload`. No-op for records
-    /// whose payload is inline.
-    async fn materialize_payload(&self, job: &mut JobRecord) -> Result<()> {
-        crate::read::materialize_payload(&self.core.payload_store, job).await
-    }
-
     /// Fetch the offloaded payloads of `jobs` concurrently, bounding a
     /// batch's wall time by the slowest object rather than the sum of
     /// the fetches. Jobs with inline payloads are untouched. On a fetch
     /// failure, one error is returned after every fetch has settled.
     async fn materialize_payloads(&self, jobs: &mut [Claim]) -> Result<()> {
-        let fetches = jobs.iter().enumerate().filter_map(|(index, claim)| {
-            let job = claim.job();
-            job.payload_ref.as_deref().map(|payload_ref| async move {
-                (
-                    index,
-                    self.core.payload_store.get(payload_ref, &job.id).await,
-                )
-            })
-        });
-        let fetched = futures_util::future::join_all(fetches).await;
-        let mut first_err = None;
-        for (index, result) in fetched {
-            match result {
-                Ok(payload) => jobs[index].job_mut().payload = payload,
-                Err(err) => {
-                    if first_err.is_none() {
-                        first_err = Some(err);
-                    }
-                }
-            }
-        }
-        match first_err {
-            Some(err) => Err(err),
-            None => Ok(()),
-        }
-    }
-
-    /// Delete `job`'s payload object if it has one, logging any failure.
-    /// Called only after the transaction that removed (or declined to
-    /// write) the record: deleting earlier could leave a live record
-    /// whose payload is gone.
-    async fn delete_payload_object(&self, job: &JobRecord) {
-        if let Some(ref payload_ref) = job.payload_ref {
-            self.core
-                .payload_store
-                .delete_best_effort(payload_ref, &job.id)
+        let store = &self.core.payload_store;
+        let fetched =
+            futures_util::future::join_all(jobs.iter_mut().map(|c| store.materialize(c.job_mut())))
                 .await;
-        }
+        fetched.into_iter().collect()
     }
 
     /// Release prepared effects once their settlement has ended:
@@ -1189,13 +1104,13 @@ impl Queue {
             Some(results) => {
                 for (prepared, result) in prepared.prepared_jobs.iter().zip(results) {
                     if matches!(result, EnqueueResult::AlreadyEnqueued(_)) {
-                        self.delete_payload_object(&prepared.job).await;
+                        self.core.payload_store.delete_for(&prepared.job).await;
                     }
                 }
             }
             None => {
                 for prepared in &prepared.prepared_jobs {
-                    self.delete_payload_object(&prepared.job).await;
+                    self.core.payload_store.delete_for(&prepared.job).await;
                 }
             }
         }
@@ -1229,7 +1144,9 @@ impl Queue {
                 id_override_used,
             });
         }
-        self.offload_payloads(prepared_jobs.iter_mut().map(|p| &mut p.job))
+        self.core
+            .payload_store
+            .offload_all(prepared_jobs.iter_mut().map(|p| &mut p.job))
             .await?;
         Ok(PreparedEffects {
             prepared_jobs,
@@ -1288,7 +1205,7 @@ impl Queue {
         id_override_used: bool,
         kv_writes: HashMap<Vec<u8>, Vec<u8>>,
     ) -> Result<EnqueueResult> {
-        self.offload_payload(&mut job).await?;
+        self.core.payload_store.offload(&mut job).await?;
         let prepared = PreparedJob {
             job,
             key,
@@ -1299,7 +1216,7 @@ impl Queue {
         // on a dedup downgrade or an error the record does not exist,
         // so remove the object written above.
         if !matches!(result, Ok(EnqueueResult::New(_))) {
-            self.delete_payload_object(&prepared.job).await;
+            self.core.payload_store.delete_for(&prepared.job).await;
         }
         result
     }
@@ -1840,7 +1757,7 @@ impl Queue {
         // without one, its payload object is removed here, after the
         // commit.
         if !keep_done {
-            self.delete_payload_object(job).await;
+            self.core.payload_store.delete_for(job).await;
         }
 
         crate::obs::completed(&job.queue, timer);
@@ -2344,7 +2261,7 @@ impl Queue {
         let Some((index_key, _, mut job)) = found else {
             return Ok(None);
         };
-        match self.materialize_payload(&mut job).await {
+        match self.core.payload_store.materialize(&mut job).await {
             Ok(()) => Ok(Some(job)),
             Err(Error::PayloadMissing { id }) => {
                 // The record can be read just before a record-removing
@@ -2482,7 +2399,7 @@ impl Queue {
                         if matches!(outcome, CancelOutcome::Removed) {
                             // The record is deleted, so its payload object
                             // (if any) is removed here, after the commit.
-                            self.delete_payload_object(&job).await;
+                            self.core.payload_store.delete_for(&job).await;
                             self.core
                                 .completion_waiters
                                 .settle(id, || WaitOutcome::Cancelled);
@@ -2586,7 +2503,9 @@ impl Queue {
                 id_override_used,
             });
         }
-        self.offload_payloads(prepared.iter_mut().map(|p| &mut p.job))
+        self.core
+            .payload_store
+            .offload_all(prepared.iter_mut().map(|p| &mut p.job))
             .await?;
 
         let write = async {
@@ -2610,7 +2529,7 @@ impl Queue {
             Ok(staged) => staged,
             Err(err) => {
                 for prepared_job in &prepared {
-                    self.delete_payload_object(&prepared_job.job).await;
+                    self.core.payload_store.delete_for(&prepared_job.job).await;
                 }
                 return Err(err);
             }

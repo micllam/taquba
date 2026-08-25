@@ -17,8 +17,10 @@
 use std::sync::Arc;
 
 use slatedb::object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, path::Path};
+use ulid::Ulid;
 
 use crate::error::{Error, Result};
+use crate::job::JobRecord;
 
 /// Storage for offloaded payload objects under a dedicated prefix.
 ///
@@ -29,11 +31,22 @@ use crate::error::{Error, Result};
 pub(crate) struct PayloadStore {
     store: Arc<dyn ObjectStore>,
     prefix: String,
+    /// Payload size above which [`Self::offload`] offloads; `None`
+    /// keeps every payload inline.
+    offload_threshold: Option<usize>,
 }
 
 impl PayloadStore {
-    pub(crate) fn new(store: Arc<dyn ObjectStore>, prefix: String) -> Self {
-        Self { store, prefix }
+    pub(crate) fn new(
+        store: Arc<dyn ObjectStore>,
+        prefix: String,
+        offload_threshold: Option<usize>,
+    ) -> Self {
+        Self {
+            store,
+            prefix,
+            offload_threshold,
+        }
     }
 
     fn object_path(&self, payload_ref: &str) -> Path {
@@ -68,6 +81,67 @@ impl PayloadStore {
         match self.store.delete(&self.object_path(payload_ref)).await {
             Ok(()) | Err(ObjectStoreError::NotFound { .. }) => Ok(()),
             Err(err) => Err(Error::PayloadStore(err)),
+        }
+    }
+
+    /// Offload `job`'s payload when it exceeds the threshold: the
+    /// payload is written once as an object named by a new ULID,
+    /// [`JobRecord::payload_ref`] is set and the inline payload is
+    /// emptied. Runs before the transaction that writes the record, so
+    /// a committed record never points at an unwritten object. The
+    /// object name is unique to this call, so it cannot overwrite
+    /// another job's object, including when a duplicate-id enqueue is
+    /// later rejected.
+    pub(crate) async fn offload(&self, job: &mut JobRecord) -> Result<()> {
+        let Some(threshold) = self.offload_threshold else {
+            return Ok(());
+        };
+        if job.payload.len() <= threshold {
+            return Ok(());
+        }
+        let payload_ref = Ulid::new().to_string();
+        self.put(&payload_ref, std::mem::take(&mut job.payload))
+            .await?;
+        job.payload_ref = Some(payload_ref);
+        Ok(())
+    }
+
+    /// Offload every oversized payload in `jobs`, in order. On a
+    /// failure the objects already written for earlier entries are
+    /// deleted (no record points at them yet) and the error is
+    /// returned.
+    pub(crate) async fn offload_all<'a, I>(&self, jobs: I) -> Result<()>
+    where
+        I: IntoIterator<Item = &'a mut JobRecord>,
+    {
+        let mut jobs: Vec<&mut JobRecord> = jobs.into_iter().collect();
+        for i in 0..jobs.len() {
+            if let Err(err) = self.offload(&mut *jobs[i]).await {
+                for job in &jobs[..i] {
+                    self.delete_for(job).await;
+                }
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    /// Fetch an offloaded payload into `job.payload`. No-op for records
+    /// whose payload is inline.
+    pub(crate) async fn materialize(&self, job: &mut JobRecord) -> Result<()> {
+        if let Some(ref payload_ref) = job.payload_ref {
+            job.payload = self.get(payload_ref, &job.id).await?;
+        }
+        Ok(())
+    }
+
+    /// Delete `job`'s payload object if it has one, logging any failure.
+    /// Called only after the transaction that removed (or declined to
+    /// write) the record: deleting earlier could leave a live record
+    /// whose payload is gone.
+    pub(crate) async fn delete_for(&self, job: &JobRecord) {
+        if let Some(ref payload_ref) = job.payload_ref {
+            self.delete_best_effort(payload_ref, &job.id).await;
         }
     }
 

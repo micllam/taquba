@@ -149,6 +149,7 @@ impl QueueReader {
             opts.payload_store.unwrap_or_else(|| object_store.clone()),
             opts.payload_path
                 .unwrap_or_else(|| format!("{path}-payloads")),
+            None,
         ));
         let mode = match opts.mode {
             ReaderMode::ManagedCheckpoint => DbReaderMode::ManagedCheckpoint,

@@ -162,12 +162,7 @@ async fn reap_job(core: &QueueCore, lease: &DueLease) -> Result<()> {
                             // Delivered in the form `get_job` returns; a
                             // failed payload fetch leaves the stored form.
                             let mut delivered = job.clone();
-                            if let Err(e) = crate::read::materialize_payload(
-                                &core.payload_store,
-                                &mut delivered,
-                            )
-                            .await
-                            {
+                            if let Err(e) = core.payload_store.materialize(&mut delivered).await {
                                 warn!(queue = %queue, job_id = %id, error = %e, "payload of a dead-lettered job could not be fetched for its waiters");
                             }
                             core.completion_waiters

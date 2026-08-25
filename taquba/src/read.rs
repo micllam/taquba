@@ -69,18 +69,6 @@ impl ReadHandle for DbReader {
     }
 }
 
-/// Fetch an offloaded payload into `job.payload`. No-op for records
-/// whose payload is inline.
-pub(crate) async fn materialize_payload(
-    payloads: &PayloadStore,
-    job: &mut JobRecord,
-) -> Result<()> {
-    if let Some(ref payload_ref) = job.payload_ref {
-        job.payload = payloads.get(payload_ref, &job.id).await?;
-    }
-    Ok(())
-}
-
 /// Body of `stats`: assemble a [`QueueStats`] snapshot from the queue's
 /// per-state counters.
 pub(crate) async fn stats<H: ReadHandle>(handle: &H, queue: &str) -> Result<QueueStats> {
@@ -183,7 +171,7 @@ pub(crate) async fn list_jobs<H: ReadHandle>(
 
     let mut jobs = Vec::with_capacity(page.len());
     for (record_key, mut job) in page {
-        match materialize_payload(payloads, &mut job).await {
+        match payloads.materialize(&mut job).await {
             Ok(()) => jobs.push(job),
             Err(Error::PayloadMissing { id }) => {
                 // The scan can list a record just before a
@@ -254,7 +242,7 @@ pub(crate) async fn get_job<H: ReadHandle>(
         return Ok(None);
     };
     let mut job = JobRecord::decode(&current_key, &bytes)?;
-    materialize_payload(payloads, &mut job).await?;
+    payloads.materialize(&mut job).await?;
     Ok(Some(job))
 }
 
