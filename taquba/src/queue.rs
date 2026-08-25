@@ -7,11 +7,10 @@ use bytes::Bytes;
 use slatedb::config::{ScanOptions, Settings, WriteOptions};
 use slatedb::object_store::ObjectStore;
 use slatedb::{Db, DbTransaction, IsolationLevel};
-use tokio::sync::watch;
-use tokio::task::JoinHandle;
 use tracing::{debug, instrument, warn};
 use ulid::Ulid;
 
+use crate::background::BackgroundTask;
 use crate::claim_cursor::{ClaimCursor, CursorState, ScanFrom};
 use crate::clock::{Clock, default_clock};
 use crate::completion::CompletionWaiters;
@@ -522,22 +521,15 @@ pub struct SettlementEffects {
 /// shared across processes.
 pub struct Queue {
     db: Arc<Db>,
-    reaper_shutdown: watch::Sender<bool>,
-    reaper_handle: JoinHandle<()>,
-    scheduler_shutdown: watch::Sender<bool>,
-    scheduler_handle: JoinHandle<()>,
-    /// Shutdown sender and join handle for the optional metrics sampler.
+    reaper: BackgroundTask,
+    scheduler: BackgroundTask,
     /// `Some` only when built with the `metrics` feature and
     /// `OpenOptions::metrics_sample_interval` was set.
-    metrics_sampler: Option<(watch::Sender<bool>, JoinHandle<()>)>,
-    /// Shutdown sender and join handle for the optional liveness
-    /// heartbeat. `Some` only when `OpenOptions::liveness_heartbeat`
-    /// was set. Joining returns the task so `close` can commit the
-    /// closing beat with the task's counter.
-    heartbeat: Option<(
-        watch::Sender<bool>,
-        JoinHandle<crate::liveness::HeartbeatTask>,
-    )>,
+    metrics_sampler: Option<BackgroundTask>,
+    /// `Some` only when `OpenOptions::liveness_heartbeat` was set.
+    /// Stopping returns the task so `close` can commit the closing
+    /// beat with the task's counter.
+    heartbeat: Option<BackgroundTask<crate::liveness::HeartbeatTask>>,
     default_queue_config: QueueConfig,
     queue_configs: HashMap<String, QueueConfig>,
     clock: Arc<dyn Clock>,
@@ -683,10 +675,8 @@ impl Queue {
         // restored bound.
         crate::reaper::requeue_interrupted_claims(&db, opts.clock.as_ref(), &claim_cursor).await?;
         let lease_registry = LeaseRegistry::new();
-        let (reaper_shutdown, reaper_rx) = watch::channel(false);
         let reaper = Reaper {
             db: db.clone(),
-            interval: opts.reaper_interval,
             default_queue_config: opts.default_queue_config.clone(),
             queue_configs: opts.queue_configs.clone(),
             clock: opts.clock.clone(),
@@ -695,28 +685,25 @@ impl Queue {
             payload_store: payload_store.clone(),
             lease_registry: lease_registry.clone(),
         };
-        let reaper_handle = tokio::spawn(reaper.run(reaper_rx));
-        let (scheduler_shutdown, scheduler_rx) = watch::channel(false);
+        let reaper = BackgroundTask::spawn(opts.reaper_interval, |ticker| reaper.run(ticker));
         let scheduler = Scheduler {
             db: db.clone(),
-            interval: opts.scheduler_interval,
             clock: opts.clock.clone(),
             claim_cursor: claim_cursor.clone(),
         };
-        let scheduler_handle = tokio::spawn(scheduler.run(scheduler_rx));
+        let scheduler =
+            BackgroundTask::spawn(opts.scheduler_interval, |ticker| scheduler.run(ticker));
 
         #[cfg(feature = "metrics")]
         let metrics_sampler = opts.metrics_sample_interval.map(|interval| {
-            let (tx, rx) = watch::channel(false);
             let sampler = crate::metrics_sampler::MetricsSampler {
                 db: db.clone(),
                 clock: opts.clock.clone(),
-                interval,
             };
-            (tx, tokio::spawn(sampler.run(rx)))
+            BackgroundTask::spawn(interval, |ticker| sampler.run(ticker))
         });
         #[cfg(not(feature = "metrics"))]
-        let metrics_sampler: Option<(watch::Sender<bool>, JoinHandle<()>)> = None;
+        let metrics_sampler: Option<BackgroundTask> = None;
 
         let heartbeat = match opts.liveness_heartbeat {
             Some(interval) => {
@@ -734,7 +721,6 @@ impl Queue {
                     false,
                 )
                 .await?;
-                let (tx, rx) = watch::channel(false);
                 let task = crate::liveness::HeartbeatTask {
                     db: db.clone(),
                     clock: opts.clock.clone(),
@@ -742,17 +728,15 @@ impl Queue {
                     next_counter: counter + 1,
                     writer_epoch,
                 };
-                Some((tx, tokio::spawn(task.run(rx))))
+                Some(BackgroundTask::spawn(interval, |ticker| task.run(ticker)))
             }
             None => None,
         };
 
         Ok(Self {
             db,
-            reaper_shutdown,
-            reaper_handle,
-            scheduler_shutdown,
-            scheduler_handle,
+            reaper,
+            scheduler,
             metrics_sampler,
             heartbeat,
             default_queue_config: opts.default_queue_config,
@@ -2832,19 +2816,15 @@ impl Queue {
     /// closed is committed best-effort, so readers can distinguish
     /// this close from a writer that stopped beating.
     pub async fn close(self) -> Result<()> {
-        let _ = self.reaper_shutdown.send(true);
-        let _ = self.reaper_handle.await;
-        let _ = self.scheduler_shutdown.send(true);
-        let _ = self.scheduler_handle.await;
-        if let Some((shutdown, handle)) = self.metrics_sampler {
-            let _ = shutdown.send(true);
-            let _ = handle.await;
+        self.reaper.stop().await;
+        self.scheduler.stop().await;
+        if let Some(sampler) = self.metrics_sampler {
+            sampler.stop().await;
         }
-        if let Some((shutdown, handle)) = self.heartbeat {
-            let _ = shutdown.send(true);
-            if let Ok(task) = handle.await {
-                task.write_closing_beat().await;
-            }
+        if let Some(heartbeat) = self.heartbeat
+            && let Some(task) = heartbeat.stop().await
+        {
+            task.write_closing_beat().await;
         }
         persist_cursor_state(&self.db, &self.claim_cursor).await?;
         self.db.close().await?;

@@ -373,6 +373,7 @@
 
 #![warn(missing_docs)]
 
+mod background;
 mod claim_cursor;
 mod clock;
 mod completion;

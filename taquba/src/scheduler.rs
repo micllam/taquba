@@ -1,11 +1,10 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use slatedb::config::WriteOptions;
 use slatedb::{Db, IsolationLevel};
-use tokio::sync::watch;
 use tracing::{debug, warn};
 
+use crate::background::Ticker;
 use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
 use crate::error::Result;
@@ -16,27 +15,20 @@ use crate::txn::put_job_record;
 
 pub(crate) struct Scheduler {
     pub(crate) db: Arc<Db>,
-    pub(crate) interval: Duration,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) claim_cursor: ClaimCursor,
 }
 
 impl Scheduler {
-    pub(crate) async fn run(self, mut shutdown: watch::Receiver<bool>) {
+    pub(crate) async fn run(self, mut ticker: Ticker) {
         let Scheduler {
             db,
-            interval,
             clock,
             claim_cursor,
         } = self;
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(interval) => {
-                    if let Err(e) = promote_due_jobs(&db, clock.as_ref(), &claim_cursor).await {
-                        warn!("scheduled job promoter error: {e}");
-                    }
-                }
-                _ = shutdown.changed() => break,
+        while ticker.tick().await {
+            if let Err(e) = promote_due_jobs(&db, clock.as_ref(), &claim_cursor).await {
+                warn!("scheduled job promoter error: {e}");
             }
         }
         debug!("scheduled job promoter stopped");

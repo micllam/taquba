@@ -24,9 +24,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use slatedb::Db;
-use tokio::sync::watch;
 use tracing::{debug, error, warn};
 
+use crate::background::Ticker;
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::keys::heartbeat_key;
@@ -165,37 +165,32 @@ pub(crate) struct HeartbeatTask {
 impl HeartbeatTask {
     /// Beat until shutdown, then return the task so the closer can
     /// commit the closing beat with the task's counter.
-    pub(crate) async fn run(mut self, mut shutdown: watch::Receiver<bool>) -> Self {
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(self.interval) => {
-                    let counter = self.next_counter;
-                    // Advance past the attempted counter even on failure: a
-                    // failed put can still have committed durably, and
-                    // reusing its counter would make the next beat repeat it,
-                    // stalling a reader that watches the counter for advance.
-                    // A gap left by a failed beat is harmless; the counter is
-                    // only required to increase.
-                    self.next_counter += 1;
-                    if let Err(e) = write_beat(
-                        &self.db,
-                        self.clock.as_ref(),
-                        counter,
-                        self.interval,
-                        self.writer_epoch,
-                        false,
-                    )
-                    .await
-                    {
-                        crate::obs::heartbeat_failed();
-                        error!(
-                            "liveness heartbeat commit failed: {e}; a fencing \
+    pub(crate) async fn run(mut self, mut ticker: Ticker) -> Self {
+        while ticker.tick().await {
+            let counter = self.next_counter;
+            // Advance past the attempted counter even on failure: a
+            // failed put can still have committed durably, and
+            // reusing its counter would make the next beat repeat it,
+            // stalling a reader that watches the counter for advance.
+            // A gap left by a failed beat is harmless; the counter is
+            // only required to increase.
+            self.next_counter += 1;
+            if let Err(e) = write_beat(
+                &self.db,
+                self.clock.as_ref(),
+                counter,
+                self.interval,
+                self.writer_epoch,
+                false,
+            )
+            .await
+            {
+                crate::obs::heartbeat_failed();
+                error!(
+                    "liveness heartbeat commit failed: {e}; a fencing \
                              error indicates another process has opened this \
                              store as its writer"
-                        );
-                    }
-                }
-                _ = shutdown.changed() => break,
+                );
             }
         }
         debug!("liveness heartbeat stopped");

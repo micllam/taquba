@@ -4,10 +4,10 @@ use std::time::Duration;
 
 use slatedb::config::WriteOptions;
 use slatedb::{Db, IsolationLevel};
-use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use crate::WaitOutcome;
+use crate::background::Ticker;
 use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
 use crate::completion::CompletionWaiters;
@@ -26,7 +26,6 @@ use crate::txn::put_job_record;
 
 pub(crate) struct Reaper {
     pub(crate) db: Arc<Db>,
-    pub(crate) interval: Duration,
     pub(crate) default_queue_config: QueueConfig,
     pub(crate) queue_configs: HashMap<String, QueueConfig>,
     pub(crate) clock: Arc<dyn Clock>,
@@ -37,10 +36,9 @@ pub(crate) struct Reaper {
 }
 
 impl Reaper {
-    pub(crate) async fn run(self, mut shutdown: watch::Receiver<bool>) {
+    pub(crate) async fn run(self, mut ticker: Ticker) {
         let Reaper {
             db,
-            interval,
             default_queue_config,
             queue_configs,
             clock,
@@ -79,36 +77,36 @@ impl Reaper {
                 .dead_retention
         };
 
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(interval) => {
-                    if let Err(e) =
-                        reap_expired(
-                            &db,
-                            clock.as_ref(),
-                            &completion_waiters,
-                            &claim_cursor,
-                            &lease_registry,
-                            &payload_store,
-                        )
-                        .await
-                    {
-                        warn!("lease reaper error: {e}");
-                    }
-                    if any_keep_done
-                        && let Err(e) =
-                            sweep_done(&db, clock.as_ref(), &keep_done_for, max_keep_done, &payload_store)
-                                .await
-                        {
-                            warn!("done retention sweep error: {e}");
-                        }
-                    if any_dead_retention
-                        && let Err(e) =
-                            sweep_dead(&db, clock.as_ref(), &dead_retention_for, &payload_store).await {
-                            warn!("dead retention sweep error: {e}");
-                        }
-                }
-                _ = shutdown.changed() => break,
+        while ticker.tick().await {
+            if let Err(e) = reap_expired(
+                &db,
+                clock.as_ref(),
+                &completion_waiters,
+                &claim_cursor,
+                &lease_registry,
+                &payload_store,
+            )
+            .await
+            {
+                warn!("lease reaper error: {e}");
+            }
+            if any_keep_done
+                && let Err(e) = sweep_done(
+                    &db,
+                    clock.as_ref(),
+                    &keep_done_for,
+                    max_keep_done,
+                    &payload_store,
+                )
+                .await
+            {
+                warn!("done retention sweep error: {e}");
+            }
+            if any_dead_retention
+                && let Err(e) =
+                    sweep_dead(&db, clock.as_ref(), &dead_retention_for, &payload_store).await
+            {
+                warn!("dead retention sweep error: {e}");
             }
         }
         debug!("lease reaper stopped");

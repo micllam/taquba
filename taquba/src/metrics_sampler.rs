@@ -9,12 +9,11 @@
 //! [`crate::OpenOptions::metrics_sample_interval`] is set.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use slatedb::Db;
-use tokio::sync::watch;
 use tracing::{debug, warn};
 
+use crate::background::Ticker;
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::job::JobRecord;
@@ -24,24 +23,14 @@ use crate::read::{list_queues, stats};
 pub(crate) struct MetricsSampler {
     pub(crate) db: Arc<Db>,
     pub(crate) clock: Arc<dyn Clock>,
-    pub(crate) interval: Duration,
 }
 
 impl MetricsSampler {
-    pub(crate) async fn run(self, mut shutdown: watch::Receiver<bool>) {
-        let MetricsSampler {
-            db,
-            clock,
-            interval,
-        } = self;
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(interval) => {
-                    if let Err(e) = sample(&db, clock.as_ref()).await {
-                        warn!("metrics sampler error: {e}");
-                    }
-                }
-                _ = shutdown.changed() => break,
+    pub(crate) async fn run(self, mut ticker: Ticker) {
+        let MetricsSampler { db, clock } = self;
+        while ticker.tick().await {
+            if let Err(e) = sample(&db, clock.as_ref()).await {
+                warn!("metrics sampler error: {e}");
             }
         }
         debug!("metrics sampler stopped");
