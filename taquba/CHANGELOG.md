@@ -81,6 +81,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `taquba_lease_renewals_total{queue}` only when the call changes the
   expiry; a renewal to the current expiry is not counted, matching
   `LeaseHandle::ensure_at_least`.
+- A settlement reads the clock once: the attempt-history entry's
+  `recorded_at` equals the `completed_at` of the done record, the
+  `failed_at` of the dead record or the base of the retry `run_at`,
+  where it was previously read separately and could trail them.
 
 ### Fixed
 

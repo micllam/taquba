@@ -1703,7 +1703,7 @@ impl Queue {
         };
 
         let outcome = self
-            .ack_txn(job, token, done_record.as_ref(), &prepared)
+            .ack_txn(job, token, completed_at, done_record.as_ref(), &prepared)
             .await;
 
         self.finish_effects(prepared, outcome.as_ref().ok().map(|r| r.as_slice()))
@@ -1866,6 +1866,7 @@ impl Queue {
         &self,
         job: &JobRecord,
         token: u64,
+        completed_at: u64,
         done_record: Option<&(Vec<u8>, Vec<u8>)>,
         prepared: &PreparedEffects,
     ) -> Result<Vec<EnqueueResult>> {
@@ -1880,7 +1881,7 @@ impl Queue {
                     &JobAttempt {
                         attempt: job.attempts,
                         claimed_at: job.claimed_at,
-                        recorded_at: self.now_ms(),
+                        recorded_at: completed_at,
                         outcome: AttemptOutcome::Completed,
                         error: None,
                     },
@@ -1929,9 +1930,10 @@ impl Queue {
             // the claim's copy predates a cancel committed during the
             // delivery.
             let mut job = take_claim(&txn, &self.core.lease_registry, queue, id, token).await?;
+            let now = self.now_ms();
 
             let staged = if job.attempts >= job.max_attempts {
-                stage_dead_letter(&txn, &mut job, self.now_ms(), error)?;
+                stage_dead_letter(&txn, &mut job, now, error)?;
                 Some(self.stage_effects(&txn, prepared).await?)
             } else {
                 job.last_error = Some(error.to_string());
@@ -1941,7 +1943,7 @@ impl Queue {
                     &JobAttempt {
                         attempt: job.attempts,
                         claimed_at: job.claimed_at.take(),
-                        recorded_at: self.now_ms(),
+                        recorded_at: now,
                         outcome: AttemptOutcome::Retried,
                         error: Some(error.to_string()),
                     },
@@ -1959,7 +1961,7 @@ impl Queue {
                         "job re-queued"
                     );
                 } else {
-                    let run_at = self.now_ms() + backoff.as_millis() as u64;
+                    let run_at = now + backoff.as_millis() as u64;
                     job.status = JobStatus::Scheduled;
                     job.run_at = Some(run_at);
                     let scheduled = scheduled_key(&job.queue, run_at, &job.id);
