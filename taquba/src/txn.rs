@@ -2,10 +2,14 @@
 use slatedb::DbTransaction;
 use slatedb::config::WriteOptions;
 
+use tracing::warn;
+
 use crate::error::{Error, Result};
-use crate::job::JobRecord;
-use crate::keys::claimed_key;
+use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
+use crate::job::{JobRecord, JobStatus};
+use crate::keys::{claimed_key, dead_key, job_index_key};
 use crate::lease_registry::LeaseRegistry;
+use crate::stats::update_stats;
 
 /// Write a job record at `key` and repoint its index entry at the same
 /// key.
@@ -99,4 +103,51 @@ pub(crate) async fn commit(txn: DbTransaction, durability: Durability) -> Result
         Err(e) if e.kind() == slatedb::ErrorKind::Transaction => Ok(Commit::Conflict),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Stage the transition of a claimed job to the dead-letter set: the
+/// record is rewritten under its dead key with `error` as its last
+/// error, a `DeadLettered` attempt is appended and the stats are
+/// adjusted. The caller has staged the deletion of the claimed key.
+pub(crate) fn stage_dead_letter(
+    txn: &DbTransaction,
+    job: &mut JobRecord,
+    now: u64,
+    error: &str,
+) -> Result<()> {
+    let claimed_at = job.claimed_at.take();
+    job.status = JobStatus::Dead;
+    job.last_error = Some(error.to_string());
+    job.failed_at = Some(now);
+    append_attempt(
+        txn,
+        &job.id,
+        &JobAttempt {
+            attempt: job.attempts,
+            claimed_at,
+            recorded_at: now,
+            outcome: AttemptOutcome::DeadLettered,
+            error: Some(error.to_string()),
+        },
+    )?;
+    let value = job.stored_bytes()?;
+    put_job_record(
+        txn,
+        &dead_key(&job.queue, &job.id),
+        &job_index_key(&job.id),
+        &value,
+    )?;
+    update_stats(
+        txn,
+        &job.queue,
+        &[(JobStatus::Claimed, -1), (JobStatus::Dead, 1)],
+    )?;
+    warn!(
+        queue = %job.queue,
+        job_id = %job.id,
+        attempts = job.attempts,
+        error,
+        "job dead-lettered"
+    );
+    Ok(())
 }

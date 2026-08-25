@@ -27,7 +27,7 @@ use crate::payload_store::PayloadStore;
 use crate::reaper::{Reaper, reap_expired};
 use crate::scheduler::{Scheduler, promote_due_jobs};
 use crate::stats::{QueueMergeOperator, QueueStats, update_stats};
-use crate::txn::{Commit, Durability, commit, put_job_record, take_claim};
+use crate::txn::{Commit, Durability, commit, put_job_record, stage_dead_letter, take_claim};
 
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(30);
@@ -1968,49 +1968,26 @@ impl Queue {
                 // the claim's copy predates a cancel committed during the
                 // delivery.
                 let mut job = take_claim(&txn, &self.lease_registry, queue, id, token).await?;
-                // Captured before the retry branches clear it on the record.
-                let claimed_at = job.claimed_at;
-                job.last_error = Some(error.to_string());
-                append_attempt(
-                    &txn,
-                    &job.id,
-                    &JobAttempt {
-                        attempt: job.attempts,
-                        claimed_at,
-                        recorded_at: self.now_ms(),
-                        outcome: if job.attempts >= job.max_attempts {
-                            AttemptOutcome::DeadLettered
-                        } else {
-                            AttemptOutcome::Retried
-                        },
-                        error: Some(error.to_string()),
-                    },
-                )?;
 
                 let staged = if job.attempts >= job.max_attempts {
-                    job.status = JobStatus::Dead;
-                    job.failed_at = Some(self.now_ms());
-                    job.claimed_at = None;
-                    let dead = dead_key(&job.queue, &job.id);
-                    let value = job.stored_bytes()?;
-                    put_job_record(&txn, &dead, &job_index_key(&job.id), &value)?;
-                    update_stats(
-                        &txn,
-                        &job.queue,
-                        &[(JobStatus::Claimed, -1), (JobStatus::Dead, 1)],
-                    )?;
-                    warn!(
-                        queue = %job.queue,
-                        job_id = %job.id,
-                        attempts = job.attempts,
-                        "job dead-lettered"
-                    );
+                    stage_dead_letter(&txn, &mut job, self.now_ms(), error)?;
                     Some(self.stage_effects(&txn, &prepared).await?)
                 } else {
+                    job.last_error = Some(error.to_string());
+                    append_attempt(
+                        &txn,
+                        &job.id,
+                        &JobAttempt {
+                            attempt: job.attempts,
+                            claimed_at: job.claimed_at.take(),
+                            recorded_at: self.now_ms(),
+                            outcome: AttemptOutcome::Retried,
+                            error: Some(error.to_string()),
+                        },
+                    )?;
                     let cfg = self.queue_config(&job.queue);
                     let backoff =
                         backoff_delay(job.attempts, cfg.retry_backoff_base, cfg.retry_backoff_max);
-                    job.claimed_at = None;
 
                     if backoff.is_zero() {
                         job.status = JobStatus::Pending;
@@ -2144,30 +2121,7 @@ impl Queue {
             loop {
                 let txn = self.db.begin(IsolationLevel::Snapshot).await?;
                 let mut job = take_claim(&txn, &self.lease_registry, queue, id, token).await?;
-                let claimed_at = job.claimed_at;
-                job.last_error = Some(reason.to_string());
-                job.status = JobStatus::Dead;
-                job.failed_at = Some(failed_at);
-                job.claimed_at = None;
-                let dead = dead_key(&job.queue, &job.id);
-                let value = job.stored_bytes()?;
-                put_job_record(&txn, &dead, &job_index_key(&job.id), &value)?;
-                append_attempt(
-                    &txn,
-                    &job.id,
-                    &JobAttempt {
-                        attempt: job.attempts,
-                        claimed_at,
-                        recorded_at: failed_at,
-                        outcome: AttemptOutcome::DeadLettered,
-                        error: Some(reason.to_string()),
-                    },
-                )?;
-                update_stats(
-                    &txn,
-                    &job.queue,
-                    &[(JobStatus::Claimed, -1), (JobStatus::Dead, 1)],
-                )?;
+                stage_dead_letter(&txn, &mut job, failed_at, reason)?;
                 let (results, staged) = self.stage_effects(&txn, &prepared).await?;
                 match commit(txn, Durability::Awaited).await? {
                     Commit::Committed => {
@@ -2194,12 +2148,6 @@ impl Queue {
         self.completion_waiters.settle(&job.id, || {
             WaitOutcome::Dead(Box::new(delivered_record(&job, claim)))
         });
-        warn!(
-            queue = %job.queue,
-            job_id = %job.id,
-            attempts = job.attempts,
-            "job dead-lettered (permanent failure)"
-        );
         Ok(results)
     }
 
