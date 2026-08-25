@@ -186,7 +186,7 @@ enum ClaimEnd {
 
 /// Stage the transition of a claimed job whose claim ended without a
 /// settlement: back to pending, or to the dead-letter set once its
-/// attempts are exhausted. QueueCore by the reaper and the open-time
+/// attempts are exhausted. Shared by the reaper and the open-time
 /// requeue; `error` names the cause in the history and log entries.
 fn stage_unsettled_claim_end(
     txn: &slatedb::DbTransaction,

@@ -1030,7 +1030,7 @@ impl Queue {
     }
 
     /// Resolve [`EnqueueOptions`] against the queue's defaults and build
-    /// the [`JobRecord`] + its primary key. QueueCore by [`Self::enqueue_with`]
+    /// the [`JobRecord`] + its primary key. Shared by [`Self::enqueue_with`]
     /// and [`Self::enqueue_with_kv`]; the two methods only diverge in how
     /// they persist the prepared record.
     fn prepare_job_record(
