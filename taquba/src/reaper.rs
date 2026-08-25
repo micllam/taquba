@@ -14,14 +14,13 @@ use crate::error::{Error, Result};
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{
-    KeyTag, attempt_history_key, claimed_key, job_index_key, parse_key_timestamp, pending_key,
-    tag_prefix,
+    KeyTag, attempt_history_key, claimed_key, job_index_key, parse_key_timestamp, tag_prefix,
 };
 use crate::lease_registry::{DueLease, LeaseRegistry};
 use crate::payload_store::PayloadStore;
 use crate::queue::QueueConfig;
 use crate::stats::update_stats;
-use crate::txn::{Commit, Durability, commit, put_job_record, stage_dead_letter, write_options};
+use crate::txn::{Commit, Durability, commit, stage_dead_letter, stage_to_pending, write_options};
 
 pub(crate) struct Reaper {
     pub(crate) db: Arc<Db>,
@@ -273,9 +272,7 @@ fn stage_unsettled_claim_end(
         Ok(ClaimEnd::DeadLettered)
     } else {
         let claimed_at = job.claimed_at.take();
-        let pending = pending_key(&job.queue, job.priority, &job.id);
-        let value = rmp_serde::to_vec_named(&job)?;
-        put_job_record(txn, &pending, &job_index_key(&job.id), &value)?;
+        let pending = stage_to_pending(txn, job, JobStatus::Claimed)?;
         append_attempt(
             txn,
             &job.id,
@@ -286,11 +283,6 @@ fn stage_unsettled_claim_end(
                 outcome,
                 error: None,
             },
-        )?;
-        update_stats(
-            txn,
-            &job.queue,
-            &[(JobStatus::Pending, 1), (JobStatus::Claimed, -1)],
         )?;
         debug!(
             queue = %job.queue,

@@ -8,9 +8,8 @@ use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::job::{JobRecord, JobStatus};
-use crate::keys::{KeyTag, job_index_key, parse_key_timestamp, pending_key, tag_prefix};
-use crate::stats::update_stats;
-use crate::txn::{Commit, Durability, commit, put_job_record};
+use crate::keys::{KeyTag, parse_key_timestamp, tag_prefix};
+use crate::txn::{Commit, Durability, commit, stage_to_pending};
 
 pub(crate) struct Scheduler {
     pub(crate) db: Arc<Db>,
@@ -86,16 +85,7 @@ async fn promote_job(
         let mut job = JobRecord::decode(scheduled_key_bytes, &raw)?;
         txn.delete(scheduled_key_bytes)?;
 
-        job.run_at = None;
-        let priority = job.priority;
-        let pending = pending_key(&job.queue, priority, &job.id);
-        let value = rmp_serde::to_vec_named(&job)?;
-        put_job_record(&txn, &pending, &job_index_key(&job.id), &value)?;
-        update_stats(
-            &txn,
-            &job.queue,
-            &[(JobStatus::Pending, 1), (JobStatus::Scheduled, -1)],
-        )?;
+        let pending = stage_to_pending(&txn, &mut job, JobStatus::Scheduled)?;
 
         // Promotion commits do not await WAL durability. Each due job
         // is promoted in its own transaction, so awaiting the flush

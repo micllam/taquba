@@ -7,7 +7,7 @@ use tracing::warn;
 use crate::error::{Error, Result};
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{JobRecord, JobStatus};
-use crate::keys::{claimed_key, dead_key, job_index_key};
+use crate::keys::{claimed_key, dead_key, job_index_key, pending_key};
 use crate::lease_registry::LeaseRegistry;
 use crate::stats::update_stats;
 
@@ -150,4 +150,22 @@ pub(crate) fn stage_dead_letter(
         "job dead-lettered"
     );
     Ok(())
+}
+
+/// Stage the move of a job into the pending key space from the state
+/// `from`, whose record the caller has staged for deletion. Returns the
+/// pending key, which the caller reports to the claim cursor after the
+/// commit.
+pub(crate) fn stage_to_pending(
+    txn: &DbTransaction,
+    job: &mut JobRecord,
+    from: JobStatus,
+) -> Result<Vec<u8>> {
+    job.status = JobStatus::Pending;
+    job.run_at = None;
+    let pending = pending_key(&job.queue, job.priority, &job.id);
+    let value = job.stored_bytes()?;
+    put_job_record(txn, &pending, &job_index_key(&job.id), &value)?;
+    update_stats(txn, &job.queue, &[(JobStatus::Pending, 1), (from, -1)])?;
+    Ok(pending)
 }

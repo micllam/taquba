@@ -27,7 +27,9 @@ use crate::payload_store::PayloadStore;
 use crate::reaper::{Reaper, reap_expired};
 use crate::scheduler::{Scheduler, promote_due_jobs};
 use crate::stats::{QueueMergeOperator, QueueStats, update_stats};
-use crate::txn::{Commit, Durability, commit, put_job_record, stage_dead_letter, take_claim};
+use crate::txn::{
+    Commit, Durability, commit, put_job_record, stage_dead_letter, stage_to_pending, take_claim,
+};
 
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(30);
@@ -1990,16 +1992,7 @@ impl Queue {
                         backoff_delay(job.attempts, cfg.retry_backoff_base, cfg.retry_backoff_max);
 
                     if backoff.is_zero() {
-                        job.status = JobStatus::Pending;
-                        let priority = job.priority;
-                        let pending = pending_key(&job.queue, priority, &job.id);
-                        let value = job.stored_bytes()?;
-                        put_job_record(&txn, &pending, &job_index_key(&job.id), &value)?;
-                        update_stats(
-                            &txn,
-                            &job.queue,
-                            &[(JobStatus::Pending, 1), (JobStatus::Claimed, -1)],
-                        )?;
+                        stage_to_pending(&txn, &mut job, JobStatus::Claimed)?;
                         debug!(
                             queue = %job.queue,
                             job_id = %job.id,
@@ -2251,7 +2244,6 @@ impl Queue {
             return Err(Error::InvalidState);
         }
         let dead = dead_key(&job.queue, &job.id);
-        let priority = job.priority;
         job.attempts = 0;
         job.last_error = None;
         job.claimed_at = None;
@@ -2259,15 +2251,13 @@ impl Queue {
         // Revival clears any prior cancel request: the operator chose to
         // start this job afresh.
         job.cancel_requested = false;
-        let pending = pending_key(&job.queue, priority, &job.id);
-        let value = job.stored_bytes()?;
 
         let txn = self.db.begin(IsolationLevel::Snapshot).await?;
         txn.get(&dead)
             .await?
             .ok_or_else(|| Error::JobNotFound(job.id.clone()))?;
         txn.delete(&dead)?;
-        put_job_record(&txn, &pending, &job_index_key(&job.id), &value)?;
+        let pending = stage_to_pending(&txn, &mut job, JobStatus::Dead)?;
         // The history is kept across the revival; the marker separates
         // entries recorded before it from the reset attempt counter.
         append_attempt(
@@ -2280,11 +2270,6 @@ impl Queue {
                 outcome: AttemptOutcome::Requeued,
                 error: None,
             },
-        )?;
-        update_stats(
-            &txn,
-            &job.queue,
-            &[(JobStatus::Pending, 1), (JobStatus::Dead, -1)],
         )?;
         txn.commit().await?;
         self.claim_cursor.note_pending_insert(&job.queue, &pending);
@@ -2618,7 +2603,7 @@ impl Queue {
         loop {
             let txn = self.db.begin(IsolationLevel::Snapshot).await?;
 
-            let Some((index_key, current_key, mut job)) = get_indexed_job(&txn, id).await? else {
+            let Some((_, current_key, mut job)) = get_indexed_job(&txn, id).await? else {
                 txn.rollback();
                 return Ok(WakeOutcome::NotFound);
             };
@@ -2629,17 +2614,9 @@ impl Queue {
             }
 
             txn.delete(&current_key)?;
-            job.run_at = None;
             job.woken_at = Some(self.now_ms());
             job.wake_payload = wake_payload.clone();
-            let pending = pending_key(&job.queue, job.priority, &job.id);
-            let value = rmp_serde::to_vec_named(&job)?;
-            put_job_record(&txn, &pending, &index_key, &value)?;
-            update_stats(
-                &txn,
-                &job.queue,
-                &[(JobStatus::Pending, 1), (JobStatus::Scheduled, -1)],
-            )?;
+            let pending = stage_to_pending(&txn, &mut job, JobStatus::Scheduled)?;
 
             match commit(txn, Durability::Awaited).await? {
                 Commit::Committed => {
