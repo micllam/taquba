@@ -14,12 +14,13 @@ use crate::background::BackgroundTask;
 use crate::claim_cursor::ClaimCursor;
 use crate::clock::{Clock, default_clock};
 use crate::completion::CompletionWaiters;
+use crate::effects::{PreparedEffects, PreparedJob};
 use crate::error::{Error, Result};
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{Claim, JobRecord, JobStatus};
 use crate::keys::{
     MAX_QUEUE_NAME_LEN, attempt_history_key, claimed_key, dead_key, dedup_index_key, job_index_key,
-    pending_key, pending_prefix, scheduled_key, user_scoped_key,
+    pending_prefix, user_scoped_key,
 };
 use crate::lease_registry::{LeaseRegistry, Renewal};
 use crate::payload_store::PayloadStore;
@@ -123,7 +124,7 @@ pub const PRIORITY_LOW: u32 = 10_000;
 pub const MAX_KV_VALUE_SIZE: usize = 256 * 1024;
 
 /// Validate a user KV value against [`MAX_KV_VALUE_SIZE`].
-fn validate_kv_value_size(value: &[u8]) -> Result<()> {
+pub(crate) fn validate_kv_value_size(value: &[u8]) -> Result<()> {
     if value.len() > MAX_KV_VALUE_SIZE {
         return Err(Error::KvValueTooLarge {
             size: value.len(),
@@ -158,7 +159,7 @@ const MAX_ID_OVERRIDE_LEN: usize = 128;
 /// Validate a caller-supplied job id. Caller-supplied ids must be
 /// 1-[`MAX_ID_OVERRIDE_LEN`] bytes of `[A-Za-z0-9_-]`, keeping ids safe
 /// for object-store paths and log lines downstream.
-fn validate_id_override(id: &str) -> Result<()> {
+pub(crate) fn validate_id_override(id: &str) -> Result<()> {
     if id.is_empty() {
         return Err(Error::InvalidId {
             id: id.to_string(),
@@ -532,11 +533,6 @@ pub struct Queue {
     /// Stopping returns the task so `close` can commit the closing
     /// beat with the task's counter.
     heartbeat: Option<BackgroundTask<crate::liveness::HeartbeatTask>>,
-    /// Source of job ids. Pending keys sort by id within a priority, so
-    /// ids must increase with enqueue order, including inside one
-    /// millisecond. One generator per store suffices: a store has a
-    /// single writer process.
-    id_gen: std::sync::Mutex<ulid::Generator>,
 }
 
 /// Outcome of [`Queue::wait_for_completion`].
@@ -574,23 +570,6 @@ pub enum WaitOutcome {
     NotFound,
 }
 
-/// A job record prepared by [`Queue::prepare_job_record`], paired with
-/// its primary key, awaiting staging into a transaction.
-struct PreparedJob {
-    job: JobRecord,
-    key: Vec<u8>,
-    id_override_used: bool,
-}
-
-/// [`SettlementEffects`] validated and prepared by [`Queue::prepare_effects`],
-/// awaiting staging into a settlement transaction.
-#[derive(Default)]
-struct PreparedEffects {
-    prepared_jobs: Vec<PreparedJob>,
-    kv_writes: HashMap<Vec<u8>, Vec<u8>>,
-    kv_deletes: Vec<Vec<u8>>,
-}
-
 /// The committed outcome of [`Queue::settle_claim`]'s transaction.
 struct SettledClaim<'e> {
     /// The record as written.
@@ -600,27 +579,6 @@ struct SettledClaim<'e> {
     pending_key: Option<Vec<u8>>,
     /// The effects' results; `None` when the transition discarded them.
     results: Option<Vec<EnqueueResult>>,
-}
-
-/// Effects staged into a settlement transaction by
-/// [`Queue::stage_effects`], retained for the work that follows the
-/// commit.
-struct StagedEffects {
-    /// One result per prepared enqueue, in order.
-    results: Vec<EnqueueResult>,
-    /// The enqueues that staged a new record.
-    jobs: Vec<StagedJob>,
-}
-
-/// Identity of a job staged by [`Queue::stage_job_writes`], retained
-/// for post-commit bookkeeping.
-struct StagedJob {
-    id: String,
-    queue: String,
-    /// `Some` when the job landed in the pending key space, in which
-    /// case the commit must be followed by a cursor insert note, which
-    /// also wakes a waiting worker.
-    pending_key: Option<Vec<u8>>,
 }
 
 impl Queue {
@@ -663,6 +621,7 @@ impl Queue {
             lease_registry: LeaseRegistry::new(),
             completion_waiters: Arc::new(CompletionWaiters::default()),
             payload_store,
+            id_gen: std::sync::Mutex::new(ulid::Generator::new()),
         });
         crate::claim_cursor::restore_cursor_state(&core).await?;
         // A claimed record found at open belongs to a process that no
@@ -701,7 +660,6 @@ impl Queue {
             scheduler_task,
             metrics_sampler,
             heartbeat,
-            id_gen: std::sync::Mutex::new(ulid::Generator::new()),
         })
     }
 
@@ -718,13 +676,7 @@ impl Queue {
     /// [`EnqueueOptions::id_override`]. Ids increase with call order and
     /// take their timestamp from this queue's [`Clock`].
     pub fn next_job_id(&self) -> String {
-        let at = std::time::UNIX_EPOCH + Duration::from_millis(self.now_ms());
-        let mut generator = self.id_gen.lock().expect("id generator mutex poisoned");
-        match generator.generate_from_datetime(at) {
-            Ok(id) => id.to_string(),
-            // Unreachable short of 2^80 ids inside one millisecond.
-            Err(_) => Ulid::from_datetime(at).to_string(),
-        }
+        self.core.next_job_id()
     }
 
     pub(crate) fn queue_config(&self, queue: &str) -> &QueueConfig {
@@ -814,7 +766,7 @@ impl Queue {
         payload: Vec<u8>,
         opts: EnqueueOptions,
     ) -> Result<String> {
-        let prepared = self.prepare_job_record(queue, payload, opts)?;
+        let prepared = self.core.prepare_job_record(queue, payload, opts)?;
         self.write_job(prepared, HashMap::new())
             .await
             .map(EnqueueResult::into_id)
@@ -872,7 +824,7 @@ impl Queue {
             validate_kv_value_size(value)?;
         }
 
-        let prepared = self.prepare_job_record(queue, payload, opts)?;
+        let prepared = self.core.prepare_job_record(queue, payload, opts)?;
         self.write_job(prepared, kv_writes).await
     }
 
@@ -1023,81 +975,6 @@ impl Queue {
         crate::read::kv_scan(self.core.db.as_ref(), prefix, cursor, limit).await
     }
 
-    /// Resolve [`EnqueueOptions`] against the queue's defaults and build
-    /// the [`JobRecord`] + its primary key. Shared by every path that
-    /// writes a new record; the paths diverge only in how they persist
-    /// the prepared record.
-    fn prepare_job_record(
-        &self,
-        queue: &str,
-        payload: Vec<u8>,
-        opts: EnqueueOptions,
-    ) -> Result<PreparedJob> {
-        validate_queue_name(queue)?;
-        let cfg = self.queue_config(queue);
-        let max_attempts = opts.max_attempts.unwrap_or(cfg.max_attempts);
-        let priority = opts.priority.unwrap_or(cfg.default_priority);
-
-        // A `run_at` that is at or before now is just an immediate enqueue.
-        let run_at = opts.run_at.and_then(|when| {
-            let ms = when
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            (ms > self.now_ms()).then_some(ms)
-        });
-
-        let (id, id_override_used) = match opts.id_override {
-            Some(supplied) => {
-                validate_id_override(&supplied)?;
-                (supplied, true)
-            }
-            None => (self.next_job_id(), false),
-        };
-
-        let (status, key) = match run_at {
-            Some(ms) => (JobStatus::Scheduled, scheduled_key(queue, ms, &id)),
-            None => (JobStatus::Pending, pending_key(queue, priority, &id)),
-        };
-
-        let mut job = JobRecord::new_pending(
-            id,
-            queue.to_string(),
-            payload,
-            max_attempts,
-            priority,
-            self.now_ms(),
-        );
-        job.headers = opts.headers;
-        job.status = status;
-        job.run_at = run_at;
-        job.dedup_key = opts.dedup_key;
-
-        Ok(PreparedJob {
-            job,
-            key,
-            id_override_used,
-        })
-    }
-
-    /// Offload the oversized payloads of `prepared`, in order, before
-    /// the transaction that writes their records. On a failure no
-    /// object written here is left behind.
-    async fn offload_prepared(&self, prepared: &mut [PreparedJob]) -> Result<()> {
-        self.core
-            .payload_store
-            .offload_all(prepared.iter_mut().map(|p| &mut p.job))
-            .await
-    }
-
-    /// Delete the payload objects of prepared jobs whose records will
-    /// not be written.
-    async fn discard_prepared(&self, prepared: &[PreparedJob]) {
-        for prepared_job in prepared {
-            self.core.payload_store.delete_for(&prepared_job.job).await;
-        }
-    }
-
     /// Fetch the offloaded payloads of `jobs` concurrently, bounding a
     /// batch's wall time by the slowest object rather than the sum of
     /// the fetches. Jobs with inline payloads are untouched. On a fetch
@@ -1108,102 +985,6 @@ impl Queue {
             futures_util::future::join_all(jobs.iter_mut().map(|c| store.materialize(c.job_mut())))
                 .await;
         fetched.into_iter().collect()
-    }
-
-    /// Release prepared effects once their settlement has ended:
-    /// delete the payload objects of follow-up jobs that no committed
-    /// record points at. `results` aligns index-wise with the prepared
-    /// jobs: an [`EnqueueResult::AlreadyEnqueued`] entry marks a dedup
-    /// downgrade whose object is unreferenced. `None` means no
-    /// follow-up record committed (the settlement failed or took a
-    /// branch that discards the effects), so every offloaded object is
-    /// deleted. Every settlement path ends with this call, on every
-    /// branch.
-    async fn finish_effects(&self, prepared: PreparedEffects, results: Option<&[EnqueueResult]>) {
-        match results {
-            Some(results) => {
-                for (prepared, result) in prepared.prepared_jobs.iter().zip(results) {
-                    if matches!(result, EnqueueResult::AlreadyEnqueued(_)) {
-                        self.core.payload_store.delete_for(&prepared.job).await;
-                    }
-                }
-            }
-            None => self.discard_prepared(&prepared.prepared_jobs).await,
-        }
-    }
-
-    /// Validate `effects` and prepare them for staging: size-check the
-    /// KV writes, build the follow-up job records and offload their
-    /// payloads. Runs once, before a settlement's transaction loop, so
-    /// the follow-up ids stay stable across conflict retries and a
-    /// committed record never points at an unwritten object. The
-    /// caller passes the result to [`Self::finish_effects`] once the
-    /// settlement has ended.
-    async fn prepare_effects(&self, effects: SettlementEffects) -> Result<PreparedEffects> {
-        for value in effects.kv_writes.values() {
-            validate_kv_value_size(value)?;
-        }
-        if let Some(key) = effects
-            .kv_deletes
-            .iter()
-            .find(|k| effects.kv_writes.contains_key(*k))
-        {
-            return Err(Error::ConflictingKvEffect { key: key.clone() });
-        }
-        let mut prepared_jobs = effects
-            .enqueues
-            .into_iter()
-            .map(|r| self.prepare_job_record(&r.queue, r.payload, r.options))
-            .collect::<Result<Vec<_>>>()?;
-        self.offload_prepared(&mut prepared_jobs).await?;
-        Ok(PreparedEffects {
-            prepared_jobs,
-            kv_writes: effects.kv_writes,
-            kv_deletes: effects.kv_deletes,
-        })
-    }
-
-    /// Add prepared effects to a caller-owned settlement transaction.
-    /// Called inside every iteration of the settlement's retry loop.
-    /// A dedup hit downgrades that enqueue to
-    /// [`EnqueueResult::AlreadyEnqueued`] without affecting the rest.
-    /// After the transaction commits, the caller passes the result to
-    /// [`Self::note_staged_effects`].
-    async fn stage_effects(
-        &self,
-        txn: &DbTransaction,
-        prepared: &PreparedEffects,
-    ) -> Result<StagedEffects> {
-        let mut staged = Vec::with_capacity(prepared.prepared_jobs.len());
-        let mut results = Vec::with_capacity(prepared.prepared_jobs.len());
-        for prepared_job in &prepared.prepared_jobs {
-            match self.stage_job_writes(txn, prepared_job).await? {
-                Ok(staged_job) => {
-                    results.push(EnqueueResult::New(staged_job.id.clone()));
-                    staged.push(staged_job);
-                }
-                Err(existing) => results.push(EnqueueResult::AlreadyEnqueued(existing)),
-            }
-        }
-        for (k, v) in &prepared.kv_writes {
-            txn.put(user_scoped_key(k), v)?;
-        }
-        for k in &prepared.kv_deletes {
-            txn.delete(user_scoped_key(k))?;
-        }
-        Ok(StagedEffects {
-            results,
-            jobs: staged,
-        })
-    }
-
-    /// Record the staged jobs after the commit and return their enqueue
-    /// results.
-    fn note_staged_effects(&self, staged: StagedEffects) -> Vec<EnqueueResult> {
-        for staged_job in &staged.jobs {
-            self.note_staged_job(staged_job);
-        }
-        staged.results
     }
 
     /// Persist a prepared [`JobRecord`], optionally checking a dedup index
@@ -1245,7 +1026,7 @@ impl Queue {
         loop {
             let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
 
-            let staged = match self.stage_job_writes(&txn, prepared).await? {
+            let staged = match self.core.stage_job_writes(&txn, prepared).await? {
                 Ok(staged) => staged,
                 Err(already_enqueued) => {
                     txn.rollback();
@@ -1260,72 +1041,12 @@ impl Queue {
             match commit(txn, Durability::Awaited).await? {
                 Commit::Committed => {
                     crate::obs::enqueued(&staged.queue, 1, timer);
-                    self.note_staged_job(&staged);
+                    self.core.note_staged_job(&staged);
                     return Ok(EnqueueResult::New(staged.id));
                 }
                 Commit::Conflict => continue,
             }
         }
-    }
-
-    /// Add one prepared job's writes (record, job index, dedup index,
-    /// stats delta) to a caller-owned transaction. Returns
-    /// `Ok(Err(existing_id))` on a dedup hit, in which case no writes
-    /// were added and the caller decides whether to roll back; the
-    /// outer `Err` is reserved for real failures. After the
-    /// transaction commits, the caller must pass the staged value to
-    /// [`Self::note_staged_job`].
-    async fn stage_job_writes(
-        &self,
-        txn: &DbTransaction,
-        prepared: &PreparedJob,
-    ) -> Result<std::result::Result<StagedJob, String>> {
-        let PreparedJob {
-            job,
-            key,
-            id_override_used,
-        } = prepared;
-        let dkey = job
-            .dedup_key
-            .as_ref()
-            .map(|dk| dedup_index_key(&job.queue, dk));
-
-        if let Some(ref dkey) = dkey
-            && let Some(bytes) = txn.get(&dkey).await?
-        {
-            let existing = String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidState)?;
-            return Ok(Err(existing));
-        }
-
-        if *id_override_used && txn.get(job_index_key(&job.id)).await?.is_some() {
-            return Err(Error::DuplicateJobId { id: job.id.clone() });
-        }
-
-        let value = job.stored_bytes()?;
-        put_job_record(txn, key, &job_index_key(&job.id), &value)?;
-        if let Some(ref dkey) = dkey {
-            txn.put(dkey, job.id.as_bytes())?;
-        }
-        update_stats(txn, &job.queue, &[(job.status, 1)])?;
-
-        Ok(Ok(StagedJob {
-            id: job.id.clone(),
-            queue: job.queue.clone(),
-            pending_key: matches!(job.status, JobStatus::Pending).then(|| key.clone()),
-        }))
-    }
-
-    /// Post-commit bookkeeping for one staged job: a Pending job is
-    /// recorded on the claim cursor, which wakes a waiting worker; a
-    /// Scheduled job becomes claimable later via the scheduler loop,
-    /// which records its own insert.
-    fn note_staged_job(&self, staged: &StagedJob) {
-        if let Some(ref pending_key) = staged.pending_key {
-            self.core
-                .claim_cursor
-                .note_pending_insert(&staged.queue, pending_key);
-        }
-        debug!(queue = %staged.queue, job_id = %staged.id, "job enqueued");
     }
 
     /// Claim the next pending job using the configured default lease duration.
@@ -1809,7 +1530,7 @@ impl Queue {
         effects: SettlementEffects,
         end_for: impl Fn(&JobRecord, u64) -> ClaimEnd<'e>,
     ) -> Result<(JobRecord, Option<Vec<EnqueueResult>>)> {
-        let prepared = self.prepare_effects(effects).await?;
+        let prepared = self.core.prepare_effects(effects).await?;
         let token = claim.token();
         let (queue, id) = (claim.queue.as_str(), claim.id.as_str());
 
@@ -1824,7 +1545,7 @@ impl Queue {
                 let end = end_for(&job, now);
                 let pending_key = stage_claim_end(&txn, &mut job, &end, now)?;
                 let staged = if end.is_terminal() {
-                    Some(self.stage_effects(&txn, &prepared).await?)
+                    Some(self.core.stage_effects(&txn, &prepared).await?)
                 } else {
                     None
                 };
@@ -1834,7 +1555,7 @@ impl Queue {
                             job,
                             end,
                             pending_key,
-                            results: staged.map(|s| self.note_staged_effects(s)),
+                            results: staged.map(|s| self.core.note_staged_effects(s)),
                         });
                     }
                     Commit::Conflict => continue,
@@ -1843,11 +1564,12 @@ impl Queue {
         }
         .await;
 
-        self.finish_effects(
-            prepared,
-            settled.as_ref().ok().and_then(|s| s.results.as_deref()),
-        )
-        .await;
+        self.core
+            .finish_effects(
+                prepared,
+                settled.as_ref().ok().and_then(|s| s.results.as_deref()),
+            )
+            .await;
         let settled = settled?;
         self.core
             .finish_claim_end(
@@ -2187,17 +1909,18 @@ impl Queue {
         id: &str,
         effects: SettlementEffects,
     ) -> Result<(CancelOutcome, Vec<EnqueueResult>)> {
-        let prepared = self.prepare_effects(effects).await?;
+        let prepared = self.core.prepare_effects(effects).await?;
         let outcome = self.cancel_txn(id, &prepared).await;
 
-        self.finish_effects(
-            prepared,
-            match &outcome {
-                Ok((CancelOutcome::Removed, results)) => Some(results.as_slice()),
-                _ => None,
-            },
-        )
-        .await;
+        self.core
+            .finish_effects(
+                prepared,
+                match &outcome {
+                    Ok((CancelOutcome::Removed, results)) => Some(results.as_slice()),
+                    _ => None,
+                },
+            )
+            .await;
         outcome
     }
 
@@ -2233,7 +1956,7 @@ impl Queue {
                     } else {
                         update_stats(&txn, &job.queue, &[(JobStatus::Pending, -1)])?;
                     }
-                    let staged = self.stage_effects(&txn, prepared).await?;
+                    let staged = self.core.stage_effects(&txn, prepared).await?;
                     (
                         "pending/scheduled job cancelled",
                         CancelOutcome::Removed,
@@ -2273,7 +1996,7 @@ impl Queue {
                     // That claim's end removes the entry.
                     self.core.lease_registry.cancel(&job.queue, id);
                     let results = staged
-                        .map(|s| self.note_staged_effects(s))
+                        .map(|s| self.core.note_staged_effects(s))
                         .unwrap_or_default();
                     // Removed = terminal (job is gone). Requested = not yet
                     // terminal; the worker's settlement delivers the
@@ -2365,16 +2088,19 @@ impl Queue {
 
         let mut prepared = payloads
             .into_iter()
-            .map(|payload| self.prepare_job_record(queue, payload, EnqueueOptions::default()))
+            .map(|payload| {
+                self.core
+                    .prepare_job_record(queue, payload, EnqueueOptions::default())
+            })
             .collect::<Result<Vec<_>>>()?;
-        self.offload_prepared(&mut prepared).await?;
+        self.core.offload_prepared(&mut prepared).await?;
 
         let write = async {
             loop {
                 let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
                 let mut staged = Vec::with_capacity(prepared.len());
                 for prepared_job in &prepared {
-                    match self.stage_job_writes(&txn, prepared_job).await? {
+                    match self.core.stage_job_writes(&txn, prepared_job).await? {
                         Ok(staged_job) => staged.push(staged_job),
                         // Batch jobs have no dedup key.
                         Err(_) => return Err(Error::InvalidState),
@@ -2389,7 +2115,7 @@ impl Queue {
         let staged = match write.await {
             Ok(staged) => staged,
             Err(err) => {
-                self.discard_prepared(&prepared).await;
+                self.core.discard_prepared(&prepared).await;
                 return Err(err);
             }
         };
@@ -2447,7 +2173,7 @@ impl Queue {
 mod tests {
     use super::*;
     use crate::clock::MockClock;
-    use crate::keys::{KeyTag, cursor_key, tag_prefix};
+    use crate::keys::{KeyTag, cursor_key, pending_key, tag_prefix};
     use crate::lease::LeaseHandle;
     use slatedb::object_store::memory::InMemory;
 

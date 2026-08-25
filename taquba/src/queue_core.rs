@@ -49,6 +49,11 @@ pub(crate) struct QueueCore {
     pub(crate) lease_registry: LeaseRegistry,
     pub(crate) completion_waiters: Arc<CompletionWaiters>,
     pub(crate) payload_store: Arc<PayloadStore>,
+    /// Source of job ids. Pending keys sort by id within a priority, so
+    /// ids must increase with enqueue order, including inside one
+    /// millisecond. One generator per store suffices: a store has a
+    /// single writer process.
+    pub(crate) id_gen: std::sync::Mutex<ulid::Generator>,
 }
 
 impl QueueCore {

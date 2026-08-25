@@ -382,6 +382,7 @@ mod background;
 mod claim_cursor;
 mod clock;
 mod completion;
+mod effects;
 mod error;
 mod history;
 mod job;
