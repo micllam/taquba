@@ -2767,6 +2767,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(job.id, id);
+        Ulid::from_string(&id).expect("a generated id is a ULID");
         assert_eq!(job.queue, "email");
         assert_eq!(job.payload, b"hello");
         assert_eq!(job.status, JobStatus::Claimed);
@@ -2800,31 +2801,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(job.id, "user-42-welcome");
-
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_enqueue_with_kv_id_override_uses_supplied_id() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
-
-        let kv = HashMap::from([(b"meta/key".to_vec(), b"value".to_vec())]);
-        let outcome = q
-            .enqueue_with_kv(
-                "email",
-                b"hello".to_vec(),
-                EnqueueOptions {
-                    id_override: Some("custom-id-01HXYZ".to_string()),
-                    ..EnqueueOptions::default()
-                },
-                kv,
-            )
-            .await
-            .unwrap();
-        assert_eq!(outcome, EnqueueResult::New("custom-id-01HXYZ".to_string()));
-
-        let job = q.get_job("custom-id-01HXYZ").await.unwrap().unwrap();
-        assert_eq!(job.id, "custom-id-01HXYZ");
 
         q.close().await.unwrap();
     }
@@ -2971,52 +2947,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_enqueue_without_id_override_generates_ulid() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
-
-        let id = q
-            .enqueue_with("email", b"hello".to_vec(), EnqueueOptions::default())
-            .await
-            .unwrap();
-        Ulid::from_string(&id).expect("default enqueue should produce a parseable ULID");
-
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_claim_empty_queue_returns_none() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
-        assert!(
-            q.claim("email", Duration::from_secs(30))
-                .await
-                .unwrap()
-                .is_none()
-        );
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_ack_moves_job_to_done() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
-
-        q.enqueue("email", b"hello".to_vec()).await.unwrap();
-        let job = q
-            .claim("email", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        q.ack(&job).await.unwrap();
-
-        assert!(
-            q.claim("email", Duration::from_secs(30))
-                .await
-                .unwrap()
-                .is_none()
-        );
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn test_nack_requeues_job() {
         let q = Queue::open_with_options(make_store(), "test", no_backoff_opts())
             .await
@@ -3049,40 +2979,6 @@ mod tests {
         assert_eq!(retried.attempts, 2);
         assert_eq!(retried.last_error.as_deref(), Some("transient error"));
         assert_eq!(retried.status, JobStatus::Claimed);
-
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_nack_dead_letters_after_max_attempts() {
-        let q = Queue::open_with_options(make_store(), "test", no_backoff_opts())
-            .await
-            .unwrap();
-
-        q.enqueue_with(
-            "email",
-            b"hello".to_vec(),
-            EnqueueOptions {
-                max_attempts: Some(2),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        for _ in 0..2 {
-            let job = q
-                .claim("email", Duration::from_secs(30))
-                .await
-                .unwrap()
-                .unwrap();
-            q.nack(&job, "persistent error").await.unwrap();
-        }
-        assert!(
-            q.claim("email", Duration::from_secs(30))
-                .await
-                .unwrap()
-                .is_none()
-        );
 
         q.close().await.unwrap();
     }
@@ -3151,134 +3047,6 @@ mod tests {
                 .is_none()
         );
 
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_reaper_requeues_expired_job() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
-
-        q.enqueue_with(
-            "work",
-            b"payload".to_vec(),
-            EnqueueOptions {
-                max_attempts: Some(3),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let job = q
-            .claim("work", Duration::from_millis(0))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(job.attempts, 1);
-
-        assert!(
-            q.claim("work", Duration::from_secs(30))
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        q.reap_now().await.unwrap();
-
-        let reclaimed = q
-            .claim("work", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(reclaimed.id, job.id);
-        assert_eq!(reclaimed.attempts, 2);
-        assert_eq!(reclaimed.status, JobStatus::Claimed);
-
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_reaper_dead_letters_after_max_attempts() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
-
-        q.enqueue_with(
-            "work",
-            b"payload".to_vec(),
-            EnqueueOptions {
-                max_attempts: Some(2),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        let _job = q
-            .claim("work", Duration::from_millis(0))
-            .await
-            .unwrap()
-            .unwrap();
-        q.reap_now().await.unwrap();
-
-        let _job = q
-            .claim("work", Duration::from_millis(0))
-            .await
-            .unwrap()
-            .unwrap();
-        q.reap_now().await.unwrap();
-
-        assert!(
-            q.claim("work", Duration::from_secs(30))
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_reaper_skips_active_leases() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
-
-        q.enqueue("work", b"payload".to_vec()).await.unwrap();
-        let job = q
-            .claim("work", Duration::from_secs(300))
-            .await
-            .unwrap()
-            .unwrap();
-
-        q.reap_now().await.unwrap();
-
-        assert!(
-            q.claim("work", Duration::from_secs(300))
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        q.ack(&job).await.unwrap();
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_reaper_ignores_already_acked_job() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
-
-        q.enqueue("work", b"payload".to_vec()).await.unwrap();
-        let job = q
-            .claim("work", Duration::from_millis(0))
-            .await
-            .unwrap()
-            .unwrap();
-        q.ack(&job).await.unwrap();
-
-        q.reap_now().await.unwrap();
-
-        assert!(
-            q.claim("work", Duration::from_secs(30))
-                .await
-                .unwrap()
-                .is_none()
-        );
         q.close().await.unwrap();
     }
 
@@ -3381,6 +3149,7 @@ mod tests {
         assert_eq!(dead.len(), 1);
         assert_eq!(dead[0].id, id);
         assert_eq!(dead[0].status, JobStatus::Dead);
+        assert!(dead[0].failed_at.is_some());
 
         // Requeue and verify it's workable again
         q.requeue_dead_job(dead.into_iter().next().unwrap())
@@ -3395,13 +3164,21 @@ mod tests {
         assert_eq!(revived.id, id);
         assert_eq!(revived.attempts, 1); // fresh attempt after reset
         assert!(revived.last_error.is_none());
+        assert!(
+            revived.failed_at.is_none(),
+            "requeue must clear failed_at so a re-fail starts a fresh retention window"
+        );
 
         q.close().await.unwrap();
     }
 
     #[tokio::test]
     async fn test_per_queue_config() {
-        let mut opts = OpenOptions::default();
+        let initial = 1_700_000_000_000u64;
+        let mut opts = OpenOptions {
+            clock: Arc::new(MockClock::new(initial)),
+            ..OpenOptions::default()
+        };
         opts.queue_configs.insert(
             "fast".to_string(),
             QueueConfig {
@@ -3419,9 +3196,8 @@ mod tests {
         let job = q.claim_next("fast").await.unwrap().unwrap();
         assert_eq!(job.max_attempts, 1);
         // Lease is 5s
-        let lease_expires_at = q.lease_expiry("fast", &job.id).unwrap();
-        let claimed_at = job.claimed_at.unwrap();
-        assert!(lease_expires_at - claimed_at <= 5_001); // within 5s + 1ms tolerance
+        assert_eq!(q.lease_expiry("fast", &job.id), Some(initial + 5_000));
+        assert_eq!(job.claimed_at, Some(initial));
 
         q.ack(&job).await.unwrap();
         q.close().await.unwrap();
@@ -3485,51 +3261,6 @@ mod tests {
         assert_eq!(j1.id, id_high);
         assert_eq!(j2.id, id_normal);
         assert_eq!(j3.id, id_low);
-
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_priority_fifo_within_same_priority() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
-
-        // Two jobs at the same priority must come out in insertion (FIFO) order.
-        let id_first = q
-            .enqueue_with(
-                "jobs",
-                b"first".to_vec(),
-                EnqueueOptions {
-                    priority: Some(PRIORITY_NORMAL),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let id_second = q
-            .enqueue_with(
-                "jobs",
-                b"second".to_vec(),
-                EnqueueOptions {
-                    priority: Some(PRIORITY_NORMAL),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        let j1 = q
-            .claim("jobs", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        let j2 = q
-            .claim("jobs", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(j1.id, id_first);
-        assert_eq!(j2.id, id_second);
 
         q.close().await.unwrap();
     }
@@ -3640,66 +3371,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_priority_stored_on_job_record() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
-
-        q.enqueue_with(
-            "jobs",
-            b"x".to_vec(),
-            EnqueueOptions {
-                priority: Some(PRIORITY_HIGH),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let job = q
-            .claim("jobs", Duration::from_secs(30))
+    async fn test_enqueue_at_past_is_immediately_pending() {
+        let initial = 1_700_000_000_000u64;
+        let opts = OpenOptions {
+            clock: Arc::new(MockClock::new(initial)),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
             .await
-            .unwrap()
             .unwrap();
 
-        assert_eq!(job.priority, PRIORITY_HIGH);
-
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_enqueue_at_future_not_immediately_claimable() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
-
-        let run_at = std::time::SystemTime::now() + Duration::from_secs(3600);
-        q.enqueue_with(
-            "jobs",
-            b"future".to_vec(),
-            EnqueueOptions {
-                run_at: Some(run_at),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        // Job is not yet claimable.
-        assert!(
-            q.claim("jobs", Duration::from_secs(30))
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        let s = q.stats("jobs").await.unwrap();
-        assert_eq!(s.scheduled, 1);
-        assert_eq!(s.pending, 0);
-
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_enqueue_at_past_is_immediately_pending() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
-
-        let run_at = std::time::SystemTime::now() - Duration::from_secs(1);
+        let run_at = std::time::UNIX_EPOCH + Duration::from_millis(initial - 1_000);
         q.enqueue_with(
             "jobs",
             b"past".to_vec(),
@@ -3744,6 +3426,9 @@ mod tests {
             .unwrap();
 
         // Not yet promoted.
+        let s = q.stats("jobs").await.unwrap();
+        assert_eq!(s.scheduled, 1);
+        assert_eq!(s.pending, 0);
         assert!(
             q.claim("jobs", Duration::from_secs(30))
                 .await
@@ -3821,23 +3506,8 @@ mod tests {
         assert_eq!(job.woken_at, Some(initial));
         assert!(job.run_at.is_none());
 
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_wake_scheduled_without_payload() {
-        let initial = 1_700_000_000_000u64;
-        let clock = MockClock::new(initial);
-        let opts = OpenOptions {
-            clock: Arc::new(clock.clone()),
-            ..OpenOptions::default()
-        };
-        let q = Queue::open_with_options(make_store(), "test", opts)
-            .await
-            .unwrap();
-
-        let run_at = std::time::UNIX_EPOCH + Duration::from_millis(initial + 60_000);
-        let id = q
+        // A wake without a payload leaves `wake_payload` unset.
+        let silent = q
             .enqueue_with(
                 "jobs",
                 b"waiting".to_vec(),
@@ -3848,17 +3518,16 @@ mod tests {
             )
             .await
             .unwrap();
-
         assert_eq!(
-            q.wake_scheduled(&id, None).await.unwrap(),
+            q.wake_scheduled(&silent, None).await.unwrap(),
             WakeOutcome::Woken
         );
-
         let job = q
             .claim("jobs", Duration::from_secs(30))
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(job.id, silent);
         assert!(job.wake_payload.is_none());
         assert_eq!(job.woken_at, Some(initial));
 
@@ -4046,6 +3715,9 @@ mod tests {
             Err(Error::KvValueTooLarge { .. })
         ));
 
+        q.kv_delete(b"config").await.unwrap();
+        assert!(q.kv_get(b"config").await.unwrap().is_none());
+
         q.close().await.unwrap();
     }
 
@@ -4186,14 +3858,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_kv_scan_excludes_internal_keys() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
+        let initial = 1_700_000_000_000u64;
+        let opts = OpenOptions {
+            clock: Arc::new(MockClock::new(initial)),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
 
         q.enqueue("jobs", b"payload".to_vec()).await.unwrap();
         q.enqueue_with(
             "jobs",
             b"later".to_vec(),
             EnqueueOptions {
-                run_at: Some(std::time::SystemTime::now() + Duration::from_secs(3600)),
+                run_at: Some(std::time::UNIX_EPOCH + Duration::from_millis(initial + 3_600_000)),
                 ..Default::default()
             },
         )
@@ -4230,28 +3909,6 @@ mod tests {
             Some(b"v2".as_slice())
         );
         assert_eq!(q.stats("jobs").await.unwrap().pending, 1);
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_enqueue_in_convenience() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
-
-        q.enqueue_with(
-            "jobs",
-            b"delayed".to_vec(),
-            EnqueueOptions {
-                run_at: Some(std::time::SystemTime::now() + Duration::from_secs(3600)),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        let s = q.stats("jobs").await.unwrap();
-        assert_eq!(s.scheduled, 1);
-        assert_eq!(s.pending, 0);
-
         q.close().await.unwrap();
     }
 
@@ -4409,64 +4066,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_worker_trait() {
-        use crate::worker::{Worker, WorkerError, run_worker};
-
-        struct EchoWorker;
-        impl Worker for EchoWorker {
-            async fn process(
-                &self,
-                _job: &JobRecord,
-                _lease: &LeaseHandle,
-            ) -> std::result::Result<(), WorkerError> {
-                Ok(())
-            }
-        }
-
-        let q = Arc::new(Queue::open(make_store(), "test").await.unwrap());
-        q.enqueue("work", b"hello".to_vec()).await.unwrap();
-
-        // Drive the worker via a oneshot shutdown so the in-flight job finishes
-        // cleanly instead of being aborted mid-claim.
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let q2 = q.clone();
-        let handle = tokio::spawn(async move {
-            run_worker(
-                &q2,
-                "work",
-                &EchoWorker,
-                Duration::from_millis(10),
-                async move {
-                    let _ = shutdown_rx.await;
-                },
-            )
-            .await
-        });
-
-        // Wait for the queue to drain, then signal shutdown.
-        loop {
-            let s = q.stats("work").await.unwrap();
-            if s.pending == 0 && s.claimed == 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        let _ = shutdown_tx.send(());
-        let _ = handle.await;
-
-        // Job should now be done, queue empty
-        assert!(
-            q.claim("work", Duration::from_secs(30))
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        // Can't call q.close() since q is in an Arc and there may be a strong reference
-        // held by the spawned task still shutting down; just drop.
-    }
-
-    #[tokio::test]
     async fn test_get_job_tracks_lifecycle() {
         // Opt in to keeping done jobs so get_job can resolve them after ack.
         let opts = OpenOptions {
@@ -4525,49 +4124,6 @@ mod tests {
         assert_eq!(s.done, 1, "done counter still tracks throughput");
         assert_eq!(s.pending, 0);
         assert_eq!(s.claimed, 0);
-
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_done_retention_sweeps_old_jobs() {
-        // `MockClock` virtualises the retention cutoff (`now_ms` reads
-        // the clock instead of `SystemTime::now()`); `start_paused`
-        // virtualises the reaper's `tokio::time::sleep` tick. Together,
-        // the test runs in zero wall-clock time.
-        let clock = MockClock::new(1_700_000_000_000);
-        let reaper_interval = Duration::from_millis(10);
-        let retention = Duration::from_millis(20);
-        let opts = OpenOptions {
-            reaper_interval,
-            default_queue_config: QueueConfig {
-                keep_done_jobs: Some(retention),
-                ..QueueConfig::default()
-            },
-            clock: Arc::new(clock.clone()),
-            ..OpenOptions::default()
-        };
-        let q = Queue::open_with_options(make_store(), "test", opts)
-            .await
-            .unwrap();
-
-        let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
-        let job = q
-            .claim("work", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        q.ack(&job).await.unwrap();
-        // Visible immediately after ack.
-        assert!(q.get_job(&id).await.unwrap().is_some());
-
-        clock.advance(retention + Duration::from_millis(10));
-        tokio::time::sleep(reaper_interval * 2).await;
-
-        assert!(
-            q.get_job(&id).await.unwrap().is_none(),
-            "retention sweep must purge expired done jobs"
-        );
 
         q.close().await.unwrap();
     }
@@ -4861,44 +4417,6 @@ mod tests {
         q.close().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn test_requeue_dead_resets_failed_at() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
-
-        q.enqueue_with(
-            "work",
-            b"payload".to_vec(),
-            EnqueueOptions {
-                max_attempts: Some(1),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let job = q
-            .claim("work", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        q.nack(&job, "fatal").await.unwrap();
-
-        let dead = q.dead_jobs("work", None, 100).await.unwrap().pop().unwrap();
-        assert!(dead.failed_at.is_some());
-
-        q.requeue_dead_job(dead).await.unwrap();
-        let pending = q
-            .claim("work", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            pending.failed_at.is_none(),
-            "requeue must clear failed_at so a re-fail starts a fresh retention window"
-        );
-
-        q.close().await.unwrap();
-    }
-
     #[tokio::test(start_paused = true)]
     async fn test_requeue_dead_rejects_stale_record_after_retention_sweep() {
         let clock = MockClock::new(1_700_000_000_000);
@@ -4954,34 +4472,6 @@ mod tests {
     async fn test_get_job_returns_none_for_unknown_id() {
         let q = Queue::open(make_store(), "test").await.unwrap();
         assert!(q.get_job("nonexistent").await.unwrap().is_none());
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_get_job_after_nack_to_dead() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
-
-        q.enqueue_with(
-            "work",
-            b"x".to_vec(),
-            EnqueueOptions {
-                max_attempts: Some(1),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let job = q
-            .claim("work", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        let id = job.id.clone();
-        q.nack(&job, "fatal").await.unwrap();
-
-        let dead = q.get_job(&id).await.unwrap().unwrap();
-        assert_eq!(dead.status, JobStatus::Dead);
-
         q.close().await.unwrap();
     }
 
@@ -5284,33 +4774,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lease_expiry_reports_the_renewed_expiry_not_the_claim_time_one() {
-        let clock = MockClock::new(1_700_000_000_000);
-        let opts = OpenOptions {
-            clock: Arc::new(clock.clone()),
-            ..OpenOptions::default()
-        };
-        let q = Queue::open_with_options(make_store(), "test", opts)
-            .await
-            .unwrap();
-
-        q.enqueue("work", b"payload".to_vec()).await.unwrap();
-        let job = q
-            .claim("work", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        let claim_time_expiry = q.lease_expiry("work", &job.id).unwrap();
-
-        clock.advance(Duration::from_secs(10));
-        let renewed = q.renew_lease(&job, Duration::from_secs(60)).unwrap();
-        assert!(renewed > claim_time_expiry);
-        assert_eq!(q.lease_expiry("work", &job.id), Some(renewed));
-
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn stale_settlement_after_reaper_requeue_is_rejected() {
         let clock = MockClock::new(1_700_000_000_000);
         let opts = OpenOptions {
@@ -5509,14 +4972,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel_scheduled_job() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
+        let initial = 1_700_000_000_000u64;
+        let opts = OpenOptions {
+            clock: Arc::new(MockClock::new(initial)),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
 
         let id = q
             .enqueue_with(
                 "work",
                 b"payload".to_vec(),
                 EnqueueOptions {
-                    run_at: Some(std::time::SystemTime::now() + Duration::from_secs(3600)),
+                    run_at: Some(
+                        std::time::UNIX_EPOCH + Duration::from_millis(initial + 3_600_000),
+                    ),
                     ..Default::default()
                 },
             )
@@ -6083,16 +5555,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cancel_nonexistent_is_not_found() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
-        assert_eq!(
-            q.cancel("does-not-exist").await.unwrap(),
-            CancelOutcome::NotFound,
-        );
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn test_enqueue_batch_atomic() {
         let q = Queue::open(make_store(), "test").await.unwrap();
 
@@ -6132,82 +5594,6 @@ mod tests {
         let ids = q.enqueue_batch("work", vec![]).await.unwrap();
         assert!(ids.is_empty());
         assert_eq!(q.stats("work").await.unwrap().pending, 0);
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_enqueue_unique_deduplicates() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
-
-        let id1 = q
-            .enqueue_with(
-                "work",
-                b"first".to_vec(),
-                EnqueueOptions {
-                    dedup_key: Some("my-key".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        // Second call with the same key must return the existing ID.
-        let id2 = q
-            .enqueue_with(
-                "work",
-                b"second".to_vec(),
-                EnqueueOptions {
-                    dedup_key: Some("my-key".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(id1, id2);
-        assert_eq!(q.stats("work").await.unwrap().pending, 1);
-
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_enqueue_unique_allows_reenqueue_after_claim() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
-
-        let id1 = q
-            .enqueue_with(
-                "work",
-                b"payload".to_vec(),
-                EnqueueOptions {
-                    dedup_key: Some("my-key".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        // Claim the job, which releases the dedup key.
-        let job = q
-            .claim("work", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(job.id, id1);
-
-        // Now a new enqueue with the same key is accepted.
-        let id2 = q
-            .enqueue_with(
-                "work",
-                b"payload".to_vec(),
-                EnqueueOptions {
-                    dedup_key: Some("my-key".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert_ne!(id1, id2);
-        assert_eq!(q.stats("work").await.unwrap().pending, 1);
-
         q.close().await.unwrap();
     }
 
@@ -6294,45 +5680,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_nack_with_backoff_parks_in_scheduled() {
-        // Default config has retry_backoff_base = 1s, so a nack should move the
-        // job into the scheduled space rather than immediately back to pending.
-        let q = Queue::open(make_store(), "test").await.unwrap();
-
-        q.enqueue_with(
-            "work",
-            b"payload".to_vec(),
-            EnqueueOptions {
-                max_attempts: Some(3),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let job = q
-            .claim("work", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        q.nack(&job, "transient").await.unwrap();
-
-        let s = q.stats("work").await.unwrap();
-        assert_eq!(s.pending, 0, "must not be pending immediately");
-        assert_eq!(s.claimed, 0);
-        assert_eq!(s.scheduled, 1, "must be parked in scheduled");
-
-        // Not yet claimable.
-        assert!(
-            q.claim("work", Duration::from_secs(30))
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn test_nack_backoff_promoted_after_run_at() {
         let clock = MockClock::new(1_700_000_000_000);
         let opts = OpenOptions {
@@ -6365,6 +5712,19 @@ mod tests {
             .unwrap();
         let id = job.id.clone();
         q.nack(&job, "boom").await.unwrap();
+
+        // The job waits in the scheduled key space until the backoff
+        // elapses.
+        let s = q.stats("work").await.unwrap();
+        assert_eq!(s.pending, 0);
+        assert_eq!(s.claimed, 0);
+        assert_eq!(s.scheduled, 1);
+        assert!(
+            q.claim("work", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // Advance past the backoff and trigger promotion.
         clock.advance(Duration::from_millis(20));
@@ -6567,44 +5927,6 @@ mod tests {
         assert_eq!(stats.done, 1, "the ack after a renewal must succeed");
         assert_eq!(stats.pending, 0, "the renewed job must not be requeued");
         assert_eq!(stats.claimed, 0);
-    }
-
-    #[tokio::test]
-    async fn test_claim_with_wait_wakes_or_times_out() {
-        // Both arms of the internal `select!`: the timeout branch returns
-        // None when nothing arrives, and the notify branch wakes immediately
-        // when an enqueue happens, well before max_wait elapses.
-        let q = Arc::new(Queue::open(make_store(), "test").await.unwrap());
-
-        // Idle queue with a short max_wait: returns None.
-        let timed_out = q
-            .claim_with_wait("work", Duration::from_secs(30), Duration::from_millis(50))
-            .await
-            .unwrap();
-        assert!(timed_out.is_none());
-
-        // Live wakeup: spawn a waiter with a long max_wait, enqueue, expect
-        // a fast resolution.
-        let q2 = q.clone();
-        let waiter = tokio::spawn(async move {
-            let start = std::time::Instant::now();
-            let job = q2
-                .claim_with_wait("work", Duration::from_secs(30), Duration::from_secs(10))
-                .await
-                .unwrap();
-            (start.elapsed(), job)
-        });
-
-        // Give the waiter time to subscribe to the notify, then enqueue.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        q.enqueue("work", b"hello".to_vec()).await.unwrap();
-
-        let (elapsed, job) = waiter.await.unwrap();
-        assert!(job.is_some(), "claim_with_wait must wake on enqueue");
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "expected fast wake; took {elapsed:?}"
-        );
     }
 
     #[tokio::test]
@@ -6811,29 +6133,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_kv_delete_removes_value() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
-        q.enqueue_with_kv(
-            "work",
-            b"x".to_vec(),
-            EnqueueOptions::default(),
-            HashMap::from([(b"runs/xyz".to_vec(), b"active".to_vec())]),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            q.kv_get(b"runs/xyz").await.unwrap().as_deref(),
-            Some(b"active".as_slice())
-        );
-
-        q.kv_delete(b"runs/xyz").await.unwrap();
-        assert!(q.kv_get(b"runs/xyz").await.unwrap().is_none());
-
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn ack_with_applies_enqueue_and_kv_effects_atomically() {
         let q = Queue::open(make_store(), "test").await.unwrap();
         let lease = Duration::from_secs(5);
@@ -6878,30 +6177,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ack_with_applies_no_effects_when_the_claim_is_gone() {
+    async fn a_lost_claim_applies_no_effects() {
         let q = Queue::open(make_store(), "test").await.unwrap();
         let lease = Duration::from_secs(5);
         q.enqueue("work", b"job".to_vec()).await.unwrap();
         let job = q.claim("work", lease).await.unwrap().unwrap();
         q.ack(&job).await.unwrap();
 
-        let err = q
-            .ack_with(
-                &job,
-                SettlementEffects {
-                    enqueues: vec![EnqueueRequest {
-                        queue: "next".to_string(),
-                        payload: b"x".to_vec(),
-                        options: EnqueueOptions::default(),
-                    }],
-                    kv_writes: HashMap::from([(b"k".to_vec(), b"v".to_vec())]),
-                    kv_deletes: Vec::new(),
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::ClaimLost));
-        assert!(q.claim("next", lease).await.unwrap().is_none());
+        let effects = || SettlementEffects {
+            enqueues: vec![EnqueueRequest {
+                queue: "next".to_string(),
+                payload: b"x".to_vec(),
+                options: EnqueueOptions::default(),
+            }],
+            kv_writes: HashMap::from([(b"k".to_vec(), b"v".to_vec())]),
+            kv_deletes: Vec::new(),
+        };
+        assert!(matches!(
+            q.ack_with(&job, effects()).await,
+            Err(Error::ClaimLost)
+        ));
+        assert!(matches!(
+            q.nack_with(&job, "late", effects()).await,
+            Err(Error::ClaimLost)
+        ));
+        assert!(matches!(
+            q.dead_letter_with(&job, "late", effects()).await,
+            Err(Error::ClaimLost)
+        ));
+        assert_eq!(q.stats("next").await.unwrap().pending, 0);
         assert!(q.kv_get(b"k").await.unwrap().is_none());
         q.close().await.unwrap();
     }
@@ -6991,36 +6295,6 @@ mod tests {
         let follow_up = q.claim("notify", lease).await.unwrap().unwrap();
         assert_eq!(follow_up.payload, b"failed");
         q.ack(&follow_up).await.unwrap();
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn dead_letter_with_applies_no_effects_when_the_claim_is_gone() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
-        let lease = Duration::from_secs(5);
-        q.enqueue("work", b"job".to_vec()).await.unwrap();
-        let job = q.claim("work", lease).await.unwrap().unwrap();
-        q.ack(&job).await.unwrap();
-
-        let err = q
-            .dead_letter_with(
-                &job,
-                "late failure",
-                SettlementEffects {
-                    enqueues: vec![EnqueueRequest {
-                        queue: "notify".to_string(),
-                        payload: b"x".to_vec(),
-                        options: EnqueueOptions::default(),
-                    }],
-                    kv_writes: HashMap::from([(b"k".to_vec(), b"v".to_vec())]),
-                    kv_deletes: Vec::new(),
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::ClaimLost));
-        assert_eq!(q.stats("notify").await.unwrap().pending, 0);
-        assert!(q.kv_get(b"k").await.unwrap().is_none());
         q.close().await.unwrap();
     }
 
@@ -7372,7 +6646,14 @@ mod tests {
 
     #[tokio::test]
     async fn ack_with_schedules_a_future_effect() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
+        let initial = 1_700_000_000_000u64;
+        let opts = OpenOptions {
+            clock: Arc::new(MockClock::new(initial)),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
         let lease = Duration::from_secs(5);
         q.enqueue("work", b"job".to_vec()).await.unwrap();
         let job = q.claim("work", lease).await.unwrap().unwrap();
@@ -7384,7 +6665,9 @@ mod tests {
                     queue: "next".to_string(),
                     payload: b"later".to_vec(),
                     options: EnqueueOptions {
-                        run_at: Some(std::time::SystemTime::now() + Duration::from_secs(300)),
+                        run_at: Some(
+                            std::time::UNIX_EPOCH + Duration::from_millis(initial + 300_000),
+                        ),
                         ..EnqueueOptions::default()
                     },
                 }],
@@ -7658,76 +6941,6 @@ mod tests {
             1,
             "a failed delete leaves an unreferenced object, the record having been removed first"
         );
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn ack_with_deletes_the_payload_object_of_a_deduplicated_follow_up() {
-        let store = make_store();
-        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
-            .await
-            .unwrap();
-
-        q.enqueue_with(
-            "next",
-            vec![1u8; 256],
-            EnqueueOptions {
-                dedup_key: Some("dk".to_string()),
-                ..EnqueueOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-        q.enqueue("work", b"job".to_vec()).await.unwrap();
-        assert_eq!(object_count(&store, "test-payloads").await, 1);
-
-        let job = q
-            .claim("work", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        let results = q
-            .ack_with(
-                &job,
-                SettlementEffects {
-                    enqueues: vec![EnqueueRequest {
-                        queue: "next".to_string(),
-                        payload: vec![2u8; 256],
-                        options: EnqueueOptions {
-                            dedup_key: Some("dk".to_string()),
-                            ..EnqueueOptions::default()
-                        },
-                    }],
-                    ..SettlementEffects::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        assert!(matches!(&results[0], EnqueueResult::AlreadyEnqueued(_)));
-        assert_eq!(
-            object_count(&store, "test-payloads").await,
-            1,
-            "the downgraded follow-up's object is removed, leaving only the existing job's"
-        );
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn ack_without_done_retention_deletes_the_payload_object() {
-        let store = make_store();
-        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
-            .await
-            .unwrap();
-
-        q.enqueue("work", vec![1u8; 256]).await.unwrap();
-        let job = q
-            .claim("work", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        q.ack(&job).await.unwrap();
-        assert_eq!(object_count(&store, "test-payloads").await, 0);
         q.close().await.unwrap();
     }
 
@@ -8243,13 +7456,21 @@ mod tests {
 
     #[tokio::test]
     async fn list_jobs_orders_scheduled_by_run_at() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
+        let initial = 1_700_000_000_000u64;
+        let opts = OpenOptions {
+            clock: Arc::new(MockClock::new(initial)),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+        let at = |secs: u64| std::time::UNIX_EPOCH + Duration::from_millis(initial + secs * 1_000);
         let later = q
             .enqueue_with(
                 "work",
                 b"later".to_vec(),
                 EnqueueOptions {
-                    run_at: Some(std::time::SystemTime::now() + Duration::from_secs(7200)),
+                    run_at: Some(at(7200)),
                     ..Default::default()
                 },
             )
@@ -8260,7 +7481,7 @@ mod tests {
                 "work",
                 b"sooner".to_vec(),
                 EnqueueOptions {
-                    run_at: Some(std::time::SystemTime::now() + Duration::from_secs(3600)),
+                    run_at: Some(at(3600)),
                     ..Default::default()
                 },
             )
@@ -8274,33 +7495,6 @@ mod tests {
         let ids: Vec<_> = page.jobs.iter().map(|j| j.id.clone()).collect();
         assert_eq!(ids, vec![sooner, later]);
         assert!(page.next_cursor.is_none());
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn list_jobs_filters_claimed_by_queue() {
-        let opts = OpenOptions {
-            clock: Arc::new(MockClock::new(1_700_000_000_000)),
-            ..OpenOptions::default()
-        };
-        let q = Queue::open_with_options(make_store(), "test", opts)
-            .await
-            .unwrap();
-        let a1 = q.enqueue("qa", b"1".to_vec()).await.unwrap();
-        let a2 = q.enqueue("qa", b"2".to_vec()).await.unwrap();
-        q.enqueue("qb", b"3".to_vec()).await.unwrap();
-        let lease = Duration::from_secs(30);
-        q.claim("qa", lease).await.unwrap().unwrap();
-        q.claim("qa", lease).await.unwrap().unwrap();
-        q.claim("qb", lease).await.unwrap().unwrap();
-
-        let page = q
-            .list_jobs("qa", JobStatus::Claimed, None, 10)
-            .await
-            .unwrap();
-        let ids: Vec<_> = page.jobs.iter().map(|j| j.id.clone()).collect();
-        assert_eq!(ids, vec![a1, a2]);
-        assert!(page.jobs.iter().all(|j| j.status == JobStatus::Claimed));
         q.close().await.unwrap();
     }
 
@@ -8385,6 +7579,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(page.jobs.len() <= 1);
+            assert!(page.jobs.iter().all(|j| j.status == JobStatus::Claimed));
             ids.extend(page.jobs.iter().map(|j| j.id.clone()));
             pages += 1;
             match page.next_cursor {
@@ -8666,7 +7861,13 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_of_scheduled_job_removes_attempt_history() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
+        let opts = OpenOptions {
+            clock: Arc::new(MockClock::new(1_700_000_000_000)),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
         let id = q.enqueue("work", b"x".to_vec()).await.unwrap();
 
         let job = q
