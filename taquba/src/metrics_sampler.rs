@@ -57,3 +57,55 @@ async fn sample(core: &QueueCore) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::test_util::*;
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn metrics_sampler_emits_pending_depth_gauge() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // Only this test installs a global recorder (the obs unit test uses a
+        // local one), so the install succeeds and the snapshotter observes the
+        // sampler running in its spawned task.
+        let _ = recorder.install();
+
+        let q = Queue::open_with_options(
+            make_store(),
+            "test",
+            OpenOptions {
+                metrics_sample_interval: Some(Duration::from_millis(25)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for _ in 0..3 {
+            q.enqueue("gsamp", vec![0u8; 8]).await.unwrap();
+        }
+
+        let mut gauge = None;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            for (composite, _unit, _desc, value) in snapshotter.snapshot().into_vec() {
+                let key = composite.key();
+                let ours = key.name() == "taquba_pending_jobs"
+                    && key
+                        .labels()
+                        .any(|l| l.key() == "queue" && l.value() == "gsamp");
+                if ours && let DebugValue::Gauge(g) = value {
+                    gauge = Some(g.into_inner());
+                }
+            }
+            if gauge == Some(3.0) {
+                break;
+            }
+        }
+        assert_eq!(gauge, Some(3.0), "sampler should report 3 pending jobs");
+        q.close().await.unwrap();
+    }
+}

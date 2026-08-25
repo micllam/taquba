@@ -160,3 +160,392 @@ impl PayloadStore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::*;
+
+    #[tokio::test]
+    async fn offloaded_payload_round_trips_through_claim() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        let payload = vec![7u8; 1024];
+        let id = q.enqueue("work", payload.clone()).await.unwrap();
+        assert_eq!(object_count(&store, "test-payloads").await, 1);
+
+        let read = q.get_job(&id).await.unwrap().unwrap();
+        assert!(read.payload_ref.is_some());
+        assert_eq!(read.payload, payload);
+
+        let job = q.claim("work", Duration::from_secs(30)).await.unwrap();
+        let job = job.unwrap();
+        assert!(job.payload_ref.is_some());
+        assert_eq!(job.payload, payload);
+
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn offloaded_payload_survives_nack_and_reclaim() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        let payload = vec![3u8; 512];
+        q.enqueue("work", payload.clone()).await.unwrap();
+
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.nack(&job, "retry").await.unwrap();
+        assert_eq!(
+            object_count(&store, "test-payloads").await,
+            1,
+            "a nack must not rewrite or remove the payload object"
+        );
+
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.payload, payload);
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    /// OpenOptions offloading to `payloads`, leaving the queue's own store
+    /// healthy so only payload-object requests are subject to faults.
+    fn faulty_payload_opts(payloads: Arc<dyn ObjectStore>) -> OpenOptions {
+        OpenOptions {
+            payload_store: Some(payloads),
+            ..offload_opts()
+        }
+    }
+
+    #[tokio::test]
+    async fn enqueue_writes_no_record_when_the_payload_object_write_fails() {
+        let payloads = FaultStore::wrap();
+        let payload_store: Arc<dyn ObjectStore> = payloads.clone();
+        let q = Queue::open_with_options(
+            make_store(),
+            "test",
+            faulty_payload_opts(payload_store.clone()),
+        )
+        .await
+        .unwrap();
+
+        payloads.fail_puts(true);
+        let err = q.enqueue("work", vec![9u8; 256]).await.unwrap_err();
+
+        assert!(
+            matches!(err, Error::PayloadStore(StoreError::Generic { store, .. }) if store == "FaultStore"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            q.stats("work").await.unwrap().pending,
+            0,
+            "a record must not be written when its payload object was not"
+        );
+        assert_eq!(object_count(&payload_store, "test-payloads").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn enqueue_batch_removes_earlier_payload_objects_when_a_later_write_fails() {
+        let payloads = FaultStore::wrap();
+        let payload_store: Arc<dyn ObjectStore> = payloads.clone();
+        let q = Queue::open_with_options(
+            make_store(),
+            "test",
+            faulty_payload_opts(payload_store.clone()),
+        )
+        .await
+        .unwrap();
+
+        // The third payload write fails, after two objects have been written.
+        payloads.fail_puts_after(2);
+        let err = q
+            .enqueue_batch("work", vec![vec![1u8; 256], vec![2u8; 256], vec![3u8; 256]])
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::PayloadStore(StoreError::Generic { store, .. }) if store == "FaultStore"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            object_count(&payload_store, "test-payloads").await,
+            0,
+            "objects written before the failure must be removed, since no record points at them"
+        );
+        assert_eq!(q.stats("work").await.unwrap().pending, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ack_settles_the_job_when_the_payload_object_delete_fails() {
+        let payloads = FaultStore::wrap();
+        let payload_store: Arc<dyn ObjectStore> = payloads.clone();
+        let q = Queue::open_with_options(
+            make_store(),
+            "test",
+            faulty_payload_opts(payload_store.clone()),
+        )
+        .await
+        .unwrap();
+
+        let id = q.enqueue("work", vec![4u8; 256]).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+
+        payloads.fail_deletes(true);
+        q.ack(&job).await.unwrap();
+
+        assert!(
+            q.get_job(&id).await.unwrap().is_none(),
+            "the payload delete is best-effort and must not prevent settlement"
+        );
+        assert_eq!(
+            object_count(&payload_store, "test-payloads").await,
+            1,
+            "a failed delete leaves an unreferenced object, the record having been removed first"
+        );
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dead_lettered_payload_survives_requeue_and_redelivery() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        let payload = vec![8u8; 512];
+        q.enqueue("work", payload.clone()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.dead_letter(&job, "permanent").await.unwrap();
+
+        let dead = q.dead_jobs("work", None, 10).await.unwrap();
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].payload, payload, "dead_jobs materializes payloads");
+
+        q.requeue_dead_job(dead.into_iter().next().unwrap())
+            .await
+            .unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.payload, payload);
+        q.ack(&job).await.unwrap();
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_id_rejection_preserves_the_existing_payload_object() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        let payload = vec![1u8; 256];
+        let opts_with_id = || EnqueueOptions {
+            id_override: Some("fixed-id".to_string()),
+            ..EnqueueOptions::default()
+        };
+        q.enqueue_with("work", payload.clone(), opts_with_id())
+            .await
+            .unwrap();
+        let err = q
+            .enqueue_with("work", vec![2u8; 256], opts_with_id())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::DuplicateJobId { .. }));
+
+        // The rejected enqueue's object is removed; the live job's object
+        // is untouched and still readable.
+        assert_eq!(object_count(&store, "test-payloads").await, 1);
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.payload, payload);
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dedup_hit_removes_the_new_payload_object() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        let opts_with_dedup = || EnqueueOptions {
+            dedup_key: Some("once".to_string()),
+            ..EnqueueOptions::default()
+        };
+        let first = q
+            .enqueue_with("work", vec![1u8; 256], opts_with_dedup())
+            .await
+            .unwrap();
+        let second = q
+            .enqueue_with("work", vec![2u8; 256], opts_with_dedup())
+            .await
+            .unwrap();
+        assert_eq!(first, second, "dedup returns the existing job's id");
+        assert_eq!(object_count(&store, "test-payloads").await, 1);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn payloads_at_or_below_the_threshold_stay_inline() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        let id = q.enqueue("work", vec![0u8; 64]).await.unwrap();
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
+        let job = q.get_job(&id).await.unwrap().unwrap();
+        assert!(job.payload_ref.is_none());
+        assert_eq!(job.payload.len(), 64);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabled_offload_keeps_large_payloads_inline() {
+        let store = make_store();
+        let opts = OpenOptions {
+            payload_offload_threshold: None,
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(store.clone(), "test", opts)
+            .await
+            .unwrap();
+
+        let id = q.enqueue("work", vec![0u8; 1024 * 1024]).await.unwrap();
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
+        let job = q.get_job(&id).await.unwrap().unwrap();
+        assert!(job.payload_ref.is_none());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_of_a_pending_job_deletes_the_payload_object() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        let id = q.enqueue("work", vec![4u8; 256]).await.unwrap();
+        assert_eq!(object_count(&store, "test-payloads").await, 1);
+        assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Removed);
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn separate_payload_store_receives_the_payload_objects() {
+        let queue_store = make_store();
+        let payload_store = make_store();
+        let opts = OpenOptions {
+            payload_offload_threshold: Some(64),
+            payload_store: Some(payload_store.clone()),
+            payload_path: Some("blobs".to_string()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(queue_store.clone(), "test", opts)
+            .await
+            .unwrap();
+
+        let payload = vec![6u8; 256];
+        q.enqueue("work", payload.clone()).await.unwrap();
+        assert_eq!(object_count(&payload_store, "blobs").await, 1);
+        assert_eq!(object_count(&queue_store, "test-payloads").await, 0);
+
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.payload, payload);
+        q.ack(&job).await.unwrap();
+        assert_eq!(object_count(&payload_store, "blobs").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_enqueue_offloads_each_oversized_payload() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        let payloads = vec![vec![1u8; 256], vec![2u8; 16], vec![3u8; 256]];
+        q.enqueue_batch("work", payloads.clone()).await.unwrap();
+        assert_eq!(
+            object_count(&store, "test-payloads").await,
+            2,
+            "only the two oversized payloads offload"
+        );
+
+        for expected in payloads {
+            let job = q
+                .claim("work", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.payload, expected);
+            q.ack(&job).await.unwrap();
+        }
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_payload_deletion_surfaces_payload_missing() {
+        use slatedb::object_store::ObjectStoreExt;
+
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        let id = q.enqueue("work", vec![1u8; 256]).await.unwrap();
+        let objects = store
+            .list_with_delimiter(Some(&slatedb::object_store::path::Path::from(
+                "test-payloads",
+            )))
+            .await
+            .unwrap()
+            .objects;
+        assert_eq!(objects.len(), 1);
+        store.delete(&objects[0].location).await.unwrap();
+
+        // The record is live, so the missing object is a real loss.
+        let err = q.get_job(&id).await.unwrap_err();
+        assert!(matches!(err, Error::PayloadMissing { id: ref e } if *e == id));
+
+        q.close().await.unwrap();
+    }
+}

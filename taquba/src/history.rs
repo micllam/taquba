@@ -124,4 +124,153 @@ mod tests {
     fn decode_of_empty_value_is_empty() {
         assert!(decode_history(&[]).unwrap().is_empty());
     }
+
+    use crate::test_util::*;
+
+    #[tokio::test]
+    async fn attempt_history_records_retries_then_completion() {
+        let opts = OpenOptions {
+            default_queue_config: QueueConfig {
+                keep_done_jobs: Some(Duration::from_secs(3600)),
+                retry_backoff_base: Duration::ZERO,
+                retry_backoff_max: Duration::ZERO,
+                ..QueueConfig::default()
+            },
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+        let id = q.enqueue("work", b"x".to_vec()).await.unwrap();
+        let lease = Duration::from_secs(30);
+
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.nack(&job, "timeout").await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.nack(&job, "connection reset").await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.ack(&job).await.unwrap();
+
+        let history = q.attempt_history(&id).await.unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].attempt, 1);
+        assert_eq!(history[0].outcome, AttemptOutcome::Retried);
+        assert_eq!(history[0].error.as_deref(), Some("timeout"));
+        assert!(history[0].claimed_at.is_some());
+        assert_eq!(history[1].attempt, 2);
+        assert_eq!(history[1].error.as_deref(), Some("connection reset"));
+        assert_eq!(history[2].attempt, 3);
+        assert_eq!(history[2].outcome, AttemptOutcome::Completed);
+        assert_eq!(history[2].error, None);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attempt_history_removed_when_ack_expunges_the_record() {
+        let q = Queue::open_with_options(make_store(), "test", no_backoff_opts())
+            .await
+            .unwrap();
+        let id = q.enqueue("work", b"x".to_vec()).await.unwrap();
+        let lease = Duration::from_secs(30);
+
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.nack(&job, "failed").await.unwrap();
+        assert_eq!(q.attempt_history(&id).await.unwrap().len(), 1);
+
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.ack(&job).await.unwrap();
+        assert!(q.attempt_history(&id).await.unwrap().is_empty());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attempt_history_records_dead_letter_on_nack_at_attempt_limit() {
+        let opts = OpenOptions {
+            default_queue_config: QueueConfig {
+                max_attempts: 1,
+                ..QueueConfig::default()
+            },
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+        let id = q.enqueue("work", b"x".to_vec()).await.unwrap();
+
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.nack(&job, "failed").await.unwrap();
+        assert_eq!(
+            q.get_job(&id).await.unwrap().unwrap().status,
+            JobStatus::Dead
+        );
+
+        let history = q.attempt_history(&id).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].attempt, 1);
+        assert_eq!(history[0].outcome, AttemptOutcome::DeadLettered);
+        assert_eq!(history[0].error.as_deref(), Some("failed"));
+        assert!(history[0].claimed_at.is_some());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attempt_history_survives_requeue_with_marker() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let id = q.enqueue("work", b"x".to_vec()).await.unwrap();
+        let lease = Duration::from_secs(30);
+
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.dead_letter(&job, "unroutable").await.unwrap();
+
+        let dead = q.get_job(&id).await.unwrap().unwrap();
+        q.requeue_dead_job(dead).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.dead_letter(&job, "still unroutable").await.unwrap();
+
+        let history = q.attempt_history(&id).await.unwrap();
+        let outcomes: Vec<_> = history.iter().map(|a| a.outcome).collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                AttemptOutcome::DeadLettered,
+                AttemptOutcome::Requeued,
+                AttemptOutcome::DeadLettered,
+            ]
+        );
+        assert_eq!(history[0].error.as_deref(), Some("unroutable"));
+        assert_eq!(history[1].attempt, 0);
+        assert_eq!(history[1].claimed_at, None);
+        assert_eq!(history[2].attempt, 1);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_of_scheduled_job_removes_attempt_history() {
+        let opts = OpenOptions {
+            clock: Arc::new(MockClock::new(1_700_000_000_000)),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+        let id = q.enqueue("work", b"x".to_vec()).await.unwrap();
+
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        // Default backoff is non-zero, so the nacked job waits in
+        // `Scheduled` with one history entry.
+        q.nack(&job, "failed").await.unwrap();
+        assert_eq!(q.attempt_history(&id).await.unwrap().len(), 1);
+
+        assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Removed);
+        assert!(q.attempt_history(&id).await.unwrap().is_empty());
+        q.close().await.unwrap();
+    }
 }

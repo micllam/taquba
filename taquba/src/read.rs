@@ -309,3 +309,366 @@ pub(crate) async fn kv_scan<H: ReadHandle>(
         next_cursor,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::*;
+
+    #[tokio::test]
+    async fn test_list_queues() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+
+        q.enqueue("alpha", b"1".to_vec()).await.unwrap();
+        q.enqueue("beta", b"2".to_vec()).await.unwrap();
+        q.enqueue("gamma", b"3".to_vec()).await.unwrap();
+
+        let mut queues = q.list_queues().await.unwrap();
+        queues.sort();
+        assert_eq!(queues, vec!["alpha", "beta", "gamma"]);
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dead_jobs_pagination() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+
+        // Create 5 dead jobs.
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            let id = q
+                .enqueue_with(
+                    "work",
+                    b"x".to_vec(),
+                    EnqueueOptions {
+                        max_attempts: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let job = q
+                .claim("work", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .unwrap();
+            q.nack(&job, "fail").await.unwrap();
+            ids.push(id);
+        }
+
+        // First page of 2 returns the first two.
+        let p1 = q.dead_jobs("work", None, 2).await.unwrap();
+        assert_eq!(p1.len(), 2);
+        assert_eq!(p1[0].id, ids[0]);
+        assert_eq!(p1[1].id, ids[1]);
+
+        // Resume from the last cursor.
+        let p2 = q.dead_jobs("work", Some(&p1[1].id), 2).await.unwrap();
+        assert_eq!(p2.len(), 2);
+        assert_eq!(p2[0].id, ids[2]);
+        assert_eq!(p2[1].id, ids[3]);
+
+        let p3 = q.dead_jobs("work", Some(&p2[1].id), 2).await.unwrap();
+        assert_eq!(p3.len(), 1);
+        assert_eq!(p3[0].id, ids[4]);
+
+        // limit=0 returns nothing.
+        assert!(q.dead_jobs("work", None, 0).await.unwrap().is_empty());
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_jobs_pages_pending_in_claim_order() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let low = q
+            .enqueue_with(
+                "work",
+                b"low".to_vec(),
+                EnqueueOptions {
+                    priority: Some(PRIORITY_LOW),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let normal_a = q.enqueue("work", b"a".to_vec()).await.unwrap();
+        let normal_b = q.enqueue("work", b"b".to_vec()).await.unwrap();
+        let high = q
+            .enqueue_with(
+                "work",
+                b"high".to_vec(),
+                EnqueueOptions {
+                    priority: Some(PRIORITY_HIGH),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut ids = Vec::new();
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let page = q
+                .list_jobs("work", JobStatus::Pending, cursor.as_deref(), 2)
+                .await
+                .unwrap();
+            ids.extend(page.jobs.iter().map(|j| j.id.clone()));
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(ids, vec![high, normal_a, normal_b, low]);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_jobs_orders_scheduled_by_run_at() {
+        let initial = 1_700_000_000_000u64;
+        let opts = OpenOptions {
+            clock: Arc::new(MockClock::new(initial)),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+        let at = |secs: u64| std::time::UNIX_EPOCH + Duration::from_millis(initial + secs * 1_000);
+        let later = q
+            .enqueue_with(
+                "work",
+                b"later".to_vec(),
+                EnqueueOptions {
+                    run_at: Some(at(7200)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let sooner = q
+            .enqueue_with(
+                "work",
+                b"sooner".to_vec(),
+                EnqueueOptions {
+                    run_at: Some(at(3600)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let page = q
+            .list_jobs("work", JobStatus::Scheduled, None, 10)
+            .await
+            .unwrap();
+        let ids: Vec<_> = page.jobs.iter().map(|j| j.id.clone()).collect();
+        assert_eq!(ids, vec![sooner, later]);
+        assert!(page.next_cursor.is_none());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_jobs_orders_claimed_by_id_stably_under_renewal() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        // Claim order is the reverse of expiry order, so a listing
+        // ordered by lease expiry would return these in reverse order.
+        let mut handles = Vec::new();
+        for secs in [90, 60, 30] {
+            q.enqueue("work", vec![secs as u8]).await.unwrap();
+            let claim = q
+                .claim("work", Duration::from_secs(secs))
+                .await
+                .unwrap()
+                .unwrap();
+            handles.push(claim);
+        }
+        let [ca, cb, cc] = <[Claim; 3]>::try_from(handles).unwrap();
+        let (a, b, c) = (ca.id.clone(), cb.id.clone(), cc.id.clone());
+
+        let ids =
+            |page: &JobPage| -> Vec<String> { page.jobs.iter().map(|j| j.id.clone()).collect() };
+        let page = q
+            .list_jobs("work", JobStatus::Claimed, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(ids(&page), vec![a.clone(), b.clone(), c.clone()]);
+
+        // A renewal leaves the ordering alone.
+        let renewed = q.renew_lease(&ca, Duration::from_secs(600)).unwrap();
+        let page = q
+            .list_jobs("work", JobStatus::Claimed, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(ids(&page), vec![a.clone(), b, c]);
+        assert_eq!(q.lease_expiry("work", &a), Some(renewed));
+
+        drop((cb, cc));
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_jobs_pages_claimed_one_queue_at_a_time() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+        let mut expected = Vec::new();
+        // Alternate claims between the two queues, so a listing that
+        // scanned a key space covering both would page the other
+        // queue's rows in.
+        for i in 0..3u8 {
+            let id = q.enqueue("qa", vec![i]).await.unwrap();
+            q.enqueue("qb", vec![i]).await.unwrap();
+            expected.push(id);
+            let lease = Duration::from_secs(30);
+            q.claim("qa", lease).await.unwrap().unwrap();
+            clock.advance(Duration::from_millis(1));
+            q.claim("qb", lease).await.unwrap().unwrap();
+            clock.advance(Duration::from_millis(1));
+        }
+
+        let mut ids = Vec::new();
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut pages = 0;
+        loop {
+            let page = q
+                .list_jobs("qa", JobStatus::Claimed, cursor.as_deref(), 1)
+                .await
+                .unwrap();
+            assert!(page.jobs.len() <= 1);
+            assert!(page.jobs.iter().all(|j| j.status == JobStatus::Claimed));
+            ids.extend(page.jobs.iter().map(|j| j.id.clone()));
+            pages += 1;
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(ids, expected);
+        assert_eq!(pages, 3);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_jobs_done_lists_only_kept_records() {
+        let mut opts = OpenOptions::default();
+        opts.queue_configs.insert(
+            "kept".to_string(),
+            QueueConfig {
+                keep_done_jobs: Some(Duration::from_secs(3600)),
+                ..QueueConfig::default()
+            },
+        );
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+        let kept = q.enqueue("kept", b"k".to_vec()).await.unwrap();
+        q.enqueue("gone", b"g".to_vec()).await.unwrap();
+        let lease = Duration::from_secs(30);
+        let job = q.claim("kept", lease).await.unwrap().unwrap();
+        q.ack(&job).await.unwrap();
+        let job = q.claim("gone", lease).await.unwrap().unwrap();
+        q.ack(&job).await.unwrap();
+
+        let page = q
+            .list_jobs("kept", JobStatus::Done, None, 10)
+            .await
+            .unwrap();
+        let ids: Vec<_> = page.jobs.iter().map(|j| j.id.clone()).collect();
+        assert_eq!(ids, vec![kept]);
+        let page = q
+            .list_jobs("gone", JobStatus::Done, None, 10)
+            .await
+            .unwrap();
+        assert!(page.jobs.is_empty());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_jobs_dead_matches_dead_jobs() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        for i in 0..3u8 {
+            q.enqueue("work", vec![i]).await.unwrap();
+        }
+        let lease = Duration::from_secs(30);
+        while let Some(job) = q.claim("work", lease).await.unwrap() {
+            q.dead_letter(&job, "failed").await.unwrap();
+        }
+
+        let via_dead_jobs: Vec<_> = q
+            .dead_jobs("work", None, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|j| j.id)
+            .collect();
+        assert_eq!(via_dead_jobs.len(), 3);
+        let page = q
+            .list_jobs("work", JobStatus::Dead, None, 10)
+            .await
+            .unwrap();
+        let via_list: Vec<_> = page.jobs.into_iter().map(|j| j.id).collect();
+        assert_eq!(via_list, via_dead_jobs);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_jobs_materializes_offloaded_payloads() {
+        let q = Queue::open_with_options(make_store(), "test", offload_opts())
+            .await
+            .unwrap();
+        let payload = vec![9u8; 512];
+        let id = q.enqueue("work", payload.clone()).await.unwrap();
+
+        let page = q
+            .list_jobs("work", JobStatus::Pending, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, id);
+        assert!(page.jobs[0].payload_ref.is_some());
+        assert_eq!(page.jobs[0].payload, payload);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_jobs_limit_zero_and_foreign_cursor_return_empty_pages() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        q.enqueue("work", b"x".to_vec()).await.unwrap();
+        q.enqueue("work", b"y".to_vec()).await.unwrap();
+
+        let zero = q
+            .list_jobs("work", JobStatus::Pending, None, 0)
+            .await
+            .unwrap();
+        assert!(zero.jobs.is_empty());
+        assert!(zero.next_cursor.is_none());
+
+        let first = q
+            .list_jobs("work", JobStatus::Pending, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(first.jobs.len(), 1);
+        let cursor = first.next_cursor.expect("a second pending entry exists");
+        let dead = q
+            .list_jobs("work", JobStatus::Dead, Some(&cursor), 10)
+            .await
+            .unwrap();
+        assert!(dead.jobs.is_empty());
+        assert!(dead.next_cursor.is_none());
+        q.close().await.unwrap();
+    }
+}

@@ -674,4 +674,315 @@ mod tests {
             scan_from(b"pending:q:00000000:job-3", true),
         );
     }
+
+    use crate::test_util::*;
+
+    #[tokio::test]
+    async fn claim_finds_job_enqueued_after_empty_polls() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        assert!(q.claim("work", lease).await.unwrap().is_none());
+        assert!(q.claim("work", lease).await.unwrap().is_none());
+
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        assert_eq!(job.payload, b"job");
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn claim_finds_batch_enqueued_after_queue_drained() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        q.enqueue("work", b"first".to_vec()).await.unwrap();
+        let first = q.claim("work", lease).await.unwrap().unwrap();
+        q.ack(&first).await.unwrap();
+        assert!(q.claim("work", lease).await.unwrap().is_none());
+        assert!(q.claim("work", lease).await.unwrap().is_none());
+
+        q.enqueue_batch("work", vec![b"second".to_vec()])
+            .await
+            .unwrap();
+
+        let second = q.claim("work", lease).await.unwrap().unwrap();
+        assert_eq!(second.payload, b"second");
+        q.ack(&second).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn enqueue_wakes_one_waiting_worker_per_job() {
+        let q = Arc::new(Queue::open(make_store(), "test").await.unwrap());
+        let lease = Duration::from_secs(5);
+        let max_wait = Duration::from_secs(60);
+
+        let mut waiters = Vec::new();
+        for _ in 0..3 {
+            let q = q.clone();
+            waiters.push(tokio::spawn(async move {
+                q.claim_with_wait("work", lease, max_wait).await.unwrap()
+            }));
+        }
+        tokio::task::yield_now().await;
+
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+
+        let mut claimed = 0;
+        for handle in waiters {
+            if let Some(job) = handle.await.unwrap() {
+                claimed += 1;
+                q.ack(&job).await.unwrap();
+            }
+        }
+        assert_eq!(claimed, 1, "exactly one waiter wakes with the job");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batch_enqueue_wakes_one_waiting_worker_per_job() {
+        let q = Arc::new(Queue::open(make_store(), "test").await.unwrap());
+        let lease = Duration::from_secs(5);
+        let max_wait = Duration::from_secs(60);
+
+        let mut waiters = Vec::new();
+        for _ in 0..3 {
+            let q = q.clone();
+            waiters.push(tokio::spawn(async move {
+                q.claim_with_wait("work", lease, max_wait).await.unwrap()
+            }));
+        }
+        tokio::task::yield_now().await;
+
+        q.enqueue_batch("work", vec![b"a".to_vec(), b"b".to_vec()])
+            .await
+            .unwrap();
+
+        let mut claimed = 0;
+        for handle in waiters {
+            if let Some(job) = handle.await.unwrap() {
+                claimed += 1;
+                q.ack(&job).await.unwrap();
+            }
+        }
+        assert_eq!(claimed, 2, "one waiter wakes per inserted job");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn claim_with_wait_waits_full_deadline_despite_stale_permit() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+
+        // A successful claim_with_wait passes the wakeup on, leaving a
+        // stale permit behind when no task is waiting.
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q
+            .claim_with_wait("work", lease, Duration::from_secs(1))
+            .await
+            .unwrap()
+            .unwrap();
+        q.ack(&job).await.unwrap();
+
+        let start = tokio::time::Instant::now();
+        let next = q
+            .claim_with_wait("work", lease, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(next.is_none());
+        assert!(
+            start.elapsed() >= Duration::from_secs(5),
+            "stale permit must not end the wait early",
+        );
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_jobs_on_consumes_permit_from_earlier_insert() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+
+        let start = tokio::time::Instant::now();
+        q.wait_for_jobs_on("work", Duration::from_secs(60)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "insert before the wait must wake it via the stored permit",
+        );
+
+        let job = q.claim("work", Duration::from_secs(5)).await.unwrap();
+        q.ack(&job.unwrap()).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn claim_batch_claims_in_order_up_to_max() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        for payload in [b"a", b"b", b"c", b"d", b"e"] {
+            q.enqueue("work", payload.to_vec()).await.unwrap();
+        }
+
+        let first = q.claim_batch("work", 3, lease).await.unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|j| j.payload.as_slice())
+                .collect::<Vec<_>>(),
+            [b"a", b"b", b"c"],
+        );
+        for job in &first {
+            assert_eq!(job.status, JobStatus::Claimed);
+            assert_eq!(job.attempts, 1);
+            assert!(q.lease_expiry("work", &job.id).is_some());
+        }
+
+        let rest = q.claim_batch("work", 3, lease).await.unwrap();
+        assert_eq!(
+            rest.iter()
+                .map(|j| j.payload.as_slice())
+                .collect::<Vec<_>>(),
+            [b"d", b"e"],
+        );
+
+        for job in first.iter().chain(rest.iter()) {
+            q.ack(job).await.unwrap();
+        }
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn claim_batch_zero_max_claims_nothing() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+
+        assert!(
+            q.claim_batch("work", 0, Duration::from_secs(5))
+                .await
+                .unwrap()
+                .is_empty(),
+        );
+
+        let job = q
+            .claim("work", Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_claim_batch_marks_empty_until_next_enqueue() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        q.enqueue("work", b"only".to_vec()).await.unwrap();
+
+        let batch = q.claim_batch("work", 8, lease).await.unwrap();
+        assert_eq!(batch.len(), 1);
+        assert!(q.claim("work", lease).await.unwrap().is_none());
+
+        q.enqueue("work", b"next".to_vec()).await.unwrap();
+        let next = q.claim("work", lease).await.unwrap().unwrap();
+        assert_eq!(next.payload, b"next");
+
+        q.ack(&batch[0]).await.unwrap();
+        q.ack(&next).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn claim_finds_job_requeued_by_nack_after_empty_poll() {
+        let q = Queue::open_with_options(make_store(), "test", no_backoff_opts())
+            .await
+            .unwrap();
+        let lease = Duration::from_secs(5);
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        assert!(q.claim("work", lease).await.unwrap().is_none());
+
+        q.nack(&job, "retry").await.unwrap();
+
+        let retried = q.claim("work", lease).await.unwrap().unwrap();
+        assert_eq!(retried.payload, b"job");
+        assert_eq!(retried.attempts, 2);
+        q.ack(&retried).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cursor_bound_persists_across_a_clean_close() {
+        let store = make_store();
+        let lease = Duration::from_secs(5);
+        let q = Queue::open(store.clone(), "test").await.unwrap();
+        q.enqueue("work", b"first".to_vec()).await.unwrap();
+        q.enqueue("work", b"second".to_vec()).await.unwrap();
+        let first = q.claim("work", lease).await.unwrap().unwrap();
+        q.ack(&first).await.unwrap();
+        q.close().await.unwrap();
+
+        let q = Queue::open(store, "test").await.unwrap();
+        let scan = q.core.claim_cursor.begin_claim("work");
+        assert!(scan.scan_from.is_some());
+        assert!(!scan.known_empty);
+        assert!(
+            q.core.db.get(cursor_key("work")).await.unwrap().is_none(),
+            "the cursor record is consumed at open",
+        );
+
+        let second = q.claim("work", lease).await.unwrap().unwrap();
+        assert_eq!(second.payload, b"second");
+        q.ack(&second).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cursor_emptiness_persists_across_a_clean_close() {
+        let store = make_store();
+        let lease = Duration::from_secs(5);
+        let q = Queue::open(store.clone(), "test").await.unwrap();
+        q.enqueue("work", b"only".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.ack(&job).await.unwrap();
+        assert!(q.claim("work", lease).await.unwrap().is_none());
+        q.close().await.unwrap();
+
+        let q = Queue::open(store, "test").await.unwrap();
+        assert!(q.core.claim_cursor.begin_claim("work").known_empty);
+
+        q.enqueue("work", b"revives".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        assert_eq!(job.payload, b"revives");
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restored_bound_moves_back_for_an_insert_behind_it() {
+        let store = make_store();
+        let lease = Duration::from_secs(5);
+        let q = Queue::open(store.clone(), "test").await.unwrap();
+        q.enqueue("work", b"normal-1".to_vec()).await.unwrap();
+        q.enqueue("work", b"normal-2".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+
+        // A high-priority job sorts before the restored bound, which
+        // sits in the normal-priority band.
+        let q = Queue::open(store, "test").await.unwrap();
+        q.enqueue_with(
+            "work",
+            b"urgent".to_vec(),
+            EnqueueOptions {
+                priority: Some(PRIORITY_HIGH),
+                ..EnqueueOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        assert_eq!(job.payload, b"urgent");
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
 }

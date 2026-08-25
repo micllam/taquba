@@ -327,12 +327,9 @@ mod tests {
     use crate::error::Error;
     use crate::queue::{OpenOptions, Queue};
     use slatedb::object_store::ObjectStoreExt;
-    use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::path::Path;
 
-    fn make_store() -> Arc<dyn ObjectStore> {
-        Arc::new(InMemory::new())
-    }
+    use crate::test_util::make_store;
 
     #[tokio::test]
     async fn a_reader_sees_the_store_a_writer_flushed() {

@@ -401,6 +401,8 @@ mod reader;
 mod reaper;
 mod scheduler;
 mod stats;
+#[cfg(test)]
+mod test_util;
 mod txn;
 /// Worker-loop primitives: the [`worker::Worker`] trait, plus the
 /// [`worker::run_worker`] / [`worker::run_worker_concurrent`] drivers that

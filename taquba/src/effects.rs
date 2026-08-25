@@ -307,3 +307,680 @@ impl QueueCore {
         debug!(queue = %staged.queue, job_id = %staged.id, "job enqueued");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn ack_with_applies_no_effects_when_a_crash_interrupts_a_stalled_settlement() {
+        let store = FaultStore::wrap();
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = || OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(store.clone(), "test", opts())
+            .await
+            .unwrap();
+        let effects = || SettlementEffects {
+            enqueues: vec![EnqueueRequest {
+                queue: "next".to_string(),
+                payload: b"follow".to_vec(),
+                options: EnqueueOptions::default(),
+            }],
+            kv_writes: HashMap::from([(b"runs/1".to_vec(), b"done".to_vec())]),
+            kv_deletes: Vec::new(),
+        };
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        // A durable barrier write, so the claim record is flushed before
+        // faults are enabled and the crash loses only the settlement.
+        q.kv_put(b"barrier", b"x").await.unwrap();
+
+        // The settlement stalls on the unavailable store (SlateDB retries
+        // transient put errors with backoff, driven virtually by the
+        // paused runtime); the elapsed timeout drops the in-flight call
+        // and the queue is dropped without a close, simulating a crash
+        // mid-outage.
+        store.fail_puts(true);
+        let stalled =
+            tokio::time::timeout(Duration::from_secs(30), q.ack_with(&job, effects())).await;
+        assert!(stalled.is_err());
+        drop(q);
+
+        store.fail_puts(false);
+        let q = Queue::open_with_options(store, "test", opts())
+            .await
+            .unwrap();
+        // None of the settlement's effects survived the crash.
+        assert!(q.kv_get(b"runs/1").await.unwrap().is_none());
+        assert!(
+            q.claim("next", Duration::from_secs(5))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // The job is still owned by the crashed claim; expire the lease
+        // and redeliver.
+        clock.advance(Duration::from_secs(60));
+        q.reap_now().await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.payload, b"job");
+        let results = q.ack_with(&job, effects()).await.unwrap();
+        assert!(matches!(results[0], EnqueueResult::New(_)));
+        assert_eq!(
+            q.kv_get(b"runs/1").await.unwrap().as_deref(),
+            Some(b"done".as_slice())
+        );
+        let follow = q
+            .claim("next", Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(follow.payload, b"follow");
+        assert!(
+            q.claim("next", Duration::from_secs(5))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ack_with_applies_enqueue_and_kv_effects_atomically() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        q.enqueue_with_kv(
+            "work",
+            b"first".to_vec(),
+            EnqueueOptions::default(),
+            HashMap::from([(b"runs/1".to_vec(), b"active".to_vec())]),
+        )
+        .await
+        .unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+
+        let results = q
+            .ack_with(
+                &job,
+                SettlementEffects {
+                    enqueues: vec![EnqueueRequest {
+                        queue: "next".to_string(),
+                        payload: b"second".to_vec(),
+                        options: EnqueueOptions::default(),
+                    }],
+                    kv_writes: HashMap::from([(b"runs/2".to_vec(), b"done".to_vec())]),
+                    kv_deletes: vec![b"runs/1".to_vec()],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], EnqueueResult::New(_)));
+
+        let follow_up = q.claim("next", lease).await.unwrap().unwrap();
+        assert_eq!(follow_up.payload, b"second");
+        q.ack(&follow_up).await.unwrap();
+        assert!(q.kv_get(b"runs/1").await.unwrap().is_none());
+        assert_eq!(
+            q.kv_get(b"runs/2").await.unwrap().as_deref(),
+            Some(b"done".as_slice()),
+        );
+        assert_eq!(q.stats("work").await.unwrap().done, 1);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lost_claim_applies_no_effects() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.ack(&job).await.unwrap();
+
+        let effects = || SettlementEffects {
+            enqueues: vec![EnqueueRequest {
+                queue: "next".to_string(),
+                payload: b"x".to_vec(),
+                options: EnqueueOptions::default(),
+            }],
+            kv_writes: HashMap::from([(b"k".to_vec(), b"v".to_vec())]),
+            kv_deletes: Vec::new(),
+        };
+        assert!(matches!(
+            q.ack_with(&job, effects()).await,
+            Err(Error::ClaimLost)
+        ));
+        assert!(matches!(
+            q.nack_with(&job, "late", effects()).await,
+            Err(Error::ClaimLost)
+        ));
+        assert!(matches!(
+            q.dead_letter_with(&job, "late", effects()).await,
+            Err(Error::ClaimLost)
+        ));
+        assert_eq!(q.stats("next").await.unwrap().pending, 0);
+        assert!(q.kv_get(b"k").await.unwrap().is_none());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ack_with_dedup_hit_downgrades_one_request() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        let existing_id = q
+            .enqueue_with(
+                "next",
+                b"existing".to_vec(),
+                EnqueueOptions {
+                    dedup_key: Some("dk".to_string()),
+                    ..EnqueueOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+
+        let results = q
+            .ack_with(
+                &job,
+                SettlementEffects {
+                    enqueues: vec![
+                        EnqueueRequest {
+                            queue: "next".to_string(),
+                            payload: b"dup".to_vec(),
+                            options: EnqueueOptions {
+                                dedup_key: Some("dk".to_string()),
+                                ..EnqueueOptions::default()
+                            },
+                        },
+                        EnqueueRequest {
+                            queue: "next".to_string(),
+                            payload: b"fresh".to_vec(),
+                            options: EnqueueOptions::default(),
+                        },
+                    ],
+                    ..SettlementEffects::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(&results[0], EnqueueResult::AlreadyEnqueued(id) if *id == existing_id));
+        assert!(matches!(&results[1], EnqueueResult::New(_)));
+        assert_eq!(q.stats("next").await.unwrap().pending, 2);
+        assert_eq!(q.stats("work").await.unwrap().done, 1);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dead_letter_with_applies_enqueue_and_kv_effects_atomically() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        assert!(q.claim("notify", lease).await.unwrap().is_none());
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+
+        let results = q
+            .dead_letter_with(
+                &job,
+                "bad input",
+                SettlementEffects {
+                    enqueues: vec![EnqueueRequest {
+                        queue: "notify".to_string(),
+                        payload: b"failed".to_vec(),
+                        options: EnqueueOptions::default(),
+                    }],
+                    kv_writes: HashMap::from([(b"runs/1".to_vec(), b"failed".to_vec())]),
+                    kv_deletes: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], EnqueueResult::New(_)));
+
+        assert_eq!(q.stats("work").await.unwrap().dead, 1);
+        assert_eq!(q.stats("notify").await.unwrap().pending, 1);
+        assert_eq!(
+            q.kv_get(b"runs/1").await.unwrap().as_deref(),
+            Some(b"failed".as_slice()),
+        );
+        let follow_up = q.claim("notify", lease).await.unwrap().unwrap();
+        assert_eq!(follow_up.payload, b"failed");
+        q.ack(&follow_up).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn nack_with_discards_effects_while_attempts_remain() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+
+        let outcome = q
+            .nack_with(
+                &job,
+                "transient",
+                SettlementEffects {
+                    enqueues: vec![EnqueueRequest {
+                        queue: "notify".to_string(),
+                        payload: b"x".to_vec(),
+                        options: EnqueueOptions::default(),
+                    }],
+                    kv_writes: HashMap::from([(b"k".to_vec(), b"v".to_vec())]),
+                    kv_deletes: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, NackOutcome::Retried);
+
+        let stats = q.stats("work").await.unwrap();
+        assert_eq!(stats.scheduled, 1);
+        assert_eq!(stats.dead, 0);
+        assert_eq!(q.stats("notify").await.unwrap().pending, 0);
+        assert!(q.kv_get(b"k").await.unwrap().is_none());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn nack_with_applies_effects_when_it_dead_letters() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        assert!(q.claim("notify", lease).await.unwrap().is_none());
+        q.enqueue_with(
+            "work",
+            b"job".to_vec(),
+            EnqueueOptions {
+                max_attempts: Some(1),
+                ..EnqueueOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+
+        let outcome = q
+            .nack_with(
+                &job,
+                "final failure",
+                SettlementEffects {
+                    enqueues: vec![EnqueueRequest {
+                        queue: "notify".to_string(),
+                        payload: b"failed".to_vec(),
+                        options: EnqueueOptions::default(),
+                    }],
+                    kv_writes: HashMap::from([(b"runs/1".to_vec(), b"failed".to_vec())]),
+                    kv_deletes: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let NackOutcome::DeadLettered(results) = outcome else {
+            panic!("expected a dead-lettering nack, got {outcome:?}");
+        };
+        assert!(matches!(results[0], EnqueueResult::New(_)));
+
+        assert_eq!(q.stats("work").await.unwrap().dead, 1);
+        assert_eq!(q.stats("notify").await.unwrap().pending, 1);
+        assert_eq!(
+            q.kv_get(b"runs/1").await.unwrap().as_deref(),
+            Some(b"failed".as_slice()),
+        );
+        let follow_up = q.claim("notify", lease).await.unwrap().unwrap();
+        assert_eq!(follow_up.payload, b"failed");
+        q.ack(&follow_up).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_with_applies_effects_with_the_removal() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        assert!(q.claim("notify", lease).await.unwrap().is_none());
+        let id = q.enqueue("work", b"job".to_vec()).await.unwrap();
+
+        let (outcome, results) = q
+            .cancel_with(
+                &id,
+                SettlementEffects {
+                    enqueues: vec![EnqueueRequest {
+                        queue: "notify".to_string(),
+                        payload: b"cancelled".to_vec(),
+                        options: EnqueueOptions::default(),
+                    }],
+                    kv_writes: HashMap::new(),
+                    kv_deletes: vec![b"runs/1".to_vec()],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, CancelOutcome::Removed);
+        assert!(matches!(results[0], EnqueueResult::New(_)));
+
+        assert_eq!(q.stats("work").await.unwrap().pending, 0);
+        assert_eq!(q.stats("notify").await.unwrap().pending, 1);
+        assert!(q.get_job(&id).await.unwrap().is_none());
+        let follow_up = q.claim("notify", lease).await.unwrap().unwrap();
+        assert_eq!(follow_up.payload, b"cancelled");
+        q.ack(&follow_up).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_with_discards_effects_on_a_claimed_job() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let lease = Duration::from_secs(5);
+        let id = q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+
+        let (outcome, results) = q
+            .cancel_with(
+                &id,
+                SettlementEffects {
+                    enqueues: vec![EnqueueRequest {
+                        queue: "notify".to_string(),
+                        payload: b"x".to_vec(),
+                        options: EnqueueOptions::default(),
+                    }],
+                    kv_writes: HashMap::from([(b"k".to_vec(), b"v".to_vec())]),
+                    kv_deletes: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, CancelOutcome::Requested);
+        assert!(results.is_empty());
+        assert_eq!(q.stats("notify").await.unwrap().pending, 0);
+        assert!(q.kv_get(b"k").await.unwrap().is_none());
+
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_with_discards_effects_on_an_unknown_job() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+
+        let (outcome, results) = q
+            .cancel_with(
+                "missing",
+                SettlementEffects {
+                    kv_writes: HashMap::from([(b"k".to_vec(), b"v".to_vec())]),
+                    ..SettlementEffects::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, CancelOutcome::NotFound);
+        assert!(results.is_empty());
+        assert!(q.kv_get(b"k").await.unwrap().is_none());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_with_deletes_the_payload_object_of_a_discarded_follow_up() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+        let id = q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (outcome, _) = q
+            .cancel_with(
+                &id,
+                SettlementEffects {
+                    enqueues: vec![EnqueueRequest {
+                        queue: "notify".to_string(),
+                        payload: vec![1u8; 256],
+                        options: EnqueueOptions::default(),
+                    }],
+                    ..SettlementEffects::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, CancelOutcome::Requested);
+        assert_eq!(
+            object_count(&store, "test-payloads").await,
+            0,
+            "the discarded follow-up's offloaded object is removed"
+        );
+
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_key_both_written_and_deleted_is_rejected_before_the_settlement() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let effects = SettlementEffects {
+            kv_writes: HashMap::from([(b"k".to_vec(), b"v".to_vec())]),
+            kv_deletes: vec![b"k".to_vec()],
+            ..SettlementEffects::default()
+        };
+        let err = q.ack_with(&job, effects.clone()).await.unwrap_err();
+        assert!(matches!(err, Error::ConflictingKvEffect { ref key } if key == b"k"));
+        assert!(q.kv_get(b"k").await.unwrap().is_none());
+        assert_eq!(
+            q.stats("work").await.unwrap().claimed,
+            1,
+            "the claim is untouched"
+        );
+
+        let err = q.nack_with(&job, "e", effects.clone()).await.unwrap_err();
+        assert!(matches!(err, Error::ConflictingKvEffect { .. }));
+        let err = q.dead_letter_with(&job, "e", effects).await.unwrap_err();
+        assert!(matches!(err, Error::ConflictingKvEffect { .. }));
+
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    fn offloaded_follow_up() -> SettlementEffects {
+        SettlementEffects {
+            enqueues: vec![EnqueueRequest {
+                queue: "notify".to_string(),
+                payload: vec![1u8; 256],
+                options: EnqueueOptions::default(),
+            }],
+            ..SettlementEffects::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn nack_with_deletes_the_payload_object_of_a_discarded_follow_up() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let outcome = q
+            .nack_with(&job, "transient", offloaded_follow_up())
+            .await
+            .unwrap();
+        assert_eq!(outcome, NackOutcome::Retried);
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lost_claim_deletes_the_payload_object_of_a_prepared_follow_up() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.ack(&job).await.unwrap();
+
+        let err = q
+            .dead_letter_with(&job, "late", offloaded_follow_up())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::ClaimLost));
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
+
+        let err = q
+            .nack_with(&job, "late", offloaded_follow_up())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::ClaimLost));
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_with_deletes_the_payload_object_when_the_job_is_unknown() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        let (outcome, _) = q
+            .cancel_with("no-such-job", offloaded_follow_up())
+            .await
+            .unwrap();
+        assert_eq!(outcome, CancelOutcome::NotFound);
+        assert_eq!(object_count(&store, "test-payloads").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ack_with_schedules_a_future_effect() {
+        let initial = 1_700_000_000_000u64;
+        let opts = OpenOptions {
+            clock: Arc::new(MockClock::new(initial)),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+        let lease = Duration::from_secs(5);
+        q.enqueue("work", b"job".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+
+        q.ack_with(
+            &job,
+            SettlementEffects {
+                enqueues: vec![EnqueueRequest {
+                    queue: "next".to_string(),
+                    payload: b"later".to_vec(),
+                    options: EnqueueOptions {
+                        run_at: Some(
+                            std::time::UNIX_EPOCH + Duration::from_millis(initial + 300_000),
+                        ),
+                        ..EnqueueOptions::default()
+                    },
+                }],
+                ..SettlementEffects::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(q.stats("next").await.unwrap().scheduled, 1);
+        assert!(q.claim("next", lease).await.unwrap().is_none());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ack_effect_enqueues_offload_and_clean_up_on_dedup_downgrade() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+
+        // An existing job holds the dedup key the follow-up enqueue will hit.
+        q.enqueue_with(
+            "next",
+            vec![1u8; 16],
+            EnqueueOptions {
+                dedup_key: Some("once".to_string()),
+                ..EnqueueOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        q.enqueue("work", vec![2u8; 16]).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let results = q
+            .ack_with(
+                &job,
+                SettlementEffects {
+                    enqueues: vec![
+                        EnqueueRequest {
+                            queue: "next".to_string(),
+                            payload: vec![3u8; 256],
+                            options: EnqueueOptions {
+                                dedup_key: Some("once".to_string()),
+                                ..EnqueueOptions::default()
+                            },
+                        },
+                        EnqueueRequest {
+                            queue: "next".to_string(),
+                            payload: vec![4u8; 256],
+                            options: EnqueueOptions::default(),
+                        },
+                    ],
+                    ..SettlementEffects::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(results[0], EnqueueResult::AlreadyEnqueued(_)));
+        assert!(matches!(results[1], EnqueueResult::New(_)));
+        // The dedup-downgraded follow-up job's payload object is removed;
+        // the committed follow-up job's object remains.
+        assert_eq!(object_count(&store, "test-payloads").await, 1);
+
+        let follow_up_ids = match &results[1] {
+            EnqueueResult::New(id) => id.clone(),
+            _ => unreachable!(),
+        };
+        let follow_up = q.get_job(&follow_up_ids).await.unwrap().unwrap();
+        assert_eq!(follow_up.payload, vec![4u8; 256]);
+        q.close().await.unwrap();
+    }
+}

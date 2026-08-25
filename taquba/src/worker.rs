@@ -741,4 +741,270 @@ mod tests {
         assert_eq!(queue.stats("notify").await.unwrap().pending, 1);
         queue.close().await.unwrap();
     }
+
+    use crate::test_util::*;
+
+    #[tokio::test]
+    async fn test_run_worker_dead_letters_on_permanent_failure() {
+        // A Worker returning PermanentFailure should dead-letter immediately,
+        // skipping the retry/backoff path that a plain error takes.
+        use crate::worker::{PermanentFailure, Worker, WorkerError, run_worker};
+
+        struct PermanentFailWorker;
+        impl Worker for PermanentFailWorker {
+            async fn process(
+                &self,
+                _job: &JobRecord,
+                _lease: &LeaseHandle,
+            ) -> std::result::Result<(), WorkerError> {
+                Err(PermanentFailure::new("HTTP 410 Gone").into())
+            }
+        }
+
+        let q = Arc::new(Queue::open(make_store(), "test").await.unwrap());
+        let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let q2 = q.clone();
+        let handle = tokio::spawn(async move {
+            run_worker(
+                &q2,
+                "work",
+                &PermanentFailWorker,
+                Duration::from_millis(10),
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        // Wait for the dead counter to tick, then shut down.
+        loop {
+            let s = q.stats("work").await.unwrap();
+            if s.dead > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let _ = shutdown_tx.send(());
+        let _ = handle.await;
+
+        let job = q.get_job(&id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Dead);
+        assert_eq!(
+            job.attempts, 1,
+            "PermanentFailure should not consume retries"
+        );
+        assert_eq!(job.last_error.as_deref(), Some("HTTP 410 Gone"));
+    }
+
+    #[tokio::test]
+    async fn test_worker_finishes_in_flight_job_on_shutdown() {
+        use crate::worker::{Worker, WorkerError, run_worker};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Worker that takes 100ms to process, long enough that shutdown
+        // fires while the job is in flight.
+        struct SlowWorker {
+            finished: Arc<AtomicBool>,
+        }
+        impl Worker for SlowWorker {
+            async fn process(
+                &self,
+                _job: &JobRecord,
+                _lease: &LeaseHandle,
+            ) -> std::result::Result<(), WorkerError> {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                self.finished.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let q = Arc::new(Queue::open(make_store(), "test").await.unwrap());
+        q.enqueue("work", b"x".to_vec()).await.unwrap();
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker = SlowWorker {
+            finished: finished.clone(),
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let q2 = q.clone();
+        let handle = tokio::spawn(async move {
+            run_worker(
+                &q2,
+                "work",
+                &worker,
+                Duration::from_millis(50),
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        // Wait for the worker to claim the job, then immediately request shutdown.
+        loop {
+            if q.stats("work").await.unwrap().claimed == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let _ = shutdown_tx.send(());
+        let _ = handle.await;
+
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "in-flight job must finish before shutdown returns"
+        );
+        // And the job was acked, not left in claimed: for the reaper.
+        assert_eq!(q.stats("work").await.unwrap().claimed, 0);
+        assert_eq!(q.stats("work").await.unwrap().done, 1);
+    }
+
+    #[tokio::test]
+    async fn worker_process_can_renew_its_own_lease() {
+        use crate::worker::{Worker, WorkerError, run_worker};
+
+        struct RenewingWorker {
+            queue: Arc<Queue>,
+            clock: MockClock,
+        }
+        impl Worker for RenewingWorker {
+            async fn process(
+                &self,
+                _job: &JobRecord,
+                lease: &LeaseHandle,
+            ) -> std::result::Result<(), WorkerError> {
+                lease.ensure_at_least(Duration::from_secs(60)).unwrap();
+                self.clock.advance(Duration::from_secs(2));
+                self.queue.reap_now().await.unwrap();
+                Ok(())
+            }
+        }
+
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            default_queue_config: QueueConfig {
+                lease_duration: Duration::from_secs(1),
+                ..QueueConfig::default()
+            },
+            ..OpenOptions::default()
+        };
+        let q = Arc::new(
+            Queue::open_with_options(make_store(), "test", opts)
+                .await
+                .unwrap(),
+        );
+        q.enqueue("work", b"x".to_vec()).await.unwrap();
+
+        let worker = RenewingWorker {
+            queue: q.clone(),
+            clock: clock.clone(),
+        };
+        run_worker(
+            &q,
+            "work",
+            &worker,
+            Duration::from_millis(10),
+            std::future::ready(()),
+        )
+        .await
+        .unwrap();
+
+        let stats = q.stats("work").await.unwrap();
+        assert_eq!(stats.done, 1, "the ack after a renewal must succeed");
+        assert_eq!(stats.pending, 0, "the renewed job must not be requeued");
+        assert_eq!(stats.claimed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_worker() {
+        use crate::worker::{Worker, WorkerError, run_worker_concurrent};
+
+        struct EchoWorker;
+        impl Worker for EchoWorker {
+            async fn process(
+                &self,
+                _job: &JobRecord,
+                _lease: &LeaseHandle,
+            ) -> std::result::Result<(), WorkerError> {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                Ok(())
+            }
+        }
+
+        let q = Arc::new(Queue::open(make_store(), "test").await.unwrap());
+        let ids = q
+            .enqueue_batch(
+                "work",
+                vec![
+                    b"a".to_vec(),
+                    b"b".to_vec(),
+                    b"c".to_vec(),
+                    b"d".to_vec(),
+                    b"e".to_vec(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 5);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let q2 = q.clone();
+        let handle = tokio::spawn(async move {
+            run_worker_concurrent(
+                &q2,
+                "work",
+                Arc::new(EchoWorker),
+                3,
+                Duration::from_millis(10),
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        loop {
+            let s = q.stats("work").await.unwrap();
+            if s.pending == 0 && s.claimed == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = shutdown_tx.send(());
+        let _ = handle.await;
+
+        assert_eq!(q.stats("work").await.unwrap().done, 5);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_token_used_in_worker_select() {
+        // Verify a worker can `select!` on the token to short-circuit a slow
+        // tool invocation.
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let token = job.cancel_token().clone();
+
+        // External cooperative cancel.
+        assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Requested);
+
+        // Worker-side: short-circuit on token.
+        let took_path = tokio::select! {
+            biased;
+            _ = token.cancelled() => "cancelled",
+            _ = tokio::time::sleep(Duration::from_secs(5)) => "slept",
+        };
+        assert_eq!(took_path, "cancelled");
+
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
 }
