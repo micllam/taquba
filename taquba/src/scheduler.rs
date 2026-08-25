@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use slatedb::config::WriteOptions;
 use slatedb::{Db, IsolationLevel};
 use tracing::{debug, warn};
 
@@ -11,7 +10,7 @@ use crate::error::Result;
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{KeyTag, job_index_key, parse_key_timestamp, pending_key, tag_prefix};
 use crate::stats::update_stats;
-use crate::txn::put_job_record;
+use crate::txn::{Commit, Durability, commit, put_job_record};
 
 pub(crate) struct Scheduler {
     pub(crate) db: Arc<Db>,
@@ -106,12 +105,8 @@ async fn promote_job(
         // it: the rewrite is idempotent. Any later durable commit
         // flushes preceding WAL entries, so a job's post-promotion
         // history is never durable without the promotion itself.
-        let write_opts = WriteOptions {
-            await_durable: false,
-            ..WriteOptions::default()
-        };
-        match txn.commit_with_options(&write_opts).await {
-            Ok(_) => {
+        match commit(txn, Durability::Deferred).await? {
+            Commit::Committed => {
                 claim_cursor.note_pending_insert(&job.queue, &pending);
                 debug!(
                     queue = %job.queue,
@@ -120,8 +115,7 @@ async fn promote_job(
                 );
                 return Ok(());
             }
-            Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
-            Err(e) => return Err(e.into()),
+            Commit::Conflict => continue,
         }
     }
 }

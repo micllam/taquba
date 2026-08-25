@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use slatedb::config::{ScanOptions, Settings, WriteOptions};
+use slatedb::config::{ScanOptions, Settings};
 use slatedb::object_store::ObjectStore;
 use slatedb::{Db, DbTransaction, IsolationLevel};
 use tracing::{debug, instrument, warn};
@@ -27,7 +27,7 @@ use crate::payload_store::PayloadStore;
 use crate::reaper::{Reaper, reap_expired};
 use crate::scheduler::{Scheduler, promote_due_jobs};
 use crate::stats::{QueueMergeOperator, QueueStats, update_stats};
-use crate::txn::{put_job_record, take_claim};
+use crate::txn::{Commit, Durability, commit, put_job_record, take_claim};
 
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(30);
@@ -991,10 +991,9 @@ impl Queue {
                 }
             }
             txn.delete(&scoped)?;
-            match txn.commit().await {
-                Ok(_) => return Ok(true),
-                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
-                Err(e) => return Err(e.into()),
+            match commit(txn, Durability::Awaited).await? {
+                Commit::Committed => return Ok(true),
+                Commit::Conflict => continue,
             }
         }
     }
@@ -1048,10 +1047,9 @@ impl Queue {
                 return Ok(false);
             }
             txn.put(&scoped, value)?;
-            match txn.commit().await {
-                Ok(_) => return Ok(true),
-                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
-                Err(e) => return Err(e.into()),
+            match commit(txn, Durability::Awaited).await? {
+                Commit::Committed => return Ok(true),
+                Commit::Conflict => continue,
             }
         }
     }
@@ -1383,14 +1381,13 @@ impl Queue {
                 txn.put(user_scoped_key(k), v)?;
             }
 
-            match txn.commit().await {
-                Ok(_) => {
+            match commit(txn, Durability::Awaited).await? {
+                Commit::Committed => {
                     crate::obs::enqueued(&staged.queue, 1, timer);
                     self.note_staged_job(&staged);
                     return Ok(EnqueueResult::New(staged.id));
                 }
-                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
-                Err(e) => return Err(e.into()),
+                Commit::Conflict => continue,
             }
         }
     }
@@ -1772,12 +1769,8 @@ impl Queue {
             // the job pending, and a durable one is requeued at open,
             // the difference being only that the durable claim has
             // consumed an attempt.
-            let write_opts = WriteOptions {
-                await_durable: false,
-                ..WriteOptions::default()
-            };
-            match txn.commit_with_options(&write_opts).await {
-                Ok(_) => {
+            match commit(txn, Durability::Deferred).await? {
+                Commit::Committed => {
                     self.claim_cursor.advance(queue, last_pending_key, &scan);
                     if drained {
                         // The scan ran dry inside this snapshot, so
@@ -1794,11 +1787,10 @@ impl Queue {
                     debug!(queue = queue, count = jobs.len(), "jobs claimed");
                     return Ok(jobs);
                 }
-                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => {
+                Commit::Conflict => {
                     warn!(queue = queue, "claim transaction conflict, retrying");
                     continue;
                 }
-                Err(e) => return Err(e.into()),
             }
         }
     }
@@ -1892,15 +1884,14 @@ impl Queue {
 
                 let (results, staged) = self.stage_effects(&txn, &prepared).await?;
 
-                match txn.commit().await {
-                    Ok(_) => {
+                match commit(txn, Durability::Awaited).await? {
+                    Commit::Committed => {
                         for staged_job in &staged {
                             self.note_staged_job(staged_job);
                         }
                         return Ok(results);
                     }
-                    Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
-                    Err(e) => return Err(e.into()),
+                    Commit::Conflict => continue,
                 }
             }
         }
@@ -2061,8 +2052,8 @@ impl Queue {
                     None
                 };
 
-                match txn.commit().await {
-                    Ok(_) => {
+                match commit(txn, Durability::Awaited).await? {
+                    Commit::Committed => {
                         let results = staged.map(|(results, staged_jobs)| {
                             for staged_job in &staged_jobs {
                                 self.note_staged_job(staged_job);
@@ -2071,8 +2062,7 @@ impl Queue {
                         });
                         return Ok((job, results));
                     }
-                    Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
-                    Err(e) => return Err(e.into()),
+                    Commit::Conflict => continue,
                 }
             }
         }
@@ -2179,15 +2169,14 @@ impl Queue {
                     &[(JobStatus::Claimed, -1), (JobStatus::Dead, 1)],
                 )?;
                 let (results, staged) = self.stage_effects(&txn, &prepared).await?;
-                match txn.commit().await {
-                    Ok(_) => {
+                match commit(txn, Durability::Awaited).await? {
+                    Commit::Committed => {
                         for staged_job in &staged {
                             self.note_staged_job(staged_job);
                         }
                         return Ok((job, results));
                     }
-                    Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
-                    Err(e) => return Err(e.into()),
+                    Commit::Conflict => continue,
                 }
             }
         }
@@ -2604,8 +2593,8 @@ impl Queue {
                     }
                 };
 
-                match txn.commit().await {
-                    Ok(_) => {
+                match commit(txn, Durability::Awaited).await? {
+                    Commit::Committed => {
                         // Fired on the Removed path as well: the
                         // worker of a claim the reaper requeued just
                         // before this call may still observe the token.
@@ -2633,8 +2622,7 @@ impl Queue {
                         debug!(job_id = %id, "{msg}");
                         return Ok((outcome, results));
                     }
-                    Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
-                    Err(e) => return Err(e.into()),
+                    Commit::Conflict => continue,
                 }
             }
         }
@@ -2705,14 +2693,13 @@ impl Queue {
                 &[(JobStatus::Pending, 1), (JobStatus::Scheduled, -1)],
             )?;
 
-            match txn.commit().await {
-                Ok(_) => {
+            match commit(txn, Durability::Awaited).await? {
+                Commit::Committed => {
                     self.claim_cursor.note_pending_insert(&job.queue, &pending);
                     debug!(job_id = %id, queue = %job.queue, "scheduled job woken");
                     return Ok(WakeOutcome::Woken);
                 }
-                Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
-                Err(e) => return Err(e.into()),
+                Commit::Conflict => continue,
             }
         }
     }

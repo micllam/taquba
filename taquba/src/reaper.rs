@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use slatedb::config::WriteOptions;
 use slatedb::{Db, IsolationLevel};
 use tracing::{debug, warn};
 
@@ -22,7 +21,7 @@ use crate::lease_registry::{DueLease, LeaseRegistry};
 use crate::payload_store::PayloadStore;
 use crate::queue::QueueConfig;
 use crate::stats::update_stats;
-use crate::txn::put_job_record;
+use crate::txn::{Commit, Durability, commit, put_job_record, write_options};
 
 pub(crate) struct Reaper {
     pub(crate) db: Arc<Db>,
@@ -217,12 +216,8 @@ async fn reap_job(
         // the sweep at one job per flush interval, and a commit lost in
         // a crash is redone by the requeue of claimed records at the
         // next open.
-        let write_opts = WriteOptions {
-            await_durable: false,
-            ..WriteOptions::default()
-        };
-        match txn.commit_with_options(&write_opts).await {
-            Ok(_) => {
+        match commit(txn, Durability::Deferred).await? {
+            Commit::Committed => {
                 registry.remove(queue, id, token);
                 match end {
                     ClaimEnd::Requeued { pending_key } => {
@@ -249,8 +244,7 @@ async fn reap_job(
                 return Ok(());
             }
             // A settlement committed concurrently; retry against fresh state.
-            Err(e) if e.kind() == slatedb::ErrorKind::Transaction => continue,
-            Err(e) => return Err(e.into()),
+            Commit::Conflict => continue,
         }
     }
 }
@@ -379,11 +373,8 @@ pub(crate) async fn requeue_interrupted_claims(
         // requeue lost in a crash is redone by the next open from the
         // claimed record it left in place. Nothing else writes at open,
         // so a commit error surfaces to the caller and fails the open.
-        let write_opts = WriteOptions {
-            await_durable: false,
-            ..WriteOptions::default()
-        };
-        txn.commit_with_options(&write_opts).await?;
+        txn.commit_with_options(&write_options(Durability::Deferred))
+            .await?;
         if let ClaimEnd::Requeued { pending_key } = end {
             claim_cursor.note_pending_insert(&job.queue, &pending_key);
         }
@@ -530,14 +521,9 @@ async fn sweep_victim(
             update_stats(&txn, queue, &[(JobStatus::Dead, -1)])?;
         }
     }
-    let write_opts = WriteOptions {
-        await_durable: false,
-        ..WriteOptions::default()
-    };
-    match txn.commit_with_options(&write_opts).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == slatedb::ErrorKind::Transaction => return Ok(()),
-        Err(e) => return Err(e.into()),
+    match commit(txn, Durability::Deferred).await? {
+        Commit::Committed => {}
+        Commit::Conflict => return Ok(()),
     }
     if existed && let Some(payload_ref) = payload_ref {
         payload_store.delete_best_effort(payload_ref, id).await;
