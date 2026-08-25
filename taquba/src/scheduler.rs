@@ -84,10 +84,9 @@ async fn promote_job(
             Some(raw) => raw,
         };
 
-        let mut job: JobRecord = rmp_serde::from_slice(&raw)?;
+        let mut job = JobRecord::decode(scheduled_key_bytes, &raw)?;
         txn.delete(scheduled_key_bytes)?;
 
-        job.status = JobStatus::Pending;
         job.run_at = None;
         let priority = job.priority;
         let pending = pending_key(&job.queue, priority, &job.id);

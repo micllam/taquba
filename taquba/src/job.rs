@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use crate::keys::KeyTag;
+
 /// A single job stored in a Taquba queue.
 ///
 /// Returned by [`Queue::claim`](crate::Queue::claim),
@@ -43,7 +45,9 @@ pub struct JobRecord {
     /// empty.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
-    /// Current lifecycle state.
+    /// Current lifecycle state. Derived from the key space the record
+    /// is read from; the stored value carries no copy of it.
+    #[serde(skip, default = "JobStatus::initial")]
     pub status: JobStatus,
     /// How many delivery attempts have been started so far. Incremented on
     /// each [`Queue::claim`](crate::Queue::claim).
@@ -241,6 +245,20 @@ impl JobRecord {
         }
     }
 
+    /// Decode a record stored under `key`, taking its state from the
+    /// key space. A key outside the job-state key spaces is a decode
+    /// error.
+    pub(crate) fn decode(key: &[u8], bytes: &[u8]) -> crate::error::Result<JobRecord> {
+        let status = KeyTag::of(key)
+            .and_then(KeyTag::job_status)
+            .ok_or_else(|| {
+                rmp_serde::decode::Error::Syntax(format!("key {key:02x?} holds no job record"))
+            })?;
+        let mut job: JobRecord = rmp_serde::from_slice(bytes)?;
+        job.status = status;
+        Ok(job)
+    }
+
     /// Serialize the record in its stored form: when the payload is
     /// offloaded ([`Self::payload_ref`] is `Some`), the inline payload
     /// is excluded so state transitions never rewrite payload bytes.
@@ -291,6 +309,13 @@ fn is_false(v: &bool) -> bool {
     !*v
 }
 
+impl JobStatus {
+    /// The state of a record before [`JobRecord::decode`] sets it.
+    fn initial() -> JobStatus {
+        JobStatus::Pending
+    }
+}
+
 /// The lifecycle state of a [`JobRecord`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum JobStatus {
@@ -312,4 +337,30 @@ pub enum JobStatus {
     /// Inspected via [`Queue::dead_jobs`](crate::Queue::dead_jobs); revived
     /// via [`Queue::requeue_dead_job`](crate::Queue::requeue_dead_job).
     Dead,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::{dead_key, job_index_key, pending_key};
+
+    fn record() -> JobRecord {
+        JobRecord::new_pending("j".into(), "q".into(), b"p".to_vec(), 3, 0, 1)
+    }
+
+    #[test]
+    fn the_stored_value_carries_no_status() {
+        let bytes = record().stored_bytes().unwrap();
+        assert!(!bytes.windows(6).any(|w| w == b"status"));
+    }
+
+    #[test]
+    fn decode_takes_the_status_from_the_key() {
+        let bytes = record().stored_bytes().unwrap();
+        let dead = JobRecord::decode(&dead_key("q", "j"), &bytes).unwrap();
+        assert_eq!(dead.status, JobStatus::Dead);
+        let pending = JobRecord::decode(&pending_key("q", 0, "j"), &bytes).unwrap();
+        assert_eq!(pending.status, JobStatus::Pending);
+        assert!(JobRecord::decode(&job_index_key("j"), &bytes).is_err());
+    }
 }

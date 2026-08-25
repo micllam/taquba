@@ -1718,7 +1718,7 @@ impl Queue {
 
             let mut jobs = Vec::with_capacity(candidates.len());
             for kv in &candidates {
-                let mut job: JobRecord = rmp_serde::from_slice(&kv.value)?;
+                let mut job = JobRecord::decode(&kv.key, &kv.value)?;
                 job.status = JobStatus::Claimed;
                 job.claimed_at = Some(now);
                 job.attempts += 1;
@@ -1851,7 +1851,6 @@ impl Queue {
             // is retained with the done record and deleted by the
             // retention sweep.
             let mut done_job = job.stored_clone();
-            done_job.status = JobStatus::Done;
             done_job.completed_at = Some(completed_at);
             Some((
                 done_key(completed_at, &job.queue, &job.id),
@@ -2316,7 +2315,6 @@ impl Queue {
         }
         let dead = dead_key(&job.queue, &job.id);
         let priority = job.priority;
-        job.status = JobStatus::Pending;
         job.attempts = 0;
         job.last_error = None;
         job.claimed_at = None;
@@ -2482,7 +2480,7 @@ impl Queue {
             None => None,
             Some(current_key) => match txn.get(&current_key).await? {
                 None => None,
-                Some(bytes) => Some(rmp_serde::from_slice::<JobRecord>(&bytes)?),
+                Some(bytes) => Some(JobRecord::decode(&current_key, &bytes)?),
             },
         };
         txn.rollback();
@@ -2695,7 +2693,6 @@ impl Queue {
             }
 
             txn.delete(&current_key)?;
-            job.status = JobStatus::Pending;
             job.run_at = None;
             job.woken_at = Some(self.now_ms());
             job.wake_payload = wake_payload.clone();
@@ -2847,7 +2844,7 @@ async fn get_indexed_job(
     let Some(bytes) = txn.get(&current_key).await? else {
         return Ok(None);
     };
-    let job: JobRecord = rmp_serde::from_slice(&bytes)?;
+    let job = JobRecord::decode(&current_key, &bytes)?;
     Ok(Some((index_key, current_key, job)))
 }
 
@@ -9464,7 +9461,7 @@ mod tests {
                 .unwrap();
         let mut claims = 0;
         while let Some(kv) = iter.next().await.unwrap() {
-            let job: JobRecord = rmp_serde::from_slice(&kv.value).unwrap();
+            let job = JobRecord::decode(&kv.key, &kv.value).unwrap();
             assert!(
                 q.lease_registry.current(&job.queue, &job.id).is_some(),
                 "no lease entry for {}/{}",

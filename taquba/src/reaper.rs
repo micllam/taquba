@@ -203,7 +203,7 @@ async fn reap_job(
             return Ok(());
         };
 
-        let mut job: JobRecord = rmp_serde::from_slice(&raw)?;
+        let mut job = JobRecord::decode(&claimed_key_bytes, &raw)?;
         let end = stage_unsettled_claim_end(
             &txn,
             &mut job,
@@ -306,7 +306,6 @@ fn stage_unsettled_claim_end(
         );
         Ok(ClaimEnd::DeadLettered)
     } else {
-        job.status = JobStatus::Pending;
         job.claimed_at = None;
         let pending = pending_key(&job.queue, job.priority, &job.id);
         let value = rmp_serde::to_vec_named(&job)?;
@@ -357,7 +356,7 @@ pub(crate) async fn requeue_interrupted_claims(
     let mut interrupted: Vec<JobRecord> = Vec::new();
     let mut iter = db.scan_prefix(tag_prefix(KeyTag::Claimed), ..).await?;
     while let Some(kv) = iter.next().await? {
-        match rmp_serde::from_slice::<JobRecord>(&kv.value) {
+        match JobRecord::decode(&kv.key, &kv.value) {
             Ok(job) => interrupted.push(job),
             // Re-queueing needs the record; the key is left in place
             // for later inspection.
@@ -426,7 +425,7 @@ async fn sweep_done(
             }
         }
 
-        let job: JobRecord = match rmp_serde::from_slice(&kv.value) {
+        let job = match JobRecord::decode(&kv.key, &kv.value) {
             Ok(j) => j,
             Err(_) => continue,
         };
@@ -464,7 +463,7 @@ async fn sweep_dead(
     let mut victims: Vec<(Vec<u8>, String, String, Option<String>)> = Vec::new();
     let mut iter = db.scan_prefix(tag_prefix(KeyTag::Dead), ..).await?;
     while let Some(kv) = iter.next().await? {
-        let job: JobRecord = match rmp_serde::from_slice(&kv.value) {
+        let job = match JobRecord::decode(&kv.key, &kv.value) {
             Ok(j) => j,
             Err(_) => continue,
         };

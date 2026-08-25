@@ -57,7 +57,7 @@ pub(crate) async fn take_claim(
     let Some(raw) = txn.get(&key).await? else {
         return Err(Error::ClaimLost);
     };
-    let job: JobRecord = rmp_serde::from_slice(&raw)?;
+    let job = JobRecord::decode(&key, &raw)?;
     txn.delete(&key)?;
     Ok(job)
 }

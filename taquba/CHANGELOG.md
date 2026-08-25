@@ -51,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (storage):** `JobRecord::status` is no longer part of the
+  stored record value; it is derived from the key space a record is
+  read from, which was already the authoritative state.
 - **Breaking:** `WaitOutcome` names the terminal transition instead of
   wrapping an optional record: `Completed(Option<Box<JobRecord>>)` is
   replaced by `Done(Box<JobRecord>)` (acknowledged),

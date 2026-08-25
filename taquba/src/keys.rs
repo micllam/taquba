@@ -28,6 +28,8 @@
 //! User KV keys are `[KeyTag::User, caller bytes]` with no version
 //! byte: caller bytes are opaque data, not a schema this module owns.
 
+use crate::job::JobStatus;
+
 /// Maximum byte length of a queue name, imposed by the one-byte length
 /// field in key encodings.
 pub const MAX_QUEUE_NAME_LEN: usize = 255;
@@ -39,6 +41,7 @@ pub(crate) const KEY_VERSION: u8 = 1;
 /// Key-space discriminator: the first byte of every stored key.
 /// `0x00` is reserved as invalid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(strum::EnumIter))]
 #[repr(u8)]
 pub(crate) enum KeyTag {
     /// `[tag, ver, qlen, queue, priority u32 BE, id]`
@@ -81,6 +84,44 @@ impl KeyTag {
     /// The tag byte value.
     pub(crate) fn id(self) -> u8 {
         self as u8
+    }
+
+    /// The tag of `key`, or `None` when its first byte is not a tag.
+    pub(crate) fn of(key: &[u8]) -> Option<KeyTag> {
+        Some(match key.first()? {
+            0x01 => KeyTag::Pending,
+            0x02 => KeyTag::Claimed,
+            0x03 => KeyTag::Scheduled,
+            0x04 => KeyTag::Done,
+            0x05 => KeyTag::Dead,
+            0x06 => KeyTag::JobIndex,
+            0x07 => KeyTag::Dedup,
+            0x08 => KeyTag::Cursor,
+            0x09 => KeyTag::Stats,
+            0x0A => KeyTag::AttemptHistory,
+            0x0B => KeyTag::Heartbeat,
+            0xFF => KeyTag::User,
+            _ => return None,
+        })
+    }
+
+    /// The state of a job record stored under this tag, or `None` for
+    /// a key space that holds no job records.
+    pub(crate) fn job_status(self) -> Option<JobStatus> {
+        match self {
+            KeyTag::Pending => Some(JobStatus::Pending),
+            KeyTag::Claimed => Some(JobStatus::Claimed),
+            KeyTag::Scheduled => Some(JobStatus::Scheduled),
+            KeyTag::Done => Some(JobStatus::Done),
+            KeyTag::Dead => Some(JobStatus::Dead),
+            KeyTag::JobIndex
+            | KeyTag::Dedup
+            | KeyTag::Cursor
+            | KeyTag::Stats
+            | KeyTag::AttemptHistory
+            | KeyTag::Heartbeat
+            | KeyTag::User => None,
+        }
     }
 }
 
@@ -244,6 +285,8 @@ pub(crate) fn parse_stats_key(key: &[u8]) -> Option<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    use strum::IntoEnumIterator;
+
     use super::*;
 
     #[test]
@@ -300,6 +343,15 @@ mod tests {
             parse_stats_key(&key),
             Some(("email".to_string(), "pending".to_string()))
         );
+    }
+
+    #[test]
+    fn every_tag_is_recovered_from_its_byte() {
+        for tag in KeyTag::iter() {
+            assert_eq!(KeyTag::of(&[tag.id(), 0]), Some(tag));
+        }
+        assert_eq!(KeyTag::of(&[0x00]), None);
+        assert_eq!(KeyTag::of(&[]), None);
     }
 
     #[test]

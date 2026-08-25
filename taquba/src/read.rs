@@ -169,7 +169,7 @@ pub(crate) async fn list_jobs<H: ReadHandle>(
     let mut more = false;
     let mut iter = handle.scan_prefix(prefix, start).await?;
     while let Some(kv) = iter.next().await? {
-        let job: JobRecord = rmp_serde::from_slice(&kv.value)?;
+        let job = JobRecord::decode(&kv.key, &kv.value)?;
         if filter_queue && job.queue != queue {
             continue;
         }
@@ -253,7 +253,7 @@ pub(crate) async fn get_job<H: ReadHandle>(
     let Some(bytes) = handle.get(&current_key).await? else {
         return Ok(None);
     };
-    let mut job: JobRecord = rmp_serde::from_slice(&bytes)?;
+    let mut job = JobRecord::decode(&current_key, &bytes)?;
     materialize_payload(payloads, &mut job).await?;
     Ok(Some(job))
 }

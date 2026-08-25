@@ -50,7 +50,7 @@ async fn sample(db: &Db, clock: &dyn Clock) -> Result<()> {
         let mut iter = db.scan_prefix(pending_prefix(&queue), ..).await?;
         let age_secs = match iter.next().await? {
             Some(kv) => {
-                let job: JobRecord = rmp_serde::from_slice(&kv.value)?;
+                let job = JobRecord::decode(&kv.key, &kv.value)?;
                 now.saturating_sub(job.enqueued_at) as f64 / 1000.0
             }
             None => 0.0,

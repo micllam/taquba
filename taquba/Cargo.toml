@@ -52,4 +52,5 @@ futures-core = "0.3"
 # Used only by `examples/admin_http.rs`.
 axum = "0.8"
 serde_json = "1"
+strum = { version = "0.28.0", features = ["derive"] }
 
