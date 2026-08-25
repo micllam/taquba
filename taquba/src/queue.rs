@@ -1508,34 +1508,26 @@ impl Queue {
         lease_duration: Duration,
         max_wait: Duration,
     ) -> Result<Option<Claim>> {
-        let wakeup = self.claim_cursor.wakeup_for(queue);
         let deadline = tokio::time::Instant::now() + max_wait;
         loop {
-            // Subscribe to the wakeup *before* the claim attempt so an
-            // insert landing between the empty scan and the wait is not
-            // missed: its `notify_one` either wakes this registered
-            // waiter or leaves a permit that `enable` consumes.
-            let notified = wakeup.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
             if let Some(job) = self.claim(queue, lease_duration).await? {
-                // Pass the wakeup on: this call may have consumed a
+                // Pass the wakeup on: the wait below may have consumed a
                 // permit another waiter needs, and when a backlog
                 // remains each delivered job should wake one more
                 // worker.
-                wakeup.notify_one();
+                self.claim_cursor.wakeup_for(queue).notify_one();
                 return Ok(Some(job));
             }
-            tokio::select! {
-                _ = &mut notified => {}
-                _ = tokio::time::sleep_until(deadline) => return Ok(None),
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
             }
-            // Woken: a job landed on this queue, but another worker may
-            // take it first; loop to claim, and if the queue is empty
-            // again keep waiting out the remaining deadline. A stale
-            // permit (a passed-on wakeup that found no backlog) costs
-            // one extra pass before waiting again.
+            // An insert between the empty scan and this wait leaves a
+            // permit that the wait consumes, so no insert is missed.
+            // A wake does not reserve the job: another worker may claim
+            // it first, in which case the loop waits out the remaining
+            // time. A stale permit costs one extra pass.
+            self.wait_for_jobs_on(queue, deadline - now).await;
         }
     }
 
