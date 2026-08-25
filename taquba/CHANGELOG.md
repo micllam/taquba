@@ -76,11 +76,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and as `LeaseHandle::cancel_token` inside `Worker::process`, both
   non-optional. The token of a `LeaseHandle::detached` handle is never
   fired.
+- Metrics: `Queue::renew_lease` increments
+  `taquba_lease_renewals_total{queue}` only when the call changes the
+  expiry; a renewal to the current expiry is not counted, matching
+  `LeaseHandle::ensure_at_least`.
 
 ### Fixed
 
-- A nack that exhausts the job's attempts clears `claimed_at` on the
-  dead record, as `dead_letter` does.
+- A nack that exhausts the job's attempts, and the reaper's dead-letter
+  of an expired lease, clear `claimed_at` on the dead record, as
+  `dead_letter` does.
+- `enqueue_batch` retries its transaction on a commit conflict, as
+  every other writing call does; it previously reported the conflict
+  as `Error::Storage`.
 - A job re-claimed between a settlement's commit and its cleanup lost
   its cancellation token, so a later `Queue::cancel` persisted the
   request without firing it and the worker observed the cancellation
