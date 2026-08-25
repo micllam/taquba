@@ -18,90 +18,86 @@ impl Scheduler {
     pub(crate) fn new(core: Arc<QueueCore>) -> Self {
         Self { core }
     }
-
-    /// Move every job whose `run_at` has passed from the scheduled key
-    /// space into the pending key space.
-    pub(crate) async fn promote_due_jobs(&self) -> Result<()> {
-        promote_due_jobs(&self.core).await
-    }
 }
 
 impl Periodic for Scheduler {
     const NAME: &'static str = "scheduled job promoter";
 
     async fn step(&self) -> Result<()> {
-        self.promote_due_jobs().await
+        self.core.promote_due_jobs().await
     }
 }
 
-/// Scan the scheduled key space and move any job whose `run_at` has passed
-/// into the pending key space so workers can claim it.
-async fn promote_due_jobs(core: &QueueCore) -> Result<()> {
-    let now = core.now_ms();
-    let mut due_keys = Vec::new();
+impl QueueCore {
+    /// Scan the scheduled key space and move any job whose `run_at` has passed
+    /// into the pending key space so workers can claim it.
+    pub(crate) async fn promote_due_jobs(&self) -> Result<()> {
+        let now = self.now_ms();
+        let mut due_keys = Vec::new();
 
-    let mut iter = core
-        .db
-        .scan_prefix(tag_prefix(KeyTag::Scheduled), ..)
-        .await?;
-    while let Some(kv) = iter.next().await? {
-        // Scheduled keys lead with `run_at`, so the scan is sorted globally
-        // by it and the first key with a timestamp in the future ends the
-        // scan.
-        let Some(run_at) = parse_key_timestamp(&kv.key, KeyTag::Scheduled) else {
-            continue;
-        };
-        if run_at > now {
-            break;
+        let mut iter = self
+            .db
+            .scan_prefix(tag_prefix(KeyTag::Scheduled), ..)
+            .await?;
+        while let Some(kv) = iter.next().await? {
+            // Scheduled keys lead with `run_at`, so the scan is sorted globally
+            // by it and the first key with a timestamp in the future ends the
+            // scan.
+            let Some(run_at) = parse_key_timestamp(&kv.key, KeyTag::Scheduled) else {
+                continue;
+            };
+            if run_at > now {
+                break;
+            }
+            due_keys.push(kv.key.clone());
         }
-        due_keys.push(kv.key.clone());
+        drop(iter);
+
+        for key_bytes in due_keys {
+            self.promote_job(&key_bytes).await?;
+        }
+
+        Ok(())
     }
-    drop(iter);
 
-    for key_bytes in due_keys {
-        promote_job(core, &key_bytes).await?;
-    }
+    async fn promote_job(&self, scheduled_key_bytes: &[u8]) -> Result<()> {
+        loop {
+            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
 
-    Ok(())
-}
+            let raw = match txn.get(scheduled_key_bytes).await? {
+                // Already promoted by a concurrent call; nothing to do.
+                None => {
+                    txn.rollback();
+                    return Ok(());
+                }
+                Some(raw) => raw,
+            };
 
-async fn promote_job(core: &QueueCore, scheduled_key_bytes: &[u8]) -> Result<()> {
-    loop {
-        let txn = core.db.begin(IsolationLevel::Snapshot).await?;
+            let mut job = JobRecord::decode(scheduled_key_bytes, &raw)?;
+            txn.delete(scheduled_key_bytes)?;
 
-        let raw = match txn.get(scheduled_key_bytes).await? {
-            // Already promoted by a concurrent call; nothing to do.
-            None => {
-                txn.rollback();
-                return Ok(());
+            let pending = stage_to_pending(&txn, &mut job, JobStatus::Scheduled)?;
+
+            // Promotion commits do not await WAL durability. Each due job
+            // is promoted in its own transaction, so awaiting the flush
+            // serialises the sweep at one job per flush interval. A commit
+            // lost in a crash leaves the scheduled key in place with its
+            // `run_at` still in the past, and the next tick re-promotes
+            // it: the rewrite is idempotent. Any later durable commit
+            // flushes preceding WAL entries, so a job's post-promotion
+            // history is never durable without the promotion itself.
+            match commit(txn, Durability::Deferred).await? {
+                Commit::Committed => {
+                    self.claim_cursor.note_pending_insert(&job.queue, &pending);
+                    debug!(
+                        queue = %job.queue,
+                        job_id = %job.id,
+                        "scheduled job promoted to pending"
+                    );
+                    return Ok(());
+                }
+                Commit::Conflict => continue,
             }
-            Some(raw) => raw,
-        };
-
-        let mut job = JobRecord::decode(scheduled_key_bytes, &raw)?;
-        txn.delete(scheduled_key_bytes)?;
-
-        let pending = stage_to_pending(&txn, &mut job, JobStatus::Scheduled)?;
-
-        // Promotion commits do not await WAL durability. Each due job
-        // is promoted in its own transaction, so awaiting the flush
-        // serialises the sweep at one job per flush interval. A commit
-        // lost in a crash leaves the scheduled key in place with its
-        // `run_at` still in the past, and the next tick re-promotes
-        // it: the rewrite is idempotent. Any later durable commit
-        // flushes preceding WAL entries, so a job's post-promotion
-        // history is never durable without the promotion itself.
-        match commit(txn, Durability::Deferred).await? {
-            Commit::Committed => {
-                core.claim_cursor.note_pending_insert(&job.queue, &pending);
-                debug!(
-                    queue = %job.queue,
-                    job_id = %job.id,
-                    "scheduled job promoted to pending"
-                );
-                return Ok(());
-            }
-            Commit::Conflict => continue,
         }
     }
 }

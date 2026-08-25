@@ -758,9 +758,7 @@ impl SettlementEffects {
 /// shared across processes.
 pub struct Queue {
     pub(crate) core: Arc<QueueCore>,
-    reaper: Arc<Reaper>,
     reaper_task: BackgroundTask,
-    scheduler: Arc<Scheduler>,
     scheduler_task: BackgroundTask,
     /// `Some` only when built with the `metrics` feature and
     /// `OpenOptions::metrics_sample_interval` was set.
@@ -865,12 +863,11 @@ impl Queue {
         // re-queued immediately. Runs after `restore_cursor_state` so
         // each re-queued job's pending insert is recorded against the
         // restored bound.
-        crate::reaper::requeue_interrupted_claims(&core).await?;
-        let reaper = Arc::new(Reaper::new(core.clone()));
-        let reaper_task = BackgroundTask::spawn_periodic(opts.reaper_interval, reaper.clone());
-        let scheduler = Arc::new(Scheduler::new(core.clone()));
+        core.requeue_interrupted_claims().await?;
+        let reaper_task =
+            BackgroundTask::spawn_periodic(opts.reaper_interval, Reaper::new(core.clone()));
         let scheduler_task =
-            BackgroundTask::spawn_periodic(opts.scheduler_interval, scheduler.clone());
+            BackgroundTask::spawn_periodic(opts.scheduler_interval, Scheduler::new(core.clone()));
 
         #[cfg(feature = "metrics")]
         let metrics_sampler = opts.metrics_sample_interval.map(|interval| {
@@ -890,9 +887,7 @@ impl Queue {
 
         Ok(Self {
             core,
-            reaper,
             reaper_task,
-            scheduler,
             scheduler_task,
             metrics_sampler,
             heartbeat,
@@ -2366,12 +2361,12 @@ impl Queue {
 
     /// Trigger an immediate reap sweep (primarily useful in tests and tooling).
     pub async fn reap_now(&self) -> Result<()> {
-        self.reaper.reap_expired().await
+        self.core.reap_expired().await
     }
 
     /// Trigger an immediate scheduled-job promotion sweep (primarily useful in tests).
     pub async fn promote_scheduled_now(&self) -> Result<()> {
-        self.scheduler.promote_due_jobs().await
+        self.core.promote_due_jobs().await
     }
 
     /// Shut down the background reaper and scheduler, persist each
