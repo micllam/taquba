@@ -830,8 +830,8 @@ impl Queue {
         payload: Vec<u8>,
         opts: EnqueueOptions,
     ) -> Result<String> {
-        let (job, key, id_override_used) = self.prepare_job_record(queue, payload, opts)?;
-        self.write_job(job, key, id_override_used, HashMap::new())
+        let prepared = self.prepare_job_record(queue, payload, opts)?;
+        self.write_job(prepared, HashMap::new())
             .await
             .map(EnqueueResult::into_id)
     }
@@ -888,8 +888,8 @@ impl Queue {
             validate_kv_value_size(value)?;
         }
 
-        let (job, key, id_override_used) = self.prepare_job_record(queue, payload, opts)?;
-        self.write_job(job, key, id_override_used, kv_writes).await
+        let prepared = self.prepare_job_record(queue, payload, opts)?;
+        self.write_job(prepared, kv_writes).await
     }
 
     /// Read a value from the user KV namespace.
@@ -1040,15 +1040,15 @@ impl Queue {
     }
 
     /// Resolve [`EnqueueOptions`] against the queue's defaults and build
-    /// the [`JobRecord`] + its primary key. Shared by [`Self::enqueue_with`]
-    /// and [`Self::enqueue_with_kv`]; the two methods only diverge in how
-    /// they persist the prepared record.
+    /// the [`JobRecord`] + its primary key. Shared by every path that
+    /// writes a new record; the paths diverge only in how they persist
+    /// the prepared record.
     fn prepare_job_record(
         &self,
         queue: &str,
         payload: Vec<u8>,
         opts: EnqueueOptions,
-    ) -> Result<(JobRecord, Vec<u8>, bool)> {
+    ) -> Result<PreparedJob> {
         validate_queue_name(queue)?;
         let cfg = self.queue_config(queue);
         let max_attempts = opts.max_attempts.unwrap_or(cfg.max_attempts);
@@ -1089,7 +1089,29 @@ impl Queue {
         job.run_at = run_at;
         job.dedup_key = opts.dedup_key;
 
-        Ok((job, key, id_override_used))
+        Ok(PreparedJob {
+            job,
+            key,
+            id_override_used,
+        })
+    }
+
+    /// Offload the oversized payloads of `prepared`, in order, before
+    /// the transaction that writes their records. On a failure no
+    /// object written here is left behind.
+    async fn offload_prepared(&self, prepared: &mut [PreparedJob]) -> Result<()> {
+        self.core
+            .payload_store
+            .offload_all(prepared.iter_mut().map(|p| &mut p.job))
+            .await
+    }
+
+    /// Delete the payload objects of prepared jobs whose records will
+    /// not be written.
+    async fn discard_prepared(&self, prepared: &[PreparedJob]) {
+        for prepared_job in prepared {
+            self.core.payload_store.delete_for(&prepared_job.job).await;
+        }
     }
 
     /// Fetch the offloaded payloads of `jobs` concurrently, bounding a
@@ -1122,11 +1144,7 @@ impl Queue {
                     }
                 }
             }
-            None => {
-                for prepared in &prepared.prepared_jobs {
-                    self.core.payload_store.delete_for(&prepared.job).await;
-                }
-            }
+            None => self.discard_prepared(&prepared.prepared_jobs).await,
         }
     }
 
@@ -1148,20 +1166,12 @@ impl Queue {
         {
             return Err(Error::ConflictingKvEffect { key: key.clone() });
         }
-        let mut prepared_jobs = Vec::with_capacity(effects.enqueues.len());
-        for request in effects.enqueues {
-            let (job, key, id_override_used) =
-                self.prepare_job_record(&request.queue, request.payload, request.options)?;
-            prepared_jobs.push(PreparedJob {
-                job,
-                key,
-                id_override_used,
-            });
-        }
-        self.core
-            .payload_store
-            .offload_all(prepared_jobs.iter_mut().map(|p| &mut p.job))
-            .await?;
+        let mut prepared_jobs = effects
+            .enqueues
+            .into_iter()
+            .map(|r| self.prepare_job_record(&r.queue, r.payload, r.options))
+            .collect::<Result<Vec<_>>>()?;
+        self.offload_prepared(&mut prepared_jobs).await?;
         Ok(PreparedEffects {
             prepared_jobs,
             kv_writes: effects.kv_writes,
@@ -1226,17 +1236,10 @@ impl Queue {
     /// [`EnqueueResult::New`].
     async fn write_job(
         &self,
-        mut job: JobRecord,
-        key: Vec<u8>,
-        id_override_used: bool,
+        mut prepared: PreparedJob,
         kv_writes: HashMap<Vec<u8>, Vec<u8>>,
     ) -> Result<EnqueueResult> {
-        self.core.payload_store.offload(&mut job).await?;
-        let prepared = PreparedJob {
-            job,
-            key,
-            id_override_used,
-        };
+        self.core.payload_store.offload(&mut prepared.job).await?;
         let result = self.write_job_txn(&prepared, &kv_writes).await;
         // A payload object is live only when a new record committed;
         // on a dedup downgrade or an error the record does not exist,
@@ -2534,20 +2537,11 @@ impl Queue {
         }
         let timer = crate::obs::start();
 
-        let mut prepared = Vec::with_capacity(payloads.len());
-        for payload in payloads {
-            let (job, key, id_override_used) =
-                self.prepare_job_record(queue, payload, EnqueueOptions::default())?;
-            prepared.push(PreparedJob {
-                job,
-                key,
-                id_override_used,
-            });
-        }
-        self.core
-            .payload_store
-            .offload_all(prepared.iter_mut().map(|p| &mut p.job))
-            .await?;
+        let mut prepared = payloads
+            .into_iter()
+            .map(|payload| self.prepare_job_record(queue, payload, EnqueueOptions::default()))
+            .collect::<Result<Vec<_>>>()?;
+        self.offload_prepared(&mut prepared).await?;
 
         let write = async {
             loop {
@@ -2569,9 +2563,7 @@ impl Queue {
         let staged = match write.await {
             Ok(staged) => staged,
             Err(err) => {
-                for prepared_job in &prepared {
-                    self.core.payload_store.delete_for(&prepared_job.job).await;
-                }
+                self.discard_prepared(&prepared).await;
                 return Err(err);
             }
         };
