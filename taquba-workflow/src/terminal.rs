@@ -95,8 +95,10 @@ pub struct RunOutcome {
 ///
 /// Runs terminated without an acknowledging settlement (an external
 /// cancellation of a pending step, a step that dead-letters) enqueue
-/// the notification job on its own after the terminal transition
-/// commits, so a crash between the two can lose or duplicate that
+/// the notification job in the transaction of that transition, so it
+/// is created exactly once on every worker and cancellation path. A
+/// step the reaper dead-letters after its lease expires, or one
+/// dead-lettered during crash recovery at open, produces no
 /// notification.
 pub trait TerminalHook: Send + Sync {
     /// Process the termination of one run. `outcome` is the committed
