@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Per-schedule options
 
 `schedule_with` accepts a `ScheduleOptions` for per-schedule overrides
-(HTTP-style headers, priority, max attempts):
+(HTTP-style headers, priority, max attempts, backfill):
 
 ```rust
 use std::collections::HashMap;
@@ -58,6 +58,46 @@ let opts = ScheduleOptions {
     ..Default::default()
 };
 ```
+
+Every enqueued job carries the header `cron.fire_ms` (`FIRE_MS_HEADER`),
+which stores the firing time as milliseconds since the Unix epoch, so a
+worker can identify the window a job covers. Header names with the `cron.`
+prefix are reserved; a schedule that supplies one is rejected.
+
+## Backfill
+
+By default a firing missed while the scheduler is not running is dropped.
+A schedule that opts in with `ScheduleOptions::backfill` replays missed
+firings instead: the scheduler persists the time of the last enqueued
+firing in the queue's KV namespace under `watermark_key(name)`
+(`cron/watermark/{name}`), and on start enqueues one job per occurrence
+between that watermark and the current time, oldest first, before resuming
+live firings. `Backfill::lookback` bounds the replay: occurrences older
+than the lookback are skipped.
+
+```rust
+use std::time::Duration;
+use taquba_cron::{Backfill, ScheduleOptions};
+
+let opts = ScheduleOptions {
+    backfill: Some(Backfill {
+        lookback: Duration::from_secs(6 * 60 * 60),
+    }),
+    ..Default::default()
+};
+```
+
+The watermark is written in the same transaction as the enqueue, so a
+crash between the two cannot occur, and it advances only when a firing is
+enqueued: an enqueue error under backfill holds the schedule at the failed
+firing and retries it. A schedule without a watermark (the first run after
+opting in) starts at the current time and replays nothing. The watermark
+records a position in the occurrence sequence rather than the schedule itself;
+after an expression change the missed occurrences of the new expression
+since the watermark are replayed. The watermark of a schedule that is no
+longer registered is left in place; remove it with
+`CronScheduler::clear_watermark`. Keys under the `cron/` prefix of the KV
+namespace are reserved for this crate.
 
 ## Cron syntax
 
@@ -73,7 +113,8 @@ Expressions are 5-field POSIX cron, parsed by [`croner`](https://crates.io/crate
 * * * * *
 ```
 
-All firing times are evaluated in UTC.
+All firing times are evaluated in UTC, against the clock the queue was
+opened with (`Queue::clock`).
 
 ## Guarantees
 
@@ -81,13 +122,18 @@ All firing times are evaluated in UTC.
   with a deterministic `dedup_key` of `"cron:{name}:{fire_time_ms}"`, so
   retries or duplicate attempts at the same firing instant cannot produce
   more than one job.
-- **No backfill.** If the scheduler is offline when a firing should have
-  happened, the missed firing is dropped; the next firing is the next
-  future occurrence, not a replay of the missed window.
+- **No backfill by default.** If the scheduler is offline when a firing
+  should have happened, the missed firing is dropped; the next firing is
+  the next future occurrence rather than a replay of the missed ones. A
+  schedule with `ScheduleOptions::backfill` set replays the missed firings
+  within its lookback exactly once, on the strength of the persisted
+  watermark rather than the dedup key, which is released when the job
+  completes.
 - **Single-instance schedules.** A given schedule (identified by `name`)
   must be owned by at most one `CronScheduler` at a time.
-- **No persistence.** Schedules live only in memory; rebuild them in
-  code on startup. The *enqueued jobs* are durable via Taquba.
+- **No schedule persistence.** Schedules live only in memory; rebuild
+  them in code on startup. The *enqueued jobs* are durable via Taquba, as
+  is the backfill watermark.
 
 ## License
 

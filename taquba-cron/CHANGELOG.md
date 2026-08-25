@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in backfill: `ScheduleOptions::backfill` takes a `Backfill` policy
+  under which firings missed while the scheduler was not running are
+  replayed, one deduplicated job per occurrence, oldest first. The last
+  enqueued firing time is persisted in the queue's KV namespace under
+  `watermark_key(name)` (`cron/watermark/{name}`), written in the enqueue
+  transaction; `Backfill::lookback` bounds the replay and
+  `CronScheduler::clear_watermark` removes a watermark. An enqueue error
+  under backfill holds the firing for retry instead of dropping it. Keys
+  under the `cron/` prefix of the KV namespace are now reserved.
+
+### Changed
+
+- Every enqueued job carries the header `cron.fire_ms` (`FIRE_MS_HEADER`)
+  which stores its firing time as milliseconds since the Unix epoch.
+  Header names with the `cron.` prefix (`RESERVED_HEADER_PREFIX`) are
+  reserved: `schedule_with` rejects a schedule that supplies one with the
+  new `Error::ReservedHeader`.
+- The scheduler reads the current time from the clock the queue was
+  opened with (`Queue::clock`) instead of the system clock, so firings
+  and the queue's own timestamps agree under a `MockClock`.
+
 ## [0.7.0] - 2026-08-12
 
 ### Changed
