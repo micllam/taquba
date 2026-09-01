@@ -390,6 +390,7 @@ mod error;
 mod history;
 mod job;
 mod keys;
+mod kv;
 mod lease;
 mod lease_registry;
 mod liveness;
@@ -419,6 +420,7 @@ pub use error::{Error, Result};
 pub use history::{AttemptOutcome, JobAttempt};
 pub use job::{Claim, JobRecord, JobStatus};
 pub use keys::MAX_QUEUE_NAME_LEN;
+pub use kv::{KvPage, MAX_KV_VALUE_SIZE};
 pub use lease::LeaseHandle;
 pub use liveness::{StoreActivity, WriterHeartbeat};
 pub use options::{
@@ -426,8 +428,7 @@ pub use options::{
     PRIORITY_NORMAL, QueueConfig,
 };
 pub use queue::{
-    CancelOutcome, EnqueueResult, JobPage, KvPage, MAX_KV_VALUE_SIZE, NackOutcome, Queue,
-    WaitOutcome, WakeOutcome,
+    CancelOutcome, EnqueueResult, JobPage, NackOutcome, Queue, WaitOutcome, WakeOutcome,
 };
 pub use reader::{QueueReader, ReaderMode, ReaderOptions};
 pub use stats::QueueStats;

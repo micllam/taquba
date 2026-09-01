@@ -18,9 +18,10 @@ use crate::keys::{
     KeyTag, attempt_history_key, claimed_prefix, dead_key, dead_prefix, heartbeat_key,
     job_index_key, parse_stats_key, pending_prefix, stats_key, tag_prefix, user_scoped_key,
 };
+use crate::kv::KvPage;
 use crate::liveness::{HeartbeatRecord, WriterHeartbeat};
 use crate::payload_store::PayloadStore;
-use crate::queue::{JobPage, KvPage, validate_queue_name};
+use crate::queue::{JobPage, validate_queue_name};
 use crate::stats::{QueueStats, metric_name};
 
 /// Uniform point-read and prefix-scan access to a store, implemented by

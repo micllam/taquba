@@ -21,9 +21,10 @@ use slatedb::{DbReader, DbReaderMode};
 use crate::error::{Error, Result};
 use crate::history::JobAttempt;
 use crate::job::{JobRecord, JobStatus};
+use crate::kv::KvPage;
 use crate::liveness::{StoreActivity, WriterHeartbeat};
 use crate::payload_store::PayloadStore;
-use crate::queue::{JobPage, KvPage};
+use crate::queue::JobPage;
 use crate::stats::{QueueMergeOperator, QueueStats};
 
 /// How a [`QueueReader`] follows the writer's state.

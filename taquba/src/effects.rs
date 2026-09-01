@@ -12,10 +12,9 @@ use ulid::Ulid;
 use crate::error::{Error, Result};
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{dedup_index_key, job_index_key, pending_key, scheduled_key, user_scoped_key};
+use crate::kv::validate_kv_value_size;
 use crate::options::EnqueueOptions;
-use crate::queue::{
-    EnqueueResult, validate_id_override, validate_kv_value_size, validate_queue_name,
-};
+use crate::queue::{EnqueueResult, validate_id_override, validate_queue_name};
 use crate::queue_core::QueueCore;
 use crate::stats::update_stats;
 use crate::txn::put_job_record;
