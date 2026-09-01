@@ -13,14 +13,12 @@ use tracing::warn;
 
 use crate::error::Result;
 use crate::keys::{TERMINAL_KV_PREFIX, parse_terminal_kv_key, validate_run_id};
-use crate::runner::StepRunner;
-use crate::runtime::RuntimeInner;
-use crate::terminal::TerminalHook;
+use crate::runtime::RuntimeCore;
 
 /// Terminal markers read per page by the memo-retention sweep.
 const SWEEP_PAGE_SIZE: usize = 256;
 
-impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
+impl RuntimeCore {
     /// Memo-retention sweep loop. Runs only when
     /// [`WorkflowRuntimeBuilder::memo_retention`] was set; the first
     /// tick fires immediately so a fresh runtime catches markers left

@@ -21,7 +21,7 @@ use crate::keys::{
     signal_wait_kv_key,
 };
 use crate::runner::StepRunner;
-use crate::runtime::{RuntimeInner, StepEnqueueOpts, WorkflowRuntime};
+use crate::runtime::{RuntimeCore, RuntimeInner, StepEnqueueOpts, WorkflowRuntime};
 use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
 
 /// Outcome of [`WorkflowRuntime::signal`].
@@ -62,7 +62,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// registration is settling concurrently falls back to the buffer and
     /// reaches it no later than its timeout.
     pub async fn signal(&self, correlation_key: &str, payload: Vec<u8>) -> Result<SignalOutcome> {
-        let queue = &self.inner.queue;
+        let queue = &self.inner.core.queue;
         let buf_key = signal_buf_kv_key(correlation_key);
         // Buffer first, durably: a waiter registering concurrently reads
         // the buffer at its settlement, so the signal is never lost even
@@ -102,7 +102,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// Discard the buffered signal for `correlation_key`, if one exists.
     /// Returns `true` when a buffered signal was removed.
     pub async fn clear_signal(&self, correlation_key: &str) -> Result<bool> {
-        let queue = &self.inner.queue;
+        let queue = &self.inner.core.queue;
         let buf_key = signal_buf_kv_key(correlation_key);
         loop {
             let Some(current) = queue.kv_get(&buf_key).await? else {
@@ -140,10 +140,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         // live waiter holds the key. The check reads current state; a
         // stale index entry (its job no longer scheduled) is overwritten.
         // The rejection terminates the run like any permanent step error.
-        match self.queue.kv_get(&wait_key).await {
+        match self.core.queue.kv_get(&wait_key).await {
             Ok(Some(existing)) => {
                 if let Ok(existing_id) = std::str::from_utf8(&existing)
-                    && let Ok(Some(job)) = self.queue.get_job(existing_id).await
+                    && let Ok(Some(job)) = self.core.queue.get_job(existing_id).await
                     && job.status == JobStatus::Scheduled
                 {
                     let message = format!(
@@ -161,7 +161,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                         base_opts.priority,
                         None,
                     );
-                    self.forget_run(run_id);
+                    self.core.forget_run(run_id);
                     return Err(FailWith::new(PermanentFailure::new(message), effects).into());
                 }
             }
@@ -170,7 +170,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         }
 
         let buf_key = signal_buf_kv_key(correlation_key);
-        match self.queue.kv_get(&buf_key).await {
+        match self.core.queue.kv_get(&buf_key).await {
             Ok(Some(buffered)) => {
                 let opts = StepEnqueueOpts {
                     reserved_headers: vec![(HEADER_SIGNAL_DELIVERED, "1".to_string())],
@@ -179,6 +179,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 let delivered_key = signal_delivered_kv_key(run_id, next_step);
                 let buffered = buffered.to_vec();
                 let mut effects = self
+                    .core
                     .advance_with_kv(run_id, next_step, payload, user_headers, opts, |_| {
                         HashMap::from([(delivered_key, buffered)])
                     })
@@ -187,13 +188,14 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 Ok(effects)
             }
             Ok(None) => {
-                let now = UNIX_EPOCH + Duration::from_millis(self.clock.now_ms());
+                let now = UNIX_EPOCH + Duration::from_millis(self.core.clock.now_ms());
                 let opts = StepEnqueueOpts {
                     run_at: Some(now + timeout),
                     reserved_headers: vec![(HEADER_SIGNAL_WAIT, correlation_key.to_string())],
                     ..base_opts
                 };
                 let effects = self
+                    .core
                     .advance_with_kv(run_id, next_step, payload, user_headers, opts, |job_id| {
                         HashMap::from([(wait_key, job_id.as_bytes().to_vec())])
                     })
@@ -203,7 +205,9 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             Err(e) => Err(e.to_string().into()),
         }
     }
+}
 
+impl RuntimeCore {
     /// Resolve the signal delivery for a claimed step job: the payload to
     /// expose on [`Step::signal`](crate::Step::signal) and the durable signal entries to delete
     /// with the step's settlement.
