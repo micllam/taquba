@@ -508,6 +508,7 @@ mod memo;
 mod runner;
 mod runtime;
 mod signal;
+mod sweep;
 mod terminal;
 
 pub use effects::{EffectsHandle, TerminalEffects};

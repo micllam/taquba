@@ -19,16 +19,12 @@ use crate::effects::{EffectsHandle, StagedEffects, TerminalEffects};
 use crate::error::{Error, Result};
 use crate::keys::{
     DEDUP_PREFIX, HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RESERVED_HEADER_PREFIX,
-    RESERVED_KV_PREFIX, TERMINAL_KV_PREFIX, parse_terminal_kv_key, run_kv_key, terminal_kv_key,
-    validate_run_id,
+    RESERVED_KV_PREFIX, run_kv_key, terminal_kv_key, validate_run_id,
 };
 use crate::kv::KvReadHandle;
 use crate::memo::MemoStore;
 use crate::runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
-
-/// Terminal markers read per page by the memo-retention sweep.
-const SWEEP_PAGE_SIZE: usize = 256;
 
 /// The portion of `delay` still ahead of `now_ms`, measured from
 /// `stored_at_ms`. Saturates to the full delay if the clock reads
@@ -302,11 +298,11 @@ pub(crate) struct RuntimeInner<R, H> {
     /// concurrently. Run ids are unbounded, so entries are removed
     /// once no submit references them.
     submit_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    memo_store: MemoStore,
+    pub(crate) memo_store: MemoStore,
     /// Window after a run reaches a terminal state during which its
     /// memo entries are retained for replay. `None` disables retention
     /// entirely (no terminal marker is written and no sweeper runs).
-    memo_retention: Option<Duration>,
+    pub(crate) memo_retention: Option<Duration>,
     /// Whether runner-returned step outcomes are persisted and replayed
     /// by `(run_id, step_number, SHA-256(step payload))`.
     step_output_replay: bool,
@@ -900,96 +896,6 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         }
     }
 
-    /// Memo-retention sweep loop. Runs only when
-    /// [`WorkflowRuntimeBuilder::memo_retention`] was set; the first
-    /// tick fires immediately so a fresh runtime catches markers left
-    /// behind by an earlier process, then ticks every `retention` until
-    /// `shutdown` is cancelled.
-    async fn run_memo_sweep(&self, shutdown: CancellationToken) {
-        let Some(retention) = self.memo_retention else {
-            return;
-        };
-        let mut ticker = tokio::time::interval(retention);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => return,
-                _ = ticker.tick() => {
-                    if let Err(err) = self.sweep_expired_memos(retention).await {
-                        warn!("memo retention sweep failed: {err}");
-                    }
-                }
-            }
-        }
-    }
-
-    /// One pass of memo retention: list the terminal markers older
-    /// than `retention` and, for each, delete the run's memo entries
-    /// and then the marker. Returns the number of runs whose memos
-    /// were cleared. Errors on individual entries are logged and
-    /// skipped (the next pass retries) so a transient failure on one
-    /// marker doesn't stall the rest of the sweep.
-    async fn sweep_expired_memos(&self, retention: Duration) -> Result<usize> {
-        let now_ms = self.clock.now_ms();
-        let retention_ms = retention.as_millis() as u64;
-        let cutoff = now_ms.saturating_sub(retention_ms);
-        let mut cleared = 0usize;
-        let mut cursor: Option<Vec<u8>> = None;
-        loop {
-            let page = self
-                .queue
-                .kv_scan(TERMINAL_KV_PREFIX, cursor.as_deref(), SWEEP_PAGE_SIZE)
-                .await?;
-            let exhausted = page.next_cursor.is_none();
-            cursor = page.next_cursor;
-            for (key, _) in page.entries {
-                let parsed = parse_terminal_kv_key(&key)
-                    .filter(|(run_id, _)| validate_run_id(run_id).is_ok());
-                let Some((run_id, terminal_at_ms)) = parsed else {
-                    // An empty run id resolves to the memo prefix itself, so
-                    // nothing is cleared under a marker that fails to parse.
-                    warn!(
-                        key = %String::from_utf8_lossy(&key),
-                        "malformed terminal marker; deleting without clearing memos",
-                    );
-                    if let Err(err) = self.queue.kv_delete(&key).await {
-                        warn!(
-                            key = %String::from_utf8_lossy(&key),
-                            "malformed terminal marker delete failed during sweep: {err}",
-                        );
-                    }
-                    continue;
-                };
-                // Markers sort by timestamp, so the first unexpired one
-                // ends the sweep: everything after it is newer.
-                if terminal_at_ms >= cutoff {
-                    return Ok(cleared);
-                }
-                if let Err(err) = self.memo_store.clear_memos_for_run(&run_id).await {
-                    warn!(
-                        run_id = %run_id,
-                        "clear_memos_for_run failed during sweep: {err}",
-                    );
-                    continue;
-                }
-                // Memos first, marker second: a failure here leaves the
-                // marker for the next pass, whose `clear_memos_for_run`
-                // is a no-op on the now-empty run prefix.
-                if let Err(err) = self.queue.kv_delete(&key).await {
-                    warn!(
-                        run_id = %run_id,
-                        "terminal marker delete failed during sweep: {err}",
-                    );
-                    continue;
-                }
-                cleared += 1;
-            }
-            if exhausted {
-                return Ok(cleared);
-            }
-        }
-    }
-
     /// Transition the entry for `run_id` into [`RunState::Running`] for
     /// `step_number`, recording the Taquba job ID powering the step so a
     /// concurrent [`WorkflowRuntime::cancel`] can target it. Creates a
@@ -1446,7 +1352,9 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
 mod tests {
     use super::*;
     use crate::keys::MAX_RUN_ID_LEN;
-    use crate::keys::{signal_buf_kv_key, signal_wait_kv_key};
+    use crate::keys::{
+        TERMINAL_KV_PREFIX, parse_terminal_kv_key, signal_buf_kv_key, signal_wait_kv_key,
+    };
     use crate::signal::SignalOutcome;
     use crate::terminal::NoopTerminalHook;
     use std::sync::Mutex as StdMutex;
