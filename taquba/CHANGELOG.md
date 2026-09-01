@@ -49,6 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Queue::lease_handle` builds the `LeaseHandle` for a held `Claim`,
   for callers that run `Worker::process` from their own claim loop.
 - `EnqueueResult::into_id`, the by-value form of `EnqueueResult::id`.
+- `OpenOptions::wal_object_store` and `ReaderOptions::wal_object_store`
+  (default `None`): place the write-ahead log on a separate object
+  store from the manifest and compacted data.
 
 ### Changed
 

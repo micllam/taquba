@@ -74,6 +74,9 @@ following holds:
   with async concurrency inside the single process.
 - Latency-sensitive paths: every durable transition is an object-store
   write, so end-to-end latency is floored by a PUT round trip.
+  `OpenOptions::wal_object_store` places the write-ahead log on a
+  separate store; one with lower write latency lowers that floor while
+  compacted state stays on the primary store.
 - Cheap jobs at high volume: throughput is bound by the durable commit
   rate, and sub-millisecond jobs pay the durability cost on every
   transition.

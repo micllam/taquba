@@ -425,6 +425,20 @@ pub struct OpenOptions {
     /// store with the queue must not equal or nest within the queue's
     /// `path`.
     pub payload_path: Option<String>,
+    /// Object store for the write-ahead log. `None` (the default) keeps
+    /// the WAL on the object store the queue is opened on.
+    ///
+    /// The transitions that await durability block on a WAL flush, so a
+    /// WAL store with lower write latency lowers their latency floor
+    /// (see [`Self::flush_interval`]); the manifest and compacted data
+    /// stay on the primary store. WAL objects live under the queue's
+    /// `path` within this store. A recent transition exists only in the
+    /// WAL until flushed to the primary store, so its durability is the
+    /// WAL store's. Every open of the same path must configure the same
+    /// pair of stores, and a [`QueueReader`](crate::QueueReader) must
+    /// receive this store via
+    /// [`ReaderOptions::wal_object_store`](crate::ReaderOptions::wal_object_store).
+    pub wal_object_store: Option<Arc<dyn ObjectStore>>,
 }
 
 impl OpenOptions {
@@ -517,6 +531,16 @@ impl OpenOptions {
         self.payload_path = payload_path.into();
         self
     }
+
+    /// Set [`Self::wal_object_store`].
+    #[must_use]
+    pub fn wal_object_store(
+        mut self,
+        wal_object_store: impl Into<Option<Arc<dyn ObjectStore>>>,
+    ) -> Self {
+        self.wal_object_store = wal_object_store.into();
+        self
+    }
 }
 
 impl Default for OpenOptions {
@@ -533,6 +557,7 @@ impl Default for OpenOptions {
             payload_offload_threshold: Some(DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD),
             payload_store: None,
             payload_path: None,
+            wal_object_store: None,
         }
     }
 }
@@ -838,10 +863,12 @@ impl Queue {
         if let Some(flush_interval) = opts.flush_interval {
             settings.flush_interval = Some(flush_interval);
         }
-        #[cfg_attr(not(feature = "metrics"), allow(unused_mut))]
         let mut builder = Db::builder(path, object_store)
             .with_merge_operator(Arc::new(QueueMergeOperator))
             .with_settings(settings);
+        if let Some(wal_object_store) = opts.wal_object_store {
+            builder = builder.with_wal_object_store(wal_object_store);
+        }
         #[cfg(feature = "metrics")]
         {
             builder = builder.with_metrics_recorder(crate::obs::slatedb_recorder());
@@ -3269,6 +3296,31 @@ mod tests {
             Some(b"v2".as_slice())
         );
         assert_eq!(q.stats("jobs").await.unwrap().pending, 1);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_separate_wal_store_holds_the_wal_and_replays_at_open() {
+        let store = make_store();
+        let wal_store = make_store();
+        let opts = || OpenOptions::default().wal_object_store(wal_store.clone());
+        let q = Queue::open_with_options(store.clone(), "test", opts())
+            .await
+            .unwrap();
+        let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        // The durable enqueue has flushed the WAL, so its objects exist
+        // and only the configured WAL store holds them.
+        assert!(object_count(&wal_store, "test/wal").await > 0);
+        assert_eq!(object_count(&store, "test/wal").await, 0);
+        drop(q);
+
+        // The enqueue was not flushed to the primary store, so recovery
+        // at open replays it from the WAL store.
+        let q = Queue::open_with_options(store, "test", opts())
+            .await
+            .unwrap();
+        let job = q.get_job(&id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Pending);
         q.close().await.unwrap();
     }
 

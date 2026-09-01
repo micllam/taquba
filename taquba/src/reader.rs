@@ -70,6 +70,12 @@ pub struct ReaderOptions {
     /// writer's [`OpenOptions::payload_path`](crate::OpenOptions::payload_path);
     /// `None` (the default) uses `"{path}-payloads"`.
     pub payload_path: Option<String>,
+    /// Object store for the write-ahead log. Must match the writer's
+    /// [`OpenOptions::wal_object_store`](crate::OpenOptions::wal_object_store);
+    /// `None` (the default) uses the object store the reader is opened
+    /// on. Without it a reader of a writer with a separate WAL store
+    /// cannot see transitions not yet flushed to the primary store.
+    pub wal_object_store: Option<Arc<dyn ObjectStore>>,
 }
 
 impl ReaderOptions {
@@ -107,6 +113,16 @@ impl ReaderOptions {
         self.payload_path = payload_path.into();
         self
     }
+
+    /// Set [`Self::wal_object_store`].
+    #[must_use]
+    pub fn wal_object_store(
+        mut self,
+        wal_object_store: impl Into<Option<Arc<dyn ObjectStore>>>,
+    ) -> Self {
+        self.wal_object_store = wal_object_store.into();
+        self
+    }
 }
 
 impl Default for ReaderOptions {
@@ -117,6 +133,7 @@ impl Default for ReaderOptions {
             checkpoint_lifetime: Duration::from_secs(10 * 60),
             payload_store: None,
             payload_path: None,
+            wal_object_store: None,
         }
     }
 }
@@ -193,7 +210,7 @@ impl QueueReader {
             ReaderMode::ManagedCheckpoint => DbReaderMode::ManagedCheckpoint,
             ReaderMode::FollowLatest => DbReaderMode::FollowLatest,
         };
-        let reader = DbReader::builder(path, object_store.clone())
+        let mut builder = DbReader::builder(path, object_store.clone())
             .with_reader_mode(mode)
             // Stats counters and attempt histories are merge operands;
             // without the operator their reads fail.
@@ -202,9 +219,11 @@ impl QueueReader {
                 manifest_poll_interval: opts.manifest_poll_interval,
                 checkpoint_lifetime: opts.checkpoint_lifetime,
                 ..DbReaderOptions::default()
-            })
-            .build()
-            .await;
+            });
+        if let Some(wal_object_store) = opts.wal_object_store {
+            builder = builder.with_wal_object_store(wal_object_store);
+        }
+        let reader = builder.build().await;
         let reader = match reader {
             Ok(reader) => reader,
             // A missing manifest and a corrupt one share an error kind;
@@ -414,6 +433,35 @@ mod tests {
         assert_eq!(stats.pending, 3);
         assert_eq!(stats.claimed, 0);
         assert_eq!(stats.done, 0);
+
+        reader.close().await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reader_reads_the_wal_from_the_writers_wal_store() {
+        let store = make_store();
+        let wal_store = make_store();
+        let q = Queue::open_with_options(
+            store.clone(),
+            "test",
+            OpenOptions::default().wal_object_store(wal_store.clone()),
+        )
+        .await
+        .unwrap();
+        // Durable but not yet flushed to the primary store: the record
+        // is only readable through the WAL store.
+        let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
+
+        let reader = QueueReader::open_with_options(
+            store,
+            "test",
+            ReaderOptions::default().wal_object_store(wal_store),
+        )
+        .await
+        .unwrap();
+        let job = reader.get_job(&id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Pending);
 
         reader.close().await.unwrap();
         q.close().await.unwrap();
