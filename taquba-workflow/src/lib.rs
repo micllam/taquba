@@ -505,6 +505,7 @@ mod error;
 mod keys;
 mod kv;
 mod memo;
+mod registry;
 mod runner;
 mod runtime;
 mod signal;
