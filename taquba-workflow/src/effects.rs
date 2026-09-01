@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use taquba::EnqueueRequest;
 
 use crate::error::{Error, Result};
-use crate::runtime::RESERVED_KV_PREFIX;
+use crate::keys::RESERVED_KV_PREFIX;
 
 /// Application KV effects staged during a step, applied in the same
 /// transaction as the settlement that commits the step's outcome.
