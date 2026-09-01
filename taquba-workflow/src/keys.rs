@@ -150,6 +150,7 @@ mod tests {
             SIGNAL_WAIT_KV_PREFIX,
             SIGNAL_BUF_KV_PREFIX,
             SIGNAL_DELIVERED_KV_PREFIX,
+            TERMINAL_KV_PREFIX,
         ] {
             assert!(
                 prefix.starts_with(RESERVED_KV_PREFIX.as_bytes()),
