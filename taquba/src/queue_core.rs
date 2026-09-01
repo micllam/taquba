@@ -10,8 +10,9 @@ use crate::clock::Clock;
 use crate::completion::CompletionWaiters;
 use crate::job::{Claim, JobRecord, JobStatus};
 use crate::lease_registry::LeaseRegistry;
+use crate::options::QueueConfig;
 use crate::payload_store::PayloadStore;
-use crate::queue::{QueueConfig, WaitOutcome};
+use crate::queue::WaitOutcome;
 use crate::txn::ClaimEnd;
 
 /// The per-queue configurations of an open queue: a default and the

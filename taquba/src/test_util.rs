@@ -10,13 +10,14 @@ pub(crate) use slatedb::object_store::memory::InMemory;
 pub(crate) use slatedb::object_store::Error as StoreError;
 
 pub(crate) use crate::clock::{Clock, MockClock};
+pub(crate) use crate::effects::SettlementEffects;
 pub(crate) use crate::job::{Claim, JobRecord, JobStatus};
 pub(crate) use crate::keys::{KeyTag, tag_prefix};
 pub(crate) use crate::lease::LeaseHandle;
-pub(crate) use crate::queue::{
-    CancelOutcome, EnqueueOptions, EnqueueRequest, NackOutcome, OpenOptions, PRIORITY_HIGH,
-    PRIORITY_LOW, Queue, QueueConfig, SettlementEffects, WaitOutcome, WakeOutcome,
+pub(crate) use crate::options::{
+    EnqueueOptions, OpenOptions, PRIORITY_HIGH, PRIORITY_LOW, QueueConfig,
 };
+pub(crate) use crate::queue::{CancelOutcome, NackOutcome, Queue, WaitOutcome, WakeOutcome};
 
 pub(crate) fn make_store() -> Arc<dyn ObjectStore> {
     Arc::new(InMemory::new())

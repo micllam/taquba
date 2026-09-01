@@ -12,13 +12,93 @@ use ulid::Ulid;
 use crate::error::{Error, Result};
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{dedup_index_key, job_index_key, pending_key, scheduled_key, user_scoped_key};
+use crate::options::EnqueueOptions;
 use crate::queue::{
-    EnqueueOptions, EnqueueResult, SettlementEffects, validate_id_override, validate_kv_value_size,
-    validate_queue_name,
+    EnqueueResult, validate_id_override, validate_kv_value_size, validate_queue_name,
 };
 use crate::queue_core::QueueCore;
 use crate::stats::update_stats;
 use crate::txn::put_job_record;
+
+/// One enqueue carried by [`SettlementEffects`].
+#[derive(Debug, Clone)]
+pub struct EnqueueRequest {
+    /// Queue the job is enqueued on.
+    pub queue: String,
+    /// Job payload.
+    pub payload: Vec<u8>,
+    /// Per-job options; `run_at`, `dedup_key`, `priority`, and
+    /// `id_override` are all honoured exactly as in
+    /// [`Queue::enqueue_with`](crate::Queue::enqueue_with).
+    pub options: EnqueueOptions,
+}
+
+/// Effects applied in the same transaction as a settlement: an
+/// acknowledgement via [`Queue::ack_with`](crate::Queue::ack_with), a dead-letter via
+/// [`Queue::dead_letter_with`](crate::Queue::dead_letter_with) or [`Queue::nack_with`](crate::Queue::nack_with), or a
+/// pending-job removal via [`Queue::cancel_with`](crate::Queue::cancel_with). Either the
+/// settlement and every effect commit together or nothing does. A
+/// branch that applies no effects ([`Queue::nack_with`](crate::Queue::nack_with) while attempts
+/// remain, [`Queue::cancel_with`](crate::Queue::cancel_with) other than
+/// [`CancelOutcome::Removed`](crate::CancelOutcome::Removed)) commits without them. A key named in
+/// both `kv_writes` and `kv_deletes` is rejected with
+/// [`Error::ConflictingKvEffect`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub struct SettlementEffects {
+    /// Jobs enqueued atomically with the settlement.
+    pub enqueues: Vec<EnqueueRequest>,
+    /// Writes applied to the caller KV namespace, as in
+    /// [`Queue::enqueue_with_kv`](crate::Queue::enqueue_with_kv). Values are size-capped at
+    /// [`MAX_KV_VALUE_SIZE`](crate::MAX_KV_VALUE_SIZE).
+    pub kv_writes: HashMap<Vec<u8>, Vec<u8>>,
+    /// Keys deleted from the caller KV namespace.
+    pub kv_deletes: Vec<Vec<u8>>,
+}
+
+impl SettlementEffects {
+    /// Set [`Self::enqueues`].
+    #[must_use]
+    pub fn enqueues(mut self, enqueues: Vec<EnqueueRequest>) -> Self {
+        self.enqueues = enqueues;
+        self
+    }
+
+    /// Add one request to [`Self::enqueues`].
+    #[must_use]
+    pub fn enqueue(mut self, request: EnqueueRequest) -> Self {
+        self.enqueues.push(request);
+        self
+    }
+
+    /// Set [`Self::kv_writes`].
+    #[must_use]
+    pub fn kv_writes(mut self, kv_writes: HashMap<Vec<u8>, Vec<u8>>) -> Self {
+        self.kv_writes = kv_writes;
+        self
+    }
+
+    /// Add one write to [`Self::kv_writes`].
+    #[must_use]
+    pub fn kv_put(mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
+        self.kv_writes.insert(key.into(), value.into());
+        self
+    }
+
+    /// Set [`Self::kv_deletes`].
+    #[must_use]
+    pub fn kv_deletes(mut self, kv_deletes: Vec<Vec<u8>>) -> Self {
+        self.kv_deletes = kv_deletes;
+        self
+    }
+
+    /// Add one key to [`Self::kv_deletes`].
+    #[must_use]
+    pub fn kv_delete(mut self, key: impl Into<Vec<u8>>) -> Self {
+        self.kv_deletes.push(key.into());
+        self
+    }
+}
 
 /// A job record prepared by [`Queue::prepare_job_record`], paired with
 /// its primary key, awaiting staging into a transaction.

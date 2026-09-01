@@ -5,10 +5,11 @@ use std::time::Duration;
 use futures_util::FutureExt;
 use tracing::{debug, warn};
 
+use crate::effects::SettlementEffects;
 use crate::error::{Error, Result};
 use crate::job::{Claim, JobRecord};
 use crate::lease::LeaseHandle;
-use crate::queue::{Queue, SettlementEffects};
+use crate::queue::Queue;
 
 /// Boxed error type returned from [`Worker::process`].
 pub type WorkerError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -397,7 +398,8 @@ fn check_shutdown<F: Future<Output = ()>>(shutdown: std::pin::Pin<&mut F>) -> bo
 mod tests {
     use super::*;
     use crate::clock::MockClock;
-    use crate::queue::{OpenOptions, Queue, QueueConfig};
+    use crate::options::{OpenOptions, QueueConfig};
+    use crate::queue::Queue;
     use slatedb::object_store::memory::InMemory;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -435,10 +437,10 @@ mod tests {
             self.processed.fetch_add(1, Ordering::SeqCst);
             if job.payload == b"first" {
                 Ok(SettlementEffects {
-                    enqueues: vec![crate::queue::EnqueueRequest {
+                    enqueues: vec![crate::effects::EnqueueRequest {
                         queue: job.queue.clone(),
                         payload: b"second".to_vec(),
-                        options: crate::queue::EnqueueOptions::default(),
+                        options: crate::options::EnqueueOptions::default(),
                     }],
                     ..SettlementEffects::default()
                 })
@@ -621,10 +623,10 @@ mod tests {
         ) -> std::result::Result<(), WorkerError> {
             self.attempts_seen.fetch_add(1, Ordering::SeqCst);
             let effects = SettlementEffects {
-                enqueues: vec![crate::queue::EnqueueRequest {
+                enqueues: vec![crate::effects::EnqueueRequest {
                     queue: "notify".to_string(),
                     payload: job.payload.clone(),
-                    options: crate::queue::EnqueueOptions::default(),
+                    options: crate::options::EnqueueOptions::default(),
                 }],
                 ..SettlementEffects::default()
             };
@@ -723,9 +725,9 @@ mod tests {
             .enqueue_with(
                 "work",
                 b"job".to_vec(),
-                crate::queue::EnqueueOptions {
+                crate::options::EnqueueOptions {
                     max_attempts: Some(1),
-                    ..crate::queue::EnqueueOptions::default()
+                    ..crate::options::EnqueueOptions::default()
                 },
             )
             .await

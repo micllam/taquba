@@ -396,6 +396,7 @@ mod liveness;
 #[cfg(feature = "metrics")]
 mod metrics_sampler;
 mod obs;
+mod options;
 mod payload_store;
 mod queue;
 mod queue_core;
@@ -413,16 +414,20 @@ mod txn;
 pub mod worker;
 
 pub use clock::{Clock, MockClock, SystemClock};
+pub use effects::{EnqueueRequest, SettlementEffects};
 pub use error::{Error, Result};
 pub use history::{AttemptOutcome, JobAttempt};
 pub use job::{Claim, JobRecord, JobStatus};
 pub use keys::MAX_QUEUE_NAME_LEN;
 pub use lease::LeaseHandle;
 pub use liveness::{StoreActivity, WriterHeartbeat};
+pub use options::{
+    DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD, EnqueueOptions, OpenOptions, PRIORITY_HIGH, PRIORITY_LOW,
+    PRIORITY_NORMAL, QueueConfig,
+};
 pub use queue::{
-    CancelOutcome, DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD, EnqueueOptions, EnqueueRequest,
-    EnqueueResult, JobPage, KvPage, MAX_KV_VALUE_SIZE, NackOutcome, OpenOptions, PRIORITY_HIGH,
-    PRIORITY_LOW, PRIORITY_NORMAL, Queue, QueueConfig, SettlementEffects, WaitOutcome, WakeOutcome,
+    CancelOutcome, EnqueueResult, JobPage, KvPage, MAX_KV_VALUE_SIZE, NackOutcome, Queue,
+    WaitOutcome, WakeOutcome,
 };
 pub use reader::{QueueReader, ReaderMode, ReaderOptions};
 pub use stats::QueueStats;

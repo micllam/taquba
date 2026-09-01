@@ -397,7 +397,8 @@ async fn store_path_is_empty(store: &Arc<dyn ObjectStore>, path: &str) -> bool {
 mod tests {
     use super::*;
     use crate::error::Error;
-    use crate::queue::{OpenOptions, Queue};
+    use crate::options::OpenOptions;
+    use crate::queue::Queue;
     use slatedb::object_store::ObjectStoreExt;
     use slatedb::object_store::path::Path;
 
