@@ -507,6 +507,7 @@ mod kv;
 mod memo;
 mod runner;
 mod runtime;
+mod signal;
 mod terminal;
 
 pub use effects::{EffectsHandle, TerminalEffects};
@@ -519,9 +520,9 @@ pub use kv::KvReadHandle;
 pub use memo::{Memo, MemoStore};
 pub use runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 pub use runtime::{
-    RunSpec, RunState, RunStatus, SignalOutcome, SubmitOutcome, WorkflowRuntime,
-    WorkflowRuntimeBuilder,
+    RunSpec, RunState, RunStatus, SubmitOutcome, WorkflowRuntime, WorkflowRuntimeBuilder,
 };
+pub use signal::SignalOutcome;
 #[cfg(feature = "webhooks")]
 pub use terminal::WebhookTerminalHook;
 pub use terminal::{NoopTerminalHook, RunOutcome, TerminalHook, TerminalStatus};
