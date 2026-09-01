@@ -45,6 +45,42 @@ struct EffectsState {
     sealed: bool,
 }
 
+impl EffectsState {
+    fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        self.check_key(&key)?;
+        if value.len() > taquba::MAX_KV_VALUE_SIZE {
+            return Err(Error::Queue(taquba::Error::KvValueTooLarge {
+                size: value.len(),
+                max: taquba::MAX_KV_VALUE_SIZE,
+            }));
+        }
+        if self.staged.deletes.contains(&key) {
+            return Err(Error::ConflictingKvEffect(display_key(&key)));
+        }
+        self.staged.writes.insert(key, value);
+        Ok(())
+    }
+
+    fn delete(&mut self, key: Vec<u8>) -> Result<()> {
+        self.check_key(&key)?;
+        if self.staged.writes.contains_key(&key) {
+            return Err(Error::ConflictingKvEffect(display_key(&key)));
+        }
+        self.staged.deletes.insert(key);
+        Ok(())
+    }
+
+    fn check_key(&self, key: &[u8]) -> Result<()> {
+        if self.sealed {
+            return Err(Error::EffectsSealed);
+        }
+        if key.starts_with(RESERVED_KV_PREFIX.as_bytes()) {
+            return Err(Error::ReservedKvKey(display_key(key)));
+        }
+        Ok(())
+    }
+}
+
 /// Writes and deletes accumulated by an [`EffectsHandle`]. Stored in
 /// the step-output replay record so a replayed delivery applies the
 /// same effects.
@@ -80,21 +116,7 @@ impl EffectsHandle {
     /// when `key` is already staged for a delete and
     /// [`Error::EffectsSealed`] when the step has returned.
     pub fn put(&self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Result<()> {
-        let key = key.into();
-        let value = value.into();
-        let mut state = self.inner.lock().unwrap();
-        check_key(&state, &key)?;
-        if value.len() > taquba::MAX_KV_VALUE_SIZE {
-            return Err(Error::Queue(taquba::Error::KvValueTooLarge {
-                size: value.len(),
-                max: taquba::MAX_KV_VALUE_SIZE,
-            }));
-        }
-        if state.staged.deletes.contains(&key) {
-            return Err(Error::ConflictingKvEffect(display_key(&key)));
-        }
-        state.staged.writes.insert(key, value);
-        Ok(())
+        self.inner.lock().unwrap().put(key.into(), value.into())
     }
 
     /// Stage a delete of `key` from the caller KV namespace.
@@ -106,14 +128,7 @@ impl EffectsHandle {
     /// already staged for a write and [`Error::EffectsSealed`] when the
     /// step has returned.
     pub fn delete(&self, key: impl Into<Vec<u8>>) -> Result<()> {
-        let key = key.into();
-        let mut state = self.inner.lock().unwrap();
-        check_key(&state, &key)?;
-        if state.staged.writes.contains_key(&key) {
-            return Err(Error::ConflictingKvEffect(display_key(&key)));
-        }
-        state.staged.deletes.insert(key);
-        Ok(())
+        self.inner.lock().unwrap().delete(key.into())
     }
 
     /// Seal the handle and move out everything staged. An effect staged
@@ -124,16 +139,6 @@ impl EffectsHandle {
         state.sealed = true;
         std::mem::take(&mut state.staged)
     }
-}
-
-fn check_key(state: &EffectsState, key: &[u8]) -> Result<()> {
-    if state.sealed {
-        return Err(Error::EffectsSealed);
-    }
-    if key.starts_with(RESERVED_KV_PREFIX.as_bytes()) {
-        return Err(Error::ReservedKvKey(display_key(key)));
-    }
-    Ok(())
 }
 
 /// Effects staged by a [`TerminalHook`](crate::TerminalHook) during a
@@ -200,21 +205,7 @@ impl TerminalEffects {
     ///
     /// As [`EffectsHandle::put`].
     pub fn put(&self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Result<()> {
-        let key = key.into();
-        let value = value.into();
-        let mut state = self.inner.lock().unwrap();
-        check_key(&state.kv, &key)?;
-        if value.len() > taquba::MAX_KV_VALUE_SIZE {
-            return Err(Error::Queue(taquba::Error::KvValueTooLarge {
-                size: value.len(),
-                max: taquba::MAX_KV_VALUE_SIZE,
-            }));
-        }
-        if state.kv.staged.deletes.contains(&key) {
-            return Err(Error::ConflictingKvEffect(display_key(&key)));
-        }
-        state.kv.staged.writes.insert(key, value);
-        Ok(())
+        self.inner.lock().unwrap().kv.put(key.into(), value.into())
     }
 
     /// Stage a delete of `key` from the caller KV namespace.
@@ -223,14 +214,7 @@ impl TerminalEffects {
     ///
     /// As [`EffectsHandle::delete`].
     pub fn delete(&self, key: impl Into<Vec<u8>>) -> Result<()> {
-        let key = key.into();
-        let mut state = self.inner.lock().unwrap();
-        check_key(&state.kv, &key)?;
-        if state.kv.staged.writes.contains_key(&key) {
-            return Err(Error::ConflictingKvEffect(display_key(&key)));
-        }
-        state.kv.staged.deletes.insert(key);
-        Ok(())
+        self.inner.lock().unwrap().kv.delete(key.into())
     }
 
     /// Seal the handle and move out everything staged.
