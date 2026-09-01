@@ -339,46 +339,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_returns_none_for_missing_key() {
+    async fn put_get_round_trips() {
         let memo = make_memo();
         assert_eq!(memo.get("missing").await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn put_then_get_round_trips() {
-        let memo = make_memo();
-        memo.put("k", b"hello").await.unwrap();
-        assert_eq!(memo.get("k").await.unwrap(), Some(b"hello".to_vec()));
-    }
-
-    #[tokio::test]
-    async fn put_overwrites_prior_value() {
-        let memo = make_memo();
         memo.put("k", b"first").await.unwrap();
+        assert_eq!(memo.get("k").await.unwrap(), Some(b"first".to_vec()));
         memo.put("k", b"second").await.unwrap();
+        assert_eq!(memo.get("k").await.unwrap(), Some(b"second".to_vec()));
+        memo.put("k2", b"").await.unwrap();
+        assert_eq!(memo.get("k2").await.unwrap(), Some(Vec::new()));
         assert_eq!(memo.get("k").await.unwrap(), Some(b"second".to_vec()));
     }
 
     #[tokio::test]
-    async fn run_id_namespaces_are_isolated() {
+    async fn run_and_step_namespaces_are_isolated() {
         let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
         let in_run_a = store.new_memo("run-a", 0);
+        let in_run_a_step_1 = store.new_memo("run-a", 1);
         let in_run_b = store.new_memo("run-b", 0);
-        in_run_a.put("k", b"value-a").await.unwrap();
-        in_run_b.put("k", b"value-b").await.unwrap();
-        assert_eq!(in_run_a.get("k").await.unwrap(), Some(b"value-a".to_vec()));
-        assert_eq!(in_run_b.get("k").await.unwrap(), Some(b"value-b".to_vec()));
-    }
-
-    #[tokio::test]
-    async fn step_number_namespaces_are_isolated() {
-        let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        let at_step_0 = store.new_memo("run-1", 0);
-        let at_step_1 = store.new_memo("run-1", 1);
-        at_step_0.put("k", b"step-0").await.unwrap();
-        at_step_1.put("k", b"step-1").await.unwrap();
-        assert_eq!(at_step_0.get("k").await.unwrap(), Some(b"step-0".to_vec()));
-        assert_eq!(at_step_1.get("k").await.unwrap(), Some(b"step-1".to_vec()));
+        in_run_a.put("k", b"a-0").await.unwrap();
+        in_run_a_step_1.put("k", b"a-1").await.unwrap();
+        in_run_b.put("k", b"b-0").await.unwrap();
+        assert_eq!(in_run_a.get("k").await.unwrap(), Some(b"a-0".to_vec()));
+        assert_eq!(
+            in_run_a_step_1.get("k").await.unwrap(),
+            Some(b"a-1".to_vec()),
+        );
+        assert_eq!(in_run_b.get("k").await.unwrap(), Some(b"b-0".to_vec()));
     }
 
     #[tokio::test]
@@ -398,15 +385,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn distinct_user_keys_map_to_distinct_entries() {
-        let memo = make_memo();
-        memo.put("k1", b"one").await.unwrap();
-        memo.put("k2", b"two").await.unwrap();
-        assert_eq!(memo.get("k1").await.unwrap(), Some(b"one".to_vec()));
-        assert_eq!(memo.get("k2").await.unwrap(), Some(b"two".to_vec()));
-    }
-
-    #[tokio::test]
     async fn awkward_user_keys_round_trip() {
         // Keys with `/`, spaces, and non-ASCII should all work because
         // they're hashed before becoming a path segment.
@@ -423,13 +401,6 @@ mod tests {
             memo.put(key, &expected).await.unwrap();
             assert_eq!(memo.get(key).await.unwrap(), Some(expected));
         }
-    }
-
-    #[tokio::test]
-    async fn empty_value_round_trips() {
-        let memo = make_memo();
-        memo.put("k", b"").await.unwrap();
-        assert_eq!(memo.get("k").await.unwrap(), Some(Vec::new()));
     }
 
     #[tokio::test]
@@ -593,16 +564,7 @@ mod tests {
         assert_eq!(in_run_a.get("k").await.unwrap(), None);
         assert_eq!(in_run_a_step1.get("k").await.unwrap(), None);
         assert_eq!(in_run_b.get("k").await.unwrap(), Some(b"b-0".to_vec()));
-    }
-
-    #[tokio::test]
-    async fn clear_memos_for_run_returns_zero_when_nothing_to_delete() {
-        let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        let deleted = store
-            .clear_memos_for_run("run-with-no-memos")
-            .await
-            .unwrap();
-        assert_eq!(deleted, 0);
+        assert_eq!(store.clear_memos_for_run("run-a").await.unwrap(), 0);
     }
 
     #[tokio::test]

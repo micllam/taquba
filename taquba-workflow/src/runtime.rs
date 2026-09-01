@@ -2231,7 +2231,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn duplicate_submit_in_process_with_same_input_is_idempotent() {
+    async fn duplicate_submit_in_process_is_idempotent_and_rejects_a_changed_input() {
         // Pause forever on the first step so the run stays active in the
         // registry while we attempt the duplicate submit.
         struct PauseRunner;
@@ -2274,32 +2274,6 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.run_id, "fixed-id");
         assert!(!outcome.newly_submitted);
-
-        let _ = shutdown.send(());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn duplicate_submit_in_process_with_different_input_errors() {
-        struct PauseRunner;
-        impl StepRunner for PauseRunner {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                std::future::pending().await
-            }
-        }
-
-        let (queue, store) = fresh_queue().await;
-        let runtime =
-            WorkflowRuntime::builder(queue, store.clone(), PauseRunner, NoopTerminalHook).build();
-        let shutdown = spawn_runtime(runtime.clone());
-
-        runtime
-            .submit(RunSpec {
-                run_id: Some("fixed-id".to_string()),
-                input: b"x".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
 
         let err = runtime
             .submit(RunSpec {
@@ -2347,7 +2321,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn duplicate_submit_across_runtime_restart_with_same_input_is_idempotent() {
+    async fn duplicate_submit_across_restart_is_idempotent_and_rejects_a_changed_input() {
         // Build a runtime, submit a run, then drop the runtime entirely
         // (simulating a process restart of the workflow layer) while
         // keeping the underlying Queue alive. The next runtime instance
@@ -2408,43 +2382,7 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.run_id, "durable-id");
         assert!(!outcome.newly_submitted);
-    }
 
-    #[tokio::test(start_paused = true)]
-    async fn duplicate_submit_across_runtime_restart_with_different_input_errors() {
-        // Like the same-input idempotency test, but the re-submit carries
-        // a different input. The check is sourced exclusively from the
-        // durable KV record since the fresh runtime's registry is empty.
-        struct PauseRunner;
-        impl StepRunner for PauseRunner {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                std::future::pending().await
-            }
-        }
-
-        let (queue, store) = fresh_queue().await;
-
-        {
-            let runtime = WorkflowRuntime::builder(
-                queue.clone(),
-                store.clone(),
-                PauseRunner,
-                NoopTerminalHook,
-            )
-            .build();
-            runtime
-                .submit(RunSpec {
-                    run_id: Some("durable-id".to_string()),
-                    input: b"x".to_vec(),
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-        }
-
-        let runtime2 =
-            WorkflowRuntime::builder(queue.clone(), store.clone(), PauseRunner, NoopTerminalHook)
-                .build();
         let err = runtime2
             .submit(RunSpec {
                 run_id: Some("durable-id".to_string()),
@@ -3079,7 +3017,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancel_pending_run_fires_cancelled_hook() {
+    async fn cancelling_a_pending_run_commits_its_marker_and_fires_the_hook() {
         // Pending case: a run sits in the queue, we call `cancel()` before
         // any worker claims it. `cancel` removes the step job and enqueues
         // the notification before returning.
@@ -3090,7 +3028,7 @@ mod tests {
             }
         }
 
-        let (queue, store) = fresh_queue().await;
+        let (queue, store, _clock) = fresh_queue_with_mock_clock(10_000).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -3098,6 +3036,7 @@ mod tests {
             UnreachableRunner,
             ChannelHook { tx },
         )
+        .memo_retention(Duration::from_secs(60))
         .build();
         // Note: deliberately do NOT spawn the worker loop, so the submitted
         // step stays Pending in the queue while we cancel it.
@@ -3119,6 +3058,15 @@ mod tests {
         let was_cancelled = runtime.cancel(&handle.run_id).await.unwrap();
         assert!(was_cancelled);
         assert!(runtime.status(&handle.run_id).await.is_none());
+
+        // The marker and the run record's delete commit with the removal,
+        // before the notification is processed.
+        let markers = terminal_markers(&queue).await;
+        assert_eq!(markers, vec![(handle.run_id.clone(), 10_000)]);
+        assert_eq!(
+            queue.kv_get(&run_kv_key(&handle.run_id)).await.unwrap(),
+            None,
+        );
 
         // The step job is gone; the one claimable job is the notification.
         let notification = queue
@@ -3314,20 +3262,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancel_suppresses_permanent_runner_error() {
+    async fn cancel_suppresses_a_runner_error() {
         // Without cancellation, `StepError::permanent` dead-letters the
-        // step and causes the worker to return `PermanentFailure`. With
-        // an external cancel in flight, the worker must ack and fire
-        // `Cancelled` instead.
+        // step and `StepError::transient` nacks for retry. With an
+        // external cancel in flight, the worker must ack and fire
+        // `Cancelled` instead, without re-invoking the runner.
         assert_cancel_suppresses_runner_error(StepError::permanent("would-dead-letter")).await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn cancel_suppresses_transient_runner_error() {
-        // Without cancellation, `StepError::transient` nacks for retry
-        // (and eventually dead-letters). With an external cancel in
-        // flight, the worker must ack and fire `Cancelled` without
-        // re-invoking the runner.
         assert_cancel_suppresses_runner_error(StepError::transient("would-retry")).await;
     }
 
@@ -3476,7 +3416,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancel_after_run_already_terminated_returns_false() {
+    async fn cancel_returns_false_for_a_terminated_or_unknown_run() {
         // Submit a run that succeeds normally, wait for the terminal
         // hook, then call `cancel`. The registry entry was removed when
         // the success hook fired, so `cancel` must report `Ok(false)`
@@ -3520,6 +3460,8 @@ mod tests {
             rx.try_recv().is_err(),
             "no Cancelled hook may fire after the run already terminated as Succeeded",
         );
+
+        assert!(!runtime.cancel("never-submitted").await.unwrap());
 
         let _ = shutdown.send(());
     }
@@ -3603,27 +3545,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancel_unknown_run_returns_false() {
-        let (queue, store) = fresh_queue().await;
-        let runtime: WorkflowRuntime<ScriptedRunner, NoopTerminalHook> = WorkflowRuntime::builder(
-            queue,
-            store.clone(),
-            ScriptedRunner::new(vec![]),
-            NoopTerminalHook,
-        )
-        .build();
-
-        let was_cancelled = runtime.cancel("never-submitted").await.unwrap();
-        assert!(!was_cancelled);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn transient_fires_once_on_single_attempt() {
+    async fn transient_retries_until_max_attempts() {
         assert_transient_retries_until_max(1).await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn transient_retries_up_to_max_attempts() {
         assert_transient_retries_until_max(3).await;
     }
 
@@ -3679,41 +3602,6 @@ mod tests {
             outcome.result.as_deref(),
             Some(b"first-attempt-value".as_slice())
         );
-
-        let _ = shutdown.send(());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn terminal_marker_is_written_when_memo_retention_is_set() {
-        let (queue, store) = fresh_queue().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue,
-            store.clone(),
-            ScriptedRunner::new(vec![StepOutcome::Succeed {
-                result: b"done".to_vec(),
-            }]),
-            ChannelHook { tx },
-        )
-        .memo_retention(Duration::from_secs(60))
-        .build();
-        let shutdown = spawn_runtime(runtime.clone());
-
-        let handle = runtime
-            .submit(RunSpec {
-                input: b"in".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-
-        let markers = terminal_markers(&runtime.inner.core.queue).await;
-        assert_eq!(markers.len(), 1);
-        assert_eq!(markers[0].0, handle.run_id);
 
         let _ = shutdown.send(());
     }
@@ -3789,7 +3677,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn terminal_marker_timestamp_reflects_runtime_clock() {
+    async fn terminal_marker_is_written_at_the_runtime_clock() {
         // The queue's MockClock is shared into the runtime by default
         // (via Queue::clock()), so a `clock.advance` between submit and
         // terminate is visible in the marker's terminal_at_ms.
@@ -3807,7 +3695,7 @@ mod tests {
         .build();
         let shutdown = spawn_runtime(runtime.clone());
 
-        runtime
+        let handle = runtime
             .submit(RunSpec {
                 input: b"in".to_vec(),
                 ..Default::default()
@@ -3822,6 +3710,7 @@ mod tests {
 
         let markers = terminal_markers(&runtime.inner.core.queue).await;
         assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].0, handle.run_id);
         // MockClock only moves on explicit advance/set, so the value the
         // effects builder reads is exactly the post-advance clock.
         assert_eq!(markers[0].1, 10_000 + 30_000);
@@ -3921,7 +3810,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_marker_with_an_empty_run_id_is_deleted_without_clearing_memos() {
+    async fn a_malformed_terminal_marker_is_deleted_without_clearing_memos() {
         let (queue, store, clock) = fresh_queue_with_mock_clock(10_000).await;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
@@ -3941,6 +3830,9 @@ mod tests {
             .unwrap();
         let marker = terminal_kv_key("", 0);
         queue.kv_put(&marker, b"").await.unwrap();
+        let mut unparseable = Vec::from(TERMINAL_KV_PREFIX);
+        unparseable.extend_from_slice(b"not-a-timestamp");
+        queue.kv_put(&unparseable, b"").await.unwrap();
 
         advance(&clock, Duration::from_secs(3_600)).await;
         runtime
@@ -3956,35 +3848,9 @@ mod tests {
         );
         assert!(
             queue.kv_get(&marker).await.unwrap().is_none(),
-            "the marker is removed rather than retried on every sweep",
+            "the marker is removed and not retried on every sweep",
         );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_malformed_terminal_marker_is_deleted_by_the_sweep() {
-        let (queue, store, clock) = fresh_queue_with_mock_clock(10_000).await;
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store,
-            ScriptedRunner::new(vec![]),
-            ChannelHook { tx },
-        )
-        .memo_retention(Duration::from_secs(60))
-        .build();
-
-        let mut malformed = Vec::from(TERMINAL_KV_PREFIX);
-        malformed.extend_from_slice(b"not-a-timestamp");
-        queue.kv_put(&malformed, b"").await.unwrap();
-
-        advance(&clock, Duration::from_secs(3_600)).await;
-        runtime
-            .inner
-            .core
-            .sweep_expired_memos(Duration::from_secs(60))
-            .await
-            .unwrap();
-        assert!(queue.kv_get(&malformed).await.unwrap().is_none());
+        assert!(queue.kv_get(&unparseable).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -4041,46 +3907,6 @@ mod tests {
         );
 
         let _ = shutdown.send(());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn cancelling_a_pending_run_commits_its_terminal_marker() {
-        struct UnreachableRunner;
-        impl StepRunner for UnreachableRunner {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                unreachable!("worker must not claim the cancelled step");
-            }
-        }
-
-        let (queue, store, _clock) = fresh_queue_with_mock_clock(10_000).await;
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store.clone(),
-            UnreachableRunner,
-            ChannelHook { tx },
-        )
-        .memo_retention(Duration::from_secs(60))
-        .build();
-        // No worker loop: the step stays Pending, so `cancel` takes the
-        // `Removed` arm and its effects commit with the removal.
-
-        let handle = runtime
-            .submit(RunSpec {
-                input: b"x".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(runtime.cancel(&handle.run_id).await.unwrap());
-
-        let markers = terminal_markers(&queue).await;
-        assert_eq!(markers, vec![(handle.run_id.clone(), 10_000)]);
-        assert_eq!(
-            queue.kv_get(&run_kv_key(&handle.run_id)).await.unwrap(),
-            None,
-            "the run record's delete commits in the same transaction",
-        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -4349,11 +4175,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn sweeper_keeps_markers_younger_than_retention() {
+    async fn the_sweeper_clears_a_marker_only_after_retention_elapses() {
         // Retention 200ms (sweep interval also 200ms). Advancing 200ms
         // after the marker is written fires the next sweep tick at the
-        // exact retention boundary; strict `<` means the marker isn't
-        // yet expired, so the sweep must skip it.
+        // exact retention boundary; strict `<` means the marker is not
+        // yet expired, so the sweep must skip it. Advancing past the
+        // boundary must then clear the marker and the run's memo
+        // entries.
         let (queue, store, clock) = fresh_queue_with_mock_clock(10_000).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
@@ -4368,49 +4196,6 @@ mod tests {
         .build();
         let shutdown = spawn_runtime(runtime.clone());
 
-        runtime
-            .submit(RunSpec {
-                input: b"in".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-
-        advance(&clock, Duration::from_millis(200)).await;
-        // Let the sweeper finish its tick.
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
-
-        let markers = terminal_markers(&runtime.inner.core.queue).await;
-        assert_eq!(markers.len(), 1, "boundary marker must not be swept");
-
-        let _ = shutdown.send(());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn sweeper_removes_expired_markers_and_their_memos() {
-        // Retention 100ms (sweep interval 50ms). After the marker is
-        // written we drop a synthetic memo entry for the run and then
-        // advance well past retention; the sweeper must clear both.
-        let (queue, store, clock) = fresh_queue_with_mock_clock(10_000).await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue,
-            store.clone(),
-            ScriptedRunner::new(vec![StepOutcome::Succeed {
-                result: b"done".to_vec(),
-            }]),
-            ChannelHook { tx },
-        )
-        .memo_retention(Duration::from_millis(100))
-        .build();
-        let shutdown = spawn_runtime(runtime.clone());
-
         let handle = runtime
             .submit(RunSpec {
                 input: b"in".to_vec(),
@@ -4422,9 +4207,6 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-
-        // Write a memo entry for the run so we can confirm sweep
-        // clears it along with the marker.
         let memos = MemoStore::new(store.clone(), "workflow-memo");
         memos
             .new_memo(&handle.run_id, 0)
@@ -4432,8 +4214,15 @@ mod tests {
             .await
             .unwrap();
 
-        advance(&clock, Duration::from_millis(300)).await;
+        advance(&clock, Duration::from_millis(200)).await;
+        // Let the sweeper finish its boundary tick.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        let markers = terminal_markers(&runtime.inner.core.queue).await;
+        assert_eq!(markers.len(), 1, "boundary marker must not be swept");
 
+        advance(&clock, Duration::from_millis(300)).await;
         let cleared = yield_until(50, || async {
             terminal_markers(&runtime.inner.core.queue).await.is_empty()
         })

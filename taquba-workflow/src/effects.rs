@@ -237,7 +237,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_reserved_prefix_key_is_rejected() {
+    fn staging_validates_keys_values_and_conflicts() {
         let handle = EffectsHandle::detached();
         assert!(matches!(
             handle.put("workflow/x", "v"),
@@ -247,21 +247,11 @@ mod tests {
             handle.delete("workflow/x"),
             Err(Error::ReservedKvKey(_))
         ));
-    }
-
-    #[test]
-    fn an_oversized_value_is_rejected() {
-        let handle = EffectsHandle::detached();
         let oversized = vec![0u8; taquba::MAX_KV_VALUE_SIZE + 1];
         assert!(matches!(
             handle.put("k", oversized),
             Err(Error::Queue(taquba::Error::KvValueTooLarge { .. }))
         ));
-    }
-
-    #[test]
-    fn a_key_staged_one_way_rejects_the_other() {
-        let handle = EffectsHandle::detached();
         handle.put("a", "v").unwrap();
         assert!(matches!(
             handle.delete("a"),
@@ -286,9 +276,21 @@ mod tests {
     }
 
     #[test]
-    fn a_sealed_terminal_handle_rejects_staging() {
+    fn the_terminal_handle_applies_the_staging_and_seal_rules() {
         let handle = TerminalEffects::for_delivery();
+        assert!(matches!(
+            handle.put("workflow/x", "v"),
+            Err(Error::ReservedKvKey(_))
+        ));
+        assert!(matches!(
+            handle.delete("workflow/x"),
+            Err(Error::ReservedKvKey(_))
+        ));
         handle.put("a", "v").unwrap();
+        assert!(matches!(
+            handle.delete("a"),
+            Err(Error::ConflictingKvEffect(_))
+        ));
         handle.delete("b").unwrap();
         handle
             .enqueue(taquba::EnqueueRequest {
@@ -310,24 +312,6 @@ mod tests {
                 options: Default::default(),
             }),
             Err(Error::EffectsSealed)
-        ));
-    }
-
-    #[test]
-    fn the_terminal_handle_applies_the_kv_staging_rules() {
-        let handle = TerminalEffects::detached();
-        assert!(matches!(
-            handle.put("workflow/x", "v"),
-            Err(Error::ReservedKvKey(_))
-        ));
-        assert!(matches!(
-            handle.delete("workflow/x"),
-            Err(Error::ReservedKvKey(_))
-        ));
-        handle.put("a", "v").unwrap();
-        assert!(matches!(
-            handle.delete("a"),
-            Err(Error::ConflictingKvEffect(_))
         ));
     }
 
