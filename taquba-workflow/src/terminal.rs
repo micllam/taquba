@@ -72,6 +72,60 @@ pub struct RunOutcome {
     pub final_step: u32,
 }
 
+impl RunOutcome {
+    /// A `Succeeded` outcome; `result` holds the runner's result.
+    pub(crate) fn succeeded(
+        run_id: String,
+        result: Vec<u8>,
+        headers: HashMap<String, String>,
+        final_step: u32,
+    ) -> Self {
+        Self {
+            run_id,
+            status: TerminalStatus::Succeeded,
+            result: Some(result),
+            error: None,
+            headers,
+            final_step,
+        }
+    }
+
+    /// A `Failed` outcome; `error` holds the failure reason.
+    pub(crate) fn failed(
+        run_id: String,
+        error: String,
+        headers: HashMap<String, String>,
+        final_step: u32,
+    ) -> Self {
+        Self {
+            run_id,
+            status: TerminalStatus::Failed,
+            result: None,
+            error: Some(error),
+            headers,
+            final_step,
+        }
+    }
+
+    /// A `Cancelled` outcome. `error` is the runner's reason, `None`
+    /// for an external cancellation.
+    pub(crate) fn cancelled(
+        run_id: String,
+        error: Option<String>,
+        headers: HashMap<String, String>,
+        final_step: u32,
+    ) -> Self {
+        Self {
+            run_id,
+            status: TerminalStatus::Cancelled,
+            result: None,
+            error,
+            headers,
+            final_step,
+        }
+    }
+}
+
 /// User-implemented hook processing a run's termination.
 ///
 /// Termination is delivered as a queue job: the settlement that commits

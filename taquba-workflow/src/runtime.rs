@@ -24,7 +24,7 @@ use crate::keys::{
 use crate::kv::KvReadHandle;
 use crate::memo::MemoStore;
 use crate::runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
-use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
+use crate::terminal::{RunOutcome, TerminalHook};
 
 /// The portion of `delay` still ahead of `now_ms`, measured from
 /// `stored_at_ms`. Saturates to the full delay if the clock reads
@@ -560,7 +560,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// terminal, never submitted here, or owned by a different runtime
     /// instance).
     ///
-    /// The run terminates as [`TerminalStatus::Cancelled`] and its
+    /// The run terminates as [`TerminalStatus::Cancelled`](crate::TerminalStatus::Cancelled) and its
     /// notification job is enqueued for the terminal hook:
     ///
     /// - **Pending / scheduled step**: the queued step job is removed
@@ -604,14 +604,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         // the API level. The effects are built before the outcome is
         // known; the queue applies them only on `Removed`.
         let effects = self.inner.terminate_collecting_effects(
-            &RunOutcome {
-                run_id: run_id.to_string(),
-                status: TerminalStatus::Cancelled,
-                result: None,
-                error: None,
-                headers,
-                final_step: current_step,
-            },
+            &RunOutcome::cancelled(run_id.to_string(), None, headers, current_step),
             None,
             None,
         );
@@ -1037,6 +1030,20 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .kv_deletes(kv_deletes)
     }
 
+    /// [`Self::terminate_collecting_effects`] plus
+    /// [`RuntimeCore::forget_run`]: the pairing every worker-path
+    /// termination site performs before its settlement commits.
+    pub(crate) fn worker_terminate(
+        &self,
+        outcome: RunOutcome,
+        priority: Option<u32>,
+        max_attempts: Option<u32>,
+    ) -> SettlementEffects {
+        let effects = self.terminate_collecting_effects(&outcome, priority, max_attempts);
+        self.core.forget_run(&outcome.run_id);
+        effects
+    }
+
     /// Process a terminal-notification job: decode the committed
     /// outcome and run the configured [`TerminalHook`] as the job's
     /// worker. Effects the hook stages join this job's acknowledgement.
@@ -1213,38 +1220,16 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         //    retries and permanent dead-letters), with `error: None` so
         //    consumers can distinguish external vs. runner-issued cancel.
         let settled = match outcome {
-            Ok(StepOutcome::Cancel { reason }) => {
-                let effects = self.terminate_collecting_effects(
-                    &RunOutcome {
-                        run_id: run_id.clone(),
-                        status: TerminalStatus::Cancelled,
-                        result: None,
-                        error: Some(reason),
-                        headers: user_headers,
-                        final_step: step_number,
-                    },
-                    Some(job.priority),
-                    Some(job.max_attempts),
-                );
-                self.core.forget_run(&run_id);
-                Ok(effects)
-            }
-            _ if external_cancel => {
-                let effects = self.terminate_collecting_effects(
-                    &RunOutcome {
-                        run_id: run_id.clone(),
-                        status: TerminalStatus::Cancelled,
-                        result: None,
-                        error: None,
-                        headers: user_headers,
-                        final_step: step_number,
-                    },
-                    Some(job.priority),
-                    Some(job.max_attempts),
-                );
-                self.core.forget_run(&run_id);
-                Ok(effects)
-            }
+            Ok(StepOutcome::Cancel { reason }) => Ok(self.worker_terminate(
+                RunOutcome::cancelled(run_id.clone(), Some(reason), user_headers, step_number),
+                Some(job.priority),
+                Some(job.max_attempts),
+            )),
+            _ if external_cancel => Ok(self.worker_terminate(
+                RunOutcome::cancelled(run_id.clone(), None, user_headers, step_number),
+                Some(job.priority),
+                Some(job.max_attempts),
+            )),
             Ok(StepOutcome::Continue { payload, when }) => match when {
                 Trigger::Immediate => Ok(self
                     .core
@@ -1283,58 +1268,30 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     .await
                 }
             },
-            Ok(StepOutcome::Succeed { result }) => {
-                let effects = self.terminate_collecting_effects(
-                    &RunOutcome {
-                        run_id: run_id.clone(),
-                        status: TerminalStatus::Succeeded,
-                        result: Some(result),
-                        error: None,
-                        headers: user_headers,
-                        final_step: step_number,
-                    },
-                    Some(job.priority),
-                    Some(job.max_attempts),
-                );
-                self.core.forget_run(&run_id);
-                Ok(effects)
-            }
+            Ok(StepOutcome::Succeed { result }) => Ok(self.worker_terminate(
+                RunOutcome::succeeded(run_id.clone(), result, user_headers, step_number),
+                Some(job.priority),
+                Some(job.max_attempts),
+            )),
             Ok(StepOutcome::Fail { reason }) => {
                 // Runner verdict: workflow failed but the step itself ran
                 // cleanly. Ack the step (no dead-letter); the run
                 // terminates as `Failed`.
-                let effects = self.terminate_collecting_effects(
-                    &RunOutcome {
-                        run_id: run_id.clone(),
-                        status: TerminalStatus::Failed,
-                        result: None,
-                        error: Some(reason),
-                        headers: user_headers,
-                        final_step: step_number,
-                    },
+                Ok(self.worker_terminate(
+                    RunOutcome::failed(run_id.clone(), reason, user_headers, step_number),
                     Some(job.priority),
                     Some(job.max_attempts),
-                );
-                self.core.forget_run(&run_id);
-                Ok(effects)
+                ))
             }
             Err(StepError {
                 message,
                 kind: StepErrorKind::Permanent,
             }) => {
-                let effects = self.terminate_collecting_effects(
-                    &RunOutcome {
-                        run_id: run_id.clone(),
-                        status: TerminalStatus::Failed,
-                        result: None,
-                        error: Some(message.clone()),
-                        headers: user_headers,
-                        final_step: step_number,
-                    },
+                let effects = self.worker_terminate(
+                    RunOutcome::failed(run_id.clone(), message.clone(), user_headers, step_number),
                     Some(job.priority),
                     None,
                 );
-                self.core.forget_run(&run_id);
                 Err(FailWith::new(PermanentFailure::new(message), effects).into())
             }
             Err(StepError {
@@ -1346,19 +1303,16 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 // hand; `nack_with` decides whether they apply. The
                 // attempts test applies only to the registry removal.
                 if job.attempts >= job.max_attempts {
-                    let effects = self.terminate_collecting_effects(
-                        &RunOutcome {
-                            run_id: run_id.clone(),
-                            status: TerminalStatus::Failed,
-                            result: None,
-                            error: Some(message.clone()),
-                            headers: user_headers,
-                            final_step: step_number,
-                        },
+                    let effects = self.worker_terminate(
+                        RunOutcome::failed(
+                            run_id.clone(),
+                            message.clone(),
+                            user_headers,
+                            step_number,
+                        ),
                         Some(job.priority),
                         None,
                     );
-                    self.core.forget_run(&run_id);
                     return Err(FailWith::new(WorkerError::from(message), effects).into());
                 }
                 Err(message.into())
@@ -1390,6 +1344,7 @@ mod tests {
     };
     use crate::signal::SignalOutcome;
     use crate::terminal::NoopTerminalHook;
+    use crate::terminal::TerminalStatus;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicU32, Ordering};
     use taquba::object_store::memory::InMemory;

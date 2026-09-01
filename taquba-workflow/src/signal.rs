@@ -22,7 +22,7 @@ use crate::keys::{
 };
 use crate::runner::StepRunner;
 use crate::runtime::{RuntimeCore, RuntimeInner, StepEnqueueOpts, WorkflowRuntime};
-use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
+use crate::terminal::{RunOutcome, TerminalHook};
 
 /// Outcome of [`WorkflowRuntime::signal`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,19 +149,16 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     let message = format!(
                         "a waiter is already registered for correlation key `{correlation_key}`"
                     );
-                    let effects = self.terminate_collecting_effects(
-                        &RunOutcome {
-                            run_id: run_id.to_string(),
-                            status: TerminalStatus::Failed,
-                            result: None,
-                            error: Some(message.clone()),
-                            headers: user_headers.clone(),
-                            final_step: next_step.saturating_sub(1),
-                        },
+                    let effects = self.worker_terminate(
+                        RunOutcome::failed(
+                            run_id.to_string(),
+                            message.clone(),
+                            user_headers.clone(),
+                            next_step.saturating_sub(1),
+                        ),
                         base_opts.priority,
                         None,
                     );
-                    self.core.forget_run(run_id);
                     return Err(FailWith::new(PermanentFailure::new(message), effects).into());
                 }
             }
