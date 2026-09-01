@@ -282,10 +282,11 @@
 //!   replay record stores the staged effects with the outcome, so a
 //!   replayed delivery applies them without invoking the runner.
 //!
-//! The written values are readable through [`taquba::Queue::kv_get`]
-//! and, from another process, through a `taquba::QueueReader`. Layer
-//! crates reserve their own KV prefixes (`workflow/`, `jobs/`);
-//! namespace application keys under a distinct application prefix.
+//! The written values are readable inside a step through [`Step::kv`]
+//! (a [`KvReadHandle`] exposing `get` only, answering from committed
+//! state, so effects staged by the running step are excluded), through
+//! [`taquba::Queue::kv_get`] and, from another process, through a
+//! `taquba::QueueReader`.
 //!
 //! See `examples/kv_effects.rs` for a runnable order flow maintaining a
 //! status row through both surfaces.
@@ -493,6 +494,7 @@
 
 mod effects;
 mod error;
+mod kv;
 mod memo;
 mod runner;
 mod runtime;
@@ -500,6 +502,7 @@ mod terminal;
 
 pub use effects::{EffectsHandle, TerminalEffects};
 pub use error::{Error, Result};
+pub use kv::KvReadHandle;
 pub use memo::{Memo, MemoStore};
 pub use runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 pub use runtime::{

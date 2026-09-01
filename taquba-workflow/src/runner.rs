@@ -6,6 +6,7 @@ use taquba::LeaseHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::effects::EffectsHandle;
+use crate::kv::KvReadHandle;
 use crate::memo::Memo;
 
 /// A single step within a workflow run, handed to [`StepRunner::run_step`].
@@ -100,6 +101,22 @@ pub struct Step {
     /// See [`EffectsHandle`] for the staging rules. Use
     /// [`EffectsHandle::detached`] when constructing a `Step` in tests.
     pub effects: EffectsHandle,
+    /// Read access to the caller KV namespace. A committed value (an
+    /// earlier step's applied effect, a [`crate::RunSpec::kv_writes`]
+    /// entry, a direct [`taquba::Queue::kv_put`]) is readable here;
+    /// effects staged by this step become readable only after it
+    /// settles. The intended use is a read-then-stage marker check:
+    ///
+    /// ```ignore
+    /// if step.kv.get(b"app/indexed/doc-1").await?.is_none() {
+    ///     index_document(&step.payload).await?; // idempotent
+    ///     step.effects.put("app/indexed/doc-1", b"1".to_vec())?;
+    /// }
+    /// ```
+    ///
+    /// See [`KvReadHandle`] for the read semantics. Use
+    /// [`KvReadHandle::detached`] when constructing a `Step` in tests.
+    pub kv: KvReadHandle,
     /// The signal payload, when this step was reached through a
     /// [`Trigger::OnSignal`] wait that a signal resolved: the previous
     /// step continued with `OnSignal`, and a

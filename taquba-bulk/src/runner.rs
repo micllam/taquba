@@ -106,6 +106,7 @@ mod tests {
             lease: taquba::LeaseHandle::detached(),
             memo,
             effects: taquba_workflow::EffectsHandle::detached(),
+            kv: taquba_workflow::KvReadHandle::detached(),
             signal: None,
         }
     }

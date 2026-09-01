@@ -3201,6 +3201,7 @@ name = "taquba-workflow"
 version = "0.10.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "futures-util",
  "rig-agent",
  "rig-core",

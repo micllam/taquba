@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Step` gains the `kv` field, a `KvReadHandle` reading committed
+  values from Taquba's caller KV namespace during a step; `get` is the
+  only operation. The read answers from committed state, so effects
+  staged by the running step become readable once their settlement
+  commits, and it is not transactional with that settlement.
+  `KvReadHandle::detached` builds a handle for constructing a `Step` in
+  tests, whose `get` returns `Ok(None)` for every key.
 - `MAX_RUN_ID_LEN` (128) and `Error::InvalidRunId`: a caller-supplied
   `RunSpec::run_id` must be 1 to 128 bytes of `[A-Za-z0-9_-]`, the same
   rule Taquba applies to a caller-supplied job id. The run id becomes an

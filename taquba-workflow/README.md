@@ -311,10 +311,10 @@ Semantics:
   record stores the staged effects with the outcome, so a replayed
   delivery applies them without invoking the runner.
 
-The written values are readable through `Queue::kv_get` and, from
-another process, through a `QueueReader`. Layer crates reserve their own
-KV prefixes (`workflow/`, `jobs/`); namespace application keys under a
-distinct application prefix.
+The written values are readable inside a step through `Step::kv` (a
+`KvReadHandle` exposing `get` only, answering from committed state, so
+effects staged by the running step are excluded), through
+`Queue::kv_get` and, from another process, through a `QueueReader`.
 
 See [`examples/kv_effects.rs`](examples/kv_effects.rs) for a runnable
 order flow maintaining a status row through both surfaces.

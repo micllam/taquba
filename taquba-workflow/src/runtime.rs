@@ -15,6 +15,7 @@ use tracing::{debug, instrument, warn};
 
 use crate::effects::{EffectsHandle, StagedEffects, TerminalEffects};
 use crate::error::{Error, Result};
+use crate::kv::KvReadHandle;
 use crate::memo::MemoStore;
 use crate::runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
@@ -1574,6 +1575,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             lease: lease.clone(),
             memo: self.memo_store.new_memo(&run_id, step_number),
             effects: effects_handle.clone(),
+            kv: KvReadHandle::for_delivery(self.queue.clone()),
             signal: step_signal,
         };
 
@@ -5306,6 +5308,70 @@ mod tests {
         assert_eq!(outcome.status, TerminalStatus::Succeeded);
         assert_eq!(wait_for_kv(&queue, b"app/step-0").await, b"done");
         assert_eq!(wait_for_kv(&queue, b"app/step-1").await, b"done");
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_step_effect_is_readable_by_the_next_step() {
+        struct ReadingRunner {
+            read_under_staging: Arc<StdMutex<Option<Option<Vec<u8>>>>>,
+        }
+        impl StepRunner for ReadingRunner {
+            async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                let read = step
+                    .kv
+                    .get(b"app/marker")
+                    .await
+                    .map_err(|e| StepError::permanent(e.to_string()))?
+                    .map(|b| b.to_vec());
+                if step.step_number == 0 {
+                    step.effects
+                        .put("app/marker", b"v".to_vec())
+                        .map_err(|e| StepError::permanent(e.to_string()))?;
+                    let staged_read = step
+                        .kv
+                        .get(b"app/marker")
+                        .await
+                        .map_err(|e| StepError::permanent(e.to_string()))?
+                        .map(|b| b.to_vec());
+                    *self.read_under_staging.lock().unwrap() = Some(staged_read);
+                    return Ok(StepOutcome::continue_now(Vec::new()));
+                }
+                Ok(StepOutcome::Succeed {
+                    result: read.unwrap_or_default(),
+                })
+            }
+        }
+
+        let (queue, store) = fresh_queue().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let read_under_staging = Arc::new(StdMutex::new(None));
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            ReadingRunner {
+                read_under_staging: read_under_staging.clone(),
+            },
+            ChannelHook { tx },
+        )
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        assert_eq!(outcome.result.as_deref(), Some(b"v".as_slice()));
+        assert_eq!(*read_under_staging.lock().unwrap(), Some(None));
 
         let _ = shutdown.send(());
     }
