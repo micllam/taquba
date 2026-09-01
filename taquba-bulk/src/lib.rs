@@ -126,6 +126,17 @@
 //! [`BulkCtx::memoized_by_content_with_cached_cost`] so the same counters are
 //! recorded on a cache hit.
 //!
+//! # Application KV effects and reads
+//!
+//! [`BulkCtx::effects`] stages writes and deletes to Taquba's caller KV
+//! namespace, applied atomically with the item's successful completion,
+//! so per-item application state (a result marker, a status row) cannot
+//! diverge from the item's outcome on a crash; a failing item applies
+//! nothing. [`BulkCtx::kv_get`] reads a committed value from the same
+//! namespace; effects staged by the running item are excluded. Both
+//! surfaces delegate to [`taquba_workflow`]'s KV effects, whose staging
+//! rules ([`EffectsHandle`]) apply unchanged.
+//!
 //! # Failure policy
 //!
 //! Per-item failures are recorded, not fatal: each failed item is written to
@@ -169,4 +180,4 @@ pub use progress::{BulkReport, ProgressSnapshot};
 /// Re-exported from [`taquba_workflow`]: the error type a [`Pipeline`]
 /// returns, with [`StepError::transient`] / [`StepError::permanent`]
 /// controlling retry versus immediate dead-letter.
-pub use taquba_workflow::{StepError, StepErrorKind};
+pub use taquba_workflow::{EffectsHandle, StepError, StepErrorKind};

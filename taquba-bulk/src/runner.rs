@@ -37,14 +37,7 @@ impl<P: Pipeline> StepRunner for PipelineRunner<P> {
         let input: P::Input = rmp_serde::from_slice(&step.payload)
             .map_err(|e| StepError::permanent(format!("failed to decode bulk input: {e}")))?;
 
-        let ctx = BulkCtx::new(
-            input,
-            step.run_id.clone(),
-            step.headers.clone(),
-            step.memo.clone(),
-            step.cancel_token.clone(),
-            step.lease.clone(),
-        );
+        let ctx = BulkCtx::new(input, step);
 
         let output = self.pipeline.run(&ctx).await.map_err(Into::into)?;
 

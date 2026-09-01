@@ -6,7 +6,7 @@ use std::future::Future;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use taquba::LeaseHandle;
-use taquba_workflow::{Memo, StepError};
+use taquba_workflow::{EffectsHandle, KvReadHandle, Memo, Step, StepError};
 use tokio_util::sync::CancellationToken;
 
 use crate::cost::CostReport;
@@ -88,8 +88,10 @@ pub trait Pipeline: Send + Sync + 'static {
 ///
 /// Wraps the typed input together with the durable per-item
 /// [memo](taquba_workflow::Memo), a [cost accumulator](CostReport), the
-/// run's cooperative [cancellation token](CancellationToken) and the
-/// delivery's [lease handle](LeaseHandle).
+/// run's cooperative [cancellation token](CancellationToken), the
+/// delivery's [lease handle](LeaseHandle), the item's staged
+/// [KV effects](EffectsHandle) and read access to the caller KV
+/// namespace.
 pub struct BulkCtx<T> {
     /// The deserialized input item for this run.
     pub input: T,
@@ -102,25 +104,22 @@ pub struct BulkCtx<T> {
     cost: CostReport,
     cancel_token: CancellationToken,
     lease: LeaseHandle,
+    effects: EffectsHandle,
+    kv: KvReadHandle,
 }
 
 impl<T> BulkCtx<T> {
-    pub(crate) fn new(
-        input: T,
-        run_id: String,
-        headers: HashMap<String, String>,
-        memo: Memo,
-        cancel_token: CancellationToken,
-        lease: LeaseHandle,
-    ) -> Self {
+    pub(crate) fn new(input: T, step: &Step) -> Self {
         Self {
             input,
-            run_id,
-            headers,
-            memo,
+            run_id: step.run_id.clone(),
+            headers: step.headers.clone(),
+            memo: step.memo.clone(),
             cost: CostReport::new(),
-            cancel_token,
-            lease,
+            cancel_token: step.cancel_token.clone(),
+            lease: step.lease.clone(),
+            effects: step.effects.clone(),
+            kv: step.kv.clone(),
         }
     }
 
@@ -275,6 +274,29 @@ impl<T> BulkCtx<T> {
         &self.lease
     }
 
+    /// The item's staged application KV effects. Writes and deletes
+    /// staged here are applied atomically with the item's successful
+    /// completion; an item that fails applies nothing, and a staged
+    /// value must be correct when applied more than once, since
+    /// delivery is at-least-once. See [`EffectsHandle`] for the
+    /// staging rules.
+    pub fn effects(&self) -> &EffectsHandle {
+        &self.effects
+    }
+
+    /// Read the committed value under `key` from the caller KV
+    /// namespace, `None` when no value exists. Effects staged by this
+    /// item become readable only once its completion commits; see
+    /// [`taquba_workflow::KvReadHandle`] for the read semantics.
+    pub async fn kv_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StepError> {
+        Ok(self
+            .kv
+            .get(key)
+            .await
+            .map_err(StepError::from)?
+            .map(|bytes| bytes.to_vec()))
+    }
+
     /// Snapshot of the cost accumulated so far for this item.
     pub(crate) fn cost(&self) -> CostReport {
         self.cost.clone()
@@ -339,16 +361,27 @@ mod tests {
         payload: &'a [u8],
     }
 
+    fn test_step(store: &MemoStore) -> Step {
+        Step {
+            run_id: "run-1".into(),
+            step_number: 0,
+            payload: Vec::new(),
+            headers: HashMap::new(),
+            job_id: "job-1".into(),
+            attempts: 1,
+            cancel_token: CancellationToken::new(),
+            lease: taquba::LeaseHandle::detached(),
+            memo: store.new_memo("run-1", 0),
+            run_memo: store.new_run_memo("run-1"),
+            effects: EffectsHandle::detached(),
+            kv: KvReadHandle::detached(),
+            signal: None,
+        }
+    }
+
     fn ctx_for_tests() -> BulkCtx<()> {
-        let memo = MemoStore::new(Arc::new(InMemory::new()), "memo").new_memo("run-1", 0);
-        BulkCtx::new(
-            (),
-            "run-1".into(),
-            HashMap::new(),
-            memo,
-            CancellationToken::new(),
-            taquba::LeaseHandle::detached(),
-        )
+        let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
+        BulkCtx::new((), &test_step(&store))
     }
 
     #[tokio::test]
@@ -460,23 +493,9 @@ mod tests {
 
     #[tokio::test]
     async fn memoized_with_cached_cost_records_cost_on_compute_and_memo_hit() {
-        let memo = MemoStore::new(Arc::new(InMemory::new()), "memo").new_memo("run-1", 0);
-        let first_ctx = BulkCtx::new(
-            (),
-            "run-1".into(),
-            HashMap::new(),
-            memo.clone(),
-            CancellationToken::new(),
-            taquba::LeaseHandle::detached(),
-        );
-        let replay_ctx = BulkCtx::new(
-            (),
-            "run-1".into(),
-            HashMap::new(),
-            memo,
-            CancellationToken::new(),
-            taquba::LeaseHandle::detached(),
-        );
+        let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
+        let first_ctx = BulkCtx::new((), &test_step(&store));
+        let replay_ctx = BulkCtx::new((), &test_step(&store));
         let calls = AtomicU32::new(0);
 
         let first = first_ctx
@@ -509,23 +528,9 @@ mod tests {
 
     #[tokio::test]
     async fn memoized_by_content_with_cached_cost_records_cost_on_compute_and_memo_hit() {
-        let memo = MemoStore::new(Arc::new(InMemory::new()), "memo").new_memo("run-1", 0);
-        let first_ctx = BulkCtx::new(
-            (),
-            "run-1".into(),
-            HashMap::new(),
-            memo.clone(),
-            CancellationToken::new(),
-            taquba::LeaseHandle::detached(),
-        );
-        let replay_ctx = BulkCtx::new(
-            (),
-            "run-1".into(),
-            HashMap::new(),
-            memo,
-            CancellationToken::new(),
-            taquba::LeaseHandle::detached(),
-        );
+        let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
+        let first_ctx = BulkCtx::new((), &test_step(&store));
+        let replay_ctx = BulkCtx::new((), &test_step(&store));
         let calls = AtomicU32::new(0);
         let input = ContentInput {
             operation: "classify",

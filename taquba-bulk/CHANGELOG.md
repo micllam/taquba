@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `BulkCtx::effects`, the item's staged application KV effects: writes
+  and deletes applied atomically with the item's successful completion,
+  with a failing item applying nothing. The handle is
+  `taquba-workflow`'s `EffectsHandle`, re-exported from this crate, and
+  its staging rules apply unchanged.
+- `BulkCtx::kv_get`, reading a committed value from Taquba's caller KV
+  namespace; effects staged by the running item are excluded.
+
 ### Fixed
 
 - `Bulk::run` and `Bulk::run_with_shutdown` stop the worker and wait

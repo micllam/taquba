@@ -586,6 +586,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pipelines_staged_write_is_visible_after_the_item_acks() {
+        struct EffectsPipeline;
+        impl Pipeline for EffectsPipeline {
+            type Input = Item;
+            type Output = u32;
+            type Error = StepError;
+
+            async fn run(&self, ctx: &BulkCtx<Item>) -> std::result::Result<u32, StepError> {
+                let seed = ctx.kv_get(b"app/seed").await?.unwrap_or_default();
+                ctx.effects()
+                    .put(format!("app/items/{}", ctx.run_id), seed)
+                    .map_err(StepError::from)?;
+                Ok(ctx.input.n)
+            }
+        }
+
+        let (queue, store) = fresh().await;
+        queue.kv_put(b"app/seed", b"seeded").await.unwrap();
+        let bulk = Bulk::builder(queue.clone(), store, EffectsPipeline)
+            .poll_interval(Duration::from_millis(10))
+            .build();
+
+        let report = tokio::time::timeout(Duration::from_secs(10), bulk.run(vec![Item { n: 1 }]))
+            .await
+            .expect("run finished in time")
+            .unwrap();
+        assert_eq!(report.succeeded, 1);
+
+        assert_eq!(
+            queue.kv_get(b"app/items/item-0").await.unwrap().as_deref(),
+            Some(b"seeded".as_slice()),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn records_failed_items() {
         let (queue, store) = fresh().await;
         let bulk = Bulk::builder(queue, store, Doubler)
