@@ -76,6 +76,12 @@ pub struct ReaderOptions {
     /// on. Without it a reader of a writer with a separate WAL store
     /// cannot see transitions not yet flushed to the primary store.
     pub wal_object_store: Option<Arc<dyn ObjectStore>>,
+    /// When `true`, the reader reads no WAL at open or on refresh and
+    /// observes only state flushed to the primary store. Lowers the
+    /// cost of opening and refreshing a reader, for deployments with
+    /// many readers whose queries tolerate the additional lag.
+    /// Defaults to `false`.
+    pub skip_wal_replay: bool,
 }
 
 impl ReaderOptions {
@@ -123,6 +129,13 @@ impl ReaderOptions {
         self.wal_object_store = wal_object_store.into();
         self
     }
+
+    /// Set [`Self::skip_wal_replay`].
+    #[must_use]
+    pub fn skip_wal_replay(mut self, skip_wal_replay: bool) -> Self {
+        self.skip_wal_replay = skip_wal_replay;
+        self
+    }
 }
 
 impl Default for ReaderOptions {
@@ -134,6 +147,7 @@ impl Default for ReaderOptions {
             payload_store: None,
             payload_path: None,
             wal_object_store: None,
+            skip_wal_replay: false,
         }
     }
 }
@@ -218,6 +232,7 @@ impl QueueReader {
             .with_options(DbReaderOptions {
                 manifest_poll_interval: opts.manifest_poll_interval,
                 checkpoint_lifetime: opts.checkpoint_lifetime,
+                skip_wal_replay: opts.skip_wal_replay,
                 ..DbReaderOptions::default()
             });
         if let Some(wal_object_store) = opts.wal_object_store {
@@ -465,6 +480,31 @@ mod tests {
 
         reader.close().await.unwrap();
         q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reader_skipping_wal_replay_observes_only_flushed_state() {
+        let store = make_store();
+        let q = Queue::open(store.clone(), "test").await.unwrap();
+        // Durable in the WAL and unflushed to the primary store.
+        let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
+
+        let skipping = ReaderOptions::default().skip_wal_replay(true);
+        let reader = QueueReader::open_with_options(store.clone(), "test", skipping.clone())
+            .await
+            .unwrap();
+        assert!(reader.get_job(&id).await.unwrap().is_none());
+        reader.close().await.unwrap();
+
+        // The close flushes the memtable, so a new reader observes the
+        // job without reading the WAL.
+        q.close().await.unwrap();
+        let reader = QueueReader::open_with_options(store, "test", skipping)
+            .await
+            .unwrap();
+        let job = reader.get_job(&id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Pending);
+        reader.close().await.unwrap();
     }
 
     #[tokio::test]
