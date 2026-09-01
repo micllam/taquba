@@ -499,6 +499,7 @@
 
 #![warn(missing_docs)]
 
+mod durable;
 mod effects;
 mod error;
 mod keys;
