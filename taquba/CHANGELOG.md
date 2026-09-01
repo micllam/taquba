@@ -103,6 +103,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   persisted during the delivery appears on the done record; it was
   previously written from the claim's copy and lost the flag.
 - Upgraded the SlateDB dependency to 0.16.0 (from 0.15.0).
+- The claim-recovery scan at open and the retention sweeps set
+  `ScanOptions::read_ahead_bytes`, so one object-store request fetches
+  many blocks; each block previously required its own request.
 
 ### Fixed
 

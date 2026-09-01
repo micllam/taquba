@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use slatedb::IsolationLevel;
+use slatedb::config::ScanOptions;
 use tracing::{debug, warn};
 
 use crate::background::Periodic;
@@ -15,6 +16,19 @@ use crate::lease_registry::DueLease;
 use crate::queue_core::QueueCore;
 use crate::stats::update_stats;
 use crate::txn::{ClaimEnd, Commit, Durability, commit, stage_claim_end};
+
+/// Target bytes fetched per object-store request by the recovery and
+/// retention scans.
+const SWEEP_READ_AHEAD_BYTES: usize = 256 * 1024;
+
+/// [`ScanOptions`] for the recovery and retention scans. Both read
+/// their key prefix sequentially in a single pass, so each fetch reads
+/// a large contiguous span, amortizing object-store round trips.
+/// Blocks are not cached: a swept record is deleted or rewritten and
+/// never read again.
+fn sweep_scan_options() -> ScanOptions {
+    ScanOptions::default().with_read_ahead_bytes(SWEEP_READ_AHEAD_BYTES)
+}
 
 pub(crate) struct Reaper {
     core: Arc<QueueCore>,
@@ -190,7 +204,10 @@ impl QueueCore {
     /// bound.
     pub(crate) async fn requeue_interrupted_claims(&self) -> Result<()> {
         let mut interrupted: Vec<JobRecord> = Vec::new();
-        let mut iter = self.db.scan_prefix(tag_prefix(KeyTag::Claimed), ..).await?;
+        let mut iter = self
+            .db
+            .scan_prefix_with_options(tag_prefix(KeyTag::Claimed), .., &sweep_scan_options())
+            .await?;
         while let Some(kv) = iter.next().await? {
             match JobRecord::decode(&kv.key, &kv.value) {
                 Ok(job) => interrupted.push(job),
@@ -250,7 +267,10 @@ impl QueueCore {
         let min_cutoff = min_cutoff.map(|r| now.saturating_sub(r.as_millis() as u64));
 
         let mut victims: Vec<(Vec<u8>, String, String, Option<String>)> = Vec::new();
-        let mut iter = self.db.scan_prefix(tag_prefix(tag), ..).await?;
+        let mut iter = self
+            .db
+            .scan_prefix_with_options(tag_prefix(tag), .., &sweep_scan_options())
+            .await?;
         while let Some(kv) = iter.next().await? {
             if let Some(min_cutoff) = min_cutoff {
                 let Some(terminal_at_in_key) = parse_key_timestamp(&kv.key, tag) else {
