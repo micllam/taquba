@@ -161,7 +161,8 @@ impl HeartbeatTask {
         };
         self.next_counter += 1;
         let bytes = rmp_serde::to_vec(&record)?;
-        self.core.db.put(heartbeat_key(), bytes).await?;
+        let handle = self.core.db.put(heartbeat_key(), bytes).await?;
+        handle.await_durable().await?;
         Ok(())
     }
 

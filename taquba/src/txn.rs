@@ -1,7 +1,6 @@
 //! Transaction helpers shared by the queue, reaper and scheduler.
 use bytes::Bytes;
 use slatedb::DbTransaction;
-use slatedb::config::WriteOptions;
 
 use tracing::{debug, warn};
 
@@ -99,14 +98,6 @@ pub(crate) enum Durability {
     Deferred,
 }
 
-/// The [`WriteOptions`] for a commit of the given durability.
-pub(crate) fn write_options(durability: Durability) -> WriteOptions {
-    WriteOptions {
-        await_durable: matches!(durability, Durability::Awaited),
-        ..WriteOptions::default()
-    }
-}
-
 /// Outcome of a commit that raised no storage error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Commit {
@@ -119,8 +110,13 @@ pub(crate) enum Commit {
 /// Commit `txn`. A transaction conflict is reported as
 /// [`Commit::Conflict`]; a storage failure is returned as an error.
 pub(crate) async fn commit(txn: DbTransaction, durability: Durability) -> Result<Commit> {
-    match txn.commit_with_options(&write_options(durability)).await {
-        Ok(_) => Ok(Commit::Committed),
+    match txn.commit().await {
+        Ok(handle) => {
+            if let (Durability::Awaited, Some(handle)) = (durability, handle) {
+                handle.await_durable().await?;
+            }
+            Ok(Commit::Committed)
+        }
         Err(e) if e.kind() == slatedb::ErrorKind::Transaction => Ok(Commit::Conflict),
         Err(e) => Err(e.into()),
     }

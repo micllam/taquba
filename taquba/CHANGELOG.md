@@ -99,6 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record, as every other settlement does, so a `cancel_requested`
   persisted during the delivery appears on the done record; it was
   previously written from the claim's copy and lost the flag.
+- Upgraded the SlateDB dependency to 0.16.0 (from 0.15.0).
 
 ### Fixed
 

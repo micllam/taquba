@@ -1079,7 +1079,8 @@ impl Queue {
     /// [`SettlementEffects::kv_writes`] via [`Self::ack_with`].
     pub async fn kv_put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         validate_kv_value_size(value)?;
-        self.core.db.put(user_scoped_key(key), value).await?;
+        let handle = self.core.db.put(user_scoped_key(key), value).await?;
+        handle.await_durable().await?;
         Ok(())
     }
 
@@ -1088,7 +1089,8 @@ impl Queue {
     /// Caller-supplied keys are internally scoped under a reserved
     /// user key tag and cannot collide with Taquba's internal layout.
     pub async fn kv_delete(&self, key: &[u8]) -> Result<()> {
-        self.core.db.delete(user_scoped_key(key)).await?;
+        let handle = self.core.db.delete(user_scoped_key(key)).await?;
+        handle.await_durable().await?;
         Ok(())
     }
 

@@ -14,7 +14,7 @@ use crate::keys::{
 use crate::lease_registry::DueLease;
 use crate::queue_core::QueueCore;
 use crate::stats::update_stats;
-use crate::txn::{ClaimEnd, Commit, Durability, commit, stage_claim_end, write_options};
+use crate::txn::{ClaimEnd, Commit, Durability, commit, stage_claim_end};
 
 pub(crate) struct Reaper {
     core: Arc<QueueCore>,
@@ -215,8 +215,7 @@ impl QueueCore {
             // requeue lost in a crash is redone by the next open from the
             // claimed record it left in place. Nothing else writes at open,
             // so a commit error surfaces to the caller and fails the open.
-            txn.commit_with_options(&write_options(Durability::Deferred))
-                .await?;
+            txn.commit().await?;
             if let Some(pending_key) = pending_key {
                 self.claim_cursor
                     .note_pending_insert(&job.queue, &pending_key);
