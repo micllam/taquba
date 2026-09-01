@@ -7,18 +7,23 @@
 //! expensive operations (LLM calls, paid external APIs, multi-step side
 //! effects) silently re-run on each retry.
 //!
-//! Each memo entry is keyed by `(run_id, step_number, user_key)`, so
-//! distinct steps and runs see independent namespaces. User keys are
-//! SHA-256-hashed before becoming object-store path segments so any
-//! string is a valid key regardless of length or characters.
+//! Each per-step memo entry is keyed by `(run_id, step_number,
+//! user_key)`, so distinct steps and runs see independent namespaces; a
+//! run-scoped memo drops the step dimension and is shared by every step
+//! of its run. User keys are SHA-256-hashed before becoming
+//! object-store path segments so any string is a valid key regardless
+//! of length or characters.
 //!
 //! # Layout
 //!
 //! [`MemoStore`] owns a single object-store prefix and partitions it into
 //! two sub-prefixes:
 //!
-//! - `<prefix>/memos/<run_id>/<step_number>/<sha256(user_key)>`: memo
-//!   entries written by [`Memo::put`].
+//! - `<prefix>/memos/<run_id>/<step_number>/<sha256(user_key)>`: per-step
+//!   memo entries written by [`Memo::put`].
+//! - `<prefix>/memos/<run_id>/run/<sha256(user_key)>`: run-scoped memo
+//!   entries; the `run` segment sits beside the numeric step segments,
+//!   so [`MemoStore::clear_memos_for_run`] removes both kinds together.
 //! - `<prefix>/step-outputs/<run_id>/<step_number>/<sha256(step_payload)>`:
 //!   step-output replay entries written by the workflow runtime when
 //!   enabled.
@@ -100,7 +105,13 @@ impl MemoStore {
 
     /// Build a [`Memo`] bound to `(run_id, step_number)`.
     pub fn new_memo(&self, run_id: impl Into<String>, step_number: u32) -> Memo {
-        Memo::new(self.clone(), run_id, step_number)
+        Memo::new(self.clone(), run_id, MemoScope::Step(step_number))
+    }
+
+    /// Build a [`Memo`] scoped to `run_id` as a whole, shared by every
+    /// step of the run.
+    pub fn new_run_memo(&self, run_id: impl Into<String>) -> Memo {
+        Memo::new(self.clone(), run_id, MemoScope::Run)
     }
 
     /// Delete every memo entry and runtime step-output replay entry for
@@ -165,9 +176,13 @@ impl MemoStore {
         .await
     }
 
-    fn memo_path(&self, run_id: &str, step_number: u32, key: &str) -> Path {
+    fn memo_path(&self, run_id: &str, scope: MemoScope, key: &str) -> Path {
+        let segment = match scope {
+            MemoScope::Step(step_number) => step_number.to_string(),
+            MemoScope::Run => "run".to_string(),
+        };
         self.memos_run_prefix(run_id)
-            .join(step_number.to_string())
+            .join(segment)
             .join(hex_sha256(key.as_bytes()))
     }
 
@@ -186,21 +201,29 @@ impl MemoStore {
     }
 }
 
-/// A view onto a [`MemoStore`] scoped to a specific
-/// `(run_id, step_number)` pair.
+/// The namespace a [`Memo`] is bound to within its run: one step, or
+/// the run as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoScope {
+    Step(u32),
+    Run,
+}
+
+/// A view onto a [`MemoStore`] scoped to a `(run_id, step_number)`
+/// pair, or to a run as a whole.
 #[derive(Clone)]
 pub struct Memo {
     store: MemoStore,
     run_id: String,
-    step_number: u32,
+    scope: MemoScope,
 }
 
 impl Memo {
-    fn new(store: MemoStore, run_id: impl Into<String>, step_number: u32) -> Self {
+    fn new(store: MemoStore, run_id: impl Into<String>, scope: MemoScope) -> Self {
         Self {
             store,
             run_id: run_id.into(),
-            step_number,
+            scope,
         }
     }
 
@@ -209,16 +232,20 @@ impl Memo {
         &self.run_id
     }
 
-    /// The step number this memo is bound to.
-    pub fn step_number(&self) -> u32 {
-        self.step_number
+    /// The step number this memo is bound to; `None` for a run-scoped
+    /// memo.
+    pub fn step_number(&self) -> Option<u32> {
+        match self.scope {
+            MemoScope::Step(step_number) => Some(step_number),
+            MemoScope::Run => None,
+        }
     }
 
     /// Read a previously stored value for `key`, or `Ok(None)` if
     /// none has been written.
     pub async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.store
-            .read_opt(&self.store.memo_path(&self.run_id, self.step_number, key))
+            .read_opt(&self.store.memo_path(&self.run_id, self.scope, key))
             .await
     }
 
@@ -230,10 +257,7 @@ impl Memo {
     /// reflects whatever the most recent attempt wrote.
     pub async fn put(&self, key: &str, value: &[u8]) -> Result<()> {
         self.store
-            .write(
-                &self.store.memo_path(&self.run_id, self.step_number, key),
-                value,
-            )
+            .write(&self.store.memo_path(&self.run_id, self.scope, key), value)
             .await
     }
 
@@ -273,7 +297,7 @@ impl std::fmt::Debug for Memo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Memo")
             .field("run_id", &self.run_id)
-            .field("step_number", &self.step_number)
+            .field("scope", &self.scope)
             .finish_non_exhaustive()
     }
 }
@@ -355,6 +379,22 @@ mod tests {
         at_step_1.put("k", b"step-1").await.unwrap();
         assert_eq!(at_step_0.get("k").await.unwrap(), Some(b"step-0".to_vec()));
         assert_eq!(at_step_1.get("k").await.unwrap(), Some(b"step-1".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn a_run_memo_is_scoped_beside_the_step_memos() {
+        let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
+        let at_step_0 = store.new_memo("run-1", 0);
+        let for_run = store.new_run_memo("run-1");
+        at_step_0.put("k", b"step-0").await.unwrap();
+        for_run.put("k", b"run").await.unwrap();
+        assert_eq!(at_step_0.get("k").await.unwrap(), Some(b"step-0".to_vec()));
+        assert_eq!(for_run.get("k").await.unwrap(), Some(b"run".to_vec()));
+        assert_eq!(
+            store.new_run_memo("run-1").get("k").await.unwrap(),
+            Some(b"run".to_vec()),
+        );
+        assert_eq!(store.new_run_memo("run-2").get("k").await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -474,9 +514,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_memos_for_run_removes_step_output_entries() {
+    async fn clear_memos_for_run_removes_step_output_and_run_memo_entries() {
         let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
         store.new_memo("run-1", 0).put("k", b"memo").await.unwrap();
+        store.new_run_memo("run-1").put("k", b"run").await.unwrap();
         store
             .put_step_output("run-1", 0, b"payload", b"out")
             .await
@@ -484,8 +525,16 @@ mod tests {
 
         let deleted = store.clear_memos_for_run("run-1").await.unwrap();
 
-        assert_eq!(deleted, 2);
+        assert_eq!(deleted, 3);
         assert!(store.new_memo("run-1", 0).get("k").await.unwrap().is_none());
+        assert!(
+            store
+                .new_run_memo("run-1")
+                .get("k")
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(
             store
                 .get_step_output("run-1", 0, b"payload")

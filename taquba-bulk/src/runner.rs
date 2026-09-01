@@ -94,7 +94,7 @@ mod tests {
     }
 
     fn step_with_input(payload: Vec<u8>) -> Step {
-        let memo = MemoStore::new(Arc::new(InMemory::new()), "memo").new_memo("run-1", 0);
+        let memo_store = MemoStore::new(Arc::new(InMemory::new()), "memo");
         Step {
             run_id: "run-1".into(),
             step_number: 0,
@@ -104,7 +104,8 @@ mod tests {
             attempts: 1,
             cancel_token: CancellationToken::new(),
             lease: taquba::LeaseHandle::detached(),
-            memo,
+            memo: memo_store.new_memo("run-1", 0),
+            run_memo: memo_store.new_run_memo("run-1"),
             effects: taquba_workflow::EffectsHandle::detached(),
             kv: taquba_workflow::KvReadHandle::detached(),
             signal: None,

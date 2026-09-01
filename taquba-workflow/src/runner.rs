@@ -88,6 +88,13 @@ pub struct Step {
     ///
     /// See [`Memo`] for the full API.
     pub memo: Memo,
+    /// Run-scoped durable key-value store, shared by every step of the
+    /// run. Entries live beside the per-step [`Step::memo`] entries and
+    /// are removed with them when the run's retention expires. Use it
+    /// for values a later step reads back, such as an accumulating
+    /// journal; the durable channel for the next step's input is
+    /// [`StepOutcome::Continue`]'s payload.
+    pub run_memo: Memo,
     /// Application KV effects for this step. Writes and deletes staged
     /// here are applied in the same transaction as the settlement that
     /// commits the returned outcome, so application state cannot

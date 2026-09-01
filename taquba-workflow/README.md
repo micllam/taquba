@@ -384,11 +384,18 @@ they are not a cross-run cache. If multiple logical operations may
 receive identical inputs, include an operation name in the
 serialized input.
 
+`Step::run_memo` is the run-scoped variant: one namespace shared by
+every step of the run, for values a later step reads back (an
+accumulating journal, for example). Its entries live beside the
+per-step entries and are removed with them when the run's retention
+expires.
+
 Memo entries live in the object store passed to
 `WorkflowRuntime::builder` under the path prefix configured by
 `WorkflowRuntimeBuilder::memo_prefix` (default `"workflow-memo"`).
-`Memo` is strictly per-step; the durable channel between steps is
-`StepOutcome::Continue`'s payload, not memo.
+A memo is a retry-safety cache whose readers tolerate absence by
+re-executing; the durable channel between steps is
+`StepOutcome::Continue`'s payload.
 
 ## Step-output replay
 

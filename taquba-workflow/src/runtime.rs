@@ -1574,6 +1574,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             cancel_token,
             lease: lease.clone(),
             memo: self.memo_store.new_memo(&run_id, step_number),
+            run_memo: self.memo_store.new_run_memo(&run_id),
             effects: effects_handle.clone(),
             kv: KvReadHandle::for_delivery(self.queue.clone()),
             signal: step_signal,
@@ -5372,6 +5373,45 @@ mod tests {
         assert_eq!(outcome.status, TerminalStatus::Succeeded);
         assert_eq!(outcome.result.as_deref(), Some(b"v".as_slice()));
         assert_eq!(*read_under_staging.lock().unwrap(), Some(None));
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_run_memo_written_in_one_step_is_readable_in_the_next() {
+        struct JournalRunner;
+        impl StepRunner for JournalRunner {
+            async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                if step.step_number == 0 {
+                    step.run_memo.put("journal", b"entry").await?;
+                    return Ok(StepOutcome::continue_now(Vec::new()));
+                }
+                let value = step.run_memo.get("journal").await?;
+                Ok(StepOutcome::Succeed {
+                    result: value.unwrap_or_default(),
+                })
+            }
+        }
+
+        let (queue, store) = fresh_queue().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime =
+            WorkflowRuntime::builder(queue, store, JournalRunner, ChannelHook { tx }).build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        assert_eq!(outcome.result.as_deref(), Some(b"entry".as_slice()));
 
         let _ = shutdown.send(());
     }

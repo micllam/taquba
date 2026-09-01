@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commits, and it is not transactional with that settlement.
   `KvReadHandle::detached` builds a handle for constructing a `Step` in
   tests, whose `get` returns `Ok(None)` for every key.
+- `Step` gains the `run_memo` field, a run-scoped `Memo` shared by
+  every step of the run, built by the new `MemoStore::new_run_memo`.
+  Entries live under a `run` segment beside the numeric step segments
+  (`<prefix>/memos/<run_id>/run/`), so `clear_memos_for_run` and the
+  retention sweep remove them with the run's per-step entries.
 - `MAX_RUN_ID_LEN` (128) and `Error::InvalidRunId`: a caller-supplied
   `RunSpec::run_id` must be 1 to 128 bytes of `[A-Za-z0-9_-]`, the same
   rule Taquba applies to a caller-supplied job id. The run id becomes an
@@ -40,6 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `Memo::step_number` returns `Option<u32>`: `Some` for a per-step
+  memo, `None` for a run-scoped one.
 - Built against the `taquba` option setters: `OpenOptions`,
   `QueueConfig`, `EnqueueOptions` and `SettlementEffects` are
   `#[non_exhaustive]` in `taquba` and are constructed through their
