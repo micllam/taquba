@@ -7,24 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-02
+
 ### Changed
 
 - **Breaking (source and storage):** the crate re-exports
-  `taquba_workflow::jobs` and receives no further development; the
-  typed-job implementation moved into `taquba-workflow`, where a job is
-  one workflow run with a single step. `taquba-workflow` is a new
-  dependency and `futures-util` is no longer one. Relative to 0.7: job
-  types are registered on `JobRunnerBuilder::register` before `build`;
-  `result_prefix` is `memo_prefix` and `result_retention` is
-  `retention`, applied through the workflow's memo retention;
-  `JobHandle::status` returns the in-process `RunStatus` and `None` once
-  the job has terminated; `JobContext::job_id` is `JobContext::id`;
-  `JobContext::state` and `try_state` return references bound to the
-  context; `Error::Store` is replaced by `Error::Workflow`. Job ids are
-  workflow run ids: a ULID, or the SHA-256 digest of the idempotency
-  key. The outcome record is stored in the run's memo under the memo
-  prefix (default `"{queue_name}-memo"`); the `jobs/dedup/` KV records
-  and the result-blob store are no longer written or read.
+  `taquba_workflow::jobs` and receives no further development; this is
+  its final release. The implementation moved into `taquba-workflow`,
+  where a job is one workflow run with a single step routed by the job
+  name carried in the run's input. Relative to 0.7:
+  - `taquba-workflow` 0.11 is a new dependency, the minimum `taquba`
+    requirement is 0.12 and `futures-util` is no longer a dependency.
+  - Job types are registered on `JobRunnerBuilder::register` before
+    `build`.
+  - `result_prefix` is `memo_prefix` and `result_retention` is
+    `retention`, applied through the workflow's memo retention. The
+    outcome record is stored in the run's memo under the memo prefix
+    (default `"{queue_name}-memo"`); the `jobs/dedup/` KV records and
+    the result-blob store are no longer written or read.
+  - Job ids are workflow run ids: a ULID, or the SHA-256 digest of the
+    idempotency key.
+  - `JobHandle::status` returns the in-process `RunStatus` and `None`
+    once the job has terminated.
+  - `JobContext::job_id` is `JobContext::id`; `JobContext::state` and
+    `try_state` return references bound to the context.
+  - `Job::classify` returns `taquba_workflow::StepErrorKind`, which
+    `JobError::kind` holds.
+  - `RunnerHandle` is `taquba_workflow::RunnerHandle`; its methods
+    return `taquba_workflow::Result`.
 
 ### Added
 
@@ -37,6 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Breaking (source):** `JobContext::queue`. A handler settles nothing
   itself; the loop that delivered the job settles it.
+- **Breaking (source):** `Error`, `Result` and `ErrorKind`. Operations
+  return `taquba_workflow::Error`, whose `InputMismatch` names the job
+  id and which gains `JobNotFound`; `JoinError::Infra` holds it.
+- **Breaking:** the `jobs.type` header. `SubmitOptions::headers`
+  reserves only the `workflow.` prefix.
 
 ## [0.7.0] - 2026-08-12
 

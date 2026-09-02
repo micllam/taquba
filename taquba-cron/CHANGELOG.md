@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-02
+
 ### Added
 
 - Opt-in backfill: `ScheduleOptions::backfill` takes a `Backfill` policy
@@ -21,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Raised the minimum `taquba` requirement to 0.12.
 - Built against the `taquba` option setters: `OpenOptions`,
   `QueueConfig`, `EnqueueOptions` and `SettlementEffects` are
   `#[non_exhaustive]` in `taquba` and are constructed through their
