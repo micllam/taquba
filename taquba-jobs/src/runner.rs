@@ -888,24 +888,31 @@ mod tests {
         }
     }
 
-    /// A job that extends its lease through the context and reports the
-    /// resulting expiry.
+    /// A job that extends its lease through the context, then waits for
+    /// the test to release it so the extension can be observed while the
+    /// delivery is still running.
     #[derive(Serialize, Deserialize)]
     struct Renewing;
 
+    #[derive(Default)]
+    struct RenewGate {
+        renewed: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
     impl Job for Renewing {
         const NAME: &'static str = "test.renewing";
-        type Output = u64;
+        type Output = ();
         type Error = TestError;
 
-        async fn run(&self, ctx: JobContext<'_>) -> std::result::Result<u64, TestError> {
+        async fn run(&self, ctx: JobContext<'_>) -> std::result::Result<(), TestError> {
             ctx.lease()
                 .ensure_at_least(Duration::from_secs(600))
                 .map_err(|e| TestError(e.to_string()))?;
-            Ok(ctx
-                .queue()
-                .lease_expiry(DEFAULT_QUEUE_NAME, ctx.job_id())
-                .expect("a running delivery holds a lease"))
+            let gate = ctx.state::<Arc<RenewGate>>();
+            gate.renewed.notify_one();
+            gate.release.notified().await;
+            Ok(())
         }
     }
 
@@ -1130,16 +1137,24 @@ mod tests {
         let base = 1_700_000_000_000;
         let (queue, store) =
             open_queue_with_clock("test-renew", MockClock::new(base), QueueConfig::default()).await;
-        let mut runner = JobRunner::builder(queue, store).build();
+        let gate = Arc::new(RenewGate::default());
+        let mut runner = JobRunner::builder(queue.clone(), store)
+            .state(gate.clone())
+            .build();
         runner.register::<Renewing>();
         let handle = runner.spawn(std::future::pending::<()>());
 
         let job = runner.submit(Renewing).await.unwrap();
-        let expiry = job.await.unwrap();
+        gate.renewed.notified().await;
+        let expiry = queue
+            .lease_expiry(DEFAULT_QUEUE_NAME, job.id())
+            .expect("a running delivery holds a lease");
         assert!(
             expiry >= base + 600_000,
             "the extension must reach the lease registry",
         );
+        gate.release.notify_one();
+        job.await.unwrap();
 
         handle.shutdown().await.unwrap();
     }

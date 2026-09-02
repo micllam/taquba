@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Breaking (source):** `JobContext::queue`. A handler settles nothing
+  itself; the loop that delivered the job settles it. The context keeps
+  `lease`, `cancel_token`, `state` and `submit`.
+
 ### Changed
 
 - Built against the `taquba` option setters: `OpenOptions`,

@@ -2,7 +2,7 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use taquba::{LeaseHandle, Queue};
+use taquba::LeaseHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::Result;
@@ -31,10 +31,10 @@ impl State {
 /// The per-call context handed to [`Job::run`].
 ///
 /// Provides access to application state registered on the
-/// [`JobRunner`](crate::JobRunner), the underlying queue, the job's identity
-/// and attempt count, and a cooperative cancellation token. It deliberately
-/// carries no domain-specific clients (HTTP, LLM, etc.); those belong to the
-/// application's registered state or to specialized layers built on top.
+/// [`JobRunner`](crate::JobRunner), the job's identity and attempt count,
+/// the delivery's lease and cancellation token, and follow-up submission.
+/// It holds no domain-specific clients (HTTP, LLM, etc.); those belong to
+/// the application's registered state or to layers built on top.
 pub struct JobContext<'a> {
     submitter: &'a Submitter,
     job_id: &'a str,
@@ -111,11 +111,6 @@ impl<'a> JobContext<'a> {
     /// still runs.
     pub fn lease(&self) -> &LeaseHandle {
         &self.lease
-    }
-
-    /// The underlying taquba queue, for direct queue operations.
-    pub fn queue(&self) -> &'a Arc<Queue> {
-        self.submitter.queue()
     }
 
     /// Submit a follow-up job from within a handler.
