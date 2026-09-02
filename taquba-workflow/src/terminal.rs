@@ -152,8 +152,9 @@ impl RunOutcome {
 /// the notification job in the transaction of that transition, so it
 /// is created exactly once on every worker and cancellation path. A
 /// step the reaper dead-letters after its lease expires, or one
-/// dead-lettered during crash recovery at open, produces no
-/// notification.
+/// dead-lettered during crash recovery at open, is reconciled by the
+/// worker, which terminates the run as failed and enqueues the
+/// notification in one transaction.
 pub trait TerminalHook: Send + Sync {
     /// Process the termination of one run. `outcome` is the committed
     /// terminal state; effects staged on `effects` commit with this

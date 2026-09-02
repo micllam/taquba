@@ -169,10 +169,13 @@
 //! dead-letter, by the attempts-exhausting nack or by the
 //! cancellation's removal, so the notification job is created exactly
 //! once on every worker and cancellation path. Two terminations occur
-//! outside any settlement the runtime performs and therefore produce
-//! no notification: a job the reaper dead-letters after its lease
-//! expires past the attempt limit, and one dead-lettered during crash
-//! recovery when the queue is opened.
+//! outside any settlement the runtime performs: a job the reaper
+//! dead-letters after its lease expires past the attempt limit, and one
+//! dead-lettered during crash recovery when the queue is opened. The
+//! worker reconciles them: whenever the queue's dead count changes it
+//! terminates every run whose dead step job still has a run record, as
+//! `Failed` with the queue record's last error, enqueueing the
+//! notification in the same transaction.
 //!
 //! `WebhookTerminalHook` (behind the `webhooks` feature) delivers HTTP
 //! callbacks via `taquba-webhooks`, staging the delivery enqueue as a

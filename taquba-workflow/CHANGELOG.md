@@ -85,6 +85,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FailureThresholdExceeded`, with `is_permanent` covering them;
   `InputMismatch` also reports a typed job re-submitted with a different
   payload after its outcome record was written.
+- Dead-step reconciliation: `WorkflowRuntime::run` terminates every
+  run whose step job the queue dead-lettered outside the worker (a
+  lease expired past the attempt limit, or crash recovery at open) as
+  `Failed` with the queue record's last error, deleting the run record
+  and enqueueing the terminal notification in one transaction through
+  `taquba::Queue::commit_effects`. A pass runs when the worker starts
+  and whenever the queue's dead count changes.
 - `WorkflowRuntime::spawn`: spawns the worker loop as a task and returns
   a `RunnerHandle` for shutting it down or waiting on it; the `jobs`
   and `bulk` workers are spawned through it and `jobs::RunnerHandle`

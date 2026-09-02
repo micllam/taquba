@@ -5,8 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use taquba::object_store::ObjectStore;
 use taquba::{
-    Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, FailWith, JobRecord, LeaseHandle,
-    PermanentFailure, Queue, SettlementEffects, Worker, WorkerError,
+    Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, FailWith, JobRecord, JobStatus,
+    LeaseHandle, PermanentFailure, Queue, SettlementEffects, Worker, WorkerError,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -650,9 +650,11 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     }
 
     /// Drive the step worker loop until `shutdown` resolves. Spawns up
-    /// to `max_concurrent_steps` step processors and, when
+    /// to `max_concurrent_steps` step processors, the dead-step
+    /// reconciliation that terminates runs whose step the queue
+    /// dead-lettered outside the worker and, when
     /// [`WorkflowRuntimeBuilder::memo_retention`] is set, a
-    /// memo-retention sweeper running in parallel. Both halt cleanly
+    /// memo-retention sweeper, all running in parallel. All halt cleanly
     /// when `shutdown` resolves or the worker errors.
     pub async fn run<F>(&self, shutdown: F) -> Result<()>
     where
@@ -667,7 +669,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         // returns on its own (typically with an error).
         let stop = CancellationToken::new();
 
-        let sweep_handles: Vec<_> = (0..self.inner.core.sweeps.len())
+        let mut background: Vec<_> = (0..self.inner.core.sweeps.len())
             .map(|i| {
                 let inner = self.inner.clone();
                 let token = stop.clone();
@@ -677,6 +679,11 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
                 })
             })
             .collect();
+        background.push({
+            let inner = self.inner.clone();
+            let token = stop.clone();
+            tokio::spawn(async move { inner.run_dead_step_reconciliation(token).await })
+        });
 
         let worker = Arc::new(StepWorker {
             inner: self.inner.clone(),
@@ -703,7 +710,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             }
         };
 
-        for handle in sweep_handles {
+        for handle in background {
             let _ = handle.await;
         }
 
@@ -1076,6 +1083,87 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         let effects = self.terminate_collecting_effects(&outcome, priority, max_attempts);
         self.core.forget_run(&outcome.run_id);
         effects
+    }
+
+    /// Terminate every run whose step job the queue dead-lettered
+    /// outside the worker path: a lease that expired past the attempt
+    /// limit, or a claim dead-lettered by crash recovery when the queue
+    /// was opened. Such a settlement runs no workflow code, so the run
+    /// record and the current-step pointer survive it and no
+    /// notification is enqueued. A dead step job whose run record still
+    /// exists identifies the case exactly, because every worker-path
+    /// dead-letter deletes the record in its own transaction. The run
+    /// terminates as [`TerminalStatus::Failed`] with the queue record's
+    /// last error, through the same effects as a worker-path
+    /// termination committed as one transaction with no transition of
+    /// their own; the runner's failure writes cannot apply, since no
+    /// runner returned. Returns the number of runs terminated.
+    pub(crate) async fn reconcile_dead_steps(&self) -> Result<usize> {
+        const PAGE: usize = 256;
+        let core = &self.core;
+        let mut terminated = 0usize;
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let page = core
+                .queue
+                .list_jobs(&core.queue_name, JobStatus::Dead, cursor.as_deref(), PAGE)
+                .await?;
+            for job in &page.jobs {
+                if job.headers.contains_key(HEADER_TERMINAL) {
+                    continue;
+                }
+                let Ok((run_id, step_number)) = parse_step_headers(job) else {
+                    continue;
+                };
+                if core.queue.kv_get(&run_kv_key(&run_id)).await?.is_none() {
+                    continue;
+                }
+                let error = job
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "step dead-lettered outside the worker".to_string());
+                let outcome = RunOutcome::failed(
+                    run_id.clone(),
+                    error,
+                    split_headers(&job.headers),
+                    step_number,
+                );
+                let effects = self.terminate_collecting_effects(&outcome, Some(job.priority), None);
+                core.queue.commit_effects(effects).await?;
+                core.forget_run(&run_id);
+                warn!(run_id = %run_id, step_number, job_id = %job.id, "terminated a run whose step was dead-lettered outside the worker");
+                terminated += 1;
+            }
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => return Ok(terminated),
+            }
+        }
+    }
+
+    /// The reconciliation loop: a pass when the worker starts, then a
+    /// pass whenever the queue's dead count has changed since the last
+    /// successful pass, checked every poll interval, until `stop` is
+    /// cancelled.
+    async fn run_dead_step_reconciliation(&self, stop: CancellationToken) {
+        let core = &self.core;
+        let mut reconciled_at: Option<i64> = None;
+        loop {
+            match core.queue.stats(&core.queue_name).await {
+                Ok(stats) if reconciled_at != Some(stats.dead) => {
+                    match self.reconcile_dead_steps().await {
+                        Ok(_) => reconciled_at = Some(stats.dead),
+                        Err(err) => warn!("dead-step reconciliation failed: {err}"),
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => warn!("dead-step reconciliation could not read queue stats: {err}"),
+            }
+            tokio::select! {
+                _ = stop.cancelled() => return,
+                _ = tokio::time::sleep(core.poll_interval) => {}
+            }
+        }
     }
 
     /// Process a terminal-notification job: decode the committed
@@ -4864,6 +4952,83 @@ mod tests {
 
         wait_for_drained(&queue).await;
         assert!(queue.kv_get(b"app/override").await.unwrap().is_none());
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_run_dead_lettered_by_the_reaper_is_terminated_by_reconciliation() {
+        struct Hang;
+
+        impl StepRunner for Hang {
+            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                std::future::pending().await
+            }
+        }
+
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions::default()
+            .clock(Arc::new(clock.clone()))
+            .default_queue_config(
+                QueueConfig::default()
+                    .retry_backoff_base(Duration::ZERO)
+                    .lease_duration(Duration::from_secs(1)),
+            )
+            .reaper_interval(Duration::from_millis(50));
+        let store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
+        let queue = Arc::new(
+            Queue::open_with_options(store.clone(), "test", opts)
+                .await
+                .unwrap(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(queue.clone(), store, Hang, ChannelHook { tx })
+            .poll_interval(Duration::from_millis(10))
+            .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        let submitted = runtime
+            .submit(RunSpec {
+                run_id: Some("hung".into()),
+                input: Vec::new(),
+                max_attempts_per_step: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            if queue.stats("workflow-steps").await.unwrap().claimed == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            runtime.status("hung").await.map(|s| s.state),
+            Some(RunState::Running)
+        );
+
+        // The lease expires past the attempt limit: the reaper dead-letters
+        // the step inside the core, with no worker in the loop.
+        advance(&clock, Duration::from_secs(2)).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.run_id, "hung");
+        assert_eq!(outcome.status, TerminalStatus::Failed);
+        assert_eq!(outcome.final_step, 0);
+        assert_eq!(
+            queue
+                .get_job(&submitted.job_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            JobStatus::Dead
+        );
+        assert!(queue.kv_get(&run_kv_key("hung")).await.unwrap().is_none());
+        assert!(queue.kv_get(&step_kv_key("hung")).await.unwrap().is_none());
+        assert!(runtime.status("hung").await.is_none());
 
         let _ = shutdown.send(());
     }
