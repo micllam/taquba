@@ -17,7 +17,7 @@
 //                       the injection (default 2). Must be at most
 //                       N_PHASES.
 //   PHASE_WORK_MS       simulated work per phase execution (default 20).
-//   MEMO                1 wraps phases in BulkCtx::memoized, 0 runs
+//   MEMO                1 wraps phases in Memo::memoized, 0 runs
 //                       them bare (default 1).
 //   MAX_CONCURRENT      items processed in parallel (default 16).
 //   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1).
@@ -81,7 +81,7 @@ impl ResumePipeline {
             Ok::<_, StepError>(value.wrapping_add(1))
         };
         if self.memoize {
-            ctx.memoized(&format!("phase-{phase}"), body).await
+            ctx.memo().memoized(&format!("phase-{phase}"), body).await
         } else {
             body.await
         }

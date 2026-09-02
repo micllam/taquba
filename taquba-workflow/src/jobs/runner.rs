@@ -19,7 +19,8 @@ use crate::jobs::context::{JobContext, State};
 use crate::jobs::error::{Error, Result};
 use crate::jobs::handle::JobHandle;
 use crate::jobs::job::{ErrorKind, Job};
-use crate::outcome::{OutcomeRecord, StoredOutcome, hash_input, read_outcome, write_outcome};
+use crate::keys::hex_sha256;
+use crate::outcome::{hash_input, read_outcome, run_recorded};
 
 /// Reserved header key holding a job's [`Job::NAME`], read by the step
 /// runner to route the run to the registered handler.
@@ -32,14 +33,7 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// The run id of a job with an idempotency key: the hex SHA-256 digest of
 /// the key, so any key maps onto the character set a run id accepts.
 fn run_id_for_key(key: &str) -> String {
-    use sha2::{Digest, Sha256};
-    use std::fmt::Write;
-    let digest = Sha256::digest(key.as_bytes());
-    let mut hex = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(&mut hex, "{byte:02x}");
-    }
-    hex
+    hex_sha256(&[key.as_bytes()])
 }
 
 /// Per-submission overrides for [`JobRunner::submit_with`].
@@ -178,91 +172,56 @@ async fn run_typed<J: Job>(
     inner: Arc<Inner>,
     step: &Step,
 ) -> std::result::Result<StepOutcome, StepError> {
-    // A payload that does not deserialize never will: dead-letter it.
-    let input: J = rmp_serde::from_slice(&step.payload).map_err(|err| {
-        StepError::permanent(format!("invalid payload for job type `{}`: {err}", J::NAME))
-    })?;
-    let input_hash = hash_input(&step.payload);
-    let ctx = JobContext::new(inner, step);
-
-    tracing::info!(
-        job_id = %step.run_id,
-        job_type = J::NAME,
-        attempt = step.attempts,
-        "job started"
-    );
-
-    match input.run(ctx).await {
-        Ok(output) => {
-            // A non-serializable output is a programming error, so a retry
-            // cannot succeed: dead-letter.
-            let bytes = rmp_serde::to_vec_named(&output).map_err(|err| {
-                StepError::permanent(format!(
-                    "job type `{}` produced an output that failed to serialize: {err}",
-                    J::NAME
-                ))
-            })?;
-            let record = OutcomeRecord {
-                input_hash,
-                outcome: StoredOutcome::Success { output: bytes },
-            };
-            // A failed record write is transient: the step retries, and the
-            // handler runs again (handlers are idempotent regardless).
-            write_outcome(&step.run_memo, &record)
-                .await
-                .map_err(|err| StepError::transient(err.to_string()))?;
-            tracing::info!(job_id = %step.run_id, job_type = J::NAME, "job completed");
-            Ok(StepOutcome::Succeed { result: Vec::new() })
-        }
-        Err(error) => {
-            let kind = input.classify(&error);
-            let message = error.to_string();
-            // Record a failure only when this attempt ends the job: a
-            // transient error with attempts left is a retry.
-            let exhausted = step.attempts >= step.max_attempts;
-            if matches!(kind, ErrorKind::Permanent) || exhausted {
-                let record = OutcomeRecord {
-                    input_hash,
-                    outcome: StoredOutcome::Failure {
-                        kind: stored_kind(kind),
-                        message: message.clone(),
-                    },
-                };
-                if let Err(err) = write_outcome(&step.run_memo, &record).await {
-                    tracing::warn!(
-                        job_id = %step.run_id,
-                        "failed to persist the job's failure outcome: {err}"
-                    );
-                }
+    run_recorded(step, async {
+        // A payload that does not deserialize never will: dead-letter it.
+        let input: J = rmp_serde::from_slice(&step.payload).map_err(|err| {
+            StepError::permanent(format!("invalid payload for job type `{}`: {err}", J::NAME))
+        })?;
+        let ctx = JobContext::new(inner, step);
+        tracing::info!(
+            job_id = %step.run_id,
+            job_type = J::NAME,
+            attempt = step.attempts,
+            "job started"
+        );
+        match input.run(ctx).await {
+            Ok(output) => {
+                // A non-serializable output is a programming error, so a
+                // retry cannot succeed: dead-letter.
+                let bytes = rmp_serde::to_vec_named(&output).map_err(|err| {
+                    StepError::permanent(format!(
+                        "job type `{}` produced an output that failed to serialize: {err}",
+                        J::NAME
+                    ))
+                })?;
+                tracing::info!(job_id = %step.run_id, job_type = J::NAME, "job completed");
+                Ok(bytes)
             }
-            match kind {
-                ErrorKind::Permanent => {
-                    tracing::warn!(
-                        job_id = %step.run_id,
-                        job_type = J::NAME,
-                        "job failed permanently: {message}"
-                    );
-                    Err(StepError::permanent(message))
-                }
-                ErrorKind::Transient => {
-                    tracing::warn!(
-                        job_id = %step.run_id,
-                        job_type = J::NAME,
-                        attempt = step.attempts,
-                        "job failed (transient): {message}"
-                    );
-                    Err(StepError::transient(message))
+            Err(error) => {
+                let message = error.to_string();
+                match input.classify(&error) {
+                    ErrorKind::Permanent => {
+                        tracing::warn!(
+                            job_id = %step.run_id,
+                            job_type = J::NAME,
+                            "job failed permanently: {message}"
+                        );
+                        Err(StepError::permanent(message))
+                    }
+                    ErrorKind::Transient => {
+                        tracing::warn!(
+                            job_id = %step.run_id,
+                            job_type = J::NAME,
+                            attempt = step.attempts,
+                            "job failed (transient): {message}"
+                        );
+                        Err(StepError::transient(message))
+                    }
                 }
             }
         }
-    }
-}
-
-fn stored_kind(kind: ErrorKind) -> crate::outcome::StoredErrorKind {
-    match kind {
-        ErrorKind::Transient => crate::outcome::StoredErrorKind::Transient,
-        ErrorKind::Permanent => crate::outcome::StoredErrorKind::Permanent,
-    }
+    })
+    .await
 }
 
 /// The step runner of the workflow runtime: routes each run's single step

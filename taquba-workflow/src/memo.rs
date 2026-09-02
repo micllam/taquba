@@ -47,10 +47,10 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use sha2::{Digest, Sha256};
 use taquba::object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, path::Path};
 
 use crate::error::{Error, Result};
+use crate::keys::hex_sha256;
 
 /// Backing store for [`Memo`] entries, parametrised by an
 /// [`ObjectStore`] and a path prefix. Builds per-step [`Memo`]
@@ -188,7 +188,7 @@ impl MemoStore {
         };
         self.memos_run_prefix(run_id)
             .join(segment)
-            .join(hex_sha256(key.as_bytes()))
+            .join(hex_sha256(&[key.as_bytes()]))
     }
 
     fn memos_run_prefix(&self, run_id: &str) -> Path {
@@ -202,7 +202,7 @@ impl MemoStore {
     fn step_output_path(&self, run_id: &str, step_number: u32, step_payload: &[u8]) -> Path {
         self.step_outputs_run_prefix(run_id)
             .join(step_number.to_string())
-            .join(hex_sha256(step_payload))
+            .join(hex_sha256(&[step_payload]))
     }
 }
 
@@ -328,7 +328,7 @@ impl Memo {
         T: Serialize + ?Sized,
     {
         let bytes = rmp_serde::to_vec_named(input)?;
-        Ok(format!("content:{}", hex_sha256(&bytes)))
+        Ok(format!("content:{}", hex_sha256(&[&bytes])))
     }
 
     /// Read the memo entry stored under [`Self::content_key`] of
@@ -358,18 +358,6 @@ impl std::fmt::Debug for Memo {
             .field("scope", &self.scope)
             .finish_non_exhaustive()
     }
-}
-
-fn hex_sha256(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(&mut hex, "{byte:02x}");
-    }
-    hex
 }
 
 #[cfg(test)]

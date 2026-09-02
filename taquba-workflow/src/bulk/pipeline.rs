@@ -19,9 +19,10 @@ use crate::bulk::cost::CostReport;
 /// A `Pipeline` is a single async [`run`](Pipeline::run) method: the bulk
 /// runner deserializes one input item, builds a [`BulkCtx`] around it, and
 /// awaits `run`. The expensive logical steps inside `run` (LLM calls, paid
-/// APIs, CPU-bound work) are wrapped in [`BulkCtx::memoized`] or
-/// [`BulkCtx::memoized_by_content`] so an at-least-once retry of the item
-/// replays cached step results instead of paying for them twice.
+/// APIs, CPU-bound work) are wrapped in [`Memo::memoized`] or
+/// [`Memo::memoized_by_content`] on [`BulkCtx::memo`], so an at-least-once
+/// retry of the item reads the completed steps back and pays for none of
+/// them twice.
 ///
 /// # Error classification
 ///
@@ -78,8 +79,8 @@ pub trait Pipeline: Send + Sync + 'static {
     type Error: Into<StepError> + Send + 'static;
 
     /// Process one input item. Wrap expensive logical steps in
-    /// [`BulkCtx::memoized`] or [`BulkCtx::memoized_by_content`] to make
-    /// retries cheap.
+    /// [`Memo::memoized`] or [`Memo::memoized_by_content`] on
+    /// [`BulkCtx::memo`] to make retries cheap.
     fn run(
         &self,
         ctx: &BulkCtx<Self::Input>,
@@ -136,83 +137,36 @@ impl<T> BulkCtx<T> {
         }
     }
 
-    /// Return the value memoized under `key`, or run `f`, memoize its
-    /// value under `key` and return it.
-    ///
-    /// This is [`Memo::memoized`] on the item's memo, with memo errors
-    /// converted into the caller's error type: a memo read or write
-    /// failure is a transient [`StepError`] and a failure to serialize
-    /// the computed value is a permanent one. An `Err` from `f` is
-    /// returned unchanged and memoizes nothing.
-    ///
-    /// `key` namespaces the memo within this item; use a distinct key
-    /// per logical step. Calls to [`record_cost`](Self::record_cost)
-    /// inside `f` run only when `f` runs. Use
-    /// [`memoized_with_cached_cost`](Self::memoized_with_cached_cost)
-    /// when memoized results should also contribute to the final cost
-    /// report.
-    pub async fn memoized<R, F, E>(&self, key: &str, f: F) -> Result<R, E>
-    where
-        R: Serialize + DeserializeOwned,
-        F: Future<Output = Result<R, E>>,
-        E: From<StepError>,
-    {
-        self.memo
-            .memoized(key, async { f.await.map_err(MemoizedError::Caller) })
-            .await
-            .map_err(MemoizedError::into_caller)
+    /// The item's durable memo. Wrap each expensive phase of
+    /// [`Pipeline::run`] in [`Memo::memoized`] or
+    /// [`Memo::memoized_by_content`] so a retried item reads the completed
+    /// phases back. Calls to [`record_cost`](Self::record_cost) inside a
+    /// memoized future run only when the future runs; use
+    /// [`memoized_with_cached_cost`](Self::memoized_with_cached_cost) when
+    /// memoized results must also contribute to the cost report.
+    pub fn memo(&self) -> &Memo {
+        &self.memo
     }
 
-    /// [`Self::memoized`] under [`Memo::content_key`] of `input`.
+    /// Run `f` once and memoize both its value and counters under `key`,
+    /// or return the memoized value and replay its counters on a retry.
     ///
-    /// The entry remains scoped to this item's workflow run and step;
-    /// this method does not create a cross-item cache. The derived key
-    /// is stable only when `input` serializes deterministically; types
-    /// with unordered iteration, such as `HashMap`, can serialize the
-    /// same logical content into different bytes and therefore
-    /// different keys. If several logical operations may receive
-    /// identical inputs, include an operation name in the serialized
-    /// input.
-    pub async fn memoized_by_content<K, R, F, E>(&self, input: &K, f: F) -> Result<R, E>
-    where
-        K: Serialize + ?Sized,
-        R: Serialize + DeserializeOwned,
-        F: Future<Output = Result<R, E>>,
-        E: From<StepError>,
-    {
-        self.memo
-            .memoized_by_content(input, async { f.await.map_err(MemoizedError::Caller) })
-            .await
-            .map_err(MemoizedError::into_caller)
-    }
-
-    /// Run `f` once and cache both its value and counters under `key`,
-    /// or return the cached value and replay its counters on a retry.
-    ///
-    /// Use this when cost counters are known only inside a memoized step.
-    /// The closure returns `(value, cost)`, and the helper records the
-    /// `CostReport` after memoization returns, so counters are included
-    /// whether the step computes freshly or hits memo state.
+    /// `f` returns `(value, cost)`, and the counters are recorded after
+    /// memoization returns, so they are included whether the phase runs or
+    /// reads its memo entry.
     pub async fn memoized_with_cached_cost<R, F, E>(&self, key: &str, f: F) -> Result<R, E>
     where
         R: Serialize + DeserializeOwned,
         F: Future<Output = Result<(R, CostReport), E>>,
-        E: From<StepError>,
+        E: From<crate::Error>,
     {
-        let (value, cost) = self.memoized(key, f).await?;
+        let (value, cost) = self.memo.memoized(key, f).await?;
         self.cost.merge(&cost);
         Ok(value)
     }
 
-    /// Run `f` once and cache both its value and counters under a key
-    /// derived from serialized `input`, or return the cached value and
-    /// replay its counters on a retry.
-    ///
-    /// Use this when the memo key should be content-derived and cost
-    /// counters are known only inside the memoized step. The closure
-    /// returns `(value, cost)`, and the helper records the `CostReport`
-    /// after memoization returns, so counters are included whether the
-    /// step computes freshly or hits memo state.
+    /// [`Self::memoized_with_cached_cost`] under [`Memo::content_key`] of
+    /// `input`.
     pub async fn memoized_by_content_with_cached_cost<K, R, F, E>(
         &self,
         input: &K,
@@ -222,9 +176,9 @@ impl<T> BulkCtx<T> {
         K: Serialize + ?Sized,
         R: Serialize + DeserializeOwned,
         F: Future<Output = Result<(R, CostReport), E>>,
-        E: From<StepError>,
+        E: From<crate::Error>,
     {
-        let (value, cost) = self.memoized_by_content(input, f).await?;
+        let (value, cost) = self.memo.memoized_by_content(input, f).await?;
         self.cost.merge(&cost);
         Ok(value)
     }
@@ -282,28 +236,6 @@ impl<T> BulkCtx<T> {
     }
 }
 
-/// Error of a memoized computation before conversion into the caller's
-/// error type: the caller's own error, or a memo error.
-enum MemoizedError<E> {
-    Caller(E),
-    Memo(crate::Error),
-}
-
-impl<E> From<crate::Error> for MemoizedError<E> {
-    fn from(err: crate::Error) -> Self {
-        Self::Memo(err)
-    }
-}
-
-impl<E: From<StepError>> MemoizedError<E> {
-    fn into_caller(self) -> E {
-        match self {
-            Self::Caller(err) => err,
-            Self::Memo(err) => E::from(StepError::from(err)),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,58 +272,6 @@ mod tests {
     fn ctx_for_tests() -> BulkCtx<()> {
         let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
         BulkCtx::new((), &test_step(&store))
-    }
-
-    #[tokio::test]
-    async fn memoized_does_not_cache_errors() {
-        let ctx = ctx_for_tests();
-        let calls = AtomicU32::new(0);
-
-        let err = ctx
-            .memoized::<u32, _, StepError>("k", async {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Err(StepError::transient("boom"))
-            })
-            .await
-            .unwrap_err();
-        assert_eq!(err.message, "boom");
-
-        // A second attempt re-runs because the error was not cached.
-        let ok = ctx
-            .memoized::<u32, _, StepError>("k", async {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Ok(99)
-            })
-            .await
-            .unwrap();
-        assert_eq!(ok, 99);
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn a_memo_error_is_converted_into_the_callers_error_type() {
-        #[derive(Debug)]
-        struct Unserializable;
-
-        impl Serialize for Unserializable {
-            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
-                Err(serde::ser::Error::custom("unserializable"))
-            }
-        }
-
-        impl<'de> serde::Deserialize<'de> for Unserializable {
-            fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
-                Ok(Self)
-            }
-        }
-
-        let ctx = ctx_for_tests();
-        let err = ctx
-            .memoized::<Unserializable, _, StepError>("k", async { Ok(Unserializable) })
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.kind, crate::StepErrorKind::Permanent);
     }
 
     #[tokio::test]

@@ -39,7 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   batch's completion through a terminal marker under
   `workflow/bulk/terminals/` and a sweep at the start of every later run
   and on every retention interval while it runs;
-  `BulkBuilder::clock` overrides the queue's clock; `Error::InvalidBatchId`,
+  `BulkBuilder::clock` overrides the queue's clock; `BulkCtx::memoized`
+  and `memoized_by_content` are replaced by `BulkCtx::memo`, the item's
+  `Memo`, and the two cost-recording variants take an error type
+  convertible from `taquba_workflow::Error`; `Error::InvalidBatchId`,
   `ReservedHeader`, `DuplicateKey`, `BatchMismatch`, `BatchNotFound`,
   `Decode` and `Store` are new. `serde_json` is a dependency.
 - The `jobs` module: typed single-function jobs, moved from the

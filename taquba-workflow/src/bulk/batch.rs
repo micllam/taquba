@@ -29,6 +29,7 @@ use crate::bulk::progress::{BatchStatus, BulkReport, ItemMarker, ProgressSnapsho
 use crate::bulk::runner::{ItemEnvelope, PipelineRunner};
 use crate::keys::{
     BULK_TERMINAL_KV_PREFIX, bulk_item_kv_key, bulk_items_kv_prefix, bulk_terminal_kv_key,
+    hex_sha256,
 };
 use crate::outcome::{StoredOutcome, read_outcome};
 use crate::sweep::sweep_expired;
@@ -51,18 +52,7 @@ const RESERVED_HEADER_PREFIX: &str = "bulk.";
 /// `{batch_id}/{key}`, so batches never share run state and any key string
 /// maps onto the character set a run id accepts.
 pub(crate) fn item_run_id(batch_id: &str, key: &str) -> String {
-    use sha2::{Digest, Sha256};
-    use std::fmt::Write;
-    let mut hasher = Sha256::new();
-    hasher.update(batch_id.as_bytes());
-    hasher.update(b"/");
-    hasher.update(key.as_bytes());
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(&mut hex, "{byte:02x}");
-    }
-    hex
+    hex_sha256(&[batch_id.as_bytes(), b"/", key.as_bytes()])
 }
 
 /// Counters plus the wake-up primitive the runner waits on. Shared between

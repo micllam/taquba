@@ -12,23 +12,23 @@
 //!
 //! Each input item becomes one [`crate`] run whose single step
 //! invokes [`Pipeline::run`]. The pipeline's own logical steps live inside
-//! that method as [`BulkCtx::memoized`] or
-//! [`BulkCtx::memoized_by_content`] calls. Taquba delivers at-least-once, so
+//! that method as [`Memo::memoized`](crate::Memo::memoized) calls on
+//! [`BulkCtx::memo`]. Taquba delivers at-least-once, so
 //! a step may run again if its lease expires before it acks; memoization makes
 //! that replay inexpensive, because each completed logical step returns its
 //! cached result instead of repeating a paid call. A pipeline error retries with
 //! backoff and then dead-letters the item (terminating it failed); the rest of
 //! the batch is unaffected.
 //!
-//! [`BulkCtx::memoized`] is [`crate`]'s per-step memo store
-//! applied at a finer granularity: the item's single step holds one memo
-//! entry per logical phase, so the phases of [`Pipeline::run`] resume
-//! individually even though the workflow sees one step.
+//! [`BulkCtx::memo`] is the run's per-step memo applied at a finer
+//! granularity: the item's single step holds one memo entry per logical
+//! phase, so the phases of [`Pipeline::run`] resume individually even
+//! though the workflow sees one step.
 //!
 //! # Content-addressed memoization
 //!
-//! Use [`BulkCtx::memoized_by_content`] when the natural memo key is a
-//! serialized input value rather than a caller-supplied string:
+//! Use [`Memo::memoized_by_content`](crate::Memo::memoized_by_content) when
+//! the natural memo key is a serialized input value:
 //!
 //! ```ignore
 //! #[derive(serde::Serialize)]
@@ -42,6 +42,7 @@
 //!     query: &ctx.input.body,
 //! };
 //! let response = ctx
+//!     .memo()
 //!     .memoized_by_content(&key, async {
 //!         Ok::<_, StepError>(lookup(&ctx.input.body).await?)
 //!     })

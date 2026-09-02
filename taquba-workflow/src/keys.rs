@@ -125,6 +125,21 @@ pub(crate) fn parse_timestamped_kv_key(prefix: &[u8], key: &[u8]) -> Option<(Str
 /// caller-supplied job id. An empty run id would resolve to the memo
 /// prefix itself, whose entries the retention sweep would then remove
 /// for every run.
+/// The lowercase hex SHA-256 digest of `parts` concatenated.
+pub(crate) fn hex_sha256(parts: &[&[u8]]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    let mut hex = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
+
 pub(crate) fn validate_run_id(run_id: &str) -> Result<()> {
     let reason = if run_id.is_empty() {
         "run id must not be empty"
