@@ -1,128 +1,135 @@
-//! The memo-retention sweep: a periodic pass that reads the terminal
-//! markers oldest first, removes the memo entries of each run whose
-//! marker is older than the retention window and then removes the
-//! marker. Runs only when
-//! [`WorkflowRuntimeBuilder::memo_retention`](crate::WorkflowRuntimeBuilder::memo_retention)
-//! is set. Deletion is unguarded by design: every consumer of a swept
-//! entry tolerates its absence and re-executes the step.
+//! Retention sweeps. A [`Sweep`] names the marker prefix of one kind of
+//! entity (a run, a batch), the window after an entity's terminal marker
+//! during which its state is retained and the removal of one entity's
+//! state. Markers are `{prefix}{ts:020}/{id}` keys in the caller KV
+//! namespace (see [`crate::keys::timestamped_kv_key`]), so a prefix scan
+//! reads them oldest first; a pass removes each expired entity's state
+//! and then its marker, and stops at the first unexpired marker.
+//! Deletion is unguarded by design: every consumer of a swept entry
+//! tolerates its absence and re-executes the step.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
+use taquba::{Clock, Queue};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::error::Result;
-use std::future::Future;
+use crate::keys::{parse_timestamped_kv_key, validate_run_id};
 
-use taquba::Queue;
-
-use crate::keys::{TERMINAL_KV_PREFIX, parse_timestamped_kv_key, validate_run_id};
-use crate::runtime::RuntimeCore;
-
-/// Terminal markers read per page by the memo-retention sweep.
+/// Terminal markers read per page by a sweep pass.
 const SWEEP_PAGE_SIZE: usize = 256;
 
-impl RuntimeCore {
-    /// Memo-retention sweep loop. Runs only when
-    /// [`WorkflowRuntimeBuilder::memo_retention`] was set; the first
-    /// tick fires immediately so a fresh runtime catches markers left
-    /// behind by an earlier process, then ticks every `retention` until
-    /// `shutdown` is cancelled.
-    pub(crate) async fn run_memo_sweep(&self, shutdown: CancellationToken) {
-        let Some(retention) = self.memo_retention else {
-            return;
-        };
-        let mut ticker = tokio::time::interval(retention);
+type ClearError = Box<dyn std::error::Error + Send + Sync>;
+type ClearFuture = Pin<Box<dyn Future<Output = std::result::Result<(), ClearError>> + Send>>;
+type ClearFn = Arc<dyn Fn(String) -> ClearFuture + Send + Sync>;
+
+/// One retention sweep: which markers it reads, how long an entity is
+/// retained after its marker and how an entity's state is removed.
+pub(crate) struct Sweep {
+    prefix: &'static [u8],
+    retention: Duration,
+    clear: ClearFn,
+}
+
+impl Sweep {
+    /// A sweep over the markers under `prefix`, removing an entity's
+    /// state with `clear` once its marker is older than `retention`.
+    ///
+    /// Panics if `retention < 1ms`: smaller values would turn the sweep
+    /// loop into a hot spin.
+    pub(crate) fn new<F, Fut, E>(prefix: &'static [u8], retention: Duration, clear: F) -> Self
+    where
+        F: Fn(String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::result::Result<(), E>> + Send + 'static,
+        E: Into<ClearError>,
+    {
+        assert!(
+            retention >= Duration::from_millis(1),
+            "retention must be at least 1ms",
+        );
+        Self {
+            prefix,
+            retention,
+            clear: Arc::new(move |id| {
+                let fut = clear(id);
+                Box::pin(async move { fut.await.map_err(Into::into) })
+            }),
+        }
+    }
+
+    /// The sweep loop: the first pass runs immediately so a fresh
+    /// process catches markers left behind by an earlier one, then one
+    /// pass every `retention` until `stop` is cancelled. A failed pass
+    /// is logged; the next pass retries.
+    pub(crate) async fn run(&self, queue: &Queue, clock: &dyn Clock, stop: CancellationToken) {
+        let mut ticker = tokio::time::interval(self.retention);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = shutdown.cancelled() => return,
+                _ = stop.cancelled() => return,
                 _ = ticker.tick() => {
-                    if let Err(err) = self.sweep_expired_memos(retention).await {
-                        warn!("memo retention sweep failed: {err}");
+                    if let Err(err) = self.pass(queue, clock).await {
+                        warn!(prefix = %String::from_utf8_lossy(self.prefix), "retention sweep failed: {err}");
                     }
                 }
             }
         }
     }
 
-    /// One pass of memo retention: list the terminal markers older
-    /// than `retention` and, for each, delete the run's memo entries
-    /// and then the marker. Returns the number of runs whose memos
-    /// were cleared. Errors on individual entries are logged and
-    /// skipped (the next pass retries) so a transient failure on one
-    /// marker doesn't stall the rest of the sweep.
-    pub(crate) async fn sweep_expired_memos(&self, retention: Duration) -> Result<usize> {
-        let cutoff = self
-            .clock
+    /// One pass: clear every entity whose marker is more than `retention`
+    /// before the clock's current time, then remove the marker. Returns
+    /// the number of entities cleared. A malformed marker, or one whose
+    /// id is not a valid run id, is deleted without clearing anything; a
+    /// failure to clear one entity leaves its marker for the next pass,
+    /// and the pass continues.
+    pub(crate) async fn pass(&self, queue: &Queue, clock: &dyn Clock) -> Result<usize> {
+        let cutoff_ms = clock
             .now_ms()
-            .saturating_sub(retention.as_millis() as u64);
-        let memo_store = &self.memo_store;
-        sweep_expired(
-            &self.queue,
-            TERMINAL_KV_PREFIX,
-            cutoff,
-            |run_id| async move { memo_store.clear_memos_for_run(&run_id).await },
-        )
-        .await
-    }
-}
-
-/// Remove the state of every entity whose marker under `prefix` (a
-/// `{ts:020}/{id}` key, see [`crate::keys::timestamped_kv_key`]) is older
-/// than `cutoff_ms`, then the marker. The scan stops at the first unexpired
-/// marker. A malformed marker, or one whose id is not a valid run id, is
-/// deleted without clearing anything. A failure to clear one entity leaves
-/// its marker for the next sweep.
-pub(crate) async fn sweep_expired<F, Fut, T>(
-    queue: &Queue,
-    prefix: &[u8],
-    cutoff_ms: u64,
-    mut clear: F,
-) -> Result<usize>
-where
-    F: FnMut(String) -> Fut,
-    Fut: Future<Output = std::result::Result<T, crate::Error>>,
-{
-    let mut cleared = 0usize;
-    let mut cursor: Option<Vec<u8>> = None;
-    loop {
-        let page = queue
-            .kv_scan(prefix, cursor.as_deref(), SWEEP_PAGE_SIZE)
-            .await?;
-        let exhausted = page.next_cursor.is_none();
-        cursor = page.next_cursor;
-        for (key, _) in page.entries {
-            let parsed = parse_timestamped_kv_key(prefix, &key)
-                .filter(|(id, _)| validate_run_id(id).is_ok());
-            let Some((id, ts_ms)) = parsed else {
-                warn!(
-                    key = %String::from_utf8_lossy(&key),
-                    "malformed marker; deleting without clearing",
-                );
-                if let Err(err) = queue.kv_delete(&key).await {
+            .saturating_sub(self.retention.as_millis() as u64);
+        let mut cleared = 0usize;
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let page = queue
+                .kv_scan(self.prefix, cursor.as_deref(), SWEEP_PAGE_SIZE)
+                .await?;
+            let exhausted = page.next_cursor.is_none();
+            cursor = page.next_cursor;
+            for (key, _) in page.entries {
+                let parsed = parse_timestamped_kv_key(self.prefix, &key)
+                    .filter(|(id, _)| validate_run_id(id).is_ok());
+                let Some((id, ts_ms)) = parsed else {
                     warn!(
                         key = %String::from_utf8_lossy(&key),
-                        "malformed marker delete failed during sweep: {err}",
+                        "malformed marker; deleting without clearing",
                     );
+                    if let Err(err) = queue.kv_delete(&key).await {
+                        warn!(
+                            key = %String::from_utf8_lossy(&key),
+                            "malformed marker delete failed during sweep: {err}",
+                        );
+                    }
+                    continue;
+                };
+                if ts_ms >= cutoff_ms {
+                    return Ok(cleared);
                 }
-                continue;
-            };
-            if ts_ms >= cutoff_ms {
+                if let Err(err) = (self.clear)(id.clone()).await {
+                    warn!(id = %id, "clear failed during sweep: {err}");
+                    continue;
+                }
+                if let Err(err) = queue.kv_delete(&key).await {
+                    warn!(id = %id, "marker delete failed during sweep: {err}");
+                    continue;
+                }
+                cleared += 1;
+            }
+            if exhausted {
                 return Ok(cleared);
             }
-            if let Err(err) = clear(id.clone()).await {
-                warn!(id = %id, "clear failed during sweep: {err}");
-                continue;
-            }
-            if let Err(err) = queue.kv_delete(&key).await {
-                warn!(id = %id, "marker delete failed during sweep: {err}");
-                continue;
-            }
-            cleared += 1;
-        }
-        if exhausted {
-            return Ok(cleared);
         }
     }
 }

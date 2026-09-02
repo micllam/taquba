@@ -14,7 +14,6 @@ use serde_json::Value;
 use taquba::object_store::ObjectStore;
 use taquba::{Clock, Queue};
 use tokio::sync::Semaphore;
-use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::bulk::cost::CostReport;
@@ -30,7 +29,7 @@ use crate::keys::{
 use crate::outcome::{
     OutcomeRecord, StoredOutcome, Terminal, Unrecorded, read_outcome, wait_terminal,
 };
-use crate::sweep::sweep_expired;
+use crate::sweep::Sweep;
 
 /// Default queue name for bulk item steps.
 const DEFAULT_QUEUE_NAME: &str = "bulk-items";
@@ -171,6 +170,50 @@ where
     }
 }
 
+/// The durable state of batches: manifests and outcome records in the
+/// object store, item markers in the queue's KV namespace.
+#[derive(Clone)]
+struct BatchStore {
+    queue: Arc<Queue>,
+    memo_store: MemoStore,
+    manifests: ManifestStore,
+}
+
+impl BatchStore {
+    /// Remove the durable state of batch `id`: its manifest, item markers,
+    /// memo entries and outcome records. A batch without a manifest has
+    /// its markers removed and nothing else.
+    async fn forget(&self, id: &str) -> Result<()> {
+        if let Some(manifest) = self.manifests.read(id).await? {
+            for item in &manifest.items {
+                self.memo_store
+                    .clear_memos_for_run(&item_run_id(id, &item.key))
+                    .await?;
+            }
+        }
+        let prefix = bulk_items_kv_prefix(id);
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let page = self
+                .queue
+                .kv_scan(&prefix, cursor.as_deref(), 1000)
+                .await
+                .map_err(crate::Error::from)?;
+            for (key, _) in &page.entries {
+                self.queue
+                    .kv_delete(key)
+                    .await
+                    .map_err(crate::Error::from)?;
+            }
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        self.manifests.delete(id).await
+    }
+}
+
 /// Closure that derives an item's key from its input.
 type KeyFn<I> = Box<dyn Fn(&I) -> String + Send + Sync>;
 
@@ -270,6 +313,10 @@ impl<P: Pipeline> BulkBuilder<P> {
     /// batches are retained until [`Batch::forget`]. The window counts
     /// from the batch's first completion: a run of the same batch inside
     /// the window completes against the same expiry.
+    ///
+    /// # Panics
+    ///
+    /// [`build`](Self::build) panics if `retention < 1ms`.
     pub fn batch_retention(mut self, retention: Duration) -> Self {
         self.batch_retention = Some(retention);
         self
@@ -285,25 +332,31 @@ impl<P: Pipeline> BulkBuilder<P> {
     /// Finalize the builder.
     pub fn build(self) -> Bulk<P> {
         let sink: Arc<dyn OutputSink> = self.sink.unwrap_or_else(|| Arc::new(NullSink));
-        let memo_store = MemoStore::new(self.object_store.clone(), self.memo_prefix.clone());
-        let manifests = ManifestStore::new(self.object_store.clone(), self.memo_prefix.clone());
+        let store = BatchStore {
+            queue: self.queue.clone(),
+            memo_store: MemoStore::new(self.object_store.clone(), self.memo_prefix.clone()),
+            manifests: ManifestStore::new(self.object_store.clone(), self.memo_prefix.clone()),
+        };
         let runner = PipelineRunner::new(self.pipeline);
-        let queue = self.queue.clone();
-        let clock = self.clock.unwrap_or_else(|| queue.clock());
-        let runtime =
+        let clock = self.clock.unwrap_or_else(|| self.queue.clock());
+        let mut builder =
             WorkflowRuntime::builder(self.queue, self.object_store, runner, NoopTerminalHook)
                 .queue_name(self.queue_name)
                 .memo_prefix(self.memo_prefix)
                 .max_concurrent_steps(self.max_concurrent)
                 .poll_interval(self.poll_interval)
-                .clock(clock.clone())
-                .build();
+                .clock(clock.clone());
+        if let Some(retention) = self.batch_retention {
+            let store = store.clone();
+            builder = builder.sweep(Sweep::new(BULK_TERMINAL_KV_PREFIX, retention, move |id| {
+                let store = store.clone();
+                async move { store.forget(&id).await }
+            }));
+        }
         Bulk {
             inner: Arc::new(BulkInner {
-                runtime,
-                queue,
-                memo_store,
-                manifests,
+                runtime: builder.build(),
+                store,
                 batches: Arc::default(),
                 sink,
                 key_fn: self.key_fn,
@@ -332,9 +385,7 @@ pub struct Bulk<P: Pipeline> {
 /// worker task.
 struct BulkInner<P: Pipeline> {
     runtime: WorkflowRuntime<PipelineRunner<P>, NoopTerminalHook>,
-    queue: Arc<Queue>,
-    memo_store: MemoStore,
-    manifests: ManifestStore,
+    store: BatchStore,
     batches: Arc<ActiveBatches>,
     sink: Arc<dyn OutputSink>,
     key_fn: Option<KeyFn<P::Input>>,
@@ -390,27 +441,7 @@ impl<P: Pipeline> Bulk<P> {
     {
         assert!(!self.spawned, "Bulk::spawn may only be called once");
         self.spawned = true;
-        let inner = self.inner.clone();
-        let token = CancellationToken::new();
-        let worker_token = token.clone();
-        let join = tokio::spawn(async move {
-            let combined_shutdown = async move {
-                tokio::select! {
-                    _ = shutdown => {}
-                    _ = worker_token.cancelled() => {}
-                }
-            };
-            // The sweep lives exactly as long as the worker loop.
-            let sweep_stop = CancellationToken::new();
-            let worker = async {
-                let result = inner.runtime.run(combined_shutdown).await;
-                sweep_stop.cancel();
-                result
-            };
-            let (result, ()) = tokio::join!(worker, inner.run_batch_sweep(sweep_stop.clone()));
-            result
-        });
-        RunnerHandle::new(token, join)
+        self.inner.runtime.spawn(shutdown)
     }
 
     /// A handle on the batch named `id`, which must be 1 to 128 bytes of
@@ -463,69 +494,6 @@ impl<P: Pipeline> BulkInner<P> {
         })
     }
 
-    /// Remove the durable state of batch `id`: its manifest, item markers,
-    /// memo entries and outcome records. A batch without a manifest has
-    /// its markers removed and nothing else.
-    async fn forget_batch(&self, id: &str) -> crate::Result<()> {
-        if let Some(manifest) = self.manifests.read(id).await.map_err(bulk_to_workflow)? {
-            for item in &manifest.items {
-                self.memo_store
-                    .clear_memos_for_run(&item_run_id(id, &item.key))
-                    .await?;
-            }
-        }
-        let prefix = bulk_items_kv_prefix(id);
-        let mut cursor: Option<Vec<u8>> = None;
-        loop {
-            let page = self.queue.kv_scan(&prefix, cursor.as_deref(), 1000).await?;
-            for (key, _) in &page.entries {
-                self.queue.kv_delete(key).await?;
-            }
-            match page.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-        }
-        self.manifests.delete(id).await.map_err(bulk_to_workflow)
-    }
-
-    /// Remove every batch whose terminal marker is older than the retention
-    /// window.
-    async fn sweep_expired_batches(&self, retention: Duration) -> crate::Result<usize> {
-        let cutoff = self
-            .clock
-            .now_ms()
-            .saturating_sub(retention.as_millis() as u64);
-        sweep_expired(
-            &self.queue,
-            BULK_TERMINAL_KV_PREFIX,
-            cutoff,
-            |id| async move { self.forget_batch(&id).await },
-        )
-        .await
-    }
-
-    /// Batch retention sweep loop. Runs only when
-    /// [`BulkBuilder::batch_retention`] was set; the first tick fires
-    /// immediately, then every `retention` until `stop` is cancelled.
-    async fn run_batch_sweep(&self, stop: CancellationToken) {
-        let Some(retention) = self.batch_retention else {
-            return;
-        };
-        let mut ticker = tokio::time::interval(retention);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                _ = stop.cancelled() => return,
-                _ = ticker.tick() => {
-                    if let Err(err) = self.sweep_expired_batches(retention).await {
-                        warn!("batch retention sweep failed: {err}");
-                    }
-                }
-            }
-        }
-    }
-
     /// Run one item to its terminal state in this process: answer it from
     /// a success record, or submit it (a failure record is ignored so the
     /// item runs again), wait for the run to terminate and fold the
@@ -539,7 +507,7 @@ impl<P: Pipeline> BulkInner<P> {
     ) -> Result<()> {
         let ManifestItem { key, input } = item;
         let run_id = item_run_id(batch_id, &key);
-        let run_memo = self.memo_store.new_run_memo(&run_id);
+        let run_memo = self.store.memo_store.new_run_memo(&run_id);
         if let Some(record) = read_outcome(&run_memo).await?
             && matches!(record.outcome, StoredOutcome::Success { .. })
         {
@@ -565,7 +533,7 @@ impl<P: Pipeline> BulkInner<P> {
         };
         let terminal = loop {
             let waited = wait_terminal(
-                &self.queue,
+                &self.store.queue,
                 &run_memo,
                 submitted.job_id.as_deref(),
                 WAIT_CHUNK,
@@ -612,19 +580,6 @@ impl<P: Pipeline> BulkInner<P> {
     }
 }
 
-/// Present a bulk error as a workflow error for the sweep, which reports
-/// through the runtime's error type.
-fn bulk_to_workflow(err: Error) -> crate::Error {
-    match err {
-        Error::Workflow(inner) => inner,
-        Error::Store(inner) => crate::Error::Store(inner),
-        other => crate::Error::Store(taquba::object_store::Error::Generic {
-            store: "bulk",
-            source: Box::new(other),
-        }),
-    }
-}
-
 /// A handle on one batch of a [`Bulk`] runner. Obtained from
 /// [`Bulk::batch`] or [`Bulk::new_batch`].
 pub struct Batch<'a, P: Pipeline> {
@@ -663,12 +618,12 @@ impl<P: Pipeline> Batch<'_, P> {
             batch_id: self.id.clone(),
             items: self.materialize(inputs)?,
         };
-        match self.inner.manifests.read(&self.id).await? {
+        match self.inner.store.manifests.read(&self.id).await? {
             Some(existing) if existing.items != manifest.items => {
                 return Err(Error::BatchMismatch(self.id.clone()));
             }
             Some(_) => {}
-            None => self.inner.manifests.write(&manifest).await?,
+            None => self.inner.store.manifests.write(&manifest).await?,
         }
         self.drive(manifest.items).await
     }
@@ -682,6 +637,7 @@ impl<P: Pipeline> Batch<'_, P> {
         self.check_headers()?;
         let manifest = self
             .inner
+            .store
             .manifests
             .read(&self.id)
             .await?
@@ -703,6 +659,7 @@ impl<P: Pipeline> Batch<'_, P> {
     pub async fn status(&self) -> Result<BatchStatus> {
         let inner = self.inner;
         let manifest = inner
+            .store
             .manifests
             .read(&self.id)
             .await?
@@ -720,6 +677,7 @@ impl<P: Pipeline> Batch<'_, P> {
         let mut cursor: Option<Vec<u8>> = None;
         loop {
             let page = inner
+                .store
                 .queue
                 .kv_scan(&prefix, cursor.as_deref(), 1000)
                 .await
@@ -756,8 +714,7 @@ impl<P: Pipeline> Batch<'_, P> {
     /// entries and outcome records. A later run of the same id starts
     /// from nothing.
     pub async fn forget(&self) -> Result<()> {
-        self.inner.forget_batch(&self.id).await?;
-        Ok(())
+        self.inner.store.forget(&self.id).await
     }
 
     fn check_headers(&self) -> Result<()> {
@@ -834,7 +791,7 @@ impl<P: Pipeline> Batch<'_, P> {
 
         if inner.batch_retention.is_some() {
             let key = bulk_terminal_kv_key(&self.id, inner.clock.now_ms());
-            if let Err(err) = inner.queue.kv_put(&key, b"").await {
+            if let Err(err) = inner.store.queue.kv_put(&key, b"").await {
                 warn!(batch_id = %self.id, "batch terminal marker write failed: {err}");
             }
         }

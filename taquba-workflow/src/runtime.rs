@@ -19,12 +19,13 @@ use crate::effects::{EffectsHandle, StagedEffects, TerminalEffects};
 use crate::error::{Error, Result};
 use crate::keys::{
     DEDUP_PREFIX, HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RESERVED_HEADER_PREFIX,
-    RESERVED_KV_PREFIX, run_kv_key, terminal_kv_key, validate_run_id,
+    RESERVED_KV_PREFIX, TERMINAL_KV_PREFIX, run_kv_key, terminal_kv_key, validate_run_id,
 };
 use crate::kv::KvReadHandle;
 use crate::memo::MemoStore;
 use crate::registry::RunRegistry;
 use crate::runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
+use crate::sweep::Sweep;
 use crate::terminal::{RunOutcome, TerminalHook};
 
 /// The portion of `delay` still ahead of `now_ms`, measured from
@@ -171,6 +172,7 @@ pub struct WorkflowRuntimeBuilder<R, H> {
     memo_retention: Option<Duration>,
     step_output_replay: bool,
     clock: Arc<dyn Clock>,
+    sweeps: Vec<Sweep>,
 }
 
 impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
@@ -254,9 +256,25 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
         self
     }
 
+    /// Add a retention sweep that [`WorkflowRuntime::run`] drives beside
+    /// the memo sweep, for a layer whose terminal markers live under its
+    /// own prefix.
+    pub(crate) fn sweep(mut self, sweep: Sweep) -> Self {
+        self.sweeps.push(sweep);
+        self
+    }
+
     /// Finalize the builder.
     pub fn build(self) -> WorkflowRuntime<R, H> {
         let memo_store = MemoStore::new(self.object_store, self.memo_prefix);
+        let mut sweeps = self.sweeps;
+        if let Some(retention) = self.memo_retention {
+            let memos = memo_store.clone();
+            sweeps.push(Sweep::new(TERMINAL_KV_PREFIX, retention, move |run_id| {
+                let memos = memos.clone();
+                async move { memos.clear_memos_for_run(&run_id).await.map(|_| ()) }
+            }));
+        }
         let core = RuntimeCore {
             queue: self.queue,
             queue_name: self.queue_name,
@@ -266,6 +284,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
             submit_locks: std::sync::Mutex::new(HashMap::new()),
             memo_store,
             memo_retention: self.memo_retention,
+            sweeps,
             step_output_replay: self.step_output_replay,
             clock: self.clock,
         };
@@ -320,8 +339,12 @@ pub(crate) struct RuntimeCore {
     pub(crate) memo_store: MemoStore,
     /// Window after a run reaches a terminal state during which its
     /// memo entries are retained for replay. `None` disables retention
-    /// entirely (no terminal marker is written and no sweeper runs).
+    /// entirely (no terminal marker is written and no memo sweep runs).
     pub(crate) memo_retention: Option<Duration>,
+    /// The retention sweeps [`WorkflowRuntime::run`] drives: the memo
+    /// sweep when `memo_retention` is set, and every sweep a layer
+    /// registered through [`WorkflowRuntimeBuilder::sweep`].
+    sweeps: Vec<Sweep>,
     /// Whether runner-returned step outcomes are persisted and replayed
     /// by `(run_id, step_number, SHA-256(step payload))`.
     step_output_replay: bool,
@@ -364,6 +387,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             memo_retention: None,
             step_output_replay: false,
             clock,
+            sweeps: Vec::new(),
         }
     }
 
@@ -615,7 +639,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
 
     /// Drive the step worker loop until `shutdown` resolves. Spawns up
     /// to `max_concurrent_steps` step processors and, when
-    /// [`WorkflowRuntimeBuilder::memo_retention`] is set, an additional
+    /// [`WorkflowRuntimeBuilder::memo_retention`] is set, a
     /// memo-retention sweeper running in parallel. Both halt cleanly
     /// when `shutdown` resolves or the worker errors.
     pub async fn run<F>(&self, shutdown: F) -> Result<()>
@@ -631,15 +655,16 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         // returns on its own (typically with an error).
         let stop = CancellationToken::new();
 
-        let sweep_handle = if self.inner.core.memo_retention.is_some() {
-            let inner = self.inner.clone();
-            let token = stop.clone();
-            Some(tokio::spawn(async move {
-                inner.core.run_memo_sweep(token).await;
-            }))
-        } else {
-            None
-        };
+        let sweep_handles: Vec<_> = (0..self.inner.core.sweeps.len())
+            .map(|i| {
+                let inner = self.inner.clone();
+                let token = stop.clone();
+                tokio::spawn(async move {
+                    let core = &inner.core;
+                    core.sweeps[i].run(&core.queue, &*core.clock, token).await;
+                })
+            })
+            .collect();
 
         let worker = Arc::new(StepWorker {
             inner: self.inner.clone(),
@@ -666,8 +691,8 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             }
         };
 
-        if let Some(h) = sweep_handle {
-            let _ = h.await;
+        for handle in sweep_handles {
+            let _ = handle.await;
         }
 
         result?;
@@ -750,6 +775,16 @@ fn parse_step_headers(job: &JobRecord) -> std::result::Result<(String, u32), Err
 }
 
 impl RuntimeCore {
+    /// One pass of every retention sweep; the number of entities cleared.
+    #[cfg(test)]
+    pub(crate) async fn sweep_once(&self) -> Result<usize> {
+        let mut cleared = 0;
+        for sweep in &self.sweeps {
+            cleared += sweep.pass(&self.queue, &*self.clock).await?;
+        }
+        Ok(cleared)
+    }
+
     /// Returns the per-run-id submit lock for `run_id`, creating it on
     /// first access.
     fn submit_lock_for(&self, run_id: &str) -> Arc<Mutex<()>> {
@@ -3863,12 +3898,7 @@ mod tests {
         assert!(terminal_markers(&queue).await.is_empty());
 
         advance(&clock, Duration::from_secs(3_600)).await;
-        runtime
-            .inner
-            .core
-            .sweep_expired_memos(Duration::from_secs(60))
-            .await
-            .unwrap();
+        runtime.inner.core.sweep_once().await.unwrap();
         assert_eq!(
             memos.new_memo("bystander", 0).get("k").await.unwrap(),
             Some(b"expensive".to_vec()),
@@ -3902,12 +3932,7 @@ mod tests {
         queue.kv_put(&unparseable, b"").await.unwrap();
 
         advance(&clock, Duration::from_secs(3_600)).await;
-        runtime
-            .inner
-            .core
-            .sweep_expired_memos(Duration::from_secs(60))
-            .await
-            .unwrap();
+        runtime.inner.core.sweep_once().await.unwrap();
         assert_eq!(
             memos.new_memo("bystander", 0).get("k").await.unwrap(),
             Some(b"expensive".to_vec()),
@@ -4190,12 +4215,7 @@ mod tests {
         }
 
         // Clock at 10_000 with 1s retention: cutoff 9_000.
-        let cleared = runtime
-            .inner
-            .core
-            .sweep_expired_memos(Duration::from_secs(1))
-            .await
-            .unwrap();
+        let cleared = runtime.inner.core.sweep_once().await.unwrap();
         assert_eq!(cleared, 1);
 
         let remaining = terminal_markers(&queue).await;
