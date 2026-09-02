@@ -41,10 +41,12 @@
 //! namespace, in the same transaction that settles the run, and its
 //! retention sweep pairs that marker with `clear_memos_for_run`.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use taquba::object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, path::Path};
 
@@ -264,6 +266,53 @@ impl Memo {
             .await
     }
 
+    /// Return the value stored under `key`, or run `compute`, store its
+    /// value under `key` and return it.
+    ///
+    /// The value is encoded as MessagePack with named fields. An entry
+    /// that fails to decode as `R` is treated as absent: `compute` runs
+    /// and its value overwrites the entry. An error from `compute` is
+    /// returned without storing anything, so a later call runs `compute`
+    /// again.
+    pub async fn memoized<R, F, E>(&self, key: &str, compute: F) -> std::result::Result<R, E>
+    where
+        R: Serialize + DeserializeOwned,
+        F: Future<Output = std::result::Result<R, E>>,
+        E: From<Error>,
+    {
+        if let Some(bytes) = self.get(key).await? {
+            match rmp_serde::from_slice::<R>(&bytes) {
+                Ok(value) => return Ok(value),
+                Err(err) => tracing::warn!(
+                    run_id = %self.run_id,
+                    key = %key,
+                    error = %err,
+                    "memo entry failed to decode; recomputing",
+                ),
+            }
+        }
+        let value = compute.await?;
+        let bytes = rmp_serde::to_vec_named(&value).map_err(Error::Serialization)?;
+        self.put(key, &bytes).await?;
+        Ok(value)
+    }
+
+    /// [`Self::memoized`] under [`Self::content_key`] of `input`.
+    pub async fn memoized_by_content<K, R, F, E>(
+        &self,
+        input: &K,
+        compute: F,
+    ) -> std::result::Result<R, E>
+    where
+        K: Serialize + ?Sized,
+        R: Serialize + DeserializeOwned,
+        F: Future<Output = std::result::Result<R, E>>,
+        E: From<Error>,
+    {
+        let key = Self::content_key(input)?;
+        self.memoized(&key, compute).await
+    }
+
     /// Derive the memo key for a content-addressed entry: `content:`
     /// followed by the hex SHA-256 digest of `input` encoded as
     /// MessagePack with named fields.
@@ -325,6 +374,8 @@ fn hex_sha256(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     use super::*;
     use serde::Serialize;
     use taquba::object_store::memory::InMemory;
@@ -383,6 +434,86 @@ mod tests {
             Some(b"run".to_vec()),
         );
         assert_eq!(store.new_run_memo("run-2").get("k").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn memoized_runs_the_computation_once() {
+        let memo = make_memo();
+        let calls = AtomicU32::new(0);
+        let compute = || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, Error>(7u32)
+        };
+
+        assert_eq!(memo.memoized("k", compute()).await.unwrap(), 7);
+        assert_eq!(memo.memoized("k", compute()).await.unwrap(), 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            memo.get("k").await.unwrap(),
+            Some(rmp_serde::to_vec_named(&7u32).unwrap()),
+        );
+    }
+
+    #[tokio::test]
+    async fn memoized_stores_nothing_for_a_failed_computation() {
+        let memo = make_memo();
+        let failed = memo
+            .memoized("k", async { Err::<u32, Error>(Error::EffectsSealed) })
+            .await;
+
+        assert!(matches!(failed, Err(Error::EffectsSealed)));
+        assert_eq!(memo.get("k").await.unwrap(), None);
+        assert_eq!(
+            memo.memoized("k", async { Ok::<_, Error>(7u32) })
+                .await
+                .unwrap(),
+            7,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_memo_entry_that_fails_to_decode_is_recomputed() {
+        let memo = make_memo();
+        memo.put("k", b"not msgpack for a string").await.unwrap();
+
+        let value: String = memo
+            .memoized("k", async { Ok::<_, Error>("fresh".to_string()) })
+            .await
+            .unwrap();
+
+        assert_eq!(value, "fresh");
+        assert_eq!(
+            memo.get("k").await.unwrap(),
+            Some(rmp_serde::to_vec_named("fresh").unwrap()),
+        );
+    }
+
+    #[tokio::test]
+    async fn memoized_by_content_stores_under_the_content_key() {
+        let memo = make_memo();
+        let input = ContentInput {
+            operation: "draft",
+            payload: b"hello",
+        };
+        let calls = AtomicU32::new(0);
+        let compute = || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, Error>(7u32)
+        };
+
+        assert_eq!(
+            memo.memoized_by_content(&input, compute()).await.unwrap(),
+            7
+        );
+        assert_eq!(
+            memo.memoized_by_content(&input, compute()).await.unwrap(),
+            7
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            memo.content_get(&input).await.unwrap(),
+            Some(rmp_serde::to_vec_named(&7u32).unwrap()),
+        );
     }
 
     #[tokio::test]

@@ -318,6 +318,20 @@
 //! Ok(StepOutcome::Succeed { result: draft })
 //! ```
 //!
+//! [`Memo::memoized`] is the typed form: it returns the stored value
+//! when one exists and otherwise runs the computation, stores its value
+//! and returns it. Values are encoded as MessagePack with named fields.
+//! An entry that fails to decode is treated as absent and is
+//! overwritten by the recomputed value; an error from the computation
+//! stores nothing.
+//!
+//! ```ignore
+//! let draft: Draft = step
+//!     .memo
+//!     .memoized("draft", async { expensive_call(&step.payload).await })
+//!     .await?;
+//! ```
+//!
 //! When the natural memo key is the content of an input value,
 //! [`Memo::content_get`] and [`Memo::content_put`] serialize that input
 //! as MessagePack, hash it with SHA-256, and use the digest as the memo
@@ -347,7 +361,8 @@
 //! receive identical inputs, include an operation name in the
 //! serialized input. [`Memo::content_key`] returns the derived key, for
 //! use with [`Memo::get`] and [`Memo::put`] or for locating an entry
-//! from outside the runtime.
+//! from outside the runtime, and [`Memo::memoized_by_content`] is the
+//! typed form over that key.
 //!
 //! [`Step::run_memo`] is the run-scoped variant: one namespace shared
 //! by every step of the run, for values a later step reads back (an
