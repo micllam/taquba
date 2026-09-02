@@ -61,6 +61,27 @@ pub(crate) const SIGNAL_DELIVERED_KV_PREFIX: &[u8] = b"workflow/signal-delivered
 /// is set, in the same transaction that settles the run.
 pub(crate) const TERMINAL_KV_PREFIX: &[u8] = b"workflow/terminals/";
 
+/// Prefix for the durable per-item markers of bulk batches:
+/// `workflow/bulk/batches/{batch_id}/items/{key}`, one per terminated
+/// item, written with the acknowledgement of the item's terminal
+/// notification.
+pub(crate) const BULK_KV_PREFIX: &[u8] = b"workflow/bulk/batches/";
+
+/// Prefix under which the markers of one batch's items are stored.
+pub(crate) fn bulk_items_kv_prefix(batch_id: &str) -> Vec<u8> {
+    let mut k = Vec::from(BULK_KV_PREFIX);
+    k.extend_from_slice(batch_id.as_bytes());
+    k.extend_from_slice(b"/items/");
+    k
+}
+
+/// Key of the marker of item `key` in batch `batch_id`.
+pub(crate) fn bulk_item_kv_key(batch_id: &str, key: &str) -> Vec<u8> {
+    let mut k = bulk_items_kv_prefix(batch_id);
+    k.extend_from_slice(key.as_bytes());
+    k
+}
+
 /// Key of the terminal marker for `run_id`, terminated at
 /// `terminal_at_ms`. The zero-padded timestamp leads the suffix, so a
 /// prefix scan returns markers oldest first and the sweep's expired set
@@ -151,6 +172,7 @@ mod tests {
             SIGNAL_BUF_KV_PREFIX,
             SIGNAL_DELIVERED_KV_PREFIX,
             TERMINAL_KV_PREFIX,
+            BULK_KV_PREFIX,
         ] {
             assert!(
                 prefix.starts_with(RESERVED_KV_PREFIX.as_bytes()),

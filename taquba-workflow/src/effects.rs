@@ -61,6 +61,22 @@ impl EffectsState {
         Ok(())
     }
 
+    /// Stage a write under a key of the reserved namespace, for the
+    /// crate's own records; validated like [`put`](Self::put) otherwise.
+    fn put_reserved(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        if self.sealed {
+            return Err(Error::EffectsSealed);
+        }
+        if value.len() > taquba::MAX_KV_VALUE_SIZE {
+            return Err(Error::Queue(taquba::Error::KvValueTooLarge {
+                size: value.len(),
+                max: taquba::MAX_KV_VALUE_SIZE,
+            }));
+        }
+        self.staged.writes.insert(key, value);
+        Ok(())
+    }
+
     fn delete(&mut self, key: Vec<u8>) -> Result<()> {
         self.check_key(&key)?;
         if self.staged.writes.contains_key(&key) {
@@ -215,6 +231,12 @@ impl TerminalEffects {
     /// As [`EffectsHandle::delete`].
     pub fn delete(&self, key: impl Into<Vec<u8>>) -> Result<()> {
         self.inner.lock().unwrap().kv.delete(key.into())
+    }
+
+    /// Stage a write under a key of the reserved `workflow/` namespace,
+    /// for the crate's own records.
+    pub(crate) fn put_reserved(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        self.inner.lock().unwrap().kv.put_reserved(key, value)
     }
 
     /// Seal the handle and move out everything staged.

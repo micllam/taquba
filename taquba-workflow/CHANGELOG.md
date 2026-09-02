@@ -29,7 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a different item set for an existing batch and rejects duplicate keys,
   and `Batch::resume` drives a batch from its manifest alone; every
   submitted item counts toward the expected total, including a run
-  still queued from an earlier run of the batch; `Error::InvalidBatchId`,
+  still queued from an earlier run of the batch; each terminal
+  notification writes the item's marker (status, error, cost) to
+  `workflow/bulk/batches/<batch_id>/items/<key>` with its
+  acknowledgement, and `Batch::status` reads the manifest and the
+  markers into a `BatchStatus`; `Error::InvalidBatchId`,
   `ReservedHeader`, `DuplicateKey`, `BatchMismatch`, `BatchNotFound`,
   `Decode` and `Store` are new. `serde_json` is a dependency.
 - The `jobs` module: typed single-function jobs, moved from the

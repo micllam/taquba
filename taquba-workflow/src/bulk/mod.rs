@@ -158,6 +158,13 @@
 //! manifest alone: completed items are answered from their outcome
 //! records, items still queued continue, and the rest run.
 //!
+//! Each terminal notification writes the item's marker (status, error,
+//! cost) to `workflow/bulk/batches/<batch_id>/items/<key>` in the queue's
+//! KV namespace, committed with the notification's acknowledgement.
+//! [`Batch::status`] reads the manifest and the markers, so a batch's
+//! durable state is available without running it and from another
+//! process through the same prefix.
+//!
 //! # Failure policy
 //!
 //! Per-item failures are recorded, not fatal: each failed item is written to
@@ -189,4 +196,4 @@ pub use cost::CostReport;
 pub use error::{Error, Result};
 pub use io::{JsonlSink, NullSink, OutputRecord, OutputSink, read_jsonl};
 pub use pipeline::{BulkCtx, Pipeline};
-pub use progress::{BulkReport, ProgressSnapshot};
+pub use progress::{BatchStatus, BulkReport, ProgressSnapshot};

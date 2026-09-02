@@ -25,8 +25,9 @@ use crate::bulk::error::{Error, Result};
 use crate::bulk::io::{NullSink, OutputRecord, OutputSink};
 use crate::bulk::manifest::{Manifest, ManifestItem, ManifestStore};
 use crate::bulk::pipeline::Pipeline;
-use crate::bulk::progress::{BulkReport, ProgressSnapshot, ProgressState};
+use crate::bulk::progress::{BatchStatus, BulkReport, ItemMarker, ProgressSnapshot, ProgressState};
 use crate::bulk::runner::{ItemEnvelope, PipelineRunner};
+use crate::keys::{bulk_item_kv_key, bulk_items_kv_prefix};
 use crate::outcome::{StoredOutcome, read_outcome};
 
 /// Default queue name for bulk item steps.
@@ -167,7 +168,7 @@ where
     async fn on_termination(
         &self,
         outcome: &RunOutcome,
-        _effects: &TerminalEffects,
+        effects: &TerminalEffects,
     ) -> std::result::Result<(), StepError> {
         let key = outcome
             .headers
@@ -177,6 +178,19 @@ where
             (TerminalStatus::Succeeded, Some(bytes)) => decode_envelope::<O>(key, bytes),
             _ => (None, None),
         };
+        // The marker commits with this notification's acknowledgement.
+        if let Some(batch_id) = outcome.headers.get(HEADER_BATCH) {
+            let marker = ItemMarker {
+                status: outcome.status.as_str().to_string(),
+                error: outcome.error.clone(),
+                cost: cost.clone().unwrap_or_default(),
+            };
+            let bytes = rmp_serde::to_vec_named(&marker)
+                .map_err(|err| StepError::permanent(err.to_string()))?;
+            effects
+                .put_reserved(bulk_item_kv_key(batch_id, key), bytes)
+                .map_err(|err| StepError::permanent(err.to_string()))?;
+        }
         self.shared.record(
             self.sink.as_ref(),
             TerminalItem {
@@ -294,6 +308,7 @@ impl<P: Pipeline> BulkBuilder<P> {
         let memo_store = MemoStore::new(self.object_store.clone(), self.memo_prefix.clone());
         let manifests = ManifestStore::new(self.object_store.clone(), self.memo_prefix.clone());
         let runner = PipelineRunner::new(self.pipeline);
+        let queue = self.queue.clone();
         let runtime = WorkflowRuntime::builder(self.queue, self.object_store, runner, hook)
             .queue_name(self.queue_name)
             .memo_prefix(self.memo_prefix)
@@ -302,6 +317,7 @@ impl<P: Pipeline> BulkBuilder<P> {
             .build();
         Bulk {
             runtime,
+            queue,
             memo_store,
             manifests,
             shared,
@@ -318,6 +334,7 @@ impl<P: Pipeline> BulkBuilder<P> {
 /// cost, and streamed output per batch.
 pub struct Bulk<P: Pipeline> {
     runtime: WorkflowRuntime<PipelineRunner<P>, BulkHook<P::Output>>,
+    queue: Arc<Queue>,
     memo_store: MemoStore,
     manifests: ManifestStore,
     shared: Arc<Shared>,
@@ -474,6 +491,62 @@ impl<P: Pipeline> Batch<'_, P> {
             .await?
             .ok_or_else(|| Error::BatchNotFound(self.id.clone()))?;
         self.drive(manifest.items, shutdown).await
+    }
+
+    /// The durable state of the batch: its item count from the manifest
+    /// and, per item, the last outcome recorded by a terminal notification.
+    /// An item that ran again after a failure is reported by its latest
+    /// outcome. Returns [`Error::BatchNotFound`] when no manifest exists.
+    pub async fn status(&self) -> Result<BatchStatus> {
+        let bulk = self.bulk;
+        let manifest = bulk
+            .manifests
+            .read(&self.id)
+            .await?
+            .ok_or_else(|| Error::BatchNotFound(self.id.clone()))?;
+        let prefix = bulk_items_kv_prefix(&self.id);
+        let mut status = BatchStatus {
+            batch_id: self.id.clone(),
+            total: manifest.items.len(),
+            succeeded: 0,
+            failed: 0,
+            cancelled: 0,
+            cost: CostReport::new(),
+            failed_keys: Vec::new(),
+        };
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let page = bulk
+                .queue
+                .kv_scan(&prefix, cursor.as_deref(), 1000)
+                .await
+                .map_err(crate::Error::from)?;
+            for (kv_key, value) in &page.entries {
+                let key = String::from_utf8_lossy(&kv_key[prefix.len()..]).into_owned();
+                let marker: ItemMarker = match rmp_serde::from_slice(value) {
+                    Ok(marker) => marker,
+                    Err(err) => {
+                        warn!(batch_id = %self.id, key = %key, error = %err, "item marker failed to decode");
+                        continue;
+                    }
+                };
+                match marker.status() {
+                    Some(TerminalStatus::Succeeded) => status.succeeded += 1,
+                    Some(TerminalStatus::Failed) => {
+                        status.failed += 1;
+                        status.failed_keys.push(key);
+                    }
+                    Some(TerminalStatus::Cancelled) => status.cancelled += 1,
+                    None => continue,
+                }
+                status.cost.merge(&marker.cost);
+            }
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        Ok(status)
     }
 
     fn check_headers(&self) -> Result<()> {
@@ -1071,6 +1144,35 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::DuplicateKey(key) if key == "same"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_reports_the_last_recorded_outcome_of_each_item() {
+        let (queue, store) = fresh().await;
+        let bulk = Bulk::builder(queue.clone(), store, Doubler)
+            .poll_interval(Duration::from_millis(10))
+            .build();
+        let batch = bulk.batch("b").unwrap();
+        assert!(matches!(batch.status().await, Err(Error::BatchNotFound(_))));
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            batch.run(vec![Item { n: 1 }, Item { n: 13 }, Item { n: 3 }]),
+        )
+        .await
+        .expect("run finished in time")
+        .unwrap();
+
+        let status = batch.status().await.unwrap();
+        assert_eq!((status.total, status.succeeded, status.failed), (3, 2, 1));
+        assert_eq!(status.failed_keys, vec!["item-1".to_string()]);
+        assert_eq!(status.cost.get("calls"), 2.0);
+        let markers = queue
+            .kv_scan(b"workflow/bulk/batches/b/items/", None, 10)
+            .await
+            .unwrap()
+            .entries;
+        assert_eq!(markers.len(), 3);
     }
 
     #[tokio::test]

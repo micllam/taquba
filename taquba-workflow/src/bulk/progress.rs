@@ -3,7 +3,51 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
+use crate::TerminalStatus;
 use crate::bulk::cost::CostReport;
+
+/// The durable marker of one terminated item, stored under
+/// `workflow/bulk/batches/{batch_id}/items/{key}` with the acknowledgement
+/// of the item's terminal notification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ItemMarker {
+    pub(crate) status: String,
+    pub(crate) error: Option<String>,
+    pub(crate) cost: CostReport,
+}
+
+impl ItemMarker {
+    pub(crate) fn status(&self) -> Option<TerminalStatus> {
+        match self.status.as_str() {
+            "succeeded" => Some(TerminalStatus::Succeeded),
+            "failed" => Some(TerminalStatus::Failed),
+            "cancelled" => Some(TerminalStatus::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+/// The durable state of a batch, read from its manifest and item markers
+/// by [`Batch::status`](crate::bulk::Batch::status).
+#[derive(Debug, Clone)]
+pub struct BatchStatus {
+    /// The batch id.
+    pub batch_id: String,
+    /// Number of items in the batch's manifest.
+    pub total: usize,
+    /// Items whose last recorded outcome is a success.
+    pub succeeded: usize,
+    /// Items whose last recorded outcome is a failure.
+    pub failed: usize,
+    /// Items whose last recorded outcome is a cancellation.
+    pub cancelled: usize,
+    /// Cost counters rolled up across the recorded items.
+    pub cost: CostReport,
+    /// Keys of the items whose last recorded outcome is a failure.
+    pub failed_keys: Vec<String>,
+}
 
 /// A point-in-time view of a bulk run's progress. Returned by
 /// [`Bulk::progress`](crate::bulk::Bulk::progress) and suitable for a status line
