@@ -95,6 +95,7 @@ mod tests {
             headers: HashMap::new(),
             job_id: "job-1".into(),
             attempts: 1,
+            max_attempts: 3,
             cancel_token: CancellationToken::new(),
             lease: taquba::LeaseHandle::detached(),
             memo: memo_store.new_memo("run-1", 0),

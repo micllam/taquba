@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `RunSpec::run_at`: the earliest time the first step may run. The
+  step-0 job waits in the queue's scheduled state until the queue's
+  clock passes it.
+- `SubmitOutcome::job_id`: the id of the queue job for the run's first
+  step, `Some` for a new submission and for a duplicate of a run the
+  runtime tracks in process, `None` for a duplicate known only from
+  the durable run record.
+- **Breaking (source):** `Step::max_attempts`, the attempt limit of the
+  step. A `Step` built by struct literal in tests must set it.
 - `Memo::content_key`, the key derivation used by `Memo::content_get`
   and `Memo::content_put`: `content:` followed by the hex SHA-256
   digest of the input encoded as MessagePack with named fields.

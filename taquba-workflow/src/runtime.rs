@@ -85,6 +85,10 @@ pub struct RunSpec {
     pub priority: Option<u32>,
     /// Override the queue's `max_attempts` for every step of this run.
     pub max_attempts_per_step: Option<u32>,
+    /// Earliest time the first step may run. The step-0 job waits in the
+    /// queue's scheduled state until the queue's clock passes this time;
+    /// `None` makes it claimable at once.
+    pub run_at: Option<SystemTime>,
     /// Writes applied to the caller KV namespace in the same transaction
     /// as the step-0 enqueue. Applied only when the submission is new: a
     /// duplicate submission's writes are dropped, and the writes do not
@@ -110,6 +114,11 @@ pub struct SubmitOutcome {
     /// [`WorkflowRuntime::status`] for the run's current state when
     /// needed.
     pub newly_submitted: bool,
+    /// The id of the queue job for the run's first step: `Some` for a new
+    /// submission and for a duplicate of a run this runtime tracks in
+    /// process, `None` for a duplicate known only from the durable run
+    /// record.
+    pub job_id: Option<String>,
 }
 
 /// In-memory status snapshot for an active run. Returned by
@@ -421,6 +430,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             return Ok(SubmitOutcome {
                 run_id: run_id.to_string(),
                 newly_submitted: false,
+                job_id: self.inner.core.registry.current_job_id(run_id),
             });
         }
 
@@ -436,6 +446,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             return Ok(SubmitOutcome {
                 run_id: run_id.to_string(),
                 newly_submitted: false,
+                job_id: None,
             });
         }
 
@@ -444,7 +455,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         headers.insert(HEADER_STEP.to_string(), "0".to_string());
         let enqueue_opts = EnqueueOptions::default()
             .headers(headers)
-            .run_at(None)
+            .run_at(spec.run_at)
             .priority(spec.priority)
             .max_attempts(spec.max_attempts_per_step)
             .dedup_key(Some(format!("{DEDUP_PREFIX}{run_id}:0")));
@@ -471,10 +482,11 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             // is missing, which only happens if the run terminated
             // without going through `terminate`. Either way the safe
             // verdict is duplicate.
-            EnqueueResult::AlreadyEnqueued(_) => {
+            EnqueueResult::AlreadyEnqueued(existing) => {
                 return Ok(SubmitOutcome {
                     run_id: run_id.to_string(),
                     newly_submitted: false,
+                    job_id: Some(existing),
                 });
             }
         };
@@ -490,6 +502,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         Ok(SubmitOutcome {
             run_id: run_id.to_string(),
             newly_submitted: true,
+            job_id: Some(job_id),
         })
     }
 
@@ -1029,6 +1042,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             headers: user_headers.clone(),
             job_id: job.id.clone(),
             attempts: job.attempts,
+            max_attempts: job.max_attempts,
             cancel_token,
             lease: lease.clone(),
             memo: self.core.memo_store.new_memo(&run_id, step_number),
@@ -2168,6 +2182,8 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.run_id, "fixed-id");
         assert!(!outcome.newly_submitted);
+        assert!(outcome.job_id.is_some());
+        assert_eq!(outcome.job_id, handle.job_id);
 
         let err = runtime
             .submit(RunSpec {
@@ -2179,6 +2195,95 @@ mod tests {
             .unwrap_err();
         assert!(matches!(&err, Error::InputMismatch(id) if id == "fixed-id"));
         assert!(err.is_permanent());
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_run_submitted_with_run_at_stays_scheduled_until_then() {
+        struct Echo;
+        impl StepRunner for Echo {
+            async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                Ok(StepOutcome::Succeed {
+                    result: step.payload.clone(),
+                })
+            }
+        }
+
+        let t0 = 1_700_000_000_000;
+        let (queue, store, clock) = fresh_queue_with_mock_clock(t0).await;
+        let runtime =
+            WorkflowRuntime::builder(queue.clone(), store, Echo, NoopTerminalHook).build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                input: b"x".to_vec(),
+                run_at: Some(UNIX_EPOCH + Duration::from_millis(t0 + 60_000)),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let scheduled = queue
+            .list_jobs("workflow-steps", taquba::JobStatus::Scheduled, None, 10)
+            .await
+            .unwrap()
+            .jobs;
+        assert_eq!(scheduled.len(), 1);
+        let job_id = scheduled[0].id.clone();
+
+        let waiter = tokio::spawn({
+            let queue = queue.clone();
+            async move {
+                queue
+                    .wait_for_completion(&job_id, Duration::from_secs(600))
+                    .await
+            }
+        });
+        advance(&clock, Duration::from_secs(120)).await;
+        assert!(matches!(
+            waiter.await.unwrap().unwrap(),
+            taquba::WaitOutcome::Done(_),
+        ));
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_step_reports_its_attempt_limit() {
+        struct Recording(Arc<std::sync::Mutex<Option<u32>>>);
+        impl StepRunner for Recording {
+            async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                *self.0.lock().unwrap() = Some(step.max_attempts);
+                Ok(StepOutcome::Succeed { result: Vec::new() })
+            }
+        }
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let (queue, store) = fresh_queue().await;
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            Recording(seen.clone()),
+            NoopTerminalHook,
+        )
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        let outcome = runtime
+            .submit(RunSpec {
+                input: b"x".to_vec(),
+                max_attempts_per_step: Some(7),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let job_id = outcome.job_id.unwrap();
+        queue
+            .wait_for_completion(&job_id, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), Some(7));
 
         let _ = shutdown.send(());
     }

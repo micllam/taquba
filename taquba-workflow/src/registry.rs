@@ -49,6 +49,16 @@ impl RunRegistry {
             .and_then(|entry| entry.input_hash)
     }
 
+    /// The id of the queue job backing the run's current step, when the
+    /// run is tracked.
+    pub(crate) fn current_job_id(&self, run_id: &str) -> Option<String> {
+        self.runs
+            .lock()
+            .unwrap()
+            .get(run_id)
+            .map(|entry| entry.current_job_id.clone())
+    }
+
     /// Record a newly submitted run: step 0, [`RunState::Pending`],
     /// backed by `job_id`.
     pub(crate) fn insert_submitted(

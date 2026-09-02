@@ -34,6 +34,9 @@ pub struct Step {
     /// How many times Taquba has attempted to deliver this step. `1` on the
     /// first attempt; `>1` after a lease expiry / nack retry.
     pub attempts: u32,
+    /// The attempt limit for this step: a transient failure on the attempt
+    /// numbered `max_attempts` ends the run.
+    pub max_attempts: u32,
     /// Cooperative cancellation signal for the run. The runtime cancels
     /// this token when [`crate::WorkflowRuntime::cancel`] is called while
     /// this step is in flight, so a long-running runner (e.g. an LLM call,
