@@ -42,6 +42,11 @@ pub enum Error {
     #[error("batch `{0}` not found")]
     BatchNotFound(String),
 
+    /// A run of a batch was started while a run of the same batch was
+    /// active in this process.
+    #[error("batch `{0}` is already running in this process")]
+    BatchRunning(String),
+
     /// A batch id was not 1 to 128 bytes of `[A-Za-z0-9_-]`.
     #[error("invalid batch id `{0}`: must be 1 to 128 bytes of `[A-Za-z0-9_-]`")]
     InvalidBatchId(String),

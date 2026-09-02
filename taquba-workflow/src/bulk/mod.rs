@@ -103,10 +103,11 @@
 //! let store = Arc::new(InMemory::new());
 //! let queue = Arc::new(Queue::open(store.clone(), "db").await?);
 //!
-//! let bulk = Bulk::builder(queue, store, TicketPipeline)
+//! let mut bulk = Bulk::builder(queue, store, TicketPipeline)
 //!     .key_fn(|t| t.id.clone())
 //!     .max_concurrent(200)
 //!     .build();
+//! let worker = bulk.spawn(std::future::pending::<()>());
 //!
 //! let inputs = vec![
 //!     Ticket { id: "t1".into(), body: "help".into() },
@@ -114,6 +115,7 @@
 //! ];
 //! let report = bulk.run(inputs).await?;
 //! println!("{}/{} succeeded", report.succeeded, report.total);
+//! worker.shutdown().await?;
 //! # Ok(()) }
 //! ```
 //!
@@ -141,8 +143,13 @@
 //!
 //! # Batches
 //!
-//! Every run is a batch: [`Bulk::run`] creates one with a generated id,
-//! [`Bulk::batch`] names one. Items are identified within a batch by key
+//! A [`Bulk`] runner spawns one worker ([`Bulk::spawn`]) and runs
+//! batches over it, several at a time if wanted: [`Bulk::run`] creates a
+//! batch with a generated id, [`Bulk::batch`] names one, and
+//! [`Batch::run`] submits the batch's items and waits until every one has
+//! terminated. Dropping that future stops the wait; the items keep
+//! running on the worker and keep their durable state. Items are
+//! identified within a batch by key
 //! ([`BulkBuilder::key_fn`], or the positional `item-{i}` default), and an
 //! item's workflow run id is the SHA-256 digest of `{batch_id}/{key}`, so
 //! batches never share run state. Each item writes an outcome record to its
@@ -169,16 +176,16 @@
 //! A batch's state is retained until [`Batch::forget`] removes it, or,
 //! under [`BulkBuilder::batch_retention`], until the window after the
 //! batch's completion has passed: a completing run writes a terminal
-//! marker to `workflow/bulk/terminals/<ts>/<batch_id>`, and every later run
-//! removes the batches whose markers have expired before submitting its
-//! items and again on every retention interval while it runs.
+//! marker to `workflow/bulk/terminals/<ts>/<batch_id>`, and the worker
+//! removes the batches whose markers have expired when it starts and on
+//! every retention interval after that.
 //!
 //! # Failure policy
 //!
 //! Per-item failures are recorded, not fatal: each failed item is written to
 //! the output sink with its error and its key is collected on
 //! [`BulkReport::failed_keys`]. Set [`BulkBuilder::fail_threshold`] to
-//! turn the whole run into an [`Error::FailureThresholdExceeded`] when the
+//! turn the batch run into an [`Error::FailureThresholdExceeded`] when the
 //! share of failures crosses a percentage, so a silent mass failure
 //! surfaces.
 //!

@@ -151,34 +151,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let executions = Arc::new(AtomicUsize::new(0));
-    let bulk = Arc::new(
-        Bulk::builder(
-            queue.clone(),
-            store,
-            ResumePipeline {
-                n_phases,
-                fail_at,
-                phase_work: Duration::from_millis(phase_work_ms),
-                memoize,
-                executions: executions.clone(),
-                failed_once: Mutex::new(HashSet::new()),
-            },
-        )
-        .max_concurrent(max_concurrent)
-        .build(),
-    );
+    let mut bulk = Bulk::builder(
+        queue.clone(),
+        store,
+        ResumePipeline {
+            n_phases,
+            fail_at,
+            phase_work: Duration::from_millis(phase_work_ms),
+            memoize,
+            executions: executions.clone(),
+            failed_once: Mutex::new(HashSet::new()),
+        },
+    )
+    .max_concurrent(max_concurrent)
+    .build();
+    let worker = bulk.spawn(std::future::pending::<()>());
+    let bulk = Arc::new(bulk);
+    let batch_id = bulk.new_batch().id().to_string();
 
     // Watcher: sample cumulative progress once per second.
     let progress_rows: Arc<Mutex<Vec<(u64, usize)>>> = Arc::new(Mutex::new(Vec::new()));
     let watcher = {
         let bulk = bulk.clone();
+        let batch_id = batch_id.clone();
         let progress_rows = progress_rows.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             tick.tick().await; // skip immediate first tick
             loop {
                 tick.tick().await;
-                let p = bulk.progress();
+                let Some(p) = bulk.batch(batch_id.clone()).unwrap().progress() else {
+                    continue;
+                };
                 let sec = p.elapsed.as_secs();
                 progress_rows.lock().unwrap().push((sec, p.completed));
                 eprintln!(
@@ -190,13 +194,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let inputs = (0..n_items as u32).map(|idx| Item { idx });
-    let report = bulk.run(inputs).await?;
+    let report = bulk.batch(batch_id.clone())?.run(inputs).await?;
     watcher.abort();
     // Await the aborted watcher so its `bulk` clone is dropped before the
     // queue refcount check below. `abort()` only requests cancellation, so
     // without this the task can still hold a `bulk` clone (and through it a
     // `queue` clone) when `Arc::try_unwrap` runs.
     let _ = watcher.await;
+    worker.shutdown().await?;
 
     println!("window_sec,completed");
     for (sec, completed) in progress_rows.lock().unwrap().iter() {

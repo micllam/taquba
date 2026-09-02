@@ -13,9 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `taquba-bulk` crate with its surface unchanged. Relative to
   taquba-bulk 0.6: `BulkCtx::effects` stages application KV effects
   applied with the item's successful completion and `BulkCtx::kv_get`
-  reads a committed value; `Bulk::run` and `Bulk::run_with_shutdown`
-  stop the worker and wait for it before returning a submission error;
-  every run is a batch (`Bulk::batch(id)` or a generated id through
+  reads a committed value; the worker is spawned once by `Bulk::spawn`
+  (returning a `RunnerHandle`) and runs the items of every batch, so
+  batches run concurrently on one runner, `Batch::run` waits for its
+  items and stops waiting when dropped, `Batch::progress` replaces
+  `Bulk::progress`, `Bulk::run_with_shutdown` and
+  `Batch::run_with_shutdown` are removed and a batch already running in
+  the process is rejected with `Error::BatchRunning`; every run is a
+  batch (`Bulk::batch(id)` or a generated id through
   `Bulk::run`), items are identified by key (`BulkBuilder::key_fn` now
   accepts any string) and their run ids are the SHA-256 digest of
   `{batch_id}/{key}`, so batches never share run state; each item writes
@@ -37,14 +42,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   manifest, markers, memo entries and outcome records, and
   `BulkBuilder::batch_retention` removes them a window after the
   batch's completion through a terminal marker under
-  `workflow/bulk/terminals/` and a sweep at the start of every later run
-  and on every retention interval while it runs;
+  `workflow/bulk/terminals/` and a sweep when the worker starts and on
+  every retention interval after that;
   `BulkBuilder::clock` overrides the queue's clock; `BulkCtx::memoized`
   and `memoized_by_content` are replaced by `BulkCtx::memo`, the item's
   `Memo`, and the two cost-recording variants take an error type
   convertible from `taquba_workflow::Error`; `Error::InvalidBatchId`,
   `ReservedHeader`, `DuplicateKey`, `BatchMismatch`, `BatchNotFound`,
-  `Decode` and `Store` are new. `serde_json` is a dependency.
+  `Decode`, `Store` and `BatchRunning` are new. `serde_json` is a
+  dependency.
 - The `jobs` module: typed single-function jobs, moved from the
   `taquba-jobs` crate and re-founded on the runtime. A job is one run
   with a single step routed by the `jobs.type` header to the
@@ -60,6 +66,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `JobHandle::status` returns the in-process `RunStatus`,
   `JobContext::job_id` is `JobContext::id`, `JobContext::queue` is
   gone, and `Error::Store` is replaced by `Error::Workflow`.
+- `WorkflowRuntime::spawn`: spawns the worker loop as a task and returns
+  a `RunnerHandle` for shutting it down or waiting on it; the `jobs`
+  and `bulk` workers are spawned through it and `jobs::RunnerHandle`
+  is a re-export.
 - `RunSpec::run_at`: the earliest time the first step may run. The
   step-0 job waits in the queue's scheduled state until the queue's
   clock passes it.

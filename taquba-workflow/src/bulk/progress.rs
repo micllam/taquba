@@ -49,9 +49,9 @@ pub struct BatchStatus {
     pub failed_keys: Vec<String>,
 }
 
-/// A point-in-time view of a bulk run's progress. Returned by
-/// [`Bulk::progress`](crate::bulk::Bulk::progress) and suitable for a status line
-/// or a polling UI.
+/// A point-in-time view of a batch run's progress. Returned by
+/// [`Batch::progress`](crate::bulk::Batch::progress) and suitable for a
+/// status line or a polling UI.
 #[derive(Debug, Clone)]
 pub struct ProgressSnapshot {
     /// Number of items expected to complete (set once submission finishes;

@@ -56,12 +56,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let queue = Arc::new(Queue::open(store.clone(), "db").await?);
 
     let sink = Arc::new(JsonlSink::new(BufWriter::new(stdout())));
-    let bulk = Bulk::builder(queue, store, WordCounter)
+    let mut bulk = Bulk::builder(queue, store, WordCounter)
         .output(sink)
         .key_fn(|doc| doc.id.clone())
         .build();
+    let worker = bulk.spawn(std::future::pending::<()>());
 
     let report = bulk.run(documents).await?;
+    worker.shutdown().await?;
 
     eprintln!(
         "\n{}/{} succeeded, {} failed in {:?}",

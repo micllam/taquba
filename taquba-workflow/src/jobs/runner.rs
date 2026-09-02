@@ -7,13 +7,11 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
 
 use crate::{
-    Memo, MemoStore, NoopTerminalHook, RunSpec, Step, StepError, StepOutcome, StepRunner,
-    WorkflowRuntime,
+    Memo, MemoStore, NoopTerminalHook, RunSpec, RunnerHandle, Step, StepError, StepOutcome,
+    StepRunner, WorkflowRuntime,
 };
 use taquba::object_store::ObjectStore;
 use taquba::{Clock, Queue};
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 
 use crate::jobs::context::{JobContext, State};
 use crate::jobs::error::{Error, Result};
@@ -309,52 +307,7 @@ impl JobRunner {
     {
         assert!(!self.spawned, "JobRunner::spawn may only be called once");
         self.spawned = true;
-
-        let token = CancellationToken::new();
-        let worker_token = token.clone();
-        let inner = self.inner.clone();
-        let join = tokio::spawn(async move {
-            let combined_shutdown = async move {
-                tokio::select! {
-                    _ = shutdown => {}
-                    _ = worker_token.cancelled() => {}
-                }
-            };
-            inner.runtime.run(combined_shutdown).await
-        });
-        RunnerHandle { token, join }
-    }
-}
-
-/// A handle to a spawned [`JobRunner`]'s worker task.
-///
-/// Dropping a `RunnerHandle` does not stop the worker: the spawned task
-/// continues until the `shutdown` future passed to [`JobRunner::spawn`]
-/// resolves. Call [`shutdown`](Self::shutdown) or [`wait`](Self::wait) to
-/// stop or join the worker explicitly.
-pub struct RunnerHandle {
-    token: CancellationToken,
-    join: JoinHandle<crate::Result<()>>,
-}
-
-impl RunnerHandle {
-    /// Signal the worker to stop and wait for it to drain.
-    ///
-    /// Stops claiming new jobs, lets in-flight jobs finish, then returns
-    /// once the worker task has exited.
-    pub async fn shutdown(self) -> Result<()> {
-        self.token.cancel();
-        self.wait().await
-    }
-
-    /// Wait for the worker task to exit on its own (because the `shutdown`
-    /// future passed to [`JobRunner::spawn`] resolved, or a claim error
-    /// ended the loop).
-    pub async fn wait(self) -> Result<()> {
-        match self.join.await {
-            Ok(result) => result.map_err(Error::from),
-            Err(join_error) => std::panic::resume_unwind(join_error.into_panic()),
-        }
+        self.inner.runtime.spawn(shutdown)
     }
 }
 

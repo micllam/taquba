@@ -95,16 +95,14 @@
 //!
 //! let runtime = WorkflowRuntime::builder(queue, store, EchoRunner, NoopTerminalHook).build();
 //!
-//! let runtime_for_worker = runtime.clone();
-//! tokio::spawn(async move {
-//!     runtime_for_worker.run(std::future::pending::<()>()).await
-//! });
+//! let worker = runtime.spawn(std::future::pending::<()>());
 //!
 //! let outcome = runtime.submit(RunSpec {
 //!     input: b"hello".to_vec(),
 //!     ..Default::default()
 //! }).await?;
 //! println!("submitted run {}", outcome.run_id);
+//! worker.shutdown().await?;
 //! # Ok(()) }
 //! ```
 //!
@@ -586,7 +584,8 @@ pub use kv::KvReadHandle;
 pub use memo::{Memo, MemoStore};
 pub use runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 pub use runtime::{
-    RunSpec, RunState, RunStatus, SubmitOutcome, WorkflowRuntime, WorkflowRuntimeBuilder,
+    RunSpec, RunState, RunStatus, RunnerHandle, SubmitOutcome, WorkflowRuntime,
+    WorkflowRuntimeBuilder,
 };
 pub use signal::SignalOutcome;
 #[cfg(feature = "webhooks")]

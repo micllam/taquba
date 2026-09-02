@@ -221,8 +221,9 @@ mod handle;
 mod job;
 mod runner;
 
+pub use crate::RunnerHandle;
 pub use context::JobContext;
 pub use error::{Error, Result};
 pub use handle::{JobError, JobHandle, JoinError};
 pub use job::{ErrorKind, Job, payload_idempotency_key};
-pub use runner::{JobRunner, JobRunnerBuilder, RunnerHandle, SubmitOptions};
+pub use runner::{JobRunner, JobRunnerBuilder, SubmitOptions};

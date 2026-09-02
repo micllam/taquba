@@ -588,6 +588,31 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         Ok(true)
     }
 
+    /// Spawn [`Self::run`] as a Tokio task and return a handle for
+    /// graceful shutdown. The worker runs until `shutdown` resolves or
+    /// [`RunnerHandle::shutdown`] is called; in-flight steps finish
+    /// either way.
+    pub fn spawn<F>(&self, shutdown: F) -> RunnerHandle
+    where
+        F: Future<Output = ()> + Send + 'static,
+        R: 'static,
+        H: 'static,
+    {
+        let token = CancellationToken::new();
+        let worker_token = token.clone();
+        let runtime = self.clone();
+        let join = tokio::spawn(async move {
+            let combined_shutdown = async move {
+                tokio::select! {
+                    _ = shutdown => {}
+                    _ = worker_token.cancelled() => {}
+                }
+            };
+            runtime.run(combined_shutdown).await
+        });
+        RunnerHandle::new(token, join)
+    }
+
     /// Drive the step worker loop until `shutdown` resolves. Spawns up
     /// to `max_concurrent_steps` step processors and, when
     /// [`WorkflowRuntimeBuilder::memo_retention`] is set, an additional
@@ -647,6 +672,41 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
 
         result?;
         Ok(())
+    }
+}
+
+/// A handle to a worker task spawned by [`WorkflowRuntime::spawn`].
+///
+/// Dropping a `RunnerHandle` does not stop the worker: the task
+/// continues until the `shutdown` future passed to `spawn` resolves.
+/// Call [`shutdown`](Self::shutdown) or [`wait`](Self::wait) to stop or
+/// join the worker explicitly.
+pub struct RunnerHandle {
+    token: CancellationToken,
+    join: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl RunnerHandle {
+    pub(crate) fn new(token: CancellationToken, join: tokio::task::JoinHandle<Result<()>>) -> Self {
+        Self { token, join }
+    }
+
+    /// Signal the worker to stop and wait for it to drain: it stops
+    /// claiming, lets in-flight steps finish and returns once the task
+    /// has exited.
+    pub async fn shutdown(self) -> Result<()> {
+        self.token.cancel();
+        self.wait().await
+    }
+
+    /// Wait for the worker task to exit on its own, because the
+    /// `shutdown` future passed to [`WorkflowRuntime::spawn`] resolved
+    /// or a claim error ended the loop.
+    pub async fn wait(self) -> Result<()> {
+        match self.join.await {
+            Ok(result) => result,
+            Err(join_error) => std::panic::resume_unwind(join_error.into_panic()),
+        }
     }
 }
 

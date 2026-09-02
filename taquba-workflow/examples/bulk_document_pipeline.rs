@@ -232,13 +232,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let sink = Arc::new(JsonlSink::new(BufWriter::new(stdout())));
-    let bulk = Bulk::builder(queue, store, pipeline)
+    let mut bulk = Bulk::builder(queue, store, pipeline)
         .output(sink)
         .key_fn(|doc: &Document| doc.id.clone())
         .queue_name("docs")
         .build();
+    let worker = bulk.spawn(std::future::pending::<()>());
 
     let report = bulk.run(sample_documents()).await?;
+    worker.shutdown().await?;
 
     eprintln!(
         "\n{}/{} succeeded, {} failed in {:?}",

@@ -111,14 +111,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let runtime = WorkflowRuntime::builder(queue, store, EchoRunner, NoopTerminalHook).build();
 
-    let worker = runtime.clone();
-    tokio::spawn(async move { worker.run(std::future::pending::<()>()).await });
+    let worker = runtime.spawn(std::future::pending::<()>());
 
     let handle = runtime.submit(RunSpec {
         input: b"hello".to_vec(),
         ..Default::default()
     }).await?;
     println!("submitted run {}", handle.run_id);
+    worker.shutdown().await?;
     Ok(())
 }
 ```
