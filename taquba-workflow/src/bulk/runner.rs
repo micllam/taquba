@@ -3,8 +3,10 @@
 use crate::{Step, StepError, StepOutcome, StepRunner};
 use serde::{Deserialize, Serialize};
 
+use crate::StepErrorKind;
 use crate::bulk::cost::CostReport;
 use crate::bulk::pipeline::{BulkCtx, Pipeline};
+use crate::outcome::{OutcomeRecord, StoredOutcome, hash_input, write_outcome};
 
 /// The per-item result the runner writes as the workflow step's `Succeed`
 /// payload. Carries both the user [`Output`](Pipeline::Output) and the cost
@@ -17,10 +19,11 @@ pub(crate) struct ItemEnvelope<O> {
 }
 
 /// Bridges a [`Pipeline`] to [`crate::StepRunner`]. Each item is one
-/// workflow run whose step 0 decodes the input, runs the pipeline once, and
-/// `Succeed`s with an [`ItemEnvelope`]. The pipeline's own multi-step logic
-/// lives inside [`Pipeline::run`] via [`BulkCtx::memoized`]; the runner never
-/// emits [`StepOutcome::Continue`].
+/// workflow run whose step 0 decodes the input, runs the pipeline once,
+/// writes the item's outcome record to the run memo and `Succeed`s with an
+/// [`ItemEnvelope`]. The pipeline's own multi-step logic lives inside
+/// [`Pipeline::run`] via [`BulkCtx::memoized`]; the runner never emits
+/// [`StepOutcome::Continue`].
 pub(crate) struct PipelineRunner<P> {
     pipeline: P,
 }
@@ -37,17 +40,51 @@ impl<P: Pipeline> StepRunner for PipelineRunner<P> {
         let input: P::Input = rmp_serde::from_slice(&step.payload)
             .map_err(|e| StepError::permanent(format!("failed to decode bulk input: {e}")))?;
 
+        let input_hash = hash_input(&step.payload);
         let ctx = BulkCtx::new(input, step);
 
-        let output = self.pipeline.run(&ctx).await.map_err(Into::into)?;
-
-        let envelope = ItemEnvelope {
-            output,
-            cost: ctx.cost(),
-        };
-        let result = rmp_serde::to_vec_named(&envelope)
-            .map_err(|e| StepError::permanent(format!("failed to encode bulk output: {e}")))?;
-        Ok(StepOutcome::Succeed { result })
+        match self.pipeline.run(&ctx).await.map_err(Into::into) {
+            Ok(output) => {
+                let envelope = ItemEnvelope {
+                    output,
+                    cost: ctx.cost(),
+                };
+                let result = rmp_serde::to_vec_named(&envelope).map_err(|e| {
+                    StepError::permanent(format!("failed to encode bulk output: {e}"))
+                })?;
+                let record = OutcomeRecord {
+                    input_hash,
+                    outcome: StoredOutcome::Success {
+                        output: result.clone(),
+                    },
+                };
+                // A failed record write is transient: the step retries.
+                write_outcome(&step.run_memo, &record)
+                    .await
+                    .map_err(|err| StepError::transient(err.to_string()))?;
+                Ok(StepOutcome::Succeed { result })
+            }
+            Err(err) => {
+                // Record a failure only when this attempt ends the item.
+                let exhausted = step.attempts >= step.max_attempts;
+                if matches!(err.kind, StepErrorKind::Permanent) || exhausted {
+                    let record = OutcomeRecord {
+                        input_hash,
+                        outcome: StoredOutcome::Failure {
+                            kind: err.kind.into(),
+                            message: err.message.clone(),
+                        },
+                    };
+                    if let Err(write_err) = write_outcome(&step.run_memo, &record).await {
+                        tracing::warn!(
+                            run_id = %step.run_id,
+                            "failed to persist the item's failure outcome: {write_err}"
+                        );
+                    }
+                }
+                Err(err)
+            }
+        }
     }
 }
 

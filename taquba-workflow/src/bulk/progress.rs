@@ -33,9 +33,11 @@ pub struct ProgressSnapshot {
 }
 
 /// The outcome of a finished (or drained) bulk run, returned by
-/// [`Bulk::run`](crate::bulk::Bulk::run).
+/// [`Batch::run`](crate::bulk::Batch::run).
 #[derive(Debug, Clone)]
 pub struct BulkReport {
+    /// The batch this report describes.
+    pub batch_id: String,
     /// Number of items that were expected to complete.
     pub total: usize,
     /// Items that terminated successfully.
@@ -48,10 +50,9 @@ pub struct BulkReport {
     pub elapsed: Duration,
     /// Cost counters rolled up across all completed items.
     pub cost: CostReport,
-    /// Run identifiers of the items that failed. Because their memo entries
-    /// are retained, re-submitting these ids resumes from the last cached
-    /// step rather than recomputing from scratch.
-    pub failed_run_ids: Vec<String>,
+    /// Keys of the items that failed. A later run of the same batch runs
+    /// them again and skips the items that succeeded.
+    pub failed_keys: Vec<String>,
 }
 
 /// Internal, mutex-guarded counters updated by the terminal hook and read by
@@ -63,7 +64,7 @@ pub(crate) struct ProgressState {
     pub failed: usize,
     pub cancelled: usize,
     pub cost: CostReport,
-    pub failed_run_ids: Vec<String>,
+    pub failed_keys: Vec<String>,
     /// Run ids already recorded, so a redelivered terminal notification
     /// (delivery is at-least-once) is not counted twice.
     pub counted: HashSet<String>,
@@ -78,7 +79,7 @@ impl ProgressState {
             failed: 0,
             cancelled: 0,
             cost: CostReport::new(),
-            failed_run_ids: Vec::new(),
+            failed_keys: Vec::new(),
             counted: HashSet::new(),
             started_at: Instant::now(),
         }
@@ -122,15 +123,16 @@ impl ProgressState {
         }
     }
 
-    pub(crate) fn to_report(&self) -> BulkReport {
+    pub(crate) fn to_report(&self, batch_id: &str) -> BulkReport {
         BulkReport {
+            batch_id: batch_id.to_string(),
             total: self.total,
             succeeded: self.succeeded,
             failed: self.failed,
             cancelled: self.cancelled,
             elapsed: self.started_at.elapsed(),
             cost: self.cost.clone(),
-            failed_run_ids: self.failed_run_ids.clone(),
+            failed_keys: self.failed_keys.clone(),
         }
     }
 }

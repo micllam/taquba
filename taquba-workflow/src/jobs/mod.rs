@@ -219,7 +219,6 @@ mod context;
 mod error;
 mod handle;
 mod job;
-mod outcome;
 mod runner;
 
 pub use context::JobContext;

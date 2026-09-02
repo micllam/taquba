@@ -10,8 +10,8 @@ use thiserror::Error;
 
 use crate::jobs::error::{Error, Result};
 use crate::jobs::job::{ErrorKind, Job};
-use crate::jobs::outcome::{StoredOutcome, read_outcome};
 use crate::jobs::runner::Inner;
+use crate::outcome::{StoredErrorKind, StoredOutcome, read_outcome};
 
 // `join` waits in chunks of this length; `wait_for_completion` needs a finite
 // timeout, so an unbounded join loops over bounded waits.
@@ -222,7 +222,10 @@ fn decode_outcome<J: Job>(
     match outcome {
         StoredOutcome::Success { output } => Ok(Ok(rmp_serde::from_slice(&output)?)),
         StoredOutcome::Failure { kind, message } => Ok(Err(JobError {
-            kind: kind.into(),
+            kind: match kind {
+                StoredErrorKind::Transient => ErrorKind::Transient,
+                StoredErrorKind::Permanent => ErrorKind::Permanent,
+            },
             message,
         })),
     }

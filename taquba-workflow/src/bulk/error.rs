@@ -21,6 +21,15 @@ pub enum Error {
     #[error("payload encode error: {0}")]
     Encode(#[from] rmp_serde::encode::Error),
 
+    /// A batch id was not 1 to 128 bytes of `[A-Za-z0-9_-]`.
+    #[error("invalid batch id `{0}`: must be 1 to 128 bytes of `[A-Za-z0-9_-]`")]
+    InvalidBatchId(String),
+
+    /// [`BulkBuilder::headers`](crate::bulk::BulkBuilder::headers) included a
+    /// key under the `bulk.` prefix, which the runner reserves.
+    #[error("header key `{0}` is reserved by the bulk runner")]
+    ReservedHeader(String),
+
     /// The run completed but the share of failed items exceeded the
     /// configured [`fail_threshold`](crate::bulk::BulkBuilder::fail_threshold).
     #[error("bulk run failed: {failed}/{total} items failed, over the {threshold:.1}% threshold")]

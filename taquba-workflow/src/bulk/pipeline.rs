@@ -9,6 +9,7 @@ use serde::de::DeserializeOwned;
 use taquba::LeaseHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::bulk::batch::{HEADER_BATCH, HEADER_KEY};
 use crate::bulk::cost::CostReport;
 
 /// Defines a per-item processing pipeline. Each bulk run executes one
@@ -96,8 +97,14 @@ pub trait Pipeline: Send + Sync + 'static {
 pub struct BulkCtx<T> {
     /// The deserialized input item for this run.
     pub input: T,
-    /// The run identifier for this item (the value the bulk runner derived
-    /// from the input, or a positional `item-{i}` default).
+    /// The batch this item belongs to.
+    pub batch_id: String,
+    /// The item's key: the value of
+    /// [`BulkBuilder::key_fn`](crate::bulk::BulkBuilder::key_fn) for the
+    /// input, or the positional `item-{i}` default.
+    pub key: String,
+    /// The workflow run identifier of this item, derived from the batch id
+    /// and the key.
     pub run_id: String,
     /// Submitter-supplied metadata threaded through from the bulk run.
     pub headers: HashMap<String, String>,
@@ -111,10 +118,15 @@ pub struct BulkCtx<T> {
 
 impl<T> BulkCtx<T> {
     pub(crate) fn new(input: T, step: &Step) -> Self {
+        let mut headers = step.headers.clone();
+        let batch_id = headers.remove(HEADER_BATCH).unwrap_or_default();
+        let key = headers.remove(HEADER_KEY).unwrap_or_default();
         Self {
             input,
+            batch_id,
+            key,
             run_id: step.run_id.clone(),
-            headers: step.headers.clone(),
+            headers,
             memo: step.memo.clone(),
             cost: CostReport::new(),
             cancel_token: step.cancel_token.clone(),

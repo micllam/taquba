@@ -138,20 +138,27 @@
 //! surfaces delegate to [`crate`]'s KV effects, whose staging
 //! rules ([`EffectsHandle`](crate::EffectsHandle)) apply unchanged.
 //!
+//! # Batches
+//!
+//! Every run is a batch: [`Bulk::run`] creates one with a generated id,
+//! [`Bulk::batch`] names one. Items are identified within a batch by key
+//! ([`BulkBuilder::key_fn`], or the positional `item-{i}` default), and an
+//! item's workflow run id is the SHA-256 digest of `{batch_id}/{key}`, so
+//! batches never share run state. Each item writes an outcome record to its
+//! run memo before its settlement. A second run of the same batch reads
+//! those records: an item whose record is a success is counted and written
+//! to the sink from the record without running again, and an item whose
+//! record is a failure runs again. [`BulkReport::failed_keys`] is the set a
+//! second run re-executes.
+//!
 //! # Failure policy
 //!
 //! Per-item failures are recorded, not fatal: each failed item is written to
-//! the output sink with its error and its run id is collected on
-//! [`BulkReport::failed_run_ids`]. Set [`BulkBuilder::fail_threshold`] to
+//! the output sink with its error and its key is collected on
+//! [`BulkReport::failed_keys`]. Set [`BulkBuilder::fail_threshold`] to
 //! turn the whole run into an [`Error::FailureThresholdExceeded`] when the
 //! share of failures crosses a percentage, so a silent mass failure
 //! surfaces.
-//!
-//! # Replay
-//!
-//! Because memo entries are retained, re-submitting a failed item's input
-//! with the same run id resumes from its last cached step rather than
-//! recomputing. [`BulkReport::failed_run_ids`] is the set to replay.
 //!
 //! # Input and output
 //!
@@ -169,7 +176,7 @@ mod pipeline;
 mod progress;
 mod runner;
 
-pub use batch::{Bulk, BulkBuilder};
+pub use batch::{Batch, Bulk, BulkBuilder};
 pub use cost::CostReport;
 pub use error::{Error, Result};
 pub use io::{JsonlSink, NullSink, OutputRecord, OutputSink, read_jsonl};

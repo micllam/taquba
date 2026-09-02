@@ -32,8 +32,10 @@ where
 /// One result record handed to an [`OutputSink`] as an item completes.
 #[derive(Debug)]
 pub struct OutputRecord<'a> {
-    /// The completed item's run identifier.
-    pub run_id: &'a str,
+    /// The completed item's key: the value of
+    /// [`BulkBuilder::key_fn`](crate::bulk::BulkBuilder::key_fn) for its
+    /// input, or the positional `item-{i}` default.
+    pub key: &'a str,
     /// Terminal status, as the canonical lowercase string
     /// (`"succeeded"`, `"failed"`, `"cancelled"`).
     pub status: &'a str,
@@ -51,9 +53,9 @@ pub struct OutputRecord<'a> {
 ///
 /// Item completion is delivered at least once. Duplicate deliveries are
 /// detected and skipped within one batch process, so a repeated record
-/// for one `run_id` is rare (a delivery racing its own redelivery, or a
-/// batch resumed after a crash) but possible; consumers that must not
-/// double-apply a record deduplicate on `run_id`.
+/// for one key is rare (a delivery racing its own redelivery, or a batch
+/// resumed after a crash) but possible; consumers that must not
+/// double-apply a record deduplicate on `key`.
 pub trait OutputSink: Send + Sync {
     /// Persist one completed item's record.
     fn write(&self, record: &OutputRecord<'_>) -> Result<()>;
@@ -66,7 +68,7 @@ pub trait OutputSink: Send + Sync {
 }
 
 /// An [`OutputSink`] that writes one JSON object per line to an underlying
-/// writer. Each line carries `run_id`, `status`, and either `output` (for
+/// writer. Each line holds `key`, `status` and either `output` (for
 /// succeeded items) or `error` (when one is present). Writes are serialized
 /// through a mutex so the sink can be shared across worker tasks.
 pub struct JsonlSink<W: Write> {
@@ -86,7 +88,7 @@ impl<W: Write> JsonlSink<W> {
 impl<W: Write + Send> OutputSink for JsonlSink<W> {
     fn write(&self, record: &OutputRecord<'_>) -> Result<()> {
         let mut obj = Map::new();
-        obj.insert("run_id".into(), Value::String(record.run_id.to_string()));
+        obj.insert("key".into(), Value::String(record.key.to_string()));
         obj.insert("status".into(), Value::String(record.status.to_string()));
         if let Some(output) = &record.output {
             obj.insert("output".into(), output.clone());
@@ -165,14 +167,14 @@ mod tests {
         let buf: Vec<u8> = Vec::new();
         let sink = JsonlSink::new(buf);
         sink.write(&OutputRecord {
-            run_id: "item-0",
+            key: "item-0",
             status: "succeeded",
             output: Some(serde_json::json!({"n": 42})),
             error: None,
         })
         .unwrap();
         sink.write(&OutputRecord {
-            run_id: "item-1",
+            key: "item-1",
             status: "failed",
             output: None,
             error: Some("boom"),
@@ -187,7 +189,7 @@ mod tests {
         assert_eq!(lines.len(), 2);
 
         let first: Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(first["run_id"], "item-0");
+        assert_eq!(first["key"], "item-0");
         assert_eq!(first["status"], "succeeded");
         assert_eq!(first["output"]["n"], 42);
         assert!(first.get("error").is_none());

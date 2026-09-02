@@ -568,6 +568,7 @@ pub mod jobs;
 mod keys;
 mod kv;
 mod memo;
+pub(crate) mod outcome;
 mod registry;
 mod runner;
 mod runtime;

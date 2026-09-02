@@ -19,11 +19,11 @@ use crate::jobs::context::{JobContext, State};
 use crate::jobs::error::{Error, Result};
 use crate::jobs::handle::JobHandle;
 use crate::jobs::job::{ErrorKind, Job};
-use crate::jobs::outcome::{OutcomeRecord, StoredOutcome, hash_input, read_outcome, write_outcome};
+use crate::outcome::{OutcomeRecord, StoredOutcome, hash_input, read_outcome, write_outcome};
 
 /// Reserved header key holding a job's [`Job::NAME`], read by the step
 /// runner to route the run to the registered handler.
-pub(crate) const JOB_TYPE_HEADER: &str = "taquba_jobs.type";
+pub(crate) const JOB_TYPE_HEADER: &str = "jobs.type";
 
 const DEFAULT_QUEUE_NAME: &str = "jobs";
 const DEFAULT_CONCURRENCY: usize = 16;
@@ -224,7 +224,7 @@ async fn run_typed<J: Job>(
                 let record = OutcomeRecord {
                     input_hash,
                     outcome: StoredOutcome::Failure {
-                        kind: kind.into(),
+                        kind: stored_kind(kind),
                         message: message.clone(),
                     },
                 };
@@ -255,6 +255,13 @@ async fn run_typed<J: Job>(
                 }
             }
         }
+    }
+}
+
+fn stored_kind(kind: ErrorKind) -> crate::outcome::StoredErrorKind {
+    match kind {
+        ErrorKind::Transient => crate::outcome::StoredErrorKind::Transient,
+        ErrorKind::Permanent => crate::outcome::StoredErrorKind::Permanent,
     }
 }
 

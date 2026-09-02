@@ -15,11 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   applied with the item's successful completion and `BulkCtx::kv_get`
   reads a committed value; `Bulk::run` and `Bulk::run_with_shutdown`
   stop the worker and wait for it before returning a submission error;
-  a run id produced by `BulkBuilder::key_fn` must be 1 to 128 bytes of
-  `[A-Za-z0-9_-]`. `serde_json` is a dependency.
+  every run is a batch (`Bulk::batch(id)` or a generated id through
+  `Bulk::run`), items are identified by key (`BulkBuilder::key_fn` now
+  accepts any string) and their run ids are the SHA-256 digest of
+  `{batch_id}/{key}`, so batches never share run state; each item writes
+  an outcome record to its run memo, and a second run of the same batch
+  skips the items that succeeded and runs the failed ones again;
+  `OutputRecord::run_id` is `OutputRecord::key` (the JSONL field is
+  `key`), `BulkReport::failed_run_ids` is `failed_keys`, `BulkReport`
+  gains `batch_id`, `BulkCtx` gains `batch_id` and `key`, and
+  `Error::InvalidBatchId` and `Error::ReservedHeader` are new.
+  `serde_json` is a dependency.
 - The `jobs` module: typed single-function jobs, moved from the
   `taquba-jobs` crate and re-founded on the runtime. A job is one run
-  with a single step routed by the `taquba_jobs.type` header to the
+  with a single step routed by the `jobs.type` header to the
   handler registered on `JobRunnerBuilder::register`; its outcome
   record is stored in the run's memo under the runner's memo prefix
   (default `"{queue_name}-memo"`), removed by the runtime's memo

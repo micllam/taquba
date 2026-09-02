@@ -9,40 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking (source):** the crate re-exports `taquba_workflow::bulk`
-  and receives no further development; the implementation moved into
-  `taquba-workflow`. `taquba-workflow` is the only dependency beside
-  `taquba`. The entries below describe the module relative to 0.6.
-
-### Added
-
-- `BulkCtx::effects`, the item's staged application KV effects: writes
-  and deletes applied atomically with the item's successful completion,
-  with a failing item applying nothing. The handle is
-  `taquba-workflow`'s `EffectsHandle`, re-exported from this crate, and
-  its staging rules apply unchanged.
-- `BulkCtx::kv_get`, reading a committed value from Taquba's caller KV
-  namespace; effects staged by the running item are excluded.
-
-### Fixed
-
-- `Bulk::run` and `Bulk::run_with_shutdown` stop the worker and wait
-  for it to exit before returning a submission error. The worker
-  outlived the call, kept processing the items submitted before the
-  error and overlapped with the worker of a subsequent run.
-
-### Changed
-
-- Built against the `taquba` option setters: `OpenOptions`,
-  `QueueConfig`, `EnqueueOptions` and `SettlementEffects` are
-  `#[non_exhaustive]` in `taquba` and are constructed through their
-  setters here and in the documentation examples. Callers that build
-  these types for a queue shared with this crate migrate the same way.
-- A run id produced by `BulkBuilder::key_fn` must be 1 to 128 bytes of
-  `[A-Za-z0-9_-]`, the constraint `taquba-workflow` now applies to every
-  caller-supplied run id. A key function returning a wider identifier,
-  for example a URL or a path, must hash or otherwise restrict it. The
-  default positional ids are unaffected.
+- **Breaking (source and storage):** the crate re-exports
+  `taquba_workflow::bulk` and receives no further development; the
+  implementation moved into `taquba-workflow`. `taquba-workflow` is the
+  only dependency beside `taquba`. The module's changes relative to
+  0.6, including the batch model and the renamed report and record
+  fields, are listed in the `taquba-workflow` changelog under the
+  `bulk` module entry.
 
 ## [0.6.0] - 2026-08-17
 

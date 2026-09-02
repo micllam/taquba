@@ -1,5 +1,5 @@
-//! The [`Bulk`] runner: submit one pipeline over N inputs, monitor progress
-//! and cost, stream outputs as items complete.
+//! The [`Bulk`] runner: submit one pipeline over N inputs as a batch,
+//! monitor progress and cost, stream outputs as items complete.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -8,21 +8,25 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::{
-    RunOutcome, RunSpec, StepError, TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
+    MemoStore, RunOutcome, RunSpec, StepError, TerminalEffects, TerminalHook, TerminalStatus,
+    WorkflowRuntime,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 use taquba::Queue;
 use taquba::object_store::ObjectStore;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use crate::bulk::cost::CostReport;
 use crate::bulk::error::{Error, Result};
 use crate::bulk::io::{NullSink, OutputRecord, OutputSink};
 use crate::bulk::pipeline::Pipeline;
 use crate::bulk::progress::{BulkReport, ProgressSnapshot, ProgressState};
 use crate::bulk::runner::{ItemEnvelope, PipelineRunner};
+use crate::outcome::{StoredOutcome, read_outcome};
 
 /// Default queue name for bulk item steps.
 const DEFAULT_QUEUE_NAME: &str = "bulk-items";
@@ -30,6 +34,31 @@ const DEFAULT_QUEUE_NAME: &str = "bulk-items";
 const DEFAULT_MEMO_PREFIX: &str = "bulk-memo";
 /// Default ceiling on concurrently-processing items in one process.
 const DEFAULT_MAX_CONCURRENT: usize = 200;
+
+/// Header holding the batch id of an item's run.
+pub(crate) const HEADER_BATCH: &str = "bulk.batch";
+/// Header holding the item key of an item's run.
+pub(crate) const HEADER_KEY: &str = "bulk.key";
+/// Prefix of the headers the runner reserves.
+const RESERVED_HEADER_PREFIX: &str = "bulk.";
+
+/// The workflow run id of an item: the hex SHA-256 digest of
+/// `{batch_id}/{key}`, so batches never share run state and any key string
+/// maps onto the character set a run id accepts.
+pub(crate) fn item_run_id(batch_id: &str, key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    let mut hasher = Sha256::new();
+    hasher.update(batch_id.as_bytes());
+    hasher.update(b"/");
+    hasher.update(key.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
 
 /// Counters plus the wake-up primitive the runner waits on. Shared between
 /// the runner and the terminal hook.
@@ -53,6 +82,72 @@ impl Shared {
             notified.await;
         }
     }
+
+    /// Write an item's record to the sink and fold it into the counters.
+    /// An item already counted under `run_id` is neither written nor
+    /// counted again.
+    fn record(&self, sink: &dyn OutputSink, item: TerminalItem<'_>) {
+        if self.state.lock().unwrap().counted.contains(item.run_id) {
+            return;
+        }
+        let record = OutputRecord {
+            key: item.key,
+            status: item.status.as_str(),
+            output: item.output,
+            error: item.error,
+        };
+        if let Err(err) = sink.write(&record) {
+            warn!(key = %item.key, error = %err, "failed to write bulk output record");
+        }
+        let done = {
+            let mut state = self.state.lock().unwrap();
+            if !state.counted.insert(item.run_id.to_string()) {
+                return;
+            }
+            match item.status {
+                TerminalStatus::Succeeded => state.succeeded += 1,
+                TerminalStatus::Failed => {
+                    state.failed += 1;
+                    state.failed_keys.push(item.key.to_string());
+                }
+                TerminalStatus::Cancelled => state.cancelled += 1,
+            }
+            if let Some(cost) = item.cost {
+                state.cost.merge(&cost);
+            }
+            state.is_done()
+        };
+        if done {
+            self.notify.notify_one();
+        }
+    }
+}
+
+/// One terminated item, as the hook or the short-circuit path reports it.
+struct TerminalItem<'a> {
+    key: &'a str,
+    run_id: &'a str,
+    status: TerminalStatus,
+    output: Option<Value>,
+    error: Option<&'a str>,
+    cost: Option<CostReport>,
+}
+
+/// Decode a succeeded item's envelope into its JSON output and cost.
+fn decode_envelope<O>(key: &str, bytes: &[u8]) -> (Option<Value>, Option<CostReport>)
+where
+    O: Serialize + DeserializeOwned,
+{
+    match rmp_serde::from_slice::<ItemEnvelope<O>>(bytes) {
+        Ok(envelope) => (
+            serde_json::to_value(&envelope.output).ok(),
+            Some(envelope.cost),
+        ),
+        Err(err) => {
+            warn!(key = %key, error = %err, "failed to decode bulk item envelope");
+            (None, None)
+        }
+    }
 }
 
 /// Terminal hook that streams each completed item's output to the sink and
@@ -73,82 +168,30 @@ where
         outcome: &RunOutcome,
         _effects: &TerminalEffects,
     ) -> std::result::Result<(), StepError> {
-        // Delivery is at-least-once; an item already recorded is not
-        // written or counted again.
-        if self
-            .shared
-            .state
-            .lock()
-            .unwrap()
-            .counted
-            .contains(&outcome.run_id)
-        {
-            return Ok(());
-        }
-
-        let status = outcome.status;
-
-        // For a succeeded item, decode the envelope to recover the output
-        // value and the per-item cost. Anything else carries no output.
-        let (output, cost) = match status {
-            TerminalStatus::Succeeded => match &outcome.result {
-                Some(bytes) => match rmp_serde::from_slice::<ItemEnvelope<O>>(bytes) {
-                    Ok(envelope) => (
-                        serde_json::to_value(&envelope.output).ok(),
-                        Some(envelope.cost),
-                    ),
-                    Err(err) => {
-                        warn!(
-                            run_id = %outcome.run_id,
-                            error = %err,
-                            "failed to decode bulk item envelope",
-                        );
-                        (None, None)
-                    }
-                },
-                None => (None, None),
-            },
+        let key = outcome
+            .headers
+            .get(HEADER_KEY)
+            .map_or(outcome.run_id.as_str(), String::as_str);
+        let (output, cost) = match (outcome.status, &outcome.result) {
+            (TerminalStatus::Succeeded, Some(bytes)) => decode_envelope::<O>(key, bytes),
             _ => (None, None),
         };
-
-        let record = OutputRecord {
-            run_id: &outcome.run_id,
-            status: status.as_str(),
-            output,
-            error: outcome.error.as_deref(),
-        };
-        if let Err(err) = self.sink.write(&record) {
-            warn!(run_id = %outcome.run_id, error = %err, "failed to write bulk output record");
-        }
-
-        let done = {
-            let mut state = self.shared.state.lock().unwrap();
-            if !state.counted.insert(outcome.run_id.clone()) {
-                return Ok(());
-            }
-            match status {
-                TerminalStatus::Succeeded => state.succeeded += 1,
-                TerminalStatus::Failed => {
-                    state.failed += 1;
-                    state.failed_run_ids.push(outcome.run_id.clone());
-                }
-                TerminalStatus::Cancelled => state.cancelled += 1,
-            }
-            if let Some(cost) = cost {
-                state.cost.merge(&cost);
-            }
-            state.is_done()
-        };
-        if done {
-            self.shared.notify.notify_one();
-        }
+        self.shared.record(
+            self.sink.as_ref(),
+            TerminalItem {
+                key,
+                run_id: &outcome.run_id,
+                status: outcome.status,
+                output,
+                error: outcome.error.as_deref(),
+                cost,
+            },
+        );
         Ok(())
     }
 }
 
-/// Closure that derives a stable run id from an input item. Stable ids make
-/// a re-submission resume from cached memo state. See
-/// [`BulkBuilder::key_fn`] for the accepted character set.
+/// Closure that derives an item's key from its input.
 type KeyFn<I> = Box<dyn Fn(&I) -> String + Send + Sync>;
 
 /// Builder for a [`Bulk`] runner. Construct via [`Bulk::builder`].
@@ -174,26 +217,19 @@ impl<P: Pipeline> BulkBuilder<P> {
         self
     }
 
-    /// Derive each item's run id from its input. The default is positional
+    /// Derive each item's key from its input. The default is positional
     /// (`item-0`, `item-1`, ...). Supply a key when items have a natural
-    /// identifier so a replay re-uses the right memo state. Under
-    /// [`crate::WorkflowRuntimeBuilder::memo_retention`] that
-    /// re-use is bounded by the first run's retention window, after which
-    /// the replay re-executes the item's steps.
-    ///
-    /// The returned id must satisfy
-    /// [`crate::MAX_RUN_ID_LEN`] bytes of `[A-Za-z0-9_-]`;
-    /// [`Bulk::run`] fails the submission otherwise. Encode a natural
-    /// identifier that ranges wider than that, for example a URL or a
-    /// path, as a hash or another restricted form.
+    /// identifier: a later run of the same batch matches items by key, so
+    /// it skips the ones that succeeded and runs the failed ones again.
+    /// Any string is accepted.
     pub fn key_fn(mut self, f: impl Fn(&P::Input) -> String + Send + Sync + 'static) -> Self {
         self.key_fn = Some(Box::new(f));
         self
     }
 
     /// Submitter metadata applied to every item, threaded through to the
-    /// pipeline via [`BulkCtx::headers`](crate::bulk::BulkCtx::headers). Keys must
-    /// not start with the reserved `workflow.` prefix.
+    /// pipeline via [`BulkCtx::headers`](crate::bulk::BulkCtx::headers). Keys
+    /// must not start with the reserved `workflow.` or `bulk.` prefixes.
     pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
         self.headers = headers;
         self
@@ -220,9 +256,9 @@ impl<P: Pipeline> BulkBuilder<P> {
         self
     }
 
-    /// Object-store prefix for per-item memo entries. Defaults to
-    /// `"bulk-memo"`. Use a distinct value when several runners share a
-    /// store.
+    /// Object-store prefix for per-item memo entries and outcome records.
+    /// Defaults to `"bulk-memo"`. Use a distinct value when several runners
+    /// share a store.
     pub fn memo_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.memo_prefix = prefix.into();
         self
@@ -235,7 +271,7 @@ impl<P: Pipeline> BulkBuilder<P> {
     /// 100.0 or more behaves the same as not setting a threshold at all.
     ///
     /// `None` (the default) records failures but always returns an `Ok`
-    /// report. With a threshold set, [`Bulk::run`] returns
+    /// report. With a threshold set, [`Batch::run`] returns
     /// [`Error::FailureThresholdExceeded`] when the failed share exceeds it.
     pub fn fail_threshold(mut self, percent: f64) -> Self {
         self.fail_threshold = Some(percent);
@@ -254,6 +290,7 @@ impl<P: Pipeline> BulkBuilder<P> {
             sink: sink.clone(),
             _output: PhantomData,
         };
+        let memo_store = MemoStore::new(self.object_store.clone(), self.memo_prefix.clone());
         let runner = PipelineRunner::new(self.pipeline);
         let runtime = WorkflowRuntime::builder(self.queue, self.object_store, runner, hook)
             .queue_name(self.queue_name)
@@ -263,6 +300,7 @@ impl<P: Pipeline> BulkBuilder<P> {
             .build();
         Bulk {
             runtime,
+            memo_store,
             shared,
             sink,
             key_fn: self.key_fn,
@@ -272,11 +310,12 @@ impl<P: Pipeline> BulkBuilder<P> {
     }
 }
 
-/// Runs one [`Pipeline`] over many inputs in a single process: submits N
-/// workflow runs, drives the worker pool, and aggregates progress, cost, and
-/// streamed output.
+/// Runs one [`Pipeline`] over many inputs in a single process: submits one
+/// workflow run per item, drives the worker pool, and aggregates progress,
+/// cost, and streamed output per batch.
 pub struct Bulk<P: Pipeline> {
     runtime: WorkflowRuntime<PipelineRunner<P>, BulkHook<P::Output>>,
+    memo_store: MemoStore,
     shared: Arc<Shared>,
     sink: Arc<dyn OutputSink>,
     key_fn: Option<KeyFn<P::Input>>,
@@ -308,8 +347,67 @@ impl<P: Pipeline> Bulk<P> {
         }
     }
 
+    /// A handle on the batch named `id`, which must be 1 to 128 bytes of
+    /// `[A-Za-z0-9_-]`. A batch groups the items of one submission: a
+    /// second run of the same batch skips the items that succeeded and runs
+    /// the failed ones again.
+    pub fn batch(&self, id: impl Into<String>) -> Result<Batch<'_, P>> {
+        let id = id.into();
+        crate::keys::validate_run_id(&id).map_err(|_| Error::InvalidBatchId(id.clone()))?;
+        Ok(Batch { bulk: self, id })
+    }
+
+    /// A handle on a new batch with a generated id.
+    pub fn new_batch(&self) -> Batch<'_, P> {
+        Batch {
+            bulk: self,
+            id: ulid::Ulid::new().to_string(),
+        }
+    }
+
+    /// Run every input as a new batch with a generated id and return the
+    /// final [`BulkReport`].
+    pub async fn run<I>(&self, inputs: I) -> Result<BulkReport>
+    where
+        I: IntoIterator<Item = P::Input>,
+    {
+        self.new_batch().run(inputs).await
+    }
+
+    /// Like [`run`](Self::run), but stops early and drains in-flight items
+    /// when `shutdown` resolves; see [`Batch::run_with_shutdown`].
+    pub async fn run_with_shutdown<I, S>(&self, inputs: I, shutdown: S) -> Result<BulkReport>
+    where
+        I: IntoIterator<Item = P::Input>,
+        S: Future<Output = ()>,
+    {
+        self.new_batch().run_with_shutdown(inputs, shutdown).await
+    }
+
+    /// A point-in-time snapshot of the current run's progress.
+    pub fn progress(&self) -> ProgressSnapshot {
+        self.shared.state.lock().unwrap().snapshot()
+    }
+}
+
+/// A handle on one batch of a [`Bulk`] runner. Obtained from
+/// [`Bulk::batch`] or [`Bulk::new_batch`].
+pub struct Batch<'a, P: Pipeline> {
+    bulk: &'a Bulk<P>,
+    id: String,
+}
+
+impl<P: Pipeline> Batch<'_, P> {
+    /// The batch id.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
     /// Submit every input and run to completion, returning the final
-    /// [`BulkReport`].
+    /// [`BulkReport`]. An item whose outcome record from an earlier run of
+    /// this batch is a success is counted and written to the sink from that
+    /// record without running again; an item whose record is a failure runs
+    /// again.
     pub async fn run<I>(&self, inputs: I) -> Result<BulkReport>
     where
         I: IntoIterator<Item = P::Input>,
@@ -321,22 +419,28 @@ impl<P: Pipeline> Bulk<P> {
     /// Like [`run`](Self::run), but stops early and drains in-flight items
     /// when `shutdown` resolves (e.g. a spot-preemption signal). The
     /// returned report reflects whatever completed before the drain. Items
-    /// still in flight keep their durable state and memo entries, so a later
-    /// run resumes them.
+    /// still in flight keep their durable state, so a later run of the same
+    /// batch resumes them.
     ///
     /// A submission error stops the worker and returns after it has
     /// exited. Items submitted before the error keep their durable state
-    /// and are resumed by a later run over the same inputs.
+    /// and are resumed by a later run of the same batch.
     pub async fn run_with_shutdown<I, S>(&self, inputs: I, shutdown: S) -> Result<BulkReport>
     where
         I: IntoIterator<Item = P::Input>,
         S: Future<Output = ()>,
     {
-        *self.shared.state.lock().unwrap() = ProgressState::new();
+        let bulk = self.bulk;
+        for key in bulk.headers.keys() {
+            if key.starts_with(RESERVED_HEADER_PREFIX) {
+                return Err(Error::ReservedHeader(key.clone()));
+            }
+        }
+        *bulk.shared.state.lock().unwrap() = ProgressState::new();
 
         let stop = CancellationToken::new();
         let worker = {
-            let runtime = self.runtime.clone();
+            let runtime = bulk.runtime.clone();
             let stop = stop.clone();
             tokio::spawn(async move {
                 if let Err(err) = runtime.run(stop.cancelled_owned()).await {
@@ -353,34 +457,34 @@ impl<P: Pipeline> Bulk<P> {
                 // task outlives this call.
                 stop.cancel();
                 let _ = worker.await;
-                if let Err(flush_err) = self.sink.flush() {
+                if let Err(flush_err) = bulk.sink.flush() {
                     warn!(error = %flush_err, "sink flush failed after a submission error");
                 }
                 return Err(err);
             }
         };
         {
-            let mut state = self.shared.state.lock().unwrap();
+            let mut state = bulk.shared.state.lock().unwrap();
             state.total = expected;
         }
         // Cover the case where every item completed during submission: a
         // completion that fired while total was still 0 did not notify.
-        self.shared.notify.notify_one();
+        bulk.shared.notify.notify_one();
 
         let mut shutdown = std::pin::pin!(shutdown);
         tokio::select! {
-            _ = self.shared.wait_until_done() => {}
+            _ = bulk.shared.wait_until_done() => {}
             _ = shutdown.as_mut() => {
-                tracing::info!("bulk run draining on shutdown signal");
+                tracing::info!(batch_id = %self.id, "bulk run draining on shutdown signal");
             }
         }
 
         stop.cancel();
         let _ = worker.await;
-        self.sink.flush()?;
+        bulk.sink.flush()?;
 
-        let report = self.shared.state.lock().unwrap().to_report();
-        if let Some(threshold) = self.fail_threshold
+        let report = bulk.shared.state.lock().unwrap().to_report(&self.id);
+        if let Some(threshold) = bulk.fail_threshold
             && report.total > 0
         {
             let pct = report.failed as f64 / report.total as f64 * 100.0;
@@ -395,8 +499,9 @@ impl<P: Pipeline> Bulk<P> {
         Ok(report)
     }
 
-    /// Submit every input, returning the number of newly-enqueued runs. A
-    /// duplicate run id that was already active (or already recorded) is not
+    /// Submit every input, returning the number of items expected to
+    /// terminate: the newly enqueued runs plus the items answered from a
+    /// success record. A duplicate run that was already active is not
     /// counted, so the expected total matches the number of terminal hooks
     /// that will fire.
     ///
@@ -414,60 +519,80 @@ impl<P: Pipeline> Bulk<P> {
         const SUBMIT_CONCURRENCY: usize = 32;
 
         fn tally(
-            joined: std::result::Result<
-                crate::Result<crate::SubmitOutcome>,
-                tokio::task::JoinError,
-            >,
+            joined: std::result::Result<Result<bool>, tokio::task::JoinError>,
             expected: &mut usize,
         ) -> Result<()> {
             match joined {
-                Ok(Ok(outcome)) => {
-                    if outcome.newly_submitted {
+                Ok(Ok(counts)) => {
+                    if counts {
                         *expected += 1;
                     }
                     Ok(())
                 }
-                Ok(Err(err)) => Err(err.into()),
+                Ok(Err(err)) => Err(err),
                 // The set is never aborted while joining, so a join error
                 // is a panic in a submission task; propagate it.
                 Err(join_err) => std::panic::resume_unwind(join_err.into_panic()),
             }
         }
 
+        let bulk = self.bulk;
         let mut set = tokio::task::JoinSet::new();
         let mut expected = 0usize;
         for (i, input) in inputs.into_iter().enumerate() {
-            let run_id = match &self.key_fn {
+            let key = match &bulk.key_fn {
                 Some(f) => f(&input),
                 None => format!("item-{i}"),
             };
+            let run_id = item_run_id(&self.id, &key);
             let payload = rmp_serde::to_vec_named(&input)?;
             if set.len() >= SUBMIT_CONCURRENCY {
                 let joined = set.join_next().await.expect("set is non-empty");
                 tally(joined, &mut expected)?;
             }
-            let runtime = self.runtime.clone();
-            let headers = self.headers.clone();
+            let runtime = bulk.runtime.clone();
+            let run_memo = bulk.memo_store.new_run_memo(&run_id);
+            let shared = bulk.shared.clone();
+            let sink = bulk.sink.clone();
+            let mut headers = bulk.headers.clone();
+            headers.insert(HEADER_BATCH.to_string(), self.id.clone());
+            headers.insert(HEADER_KEY.to_string(), key.clone());
             set.spawn(async move {
-                runtime
+                // A success record from an earlier run of the batch answers
+                // the item; a failure record is ignored so the item runs
+                // again.
+                if let Some(record) = read_outcome(&run_memo).await?
+                    && let StoredOutcome::Success { output } = record.outcome
+                {
+                    let (output, cost) = decode_envelope::<P::Output>(&key, &output);
+                    shared.record(
+                        sink.as_ref(),
+                        TerminalItem {
+                            key: &key,
+                            run_id: &run_id,
+                            status: TerminalStatus::Succeeded,
+                            output,
+                            error: None,
+                            cost,
+                        },
+                    );
+                    return Ok(true);
+                }
+                let outcome = runtime
                     .submit(RunSpec {
                         run_id: Some(run_id),
                         input: payload,
                         headers,
                         ..RunSpec::default()
                     })
-                    .await
+                    .await?;
+                Ok(outcome.newly_submitted)
             });
         }
         while let Some(joined) = set.join_next().await {
             tally(joined, &mut expected)?;
         }
         Ok(expected)
-    }
-
-    /// A point-in-time snapshot of the current run's progress.
-    pub fn progress(&self) -> ProgressSnapshot {
-        self.shared.state.lock().unwrap().snapshot()
     }
 }
 
@@ -513,7 +638,7 @@ mod tests {
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
             self.records.lock().unwrap().push((
-                record.run_id.to_string(),
+                record.key.to_string(),
                 record.status.to_string(),
                 output,
             ));
@@ -575,7 +700,7 @@ mod tests {
         assert_eq!(report.total, 80);
         assert_eq!(report.succeeded, 79);
         assert_eq!(report.failed, 1);
-        assert_eq!(report.failed_run_ids, vec!["item-13".to_string()]);
+        assert_eq!(report.failed_keys, vec!["item-13".to_string()]);
         assert_eq!(sink.records.lock().unwrap().len(), 80);
     }
 
@@ -590,7 +715,7 @@ mod tests {
             async fn run(&self, ctx: &BulkCtx<Item>) -> std::result::Result<u32, StepError> {
                 let seed = ctx.kv_get(b"app/seed").await?.unwrap_or_default();
                 ctx.effects()
-                    .put(format!("app/items/{}", ctx.run_id), seed)
+                    .put(format!("app/items/{}", ctx.key), seed)
                     .map_err(StepError::from)?;
                 Ok(ctx.input.n)
             }
@@ -630,7 +755,7 @@ mod tests {
         assert_eq!(report.total, 3);
         assert_eq!(report.succeeded, 2);
         assert_eq!(report.failed, 1);
-        assert_eq!(report.failed_run_ids, vec!["item-1".to_string()]);
+        assert_eq!(report.failed_keys, vec!["item-1".to_string()]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -658,7 +783,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn custom_key_fn_sets_run_ids() {
+    async fn custom_key_fn_sets_item_keys() {
         let (queue, store) = fresh().await;
         let sink = Arc::new(Collect::default());
         let bulk = Bulk::builder(queue, store, Doubler)
@@ -688,16 +813,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_rejected_run_id_stops_the_worker_before_returning() {
+    async fn a_rejected_submission_stops_the_worker_before_returning() {
         let (queue, store) = fresh().await;
         let bulk = Bulk::builder(queue, store, Doubler)
-            .key_fn(|item| {
-                if item.n == 3 {
-                    "a/b".to_string()
-                } else {
-                    format!("n-{}", item.n)
-                }
-            })
+            .headers(HashMap::from([("workflow.x".to_string(), "y".to_string())]))
             .poll_interval(Duration::from_millis(10))
             .build();
 
@@ -709,9 +828,12 @@ mod tests {
         )
         .await
         .expect("run finished in time")
-        .expect_err("an invalid run id fails the submission");
+        .expect_err("a reserved header fails the submission");
         assert!(
-            matches!(err, Error::Workflow(crate::Error::InvalidRunId { .. })),
+            matches!(
+                err,
+                Error::Workflow(crate::Error::ReservedHeaderInSubmit(_))
+            ),
             "unexpected error: {err}",
         );
 
@@ -722,6 +844,99 @@ mod tests {
         })
         .await;
         assert!(settled.is_ok(), "the worker task outlived the failed run");
+    }
+
+    struct Counting {
+        runs: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl Pipeline for Counting {
+        type Input = Item;
+        type Output = u32;
+        type Error = StepError;
+
+        async fn run(&self, ctx: &BulkCtx<Item>) -> std::result::Result<u32, StepError> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if ctx.input.n == 13 {
+                return Err(StepError::permanent("unlucky"));
+            }
+            Ok(ctx.input.n * 2)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_run_of_a_batch_skips_succeeded_items_and_reruns_failed_ones() {
+        let (queue, store) = fresh().await;
+        let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let sink = Arc::new(Collect::default());
+        let bulk = Bulk::builder(queue, store, Counting { runs: runs.clone() })
+            .output(sink.clone())
+            .poll_interval(Duration::from_millis(10))
+            .build();
+        let inputs = || vec![Item { n: 1 }, Item { n: 13 }, Item { n: 3 }];
+
+        let first = tokio::time::timeout(
+            Duration::from_secs(10),
+            bulk.batch("nightly").unwrap().run(inputs()),
+        )
+        .await
+        .expect("run finished in time")
+        .unwrap();
+        assert_eq!((first.succeeded, first.failed), (2, 1));
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(10),
+            bulk.batch("nightly").unwrap().run(inputs()),
+        )
+        .await
+        .expect("run finished in time")
+        .unwrap();
+
+        assert_eq!(second.batch_id, "nightly");
+        assert_eq!((second.total, second.succeeded, second.failed), (3, 2, 1));
+        assert_eq!(second.failed_keys, vec!["item-1".to_string()]);
+        // Only the failed item ran again.
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 4);
+        let records = sink.records.lock().unwrap();
+        assert_eq!(records.len(), 6);
+        assert!(records.iter().any(|(key, status, output)| {
+            key == "item-0" && status == "succeeded" && *output == Some(2)
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batches_with_the_same_keys_do_not_share_state() {
+        let (queue, store) = fresh().await;
+        let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let bulk = Bulk::builder(queue, store, Counting { runs: runs.clone() })
+            .poll_interval(Duration::from_millis(10))
+            .build();
+
+        for id in ["a", "b"] {
+            let report = tokio::time::timeout(
+                Duration::from_secs(10),
+                bulk.batch(id)
+                    .unwrap()
+                    .run(vec![Item { n: 1 }, Item { n: 2 }]),
+            )
+            .await
+            .expect("run finished in time")
+            .unwrap();
+            assert_eq!(report.succeeded, 2);
+        }
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_batch_id_is_rejected() {
+        let (queue, store) = fresh().await;
+        let bulk = Bulk::builder(queue, store, Doubler).build();
+        assert!(matches!(
+            bulk.batch("a/b").map(|b| b.id().to_string()),
+            Err(Error::InvalidBatchId(id)) if id == "a/b"
+        ));
+        assert_eq!(bulk.batch("ok-1").unwrap().id(), "ok-1");
     }
 
     #[tokio::test]
