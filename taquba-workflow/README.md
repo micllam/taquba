@@ -569,13 +569,16 @@ programmer error; choose a fresh `run_id` for a new run.
 Duplicates are caught from two sources, in order:
 
 1. An in-process registry catches duplicates within the same runtime.
-2. A **durable per-run record** written atomically with the step-0
-   enqueue (via Taquba's `enqueue_with_kv`) catches duplicates across
-   process restarts, even after step 0 has been claimed and its dedup
-   key released. The record carries a SHA-256 of the original input so
-   the cross-restart mismatch check works even when the in-memory
-   registry is empty. The record is cleaned up when the run reaches a
-   terminal state.
+2. A **durable per-run record** written atomically with the step-0 enqueue
+   (via Taquba's `enqueue_with_kv`) catches duplicates across process
+   restarts, even after step 0 has been claimed and its dedup key released.
+   The record carries a SHA-256 of the original input so the cross-restart
+   mismatch check works even when the in-memory registry is empty. A
+   current-step pointer under `workflow/steps/` is written beside it,
+   rewritten in the settlement that enqueues each next step, and names the
+   queue job `SubmitOutcome::job_id` reports for a duplicate; a
+   `QueueReader` can read it to resolve a run's live job from outside the
+   process. Both are cleaned up when the run reaches a terminal state.
 
 ## Terminal hook
 

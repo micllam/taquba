@@ -13,13 +13,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 
 use crate::durable::{
-    DurableRunOutcome, DurableRunRecord, DurableStepOutcome, DurableStepOutcomeRecord,
+    DurableCurrentStep, DurableRunOutcome, DurableRunRecord, DurableStepOutcome,
+    DurableStepOutcomeRecord,
 };
 use crate::effects::{EffectsHandle, StagedEffects, TerminalEffects};
 use crate::error::{Error, Result};
 use crate::keys::{
     DEDUP_PREFIX, HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RESERVED_HEADER_PREFIX,
-    RESERVED_KV_PREFIX, TERMINAL_KV_PREFIX, hash_input, run_kv_key, terminal_kv_key,
+    RESERVED_KV_PREFIX, TERMINAL_KV_PREFIX, hash_input, run_kv_key, step_kv_key, terminal_kv_key,
     validate_run_id,
 };
 use crate::kv::KvReadHandle;
@@ -28,6 +29,14 @@ use crate::registry::RunRegistry;
 use crate::runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 use crate::sweep::Sweep;
 use crate::terminal::{RunOutcome, TerminalHook};
+
+/// The encoded current-step pointer for `job_id` at `step_number`.
+fn current_step_bytes(step_number: u32, job_id: &str) -> Result<Vec<u8>> {
+    Ok(rmp_serde::to_vec_named(&DurableCurrentStep {
+        step_number,
+        job_id: job_id.to_string(),
+    })?)
+}
 
 /// The portion of `delay` still ahead of `now_ms`, measured from
 /// `stored_at_ms`. Saturates to the full delay if the clock reads
@@ -109,11 +118,11 @@ pub struct SubmitOutcome {
     /// [`WorkflowRuntime::status`] for the run's current state when
     /// needed.
     pub newly_submitted: bool,
-    /// The id of the queue job for the run's first step: `Some` for a new
-    /// submission and for a duplicate of a run this runtime tracks in
-    /// process, `None` for a duplicate known only from the durable run
-    /// record.
-    pub job_id: Option<String>,
+    /// The id of the queue job currently representing the run: its
+    /// first step for a new submission, and the step the run has reached
+    /// for a duplicate, whether the run is tracked in process or known
+    /// only from its durable record.
+    pub job_id: String,
 }
 
 /// In-memory status snapshot for an active run. Returned by
@@ -445,10 +454,16 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             if existing != input_hash {
                 return Err(Error::InputMismatch(run_id.to_string()));
             }
+            let job_id = self
+                .inner
+                .core
+                .registry
+                .current_job_id(run_id)
+                .ok_or_else(|| Error::InconsistentRunState(run_id.to_string()))?;
             return Ok(SubmitOutcome {
                 run_id: run_id.to_string(),
                 newly_submitted: false,
-                job_id: self.inner.core.registry.current_job_id(run_id),
+                job_id,
             });
         }
 
@@ -456,18 +471,19 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         // the in-process race window; this read closes the across-restart
         // one (same queue, fresh runtime).
         if let Some(bytes) = self.inner.core.queue.kv_get(&run_kv_key(run_id)).await? {
-            let existing: DurableRunRecord =
-                rmp_serde::from_slice(&bytes).map_err(taquba::Error::from)?;
+            let existing: DurableRunRecord = rmp_serde::from_slice(&bytes)?;
             if existing.input_hash != input_hash {
                 return Err(Error::InputMismatch(run_id.to_string()));
             }
+            let current = self.inner.core.current_step(run_id).await?;
             return Ok(SubmitOutcome {
                 run_id: run_id.to_string(),
                 newly_submitted: false,
-                job_id: None,
+                job_id: current.job_id,
             });
         }
 
+        let job_id = self.inner.core.queue.next_job_id();
         let mut headers = spec.headers.clone();
         headers.insert(HEADER_RUN_ID.to_string(), run_id.to_string());
         headers.insert(HEADER_STEP.to_string(), "0".to_string());
@@ -476,7 +492,8 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             .run_at(spec.run_at)
             .priority(spec.priority)
             .max_attempts(spec.max_attempts_per_step)
-            .dedup_key(Some(format!("{DEDUP_PREFIX}{run_id}:0")));
+            .dedup_key(Some(format!("{DEDUP_PREFIX}{run_id}:0")))
+            .id_override(Some(job_id.clone()));
 
         let record_bytes = rmp_serde::to_vec_named(&DurableRunRecord {
             run_id: run_id.to_string(),
@@ -485,6 +502,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         })?;
         let mut kv = spec.kv_writes;
         kv.insert(run_kv_key(run_id), record_bytes);
+        kv.insert(step_kv_key(run_id), current_step_bytes(0, &job_id)?);
 
         let job_id = match self
             .inner
@@ -504,7 +522,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
                 return Ok(SubmitOutcome {
                     run_id: run_id.to_string(),
                     newly_submitted: false,
-                    job_id: Some(existing),
+                    job_id: existing,
                 });
             }
         };
@@ -520,7 +538,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         Ok(SubmitOutcome {
             run_id: run_id.to_string(),
             newly_submitted: true,
-            job_id: Some(job_id),
+            job_id,
         })
     }
 
@@ -779,6 +797,16 @@ impl RuntimeCore {
         Ok(cleared)
     }
 
+    /// The current-step pointer of a run whose durable record exists.
+    pub(crate) async fn current_step(&self, run_id: &str) -> Result<DurableCurrentStep> {
+        let bytes = self
+            .queue
+            .kv_get(&step_kv_key(run_id))
+            .await?
+            .ok_or_else(|| Error::InconsistentRunState(run_id.to_string()))?;
+        Ok(rmp_serde::from_slice(&bytes)?)
+    }
+
     /// Returns the per-run-id submit lock for `run_id`, creating it on
     /// first access.
     fn submit_lock_for(&self, run_id: &str) -> Arc<Mutex<()>> {
@@ -970,7 +998,11 @@ impl RuntimeCore {
     ) -> SettlementEffects {
         let (request, next_job_id) =
             self.step_enqueue_request(run_id, next_step, payload, user_headers, opts);
-        let kv_writes = kv_writes(&next_job_id);
+        let mut kv_writes = kv_writes(&next_job_id);
+        // The pointer's encoding cannot fail for a step number and an id.
+        if let Ok(pointer) = current_step_bytes(next_step, &next_job_id) {
+            kv_writes.insert(step_kv_key(run_id), pointer);
+        }
         self.registry.mark_pending(run_id, next_step, next_job_id);
         SettlementEffects::default()
             .enqueues(vec![request])
@@ -979,8 +1011,9 @@ impl RuntimeCore {
 }
 
 impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
-    /// Settle a run into its terminal state: return the durable run
-    /// record's delete, the terminal marker's write (when memo
+    /// Settle a run into its terminal state: return the deletes of the
+    /// durable run record and the current-step pointer, the terminal
+    /// marker's write (when memo
     /// retention is enabled) and the terminal-notification enqueue
     /// (when the hook observes this outcome) as [`SettlementEffects`]
     /// for the settlement transaction. The notification job's payload
@@ -999,7 +1032,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         priority: Option<u32>,
         max_attempts: Option<u32>,
     ) -> SettlementEffects {
-        let kv_deletes = vec![run_kv_key(&outcome.run_id)];
+        let kv_deletes = vec![run_kv_key(&outcome.run_id), step_kv_key(&outcome.run_id)];
         let kv_writes = if self.core.memo_retention.is_some() {
             HashMap::from([(
                 terminal_kv_key(&outcome.run_id, self.core.clock.now_ms()),
@@ -2279,7 +2312,6 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.run_id, "fixed-id");
         assert!(!outcome.newly_submitted);
-        assert!(outcome.job_id.is_some());
         assert_eq!(outcome.job_id, handle.job_id);
 
         let err = runtime
@@ -2294,6 +2326,68 @@ mod tests {
         assert!(err.is_permanent());
 
         let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_duplicate_known_only_from_the_durable_record_reports_the_current_job() {
+        let (queue, store) = fresh_queue().await;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        // Step 0 continues into a step scheduled an hour out, so the run
+        // rests at step 1 with a job the second runtime never saw.
+        let first = WorkflowRuntime::builder(
+            queue.clone(),
+            store.clone(),
+            ScriptedRunner::new(vec![StepOutcome::continue_after(
+                b"next".to_vec(),
+                Duration::from_secs(3600),
+            )]),
+            ChannelHook { tx },
+        )
+        .build();
+        let shutdown = spawn_runtime(first.clone());
+        let submitted = first
+            .submit(RunSpec {
+                run_id: Some("durable".into()),
+                input: b"x".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            if queue.stats("workflow-steps").await.unwrap().scheduled == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = shutdown.send(());
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let second = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            ScriptedRunner::new(vec![]),
+            ChannelHook { tx },
+        )
+        .build();
+        let duplicate = second
+            .submit(RunSpec {
+                run_id: Some("durable".into()),
+                input: b"x".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!duplicate.newly_submitted);
+        assert_ne!(
+            duplicate.job_id, submitted.job_id,
+            "the pointer moved to step 1"
+        );
+        let step_1 = queue.get_job(&duplicate.job_id).await.unwrap().unwrap();
+        assert_eq!(step_1.status, taquba::JobStatus::Scheduled);
+        assert_eq!(
+            step_1.headers.get(HEADER_STEP).map(String::as_str),
+            Some("1")
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2375,7 +2469,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let job_id = outcome.job_id.unwrap();
+        let job_id = outcome.job_id;
         queue
             .wait_for_completion(&job_id, Duration::from_secs(60))
             .await

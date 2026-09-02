@@ -63,9 +63,9 @@ pub enum JoinError {
 /// reads it back from object storage after a restart.
 pub struct JobHandle<J: Job> {
     id: String,
-    /// The queue job backing the delivery, when known. A duplicate
-    /// submission recognised only from the durable run record has none;
-    /// `join_timeout` then polls the outcome record.
+    /// The queue job backing the delivery, or `None` for a submission
+    /// answered from a completed job's outcome record, which `join`
+    /// reads back without waiting.
     queue_job_id: Option<String>,
     inner: Arc<Inner>,
     newly_submitted: bool,
@@ -167,12 +167,17 @@ impl<J: Job> JobHandle<J> {
         &self,
         timeout: Duration,
     ) -> Result<Option<std::result::Result<J::Output, JobError>>> {
+        let Some(queue_job_id) = &self.queue_job_id else {
+            return match self.fetch_result().await? {
+                Some(outcome) => Ok(Some(outcome)),
+                None => Err(Error::JobNotFound(self.id.clone())),
+            };
+        };
         let terminal = wait_terminal(
             self.inner.queue(),
             &self.inner.run_memo(&self.id),
-            self.queue_job_id.as_deref(),
+            queue_job_id,
             timeout,
-            self.inner.poll_interval(),
         )
         .await?;
         match terminal {

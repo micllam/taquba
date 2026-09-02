@@ -33,6 +33,18 @@ pub(crate) struct DurableRunRecord {
     pub(crate) input_hash: [u8; 32],
 }
 
+/// Durable pointer from a run to the queue job currently representing
+/// it, kept beside the run record: written with the step-0 enqueue,
+/// rewritten in the settlement that enqueues each next step and deleted
+/// with the termination. It is what a duplicate submission known only
+/// from the durable record, or a reader outside the process, resolves a
+/// run's live job from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DurableCurrentStep {
+    pub(crate) step_number: u32,
+    pub(crate) job_id: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub(crate) struct DurableDuration {
     secs: u64,

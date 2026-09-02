@@ -42,6 +42,12 @@ pub const MAX_RUN_ID_LEN: usize = 128;
 /// Prefix for the durable per-run record in Taquba's user KV namespace.
 pub(crate) const RUN_KV_PREFIX: &[u8] = b"workflow/runs/";
 
+/// Prefix for the durable current-step pointer: `run id -> (step, job id)`
+/// of the queue job currently representing the run, written with the
+/// step-0 enqueue, rewritten with every advance and deleted with the
+/// run's termination.
+pub(crate) const STEP_KV_PREFIX: &[u8] = b"workflow/steps/";
+
 /// Prefix for the durable waiter index: `correlation key -> job id` of the
 /// step job waiting on that key.
 pub(crate) const SIGNAL_WAIT_KV_PREFIX: &[u8] = b"workflow/signal-wait/";
@@ -168,6 +174,13 @@ pub(crate) fn validate_run_id(run_id: &str) -> Result<()> {
 pub(crate) fn run_kv_key(run_id: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(RUN_KV_PREFIX.len() + run_id.len());
     k.extend_from_slice(RUN_KV_PREFIX);
+    k.extend_from_slice(run_id.as_bytes());
+    k
+}
+
+pub(crate) fn step_kv_key(run_id: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(STEP_KV_PREFIX.len() + run_id.len());
+    k.extend_from_slice(STEP_KV_PREFIX);
     k.extend_from_slice(run_id.as_bytes());
     k
 }

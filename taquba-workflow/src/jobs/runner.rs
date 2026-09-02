@@ -70,7 +70,6 @@ pub(crate) struct Inner {
     queue: Arc<Queue>,
     memo_store: MemoStore,
     state: State,
-    poll_interval: Duration,
 }
 
 impl Inner {
@@ -84,10 +83,6 @@ impl Inner {
 
     pub(crate) fn state(&self) -> &State {
         &self.state
-    }
-
-    pub(crate) fn poll_interval(&self) -> Duration {
-        self.poll_interval
     }
 
     pub(crate) fn run_memo(&self, id: &str) -> Memo {
@@ -139,7 +134,7 @@ impl Inner {
         );
         Ok(JobHandle::new(
             outcome.run_id,
-            outcome.job_id,
+            Some(outcome.job_id),
             self.clone(),
             outcome.newly_submitted,
         ))
@@ -445,7 +440,6 @@ impl JobRunnerBuilder {
                 queue: self.queue,
                 memo_store,
                 state: self.state,
-                poll_interval: self.poll_interval,
             }
         });
         JobRunner {

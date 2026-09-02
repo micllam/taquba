@@ -182,28 +182,13 @@ pub(crate) enum Unrecorded {
 
 /// Wait up to `timeout` for the typed single-step run whose step job is
 /// `job_id` to reach a terminal state, then read its outcome record.
-/// Returns `Ok(None)` when the timeout elapses first. Without a job id
-/// (a duplicate submission known only from the durable run record) the
-/// outcome record is polled every `poll_interval`.
+/// Returns `Ok(None)` when the timeout elapses first.
 pub(crate) async fn wait_terminal(
     queue: &Queue,
     run_memo: &Memo,
-    job_id: Option<&str>,
+    job_id: &str,
     timeout: Duration,
-    poll_interval: Duration,
 ) -> Result<Option<Terminal>> {
-    let Some(job_id) = job_id else {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if let Some(record) = read_outcome(run_memo).await? {
-                return Ok(Some(Terminal::Recorded(record)));
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Ok(None);
-            }
-            tokio::time::sleep(poll_interval).await;
-        }
-    };
     let unrecorded = match queue.wait_for_completion(job_id, timeout).await? {
         WaitOutcome::TimedOut => return Ok(None),
         WaitOutcome::Done(_) => Unrecorded::Done,

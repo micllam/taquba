@@ -46,6 +46,12 @@ pub enum Error {
     #[error("run `{0}` exists with a different input; pick a fresh run_id")]
     InputMismatch(String),
 
+    /// A run's durable record exists without the current-step pointer
+    /// written beside it. The two are written and deleted in one
+    /// transaction, so this reports a store the runtime did not write.
+    #[error("run `{0}` has a run record but no current-step pointer")]
+    InconsistentRunState(String),
+
     /// A caller KV key passed via [`crate::RunSpec::kv_writes`] or staged
     /// through an [`crate::EffectsHandle`] starts with the reserved
     /// `workflow/` prefix. The runtime owns that prefix; callers must use
@@ -147,6 +153,7 @@ impl Error {
             | Self::ReservedHeaderInSubmit(_)
             | Self::InvalidRunId { .. }
             | Self::InputMismatch(_)
+            | Self::InconsistentRunState(_)
             | Self::ReservedKvKey(_)
             | Self::ConflictingKvEffect(_)
             | Self::EffectsSealed

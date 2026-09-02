@@ -543,8 +543,13 @@
 //!    duplicates across process restarts, even after step 0 has been
 //!    claimed and its dedup key released. The record carries a SHA-256
 //!    of the original input so the cross-restart mismatch check works
-//!    even when the in-memory registry is empty. The record is cleaned
-//!    up when the run reaches a terminal state.
+//!    even when the in-memory registry is empty. A current-step pointer
+//!    under `workflow/steps/` is written beside it, rewritten in the
+//!    settlement that enqueues each next step, and names the queue job
+//!    [`SubmitOutcome::job_id`] reports for a duplicate; a
+//!    `taquba::QueueReader` can read it to resolve a run's live job
+//!    from outside the process. Both are cleaned up when the run reaches
+//!    a terminal state.
 //!
 //! # Reserved headers
 //!

@@ -263,9 +263,8 @@ impl<P: Pipeline> BulkBuilder<P> {
         self
     }
 
-    /// Maximum time the worker waits on an empty queue before re-checking,
-    /// and the interval at which a batch run polls the outcome record of
-    /// an item whose queue job it cannot wait on. Defaults to 250ms.
+    /// Maximum time the worker waits on an empty queue before re-checking.
+    /// Defaults to 250ms.
     pub fn poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
         self
@@ -356,7 +355,6 @@ impl<P: Pipeline> BulkBuilder<P> {
                 sink,
                 key_fn: self.key_fn,
                 headers: self.headers,
-                poll_interval: self.poll_interval,
                 fail_threshold: self.fail_threshold,
                 batch_retention: self.batch_retention,
                 clock,
@@ -385,7 +383,6 @@ struct BulkInner<P: Pipeline> {
     sink: Arc<dyn OutputSink>,
     key_fn: Option<KeyFn<P::Input>>,
     headers: HashMap<String, String>,
-    poll_interval: Duration,
     fail_threshold: Option<f64>,
     batch_retention: Option<Duration>,
     clock: Arc<dyn Clock>,
@@ -529,14 +526,8 @@ impl<P: Pipeline> BulkInner<P> {
                 .await?
         };
         let terminal = loop {
-            let waited = wait_terminal(
-                &self.store.queue,
-                &run_memo,
-                submitted.job_id.as_deref(),
-                WAIT_CHUNK,
-                self.poll_interval,
-            )
-            .await?;
+            let waited =
+                wait_terminal(&self.store.queue, &run_memo, &submitted.job_id, WAIT_CHUNK).await?;
             if let Some(terminal) = waited {
                 break terminal;
             }
