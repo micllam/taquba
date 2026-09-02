@@ -33,7 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   notification writes the item's marker (status, error, cost) to
   `workflow/bulk/batches/<batch_id>/items/<key>` with its
   acknowledgement, and `Batch::status` reads the manifest and the
-  markers into a `BatchStatus`; `Error::InvalidBatchId`,
+  markers into a `BatchStatus`; `Batch::forget` removes a batch's
+  manifest, markers, memo entries and outcome records, and
+  `BulkBuilder::batch_retention` removes them a window after the
+  batch's completion through a terminal marker under
+  `workflow/bulk/terminals/` and a sweep at the start of every later run
+  and on every retention interval while it runs;
+  `BulkBuilder::clock` overrides the queue's clock; `Error::InvalidBatchId`,
   `ReservedHeader`, `DuplicateKey`, `BatchMismatch`, `BatchNotFound`,
   `Decode` and `Store` are new. `serde_json` is a dependency.
 - The `jobs` module: typed single-function jobs, moved from the

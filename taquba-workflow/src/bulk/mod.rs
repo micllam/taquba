@@ -165,6 +165,13 @@
 //! durable state is available without running it and from another
 //! process through the same prefix.
 //!
+//! A batch's state is retained until [`Batch::forget`] removes it, or,
+//! under [`BulkBuilder::batch_retention`], until the window after the
+//! batch's completion has passed: a completing run writes a terminal
+//! marker to `workflow/bulk/terminals/<ts>/<batch_id>`, and every later run
+//! removes the batches whose markers have expired before submitting its
+//! items and again on every retention interval while it runs.
+//!
 //! # Failure policy
 //!
 //! Per-item failures are recorded, not fatal: each failed item is written to

@@ -88,21 +88,34 @@ pub(crate) fn bulk_item_kv_key(batch_id: &str, key: &str) -> Vec<u8> {
 /// is the front of the range. The value is empty: both fields are in
 /// the key.
 pub(crate) fn terminal_kv_key(run_id: &str, terminal_at_ms: u64) -> Vec<u8> {
-    let mut k = Vec::from(TERMINAL_KV_PREFIX);
-    k.extend_from_slice(format!("{terminal_at_ms:020}/").as_bytes());
-    k.extend_from_slice(run_id.as_bytes());
+    timestamped_kv_key(TERMINAL_KV_PREFIX, run_id, terminal_at_ms)
+}
+
+/// Prefix for the durable terminal markers of bulk batches, read by the
+/// batch retention sweep: `workflow/bulk/terminals/{ts:020}/{batch_id}`.
+pub(crate) const BULK_TERMINAL_KV_PREFIX: &[u8] = b"workflow/bulk/terminals/";
+
+/// Key of the terminal marker of batch `batch_id`, completed at
+/// `terminal_at_ms`.
+pub(crate) fn bulk_terminal_kv_key(batch_id: &str, terminal_at_ms: u64) -> Vec<u8> {
+    timestamped_kv_key(BULK_TERMINAL_KV_PREFIX, batch_id, terminal_at_ms)
+}
+
+/// `{prefix}{ts:020}/{id}`: a marker whose zero-padded timestamp leads the
+/// suffix, so a prefix scan returns markers oldest first.
+pub(crate) fn timestamped_kv_key(prefix: &[u8], id: &str, ts_ms: u64) -> Vec<u8> {
+    let mut k = Vec::from(prefix);
+    k.extend_from_slice(format!("{ts_ms:020}/").as_bytes());
+    k.extend_from_slice(id.as_bytes());
     k
 }
 
-/// Parse a terminal marker key produced by [`terminal_kv_key`] back
-/// into its `(run_id, terminal_at_ms)` pair. Returns `None` for a key
-/// that does not match the layout. The run id is not validated here;
-/// the sweep validates it before clearing entries under it.
-pub(crate) fn parse_terminal_kv_key(key: &[u8]) -> Option<(String, u64)> {
-    let suffix = key.strip_prefix(TERMINAL_KV_PREFIX)?;
+/// The `(id, ts_ms)` of a key built by [`timestamped_kv_key`].
+pub(crate) fn parse_timestamped_kv_key(prefix: &[u8], key: &[u8]) -> Option<(String, u64)> {
+    let suffix = key.strip_prefix(prefix)?;
     let text = std::str::from_utf8(suffix).ok()?;
-    let (ts, run_id) = text.split_once('/')?;
-    Some((run_id.to_string(), ts.parse().ok()?))
+    let (ts, id) = text.split_once('/')?;
+    Some((id.to_string(), ts.parse().ok()?))
 }
 
 /// Validate a caller-supplied run id. The run id becomes an object-store
@@ -173,6 +186,7 @@ mod tests {
             SIGNAL_DELIVERED_KV_PREFIX,
             TERMINAL_KV_PREFIX,
             BULK_KV_PREFIX,
+            BULK_TERMINAL_KV_PREFIX,
         ] {
             assert!(
                 prefix.starts_with(RESERVED_KV_PREFIX.as_bytes()),

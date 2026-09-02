@@ -52,6 +52,13 @@ impl ManifestStore {
         }
     }
 
+    pub(crate) async fn delete(&self, batch_id: &str) -> Result<()> {
+        match self.store.delete(&self.path(batch_id)).await {
+            Ok(()) | Err(ObjectStoreError::NotFound { .. }) => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     pub(crate) async fn write(&self, manifest: &Manifest) -> Result<()> {
         let bytes = rmp_serde::to_vec_named(manifest)?;
         self.store

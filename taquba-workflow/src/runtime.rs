@@ -1248,7 +1248,7 @@ mod tests {
     use super::*;
     use crate::keys::MAX_RUN_ID_LEN;
     use crate::keys::{
-        TERMINAL_KV_PREFIX, parse_terminal_kv_key, signal_buf_kv_key, signal_wait_kv_key,
+        TERMINAL_KV_PREFIX, parse_timestamped_kv_key, signal_buf_kv_key, signal_wait_kv_key,
     };
     use crate::signal::SignalOutcome;
     use crate::terminal::NoopTerminalHook;
@@ -1304,7 +1304,9 @@ mod tests {
             .unwrap();
         page.entries
             .iter()
-            .map(|(key, _)| parse_terminal_kv_key(key).expect("well-formed marker key"))
+            .map(|(key, _)| {
+                parse_timestamped_kv_key(TERMINAL_KV_PREFIX, key).expect("well-formed marker key")
+            })
             .collect()
     }
 
@@ -4149,10 +4151,13 @@ mod tests {
             "ordering must follow the timestamp ahead of the id"
         );
         assert_eq!(
-            parse_terminal_kv_key(&young),
+            parse_timestamped_kv_key(TERMINAL_KV_PREFIX, &young),
             Some(("run-a".to_string(), 2_000)),
         );
-        assert_eq!(parse_terminal_kv_key(b"workflow/runs/run-a"), None);
+        assert_eq!(
+            parse_timestamped_kv_key(TERMINAL_KV_PREFIX, b"workflow/runs/run-a"),
+            None
+        );
     }
 
     /// Yield up to `iters` times waiting for `cond` to become true.

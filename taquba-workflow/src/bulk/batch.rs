@@ -14,8 +14,8 @@ use crate::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use taquba::Queue;
 use taquba::object_store::ObjectStore;
+use taquba::{Clock, Queue};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -27,8 +27,11 @@ use crate::bulk::manifest::{Manifest, ManifestItem, ManifestStore};
 use crate::bulk::pipeline::Pipeline;
 use crate::bulk::progress::{BatchStatus, BulkReport, ItemMarker, ProgressSnapshot, ProgressState};
 use crate::bulk::runner::{ItemEnvelope, PipelineRunner};
-use crate::keys::{bulk_item_kv_key, bulk_items_kv_prefix};
+use crate::keys::{
+    BULK_TERMINAL_KV_PREFIX, bulk_item_kv_key, bulk_items_kv_prefix, bulk_terminal_kv_key,
+};
 use crate::outcome::{StoredOutcome, read_outcome};
+use crate::sweep::sweep_expired;
 
 /// Default queue name for bulk item steps.
 const DEFAULT_QUEUE_NAME: &str = "bulk-items";
@@ -222,6 +225,8 @@ pub struct BulkBuilder<P: Pipeline> {
     queue_name: String,
     memo_prefix: String,
     fail_threshold: Option<f64>,
+    batch_retention: Option<Duration>,
+    clock: Option<Arc<dyn Clock>>,
 }
 
 impl<P: Pipeline> BulkBuilder<P> {
@@ -293,6 +298,26 @@ impl<P: Pipeline> BulkBuilder<P> {
         self
     }
 
+    /// Remove a batch's durable state (its manifest, item markers, memo
+    /// entries and outcome records) `retention` after the batch completes.
+    /// A completing run writes a terminal marker; every later run removes
+    /// the batches whose markers have expired before submitting its items
+    /// and again on every retention interval while it runs. When unset
+    /// (default), batches are retained until [`Batch::forget`]. The window
+    /// counts from the batch's first completion: a run of the same batch
+    /// inside the window completes against the same expiry.
+    pub fn batch_retention(mut self, retention: Duration) -> Self {
+        self.batch_retention = Some(retention);
+        self
+    }
+
+    /// Override the [`Clock`] the runner reads timestamps from. Defaults to
+    /// the queue's clock ([`Queue::clock`]).
+    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
     /// Finalize the builder.
     pub fn build(self) -> Bulk<P> {
         let shared = Arc::new(Shared {
@@ -309,11 +334,13 @@ impl<P: Pipeline> BulkBuilder<P> {
         let manifests = ManifestStore::new(self.object_store.clone(), self.memo_prefix.clone());
         let runner = PipelineRunner::new(self.pipeline);
         let queue = self.queue.clone();
+        let clock = self.clock.unwrap_or_else(|| queue.clock());
         let runtime = WorkflowRuntime::builder(self.queue, self.object_store, runner, hook)
             .queue_name(self.queue_name)
             .memo_prefix(self.memo_prefix)
             .max_concurrent_steps(self.max_concurrent)
             .poll_interval(self.poll_interval)
+            .clock(clock.clone())
             .build();
         Bulk {
             runtime,
@@ -325,6 +352,8 @@ impl<P: Pipeline> BulkBuilder<P> {
             key_fn: self.key_fn,
             headers: self.headers,
             fail_threshold: self.fail_threshold,
+            batch_retention: self.batch_retention,
+            clock,
         }
     }
 }
@@ -342,6 +371,8 @@ pub struct Bulk<P: Pipeline> {
     key_fn: Option<KeyFn<P::Input>>,
     headers: HashMap<String, String>,
     fail_threshold: Option<f64>,
+    batch_retention: Option<Duration>,
+    clock: Arc<dyn Clock>,
 }
 
 impl<P: Pipeline> Bulk<P> {
@@ -365,7 +396,51 @@ impl<P: Pipeline> Bulk<P> {
             queue_name: DEFAULT_QUEUE_NAME.to_string(),
             memo_prefix: DEFAULT_MEMO_PREFIX.to_string(),
             fail_threshold: None,
+            batch_retention: None,
+            clock: None,
         }
+    }
+
+    /// Remove the durable state of batch `id`: its manifest, item markers,
+    /// memo entries and outcome records. A batch without a manifest has
+    /// its markers removed and nothing else.
+    async fn forget_batch(&self, id: &str) -> crate::Result<()> {
+        if let Some(manifest) = self.manifests.read(id).await.map_err(bulk_to_workflow)? {
+            for item in &manifest.items {
+                self.memo_store
+                    .clear_memos_for_run(&item_run_id(id, &item.key))
+                    .await?;
+            }
+        }
+        let prefix = bulk_items_kv_prefix(id);
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let page = self.queue.kv_scan(&prefix, cursor.as_deref(), 1000).await?;
+            for (key, _) in &page.entries {
+                self.queue.kv_delete(key).await?;
+            }
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        self.manifests.delete(id).await.map_err(bulk_to_workflow)
+    }
+
+    /// Remove every batch whose terminal marker is older than the retention
+    /// window.
+    async fn sweep_expired_batches(&self, retention: Duration) -> crate::Result<usize> {
+        let cutoff = self
+            .clock
+            .now_ms()
+            .saturating_sub(retention.as_millis() as u64);
+        sweep_expired(
+            &self.queue,
+            BULK_TERMINAL_KV_PREFIX,
+            cutoff,
+            |id| async move { self.forget_batch(&id).await },
+        )
+        .await
     }
 
     /// A handle on the batch named `id`, which must be 1 to 128 bytes of
@@ -408,6 +483,19 @@ impl<P: Pipeline> Bulk<P> {
     /// A point-in-time snapshot of the current run's progress.
     pub fn progress(&self) -> ProgressSnapshot {
         self.shared.state.lock().unwrap().snapshot()
+    }
+}
+
+/// Present a bulk error as a workflow error for the sweep, which reports
+/// through the runtime's error type.
+fn bulk_to_workflow(err: Error) -> crate::Error {
+    match err {
+        Error::Workflow(inner) => inner,
+        Error::Store(inner) => crate::Error::Store(inner),
+        other => crate::Error::Store(taquba::object_store::Error::Generic {
+            store: "bulk",
+            source: Box::new(other),
+        }),
     }
 }
 
@@ -549,6 +637,14 @@ impl<P: Pipeline> Batch<'_, P> {
         Ok(status)
     }
 
+    /// Remove the batch's durable state: its manifest, item markers, memo
+    /// entries and outcome records. A later run of the same id starts
+    /// from nothing.
+    pub async fn forget(&self) -> Result<()> {
+        self.bulk.forget_batch(&self.id).await?;
+        Ok(())
+    }
+
     fn check_headers(&self) -> Result<()> {
         for key in self.bulk.headers.keys() {
             if key.starts_with(RESERVED_HEADER_PREFIX) {
@@ -601,6 +697,38 @@ impl<P: Pipeline> Batch<'_, P> {
                 }
             })
         };
+        // Expired batches are removed before this batch's items are
+        // submitted, then on every retention interval while it runs.
+        if let Some(retention) = bulk.batch_retention
+            && let Err(err) = bulk.sweep_expired_batches(retention).await
+        {
+            warn!("batch retention sweep failed: {err}");
+        }
+        let sweeper = bulk.batch_retention.map(|retention| {
+            let stop = stop.clone();
+            async move {
+                let mut ticker = tokio::time::interval(retention);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                ticker.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = stop.cancelled() => return,
+                        _ = ticker.tick() => {
+                            if let Err(err) = bulk.sweep_expired_batches(retention).await {
+                                warn!("batch retention sweep failed: {err}");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let mut sweeper = std::pin::pin!(async move {
+            if let Some(sweeper) = sweeper {
+                sweeper.await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        });
 
         let expected = items.len();
         let submitted = self.submit_all(items).await;
@@ -626,16 +754,24 @@ impl<P: Pipeline> Batch<'_, P> {
         bulk.shared.notify.notify_one();
 
         let mut shutdown = std::pin::pin!(shutdown);
-        tokio::select! {
-            _ = bulk.shared.wait_until_done() => {}
+        let completed = tokio::select! {
+            _ = bulk.shared.wait_until_done() => true,
             _ = shutdown.as_mut() => {
                 tracing::info!(batch_id = %self.id, "bulk run draining on shutdown signal");
+                false
             }
-        }
+            _ = sweeper.as_mut() => false,
+        };
 
         stop.cancel();
         let _ = worker.await;
         bulk.sink.flush()?;
+        if completed && let Some(_) = bulk.batch_retention {
+            let key = bulk_terminal_kv_key(&self.id, bulk.clock.now_ms());
+            if let Err(err) = bulk.queue.kv_put(&key, b"").await {
+                warn!(batch_id = %self.id, "batch terminal marker write failed: {err}");
+            }
+        }
 
         let report = bulk.shared.state.lock().unwrap().to_report(&self.id);
         if let Some(threshold) = bulk.fail_threshold
@@ -788,7 +924,7 @@ mod tests {
         (queue, store)
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(start_paused = true)]
     async fn runs_all_items_and_rolls_up_cost() {
         let (queue, store) = fresh().await;
         let sink = Arc::new(Collect::default());
@@ -815,7 +951,7 @@ mod tests {
         assert!(outputs.contains(&2) && outputs.contains(&4) && outputs.contains(&6));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(start_paused = true)]
     async fn large_batch_submits_with_bounded_concurrency() {
         let (queue, store) = fresh().await;
         let sink = Arc::new(Collect::default());
@@ -840,7 +976,7 @@ mod tests {
         assert_eq!(sink.records.lock().unwrap().len(), 80);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(start_paused = true)]
     async fn a_pipelines_staged_write_is_visible_after_the_item_acks() {
         struct EffectsPipeline;
         impl Pipeline for EffectsPipeline {
@@ -875,7 +1011,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(start_paused = true)]
     async fn records_failed_items() {
         let (queue, store) = fresh().await;
         let bulk = Bulk::builder(queue, store, Doubler)
@@ -894,7 +1030,7 @@ mod tests {
         assert_eq!(report.failed_keys, vec!["item-1".to_string()]);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(start_paused = true)]
     async fn fail_threshold_trips_when_exceeded() {
         let (queue, store) = fresh().await;
         let bulk = Bulk::builder(queue, store, Doubler)
@@ -918,7 +1054,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(start_paused = true)]
     async fn custom_key_fn_sets_item_keys() {
         let (queue, store) = fresh().await;
         let sink = Arc::new(Collect::default());
@@ -948,7 +1084,7 @@ mod tests {
         assert!(ids.contains(&"n-7".to_string()));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(start_paused = true)]
     async fn a_rejected_submission_stops_the_worker_before_returning() {
         let (queue, store) = fresh().await;
         let bulk = Bulk::builder(queue, store, Doubler)
@@ -1000,7 +1136,7 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(start_paused = true)]
     async fn a_second_run_of_a_batch_skips_succeeded_items_and_reruns_failed_ones() {
         let (queue, store) = fresh().await;
         let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1041,7 +1177,7 @@ mod tests {
         }));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(start_paused = true)]
     async fn batches_with_the_same_keys_do_not_share_state() {
         let (queue, store) = fresh().await;
         let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1064,7 +1200,7 @@ mod tests {
         assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(start_paused = true)]
     async fn resume_runs_a_batch_from_its_manifest() {
         let (queue, store) = fresh().await;
         let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1100,7 +1236,7 @@ mod tests {
         assert_eq!(sink.records.lock().unwrap().len(), 4);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(start_paused = true)]
     async fn a_run_with_a_different_item_set_is_rejected() {
         let (queue, store) = fresh().await;
         let bulk = Bulk::builder(queue, store, Doubler)
@@ -1146,7 +1282,7 @@ mod tests {
         assert!(matches!(err, Error::DuplicateKey(key) if key == "same"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(start_paused = true)]
     async fn status_reports_the_last_recorded_outcome_of_each_item() {
         let (queue, store) = fresh().await;
         let bulk = Bulk::builder(queue.clone(), store, Doubler)
@@ -1173,6 +1309,99 @@ mod tests {
             .unwrap()
             .entries;
         assert_eq!(markers.len(), 3);
+    }
+
+    async fn fresh_with_clock(t0: u64) -> (Arc<Queue>, Arc<dyn ObjectStore>, taquba::MockClock) {
+        let clock = taquba::MockClock::new(t0);
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let opts = taquba::OpenOptions::default().clock(Arc::new(clock.clone()));
+        let queue = Arc::new(
+            Queue::open_with_options(store.clone(), "db", opts)
+                .await
+                .unwrap(),
+        );
+        (queue, store, clock)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forget_removes_the_batch_state_and_a_later_run_starts_over() {
+        let (queue, store) = fresh().await;
+        let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let bulk = Bulk::builder(queue.clone(), store, Counting { runs: runs.clone() })
+            .poll_interval(Duration::from_millis(10))
+            .build();
+        let batch = bulk.batch("b").unwrap();
+        tokio::time::timeout(Duration::from_secs(10), batch.run(vec![Item { n: 1 }]))
+            .await
+            .expect("run finished in time")
+            .unwrap();
+
+        batch.forget().await.unwrap();
+
+        assert!(matches!(batch.status().await, Err(Error::BatchNotFound(_))));
+        let markers = queue
+            .kv_scan(b"workflow/bulk/batches/b/", None, 10)
+            .await
+            .unwrap()
+            .entries;
+        assert!(markers.is_empty());
+        tokio::time::timeout(Duration::from_secs(10), batch.run(vec![Item { n: 1 }]))
+            .await
+            .expect("run finished in time")
+            .unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_batch_is_swept_by_a_later_run() {
+        let t0 = 1_700_000_000_000;
+        let (queue, store, clock) = fresh_with_clock(t0).await;
+        let bulk = Bulk::builder(queue.clone(), store, Doubler)
+            .poll_interval(Duration::from_millis(10))
+            .batch_retention(Duration::from_secs(60))
+            .clock(Arc::new(clock.clone()))
+            .build();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            bulk.batch("old").unwrap().run(vec![Item { n: 1 }]),
+        )
+        .await
+        .expect("run finished in time")
+        .unwrap();
+        assert!(bulk.batch("old").unwrap().status().await.is_ok());
+        let terminals = queue
+            .kv_scan(b"workflow/bulk/terminals/", None, 10)
+            .await
+            .unwrap()
+            .entries;
+        assert_eq!(terminals.len(), 1);
+
+        // Inside the window a run sweeps nothing.
+        clock.advance(Duration::from_secs(30));
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            bulk.batch("mid").unwrap().run(vec![Item { n: 2 }]),
+        )
+        .await
+        .expect("run finished in time")
+        .unwrap();
+        assert!(bulk.batch("old").unwrap().status().await.is_ok());
+
+        // Past the window the next run's sweep removes the old batch.
+        clock.advance(Duration::from_secs(31));
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            bulk.batch("new").unwrap().run(vec![Item { n: 3 }]),
+        )
+        .await
+        .expect("run finished in time")
+        .unwrap();
+
+        assert!(matches!(
+            bulk.batch("old").unwrap().status().await,
+            Err(Error::BatchNotFound(_))
+        ));
+        assert!(bulk.batch("mid").unwrap().status().await.is_ok());
     }
 
     #[tokio::test]

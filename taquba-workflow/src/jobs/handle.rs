@@ -19,9 +19,9 @@ const JOIN_CHUNK: Duration = Duration::from_secs(3600);
 
 /// The logical failure outcome of a job that ran and did not succeed.
 ///
-/// Distinct from [`Error`](enum@Error): an infrastructure `Error` is an infrastructure
-/// failure, whereas a `JobError` means the job terminated unsuccessfully.
-/// The concrete `Job::Error` value is not persisted, so this holds its
+/// Distinct from [`Error`](enum@Error), which is an infrastructure
+/// failure: a `JobError` means the job terminated unsuccessfully. The
+/// concrete `Job::Error` value is not persisted, so this holds its
 /// [`Display`](std::fmt::Display) message and classification.
 #[derive(Debug, Clone, Error)]
 #[error("job failed ({kind:?}): {message}")]

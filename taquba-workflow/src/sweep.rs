@@ -12,7 +12,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::error::Result;
-use crate::keys::{TERMINAL_KV_PREFIX, parse_terminal_kv_key, validate_run_id};
+use std::future::Future;
+
+use taquba::Queue;
+
+use crate::keys::{TERMINAL_KV_PREFIX, parse_timestamped_kv_key, validate_run_id};
 use crate::runtime::RuntimeCore;
 
 /// Terminal markers read per page by the memo-retention sweep.
@@ -49,63 +53,76 @@ impl RuntimeCore {
     /// skipped (the next pass retries) so a transient failure on one
     /// marker doesn't stall the rest of the sweep.
     pub(crate) async fn sweep_expired_memos(&self, retention: Duration) -> Result<usize> {
-        let now_ms = self.clock.now_ms();
-        let retention_ms = retention.as_millis() as u64;
-        let cutoff = now_ms.saturating_sub(retention_ms);
-        let mut cleared = 0usize;
-        let mut cursor: Option<Vec<u8>> = None;
-        loop {
-            let page = self
-                .queue
-                .kv_scan(TERMINAL_KV_PREFIX, cursor.as_deref(), SWEEP_PAGE_SIZE)
-                .await?;
-            let exhausted = page.next_cursor.is_none();
-            cursor = page.next_cursor;
-            for (key, _) in page.entries {
-                let parsed = parse_terminal_kv_key(&key)
-                    .filter(|(run_id, _)| validate_run_id(run_id).is_ok());
-                let Some((run_id, terminal_at_ms)) = parsed else {
-                    // An empty run id resolves to the memo prefix itself, so
-                    // nothing is cleared under a marker that fails to parse.
+        let cutoff = self
+            .clock
+            .now_ms()
+            .saturating_sub(retention.as_millis() as u64);
+        let memo_store = &self.memo_store;
+        sweep_expired(
+            &self.queue,
+            TERMINAL_KV_PREFIX,
+            cutoff,
+            |run_id| async move { memo_store.clear_memos_for_run(&run_id).await },
+        )
+        .await
+    }
+}
+
+/// Remove the state of every entity whose marker under `prefix` (a
+/// `{ts:020}/{id}` key, see [`crate::keys::timestamped_kv_key`]) is older
+/// than `cutoff_ms`, then the marker. The scan stops at the first unexpired
+/// marker. A malformed marker, or one whose id is not a valid run id, is
+/// deleted without clearing anything. A failure to clear one entity leaves
+/// its marker for the next sweep.
+pub(crate) async fn sweep_expired<F, Fut, T>(
+    queue: &Queue,
+    prefix: &[u8],
+    cutoff_ms: u64,
+    mut clear: F,
+) -> Result<usize>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = std::result::Result<T, crate::Error>>,
+{
+    let mut cleared = 0usize;
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let page = queue
+            .kv_scan(prefix, cursor.as_deref(), SWEEP_PAGE_SIZE)
+            .await?;
+        let exhausted = page.next_cursor.is_none();
+        cursor = page.next_cursor;
+        for (key, _) in page.entries {
+            let parsed = parse_timestamped_kv_key(prefix, &key)
+                .filter(|(id, _)| validate_run_id(id).is_ok());
+            let Some((id, ts_ms)) = parsed else {
+                warn!(
+                    key = %String::from_utf8_lossy(&key),
+                    "malformed marker; deleting without clearing",
+                );
+                if let Err(err) = queue.kv_delete(&key).await {
                     warn!(
                         key = %String::from_utf8_lossy(&key),
-                        "malformed terminal marker; deleting without clearing memos",
+                        "malformed marker delete failed during sweep: {err}",
                     );
-                    if let Err(err) = self.queue.kv_delete(&key).await {
-                        warn!(
-                            key = %String::from_utf8_lossy(&key),
-                            "malformed terminal marker delete failed during sweep: {err}",
-                        );
-                    }
-                    continue;
-                };
-                // Markers sort by timestamp, so the first unexpired one
-                // ends the sweep: everything after it is newer.
-                if terminal_at_ms >= cutoff {
-                    return Ok(cleared);
                 }
-                if let Err(err) = self.memo_store.clear_memos_for_run(&run_id).await {
-                    warn!(
-                        run_id = %run_id,
-                        "clear_memos_for_run failed during sweep: {err}",
-                    );
-                    continue;
-                }
-                // Memos first, marker second: a failure here leaves the
-                // marker for the next pass, whose `clear_memos_for_run`
-                // is a no-op on the now-empty run prefix.
-                if let Err(err) = self.queue.kv_delete(&key).await {
-                    warn!(
-                        run_id = %run_id,
-                        "terminal marker delete failed during sweep: {err}",
-                    );
-                    continue;
-                }
-                cleared += 1;
-            }
-            if exhausted {
+                continue;
+            };
+            if ts_ms >= cutoff_ms {
                 return Ok(cleared);
             }
+            if let Err(err) = clear(id.clone()).await {
+                warn!(id = %id, "clear failed during sweep: {err}");
+                continue;
+            }
+            if let Err(err) = queue.kv_delete(&key).await {
+                warn!(id = %id, "marker delete failed during sweep: {err}");
+                continue;
+            }
+            cleared += 1;
+        }
+        if exhausted {
+            return Ok(cleared);
         }
     }
 }
