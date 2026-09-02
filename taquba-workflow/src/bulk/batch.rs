@@ -23,6 +23,7 @@ use tracing::warn;
 use crate::bulk::cost::CostReport;
 use crate::bulk::error::{Error, Result};
 use crate::bulk::io::{NullSink, OutputRecord, OutputSink};
+use crate::bulk::manifest::{Manifest, ManifestItem, ManifestStore};
 use crate::bulk::pipeline::Pipeline;
 use crate::bulk::progress::{BulkReport, ProgressSnapshot, ProgressState};
 use crate::bulk::runner::{ItemEnvelope, PipelineRunner};
@@ -291,6 +292,7 @@ impl<P: Pipeline> BulkBuilder<P> {
             _output: PhantomData,
         };
         let memo_store = MemoStore::new(self.object_store.clone(), self.memo_prefix.clone());
+        let manifests = ManifestStore::new(self.object_store.clone(), self.memo_prefix.clone());
         let runner = PipelineRunner::new(self.pipeline);
         let runtime = WorkflowRuntime::builder(self.queue, self.object_store, runner, hook)
             .queue_name(self.queue_name)
@@ -301,6 +303,7 @@ impl<P: Pipeline> BulkBuilder<P> {
         Bulk {
             runtime,
             memo_store,
+            manifests,
             shared,
             sink,
             key_fn: self.key_fn,
@@ -316,6 +319,7 @@ impl<P: Pipeline> BulkBuilder<P> {
 pub struct Bulk<P: Pipeline> {
     runtime: WorkflowRuntime<PipelineRunner<P>, BulkHook<P::Output>>,
     memo_store: MemoStore,
+    manifests: ManifestStore,
     shared: Arc<Shared>,
     sink: Arc<dyn OutputSink>,
     key_fn: Option<KeyFn<P::Input>>,
@@ -404,10 +408,12 @@ impl<P: Pipeline> Batch<'_, P> {
     }
 
     /// Submit every input and run to completion, returning the final
-    /// [`BulkReport`]. An item whose outcome record from an earlier run of
-    /// this batch is a success is counted and written to the sink from that
-    /// record without running again; an item whose record is a failure runs
-    /// again.
+    /// [`BulkReport`]. The batch's manifest is written before any item is
+    /// submitted; a run of an existing batch with a different item set is
+    /// rejected with [`Error::BatchMismatch`]. An item whose outcome record
+    /// from an earlier run of this batch is a success is counted and
+    /// written to the sink from that record without running again; an item
+    /// whose record is a failure runs again.
     pub async fn run<I>(&self, inputs: I) -> Result<BulkReport>
     where
         I: IntoIterator<Item = P::Input>,
@@ -430,12 +436,86 @@ impl<P: Pipeline> Batch<'_, P> {
         I: IntoIterator<Item = P::Input>,
         S: Future<Output = ()>,
     {
-        let bulk = self.bulk;
-        for key in bulk.headers.keys() {
+        self.check_headers()?;
+        let manifest = Manifest {
+            batch_id: self.id.clone(),
+            items: self.materialize(inputs)?,
+        };
+        match self.bulk.manifests.read(&self.id).await? {
+            Some(existing) if existing.items != manifest.items => {
+                return Err(Error::BatchMismatch(self.id.clone()));
+            }
+            Some(_) => {}
+            None => self.bulk.manifests.write(&manifest).await?,
+        }
+        self.drive(manifest.items, shutdown).await
+    }
+
+    /// Run the batch from its manifest, without the inputs: completed
+    /// items are answered from their outcome records, items still queued
+    /// continue, and the rest run. Returns [`Error::BatchNotFound`] when
+    /// no manifest exists.
+    pub async fn resume(&self) -> Result<BulkReport> {
+        self.resume_with_shutdown(std::future::pending::<()>())
+            .await
+    }
+
+    /// Like [`resume`](Self::resume), but stops early and drains in-flight
+    /// items when `shutdown` resolves.
+    pub async fn resume_with_shutdown<S>(&self, shutdown: S) -> Result<BulkReport>
+    where
+        S: Future<Output = ()>,
+    {
+        self.check_headers()?;
+        let manifest = self
+            .bulk
+            .manifests
+            .read(&self.id)
+            .await?
+            .ok_or_else(|| Error::BatchNotFound(self.id.clone()))?;
+        self.drive(manifest.items, shutdown).await
+    }
+
+    fn check_headers(&self) -> Result<()> {
+        for key in self.bulk.headers.keys() {
             if key.starts_with(RESERVED_HEADER_PREFIX) {
                 return Err(Error::ReservedHeader(key.clone()));
             }
         }
+        Ok(())
+    }
+
+    /// Derive each input's key and serialize it. Two inputs with one key
+    /// are rejected.
+    fn materialize<I>(&self, inputs: I) -> Result<Vec<ManifestItem>>
+    where
+        I: IntoIterator<Item = P::Input>,
+    {
+        let mut seen = std::collections::HashSet::new();
+        let mut items = Vec::new();
+        for (i, input) in inputs.into_iter().enumerate() {
+            let key = match &self.bulk.key_fn {
+                Some(f) => f(&input),
+                None => format!("item-{i}"),
+            };
+            if !seen.insert(key.clone()) {
+                return Err(Error::DuplicateKey(key));
+            }
+            items.push(ManifestItem {
+                key,
+                input: rmp_serde::to_vec_named(&input)?,
+            });
+        }
+        Ok(items)
+    }
+
+    /// Submit every item, drive the worker until every item has
+    /// terminated or `shutdown` resolves, and build the report.
+    async fn drive<S>(&self, items: Vec<ManifestItem>, shutdown: S) -> Result<BulkReport>
+    where
+        S: Future<Output = ()>,
+    {
+        let bulk = self.bulk;
         *bulk.shared.state.lock().unwrap() = ProgressState::new();
 
         let stop = CancellationToken::new();
@@ -449,9 +529,10 @@ impl<P: Pipeline> Batch<'_, P> {
             })
         };
 
-        let submitted = self.submit_all(inputs).await;
-        let expected = match submitted {
-            Ok(expected) => expected,
+        let expected = items.len();
+        let submitted = self.submit_all(items).await;
+        match submitted {
+            Ok(()) => {}
             Err(err) => {
                 // Stop the worker before reporting the error so that no
                 // task outlives this call.
@@ -462,7 +543,7 @@ impl<P: Pipeline> Batch<'_, P> {
                 }
                 return Err(err);
             }
-        };
+        }
         {
             let mut state = bulk.shared.state.lock().unwrap();
             state.total = expected;
@@ -499,11 +580,10 @@ impl<P: Pipeline> Batch<'_, P> {
         Ok(report)
     }
 
-    /// Submit every input, returning the number of items expected to
-    /// terminate: the newly enqueued runs plus the items answered from a
-    /// success record. A duplicate run that was already active is not
-    /// counted, so the expected total matches the number of terminal hooks
-    /// that will fire.
+    /// Submit every item. Every item terminates in this process: a
+    /// newly enqueued run and a run still queued from an earlier run of
+    /// the batch both fire the terminal hook here, and an item answered
+    /// from a success record is counted at submission.
     ///
     /// Submissions run with bounded concurrency. Each submission blocks
     /// on a durable enqueue commit, and concurrent commits share WAL
@@ -512,24 +592,12 @@ impl<P: Pipeline> Batch<'_, P> {
     /// item per flush. Enqueue order across in-flight submissions is not
     /// defined; batch items are independent. The first submission error
     /// aborts the remaining in-flight submissions and is returned.
-    async fn submit_all<I>(&self, inputs: I) -> Result<usize>
-    where
-        I: IntoIterator<Item = P::Input>,
-    {
+    async fn submit_all(&self, items: Vec<ManifestItem>) -> Result<()> {
         const SUBMIT_CONCURRENCY: usize = 32;
 
-        fn tally(
-            joined: std::result::Result<Result<bool>, tokio::task::JoinError>,
-            expected: &mut usize,
-        ) -> Result<()> {
+        fn tally(joined: std::result::Result<Result<()>, tokio::task::JoinError>) -> Result<()> {
             match joined {
-                Ok(Ok(counts)) => {
-                    if counts {
-                        *expected += 1;
-                    }
-                    Ok(())
-                }
-                Ok(Err(err)) => Err(err),
+                Ok(result) => result,
                 // The set is never aborted while joining, so a join error
                 // is a panic in a submission task; propagate it.
                 Err(join_err) => std::panic::resume_unwind(join_err.into_panic()),
@@ -538,17 +606,12 @@ impl<P: Pipeline> Batch<'_, P> {
 
         let bulk = self.bulk;
         let mut set = tokio::task::JoinSet::new();
-        let mut expected = 0usize;
-        for (i, input) in inputs.into_iter().enumerate() {
-            let key = match &bulk.key_fn {
-                Some(f) => f(&input),
-                None => format!("item-{i}"),
-            };
+        for ManifestItem { key, input } in items {
             let run_id = item_run_id(&self.id, &key);
-            let payload = rmp_serde::to_vec_named(&input)?;
+            let payload = input;
             if set.len() >= SUBMIT_CONCURRENCY {
                 let joined = set.join_next().await.expect("set is non-empty");
-                tally(joined, &mut expected)?;
+                tally(joined)?;
             }
             let runtime = bulk.runtime.clone();
             let run_memo = bulk.memo_store.new_run_memo(&run_id);
@@ -576,9 +639,9 @@ impl<P: Pipeline> Batch<'_, P> {
                             cost,
                         },
                     );
-                    return Ok(true);
+                    return Ok(());
                 }
-                let outcome = runtime
+                runtime
                     .submit(RunSpec {
                         run_id: Some(run_id),
                         input: payload,
@@ -586,13 +649,13 @@ impl<P: Pipeline> Batch<'_, P> {
                         ..RunSpec::default()
                     })
                     .await?;
-                Ok(outcome.newly_submitted)
+                Ok(())
             });
         }
         while let Some(joined) = set.join_next().await {
-            tally(joined, &mut expected)?;
+            tally(joined)?;
         }
-        Ok(expected)
+        Ok(())
     }
 }
 
@@ -926,6 +989,88 @@ mod tests {
             assert_eq!(report.succeeded, 2);
         }
         assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_runs_a_batch_from_its_manifest() {
+        let (queue, store) = fresh().await;
+        let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let sink = Arc::new(Collect::default());
+        let bulk = Bulk::builder(queue, store, Counting { runs: runs.clone() })
+            .output(sink.clone())
+            .poll_interval(Duration::from_millis(10))
+            .build();
+
+        let first = tokio::time::timeout(
+            Duration::from_secs(10),
+            bulk.batch("b")
+                .unwrap()
+                .run(vec![Item { n: 1 }, Item { n: 13 }]),
+        )
+        .await
+        .expect("run finished in time")
+        .unwrap();
+        assert_eq!((first.succeeded, first.failed), (1, 1));
+
+        let resumed =
+            tokio::time::timeout(Duration::from_secs(10), bulk.batch("b").unwrap().resume())
+                .await
+                .expect("resume finished in time")
+                .unwrap();
+
+        assert_eq!(
+            (resumed.total, resumed.succeeded, resumed.failed),
+            (2, 1, 1)
+        );
+        // The succeeded item was answered from its record; the failed one ran again.
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(sink.records.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_with_a_different_item_set_is_rejected() {
+        let (queue, store) = fresh().await;
+        let bulk = Bulk::builder(queue, store, Doubler)
+            .poll_interval(Duration::from_millis(10))
+            .build();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            bulk.batch("b")
+                .unwrap()
+                .run(vec![Item { n: 1 }, Item { n: 2 }]),
+        )
+        .await
+        .expect("run finished in time")
+        .unwrap();
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            bulk.batch("b")
+                .unwrap()
+                .run(vec![Item { n: 1 }, Item { n: 3 }]),
+        )
+        .await
+        .expect("run finished in time")
+        .unwrap_err();
+        assert!(matches!(err, Error::BatchMismatch(id) if id == "b"));
+    }
+
+    #[tokio::test]
+    async fn resume_of_an_unknown_batch_and_duplicate_keys_are_rejected() {
+        let (queue, store) = fresh().await;
+        let bulk = Bulk::builder(queue, store, Doubler)
+            .key_fn(|_| "same".to_string())
+            .build();
+        let err = bulk.batch("missing").unwrap().resume().await.unwrap_err();
+        assert!(matches!(err, Error::BatchNotFound(id) if id == "missing"));
+
+        let err = bulk
+            .batch("b")
+            .unwrap()
+            .run(vec![Item { n: 1 }, Item { n: 2 }])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::DuplicateKey(key) if key == "same"));
     }
 
     #[tokio::test]

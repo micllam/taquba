@@ -23,9 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   skips the items that succeeded and runs the failed ones again;
   `OutputRecord::run_id` is `OutputRecord::key` (the JSONL field is
   `key`), `BulkReport::failed_run_ids` is `failed_keys`, `BulkReport`
-  gains `batch_id`, `BulkCtx` gains `batch_id` and `key`, and
-  `Error::InvalidBatchId` and `Error::ReservedHeader` are new.
-  `serde_json` is a dependency.
+  gains `batch_id`, `BulkCtx` gains `batch_id` and `key`; a run writes
+  the batch's manifest (keys and serialized inputs) to
+  `<memo_prefix>/batches/<batch_id>/manifest` before submitting, rejects
+  a different item set for an existing batch and rejects duplicate keys,
+  and `Batch::resume` drives a batch from its manifest alone; every
+  submitted item counts toward the expected total, including a run
+  still queued from an earlier run of the batch; `Error::InvalidBatchId`,
+  `ReservedHeader`, `DuplicateKey`, `BatchMismatch`, `BatchNotFound`,
+  `Decode` and `Store` are new. `serde_json` is a dependency.
 - The `jobs` module: typed single-function jobs, moved from the
   `taquba-jobs` crate and re-founded on the runtime. A job is one run
   with a single step routed by the `jobs.type` header to the

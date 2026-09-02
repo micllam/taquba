@@ -151,6 +151,13 @@
 //! record is a failure runs again. [`BulkReport::failed_keys`] is the set a
 //! second run re-executes.
 //!
+//! Before submitting any item, a run writes the batch's manifest (its keys
+//! and serialized inputs) to `<memo_prefix>/batches/<batch_id>/manifest`;
+//! a run of an existing batch with a different item set is rejected with
+//! [`Error::BatchMismatch`]. [`Batch::resume`] drives a batch from its
+//! manifest alone: completed items are answered from their outcome
+//! records, items still queued continue, and the rest run.
+//!
 //! # Failure policy
 //!
 //! Per-item failures are recorded, not fatal: each failed item is written to
@@ -172,6 +179,7 @@ mod batch;
 mod cost;
 mod error;
 mod io;
+mod manifest;
 mod pipeline;
 mod progress;
 mod runner;

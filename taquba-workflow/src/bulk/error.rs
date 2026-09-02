@@ -17,9 +17,30 @@ pub enum Error {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// Encoding an input item to the queue's internal payload format failed.
+    /// Encoding an input item or a manifest failed.
     #[error("payload encode error: {0}")]
     Encode(#[from] rmp_serde::encode::Error),
+
+    /// Decoding a manifest failed.
+    #[error("payload decode error: {0}")]
+    Decode(#[from] rmp_serde::decode::Error),
+
+    /// Reading or writing a manifest in the object store failed.
+    #[error("object store error: {0}")]
+    Store(#[from] taquba::object_store::Error),
+
+    /// Two items of one batch produced the same key.
+    #[error("duplicate item key `{0}` in batch")]
+    DuplicateKey(String),
+
+    /// A run of an existing batch supplied a different item set than the
+    /// batch's manifest.
+    #[error("batch `{0}` exists with a different item set")]
+    BatchMismatch(String),
+
+    /// A resume named a batch with no manifest.
+    #[error("batch `{0}` not found")]
+    BatchNotFound(String),
 
     /// A batch id was not 1 to 128 bytes of `[A-Za-z0-9_-]`.
     #[error("invalid batch id `{0}`: must be 1 to 128 bytes of `[A-Za-z0-9_-]`")]
