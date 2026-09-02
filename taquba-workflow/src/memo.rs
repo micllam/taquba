@@ -20,7 +20,10 @@
 //! two sub-prefixes:
 //!
 //! - `<prefix>/memos/<run_id>/<step_number>/<sha256(user_key)>`: per-step
-//!   memo entries written by [`Memo::put`].
+//!   memo entries written by [`Memo::put`]. A content-addressed entry
+//!   ([`Memo::content_put`]) is stored under the user key
+//!   `content:<sha256(msgpack(input))>`, so its path segment is the
+//!   digest of that key.
 //! - `<prefix>/memos/<run_id>/run/<sha256(user_key)>`: run-scoped memo
 //!   entries; the `run` segment sits beside the numeric step segments,
 //!   so [`MemoStore::clear_memos_for_run`] removes both kinds together.
@@ -441,25 +444,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn content_entries_remain_step_scoped() {
-        let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        let at_step_0 = store.new_memo("run-1", 0);
-        let at_step_1 = store.new_memo("run-1", 1);
-        let input = ContentInput {
-            operation: "draft",
-            payload: b"hello",
-        };
-
-        at_step_0.content_put(&input, b"step-0").await.unwrap();
-
-        assert_eq!(
-            at_step_0.content_get(&input).await.unwrap(),
-            Some(b"step-0".to_vec()),
-        );
-        assert!(at_step_1.content_get(&input).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
     async fn step_output_entries_are_scoped_by_payload_hash() {
         let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
 
@@ -481,6 +465,43 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none(),
+        );
+    }
+
+    #[tokio::test]
+    async fn entries_are_stored_at_the_documented_paths() {
+        let backing = Arc::new(InMemory::new());
+        let store = MemoStore::new(backing.clone(), "memo");
+        store.new_memo("run-1", 0).put("k", b"step").await.unwrap();
+        store.new_run_memo("run-1").put("k", b"run").await.unwrap();
+        store
+            .new_memo("run-1", 0)
+            .content_put("hello", b"content")
+            .await
+            .unwrap();
+        store
+            .put_step_output("run-1", 0, b"payload", b"out")
+            .await
+            .unwrap();
+
+        let mut paths = Vec::new();
+        let mut listing = backing.list(None);
+        while let Some(item) = listing.next().await {
+            paths.push(item.unwrap().location.to_string());
+        }
+        paths.sort();
+
+        // Digests are, in order: sha256("content:" + hex sha256 of the
+        // MessagePack encoding of "hello"), sha256("k") twice and
+        // sha256("payload").
+        assert_eq!(
+            paths,
+            [
+                "memo/memos/run-1/0/1adc4f8ba16f15ba2172dab9b84bb9ba73f5cf4f156f50df4dda663b4f9c61ba",
+                "memo/memos/run-1/0/8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a",
+                "memo/memos/run-1/run/8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a",
+                "memo/step-outputs/run-1/0/239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
+            ],
         );
     }
 
