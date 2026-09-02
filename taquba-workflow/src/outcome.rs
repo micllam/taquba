@@ -1,7 +1,7 @@
 //! The typed single-step run shared by the [`jobs`](crate::jobs) and
-//! [`bulk`](crate::bulk) modules: the adapter that decodes a step's
-//! payload into a typed input, runs a typed handler and encodes its
-//! output ([`run_typed_step`]), the durable outcome record it writes
+//! [`bulk`](crate::bulk) modules: the adapter that decodes a typed
+//! input, runs a typed handler and encodes its output
+//! ([`run_typed_step`]), the durable outcome record it writes
 //! before its settlement, stored in the run-scoped memo under a key
 //! reserved by this crate, and the in-process wait for the run's
 //! terminal state ([`wait_terminal`]).
@@ -56,15 +56,16 @@ impl From<StepErrorKind> for StoredErrorKind {
     }
 }
 
-/// Run one typed single-step delivery: decode the step's payload as `I`,
-/// run `handler` on it and encode its `O` as the step's result, recording
-/// the outcome through [`run_recorded`]. A payload that does not decode
-/// and an output that does not encode are permanent errors, since a
-/// retry cannot change either; `name` identifies the typed handler in
-/// those messages.
+/// Run one typed single-step delivery: decode `input`, the serialized
+/// typed input carried in the step's payload, as `I`, run `handler` on it
+/// and encode its `O` as the step's result, recording the outcome through
+/// [`run_recorded`]. An input that does not decode and an output that
+/// does not encode are permanent errors, since a retry cannot change
+/// either; `name` identifies the typed handler in those messages.
 pub(crate) async fn run_typed_step<I, O, F, Fut>(
     step: &Step,
     name: &str,
+    input: &[u8],
     handler: F,
 ) -> std::result::Result<StepOutcome, StepError>
 where
@@ -74,8 +75,8 @@ where
     Fut: Future<Output = std::result::Result<O, StepError>>,
 {
     run_recorded(step, async {
-        let input: I = rmp_serde::from_slice(&step.payload)
-            .map_err(|err| StepError::permanent(format!("invalid payload for `{name}`: {err}")))?;
+        let input: I = rmp_serde::from_slice(input)
+            .map_err(|err| StepError::permanent(format!("invalid input for `{name}`: {err}")))?;
         let output = handler(input).await?;
         rmp_serde::to_vec_named(&output).map_err(|err| {
             StepError::permanent(format!(

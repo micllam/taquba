@@ -174,7 +174,7 @@
 //! marker and runs again on the next run of the batch. [`Batch::status`]
 //! reads the manifest and the markers, so a batch's durable state is
 //! available without running it and from another process through the
-//! same prefix. A batch run learns of each item's termination through
+//! same prefix. A batch run observes each item's termination through
 //! the queue's in-process completion notification and reads the item's
 //! outcome record to stream its output; an item runs as one queue job.
 //!

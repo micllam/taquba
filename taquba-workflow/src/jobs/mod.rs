@@ -75,8 +75,8 @@
 //! Like the rest of the Taquba ecosystem, the runner is single-process:
 //! one [`JobRunner`] per process, owning a workflow runtime over one
 //! [`taquba::Queue`]. A submission becomes a workflow run whose input is
-//! the serialized job and whose single step routes, by the job's
-//! [`Job::NAME`], to the registered handler.
+//! the job's [`Job::NAME`] and its serialized fields, and whose single
+//! step routes by that name to the registered handler.
 //!
 //! A job's outcome is durable: the handler's step writes an outcome record
 //! (the serialized output, or the failure) to the run's memo in the object

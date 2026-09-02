@@ -3,12 +3,20 @@
 use crate::{Step, StepError, StepOutcome, StepRunner, TerminalStatus};
 use serde::{Deserialize, Serialize};
 
-use crate::bulk::batch::{HEADER_BATCH, HEADER_KEY};
 use crate::bulk::cost::CostReport;
 use crate::bulk::pipeline::{BulkCtx, Pipeline};
 use crate::bulk::progress::ItemMarker;
 use crate::keys::bulk_item_kv_key;
 use crate::outcome::run_typed_step;
+
+/// The payload of an item's run: the batch and key that identify the item
+/// and its serialized input.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ItemPayload {
+    pub(crate) batch_id: String,
+    pub(crate) key: String,
+    pub(crate) input: Vec<u8>,
+}
 
 /// The per-item result the runner writes as the workflow step's `Succeed`
 /// payload and into the item's outcome record. Carries both the user
@@ -44,8 +52,18 @@ impl<P> PipelineRunner<P> {
 
 impl<P: Pipeline> StepRunner for PipelineRunner<P> {
     async fn run_step(&self, step: &Step) -> Result<StepOutcome, StepError> {
-        let outcome = run_typed_step(step, "bulk item", |input: P::Input| async move {
-            let ctx = BulkCtx::new(input, step);
+        let ItemPayload {
+            batch_id,
+            key,
+            input,
+        } = rmp_serde::from_slice(&step.payload).map_err(|err| {
+            StepError::permanent(format!(
+                "item {} has a malformed payload: {err}",
+                step.run_id
+            ))
+        })?;
+        let outcome = run_typed_step(step, "bulk item", &input, |input: P::Input| async {
+            let ctx = BulkCtx::new(&batch_id, &key, input, step);
             let output = self.pipeline.run(&ctx).await.map_err(Into::into)?;
             Ok(ItemEnvelope {
                 output,
@@ -53,11 +71,7 @@ impl<P: Pipeline> StepRunner for PipelineRunner<P> {
             })
         })
         .await;
-        let (batch_id, key) = match (step.headers.get(HEADER_BATCH), step.headers.get(HEADER_KEY)) {
-            (Some(batch_id), Some(key)) => (batch_id, key),
-            _ => return outcome,
-        };
-        let marker_key = bulk_item_kv_key(batch_id, key);
+        let marker_key = bulk_item_kv_key(&batch_id, &key);
         match &outcome {
             Ok(StepOutcome::Succeed { result }) => {
                 let cost = rmp_serde::from_slice::<ItemEnvelope<P::Output>>(result)
@@ -116,8 +130,14 @@ mod tests {
         }
     }
 
-    fn step_with_input(payload: Vec<u8>) -> Step {
+    fn step_with_input(input: Vec<u8>) -> Step {
         let memo_store = MemoStore::new(Arc::new(InMemory::new()), "memo");
+        let payload = rmp_serde::to_vec_named(&ItemPayload {
+            batch_id: "b".into(),
+            key: "item-1".into(),
+            input,
+        })
+        .unwrap();
         Step {
             run_id: "run-1".into(),
             step_number: 0,

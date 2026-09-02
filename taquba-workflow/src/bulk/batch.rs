@@ -22,7 +22,7 @@ use crate::bulk::io::{NullSink, OutputRecord, OutputSink};
 use crate::bulk::manifest::{Manifest, ManifestItem, ManifestStore};
 use crate::bulk::pipeline::Pipeline;
 use crate::bulk::progress::{BatchStatus, BulkReport, ItemMarker, ProgressSnapshot, ProgressState};
-use crate::bulk::runner::{ItemEnvelope, PipelineRunner};
+use crate::bulk::runner::{ItemEnvelope, ItemPayload, PipelineRunner};
 use crate::keys::{
     BULK_TERMINAL_KV_PREFIX, bulk_items_kv_prefix, bulk_terminal_kv_key, hex_sha256,
 };
@@ -44,13 +44,6 @@ const SUBMIT_CONCURRENCY: usize = 32;
 /// An item's wait runs in chunks of this length; `wait_for_completion`
 /// needs a finite timeout, so an unbounded wait loops over bounded ones.
 const WAIT_CHUNK: Duration = Duration::from_secs(3600);
-
-/// Header holding the batch id of an item's run.
-pub(crate) const HEADER_BATCH: &str = "bulk.batch";
-/// Header holding the item key of an item's run.
-pub(crate) const HEADER_KEY: &str = "bulk.key";
-/// Prefix of the headers the runner reserves.
-const RESERVED_HEADER_PREFIX: &str = "bulk.";
 
 /// The workflow run id of an item: the hex SHA-256 digest of
 /// `{batch_id}/{key}`, so batches never share run state and any key string
@@ -254,7 +247,7 @@ impl<P: Pipeline> BulkBuilder<P> {
 
     /// Submitter metadata applied to every item, threaded through to the
     /// pipeline via [`BulkCtx::headers`](crate::bulk::BulkCtx::headers). Keys
-    /// must not start with the reserved `workflow.` or `bulk.` prefixes.
+    /// must not start with the runtime's reserved `workflow.` prefix.
     pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
         self.headers = headers;
         self
@@ -514,9 +507,11 @@ impl<P: Pipeline> BulkInner<P> {
             record_outcome::<P::Output>(state, self.sink.as_ref(), &key, record);
             return Ok(());
         }
-        let mut headers = self.headers.clone();
-        headers.insert(HEADER_BATCH.to_string(), batch_id.to_string());
-        headers.insert(HEADER_KEY.to_string(), key.clone());
+        let payload = rmp_serde::to_vec_named(&ItemPayload {
+            batch_id: batch_id.to_string(),
+            key: key.clone(),
+            input,
+        })?;
         let submitted = {
             let _permit = submits
                 .acquire()
@@ -525,8 +520,8 @@ impl<P: Pipeline> BulkInner<P> {
             self.runtime
                 .submit(RunSpec {
                     run_id: Some(run_id),
-                    input,
-                    headers,
+                    input: payload,
+                    headers: self.headers.clone(),
                     ..RunSpec::default()
                 })
                 .await?
@@ -607,13 +602,12 @@ impl<P: Pipeline> Batch<'_, P> {
     /// keep running on the worker, keep their durable state and are
     /// continued by a later run or [`resume`](Self::resume) of the
     /// batch. A submission error returns after the items submitted so
-    /// far, which likewise keep their durable state. A batch already
+    /// far, and those keep their durable state as well. A batch already
     /// running in this process is rejected with [`Error::BatchRunning`].
     pub async fn run<I>(&self, inputs: I) -> Result<BulkReport>
     where
         I: IntoIterator<Item = P::Input>,
     {
-        self.check_headers()?;
         let manifest = Manifest {
             batch_id: self.id.clone(),
             items: self.materialize(inputs)?,
@@ -634,7 +628,6 @@ impl<P: Pipeline> Batch<'_, P> {
     /// no manifest exists. Waits and stops waiting as [`run`](Self::run)
     /// does.
     pub async fn resume(&self) -> Result<BulkReport> {
-        self.check_headers()?;
         let manifest = self
             .inner
             .store
@@ -715,15 +708,6 @@ impl<P: Pipeline> Batch<'_, P> {
     /// from nothing.
     pub async fn forget(&self) -> Result<()> {
         self.inner.store.forget(&self.id).await
-    }
-
-    fn check_headers(&self) -> Result<()> {
-        for key in self.inner.headers.keys() {
-            if key.starts_with(RESERVED_HEADER_PREFIX) {
-                return Err(Error::ReservedHeader(key.clone()));
-            }
-        }
-        Ok(())
     }
 
     /// Derive each input's key and serialize it. Two inputs with one key

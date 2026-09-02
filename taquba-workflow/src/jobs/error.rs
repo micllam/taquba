@@ -30,12 +30,6 @@ pub enum Error {
     #[error("job `{0}` not found")]
     JobNotFound(String),
 
-    /// A submission's [`SubmitOptions::headers`](crate::jobs::SubmitOptions::headers)
-    /// included a header key reserved by `taquba-jobs` (the job-type
-    /// routing header).
-    #[error("header key `{0}` is reserved by taquba-jobs and must not be set on submission")]
-    ReservedHeader(String),
-
     /// A re-submission used the same `idempotency_key` as a previous
     /// submission with a different payload. The string is the key.
     #[error("submission for idempotency key `{0}` already exists with a different payload")]
@@ -46,11 +40,9 @@ impl Error {
     /// True if this error has no chance of succeeding on retry.
     pub fn is_permanent(&self) -> bool {
         match self {
-            Self::Encode(_)
-            | Self::Decode(_)
-            | Self::JobNotFound(_)
-            | Self::ReservedHeader(_)
-            | Self::InputMismatch(_) => true,
+            Self::Encode(_) | Self::Decode(_) | Self::JobNotFound(_) | Self::InputMismatch(_) => {
+                true
+            }
             Self::Queue(e) => e.is_permanent(),
             Self::Workflow(e) => e.is_permanent(),
         }
@@ -67,7 +59,6 @@ mod tests {
     #[test]
     fn jobs_variants_are_permanent() {
         assert!(Error::JobNotFound("job-1".into()).is_permanent());
-        assert!(Error::ReservedHeader("jobs.type".into()).is_permanent());
         assert!(Error::InputMismatch("idem-key".into()).is_permanent());
     }
 

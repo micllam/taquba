@@ -9,7 +9,6 @@ use serde::de::DeserializeOwned;
 use taquba::LeaseHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::bulk::batch::{HEADER_BATCH, HEADER_KEY};
 use crate::bulk::cost::CostReport;
 
 /// Defines a per-item processing pipeline. Each bulk run executes one
@@ -118,16 +117,13 @@ pub struct BulkCtx<T> {
 }
 
 impl<T> BulkCtx<T> {
-    pub(crate) fn new(input: T, step: &Step) -> Self {
-        let mut headers = step.headers.clone();
-        let batch_id = headers.remove(HEADER_BATCH).unwrap_or_default();
-        let key = headers.remove(HEADER_KEY).unwrap_or_default();
+    pub(crate) fn new(batch_id: &str, key: &str, input: T, step: &Step) -> Self {
         Self {
             input,
-            batch_id,
-            key,
+            batch_id: batch_id.to_string(),
+            key: key.to_string(),
             run_id: step.run_id.clone(),
-            headers,
+            headers: step.headers.clone(),
             memo: step.memo.clone(),
             cost: CostReport::new(),
             cancel_token: step.cancel_token.clone(),
@@ -271,14 +267,14 @@ mod tests {
 
     fn ctx_for_tests() -> BulkCtx<()> {
         let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        BulkCtx::new((), &test_step(&store))
+        BulkCtx::new("b", "item-1", (), &test_step(&store))
     }
 
     #[tokio::test]
     async fn memoized_with_cached_cost_records_cost_on_compute_and_memo_hit() {
         let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        let first_ctx = BulkCtx::new((), &test_step(&store));
-        let replay_ctx = BulkCtx::new((), &test_step(&store));
+        let first_ctx = BulkCtx::new("b", "item-1", (), &test_step(&store));
+        let replay_ctx = BulkCtx::new("b", "item-1", (), &test_step(&store));
         let calls = AtomicU32::new(0);
 
         let first = first_ctx
@@ -312,8 +308,8 @@ mod tests {
     #[tokio::test]
     async fn memoized_by_content_with_cached_cost_records_cost_on_compute_and_memo_hit() {
         let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        let first_ctx = BulkCtx::new((), &test_step(&store));
-        let replay_ctx = BulkCtx::new((), &test_step(&store));
+        let first_ctx = BulkCtx::new("b", "item-1", (), &test_step(&store));
+        let replay_ctx = BulkCtx::new("b", "item-1", (), &test_step(&store));
         let calls = AtomicU32::new(0);
         let input = ContentInput {
             operation: "classify",

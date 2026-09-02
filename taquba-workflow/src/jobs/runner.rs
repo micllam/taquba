@@ -6,6 +6,8 @@ use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     Memo, MemoStore, NoopTerminalHook, RunSpec, RunnerHandle, Step, StepError, StepOutcome,
     StepRunner, WorkflowRuntime,
@@ -20,9 +22,14 @@ use crate::jobs::job::Job;
 use crate::keys::hex_sha256;
 use crate::outcome::{hash_input, read_outcome, run_typed_step};
 
-/// Reserved header key holding a job's [`Job::NAME`], read by the step
-/// runner to route the run to the registered handler.
-pub(crate) const JOB_TYPE_HEADER: &str = "jobs.type";
+/// The payload of a job's run: the job's [`Job::NAME`], by which the step
+/// runner routes the run to the registered handler, and the serialized
+/// job.
+#[derive(Serialize, Deserialize)]
+struct JobPayload {
+    name: String,
+    input: Vec<u8>,
+}
 
 const DEFAULT_QUEUE_NAME: &str = "jobs";
 const DEFAULT_CONCURRENCY: usize = 16;
@@ -49,9 +56,8 @@ pub struct SubmitOptions {
     /// Delay the job until this time. The job waits in the scheduled key
     /// space until taquba's scheduler promotes it.
     pub run_at: Option<SystemTime>,
-    /// Extra headers to attach to the job. The runner adds its own reserved
-    /// routing header on every submission; setting that key here fails the
-    /// submission with [`Error::ReservedHeader`](crate::jobs::Error::ReservedHeader).
+    /// Extra headers to attach to the job. Keys must not start with the
+    /// runtime's reserved `workflow.` prefix.
     pub headers: HashMap<String, String>,
 }
 
@@ -93,12 +99,10 @@ impl Inner {
         job: J,
         opts: SubmitOptions,
     ) -> Result<JobHandle<J>> {
-        let mut headers = opts.headers;
-        if headers.contains_key(JOB_TYPE_HEADER) {
-            return Err(Error::ReservedHeader(JOB_TYPE_HEADER.to_string()));
-        }
-        headers.insert(JOB_TYPE_HEADER.to_string(), J::NAME.to_string());
-        let payload = rmp_serde::to_vec_named(&job)?;
+        let payload = rmp_serde::to_vec_named(&JobPayload {
+            name: J::NAME.to_string(),
+            input: rmp_serde::to_vec_named(&job)?,
+        })?;
         let key = job.idempotency_key();
         let run_id = key.as_deref().map(run_id_for_key);
 
@@ -120,7 +124,7 @@ impl Inner {
             .submit(RunSpec {
                 run_id,
                 input: payload,
-                headers,
+                headers: opts.headers,
                 priority: opts.priority,
                 max_attempts_per_step: opts.max_attempts.or_else(|| job.max_attempts()),
                 run_at: opts.run_at,
@@ -149,9 +153,15 @@ impl Inner {
 type DispatchFuture<'a> =
     Pin<Box<dyn Future<Output = std::result::Result<StepOutcome, StepError>> + Send + 'a>>;
 
-/// Type-erased dispatch from a job-type header to a typed [`Job::run`].
+/// Type-erased dispatch from a job name to a typed [`Job::run`] over the
+/// serialized job.
 trait ErasedHandler: Send + Sync {
-    fn dispatch<'a>(&'a self, inner: Arc<Inner>, step: &'a Step) -> DispatchFuture<'a>;
+    fn dispatch<'a>(
+        &'a self,
+        inner: Arc<Inner>,
+        step: &'a Step,
+        input: Vec<u8>,
+    ) -> DispatchFuture<'a>;
 }
 
 struct TypedHandler<J: Job> {
@@ -159,8 +169,13 @@ struct TypedHandler<J: Job> {
 }
 
 impl<J: Job> ErasedHandler for TypedHandler<J> {
-    fn dispatch<'a>(&'a self, inner: Arc<Inner>, step: &'a Step) -> DispatchFuture<'a> {
-        Box::pin(run_typed::<J>(inner, step))
+    fn dispatch<'a>(
+        &'a self,
+        inner: Arc<Inner>,
+        step: &'a Step,
+        input: Vec<u8>,
+    ) -> DispatchFuture<'a> {
+        Box::pin(run_typed::<J>(inner, step, input))
     }
 }
 
@@ -168,8 +183,9 @@ impl<J: Job> ErasedHandler for TypedHandler<J> {
 async fn run_typed<J: Job>(
     inner: Arc<Inner>,
     step: &Step,
+    input: Vec<u8>,
 ) -> std::result::Result<StepOutcome, StepError> {
-    run_typed_step(step, J::NAME, |input: J| async move {
+    run_typed_step(step, J::NAME, &input, |input: J| async move {
         let ctx = JobContext::new(inner, step);
         tracing::info!(
             job_id = %step.run_id,
@@ -207,14 +223,14 @@ pub(crate) struct Dispatch {
 
 impl StepRunner for Dispatch {
     async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
-        let job_type = step.headers.get(JOB_TYPE_HEADER).ok_or_else(|| {
+        let JobPayload { name, input } = rmp_serde::from_slice(&step.payload).map_err(|err| {
             StepError::permanent(format!(
-                "job {} is missing the `{JOB_TYPE_HEADER}` header",
+                "job {} has a malformed payload: {err}",
                 step.run_id
             ))
         })?;
-        let handler = self.handlers.get(job_type.as_str()).ok_or_else(|| {
-            StepError::permanent(format!("no handler registered for job type `{job_type}`"))
+        let handler = self.handlers.get(name.as_str()).ok_or_else(|| {
+            StepError::permanent(format!("no handler registered for job type `{name}`"))
         })?;
         // The worker task holds the runner's shared state for as long as it
         // runs, so the upgrade fails only for a delivery in flight after
@@ -223,7 +239,7 @@ impl StepRunner for Dispatch {
             .inner
             .upgrade()
             .ok_or_else(|| StepError::transient("the job runner has shut down"))?;
-        handler.dispatch(inner, step).await
+        handler.dispatch(inner, step, input).await
     }
 }
 
@@ -1114,21 +1130,6 @@ mod tests {
         assert_eq!(count_jobs(&queue, JobStatus::Dead).await, 1);
 
         handle.shutdown().await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn reserved_header_in_submit_options_is_rejected() {
-        let (queue, store) = open_queue("test-reserved-header").await;
-        let runner = JobRunner::builder(queue, store).build();
-
-        let mut opts = SubmitOptions::default();
-        opts.headers
-            .insert(JOB_TYPE_HEADER.to_string(), "evil".to_string());
-        match runner.submit_with(Keyed { n: 1 }, opts).await {
-            Err(Error::ReservedHeader(key)) => assert_eq!(key, JOB_TYPE_HEADER),
-            Err(other) => panic!("expected ReservedHeader, got {other:?}"),
-            Ok(_) => panic!("expected ReservedHeader, got Ok"),
-        }
     }
 
     #[tokio::test(start_paused = true)]

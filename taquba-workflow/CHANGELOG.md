@@ -20,57 +20,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Bulk::progress`, `Bulk::run_with_shutdown` and
   `Batch::run_with_shutdown` are removed and a batch already running in
   the process is rejected with `Error::BatchRunning`; every run is a
-  batch (`Bulk::batch(id)` or a generated id through
-  `Bulk::run`), items are identified by key (`BulkBuilder::key_fn` now
-  accepts any string) and their run ids are the SHA-256 digest of
-  `{batch_id}/{key}`, so batches never share run state; each item writes
-  an outcome record to its run memo, and a second run of the same batch
-  skips the items that succeeded and runs the failed ones again;
-  `OutputRecord::run_id` is `OutputRecord::key` (the JSONL field is
-  `key`), `BulkReport::failed_run_ids` is `failed_keys`, `BulkReport`
-  gains `batch_id`, `BulkCtx` gains `batch_id` and `key`; a run writes
-  the batch's manifest (keys and serialized inputs) to
+  batch (`Bulk::batch(id)` or a generated id through `Bulk::run`), items
+  are identified by key (`BulkBuilder::key_fn` now accepts any string)
+  and their run ids are the SHA-256 digest of `{batch_id}/{key}`, so
+  batches never share run state; each item writes an outcome record to
+  its run memo, and a second run of the same batch skips the items that
+  succeeded and runs the failed ones again; `OutputRecord::run_id` is
+  `OutputRecord::key` (the JSONL field is `key`),
+  `BulkReport::failed_run_ids` is `failed_keys`, `BulkReport` gains
+  `batch_id`, `BulkCtx` gains `batch_id` and `key`; a run writes the
+  batch's manifest (keys and serialized inputs) to
   `<memo_prefix>/batches/<batch_id>/manifest` before submitting, rejects
   a different item set for an existing batch and rejects duplicate keys,
   and `Batch::resume` drives a batch from its manifest alone; every
-  submitted item counts toward the expected total, including a run
-  still queued from an earlier run of the batch; the settlement that
-  commits an item's terminal outcome writes the item's marker (status,
-  error, cost) to `workflow/bulk/batches/<batch_id>/items/<key>`, and
+  submitted item counts toward the expected total, including a run still
+  queued from an earlier run of the batch; the settlement that commits
+  an item's terminal outcome writes the item's marker (status, error,
+  cost) to `workflow/bulk/batches/<batch_id>/items/<key>`, and
   `Batch::status` reads the manifest and the markers into a
   `BatchStatus`; an item runs as one queue job, with no terminal
   notification job, and a batch run observes each item's termination
   through the queue's completion notification and reads its outcome
-  record, so an `OutputSink` receives each item once per run; `Batch::forget` removes a batch's
-  manifest, markers, memo entries and outcome records, and
-  `BulkBuilder::batch_retention` removes them a window after the
-  batch's completion through a terminal marker under
+  record, so an `OutputSink` receives each item once per run;
+  `Batch::forget` removes a batch's manifest, markers, memo entries and
+  outcome records, and `BulkBuilder::batch_retention` removes them a
+  window after the batch's completion through a terminal marker under
   `workflow/bulk/terminals/` and a sweep when the worker starts and on
-  every retention interval after that;
-  `BulkBuilder::clock` overrides the queue's clock; `BulkCtx::memoized`
-  and `memoized_by_content` are replaced by `BulkCtx::memo`, the item's
-  `Memo`, and the two cost-recording variants take an error type
-  convertible from `taquba_workflow::Error`; `Error::InvalidBatchId`,
-  `ReservedHeader`, `DuplicateKey`, `BatchMismatch`, `BatchNotFound`,
-  `Decode`, `Store` and `BatchRunning` are new. `serde_json` is a
-  dependency.
+  every retention interval after that; `BulkBuilder::clock` overrides
+  the queue's clock; `BulkCtx::memoized` and `memoized_by_content` are
+  replaced by `BulkCtx::memo`, the item's `Memo`, and the two
+  cost-recording variants take an error type convertible from
+  `taquba_workflow::Error`; an item's batch id and key are carried in
+  its run's input rather than in `bulk.*` headers, so
+  `BulkBuilder::headers` reserves only the runtime's `workflow.` prefix;
+  `Error::InvalidBatchId`, `DuplicateKey`, `BatchMismatch`,
+  `BatchNotFound`, `Decode`, `Store` and `BatchRunning` are new.
+  `serde_json` is a dependency.
 - The `jobs` module: typed single-function jobs, moved from the
   `taquba-jobs` crate and re-founded on the runtime. A job is one run
-  with a single step routed by the `jobs.type` header to the
-  handler registered on `JobRunnerBuilder::register`; its outcome
-  record is stored in the run's memo under the runner's memo prefix
-  (default `"{queue_name}-memo"`), removed by the runtime's memo
-  retention through `JobRunnerBuilder::retention`; job ids are run
-  ids, a ULID or the SHA-256 digest of the idempotency key.
-  `JobContext` exposes `memo`, `effects` and `kv_get` beside state,
-  lease, cancellation token and `submit`. Relative to `taquba-jobs`
-  0.7: registration moved to the builder, `result_prefix` is
-  `memo_prefix`, `result_retention` is `retention`,
-  `JobHandle::status` returns the in-process `RunStatus`,
+  whose input carries the job's name and serialized fields, with a
+  single step routed by that name to the handler registered on
+  `JobRunnerBuilder::register`; its outcome record is stored in the
+  run's memo under the runner's memo prefix (default
+  `"{queue_name}-memo"`), removed by the runtime's memo retention
+  through `JobRunnerBuilder::retention`; job ids are run ids, a ULID or
+  the SHA-256 digest of the idempotency key. `JobContext` exposes
+  `memo`, `effects` and `kv_get` beside state, lease, cancellation token
+  and `submit`. Relative to `taquba-jobs` 0.7: registration moved to the
+  builder, `result_prefix` is `memo_prefix`, `result_retention` is
+  `retention`, `JobHandle::status` returns the in-process `RunStatus`,
   `JobContext::job_id` is `JobContext::id`, `JobContext::queue` is
-  gone, `Error::Store` is replaced by `Error::Workflow`, and
+  removed, `Error::Store` is replaced by `Error::Workflow`,
   `jobs::ErrorKind` is replaced by the crate's `StepErrorKind` in
-  `Job::classify` and `JobError::kind`.
+  `Job::classify` and `JobError::kind`, and `Error::ReservedHeader` and
+  the `jobs.type` header are removed (`SubmitOptions::headers` reserves
+  only the runtime's `workflow.` prefix).
 - `WorkflowRuntime::spawn`: spawns the worker loop as a task and returns
   a `RunnerHandle` for shutting it down or waiting on it; the `jobs`
   and `bulk` workers are spawned through it and `jobs::RunnerHandle`
