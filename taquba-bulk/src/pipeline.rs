@@ -123,67 +123,43 @@ impl<T> BulkCtx<T> {
         }
     }
 
-    /// Run `f` once and cache its result durably under `key`, or return the
-    /// previously cached result on a retry.
+    /// Return the value memoized under `key`, or run `f`, memoize its
+    /// value under `key` and return it.
     ///
-    /// On the first execution of a step, `f` runs and its `Ok` value is
-    /// rmp-serialized into the item's [`Memo`] under `key` before being
-    /// returned. If the step is later re-executed (at-least-once retry after
-    /// a lease expiry), the cached bytes are returned without running `f`
-    /// again, so a paid call inside `f` bills once, not once per attempt.
-    /// An `Err` from `f` is never cached and propagates unchanged.
+    /// This is [`Memo::memoized`] on the item's memo, with memo errors
+    /// converted into the caller's error type: a memo read or write
+    /// failure is a transient [`StepError`] and a failure to serialize
+    /// the computed value is a permanent one. An `Err` from `f` is
+    /// returned unchanged and memoizes nothing.
     ///
-    /// `key` namespaces the cache within this item; use a distinct key per
-    /// logical step. A cached entry that fails to deserialize (e.g. an
-    /// output type changed shape between runs) is treated as a miss and `f`
-    /// re-runs, overwriting it. Memo I/O failures surface as a transient
-    /// [`StepError`]; serializing the computed value fails
-    /// deterministically, so that surfaces as a permanent [`StepError`].
-    /// Both are converted into the caller's error type.
-    ///
-    /// Calls to [`record_cost`](Self::record_cost) inside `f` run only on a
-    /// cache miss. Use [`memoized_with_cached_cost`](Self::memoized_with_cached_cost)
-    /// when cached results should also contribute to the final cost report.
+    /// `key` namespaces the memo within this item; use a distinct key
+    /// per logical step. Calls to [`record_cost`](Self::record_cost)
+    /// inside `f` run only when `f` runs. Use
+    /// [`memoized_with_cached_cost`](Self::memoized_with_cached_cost)
+    /// when memoized results should also contribute to the final cost
+    /// report.
     pub async fn memoized<R, F, E>(&self, key: &str, f: F) -> Result<R, E>
     where
         R: Serialize + DeserializeOwned,
         F: Future<Output = Result<R, E>>,
         E: From<StepError>,
     {
-        if let Some(value) = self
-            .decode_cached::<R>(self.memo.get(key).await, Some(key))
-            .map_err(E::from)?
-        {
-            return Ok(value);
-        }
-
-        let value = f.await?;
-        let bytes = encode_memo_value(&value).map_err(E::from)?;
         self.memo
-            .put(key, &bytes)
+            .memoized(key, async { f.await.map_err(MemoizedError::Caller) })
             .await
-            .map_err(|e| E::from(StepError::from(e)))?;
-        Ok(value)
+            .map_err(MemoizedError::into_caller)
     }
 
-    /// Run `f` once and cache its result under a key derived from
-    /// serialized `input`, or return the previously cached result on a
-    /// retry.
+    /// [`Self::memoized`] under [`Memo::content_key`] of `input`.
     ///
-    /// This has the same typed compute-on-miss behaviour as
-    /// [`memoized`](Self::memoized), but the memo key is derived by
-    /// serializing `input` as MessagePack and hashing it with SHA-256 via
-    /// [`taquba_workflow::Memo::content_get`] and
-    /// [`taquba_workflow::Memo::content_put`]. The entry remains scoped to
-    /// this item's workflow run and step; this method does not create a
-    /// cross-item cache.
-    ///
-    /// The derived key is stable only when `input` serializes
-    /// deterministically; types with unordered iteration, such as
-    /// `HashMap`, can serialize the same logical content into different
-    /// bytes and therefore different keys. If several
-    /// logical operations may receive the same input shape, include an
-    /// operation name in the serialized input.
+    /// The entry remains scoped to this item's workflow run and step;
+    /// this method does not create a cross-item cache. The derived key
+    /// is stable only when `input` serializes deterministically; types
+    /// with unordered iteration, such as `HashMap`, can serialize the
+    /// same logical content into different bytes and therefore
+    /// different keys. If several logical operations may receive
+    /// identical inputs, include an operation name in the serialized
+    /// input.
     pub async fn memoized_by_content<K, R, F, E>(&self, input: &K, f: F) -> Result<R, E>
     where
         K: Serialize + ?Sized,
@@ -191,20 +167,10 @@ impl<T> BulkCtx<T> {
         F: Future<Output = Result<R, E>>,
         E: From<StepError>,
     {
-        if let Some(value) = self
-            .decode_cached::<R>(self.memo.content_get(input).await, None)
-            .map_err(E::from)?
-        {
-            return Ok(value);
-        }
-
-        let value = f.await?;
-        let bytes = encode_memo_value(&value).map_err(E::from)?;
         self.memo
-            .content_put(input, &bytes)
+            .memoized_by_content(input, async { f.await.map_err(MemoizedError::Caller) })
             .await
-            .map_err(|e| E::from(StepError::from(e)))?;
-        Ok(value)
+            .map_err(MemoizedError::into_caller)
     }
 
     /// Run `f` once and cache both its value and counters under `key`,
@@ -301,50 +267,28 @@ impl<T> BulkCtx<T> {
     pub(crate) fn cost(&self) -> CostReport {
         self.cost.clone()
     }
+}
 
-    /// Decode a cached memo entry: `Ok(Some(value))` on a hit,
-    /// `Ok(None)` on a miss, and `Err` when the memo read itself
-    /// failed. An entry that fails to deserialize is treated as a miss
-    /// (self-healing: the caller recomputes and overwrites it), logged
-    /// with `key` when the entry is key-addressed.
-    fn decode_cached<R: DeserializeOwned>(
-        &self,
-        cached: taquba_workflow::Result<Option<Vec<u8>>>,
-        key: Option<&str>,
-    ) -> Result<Option<R>, StepError> {
-        let bytes = match cached {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => return Ok(None),
-            Err(err) => return Err(err.into()),
-        };
-        match rmp_serde::from_slice::<R>(&bytes) {
-            Ok(value) => Ok(Some(value)),
-            Err(err) => {
-                match key {
-                    Some(key) => tracing::warn!(
-                        run_id = %self.run_id,
-                        key = %key,
-                        error = %err,
-                        "memoized cache entry failed to deserialize; recomputing",
-                    ),
-                    None => tracing::warn!(
-                        run_id = %self.run_id,
-                        error = %err,
-                        "content-addressed memoized cache entry failed to deserialize; recomputing",
-                    ),
-                }
-                Ok(None)
-            }
-        }
+/// Error of a memoized computation before conversion into the caller's
+/// error type: the caller's own error, or a memo error.
+enum MemoizedError<E> {
+    Caller(E),
+    Memo(taquba_workflow::Error),
+}
+
+impl<E> From<taquba_workflow::Error> for MemoizedError<E> {
+    fn from(err: taquba_workflow::Error) -> Self {
+        Self::Memo(err)
     }
 }
 
-/// Serialize a computed value for the memo. A serialization failure is
-/// deterministic, so a retry produces the same error and the failure
-/// is classified permanent.
-fn encode_memo_value<R: Serialize>(value: &R) -> Result<Vec<u8>, StepError> {
-    rmp_serde::to_vec_named(value)
-        .map_err(|e| StepError::permanent(format!("memo serialize failed: {e}")))
+impl<E: From<StepError>> MemoizedError<E> {
+    fn into_caller(self) -> E {
+        match self {
+            Self::Caller(err) => err,
+            Self::Memo(err) => E::from(StepError::from(err)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -385,22 +329,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memoized_runs_once_then_serves_cache() {
-        let ctx = ctx_for_tests();
-        let calls = AtomicU32::new(0);
-        let compute = || async {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, StepError>(7u32)
-        };
-
-        let first = ctx.memoized("k", compute()).await.unwrap();
-        let second = ctx.memoized("k", compute()).await.unwrap();
-        assert_eq!(first, 7);
-        assert_eq!(second, 7);
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "closure ran exactly once");
-    }
-
-    #[tokio::test]
     async fn memoized_does_not_cache_errors() {
         let ctx = ctx_for_tests();
         let calls = AtomicU32::new(0);
@@ -427,68 +355,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn distinct_keys_cache_independently() {
+    async fn a_memo_error_is_converted_into_the_callers_error_type() {
+        #[derive(Debug)]
+        struct Unserializable;
+
+        impl Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("unserializable"))
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for Unserializable {
+            fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+                Ok(Self)
+            }
+        }
+
         let ctx = ctx_for_tests();
-        let a = ctx
-            .memoized::<String, _, StepError>("a", async { Ok("first".to_string()) })
+        let err = ctx
+            .memoized::<Unserializable, _, StepError>("k", async { Ok(Unserializable) })
             .await
-            .unwrap();
-        let b = ctx
-            .memoized::<String, _, StepError>("b", async { Ok("second".to_string()) })
-            .await
-            .unwrap();
-        assert_eq!(a, "first");
-        assert_eq!(b, "second");
-    }
+            .unwrap_err();
 
-    #[tokio::test]
-    async fn memoized_by_content_runs_once_then_serves_cache() {
-        let ctx = ctx_for_tests();
-        let calls = AtomicU32::new(0);
-        let input = ContentInput {
-            operation: "classify",
-            payload: b"ticket",
-        };
-        let compute = || async {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, StepError>("billing".to_string())
-        };
-
-        let first = ctx.memoized_by_content(&input, compute()).await.unwrap();
-        let second = ctx.memoized_by_content(&input, compute()).await.unwrap();
-
-        assert_eq!(first, "billing");
-        assert_eq!(second, "billing");
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "closure ran exactly once");
-    }
-
-    #[tokio::test]
-    async fn memoized_by_content_distinguishes_serialized_inputs() {
-        let ctx = ctx_for_tests();
-        let classify = ContentInput {
-            operation: "classify",
-            payload: b"ticket",
-        };
-        let summarize = ContentInput {
-            operation: "summarize",
-            payload: b"ticket",
-        };
-
-        let first = ctx
-            .memoized_by_content::<_, String, _, StepError>(&classify, async {
-                Ok("class-a".to_string())
-            })
-            .await
-            .unwrap();
-        let second = ctx
-            .memoized_by_content::<_, String, _, StepError>(&summarize, async {
-                Ok("summary".to_string())
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(first, "class-a");
-        assert_eq!(second, "summary");
+        assert_eq!(err.kind, taquba_workflow::StepErrorKind::Permanent);
     }
 
     #[tokio::test]
