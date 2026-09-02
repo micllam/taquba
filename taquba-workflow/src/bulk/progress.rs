@@ -3,10 +3,10 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use crate::cost::CostReport;
+use crate::bulk::cost::CostReport;
 
 /// A point-in-time view of a bulk run's progress. Returned by
-/// [`Bulk::progress`](crate::Bulk::progress) and suitable for a status line
+/// [`Bulk::progress`](crate::bulk::Bulk::progress) and suitable for a status line
 /// or a polling UI.
 #[derive(Debug, Clone)]
 pub struct ProgressSnapshot {
@@ -33,7 +33,7 @@ pub struct ProgressSnapshot {
 }
 
 /// The outcome of a finished (or drained) bulk run, returned by
-/// [`Bulk::run`](crate::Bulk::run).
+/// [`Bulk::run`](crate::bulk::Bulk::run).
 #[derive(Debug, Clone)]
 pub struct BulkReport {
     /// Number of items that were expected to complete.

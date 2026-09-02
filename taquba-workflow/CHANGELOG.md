@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The `bulk` module: bulk multi-step processing, moved from the
+  `taquba-bulk` crate with its surface unchanged. Relative to
+  taquba-bulk 0.6: `BulkCtx::effects` stages application KV effects
+  applied with the item's successful completion and `BulkCtx::kv_get`
+  reads a committed value; `Bulk::run` and `Bulk::run_with_shutdown`
+  stop the worker and wait for it before returning a submission error;
+  a run id produced by `BulkBuilder::key_fn` must be 1 to 128 bytes of
+  `[A-Za-z0-9_-]`. `serde_json` is a dependency.
 - The `jobs` module: typed single-function jobs, moved from the
   `taquba-jobs` crate and re-founded on the runtime. A job is one run
   with a single step routed by the `taquba_jobs.type` header to the

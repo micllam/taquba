@@ -2,7 +2,7 @@
 
 Benchmark binaries for the taquba workspace. This crate is an internal
 workspace member (`publish = false`): it consumes `taquba`,
-`taquba-workflow` and `taquba-bulk` as normal
+`taquba-workflow` as normal
 dependencies, so the published crates carry no bench targets or
 bench-only dependencies.
 
@@ -37,7 +37,7 @@ documented in the header comment of its source file.
 |---|---|---|
 | `step_transitions` | Submit `N_RUNS` runs of `N_STEPS` steps each; the runner returns `Continue` immediately, so only the runtime's own overhead is measured | What does a step transition cost (persisting the transition, enqueuing the next step, the claim / dispatch round trip), and does it hold while many runs progress concurrently? |
 
-### taquba-bulk
+### taquba-workflow bulk processing (`bulk` module)
 
 | Benchmark | Workload | Question it answers |
 |---|---|---|

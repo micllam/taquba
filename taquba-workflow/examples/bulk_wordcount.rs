@@ -3,14 +3,15 @@
 //! Demonstrates the full path (submit N, process concurrently, stream output,
 //! roll up cost) over an in-memory store, with no network calls.
 //!
-//! Run with: `cargo run -p taquba-bulk --example wordcount`
+//! Run with: `cargo run -p taquba-workflow --example bulk_wordcount`
 
 use std::io::{BufWriter, stdout};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use taquba::{Queue, object_store::memory::InMemory};
-use taquba_bulk::{Bulk, BulkCtx, JsonlSink, Pipeline, StepError, read_jsonl};
+use taquba_workflow::StepError;
+use taquba_workflow::bulk::{Bulk, BulkCtx, JsonlSink, Pipeline, read_jsonl};
 
 #[derive(Serialize, Deserialize)]
 struct Document {

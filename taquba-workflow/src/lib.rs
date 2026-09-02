@@ -27,13 +27,12 @@
 //! - **An event-sourced workflow engine.** There's no event-history
 //!   replay, no per-side-effect recording.
 //!
-//! Within the ecosystem, `taquba-jobs` is the sibling crate for
-//! single-shot typed tasks: use it when the caller awaits a typed return
-//! value and there are no intermediate steps to persist; use a workflow
-//! (even a single-step one) when the caller observes the run through
-//! cancellation and a terminal hook rather than awaiting a returned
-//! value. `taquba-bulk` builds on this crate to run one pipeline over
-//! many inputs with batch progress and cost rollup.
+//! The [`jobs`] module runs single-shot typed tasks: use it when the
+//! caller awaits a typed return value and there are no intermediate steps
+//! to persist; use a step runner (even for a single step) when the caller
+//! observes the run through cancellation and a terminal hook and awaits no
+//! returned value. The [`bulk`] module runs one pipeline over many inputs
+//! with batch progress and cost rollup.
 //!
 //! # Single-process by design
 //!
@@ -290,6 +289,15 @@
 //!
 //! See `examples/kv_effects.rs` for a runnable order flow maintaining a
 //! status row through both surfaces.
+//!
+//! # Bulk processing
+//!
+//! The [`bulk`] module runs one [`bulk::Pipeline`] over many input items in
+//! parallel, one run per item with the pipeline's phases as memoized calls
+//! inside the item's single step, and adds batch-level progress, cost
+//! rollup, streamed output and a failure threshold. The module
+//! documentation covers the execution model, cost tracking, the failure
+//! policy and replay.
 //!
 //! # Typed jobs
 //!
@@ -552,6 +560,7 @@
 
 #![warn(missing_docs)]
 
+pub mod bulk;
 mod durable;
 mod effects;
 mod error;

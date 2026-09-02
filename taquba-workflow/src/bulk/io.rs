@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
-use crate::error::{Error, Result};
+use crate::bulk::error::{Error, Result};
 
 /// Decode a JSONL reader into an iterator of typed items. Each non-empty
 /// line is parsed as one `T`; blank lines are skipped. Decode errors are

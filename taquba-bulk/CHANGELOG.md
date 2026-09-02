@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking (source):** the crate re-exports `taquba_workflow::bulk`
+  and receives no further development; the implementation moved into
+  `taquba-workflow`. `taquba-workflow` is the only dependency beside
+  `taquba`. The entries below describe the module relative to 0.6.
+
 ### Added
 
 - `BulkCtx::effects`, the item's staged application KV effects: writes

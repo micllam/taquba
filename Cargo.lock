@@ -3132,7 +3132,6 @@ dependencies = [
  "rand 0.9.4",
  "serde",
  "taquba",
- "taquba-bulk",
  "taquba-workflow",
  "thiserror 1.0.69",
  "tokio",
@@ -3144,16 +3143,8 @@ dependencies = [
 name = "taquba-bulk"
 version = "0.6.0"
 dependencies = [
- "rmp-serde",
- "serde",
- "serde_json",
  "taquba",
  "taquba-workflow",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "ulid",
 ]
 
 [[package]]

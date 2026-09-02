@@ -17,7 +17,7 @@
 //!     `memoized_with_cached_cost` are recorded once per item regardless of
 //!     retries.
 //!
-//! Run with: `cargo run -p taquba-bulk --example document_pipeline`
+//! Run with: `cargo run -p taquba-workflow --example bulk_document_pipeline`
 
 use std::collections::BTreeMap;
 use std::io::{BufWriter, stdout};
@@ -27,7 +27,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use taquba::{OpenOptions, Queue, QueueConfig, object_store::memory::InMemory};
-use taquba_bulk::{Bulk, BulkCtx, CostReport, JsonlSink, Pipeline, StepError};
+use taquba_workflow::StepError;
+use taquba_workflow::bulk::{Bulk, BulkCtx, CostReport, JsonlSink, Pipeline};
 
 #[derive(Serialize, Deserialize)]
 struct Document {

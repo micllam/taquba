@@ -1,10 +1,10 @@
-//! Adapter that drives a [`Pipeline`] as a single [`taquba_workflow`] step.
+//! Adapter that drives a [`Pipeline`] as a single [`crate`] step.
 
+use crate::{Step, StepError, StepOutcome, StepRunner};
 use serde::{Deserialize, Serialize};
-use taquba_workflow::{Step, StepError, StepOutcome, StepRunner};
 
-use crate::cost::CostReport;
-use crate::pipeline::{BulkCtx, Pipeline};
+use crate::bulk::cost::CostReport;
+use crate::bulk::pipeline::{BulkCtx, Pipeline};
 
 /// The per-item result the runner writes as the workflow step's `Succeed`
 /// payload. Carries both the user [`Output`](Pipeline::Output) and the cost
@@ -16,7 +16,7 @@ pub(crate) struct ItemEnvelope<O> {
     pub cost: CostReport,
 }
 
-/// Bridges a [`Pipeline`] to [`taquba_workflow::StepRunner`]. Each item is one
+/// Bridges a [`Pipeline`] to [`crate::StepRunner`]. Each item is one
 /// workflow run whose step 0 decodes the input, runs the pipeline once, and
 /// `Succeed`s with an [`ItemEnvelope`]. The pipeline's own multi-step logic
 /// lives inside [`Pipeline::run`] via [`BulkCtx::memoized`]; the runner never
@@ -54,10 +54,10 @@ impl<P: Pipeline> StepRunner for PipelineRunner<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MemoStore;
     use std::collections::HashMap;
     use std::sync::Arc;
     use taquba::object_store::memory::InMemory;
-    use taquba_workflow::MemoStore;
     use tokio_util::sync::CancellationToken;
 
     #[derive(Serialize, Deserialize)]
@@ -100,8 +100,8 @@ mod tests {
             lease: taquba::LeaseHandle::detached(),
             memo: memo_store.new_memo("run-1", 0),
             run_memo: memo_store.new_run_memo("run-1"),
-            effects: taquba_workflow::EffectsHandle::detached(),
-            kv: taquba_workflow::KvReadHandle::detached(),
+            effects: crate::EffectsHandle::detached(),
+            kv: crate::KvReadHandle::detached(),
             signal: None,
         }
     }
@@ -126,7 +126,7 @@ mod tests {
         // A string where a u32 is expected: msgpack decode fails.
         let step = step_with_input(rmp_serde::to_vec_named(&"not a number").unwrap());
         let err = runner.run_step(&step).await.unwrap_err();
-        assert_eq!(err.kind, taquba_workflow::StepErrorKind::Permanent);
+        assert_eq!(err.kind, crate::StepErrorKind::Permanent);
     }
 
     #[tokio::test]
@@ -135,6 +135,6 @@ mod tests {
         let step = step_with_input(rmp_serde::to_vec_named(&1u32).unwrap());
         let err = runner.run_step(&step).await.unwrap_err();
         assert_eq!(err.message, "nope");
-        assert_eq!(err.kind, taquba_workflow::StepErrorKind::Permanent);
+        assert_eq!(err.kind, crate::StepErrorKind::Permanent);
     }
 }

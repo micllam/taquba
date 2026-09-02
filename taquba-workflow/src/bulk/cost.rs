@@ -3,10 +3,10 @@
 //! [`CostReport`] is an unopinionated collection of named `f64` counters.
 //! Pipelines report whatever units make sense for their workload (LLM token
 //! counts, paid-API call units, compute-seconds, dollars) via
-//! [`crate::BulkCtx::record_cost`], and the bulk runner rolls the per-item
+//! [`crate::bulk::BulkCtx::record_cost`], and the bulk runner rolls the per-item
 //! reports up into a batch-level total surfaced on
-//! [`crate::ProgressSnapshot`] and [`crate::BulkReport`].
-//! [`crate::BulkCtx::memoized_with_cached_cost`] stores value/cost pairs
+//! [`crate::bulk::ProgressSnapshot`] and [`crate::bulk::BulkReport`].
+//! [`crate::bulk::BulkCtx::memoized_with_cached_cost`] stores value/cost pairs
 //! when counters should be replayed on memo hits.
 //!
 //! The same type plays two roles: an interior-mutable accumulator while a

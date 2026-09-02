@@ -7,22 +7,22 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::{
+    RunOutcome, RunSpec, StepError, TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use taquba::Queue;
 use taquba::object_store::ObjectStore;
-use taquba_workflow::{
-    RunOutcome, RunSpec, StepError, TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
-};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::error::{Error, Result};
-use crate::io::{NullSink, OutputRecord, OutputSink};
-use crate::pipeline::Pipeline;
-use crate::progress::{BulkReport, ProgressSnapshot, ProgressState};
-use crate::runner::{ItemEnvelope, PipelineRunner};
+use crate::bulk::error::{Error, Result};
+use crate::bulk::io::{NullSink, OutputRecord, OutputSink};
+use crate::bulk::pipeline::Pipeline;
+use crate::bulk::progress::{BulkReport, ProgressSnapshot, ProgressState};
+use crate::bulk::runner::{ItemEnvelope, PipelineRunner};
 
 /// Default queue name for bulk item steps.
 const DEFAULT_QUEUE_NAME: &str = "bulk-items";
@@ -133,12 +133,6 @@ where
                     state.failed_run_ids.push(outcome.run_id.clone());
                 }
                 TerminalStatus::Cancelled => state.cancelled += 1,
-                // `TerminalStatus` is non_exhaustive. Count an unrecognized
-                // terminal state toward completion so the run still settles.
-                other => {
-                    warn!(run_id = %outcome.run_id, status = %other, "unknown terminal status");
-                    state.cancelled += 1;
-                }
             }
             if let Some(cost) = cost {
                 state.cost.merge(&cost);
@@ -174,7 +168,7 @@ pub struct BulkBuilder<P: Pipeline> {
 
 impl<P: Pipeline> BulkBuilder<P> {
     /// Where completed item records are written. Defaults to
-    /// [`NullSink`](crate::NullSink), which discards them.
+    /// [`NullSink`](crate::bulk::NullSink), which discards them.
     pub fn output(mut self, sink: Arc<dyn OutputSink>) -> Self {
         self.sink = Some(sink);
         self
@@ -183,12 +177,12 @@ impl<P: Pipeline> BulkBuilder<P> {
     /// Derive each item's run id from its input. The default is positional
     /// (`item-0`, `item-1`, ...). Supply a key when items have a natural
     /// identifier so a replay re-uses the right memo state. Under
-    /// [`taquba_workflow::WorkflowRuntimeBuilder::memo_retention`] that
+    /// [`crate::WorkflowRuntimeBuilder::memo_retention`] that
     /// re-use is bounded by the first run's retention window, after which
     /// the replay re-executes the item's steps.
     ///
     /// The returned id must satisfy
-    /// [`taquba_workflow::MAX_RUN_ID_LEN`] bytes of `[A-Za-z0-9_-]`;
+    /// [`crate::MAX_RUN_ID_LEN`] bytes of `[A-Za-z0-9_-]`;
     /// [`Bulk::run`] fails the submission otherwise. Encode a natural
     /// identifier that ranges wider than that, for example a URL or a
     /// path, as a hash or another restricted form.
@@ -198,7 +192,7 @@ impl<P: Pipeline> BulkBuilder<P> {
     }
 
     /// Submitter metadata applied to every item, threaded through to the
-    /// pipeline via [`BulkCtx::headers`](crate::BulkCtx::headers). Keys must
+    /// pipeline via [`BulkCtx::headers`](crate::bulk::BulkCtx::headers). Keys must
     /// not start with the reserved `workflow.` prefix.
     pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
         self.headers = headers;
@@ -421,7 +415,7 @@ impl<P: Pipeline> Bulk<P> {
 
         fn tally(
             joined: std::result::Result<
-                taquba_workflow::Result<taquba_workflow::SubmitOutcome>,
+                crate::Result<crate::SubmitOutcome>,
                 tokio::task::JoinError,
             >,
             expected: &mut usize,
@@ -480,10 +474,10 @@ impl<P: Pipeline> Bulk<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::BulkCtx;
+    use crate::StepError;
+    use crate::bulk::pipeline::BulkCtx;
     use serde::Deserialize;
     use taquba::object_store::memory::InMemory;
-    use taquba_workflow::StepError;
 
     #[derive(Serialize, Deserialize)]
     struct Item {
@@ -717,10 +711,7 @@ mod tests {
         .expect("run finished in time")
         .expect_err("an invalid run id fails the submission");
         assert!(
-            matches!(
-                err,
-                Error::Workflow(taquba_workflow::Error::InvalidRunId { .. })
-            ),
+            matches!(err, Error::Workflow(crate::Error::InvalidRunId { .. })),
             "unexpected error: {err}",
         );
 

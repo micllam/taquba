@@ -3,17 +3,17 @@
 use std::collections::HashMap;
 use std::future::Future;
 
+use crate::{EffectsHandle, KvReadHandle, Memo, Step, StepError};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use taquba::LeaseHandle;
-use taquba_workflow::{EffectsHandle, KvReadHandle, Memo, Step, StepError};
 use tokio_util::sync::CancellationToken;
 
-use crate::cost::CostReport;
+use crate::bulk::cost::CostReport;
 
 /// Defines a per-item processing pipeline. Each bulk run executes one
 /// `Pipeline` for every input item independently, materialised internally
-/// as a [`taquba_workflow`] run.
+/// as a [`crate`] run.
 ///
 /// A `Pipeline` is a single async [`run`](Pipeline::run) method: the bulk
 /// runner deserializes one input item, builds a [`BulkCtx`] around it, and
@@ -36,7 +36,8 @@ use crate::cost::CostReport;
 ///
 /// ```no_run
 /// use serde::{Deserialize, Serialize};
-/// use taquba_bulk::{BulkCtx, CostReport, Pipeline, StepError};
+/// use taquba_workflow::bulk::{BulkCtx, CostReport, Pipeline};
+/// use taquba_workflow::StepError;
 ///
 /// #[derive(Serialize, Deserialize)]
 /// struct Ticket { id: String, body: String }
@@ -87,7 +88,7 @@ pub trait Pipeline: Send + Sync + 'static {
 /// Per-item execution context handed to [`Pipeline::run`].
 ///
 /// Wraps the typed input together with the durable per-item
-/// [memo](taquba_workflow::Memo), a [cost accumulator](CostReport), the
+/// [memo](crate::Memo), a [cost accumulator](CostReport), the
 /// run's cooperative [cancellation token](CancellationToken), the
 /// delivery's [lease handle](LeaseHandle), the item's staged
 /// [KV effects](EffectsHandle) and read access to the caller KV
@@ -218,15 +219,15 @@ impl<T> BulkCtx<T> {
 
     /// Add `amount` to the cost counter named `metric` for this item. The
     /// per-item totals roll up into the batch-level
-    /// [`ProgressSnapshot`](crate::ProgressSnapshot) and
-    /// [`BulkReport`](crate::BulkReport).
+    /// [`ProgressSnapshot`](crate::bulk::ProgressSnapshot) and
+    /// [`BulkReport`](crate::bulk::BulkReport).
     pub fn record_cost(&self, metric: &str, amount: f64) {
         self.cost.record(metric, amount);
     }
 
     /// The run's cooperative cancellation token. Watch it to short-circuit a
     /// long-running step when the bulk run is draining (e.g. on spot
-    /// preemption); see [`taquba_workflow::Step::cancel_token`].
+    /// preemption); see [`crate::Step::cancel_token`].
     pub fn cancel_token(&self) -> &CancellationToken {
         &self.cancel_token
     }
@@ -235,7 +236,7 @@ impl<T> BulkCtx<T> {
     /// pipeline calls [`LeaseHandle::ensure_at_least`] at progress
     /// points (or once, with a slow call's timeout, before issuing it)
     /// so the item is not re-queued while it still runs; see
-    /// [`taquba_workflow::Step::lease`].
+    /// [`crate::Step::lease`].
     pub fn lease(&self) -> &LeaseHandle {
         &self.lease
     }
@@ -253,7 +254,7 @@ impl<T> BulkCtx<T> {
     /// Read the committed value under `key` from the caller KV
     /// namespace, `None` when no value exists. Effects staged by this
     /// item become readable only once its completion commits; see
-    /// [`taquba_workflow::KvReadHandle`] for the read semantics.
+    /// [`crate::KvReadHandle`] for the read semantics.
     pub async fn kv_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StepError> {
         Ok(self
             .kv
@@ -273,11 +274,11 @@ impl<T> BulkCtx<T> {
 /// error type: the caller's own error, or a memo error.
 enum MemoizedError<E> {
     Caller(E),
-    Memo(taquba_workflow::Error),
+    Memo(crate::Error),
 }
 
-impl<E> From<taquba_workflow::Error> for MemoizedError<E> {
-    fn from(err: taquba_workflow::Error) -> Self {
+impl<E> From<crate::Error> for MemoizedError<E> {
+    fn from(err: crate::Error) -> Self {
         Self::Memo(err)
     }
 }
@@ -294,10 +295,10 @@ impl<E: From<StepError>> MemoizedError<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MemoStore;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
     use taquba::object_store::memory::InMemory;
-    use taquba_workflow::MemoStore;
 
     #[derive(Serialize)]
     struct ContentInput<'a> {
@@ -378,7 +379,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(err.kind, taquba_workflow::StepErrorKind::Permanent);
+        assert_eq!(err.kind, crate::StepErrorKind::Permanent);
     }
 
     #[tokio::test]

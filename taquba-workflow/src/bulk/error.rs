@@ -4,10 +4,10 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// An error from the underlying [`taquba_workflow`] runtime (submission,
+    /// An error from the underlying [`crate`] runtime (submission,
     /// status, cancellation).
     #[error(transparent)]
-    Workflow(#[from] taquba_workflow::Error),
+    Workflow(#[from] crate::Error),
 
     /// Reading an input source or writing an output sink failed.
     #[error("I/O error: {0}")]
@@ -22,7 +22,7 @@ pub enum Error {
     Encode(#[from] rmp_serde::encode::Error),
 
     /// The run completed but the share of failed items exceeded the
-    /// configured [`fail_threshold`](crate::BulkBuilder::fail_threshold).
+    /// configured [`fail_threshold`](crate::bulk::BulkBuilder::fail_threshold).
     #[error("bulk run failed: {failed}/{total} items failed, over the {threshold:.1}% threshold")]
     FailureThresholdExceeded {
         /// Number of items that terminated failed.
