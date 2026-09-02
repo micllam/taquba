@@ -19,8 +19,8 @@ use crate::Result;
 use crate::jobs::context::{JobContext, State};
 use crate::jobs::handle::JobHandle;
 use crate::jobs::job::Job;
-use crate::keys::hex_sha256;
-use crate::outcome::{hash_input, read_outcome, run_typed_step};
+use crate::keys::{hash_input, hex_sha256};
+use crate::outcome::{read_outcome, run_typed_step};
 
 /// The payload of a job's run: the job's [`Job::NAME`], by which the step
 /// runner routes the run to the registered handler, and the serialized

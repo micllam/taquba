@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use taquba::{Queue, WaitOutcome};
 
+use crate::keys::hash_input;
 use crate::memo::Memo;
 use crate::{Result, Step, StepError, StepErrorKind, StepOutcome};
 
@@ -131,11 +132,6 @@ where
             Err(err)
         }
     }
-}
-
-pub(crate) fn hash_input(input: &[u8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(input).into()
 }
 
 /// Read the outcome record of `run_memo`. A record that fails to decode is

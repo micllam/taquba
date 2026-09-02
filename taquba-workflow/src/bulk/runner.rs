@@ -1,11 +1,11 @@
 //! Adapter that drives a [`Pipeline`] as a single [`crate`] step.
 
-use crate::{Step, StepError, StepOutcome, StepRunner, TerminalStatus};
+use crate::{Step, StepError, StepOutcome, StepRunner};
 use serde::{Deserialize, Serialize};
 
 use crate::bulk::cost::CostReport;
 use crate::bulk::pipeline::{BulkCtx, Pipeline};
-use crate::bulk::progress::ItemMarker;
+use crate::bulk::progress::{ItemMarker, MarkerStatus};
 use crate::keys::bulk_item_kv_key;
 use crate::outcome::run_typed_step;
 
@@ -77,12 +77,12 @@ impl<P: Pipeline> StepRunner for PipelineRunner<P> {
                 let cost = rmp_serde::from_slice::<ItemEnvelope<P::Output>>(result)
                     .map(|envelope| envelope.cost)
                     .unwrap_or_default();
-                let marker = ItemMarker::new(TerminalStatus::Succeeded, None, cost);
+                let marker = ItemMarker::new(MarkerStatus::Succeeded, None, cost);
                 step.effects.put_reserved(marker_key, marker.encode()?)?;
             }
             Err(err) => {
                 let marker = ItemMarker::new(
-                    TerminalStatus::Failed,
+                    MarkerStatus::Failed,
                     Some(err.message.clone()),
                     CostReport::new(),
                 );

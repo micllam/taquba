@@ -157,9 +157,7 @@ pub(crate) struct DurableStepOutcomeRecord {
     pub(crate) outcome: DurableStepOutcome,
     /// Effects staged through [`crate::EffectsHandle`] during the
     /// recorded delivery, restored into the settlement when the outcome
-    /// is replayed. Defaulted so records written before the field
-    /// existed deserialize.
-    #[serde(default)]
+    /// is replayed.
     pub(crate) effects: StagedEffects,
 }
 

@@ -20,7 +20,9 @@ use crate::bulk::cost::CostReport;
 use crate::bulk::io::{NullSink, OutputRecord, OutputSink};
 use crate::bulk::manifest::{Manifest, ManifestItem, ManifestStore};
 use crate::bulk::pipeline::Pipeline;
-use crate::bulk::progress::{BatchStatus, BulkReport, ItemMarker, ProgressSnapshot, ProgressState};
+use crate::bulk::progress::{
+    BatchStatus, BulkReport, ItemMarker, MarkerStatus, ProgressSnapshot, ProgressState,
+};
 use crate::bulk::runner::{ItemEnvelope, ItemPayload, PipelineRunner};
 use crate::keys::{
     BULK_TERMINAL_KV_PREFIX, bulk_items_kv_prefix, bulk_terminal_kv_key, hex_sha256,
@@ -663,7 +665,6 @@ impl<P: Pipeline> Batch<'_, P> {
             total: manifest.items.len(),
             succeeded: 0,
             failed: 0,
-            cancelled: 0,
             cost: CostReport::new(),
             failed_keys: Vec::new(),
         };
@@ -683,14 +684,12 @@ impl<P: Pipeline> Batch<'_, P> {
                         continue;
                     }
                 };
-                match marker.status() {
-                    Some(TerminalStatus::Succeeded) => status.succeeded += 1,
-                    Some(TerminalStatus::Failed) => {
+                match marker.status {
+                    MarkerStatus::Succeeded => status.succeeded += 1,
+                    MarkerStatus::Failed => {
                         status.failed += 1;
                         status.failed_keys.push(key);
                     }
-                    Some(TerminalStatus::Cancelled) => status.cancelled += 1,
-                    None => continue,
                 }
                 status.cost.merge(&marker.cost);
             }

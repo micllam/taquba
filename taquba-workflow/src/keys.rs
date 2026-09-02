@@ -118,13 +118,12 @@ pub(crate) fn parse_timestamped_kv_key(prefix: &[u8], key: &[u8]) -> Option<(Str
     Some((id.to_string(), ts.parse().ok()?))
 }
 
-/// Validate a caller-supplied run id. The run id becomes an object-store
-/// path segment under the memo prefix and a key segment in the queue's
-/// key-value namespace, so it is restricted to the same 1 to
-/// [`MAX_RUN_ID_LEN`] bytes of `[A-Za-z0-9_-]` that Taquba requires of a
-/// caller-supplied job id. An empty run id would resolve to the memo
-/// prefix itself, whose entries the retention sweep would then remove
-/// for every run.
+/// The SHA-256 digest of `input`.
+pub(crate) fn hash_input(input: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(input).into()
+}
+
 /// The lowercase hex SHA-256 digest of `parts` concatenated.
 pub(crate) fn hex_sha256(parts: &[&[u8]]) -> String {
     use sha2::{Digest, Sha256};
@@ -140,6 +139,13 @@ pub(crate) fn hex_sha256(parts: &[&[u8]]) -> String {
     hex
 }
 
+/// Validate a caller-supplied run id. The run id becomes an object-store
+/// path segment under the memo prefix and a key segment in the queue's
+/// key-value namespace, so it is restricted to the same 1 to
+/// [`MAX_RUN_ID_LEN`] bytes of `[A-Za-z0-9_-]` that Taquba requires of a
+/// caller-supplied job id. An empty run id would resolve to the memo
+/// prefix itself, whose entries the retention sweep would then remove
+/// for every run.
 pub(crate) fn validate_run_id(run_id: &str) -> Result<()> {
     let reason = if run_id.is_empty() {
         "run id must not be empty"

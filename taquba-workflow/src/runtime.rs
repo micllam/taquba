@@ -19,7 +19,8 @@ use crate::effects::{EffectsHandle, StagedEffects, TerminalEffects};
 use crate::error::{Error, Result};
 use crate::keys::{
     DEDUP_PREFIX, HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RESERVED_HEADER_PREFIX,
-    RESERVED_KV_PREFIX, TERMINAL_KV_PREFIX, run_kv_key, terminal_kv_key, validate_run_id,
+    RESERVED_KV_PREFIX, TERMINAL_KV_PREFIX, hash_input, run_kv_key, terminal_kv_key,
+    validate_run_id,
 };
 use crate::kv::KvReadHandle;
 use crate::memo::MemoStore;
@@ -34,13 +35,6 @@ use crate::terminal::{RunOutcome, TerminalHook};
 fn remaining_delay(stored_at_ms: u64, now_ms: u64, delay: Duration) -> Duration {
     let elapsed = Duration::from_millis(now_ms.saturating_sub(stored_at_ms));
     delay.saturating_sub(elapsed)
-}
-
-fn hash_input(input: &[u8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(input);
-    hasher.finalize().into()
 }
 
 /// Per-step enqueue options the runtime forwards through to Taquba. The

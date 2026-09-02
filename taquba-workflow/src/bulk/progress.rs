@@ -4,23 +4,30 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::TerminalStatus;
 use crate::bulk::cost::CostReport;
 
 /// The durable marker of one terminated item, stored under
 /// `workflow/bulk/batches/{batch_id}/items/{key}` in the settlement that
-/// commits the item's terminal outcome.
+/// commits the item's terminal outcome. Only a success and a failure
+/// settle through the item's own step, so those are the recorded
+/// outcomes; a cancelled item leaves no marker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ItemMarker {
-    pub(crate) status: String,
+    pub(crate) status: MarkerStatus,
     pub(crate) error: Option<String>,
     pub(crate) cost: CostReport,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum MarkerStatus {
+    Succeeded,
+    Failed,
+}
+
 impl ItemMarker {
-    pub(crate) fn new(status: TerminalStatus, error: Option<String>, cost: CostReport) -> Self {
+    pub(crate) fn new(status: MarkerStatus, error: Option<String>, cost: CostReport) -> Self {
         Self {
-            status: status.as_str().to_string(),
+            status,
             error,
             cost,
         }
@@ -29,19 +36,12 @@ impl ItemMarker {
     pub(crate) fn encode(&self) -> Result<Vec<u8>, crate::Error> {
         Ok(rmp_serde::to_vec_named(self)?)
     }
-
-    pub(crate) fn status(&self) -> Option<TerminalStatus> {
-        match self.status.as_str() {
-            "succeeded" => Some(TerminalStatus::Succeeded),
-            "failed" => Some(TerminalStatus::Failed),
-            "cancelled" => Some(TerminalStatus::Cancelled),
-            _ => None,
-        }
-    }
 }
 
 /// The durable state of a batch, read from its manifest and item markers
-/// by [`Batch::status`](crate::bulk::Batch::status).
+/// by [`Batch::status`](crate::bulk::Batch::status). An item with no
+/// recorded outcome is neither succeeded nor failed: it has not run to
+/// a settlement of its own, or it was cancelled.
 #[derive(Debug, Clone)]
 pub struct BatchStatus {
     /// The batch id.
@@ -52,8 +52,6 @@ pub struct BatchStatus {
     pub succeeded: usize,
     /// Items whose last recorded outcome is a failure.
     pub failed: usize,
-    /// Items whose last recorded outcome is a cancellation.
-    pub cancelled: usize,
     /// Cost counters rolled up across the recorded items.
     pub cost: CostReport,
     /// Keys of the items whose last recorded outcome is a failure.
