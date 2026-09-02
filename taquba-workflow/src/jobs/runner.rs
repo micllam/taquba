@@ -16,9 +16,9 @@ use taquba::{Clock, Queue};
 use crate::jobs::context::{JobContext, State};
 use crate::jobs::error::{Error, Result};
 use crate::jobs::handle::JobHandle;
-use crate::jobs::job::{ErrorKind, Job};
+use crate::jobs::job::Job;
 use crate::keys::hex_sha256;
-use crate::outcome::{hash_input, read_outcome, run_recorded};
+use crate::outcome::{hash_input, read_outcome, run_typed_step};
 
 /// Reserved header key holding a job's [`Job::NAME`], read by the step
 /// runner to route the run to the registered handler.
@@ -164,17 +164,12 @@ impl<J: Job> ErasedHandler for TypedHandler<J> {
     }
 }
 
-/// Deserialize and run a single job of a known type, and record its
-/// outcome.
+/// Run a single job of a known type and record its outcome.
 async fn run_typed<J: Job>(
     inner: Arc<Inner>,
     step: &Step,
 ) -> std::result::Result<StepOutcome, StepError> {
-    run_recorded(step, async {
-        // A payload that does not deserialize never will: dead-letter it.
-        let input: J = rmp_serde::from_slice(&step.payload).map_err(|err| {
-            StepError::permanent(format!("invalid payload for job type `{}`: {err}", J::NAME))
-        })?;
+    run_typed_step(step, J::NAME, |input: J| async move {
         let ctx = JobContext::new(inner, step);
         tracing::info!(
             job_id = %step.run_id,
@@ -184,38 +179,19 @@ async fn run_typed<J: Job>(
         );
         match input.run(ctx).await {
             Ok(output) => {
-                // A non-serializable output is a programming error, so a
-                // retry cannot succeed: dead-letter.
-                let bytes = rmp_serde::to_vec_named(&output).map_err(|err| {
-                    StepError::permanent(format!(
-                        "job type `{}` produced an output that failed to serialize: {err}",
-                        J::NAME
-                    ))
-                })?;
                 tracing::info!(job_id = %step.run_id, job_type = J::NAME, "job completed");
-                Ok(bytes)
+                Ok(output)
             }
             Err(error) => {
                 let message = error.to_string();
-                match input.classify(&error) {
-                    ErrorKind::Permanent => {
-                        tracing::warn!(
-                            job_id = %step.run_id,
-                            job_type = J::NAME,
-                            "job failed permanently: {message}"
-                        );
-                        Err(StepError::permanent(message))
-                    }
-                    ErrorKind::Transient => {
-                        tracing::warn!(
-                            job_id = %step.run_id,
-                            job_type = J::NAME,
-                            attempt = step.attempts,
-                            "job failed (transient): {message}"
-                        );
-                        Err(StepError::transient(message))
-                    }
-                }
+                let kind = input.classify(&error);
+                tracing::warn!(
+                    job_id = %step.run_id,
+                    job_type = J::NAME,
+                    attempt = step.attempts,
+                    "job failed ({kind:?}): {message}"
+                );
+                Err(StepError { message, kind })
             }
         }
     })
@@ -478,8 +454,9 @@ mod tests {
     use taquba::object_store::{ObjectStore, memory::InMemory};
     use taquba::{JobStatus, MockClock, OpenOptions, Queue, QueueConfig};
 
+    use crate::StepErrorKind;
     use crate::jobs::handle::JoinError;
-    use crate::jobs::job::{ErrorKind, payload_idempotency_key};
+    use crate::jobs::job::payload_idempotency_key;
 
     #[derive(Debug, thiserror::Error)]
     #[error("{0}")]
@@ -515,8 +492,8 @@ mod tests {
             Err(TestError("nope".to_string()))
         }
 
-        fn classify(&self, _error: &TestError) -> ErrorKind {
-            ErrorKind::Permanent
+        fn classify(&self, _error: &TestError) -> StepErrorKind {
+            StepErrorKind::Permanent
         }
     }
 
@@ -675,8 +652,8 @@ mod tests {
             Some(format!("keyed-failure:{}", self.n))
         }
 
-        fn classify(&self, _error: &TestError) -> ErrorKind {
-            ErrorKind::Permanent
+        fn classify(&self, _error: &TestError) -> StepErrorKind {
+            StepErrorKind::Permanent
         }
     }
 
@@ -873,7 +850,7 @@ mod tests {
         let job = runner.submit(AlwaysFails).await.unwrap();
         match job.clone().await {
             Err(JoinError::Job(error)) => {
-                assert_eq!(error.kind, ErrorKind::Permanent);
+                assert_eq!(error.kind, StepErrorKind::Permanent);
                 assert!(error.message.contains("nope"));
             }
             other => panic!("expected JoinError::Job, got {other:?}"),
@@ -1010,7 +987,7 @@ mod tests {
         assert!(first.newly_submitted());
         let first_id = first.id().to_string();
         match first.await {
-            Err(JoinError::Job(job_err)) => assert_eq!(job_err.kind, ErrorKind::Permanent),
+            Err(JoinError::Job(job_err)) => assert_eq!(job_err.kind, StepErrorKind::Permanent),
             other => panic!("expected Permanent JobError, got {other:?}"),
         }
 
@@ -1018,7 +995,7 @@ mod tests {
         assert!(!second.newly_submitted());
         assert_eq!(second.id(), first_id);
         match second.await {
-            Err(JoinError::Job(job_err)) => assert_eq!(job_err.kind, ErrorKind::Permanent),
+            Err(JoinError::Job(job_err)) => assert_eq!(job_err.kind, StepErrorKind::Permanent),
             other => panic!("expected cached Permanent JobError, got {other:?}"),
         }
 
@@ -1168,7 +1145,7 @@ mod tests {
         let job = runner.submit(AlwaysFailsTransient).await.unwrap();
         let error = job.join().await.unwrap().unwrap_err();
 
-        assert_eq!(error.kind, ErrorKind::Transient);
+        assert_eq!(error.kind, StepErrorKind::Transient);
         assert!(error.message.contains("flaky"));
         assert_eq!(count_jobs(&queue, JobStatus::Dead).await, 1);
 

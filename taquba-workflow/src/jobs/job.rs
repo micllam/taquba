@@ -3,8 +3,10 @@ use std::future::Future;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::StepErrorKind;
 use crate::jobs::context::JobContext;
 use crate::jobs::error::Result;
+use crate::keys::hex_sha256;
 
 /// A unit of durable background work.
 ///
@@ -22,7 +24,8 @@ use crate::jobs::error::Result;
 ///
 /// ```
 /// use serde::{Serialize, Deserialize};
-/// use taquba_workflow::jobs::{ErrorKind, Job, JobContext};
+/// use taquba_workflow::StepErrorKind;
+/// use taquba_workflow::jobs::{Job, JobContext};
 ///
 /// #[derive(Serialize, Deserialize)]
 /// struct ResizeImage {
@@ -48,8 +51,8 @@ use crate::jobs::error::Result;
 ///         Some(format!("resize:{}:{}", self.bucket, self.key))
 ///     }
 ///
-///     fn classify(&self, _err: &ResizeError) -> ErrorKind {
-///         ErrorKind::Transient
+///     fn classify(&self, _err: &ResizeError) -> StepErrorKind {
+///         StepErrorKind::Transient
 ///     }
 /// }
 /// ```
@@ -111,25 +114,13 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
 
     /// Classify a failure from [`run`](Self::run) as transient or permanent.
     ///
-    /// The default treats every error as [`ErrorKind::Transient`], so jobs
-    /// retry up to their attempt limit before being dead-lettered. Override
-    /// to send known-unrecoverable failures (validation errors, auth
-    /// failures) straight to the dead-letter queue.
-    fn classify(&self, _error: &Self::Error) -> ErrorKind {
-        ErrorKind::Transient
+    /// The default treats every error as [`StepErrorKind::Transient`], so
+    /// jobs retry up to their attempt limit before being dead-lettered.
+    /// Override to send known-unrecoverable failures (validation errors,
+    /// auth failures) straight to the dead-letter queue.
+    fn classify(&self, _error: &Self::Error) -> StepErrorKind {
+        StepErrorKind::Transient
     }
-}
-
-/// Whether a failed job should be retried or dead-lettered immediately.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ErrorKind {
-    /// The failure may succeed on retry (network blip, rate limit, transient
-    /// downstream outage). The job is re-queued with backoff until its
-    /// attempt limit is reached, then dead-lettered.
-    Transient,
-    /// The failure will not succeed on retry (validation error, auth failure,
-    /// malformed input). The job is dead-lettered immediately.
-    Permanent,
 }
 
 /// Derive a stable idempotency key by hashing a job's serialized form.
@@ -161,16 +152,6 @@ pub enum ErrorKind {
 /// }
 /// ```
 pub fn payload_idempotency_key<J: Job>(job: &J) -> Result<String> {
-    use sha2::{Digest, Sha256};
-
     let bytes = rmp_serde::to_vec_named(job)?;
-    let digest = Sha256::digest(&bytes);
-    let mut hex = String::with_capacity(2 + J::NAME.len() + 64);
-    hex.push_str(J::NAME);
-    hex.push(':');
-    for byte in digest {
-        use std::fmt::Write;
-        let _ = write!(&mut hex, "{byte:02x}");
-    }
-    Ok(hex)
+    Ok(format!("{}:{}", J::NAME, hex_sha256(&[&bytes])))
 }

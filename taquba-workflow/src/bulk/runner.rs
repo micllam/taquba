@@ -8,7 +8,7 @@ use crate::bulk::cost::CostReport;
 use crate::bulk::pipeline::{BulkCtx, Pipeline};
 use crate::bulk::progress::ItemMarker;
 use crate::keys::bulk_item_kv_key;
-use crate::outcome::run_recorded;
+use crate::outcome::run_typed_step;
 
 /// The per-item result the runner writes as the workflow step's `Succeed`
 /// payload and into the item's outcome record. Carries both the user
@@ -44,18 +44,13 @@ impl<P> PipelineRunner<P> {
 
 impl<P: Pipeline> StepRunner for PipelineRunner<P> {
     async fn run_step(&self, step: &Step) -> Result<StepOutcome, StepError> {
-        let outcome = run_recorded(step, async {
-            // A bad payload does not decode on retry either: fail permanently.
-            let input: P::Input = rmp_serde::from_slice(&step.payload)
-                .map_err(|e| StepError::permanent(format!("failed to decode bulk input: {e}")))?;
+        let outcome = run_typed_step(step, "bulk item", |input: P::Input| async move {
             let ctx = BulkCtx::new(input, step);
             let output = self.pipeline.run(&ctx).await.map_err(Into::into)?;
-            let envelope = ItemEnvelope {
+            Ok(ItemEnvelope {
                 output,
                 cost: ctx.cost(),
-            };
-            rmp_serde::to_vec_named(&envelope)
-                .map_err(|e| StepError::permanent(format!("failed to encode bulk output: {e}")))
+            })
         })
         .await;
         let (batch_id, key) = match (step.headers.get(HEADER_BATCH), step.headers.get(HEADER_KEY)) {

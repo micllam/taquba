@@ -210,9 +210,10 @@
 //! # Retries and failure
 //!
 //! A job that returns `Err` is classified by [`Job::classify`] as
-//! [`ErrorKind::Transient`] (retried with backoff up to the attempt limit,
-//! then dead-lettered) or [`ErrorKind::Permanent`] (dead-lettered on that
-//! attempt). Backoff is a queue-level Taquba setting; [`Job::max_attempts`]
+//! [`StepErrorKind::Transient`](crate::StepErrorKind::Transient) (retried
+//! with backoff up to the attempt limit, then dead-lettered) or
+//! [`StepErrorKind::Permanent`](crate::StepErrorKind::Permanent)
+//! (dead-lettered on that attempt). Backoff is a queue-level Taquba setting; [`Job::max_attempts`]
 //! and per-submission [`SubmitOptions`] cover the per-job settings.
 
 mod context;
@@ -225,5 +226,5 @@ pub use crate::RunnerHandle;
 pub use context::JobContext;
 pub use error::{Error, Result};
 pub use handle::{JobError, JobHandle, JoinError};
-pub use job::{ErrorKind, Job, payload_idempotency_key};
+pub use job::{Job, payload_idempotency_key};
 pub use runner::{JobRunner, JobRunnerBuilder, SubmitOptions};

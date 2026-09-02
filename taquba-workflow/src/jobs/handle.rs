@@ -4,11 +4,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::RunStatus;
+use crate::{RunStatus, StepErrorKind};
 use thiserror::Error;
 
 use crate::jobs::error::{Error, Result};
-use crate::jobs::job::{ErrorKind, Job};
+use crate::jobs::job::Job;
 use crate::jobs::runner::Inner;
 use crate::outcome::{
     StoredErrorKind, StoredOutcome, Terminal, Unrecorded, read_outcome, wait_terminal,
@@ -29,7 +29,7 @@ const JOIN_CHUNK: Duration = Duration::from_secs(3600);
 pub struct JobError {
     /// Whether the failure was classified transient (the job exhausted its
     /// attempts) or permanent (dead-lettered on the failing attempt).
-    pub kind: ErrorKind,
+    pub kind: StepErrorKind,
     /// The failure message.
     pub message: String,
 }
@@ -187,7 +187,7 @@ impl<J: Job> JobHandle<J> {
                     _ => "job terminated without recording an outcome".to_string(),
                 };
                 Ok(Some(Err(JobError {
-                    kind: ErrorKind::Transient,
+                    kind: StepErrorKind::Transient,
                     message,
                 })))
             }
@@ -202,8 +202,8 @@ fn decode_outcome<J: Job>(
         StoredOutcome::Success { output } => Ok(Ok(rmp_serde::from_slice(&output)?)),
         StoredOutcome::Failure { kind, message } => Ok(Err(JobError {
             kind: match kind {
-                StoredErrorKind::Transient => ErrorKind::Transient,
-                StoredErrorKind::Permanent => ErrorKind::Permanent,
+                StoredErrorKind::Transient => StepErrorKind::Transient,
+                StoredErrorKind::Permanent => StepErrorKind::Permanent,
             },
             message,
         })),

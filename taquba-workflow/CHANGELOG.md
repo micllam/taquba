@@ -68,7 +68,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `memo_prefix`, `result_retention` is `retention`,
   `JobHandle::status` returns the in-process `RunStatus`,
   `JobContext::job_id` is `JobContext::id`, `JobContext::queue` is
-  gone, and `Error::Store` is replaced by `Error::Workflow`.
+  gone, `Error::Store` is replaced by `Error::Workflow`, and
+  `jobs::ErrorKind` is replaced by the crate's `StepErrorKind` in
+  `Job::classify` and `JobError::kind`.
 - `WorkflowRuntime::spawn`: spawns the worker loop as a task and returns
   a `RunnerHandle` for shutting it down or waiting on it; the `jobs`
   and `bulk` workers are spawned through it and `jobs::RunnerHandle`
