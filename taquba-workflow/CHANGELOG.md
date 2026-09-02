@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Memo::content_key`, the key derivation used by `Memo::content_get`
+  and `Memo::content_put`: `content:` followed by the hex SHA-256
+  digest of the input encoded as MessagePack with named fields.
 - `Step` gains the `kv` field, a `KvReadHandle` reading committed
   values from Taquba's caller KV namespace during a step; `get` is the
   only operation. The read answers from committed state, so effects

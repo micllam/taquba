@@ -264,34 +264,40 @@ impl Memo {
             .await
     }
 
-    /// Read a memo entry whose key is derived from serialized `input`.
+    /// Derive the memo key for a content-addressed entry: `content:`
+    /// followed by the hex SHA-256 digest of `input` encoded as
+    /// MessagePack with named fields.
     ///
-    /// The input is encoded as MessagePack and hashed with SHA-256 to
-    /// derive the memo key.
-    ///
-    /// The derived key is stable only when `input` serializes
+    /// The key is stable only when `input` serializes
     /// deterministically; types with unordered iteration, such as
     /// `HashMap`, can serialize the same logical content into different
-    /// bytes and therefore different keys. If several
-    /// logical operations may receive the same input shape, include an
-    /// operation name in the serialized input.
+    /// bytes and therefore different keys. If several logical
+    /// operations may receive identical inputs, include an operation
+    /// name in the serialized input.
+    pub fn content_key<T>(input: &T) -> Result<String>
+    where
+        T: Serialize + ?Sized,
+    {
+        let bytes = rmp_serde::to_vec_named(input)?;
+        Ok(format!("content:{}", hex_sha256(&bytes)))
+    }
+
+    /// Read the memo entry stored under [`Self::content_key`] of
+    /// `input`.
     pub async fn content_get<T>(&self, input: &T) -> Result<Option<Vec<u8>>>
     where
         T: Serialize + ?Sized,
     {
-        let key = content_key(input)?;
+        let key = Self::content_key(input)?;
         self.get(&key).await
     }
 
-    /// Store `value` under a memo key derived from serialized `input`.
-    ///
-    /// See [`Self::content_get`] for the key derivation and namespace
-    /// semantics.
+    /// Store `value` under [`Self::content_key`] of `input`.
     pub async fn content_put<T>(&self, input: &T, value: &[u8]) -> Result<()>
     where
         T: Serialize + ?Sized,
     {
-        let key = content_key(input)?;
+        let key = Self::content_key(input)?;
         self.put(&key, value).await
     }
 }
@@ -315,14 +321,6 @@ fn hex_sha256(bytes: &[u8]) -> String {
         let _ = write!(&mut hex, "{byte:02x}");
     }
     hex
-}
-
-fn content_key<T>(input: &T) -> Result<String>
-where
-    T: Serialize + ?Sized,
-{
-    let bytes = rmp_serde::to_vec_named(input)?;
-    Ok(format!("content:{}", hex_sha256(&bytes)))
 }
 
 #[cfg(test)]
