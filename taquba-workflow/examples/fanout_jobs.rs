@@ -1,5 +1,5 @@
-//! Inner fan-out composing `taquba-workflow` with `taquba-jobs`: a
-//! workflow step submits N typed jobs to a shared [`JobRunner`], joins
+//! Inner fan-out composing workflow steps with typed jobs: a workflow
+//! step submits N typed jobs to a shared [`JobRunner`], joins
 //! their typed results, and memoizes the aggregate so a step retry
 //! does not re-submit the fan-out.
 //!
@@ -33,7 +33,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use taquba::Queue;
 use taquba::object_store::memory::InMemory;
-use taquba_jobs::{Job, JobContext, JobRunner};
+use taquba_workflow::jobs::{Job, JobContext, JobRunner};
 use taquba_workflow::{
     RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects, TerminalHook,
     TerminalStatus, WorkflowRuntime,
@@ -178,8 +178,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Typed-jobs layer, sharing the queue with the workflow runtime
     // below. The runner's dispatch worker runs until shutdown.
-    let mut jobs = JobRunner::builder(queue.clone(), store.clone()).build();
-    jobs.register::<FetchPage>();
+    let mut jobs = JobRunner::builder(queue.clone(), store.clone())
+        .register::<FetchPage>()
+        .build();
     let jobs_handle = jobs.spawn(std::future::pending::<()>());
     let jobs = Arc::new(jobs);
 

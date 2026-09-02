@@ -3133,7 +3133,6 @@ dependencies = [
  "serde",
  "taquba",
  "taquba-bulk",
- "taquba-jobs",
  "taquba-workflow",
  "thiserror 1.0.69",
  "tokio",
@@ -3173,15 +3172,8 @@ dependencies = [
 name = "taquba-jobs"
 version = "0.7.0"
 dependencies = [
- "futures-util",
- "rmp-serde",
- "serde",
- "sha2",
  "taquba",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
+ "taquba-workflow",
 ]
 
 [[package]]
@@ -3210,7 +3202,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "taquba",
- "taquba-jobs",
  "taquba-webhooks",
  "thiserror 1.0.69",
  "tokio",

@@ -3,8 +3,8 @@ use std::future::Future;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::context::JobContext;
-use crate::error::Result;
+use crate::jobs::context::JobContext;
+use crate::jobs::error::Result;
 
 /// A unit of durable background work.
 ///
@@ -22,7 +22,7 @@ use crate::error::Result;
 ///
 /// ```
 /// use serde::{Serialize, Deserialize};
-/// use taquba_jobs::{ErrorKind, Job, JobContext};
+/// use taquba_workflow::jobs::{ErrorKind, Job, JobContext};
 ///
 /// #[derive(Serialize, Deserialize)]
 /// struct ResizeImage {
@@ -58,20 +58,20 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
     ///
     /// Stored in a reserved header on every enqueued job so the runner can
     /// dispatch the opaque payload back to the right handler. Must be unique
-    /// across all job types registered on a single [`JobRunner`](crate::JobRunner),
+    /// across all job types registered on a single [`JobRunner`](crate::jobs::JobRunner),
     /// and stable across releases; changing it strands in-flight jobs of the
     /// old name in the dead-letter queue.
     const NAME: &'static str;
 
     /// The typed value produced by a successful run. Persisted to object
-    /// storage so it can be retrieved via [`JobHandle`](crate::JobHandle).
+    /// storage so it can be retrieved via [`JobHandle`](crate::jobs::JobHandle).
     type Output: Serialize + DeserializeOwned + Send + 'static;
 
     /// The error type [`run`](Self::run) returns on failure.
     ///
     /// The error's [`Display`](std::fmt::Display) output is recorded as the
     /// job's failure message; the error value itself is *not* persisted, so
-    /// callers awaiting the job see a [`JobError`](crate::JobError) carrying
+    /// callers awaiting the job see a [`JobError`](crate::jobs::JobError) carrying
     /// the message and classification rather than this concrete type.
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -93,7 +93,7 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
     ///
     /// When `Some`, a submission whose key matches an already-pending or
     /// scheduled job is collapsed onto that existing job rather than creating
-    /// a new one; the returned [`JobHandle`](crate::JobHandle) points at the
+    /// a new one; the returned [`JobHandle`](crate::jobs::JobHandle) points at the
     /// original. The default is `None`: every submission runs.
     ///
     /// To opt in to hash-based deduplication, return
@@ -144,7 +144,7 @@ pub enum ErrorKind {
 ///
 /// ```
 /// # use serde::{Serialize, Deserialize};
-/// # use taquba_jobs::{Job, JobContext, payload_idempotency_key};
+/// # use taquba_workflow::jobs::{Job, JobContext, payload_idempotency_key};
 /// # #[derive(Serialize, Deserialize)]
 /// # struct SendDigest { user_id: u64 }
 /// # #[derive(Debug, thiserror::Error)]

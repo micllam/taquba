@@ -2,11 +2,11 @@
 //
 // Fan-out benchmark for typed jobs: submit N_JOBS concurrently with
 // idempotency keys, await every handle, then submit the identical
-// batch again so each handle short-circuits to its cached result
-// blob. The cold phase measures the full round trip (idempotency
-// record plus enqueue, claim, run, result-blob write, completion
-// notification, result read); the resubmit phase measures the
-// idempotent short-circuit that crash-resume relies on.
+// batch again so each handle short-circuits to its cached outcome
+// record. The cold phase measures the full round trip (run record plus
+// enqueue, claim, run, outcome-record write, completion notification,
+// outcome read); the resubmit phase measures the idempotent
+// short-circuit that crash-resume relies on.
 //
 // Parameters (env vars, all optional).
 //   N_JOBS              jobs per phase (default 500).
@@ -18,7 +18,7 @@
 //                       object_store's ThrottledStore so every get, put,
 //                       list, and delete sleeps this long before running,
 //                       approximating an S3-class backend. Applies to
-//                       result blobs as well as the queue.
+//                       outcome records as well as the queue.
 //   STORE_JITTER_MS     random tail latency in [0, STORE_JITTER_MS] added to
 //                       each write on top of STORE_LATENCY_MS (default 0).
 //   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use taquba::{OpenOptions, Queue, QueueConfig};
 use taquba_bencher::{env_var, init_tracing, store_from_env};
-use taquba_jobs::{Job, JobContext, JobRunner};
+use taquba_workflow::jobs::{Job, JobContext, JobRunner};
 
 #[derive(Debug, thiserror::Error)]
 #[error("bench job error: {0}")]
@@ -121,8 +121,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut runner = JobRunner::builder(queue.clone(), store)
         .max_concurrent_jobs(max_concurrent)
+        .register::<BenchJob>()
         .build();
-    runner.register::<BenchJob>();
     let worker = runner.spawn(std::future::pending::<()>());
 
     println!("phase,jobs,secs,jobs_per_sec");
@@ -139,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // The identical batch again: every handle should short-circuit to
-    // the cached result blob without re-running the job.
+    // the cached outcome record without re-running the job.
     let (resubmit_secs, resubmit_new) = run_phase(&runner, n_jobs, job_work_ms).await?;
     let total_executed = EXECUTIONS.load(Ordering::SeqCst);
     eprintln!(

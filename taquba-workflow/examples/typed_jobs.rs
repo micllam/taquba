@@ -1,4 +1,4 @@
-// cargo run -p taquba-jobs --example hello_jobs
+// cargo run -p taquba-workflow --example typed_jobs
 //
 // Defines a single typed job (`Greet`), spins up a JobRunner backed by an
 // in-memory object store, submits a handful of jobs concurrently, and waits
@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use taquba::{Queue, object_store::memory::InMemory};
-use taquba_jobs::{Job, JobContext, JobRunner};
+use taquba_workflow::jobs::{Job, JobContext, JobRunner};
 
 #[derive(Serialize, Deserialize)]
 struct Greet {
@@ -39,16 +39,15 @@ impl Job for Greet {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // In production swap InMemory for an S3 / GCS / Azure / local-disk store.
-    // The queue and the result-blob store can be the same handle (as here) or
-    // separate stores entirely.
+    // The queue and the memo store can be the same handle (as here) or
+    // separate stores.
     let store = Arc::new(InMemory::new());
     let queue = Arc::new(Queue::open(store.clone(), "jobs-demo").await?);
 
     let mut runner = JobRunner::builder(queue, store)
         .max_concurrent_jobs(4)
+        .register::<Greet>()
         .build();
-
-    runner.register::<Greet>();
     let handle = runner.spawn(std::future::pending::<()>());
 
     // Submit three jobs, then await each typed result.

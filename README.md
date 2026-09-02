@@ -162,35 +162,33 @@ already use the stack.
 
 | Tier | Crate | What it does | Best for |
 |---|---|---|---|
-| Execution | [`taquba-workflow`](./taquba-workflow) | Runs one durable multi-step process: a sequence of steps with per-step memoization, retries, durable signals and a terminal hook | LLM agent runs, payment flows, document pipelines |
+| Execution | [`taquba-workflow`](./taquba-workflow) | Runs one durable multi-step process: a sequence of steps with per-step memoization, retries, durable signals and a terminal hook. Its `jobs` module runs one typed async function as a single-step run and returns the result to an awaiting caller | LLM agent runs, payment flows, document pipelines, typed background tasks |
 | Execution | [`taquba-bulk`](./taquba-bulk) | Applies one pipeline definition to many inputs in parallel, one workflow run per input, with per-item memoization, batch progress, cost rollup and streamed output | Bulk LLM workloads, document/OCR pipelines, data enrichment, parameter sweeps |
-| Execution | [`taquba-jobs`](./taquba-jobs) | Runs one typed async function and returns its result to an awaiting caller, with idempotent submission and per-job result retention | Typed background tasks whose return value the caller awaits |
 | Substrate | [`taquba`](./taquba) | Durable task queue with transactional KV, leases, retries, scheduling and dead-letter | Building your own execution layer, or background jobs with opaque payloads |
 | Component | [`taquba-cron`](./taquba-cron) | POSIX cron scheduling onto a Taquba queue | Periodic enqueues (reports, sweeps, reminders) |
 | Component | [`taquba-webhooks`](./taquba-webhooks) | HTTP webhook delivery with retries and dead-letter | Outbound webhook fan-out with durable retries |
 
 Every crate above the substrate consumes one `Arc<Queue>`. `taquba-bulk`
-is built on `taquba-workflow`; `taquba-jobs` and `taquba-workflow` are
-independent of each other.
+is built on `taquba-workflow`.
 
 ### Choosing between them
 
-- **A single-step workflow or a job.** Use `taquba-jobs` when the caller
-  awaits a typed return value in process, and `taquba-workflow` when the
-  caller observes the run through cancellation, headers and a terminal
-  hook.
+- **A single-step workflow or a job.** Use a typed job (the `jobs`
+  module) when the caller awaits a typed return value in process, and a
+  step runner when the caller observes the run through cancellation,
+  headers and a terminal hook.
 - **Chained jobs or a workflow.** A job can submit further jobs, so a
   pipeline can be approximated by chaining. Chained jobs share no run
   identity, no end-to-end terminal status and no resume point; a process
-  modelled by chaining belongs in `taquba-workflow`.
-- **Job fan-out or bulk.** Submitting N jobs through `taquba-jobs` and
-  awaiting their handles yields N independent typed results. Use
+  modelled by chaining belongs in a step runner.
+- **Job fan-out or bulk.** Submitting N typed jobs and awaiting their
+  handles yields N independent typed results. Use
   `taquba-bulk` when each item is itself a multi-phase pipeline whose
   completed phases must survive a retry, and the batch needs progress,
   cost rollup and a failure threshold.
-- **Fan-out inside one run.** Compose `taquba-workflow` with
-  `taquba-jobs`: a workflow step submits N typed jobs, joins their results
-  and memoizes the aggregate so a step retry does not re-submit. The
+- **Fan-out inside one run.** Compose steps with typed jobs: a workflow
+  step submits N typed jobs, joins their results and memoizes the
+  aggregate so a step retry does not re-submit. The
   reference agent uses this for its parallel page-fetch phase and cancels
   in-flight jobs when the surrounding run is cancelled. It is a manual
   pattern, demonstrated in

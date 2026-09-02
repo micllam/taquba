@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The `jobs` module: typed single-function jobs, moved from the
+  `taquba-jobs` crate and re-founded on the runtime. A job is one run
+  with a single step routed by the `taquba_jobs.type` header to the
+  handler registered on `JobRunnerBuilder::register`; its outcome
+  record is stored in the run's memo under the runner's memo prefix
+  (default `"{queue_name}-memo"`), removed by the runtime's memo
+  retention through `JobRunnerBuilder::retention`; job ids are run
+  ids, a ULID or the SHA-256 digest of the idempotency key.
+  `JobContext` exposes `memo`, `effects` and `kv_get` beside state,
+  lease, cancellation token and `submit`. Relative to `taquba-jobs`
+  0.7: registration moved to the builder, `result_prefix` is
+  `memo_prefix`, `result_retention` is `retention`,
+  `JobHandle::status` returns the in-process `RunStatus`,
+  `JobContext::job_id` is `JobContext::id`, `JobContext::queue` is
+  gone, and `Error::Store` is replaced by `Error::Workflow`.
 - `RunSpec::run_at`: the earliest time the first step may run. The
   step-0 job waits in the queue's scheduled state until the queue's
   clock passes it.

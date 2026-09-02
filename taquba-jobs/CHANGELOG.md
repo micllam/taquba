@@ -7,19 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking (source and storage):** the crate re-exports
+  `taquba_workflow::jobs` and receives no further development; the
+  typed-job implementation moved into `taquba-workflow`, where a job is
+  one workflow run with a single step. `taquba-workflow` is a new
+  dependency and `futures-util` is no longer one. Relative to 0.7: job
+  types are registered on `JobRunnerBuilder::register` before `build`;
+  `result_prefix` is `memo_prefix` and `result_retention` is
+  `retention`, applied through the workflow's memo retention;
+  `JobHandle::status` returns the in-process `RunStatus` and `None` once
+  the job has terminated; `JobContext::job_id` is `JobContext::id`;
+  `JobContext::state` and `try_state` return references bound to the
+  context; `Error::Store` is replaced by `Error::Workflow`. Job ids are
+  workflow run ids: a ULID, or the SHA-256 digest of the idempotency
+  key. The outcome record is stored in the run's memo under the memo
+  prefix (default `"{queue_name}-memo"`); the `jobs/dedup/` KV records
+  and the result-blob store are no longer written or read.
+
+### Added
+
+- `JobContext::memo`, `JobContext::effects` and `JobContext::kv_get`: a
+  handler's durable memo, its staged KV effects applied with the job's
+  successful completion, and committed KV reads.
+- `RunState` and `RunStatus` re-exported from `taquba-workflow`.
+
 ### Removed
 
 - **Breaking (source):** `JobContext::queue`. A handler settles nothing
-  itself; the loop that delivered the job settles it. The context keeps
-  `lease`, `cancel_token`, `state` and `submit`.
-
-### Changed
-
-- Built against the `taquba` option setters: `OpenOptions`,
-  `QueueConfig`, `EnqueueOptions` and `SettlementEffects` are
-  `#[non_exhaustive]` in `taquba` and are constructed through their
-  setters here and in the documentation examples. Callers that build
-  these types for a queue shared with this crate migrate the same way.
+  itself; the loop that delivered the job settles it.
 
 ## [0.7.0] - 2026-08-12
 

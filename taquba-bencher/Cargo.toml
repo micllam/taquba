@@ -21,7 +21,6 @@ metrics = ["taquba/metrics", "dep:metrics-exporter-prometheus"]
 [dependencies]
 taquba = { workspace = true }
 taquba-bulk = { workspace = true }
-taquba-jobs = { workspace = true }
 taquba-workflow = { workspace = true }
 
 tokio = { workspace = true, features = ["rt-multi-thread"] }
@@ -89,5 +88,5 @@ harness = false
 
 [[bench]]
 name = "fanout"
-path = "benches/taquba-jobs/fanout.rs"
+path = "benches/taquba-workflow/fanout.rs"
 harness = false

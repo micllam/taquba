@@ -330,6 +330,41 @@ through every step and reach the terminal hook on `RunOutcome::headers`.
 | `workflow.run_id` | Run identifier. |
 | `workflow.step` | Zero-based step number. |
 
+## Typed jobs
+
+The `jobs` module runs one typed async function as a single-step run and
+returns its result to an awaiting caller: define a `Job` with typed input
+fields, an `Output` and an `Error`, register it on a `JobRunner`, submit
+instances and await the `JobHandle`. The outcome record is stored in the
+run's memo, so `JobHandle::fetch_result` reads it after a restart, and a
+`Job::idempotency_key` collapses duplicate submissions before and after
+completion. The module documentation covers idempotent submission,
+retention and the handler context.
+
+```rust,ignore
+use taquba_workflow::jobs::{Job, JobContext, JobRunner};
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SendEmail { to: String }
+
+impl Job for SendEmail {
+    const NAME: &'static str = "email.send";
+    type Output = String;
+    type Error = EmailError;
+
+    async fn run(&self, _ctx: JobContext<'_>) -> Result<String, EmailError> {
+        Ok(format!("msg-for-{}", self.to))
+    }
+}
+
+let mut runner = JobRunner::builder(queue, store)
+    .register::<SendEmail>()
+    .build();
+let worker = runner.spawn(std::future::pending::<()>());
+let message_id = runner.submit(SendEmail { to: "user@example.com".into() }).await?.await?;
+worker.shutdown().await?;
+```
+
 ## Idempotency
 
 Each step is enqueued with `dedup_key = "run:{run_id}:{step_number}"`,
