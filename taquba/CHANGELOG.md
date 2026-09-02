@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Queue::commit_effects`: applies a `SettlementEffects` (enqueues, KV
+  writes and deletes) as one transaction with no job transition and
+  returns one `EnqueueResult` per enqueue; a dedup hit downgrades that
+  enqueue while the rest of the effects still apply.
 - Settlement effects on the failure and cancellation transitions.
   `Queue::dead_letter_with` applies `SettlementEffects` atomically
   with the dead-letter transition, exactly as `Queue::ack_with` does

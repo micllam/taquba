@@ -516,6 +516,38 @@ impl Queue {
         self.write_job(prepared, kv_writes).await
     }
 
+    /// Apply `effects` as one transaction with no job transition: the
+    /// enqueues, the KV writes and the KV deletes commit together or not
+    /// at all. Returns one [`EnqueueResult`] per enqueue, in order; an
+    /// enqueue whose `dedup_key` matches a pending or scheduled job is
+    /// reported as [`EnqueueResult::AlreadyEnqueued`] while the rest of
+    /// the effects still apply, unlike [`Self::enqueue_with_kv`], whose
+    /// writes belong to the one job it enqueues.
+    ///
+    /// The effects of a claim's own settlement belong on [`Self::ack_with`]
+    /// and the other `*_with` settlements. This method is for state a
+    /// layer keeps beside the queue and must move in one step without a
+    /// transition of its own to carry it, such as reconciling the state
+    /// of a job the reaper dead-lettered.
+    pub async fn commit_effects(&self, effects: SettlementEffects) -> Result<Vec<EnqueueResult>> {
+        let prepared = self.core.prepare_effects(effects).await?;
+        let committed: Result<Vec<EnqueueResult>> = async {
+            loop {
+                let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
+                let staged = self.core.stage_effects(&txn, &prepared).await?;
+                match commit(txn, Durability::Awaited).await? {
+                    Commit::Committed => return Ok(self.core.note_staged_effects(staged)),
+                    Commit::Conflict => continue,
+                }
+            }
+        }
+        .await;
+        self.core
+            .finish_effects(prepared, committed.as_ref().ok().map(Vec::as_slice))
+            .await;
+        committed
+    }
+
     /// Fetch the offloaded payloads of `jobs` concurrently, bounding a
     /// batch's wall time by the slowest object rather than the sum of
     /// the fetches. Jobs with inline payloads are untouched. On a fetch
@@ -1713,6 +1745,7 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EnqueueRequest;
     use crate::kv::MAX_KV_VALUE_SIZE;
     use crate::options::{PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_NORMAL};
     use crate::test_util::*;
@@ -2833,6 +2866,60 @@ mod tests {
 
         let v = q.kv_get(b"runs/abc").await.unwrap();
         assert_eq!(v.as_deref(), Some(b"submitted".as_slice()));
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn commit_effects_applies_enqueues_and_kv_in_one_transaction() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        q.kv_put(b"runs/old", b"stale").await.unwrap();
+        let request = || EnqueueRequest {
+            queue: "work".to_string(),
+            payload: b"follow-up".to_vec(),
+            options: EnqueueOptions::default().dedup_key(Some("once".into())),
+        };
+
+        let results = q
+            .commit_effects(
+                SettlementEffects::default()
+                    .enqueues(vec![request()])
+                    .kv_put(b"runs/new".to_vec(), b"reconciled".to_vec())
+                    .kv_deletes(vec![b"runs/old".to_vec()]),
+            )
+            .await
+            .unwrap();
+        let id = match results.as_slice() {
+            [EnqueueResult::New(id)] => id.clone(),
+            other => panic!("expected one new enqueue, got {other:?}"),
+        };
+        assert_eq!(
+            q.get_job(&id).await.unwrap().unwrap().status,
+            JobStatus::Pending
+        );
+        assert_eq!(
+            q.kv_get(b"runs/new").await.unwrap().as_deref(),
+            Some(b"reconciled".as_slice()),
+        );
+        assert!(q.kv_get(b"runs/old").await.unwrap().is_none());
+
+        // A dedup hit downgrades that enqueue and leaves the writes applied.
+        let results = q
+            .commit_effects(
+                SettlementEffects::default()
+                    .enqueues(vec![request()])
+                    .kv_put(b"runs/new".to_vec(), b"again".to_vec()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(results.as_slice(), [EnqueueResult::AlreadyEnqueued(existing)] if *existing == id)
+        );
+        assert_eq!(
+            q.kv_get(b"runs/new").await.unwrap().as_deref(),
+            Some(b"again".as_slice()),
+        );
+        assert_eq!(q.stats("work").await.unwrap().pending, 1);
 
         q.close().await.unwrap();
     }

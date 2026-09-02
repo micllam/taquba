@@ -206,7 +206,10 @@
 //! the read-modify-write primitive that makes concurrent updates of
 //! one entry lose no writes. [`Queue::kv_scan`] lists entries under a
 //! key prefix in pages, for enumerating live state and for exporting
-//! the namespace.
+//! the namespace. [`Queue::commit_effects`] applies a
+//! [`SettlementEffects`] (enqueues, KV writes and deletes) as one
+//! transaction with no job transition, for state that must move in one
+//! step when no transition of its own carries it.
 //!
 //! [`Queue::ack_with`] extends the same atomicity to settlement: it
 //! acknowledges a claimed job and, in the same transaction, enqueues
