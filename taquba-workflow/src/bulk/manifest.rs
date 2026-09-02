@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use taquba::object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, path::Path};
 
-use crate::bulk::error::Result;
+use crate::Result;
 
 /// The items of one batch, in submission order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

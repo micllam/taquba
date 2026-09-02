@@ -162,7 +162,8 @@
 //! Before submitting any item, a run writes the batch's manifest (its keys
 //! and serialized inputs) to `<memo_prefix>/batches/<batch_id>/manifest`;
 //! a run of an existing batch with a different item set is rejected with
-//! [`Error::BatchMismatch`]. [`Batch::resume`] drives a batch from its
+//! [`Error::BatchMismatch`](crate::Error::BatchMismatch). [`Batch::resume`]
+//! drives a batch from its
 //! manifest alone: completed items are answered from their outcome
 //! records, items still queued continue, and the rest run.
 //!
@@ -190,7 +191,9 @@
 //! Per-item failures are recorded, not fatal: each failed item is written to
 //! the output sink with its error and its key is collected on
 //! [`BulkReport::failed_keys`]. Set [`BulkBuilder::fail_threshold`] to
-//! turn the batch run into an [`Error::FailureThresholdExceeded`] when the
+//! turn the batch run into an
+//! [`Error::FailureThresholdExceeded`](crate::Error::FailureThresholdExceeded)
+//! when the
 //! share of failures crosses a percentage, so a silent mass failure
 //! surfaces.
 //!
@@ -204,7 +207,6 @@
 
 mod batch;
 mod cost;
-mod error;
 mod io;
 mod manifest;
 mod pipeline;
@@ -213,7 +215,6 @@ mod runner;
 
 pub use batch::{Batch, Bulk, BulkBuilder};
 pub use cost::CostReport;
-pub use error::{Error, Result};
 pub use io::{JsonlSink, NullSink, OutputRecord, OutputSink, read_jsonl};
 pub use pipeline::{BulkCtx, Pipeline};
 pub use progress::{BatchStatus, BulkReport, ProgressSnapshot};

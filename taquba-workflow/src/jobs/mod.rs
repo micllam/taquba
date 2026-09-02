@@ -106,14 +106,15 @@
 //!   a second submission with the same key returns a [`JobHandle`] to the
 //!   in-flight job, with [`JobHandle::newly_submitted`] `== false`. If the
 //!   payload differs from the original, the submission fails with
-//!   [`Error::InputMismatch`]. The check survives process restarts: the
+//!   [`Error::InputMismatch`](crate::Error::InputMismatch). The check
+//!   survives process restarts: the
 //!   SHA-256 of the serialized payload is stored in the workflow's run
 //!   record, atomically with the enqueue.
 //! - **After the original completes**: the outcome record holds the same
 //!   hash, so a re-submission with a matching payload returns a handle to
 //!   the recorded outcome (success or terminal failure) without running
 //!   the job again, and a differing payload fails with
-//!   [`Error::InputMismatch`].
+//!   [`Error::InputMismatch`](crate::Error::InputMismatch).
 //!
 //! If [`JobRunnerBuilder::retention`] is configured and the outcome record
 //! has been removed, the re-submission runs the job again under the same
@@ -137,7 +138,7 @@
 //! # use std::time::Duration;
 //! # use taquba::{Queue, object_store::memory::InMemory};
 //! # use taquba_workflow::jobs::JobRunner;
-//! # async fn run() -> taquba_workflow::jobs::Result<()> {
+//! # async fn run() -> taquba_workflow::Result<()> {
 //! # let store = Arc::new(InMemory::new());
 //! # let queue = Arc::new(Queue::open(store.clone(), "demo").await?);
 //! let runner = JobRunner::builder(queue, store)
@@ -170,7 +171,7 @@
 //! # use std::time::Duration;
 //! # use taquba::{OpenOptions, Queue, QueueConfig, object_store::memory::InMemory};
 //! # use taquba_workflow::jobs::JobRunner;
-//! # async fn run() -> taquba_workflow::jobs::Result<()> {
+//! # async fn run() -> taquba_workflow::Result<()> {
 //! let store = Arc::new(InMemory::new());
 //! let opts = OpenOptions::default().queue_config(
 //!     "background-jobs",
@@ -217,14 +218,12 @@
 //! and per-submission [`SubmitOptions`] cover the per-job settings.
 
 mod context;
-mod error;
 mod handle;
 mod job;
 mod runner;
 
 pub use crate::RunnerHandle;
 pub use context::JobContext;
-pub use error::{Error, Result};
 pub use handle::{JobError, JobHandle, JoinError};
 pub use job::{Job, payload_idempotency_key};
 pub use runner::{JobRunner, JobRunnerBuilder, SubmitOptions};

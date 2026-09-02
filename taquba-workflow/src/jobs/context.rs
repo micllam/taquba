@@ -6,7 +6,7 @@ use crate::{EffectsHandle, Memo, Step};
 use taquba::LeaseHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::jobs::error::Result;
+use crate::Result;
 use crate::jobs::handle::JobHandle;
 use crate::jobs::job::Job;
 use crate::jobs::runner::{Inner, SubmitOptions};

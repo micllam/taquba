@@ -3,9 +3,9 @@ use std::future::Future;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::Result;
 use crate::StepErrorKind;
 use crate::jobs::context::JobContext;
-use crate::jobs::error::Result;
 use crate::keys::hex_sha256;
 
 /// A unit of durable background work.

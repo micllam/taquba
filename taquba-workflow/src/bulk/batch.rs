@@ -17,7 +17,6 @@ use tokio::sync::Semaphore;
 use tracing::warn;
 
 use crate::bulk::cost::CostReport;
-use crate::bulk::error::{Error, Result};
 use crate::bulk::io::{NullSink, OutputRecord, OutputSink};
 use crate::bulk::manifest::{Manifest, ManifestItem, ManifestStore};
 use crate::bulk::pipeline::Pipeline;
@@ -30,6 +29,7 @@ use crate::outcome::{
     OutcomeRecord, StoredOutcome, Terminal, Unrecorded, read_outcome, wait_terminal,
 };
 use crate::sweep::Sweep;
+use crate::{Error, Result};
 
 /// Default queue name for bulk item steps.
 const DEFAULT_QUEUE_NAME: &str = "bulk-items";
@@ -673,8 +673,7 @@ impl<P: Pipeline> Batch<'_, P> {
                 .store
                 .queue
                 .kv_scan(&prefix, cursor.as_deref(), 1000)
-                .await
-                .map_err(crate::Error::from)?;
+                .await?;
             for (kv_key, value) in &page.entries {
                 let key = String::from_utf8_lossy(&kv_key[prefix.len()..]).into_owned();
                 let marker: ItemMarker = match rmp_serde::from_slice(value) {
@@ -724,7 +723,7 @@ impl<P: Pipeline> Batch<'_, P> {
                 None => format!("item-{i}"),
             };
             if !seen.insert(key.clone()) {
-                return Err(Error::DuplicateKey(key));
+                return Err(Error::DuplicateItemKey(key));
             }
             items.push(ManifestItem {
                 key,
@@ -1282,7 +1281,7 @@ mod tests {
             .run(vec![Item { n: 1 }, Item { n: 2 }])
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::DuplicateKey(key) if key == "same"));
+        assert!(matches!(err, Error::DuplicateItemKey(key) if key == "same"));
         worker.shutdown().await.unwrap();
     }
 

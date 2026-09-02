@@ -7,12 +7,12 @@ use std::time::Duration;
 use crate::{RunStatus, StepErrorKind};
 use thiserror::Error;
 
-use crate::jobs::error::{Error, Result};
 use crate::jobs::job::Job;
 use crate::jobs::runner::Inner;
 use crate::outcome::{
     StoredErrorKind, StoredOutcome, Terminal, Unrecorded, read_outcome, wait_terminal,
 };
+use crate::{Error, Result};
 
 // `join` waits in chunks of this length; `wait_for_completion` needs a finite
 // timeout, so an unbounded join loops over bounded waits.

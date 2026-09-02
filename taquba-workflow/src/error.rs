@@ -38,11 +38,12 @@ pub enum Error {
         reason: &'static str,
     },
 
-    /// A re-submission of an active `run_id` carried `spec.input` bytes
-    /// that differ from the original submission's. Reusing a `run_id`
+    /// A re-submission of `run_id` carried `spec.input` bytes that differ
+    /// from the original submission's: the run is active, or it is a
+    /// typed job whose outcome record is retained. Reusing a `run_id`
     /// with new input is treated as a programmer error: pick a fresh
-    /// `run_id` for a new run, or wait for the active one to terminate.
-    #[error("run `{0}` is active with a different input; pick a fresh run_id")]
+    /// `run_id` for a new run.
+    #[error("run `{0}` exists with a different input; pick a fresh run_id")]
     InputMismatch(String),
 
     /// A caller KV key passed via [`crate::RunSpec::kv_writes`] or staged
@@ -77,6 +78,60 @@ pub enum Error {
     /// Serializing a value for workflow storage failed.
     #[error("serialization error: {0}")]
     Serialization(#[from] rmp_serde::encode::Error),
+
+    /// Deserializing a stored value, a typed input or a typed output
+    /// failed.
+    #[error("deserialization error: {0}")]
+    Deserialization(#[from] rmp_serde::decode::Error),
+
+    /// Reading a bulk input source or writing an output sink failed.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// Parsing or serializing JSON for a bulk input or output line failed.
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    /// A [`jobs::JobHandle`](crate::jobs::JobHandle) was awaited for a
+    /// job the runtime has no record of.
+    #[error("job `{0}` not found")]
+    JobNotFound(String),
+
+    /// Two items of one bulk batch produced the same key.
+    #[error("duplicate item key `{0}` in batch")]
+    DuplicateItemKey(String),
+
+    /// A run of an existing bulk batch supplied a different item set than
+    /// the batch's manifest.
+    #[error("batch `{0}` exists with a different item set")]
+    BatchMismatch(String),
+
+    /// A bulk batch operation named a batch with no manifest.
+    #[error("batch `{0}` not found")]
+    BatchNotFound(String),
+
+    /// A run of a bulk batch was started while a run of the same batch
+    /// was active in this process.
+    #[error("batch `{0}` is already running in this process")]
+    BatchRunning(String),
+
+    /// A bulk batch id was not 1 to [`crate::MAX_RUN_ID_LEN`] bytes of
+    /// `[A-Za-z0-9_-]`.
+    #[error("invalid batch id `{0}`: must be 1 to 128 bytes of `[A-Za-z0-9_-]`")]
+    InvalidBatchId(String),
+
+    /// A bulk batch run completed but the share of failed items exceeded
+    /// the configured
+    /// [`fail_threshold`](crate::bulk::BulkBuilder::fail_threshold).
+    #[error("bulk run failed: {failed}/{total} items failed, over the {threshold:.1}% threshold")]
+    FailureThresholdExceeded {
+        /// Number of items that terminated failed.
+        failed: usize,
+        /// Total number of items submitted.
+        total: usize,
+        /// The configured threshold, as a percentage.
+        threshold: f64,
+    },
 }
 
 impl Error {
@@ -95,9 +150,17 @@ impl Error {
             | Self::ReservedKvKey(_)
             | Self::ConflictingKvEffect(_)
             | Self::EffectsSealed
-            | Self::Serialization(_) => true,
+            | Self::Serialization(_)
+            | Self::Deserialization(_)
+            | Self::Json(_)
+            | Self::JobNotFound(_)
+            | Self::DuplicateItemKey(_)
+            | Self::BatchMismatch(_)
+            | Self::BatchNotFound(_)
+            | Self::InvalidBatchId(_)
+            | Self::FailureThresholdExceeded { .. } => true,
             Self::Queue(e) => e.is_permanent(),
-            Self::Store(_) => false,
+            Self::Store(_) | Self::Io(_) | Self::BatchRunning(_) => false,
         }
     }
 }
@@ -131,6 +194,20 @@ mod tests {
         assert!(Error::ReservedKvKey("workflow/x".into()).is_permanent());
         assert!(Error::ConflictingKvEffect("k".into()).is_permanent());
         assert!(Error::EffectsSealed.is_permanent());
+        assert!(Error::JobNotFound("job-1".into()).is_permanent());
+        assert!(Error::DuplicateItemKey("k".into()).is_permanent());
+        assert!(Error::BatchMismatch("b".into()).is_permanent());
+        assert!(Error::BatchNotFound("b".into()).is_permanent());
+        assert!(Error::InvalidBatchId("a/b".into()).is_permanent());
+        assert!(
+            Error::FailureThresholdExceeded {
+                failed: 1,
+                total: 2,
+                threshold: 10.0,
+            }
+            .is_permanent()
+        );
+        assert!(!Error::BatchRunning("b".into()).is_permanent());
     }
 
     #[test]
@@ -141,12 +218,13 @@ mod tests {
     }
 
     #[test]
-    fn store_is_transient() {
+    fn store_and_io_are_transient() {
         let store_err = taquba::object_store::Error::NotFound {
             path: "x".into(),
             source: "missing".into(),
         };
         assert!(!Error::Store(store_err).is_permanent());
+        assert!(!Error::Io(std::io::Error::other("disk")).is_permanent());
     }
 
     #[test]

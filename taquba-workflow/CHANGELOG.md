@@ -53,8 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `taquba_workflow::Error`; an item's batch id and key are carried in
   its run's input rather than in `bulk.*` headers, so
   `BulkBuilder::headers` reserves only the runtime's `workflow.` prefix;
-  `Error::InvalidBatchId`, `DuplicateKey`, `BatchMismatch`,
-  `BatchNotFound`, `Decode`, `Store` and `BatchRunning` are new.
+  the module has no error type of its own: its operations return
+  `taquba_workflow::Error`, whose new variants are listed below, and
+  bulk's `Error::Workflow`, `Encode`, `Decode` and `Store` are removed.
   `serde_json` is a dependency.
 - The `jobs` module: typed single-function jobs, moved from the
   `taquba-jobs` crate and re-founded on the runtime. A job is one run
@@ -74,7 +75,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `jobs::ErrorKind` is replaced by the crate's `StepErrorKind` in
   `Job::classify` and `JobError::kind`, and `Error::ReservedHeader` and
   the `jobs.type` header are removed (`SubmitOptions::headers` reserves
-  only the runtime's `workflow.` prefix).
+  only the runtime's `workflow.` prefix); the module has no error type
+  of its own: its operations and `JoinError::Infra` carry
+  `taquba_workflow::Error`, `InputMismatch` names the job id, and jobs'
+  `Error::Queue`, `Workflow`, `Encode` and `Decode` are removed.
+- `Error` gains the variants of the `jobs` and `bulk` modules:
+  `Deserialization`, `Io`, `Json`, `JobNotFound`, `DuplicateItemKey`,
+  `BatchMismatch`, `BatchNotFound`, `BatchRunning`, `InvalidBatchId` and
+  `FailureThresholdExceeded`, with `is_permanent` covering them;
+  `InputMismatch` also reports a typed job re-submitted with a different
+  payload after its outcome record was written.
 - `WorkflowRuntime::spawn`: spawns the worker loop as a task and returns
   a `RunnerHandle` for shutting it down or waiting on it; the `jobs`
   and `bulk` workers are spawned through it and `jobs::RunnerHandle`

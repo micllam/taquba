@@ -15,8 +15,8 @@ use crate::{
 use taquba::object_store::ObjectStore;
 use taquba::{Clock, Queue};
 
+use crate::Result;
 use crate::jobs::context::{JobContext, State};
-use crate::jobs::error::{Error, Result};
 use crate::jobs::handle::JobHandle;
 use crate::jobs::job::Job;
 use crate::keys::hex_sha256;
@@ -113,7 +113,7 @@ impl Inner {
             && let Some(record) = read_outcome(&self.run_memo(run_id)).await?
         {
             if record.input_hash != hash_input(&payload) {
-                return Err(Error::InputMismatch(key.unwrap_or_default()));
+                return Err(crate::Error::InputMismatch(run_id.clone()));
             }
             tracing::debug!(job_id = %run_id, job_type = J::NAME, "submit matched a completed job");
             return Ok(JobHandle::new(run_id.clone(), None, self.clone(), false));
@@ -130,11 +130,7 @@ impl Inner {
                 run_at: opts.run_at,
                 kv_writes: HashMap::new(),
             })
-            .await
-            .map_err(|err| match err {
-                crate::Error::InputMismatch(_) => Error::InputMismatch(key.unwrap_or_default()),
-                other => Error::Workflow(other),
-            })?;
+            .await?;
         tracing::debug!(
             job_id = %outcome.run_id,
             job_type = J::NAME,
@@ -462,6 +458,8 @@ impl JobRunnerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::Error;
 
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -932,7 +930,7 @@ mod tests {
             })
             .await;
         match result {
-            Err(Error::InputMismatch(key)) => assert_eq!(key, "fixed"),
+            Err(Error::InputMismatch(id)) => assert_eq!(id, run_id_for_key("fixed")),
             Err(other) => panic!("expected InputMismatch, got Err({other:?})"),
             Ok(_) => panic!("expected InputMismatch, got Ok(_)"),
         }
