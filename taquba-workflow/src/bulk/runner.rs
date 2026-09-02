@@ -1,16 +1,20 @@
 //! Adapter that drives a [`Pipeline`] as a single [`crate`] step.
 
-use crate::{Step, StepError, StepOutcome, StepRunner};
+use crate::{Step, StepError, StepOutcome, StepRunner, TerminalStatus};
 use serde::{Deserialize, Serialize};
 
+use crate::bulk::batch::{HEADER_BATCH, HEADER_KEY};
 use crate::bulk::cost::CostReport;
 use crate::bulk::pipeline::{BulkCtx, Pipeline};
+use crate::bulk::progress::ItemMarker;
+use crate::keys::bulk_item_kv_key;
 use crate::outcome::run_recorded;
 
 /// The per-item result the runner writes as the workflow step's `Succeed`
-/// payload. Carries both the user [`Output`](Pipeline::Output) and the cost
-/// accumulated while producing it, so the bulk terminal hook can stream the
-/// output and roll the cost into the batch total in one decode.
+/// payload and into the item's outcome record. Carries both the user
+/// [`Output`](Pipeline::Output) and the cost accumulated while producing
+/// it, so the batch run can stream the output and roll the cost into the
+/// batch total in one decode.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ItemEnvelope<O> {
     pub output: O,
@@ -23,6 +27,11 @@ pub(crate) struct ItemEnvelope<O> {
 /// [`ItemEnvelope`]. The pipeline's own multi-step logic lives inside
 /// [`Pipeline::run`] as memoized calls; the runner never emits
 /// [`StepOutcome::Continue`].
+///
+/// The item's marker is staged on the step's effects: with the outcome
+/// for a success, and in the failure set for an error, so it commits with
+/// the acknowledgement or with the dead-lettering settlement and never
+/// with a retried attempt.
 pub(crate) struct PipelineRunner<P> {
     pipeline: P,
 }
@@ -35,7 +44,7 @@ impl<P> PipelineRunner<P> {
 
 impl<P: Pipeline> StepRunner for PipelineRunner<P> {
     async fn run_step(&self, step: &Step) -> Result<StepOutcome, StepError> {
-        run_recorded(step, async {
+        let outcome = run_recorded(step, async {
             // A bad payload does not decode on retry either: fail permanently.
             let input: P::Input = rmp_serde::from_slice(&step.payload)
                 .map_err(|e| StepError::permanent(format!("failed to decode bulk input: {e}")))?;
@@ -48,7 +57,32 @@ impl<P: Pipeline> StepRunner for PipelineRunner<P> {
             rmp_serde::to_vec_named(&envelope)
                 .map_err(|e| StepError::permanent(format!("failed to encode bulk output: {e}")))
         })
-        .await
+        .await;
+        let (batch_id, key) = match (step.headers.get(HEADER_BATCH), step.headers.get(HEADER_KEY)) {
+            (Some(batch_id), Some(key)) => (batch_id, key),
+            _ => return outcome,
+        };
+        let marker_key = bulk_item_kv_key(batch_id, key);
+        match &outcome {
+            Ok(StepOutcome::Succeed { result }) => {
+                let cost = rmp_serde::from_slice::<ItemEnvelope<P::Output>>(result)
+                    .map(|envelope| envelope.cost)
+                    .unwrap_or_default();
+                let marker = ItemMarker::new(TerminalStatus::Succeeded, None, cost);
+                step.effects.put_reserved(marker_key, marker.encode()?)?;
+            }
+            Err(err) => {
+                let marker = ItemMarker::new(
+                    TerminalStatus::Failed,
+                    Some(err.message.clone()),
+                    CostReport::new(),
+                );
+                step.effects
+                    .put_reserved_on_failure(marker_key, marker.encode()?)?;
+            }
+            Ok(_) => {}
+        }
+        outcome
     }
 }
 

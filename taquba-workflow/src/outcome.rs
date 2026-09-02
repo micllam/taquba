@@ -3,8 +3,10 @@
 //! [`jobs`](crate::jobs) and [`bulk`](crate::bulk) modules.
 
 use std::future::Future;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use taquba::{Queue, WaitOutcome};
 
 use crate::memo::Memo;
 use crate::{Result, Step, StepError, StepErrorKind, StepOutcome};
@@ -124,4 +126,63 @@ pub(crate) async fn read_outcome(run_memo: &Memo) -> Result<Option<OutcomeRecord
 pub(crate) async fn write_outcome(run_memo: &Memo, record: &OutcomeRecord) -> Result<()> {
     let bytes = rmp_serde::to_vec_named(record)?;
     run_memo.put(OUTCOME_KEY, &bytes).await
+}
+
+/// How a typed single-step run ended, as observed by an in-process
+/// waiter: with its outcome record, or without one.
+pub(crate) enum Terminal {
+    Recorded(OutcomeRecord),
+    /// The run ended without the step recording an outcome: it was
+    /// cancelled, dead-lettered by the reaper or its records are gone.
+    Unrecorded(Unrecorded),
+}
+
+pub(crate) enum Unrecorded {
+    /// The queue job was acknowledged; only an external cancellation
+    /// acknowledges a typed step without a record.
+    Done,
+    /// The queue job was dead-lettered outside the step, with the queue
+    /// record's last error.
+    Dead(Option<String>),
+    /// The queue job was removed by a cancellation before it was claimed.
+    Cancelled,
+    /// Neither a queue record nor an outcome record exists.
+    NotFound,
+}
+
+/// Wait up to `timeout` for the typed single-step run whose step job is
+/// `job_id` to reach a terminal state, then read its outcome record.
+/// Returns `Ok(None)` when the timeout elapses first. Without a job id
+/// (a duplicate submission known only from the durable run record) the
+/// outcome record is polled every `poll_interval`.
+pub(crate) async fn wait_terminal(
+    queue: &Queue,
+    run_memo: &Memo,
+    job_id: Option<&str>,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<Option<Terminal>> {
+    let Some(job_id) = job_id else {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(record) = read_outcome(run_memo).await? {
+                return Ok(Some(Terminal::Recorded(record)));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+    };
+    let unrecorded = match queue.wait_for_completion(job_id, timeout).await? {
+        WaitOutcome::TimedOut => return Ok(None),
+        WaitOutcome::Done(_) => Unrecorded::Done,
+        WaitOutcome::Dead(record) => Unrecorded::Dead(record.last_error),
+        WaitOutcome::Cancelled => Unrecorded::Cancelled,
+        WaitOutcome::NotFound => Unrecorded::NotFound,
+    };
+    Ok(Some(match read_outcome(run_memo).await? {
+        Some(record) => Terminal::Recorded(record),
+        None => Terminal::Unrecorded(unrecorded),
+    }))
 }

@@ -63,8 +63,8 @@ pub(crate) const TERMINAL_KV_PREFIX: &[u8] = b"workflow/terminals/";
 
 /// Prefix for the durable per-item markers of bulk batches:
 /// `workflow/bulk/batches/{batch_id}/items/{key}`, one per terminated
-/// item, written with the acknowledgement of the item's terminal
-/// notification.
+/// item, written in the settlement that commits the item's terminal
+/// outcome.
 pub(crate) const BULK_KV_PREFIX: &[u8] = b"workflow/bulk/batches/";
 
 /// Prefix under which the markers of one batch's items are stored.

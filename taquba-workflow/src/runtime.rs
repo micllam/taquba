@@ -1149,11 +1149,12 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         // Sealed as soon as the runner has returned: an effect staged
         // through a retained handle clone after this point could not
         // join the settlement, so staging it errors.
-        let staged_effects = effects_handle.seal_and_take();
+        let sealed = effects_handle.seal_and_take();
+        let failure_writes = sealed.on_failure;
         let caller_effects = if replayed_step_output {
             replayed_effects
         } else {
-            staged_effects
+            sealed.outcome
         };
 
         // Both sources are required: the claim's token reports a
@@ -1251,15 +1252,19 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     Some(job.max_attempts),
                 ))
             }
+            // The two terminating failures carry the runner's failure
+            // writes beside the termination effects; the core applies
+            // them only with the dead-lettering settlement.
             Err(StepError {
                 message,
                 kind: StepErrorKind::Permanent,
             }) => {
-                let effects = self.worker_terminate(
+                let mut effects = self.worker_terminate(
                     RunOutcome::failed(run_id.clone(), message.clone(), user_headers, step_number),
                     Some(job.priority),
                     None,
                 );
+                effects.kv_writes.extend(failure_writes);
                 Err(FailWith::new(PermanentFailure::new(message), effects).into())
             }
             Err(StepError {
@@ -1271,7 +1276,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 // hand; `nack_with` decides whether they apply. The
                 // attempts test applies only to the registry removal.
                 if job.attempts >= job.max_attempts {
-                    let effects = self.worker_terminate(
+                    let mut effects = self.worker_terminate(
                         RunOutcome::failed(
                             run_id.clone(),
                             message.clone(),
@@ -1281,6 +1286,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                         Some(job.priority),
                         None,
                     );
+                    effects.kv_writes.extend(failure_writes);
                     return Err(FailWith::new(WorkerError::from(message), effects).into());
                 }
                 Err(message.into())
@@ -4788,6 +4794,72 @@ mod tests {
         }
         assert_eq!(queue.stats("workflow-steps").await.unwrap().dead, 1);
         assert!(queue.kv_get(b"app/step-0").await.unwrap().is_none());
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failure_writes_apply_only_with_the_terminating_failure() {
+        struct FailureStagingRunner;
+
+        impl StepRunner for FailureStagingRunner {
+            async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                step.effects
+                    .put(b"app/outcome".to_vec(), b"staged".to_vec())
+                    .map_err(|e| StepError::permanent(e.to_string()))?;
+                step.effects
+                    .put_reserved_on_failure(
+                        b"workflow/test/failed".to_vec(),
+                        step.attempts.to_string().into_bytes(),
+                    )
+                    .map_err(|e| StepError::permanent(e.to_string()))?;
+                Err(StepError::transient("still failing"))
+            }
+        }
+
+        let (queue, store) = fresh_queue_fast_retry().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            FailureStagingRunner,
+            ChannelHook { tx },
+        )
+        .build();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                max_attempts_per_step: Some(2),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.status, TerminalStatus::Failed);
+        for _ in 0..200 {
+            if queue.stats("workflow-steps").await.unwrap().dead == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(queue.stats("workflow-steps").await.unwrap().dead, 1);
+
+        // The retried first attempt applied nothing; the exhausted second
+        // attempt applied its failure write and not its outcome write.
+        assert_eq!(
+            queue
+                .kv_get(b"workflow/test/failed")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"2".as_slice()),
+        );
+        assert!(queue.kv_get(b"app/outcome").await.unwrap().is_none());
 
         let _ = shutdown.send(());
     }

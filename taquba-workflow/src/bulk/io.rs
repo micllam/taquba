@@ -48,14 +48,13 @@ pub struct OutputRecord<'a> {
 
 /// The write side of a bulk run. Implementations receive one
 /// [`OutputRecord`] per item as it reaches a terminal state, possibly from
-/// many worker tasks concurrently, so `write` takes `&self` and must handle
-/// its own synchronization.
+/// many tasks concurrently, so `write` takes `&self` and must handle its
+/// own synchronization.
 ///
-/// Item completion is delivered at least once. Duplicate deliveries are
-/// detected and skipped within one batch process, so a repeated record
-/// for one key is rare (a delivery racing its own redelivery, or a batch
-/// resumed after a crash) but possible; consumers that must not
-/// double-apply a record deduplicate on `key`.
+/// A batch run writes each of its items once. A later run of the same
+/// batch writes its items again, the succeeded ones from their outcome
+/// records, so consumers that must not double-apply a record across runs
+/// deduplicate on `key`.
 pub trait OutputSink: Send + Sync {
     /// Persist one completed item's record.
     fn write(&self, record: &OutputRecord<'_>) -> Result<()>;

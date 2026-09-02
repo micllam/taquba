@@ -34,11 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a different item set for an existing batch and rejects duplicate keys,
   and `Batch::resume` drives a batch from its manifest alone; every
   submitted item counts toward the expected total, including a run
-  still queued from an earlier run of the batch; each terminal
-  notification writes the item's marker (status, error, cost) to
-  `workflow/bulk/batches/<batch_id>/items/<key>` with its
-  acknowledgement, and `Batch::status` reads the manifest and the
-  markers into a `BatchStatus`; `Batch::forget` removes a batch's
+  still queued from an earlier run of the batch; the settlement that
+  commits an item's terminal outcome writes the item's marker (status,
+  error, cost) to `workflow/bulk/batches/<batch_id>/items/<key>`, and
+  `Batch::status` reads the manifest and the markers into a
+  `BatchStatus`; an item runs as one queue job, with no terminal
+  notification job, and a batch run observes each item's termination
+  through the queue's completion notification and reads its outcome
+  record, so an `OutputSink` receives each item once per run; `Batch::forget` removes a batch's
   manifest, markers, memo entries and outcome records, and
   `BulkBuilder::batch_retention` removes them a window after the
   batch's completion through a terminal marker under

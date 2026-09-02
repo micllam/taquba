@@ -1,6 +1,5 @@
 //! Batch-level progress and the final run report.
 
-use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -9,8 +8,8 @@ use crate::TerminalStatus;
 use crate::bulk::cost::CostReport;
 
 /// The durable marker of one terminated item, stored under
-/// `workflow/bulk/batches/{batch_id}/items/{key}` with the acknowledgement
-/// of the item's terminal notification.
+/// `workflow/bulk/batches/{batch_id}/items/{key}` in the settlement that
+/// commits the item's terminal outcome.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ItemMarker {
     pub(crate) status: String,
@@ -19,6 +18,18 @@ pub(crate) struct ItemMarker {
 }
 
 impl ItemMarker {
+    pub(crate) fn new(status: TerminalStatus, error: Option<String>, cost: CostReport) -> Self {
+        Self {
+            status: status.as_str().to_string(),
+            error,
+            cost,
+        }
+    }
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, crate::Error> {
+        Ok(rmp_serde::to_vec_named(self)?)
+    }
+
     pub(crate) fn status(&self) -> Option<TerminalStatus> {
         match self.status.as_str() {
             "succeeded" => Some(TerminalStatus::Succeeded),
@@ -54,8 +65,7 @@ pub struct BatchStatus {
 /// status line or a polling UI.
 #[derive(Debug, Clone)]
 pub struct ProgressSnapshot {
-    /// Number of items expected to complete (set once submission finishes;
-    /// `0` while items are still being submitted).
+    /// Number of items in the batch.
     pub total: usize,
     /// Items that have reached any terminal state.
     pub completed: usize,
@@ -99,8 +109,8 @@ pub struct BulkReport {
     pub failed_keys: Vec<String>,
 }
 
-/// Internal, mutex-guarded counters updated by the terminal hook and read by
-/// [`ProgressSnapshot`] / [`BulkReport`].
+/// Internal, mutex-guarded counters of a batch being run, updated as its
+/// items terminate and read by [`ProgressSnapshot`] / [`BulkReport`].
 #[derive(Debug)]
 pub(crate) struct ProgressState {
     pub total: usize,
@@ -109,34 +119,24 @@ pub(crate) struct ProgressState {
     pub cancelled: usize,
     pub cost: CostReport,
     pub failed_keys: Vec<String>,
-    /// Run ids already recorded, so a redelivered terminal notification
-    /// (delivery is at-least-once) is not counted twice.
-    pub counted: HashSet<String>,
     started_at: Instant,
 }
 
 impl ProgressState {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(total: usize) -> Self {
         Self {
-            total: 0,
+            total,
             succeeded: 0,
             failed: 0,
             cancelled: 0,
             cost: CostReport::new(),
             failed_keys: Vec::new(),
-            counted: HashSet::new(),
             started_at: Instant::now(),
         }
     }
 
     pub(crate) fn completed(&self) -> usize {
         self.succeeded + self.failed + self.cancelled
-    }
-
-    /// True once submission has set a total and every expected item has
-    /// reached a terminal state.
-    pub(crate) fn is_done(&self) -> bool {
-        self.total > 0 && self.completed() >= self.total
     }
 
     pub(crate) fn snapshot(&self) -> ProgressSnapshot {
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn completed_sums_terminal_buckets() {
-        let mut st = ProgressState::new();
+        let mut st = ProgressState::new(6);
         st.succeeded = 3;
         st.failed = 2;
         st.cancelled = 1;
@@ -195,18 +195,8 @@ mod tests {
     }
 
     #[test]
-    fn is_done_requires_a_total() {
-        let mut st = ProgressState::new();
-        st.succeeded = 5;
-        assert!(!st.is_done(), "no total set yet");
-        st.total = 5;
-        assert!(st.is_done());
-    }
-
-    #[test]
     fn snapshot_reports_no_time_remaining_before_progress() {
-        let mut st = ProgressState::new();
-        st.total = 10;
+        let st = ProgressState::new(10);
         let snap = st.snapshot();
         assert_eq!(snap.total, 10);
         assert_eq!(snap.completed, 0);

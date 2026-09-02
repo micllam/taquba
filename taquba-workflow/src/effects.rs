@@ -42,6 +42,9 @@ pub struct EffectsHandle {
 #[derive(Debug, Default)]
 struct EffectsState {
     staged: StagedEffects,
+    /// Writes under the reserved namespace applied only when the step's
+    /// failure terminates the run; see [`EffectsHandle::put_reserved_on_failure`].
+    on_failure: HashMap<Vec<u8>, Vec<u8>>,
     sealed: bool,
 }
 
@@ -64,6 +67,19 @@ impl EffectsState {
     /// Stage a write under a key of the reserved namespace, for the
     /// crate's own records; validated like [`put`](Self::put) otherwise.
     fn put_reserved(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        self.check_reserved(&value)?;
+        self.staged.writes.insert(key, value);
+        Ok(())
+    }
+
+    /// Stage a reserved-namespace write into the failure set.
+    fn put_reserved_on_failure(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        self.check_reserved(&value)?;
+        self.on_failure.insert(key, value);
+        Ok(())
+    }
+
+    fn check_reserved(&self, value: &[u8]) -> Result<()> {
         if self.sealed {
             return Err(Error::EffectsSealed);
         }
@@ -73,8 +89,16 @@ impl EffectsState {
                 max: taquba::MAX_KV_VALUE_SIZE,
             }));
         }
-        self.staged.writes.insert(key, value);
         Ok(())
+    }
+
+    /// Seal the state and move out both staged sets.
+    fn seal_and_take(&mut self) -> SealedEffects {
+        self.sealed = true;
+        SealedEffects {
+            outcome: std::mem::take(&mut self.staged),
+            on_failure: std::mem::take(&mut self.on_failure),
+        }
     }
 
     fn delete(&mut self, key: Vec<u8>) -> Result<()> {
@@ -104,6 +128,15 @@ impl EffectsState {
 pub(crate) struct StagedEffects {
     pub(crate) writes: HashMap<Vec<u8>, Vec<u8>>,
     pub(crate) deletes: HashSet<Vec<u8>>,
+}
+
+/// Everything an [`EffectsHandle`] holds when its delivery returns: the
+/// effects of the returned outcome and the writes reserved for a
+/// terminating failure.
+#[derive(Debug, Default)]
+pub(crate) struct SealedEffects {
+    pub(crate) outcome: StagedEffects,
+    pub(crate) on_failure: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 impl EffectsHandle {
@@ -147,13 +180,31 @@ impl EffectsHandle {
         self.inner.lock().unwrap().delete(key.into())
     }
 
+    /// Stage a write under a key of the reserved `workflow/` namespace,
+    /// for the crate's own records, applied with the returned outcome
+    /// like [`put`](Self::put).
+    pub(crate) fn put_reserved(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        self.inner.lock().unwrap().put_reserved(key, value)
+    }
+
+    /// Stage a write under a key of the reserved `workflow/` namespace
+    /// that is applied only when the step returns a
+    /// [`StepError`](crate::StepError) that terminates the run: a
+    /// permanent error, or a transient one on the step's last attempt.
+    /// A retried attempt applies nothing, and the writes of an acking
+    /// outcome are the ones staged through [`put`](Self::put).
+    pub(crate) fn put_reserved_on_failure(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .put_reserved_on_failure(key, value)
+    }
+
     /// Seal the handle and move out everything staged. An effect staged
     /// after the seal could not join the settlement, so later staging
     /// attempts return [`Error::EffectsSealed`].
-    pub(crate) fn seal_and_take(&self) -> StagedEffects {
-        let mut state = self.inner.lock().unwrap();
-        state.sealed = true;
-        std::mem::take(&mut state.staged)
+    pub(crate) fn seal_and_take(&self) -> SealedEffects {
+        self.inner.lock().unwrap().seal_and_take()
     }
 }
 
@@ -233,20 +284,11 @@ impl TerminalEffects {
         self.inner.lock().unwrap().kv.delete(key.into())
     }
 
-    /// Stage a write under a key of the reserved `workflow/` namespace,
-    /// for the crate's own records.
-    pub(crate) fn put_reserved(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
-        self.inner.lock().unwrap().kv.put_reserved(key, value)
-    }
-
     /// Seal the handle and move out everything staged.
     pub(crate) fn seal_and_take(&self) -> (StagedEffects, Vec<EnqueueRequest>) {
         let mut state = self.inner.lock().unwrap();
-        state.kv.sealed = true;
-        (
-            std::mem::take(&mut state.kv.staged),
-            std::mem::take(&mut state.enqueues),
-        )
+        let sealed = state.kv.seal_and_take();
+        (sealed.outcome, std::mem::take(&mut state.enqueues))
     }
 }
 
@@ -291,9 +333,13 @@ mod tests {
         let handle = EffectsHandle::for_delivery();
         let clone = handle.clone();
         handle.put("a", "v").unwrap();
-        let staged = handle.seal_and_take();
-        assert_eq!(staged.writes.len(), 1);
+        let sealed = handle.seal_and_take();
+        assert_eq!(sealed.outcome.writes.len(), 1);
         assert!(matches!(clone.put("b", "v"), Err(Error::EffectsSealed)));
+        assert!(matches!(
+            clone.put_reserved_on_failure(b"workflow/x".to_vec(), b"v".to_vec()),
+            Err(Error::EffectsSealed)
+        ));
         assert!(matches!(clone.delete("b"), Err(Error::EffectsSealed)));
     }
 
@@ -343,7 +389,7 @@ mod tests {
         let clone = handle.clone();
         clone.put("a", "v").unwrap();
         clone.delete("b").unwrap();
-        let staged = handle.seal_and_take();
+        let staged = handle.seal_and_take().outcome;
         assert_eq!(staged.writes.get(b"a".as_slice()), Some(&b"v".to_vec()));
         assert!(staged.deletes.contains(b"b".as_slice()));
     }

@@ -166,12 +166,17 @@
 //! manifest alone: completed items are answered from their outcome
 //! records, items still queued continue, and the rest run.
 //!
-//! Each terminal notification writes the item's marker (status, error,
-//! cost) to `workflow/bulk/batches/<batch_id>/items/<key>` in the queue's
-//! KV namespace, committed with the notification's acknowledgement.
-//! [`Batch::status`] reads the manifest and the markers, so a batch's
-//! durable state is available without running it and from another
-//! process through the same prefix.
+//! The settlement that commits an item's terminal outcome also writes
+//! the item's marker (status, error, cost) to
+//! `workflow/bulk/batches/<batch_id>/items/<key>` in the queue's KV
+//! namespace: the acknowledgement of a success, or the dead-lettering
+//! settlement of a failure. An item cancelled from outside writes no
+//! marker and runs again on the next run of the batch. [`Batch::status`]
+//! reads the manifest and the markers, so a batch's durable state is
+//! available without running it and from another process through the
+//! same prefix. A batch run learns of each item's termination through
+//! the queue's in-process completion notification and reads the item's
+//! outcome record to stream its output; an item runs as one queue job.
 //!
 //! A batch's state is retained until [`Batch::forget`] removes it, or,
 //! under [`BulkBuilder::batch_retention`], until the window after the

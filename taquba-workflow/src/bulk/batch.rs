@@ -4,20 +4,16 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::{
-    MemoStore, RunOutcome, RunSpec, RunnerHandle, StepError, TerminalEffects, TerminalHook,
-    TerminalStatus, WorkflowRuntime,
-};
+use crate::{MemoStore, NoopTerminalHook, RunSpec, RunnerHandle, TerminalStatus, WorkflowRuntime};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use taquba::object_store::ObjectStore;
 use taquba::{Clock, Queue};
-use tokio::sync::Notify;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -29,10 +25,11 @@ use crate::bulk::pipeline::Pipeline;
 use crate::bulk::progress::{BatchStatus, BulkReport, ItemMarker, ProgressSnapshot, ProgressState};
 use crate::bulk::runner::{ItemEnvelope, PipelineRunner};
 use crate::keys::{
-    BULK_TERMINAL_KV_PREFIX, bulk_item_kv_key, bulk_items_kv_prefix, bulk_terminal_kv_key,
-    hex_sha256,
+    BULK_TERMINAL_KV_PREFIX, bulk_items_kv_prefix, bulk_terminal_kv_key, hex_sha256,
 };
-use crate::outcome::{StoredOutcome, read_outcome};
+use crate::outcome::{
+    OutcomeRecord, StoredOutcome, Terminal, Unrecorded, read_outcome, wait_terminal,
+};
 use crate::sweep::sweep_expired;
 
 /// Default queue name for bulk item steps.
@@ -41,6 +38,13 @@ const DEFAULT_QUEUE_NAME: &str = "bulk-items";
 const DEFAULT_MEMO_PREFIX: &str = "bulk-memo";
 /// Default ceiling on concurrently-processing items in one process.
 const DEFAULT_MAX_CONCURRENT: usize = 200;
+/// Submissions in flight at once. Each blocks on a durable enqueue
+/// commit, and concurrent commits share WAL flushes, so at flush-bound
+/// latencies serial submission would cap at one item per flush.
+const SUBMIT_CONCURRENCY: usize = 32;
+/// An item's wait runs in chunks of this length; `wait_for_completion`
+/// needs a finite timeout, so an unbounded wait loops over bounded ones.
+const WAIT_CHUNK: Duration = Duration::from_secs(3600);
 
 /// Header holding the batch id of an item's run.
 pub(crate) const HEADER_BATCH: &str = "bulk.batch";
@@ -57,43 +61,14 @@ pub(crate) fn item_run_id(batch_id: &str, key: &str) -> String {
 }
 
 /// The in-process state of a batch being run in this process: its
-/// counters and the wake-up the run waits on. Shared between the run and
-/// the terminal hook.
+/// counters, updated as its items terminate.
 struct BatchState {
     state: Mutex<ProgressState>,
-    notify: Notify,
 }
 
 impl BatchState {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(ProgressState::new()),
-            notify: Notify::new(),
-        }
-    }
-
-    /// Resolve once submission has set a total and every expected item has
-    /// terminated. Re-checks the condition under the lock around each
-    /// notification so a completion that races the wait is not missed.
-    async fn wait_until_done(&self) {
-        loop {
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.state.lock().unwrap().is_done() {
-                return;
-            }
-            notified.await;
-        }
-    }
-
     /// Write an item's record to the sink and fold it into the counters.
-    /// An item already counted under `run_id` is neither written nor
-    /// counted again.
     fn record(&self, sink: &dyn OutputSink, item: TerminalItem<'_>) {
-        if self.state.lock().unwrap().counted.contains(item.run_id) {
-            return;
-        }
         let record = OutputRecord {
             key: item.key,
             status: item.status.as_str(),
@@ -103,33 +78,23 @@ impl BatchState {
         if let Err(err) = sink.write(&record) {
             warn!(key = %item.key, error = %err, "failed to write bulk output record");
         }
-        let done = {
-            let mut state = self.state.lock().unwrap();
-            if !state.counted.insert(item.run_id.to_string()) {
-                return;
+        let mut state = self.state.lock().unwrap();
+        match item.status {
+            TerminalStatus::Succeeded => state.succeeded += 1,
+            TerminalStatus::Failed => {
+                state.failed += 1;
+                state.failed_keys.push(item.key.to_string());
             }
-            match item.status {
-                TerminalStatus::Succeeded => state.succeeded += 1,
-                TerminalStatus::Failed => {
-                    state.failed += 1;
-                    state.failed_keys.push(item.key.to_string());
-                }
-                TerminalStatus::Cancelled => state.cancelled += 1,
-            }
-            if let Some(cost) = item.cost {
-                state.cost.merge(&cost);
-            }
-            state.is_done()
-        };
-        if done {
-            self.notify.notify_one();
+            TerminalStatus::Cancelled => state.cancelled += 1,
+        }
+        if let Some(cost) = item.cost {
+            state.cost.merge(&cost);
         }
     }
 }
 
-/// The batches being run in this process, keyed by batch id. Shared by
-/// the runner and the terminal hook; an entry exists for the duration of
-/// [`Batch::run`] or [`Batch::resume`].
+/// The batches being run in this process, keyed by batch id; an entry
+/// exists for the duration of [`Batch::run`] or [`Batch::resume`].
 type ActiveBatches = Mutex<HashMap<String, Arc<BatchState>>>;
 
 /// The registration of a running batch in [`ActiveBatches`]; removed on
@@ -147,10 +112,9 @@ impl Drop for ActiveBatch {
     }
 }
 
-/// One terminated item, as the hook or the short-circuit path reports it.
+/// One terminated item, as observed in this process.
 struct TerminalItem<'a> {
     key: &'a str,
-    run_id: &'a str,
     status: TerminalStatus,
     output: Option<Value>,
     error: Option<&'a str>,
@@ -174,67 +138,36 @@ where
     }
 }
 
-/// Terminal hook that writes each terminated item's marker and, when the
-/// item's batch is being run in this process, streams its output to the
-/// sink and folds its counts and cost into the batch's progress. Generic
-/// over the pipeline's output type so it can decode the per-item
-/// envelope.
-struct BulkHook<O> {
-    batches: Arc<ActiveBatches>,
-    sink: Arc<dyn OutputSink>,
-    _output: PhantomData<fn() -> O>,
-}
-
-impl<O> TerminalHook for BulkHook<O>
+/// Fold an item's outcome record into the batch: a success carries its
+/// output and cost, a failure its error.
+fn record_outcome<O>(state: &BatchState, sink: &dyn OutputSink, key: &str, record: OutcomeRecord)
 where
-    O: Serialize + DeserializeOwned + Send + 'static,
+    O: Serialize + DeserializeOwned,
 {
-    async fn on_termination(
-        &self,
-        outcome: &RunOutcome,
-        effects: &TerminalEffects,
-    ) -> std::result::Result<(), StepError> {
-        let Some(batch_id) = outcome.headers.get(HEADER_BATCH) else {
-            warn!(run_id = %outcome.run_id, "terminated run carries no batch header");
-            return Ok(());
-        };
-        let key = outcome
-            .headers
-            .get(HEADER_KEY)
-            .map_or(outcome.run_id.as_str(), String::as_str);
-        let (output, cost) = match (outcome.status, &outcome.result) {
-            (TerminalStatus::Succeeded, Some(bytes)) => decode_envelope::<O>(key, bytes),
-            _ => (None, None),
-        };
-        // The marker commits with this notification's acknowledgement.
-        let marker = ItemMarker {
-            status: outcome.status.as_str().to_string(),
-            error: outcome.error.clone(),
-            cost: cost.clone().unwrap_or_default(),
-        };
-        let bytes = rmp_serde::to_vec_named(&marker)
-            .map_err(|err| StepError::permanent(err.to_string()))?;
-        effects
-            .put_reserved(bulk_item_kv_key(batch_id, key), bytes)
-            .map_err(|err| StepError::permanent(err.to_string()))?;
-        // A batch not being run here (its run future was dropped, or it
-        // was submitted by an earlier process) keeps its durable state
-        // only.
-        let state = self.batches.lock().unwrap().get(batch_id).cloned();
-        if let Some(state) = state {
+    match record.outcome {
+        StoredOutcome::Success { output } => {
+            let (output, cost) = decode_envelope::<O>(key, &output);
             state.record(
-                self.sink.as_ref(),
+                sink,
                 TerminalItem {
                     key,
-                    run_id: &outcome.run_id,
-                    status: outcome.status,
+                    status: TerminalStatus::Succeeded,
                     output,
-                    error: outcome.error.as_deref(),
+                    error: None,
                     cost,
                 },
             );
         }
-        Ok(())
+        StoredOutcome::Failure { message, .. } => state.record(
+            sink,
+            TerminalItem {
+                key,
+                status: TerminalStatus::Failed,
+                output: None,
+                error: Some(&message),
+                cost: None,
+            },
+        ),
     }
 }
 
@@ -292,8 +225,9 @@ impl<P: Pipeline> BulkBuilder<P> {
         self
     }
 
-    /// Maximum time the worker waits on an empty queue before re-checking.
-    /// Defaults to 250ms.
+    /// Maximum time the worker waits on an empty queue before re-checking,
+    /// and the interval at which a batch run polls the outcome record of
+    /// an item whose queue job it cannot wait on. Defaults to 250ms.
     pub fn poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
         self
@@ -350,35 +284,31 @@ impl<P: Pipeline> BulkBuilder<P> {
 
     /// Finalize the builder.
     pub fn build(self) -> Bulk<P> {
-        let batches: Arc<ActiveBatches> = Arc::default();
         let sink: Arc<dyn OutputSink> = self.sink.unwrap_or_else(|| Arc::new(NullSink));
-        let hook = BulkHook {
-            batches: batches.clone(),
-            sink: sink.clone(),
-            _output: PhantomData,
-        };
         let memo_store = MemoStore::new(self.object_store.clone(), self.memo_prefix.clone());
         let manifests = ManifestStore::new(self.object_store.clone(), self.memo_prefix.clone());
         let runner = PipelineRunner::new(self.pipeline);
         let queue = self.queue.clone();
         let clock = self.clock.unwrap_or_else(|| queue.clock());
-        let runtime = WorkflowRuntime::builder(self.queue, self.object_store, runner, hook)
-            .queue_name(self.queue_name)
-            .memo_prefix(self.memo_prefix)
-            .max_concurrent_steps(self.max_concurrent)
-            .poll_interval(self.poll_interval)
-            .clock(clock.clone())
-            .build();
+        let runtime =
+            WorkflowRuntime::builder(self.queue, self.object_store, runner, NoopTerminalHook)
+                .queue_name(self.queue_name)
+                .memo_prefix(self.memo_prefix)
+                .max_concurrent_steps(self.max_concurrent)
+                .poll_interval(self.poll_interval)
+                .clock(clock.clone())
+                .build();
         Bulk {
             inner: Arc::new(BulkInner {
                 runtime,
                 queue,
                 memo_store,
                 manifests,
-                batches,
+                batches: Arc::default(),
                 sink,
                 key_fn: self.key_fn,
                 headers: self.headers,
+                poll_interval: self.poll_interval,
                 fail_threshold: self.fail_threshold,
                 batch_retention: self.batch_retention,
                 clock,
@@ -401,7 +331,7 @@ pub struct Bulk<P: Pipeline> {
 /// The state shared by the runner, its batch handles and the spawned
 /// worker task.
 struct BulkInner<P: Pipeline> {
-    runtime: WorkflowRuntime<PipelineRunner<P>, BulkHook<P::Output>>,
+    runtime: WorkflowRuntime<PipelineRunner<P>, NoopTerminalHook>,
     queue: Arc<Queue>,
     memo_store: MemoStore,
     manifests: ManifestStore,
@@ -409,6 +339,7 @@ struct BulkInner<P: Pipeline> {
     sink: Arc<dyn OutputSink>,
     key_fn: Option<KeyFn<P::Input>>,
     headers: HashMap<String, String>,
+    poll_interval: Duration,
     fail_threshold: Option<f64>,
     batch_retention: Option<Duration>,
     clock: Arc<dyn Clock>,
@@ -514,14 +445,16 @@ impl<P: Pipeline> Bulk<P> {
 }
 
 impl<P: Pipeline> BulkInner<P> {
-    /// Register `id` as running in this process. Rejects a batch that is
-    /// already running here.
-    fn activate(&self, id: &str) -> Result<ActiveBatch> {
+    /// Register `id` as running in this process with `total` items.
+    /// Rejects a batch that is already running here.
+    fn activate(&self, id: &str, total: usize) -> Result<ActiveBatch> {
         let mut batches = self.batches.lock().unwrap();
         if batches.contains_key(id) {
             return Err(Error::BatchRunning(id.to_string()));
         }
-        let state = Arc::new(BatchState::new());
+        let state = Arc::new(BatchState {
+            state: Mutex::new(ProgressState::new(total)),
+        });
         batches.insert(id.to_string(), state.clone());
         Ok(ActiveBatch {
             batches: self.batches.clone(),
@@ -592,6 +525,91 @@ impl<P: Pipeline> BulkInner<P> {
             }
         }
     }
+
+    /// Run one item to its terminal state in this process: answer it from
+    /// a success record, or submit it (a failure record is ignored so the
+    /// item runs again), wait for the run to terminate and fold the
+    /// outcome into the batch.
+    async fn drive_item(
+        &self,
+        batch_id: &str,
+        state: &BatchState,
+        submits: &Semaphore,
+        item: ManifestItem,
+    ) -> Result<()> {
+        let ManifestItem { key, input } = item;
+        let run_id = item_run_id(batch_id, &key);
+        let run_memo = self.memo_store.new_run_memo(&run_id);
+        if let Some(record) = read_outcome(&run_memo).await?
+            && matches!(record.outcome, StoredOutcome::Success { .. })
+        {
+            record_outcome::<P::Output>(state, self.sink.as_ref(), &key, record);
+            return Ok(());
+        }
+        let mut headers = self.headers.clone();
+        headers.insert(HEADER_BATCH.to_string(), batch_id.to_string());
+        headers.insert(HEADER_KEY.to_string(), key.clone());
+        let submitted = {
+            let _permit = submits
+                .acquire()
+                .await
+                .expect("the semaphore is never closed");
+            self.runtime
+                .submit(RunSpec {
+                    run_id: Some(run_id),
+                    input,
+                    headers,
+                    ..RunSpec::default()
+                })
+                .await?
+        };
+        let terminal = loop {
+            let waited = wait_terminal(
+                &self.queue,
+                &run_memo,
+                submitted.job_id.as_deref(),
+                WAIT_CHUNK,
+                self.poll_interval,
+            )
+            .await?;
+            if let Some(terminal) = waited {
+                break terminal;
+            }
+        };
+        match terminal {
+            Terminal::Recorded(record) => {
+                record_outcome::<P::Output>(state, self.sink.as_ref(), &key, record);
+            }
+            // A run dead-lettered outside its step (its lease expired
+            // past the attempt limit) failed without a record; every
+            // other unrecorded end is a cancellation.
+            Terminal::Unrecorded(Unrecorded::Dead(error)) => state.record(
+                self.sink.as_ref(),
+                TerminalItem {
+                    key: &key,
+                    status: TerminalStatus::Failed,
+                    output: None,
+                    error: Some(
+                        error
+                            .as_deref()
+                            .unwrap_or("dead-lettered without an outcome"),
+                    ),
+                    cost: None,
+                },
+            ),
+            Terminal::Unrecorded(_) => state.record(
+                self.sink.as_ref(),
+                TerminalItem {
+                    key: &key,
+                    status: TerminalStatus::Cancelled,
+                    output: None,
+                    error: None,
+                    cost: None,
+                },
+            ),
+        }
+        Ok(())
+    }
 }
 
 /// Present a bulk error as a workflow error for the sweep, which reports
@@ -610,7 +628,7 @@ fn bulk_to_workflow(err: Error) -> crate::Error {
 /// A handle on one batch of a [`Bulk`] runner. Obtained from
 /// [`Bulk::batch`] or [`Bulk::new_batch`].
 pub struct Batch<'a, P: Pipeline> {
-    inner: &'a BulkInner<P>,
+    inner: &'a Arc<BulkInner<P>>,
     id: String,
 }
 
@@ -679,9 +697,9 @@ impl<P: Pipeline> Batch<'_, P> {
     }
 
     /// The durable state of the batch: its item count from the manifest
-    /// and, per item, the last outcome recorded by a terminal notification.
-    /// An item that ran again after a failure is reported by its latest
-    /// outcome. Returns [`Error::BatchNotFound`] when no manifest exists.
+    /// and, per item, the last outcome its settlement recorded. An item
+    /// that ran again after a failure is reported by its latest outcome.
+    /// Returns [`Error::BatchNotFound`] when no manifest exists.
     pub async fn status(&self) -> Result<BatchStatus> {
         let inner = self.inner;
         let manifest = inner
@@ -775,25 +793,45 @@ impl<P: Pipeline> Batch<'_, P> {
         Ok(items)
     }
 
-    /// Register the batch, submit every item, wait until every item has
-    /// terminated and build the report.
+    /// Register the batch, drive every item to its terminal state and
+    /// build the report. Items are driven concurrently; the first error
+    /// stops the others and is returned.
     async fn drive(&self, items: Vec<ManifestItem>) -> Result<BulkReport> {
         let inner = self.inner;
-        let active = inner.activate(&self.id)?;
-        let expected = items.len();
-        if let Err(err) = self.submit_all(&active.state, items).await {
-            if let Err(flush_err) = inner.sink.flush() {
-                warn!(error = %flush_err, "sink flush failed after a submission error");
+        let active = inner.activate(&self.id, items.len())?;
+        let submits = Arc::new(Semaphore::new(SUBMIT_CONCURRENCY));
+        let driven = {
+            let mut set = tokio::task::JoinSet::new();
+            for item in items {
+                let inner = Arc::clone(inner);
+                let state = active.state.clone();
+                let submits = submits.clone();
+                let batch_id = self.id.clone();
+                set.spawn(async move { inner.drive_item(&batch_id, &state, &submits, item).await });
             }
-            return Err(err);
+            let mut result = Ok(());
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        result = Err(err);
+                        break;
+                    }
+                    // The set is never aborted while joining, so a join
+                    // error is a panic in an item task; propagate it.
+                    Err(join_err) => std::panic::resume_unwind(join_err.into_panic()),
+                }
+            }
+            result
+        };
+        if let Err(flush_err) = inner.sink.flush() {
+            match driven {
+                Ok(()) => return Err(flush_err),
+                Err(_) => warn!(error = %flush_err, "sink flush failed after an item error"),
+            }
         }
-        active.state.state.lock().unwrap().total = expected;
-        // Cover the case where every item completed during submission: a
-        // completion that fired while total was still 0 did not notify.
-        active.state.notify.notify_one();
-        active.state.wait_until_done().await;
+        driven?;
 
-        inner.sink.flush()?;
         if inner.batch_retention.is_some() {
             let key = bulk_terminal_kv_key(&self.id, inner.clock.now_ms());
             if let Err(err) = inner.queue.kv_put(&key, b"").await {
@@ -815,84 +853,6 @@ impl<P: Pipeline> Batch<'_, P> {
             }
         }
         Ok(report)
-    }
-
-    /// Submit every item. Every item terminates in this process: a
-    /// newly enqueued run and a run still queued from an earlier run of
-    /// the batch both fire the terminal hook here, and an item answered
-    /// from a success record is counted at submission.
-    ///
-    /// Submissions run with bounded concurrency. Each submission blocks
-    /// on a durable enqueue commit, and concurrent commits share WAL
-    /// flushes, so at flush-bound latencies (for example the SlateDB
-    /// default 100ms flush interval) serial submission would cap at one
-    /// item per flush. Enqueue order across in-flight submissions is not
-    /// defined; batch items are independent. The first submission error
-    /// aborts the remaining in-flight submissions and is returned.
-    async fn submit_all(&self, state: &Arc<BatchState>, items: Vec<ManifestItem>) -> Result<()> {
-        const SUBMIT_CONCURRENCY: usize = 32;
-
-        fn tally(joined: std::result::Result<Result<()>, tokio::task::JoinError>) -> Result<()> {
-            match joined {
-                Ok(result) => result,
-                // The set is never aborted while joining, so a join error
-                // is a panic in a submission task; propagate it.
-                Err(join_err) => std::panic::resume_unwind(join_err.into_panic()),
-            }
-        }
-
-        let inner = self.inner;
-        let mut set = tokio::task::JoinSet::new();
-        for ManifestItem { key, input } in items {
-            let run_id = item_run_id(&self.id, &key);
-            let payload = input;
-            if set.len() >= SUBMIT_CONCURRENCY {
-                let joined = set.join_next().await.expect("set is non-empty");
-                tally(joined)?;
-            }
-            let runtime = inner.runtime.clone();
-            let run_memo = inner.memo_store.new_run_memo(&run_id);
-            let state = state.clone();
-            let sink = inner.sink.clone();
-            let mut headers = inner.headers.clone();
-            headers.insert(HEADER_BATCH.to_string(), self.id.clone());
-            headers.insert(HEADER_KEY.to_string(), key.clone());
-            set.spawn(async move {
-                // A success record from an earlier run of the batch answers
-                // the item; a failure record is ignored so the item runs
-                // again.
-                if let Some(record) = read_outcome(&run_memo).await?
-                    && let StoredOutcome::Success { output } = record.outcome
-                {
-                    let (output, cost) = decode_envelope::<P::Output>(&key, &output);
-                    state.record(
-                        sink.as_ref(),
-                        TerminalItem {
-                            key: &key,
-                            run_id: &run_id,
-                            status: TerminalStatus::Succeeded,
-                            output,
-                            error: None,
-                            cost,
-                        },
-                    );
-                    return Ok(());
-                }
-                runtime
-                    .submit(RunSpec {
-                        run_id: Some(run_id),
-                        input: payload,
-                        headers,
-                        ..RunSpec::default()
-                    })
-                    .await?;
-                Ok(())
-            });
-        }
-        while let Some(joined) = set.join_next().await {
-            tally(joined)?;
-        }
-        Ok(())
     }
 }
 
@@ -1533,42 +1493,5 @@ mod tests {
         ));
         assert_eq!(bulk.batch("ok-1").unwrap().id(), "ok-1");
         worker.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_redelivered_notification_counts_an_item_once() {
-        let state = Arc::new(BatchState::new());
-        state.state.lock().unwrap().total = 2;
-        let batches: Arc<ActiveBatches> = Arc::default();
-        batches
-            .lock()
-            .unwrap()
-            .insert("b".to_string(), state.clone());
-        let sink = Arc::new(Collect::default());
-        let hook = BulkHook::<u32> {
-            batches,
-            sink: sink.clone(),
-            _output: PhantomData,
-        };
-
-        let outcome = RunOutcome {
-            run_id: "item-1".to_string(),
-            status: TerminalStatus::Succeeded,
-            result: None,
-            error: None,
-            headers: HashMap::from([(HEADER_BATCH.to_string(), "b".to_string())]),
-            final_step: 0,
-        };
-        hook.on_termination(&outcome, &TerminalEffects::detached())
-            .await
-            .unwrap();
-        hook.on_termination(&outcome, &TerminalEffects::detached())
-            .await
-            .unwrap();
-
-        let state = state.state.lock().unwrap();
-        assert_eq!(state.succeeded, 1);
-        assert!(!state.is_done(), "one of two items is terminal");
-        assert_eq!(sink.records.lock().unwrap().len(), 1);
     }
 }

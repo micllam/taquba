@@ -5,13 +5,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::RunStatus;
-use taquba::WaitOutcome;
 use thiserror::Error;
 
 use crate::jobs::error::{Error, Result};
 use crate::jobs::job::{ErrorKind, Job};
 use crate::jobs::runner::Inner;
-use crate::outcome::{StoredErrorKind, StoredOutcome, read_outcome};
+use crate::outcome::{
+    StoredErrorKind, StoredOutcome, Terminal, Unrecorded, read_outcome, wait_terminal,
+};
 
 // `join` waits in chunks of this length; `wait_for_completion` needs a finite
 // timeout, so an unbounded join loops over bounded waits.
@@ -166,52 +167,30 @@ impl<J: Job> JobHandle<J> {
         &self,
         timeout: Duration,
     ) -> Result<Option<std::result::Result<J::Output, JobError>>> {
-        let Some(queue_job_id) = &self.queue_job_id else {
-            return self.poll_outcome(timeout).await;
-        };
-        match self
-            .inner
-            .queue()
-            .wait_for_completion(queue_job_id, timeout)
-            .await?
-        {
-            WaitOutcome::TimedOut => Ok(None),
-            WaitOutcome::NotFound => match self.fetch_result().await? {
-                Some(outcome) => Ok(Some(outcome)),
-                None => Err(Error::JobNotFound(self.id.clone())),
-            },
-            terminal @ (WaitOutcome::Done(_) | WaitOutcome::Dead(_) | WaitOutcome::Cancelled) => {
-                if let Some(outcome) = self.fetch_result().await? {
-                    return Ok(Some(outcome));
-                }
-                let message = match terminal {
-                    WaitOutcome::Done(record) | WaitOutcome::Dead(record) => record.last_error,
-                    _ => None,
-                }
-                .unwrap_or_else(|| "job terminated without recording an outcome".to_string());
+        let terminal = wait_terminal(
+            self.inner.queue(),
+            &self.inner.run_memo(&self.id),
+            self.queue_job_id.as_deref(),
+            timeout,
+            self.inner.poll_interval(),
+        )
+        .await?;
+        match terminal {
+            None => Ok(None),
+            Some(Terminal::Recorded(record)) => Ok(Some(decode_outcome::<J>(record.outcome)?)),
+            Some(Terminal::Unrecorded(Unrecorded::NotFound)) => {
+                Err(Error::JobNotFound(self.id.clone()))
+            }
+            Some(Terminal::Unrecorded(unrecorded)) => {
+                let message = match unrecorded {
+                    Unrecorded::Dead(Some(error)) => error,
+                    _ => "job terminated without recording an outcome".to_string(),
+                };
                 Ok(Some(Err(JobError {
                     kind: ErrorKind::Transient,
                     message,
                 })))
             }
-        }
-    }
-
-    /// Wait for the outcome record by polling, for a handle without a
-    /// queue job id.
-    async fn poll_outcome(
-        &self,
-        timeout: Duration,
-    ) -> Result<Option<std::result::Result<J::Output, JobError>>> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if let Some(outcome) = self.fetch_result().await? {
-                return Ok(Some(outcome));
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Ok(None);
-            }
-            tokio::time::sleep(self.inner.poll_interval()).await;
         }
     }
 }
