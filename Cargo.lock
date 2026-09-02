@@ -3140,14 +3140,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "taquba-bulk"
-version = "0.7.0"
-dependencies = [
- "taquba",
- "taquba-workflow",
-]
-
-[[package]]
 name = "taquba-cron"
 version = "0.8.0"
 dependencies = [
@@ -3157,14 +3149,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "taquba-jobs"
-version = "0.8.0"
-dependencies = [
- "taquba",
- "taquba-workflow",
 ]
 
 [[package]]

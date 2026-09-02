@@ -1,11 +1,9 @@
 [workspace]
 members = [
     "taquba",
-    "taquba-jobs",
     "taquba-cron",
     "taquba-webhooks",
     "taquba-workflow",
-    "taquba-bulk",
     "taquba-bencher",
 ]
 resolver = "2"
@@ -17,8 +15,6 @@ repository = "https://github.com/micllam/taquba"
 
 [workspace.dependencies]
 taquba = { path = "taquba", version = "0.12.0" }
-taquba-bulk = { path = "taquba-bulk", version = "0.7.0" }
-taquba-jobs = { path = "taquba-jobs", version = "0.8.0" }
 taquba-webhooks = { path = "taquba-webhooks", version = "0.8.0" }
 taquba-workflow = { path = "taquba-workflow", version = "0.11.0" }
 
