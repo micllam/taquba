@@ -4,43 +4,45 @@
 [![docs.rs](https://img.shields.io/docsrs/taquba-workflow)](https://docs.rs/taquba-workflow)
 [![license](https://img.shields.io/crates/l/taquba-workflow.svg)](#license)
 
-Durable execution on object storage: an at-least-once workflow runtime on
-top of the [Taquba](../taquba) durable task queue.
+Durable execution for Rust on object storage: an at-least-once workflow
+runtime over the [Taquba](../taquba) durable task queue. A run is a
+sequence of steps whose state (each step's output, memoized side effects
+and application KV effects) is stored in a bucket or a local directory,
+so a process restarted mid-run resumes at its last committed step.
 
 > Part of the [Taquba ecosystem](https://github.com/micllam/taquba); see the
 > workspace README for the queue core and the other crates that compose with
 > this one.
 
-`taquba-workflow` provides the durable machinery for any multi-step process
-that benefits from durable state between steps: idempotent step execution,
-retries with backoff, graceful restart, and terminal-state notifications.
-Implement `StepRunner` with bytes-in / bytes-out per-step logic; the
-runtime persists everything else.
+The runtime is an embedded library: producers and workers share one
+`Arc<Queue>` in one process, and no server, database or control plane
+runs beside it. It is built for long-running, expensive, IO- or API-bound
+work: LLM agent runs (see [`examples/rig_agent.rs`](examples/rig_agent.rs)
+for a [Rig](https://github.com/0xPlaygrounds/rig) integration), document
+pipelines, payment flows and command-line tools whose runs survive an
+interruption. Implement `StepRunner` with bytes-in, bytes-out per-step
+logic; the runtime persists everything else.
 
-Particularly well-suited for **AI agent runs** (see
-[`examples/rig_agent.rs`](examples/rig_agent.rs) for a
-[Rig](https://github.com/0xPlaygrounds/rig) integration), but the runtime
-itself is framework-neutral and equally usable for ETL pipelines, document
-processing, payment flows, etc.
+## Scope
 
-## What this is / isn't
+`taquba-workflow` is an imperative step orchestrator: at each step the
+runner returns a `StepOutcome` (Continue, Succeed, Fail or Cancel) that
+decides what happens next, and `WorkflowRuntime::cancel` cancels a run
+from outside. It is neither a DAG executor (no declarative graph, no
+fan-out or fan-in, no dependency-driven scheduling) nor an event-sourced
+engine (no event-history replay; a side effect is recorded only where
+the runner memoizes it).
 
-`taquba-workflow` is an **imperative step orchestrator**: at each step
-the runner decides what happens next via `StepOutcome` (Continue,
-Succeed, Fail, Cancel). External cancellation is supported via
-`WorkflowRuntime::cancel`. It is *not*:
-
-- **A DAG executor**. There's no declarative graph, no fan-out / fan-in, no
-  dependency-driven scheduling.
-- **An event-sourced workflow engine**. There's no event-history replay, no
-  per-side-effect recording.
-
-The `jobs` module runs single-shot typed tasks: use it when the caller
-awaits a typed return value and there are no intermediate steps to
-persist; use a step runner (even for a single step) when the caller
-observes the run through cancellation and a terminal hook and awaits no
-returned value. The `bulk` module runs one pipeline over many inputs with
-batch progress and cost rollup.
+Two typed presentations of the runtime are included. The `jobs` module
+runs one typed async function as a single-step run and returns its
+result to an awaiting caller. The `bulk` module runs one pipeline over
+many inputs with batch progress and cost rollup. Use a job when the
+caller awaits a typed return value and there are no intermediate steps
+to persist; a step runner, even for a single step, when the caller
+observes the run through cancellation, headers and a terminal hook; and
+bulk when each item is a multi-phase pipeline whose completed phases
+must survive a retry and the batch needs progress, cost rollup and a
+failure threshold.
 
 ## Install
 
@@ -53,38 +55,6 @@ Enable the `webhooks` feature for `WebhookTerminalHook`:
 
 ```bash
 cargo add taquba-workflow --features webhooks
-```
-
-## Configuring the queue
-
-Per-queue retention (`QueueConfig::keep_done_jobs` and
-`QueueConfig::dead_retention`) is set on the `taquba::Queue` before it's
-handed to the runtime. Choose an explicit name via
-`WorkflowRuntimeBuilder::queue_name` and key `OpenOptions::queue_configs`
-on the same string.
-
-```rust
-use std::sync::Arc;
-use std::time::Duration;
-use taquba::{OpenOptions, Queue, QueueConfig, object_store::memory::InMemory};
-use taquba_workflow::{NoopTerminalHook, StepError, StepOutcome, StepRunner, WorkflowRuntime, Step};
-
-struct EchoRunner;
-impl StepRunner for EchoRunner {
-    async fn run_step(&self, step: &Step) -> Result<StepOutcome, StepError> {
-        Ok(StepOutcome::Succeed { result: step.payload.clone() })
-    }
-}
-
-let store = Arc::new(InMemory::new());
-let opts = OpenOptions::default().queue_config(
-    "agent-runs",
-    QueueConfig::default().keep_done_jobs(Duration::from_secs(24 * 60 * 60)),
-);
-let queue = Arc::new(Queue::open_with_options(store.clone(), "db", opts).await?);
-let runtime = WorkflowRuntime::builder(queue, store, EchoRunner, NoopTerminalHook)
-    .queue_name("agent-runs") // same string as in queue_configs
-    .build();
 ```
 
 ## Quick start
@@ -113,91 +83,104 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let worker = runtime.spawn(std::future::pending::<()>());
 
-    let handle = runtime.submit(RunSpec {
+    let outcome = runtime.submit(RunSpec {
         input: b"hello".to_vec(),
         ..Default::default()
     }).await?;
-    println!("submitted run {}", handle.run_id);
+    println!("submitted run {}", outcome.run_id);
     worker.shutdown().await?;
     Ok(())
 }
 ```
 
+Replace `InMemory` with an S3, GCS or Azure builder in production. The
+runtime's queue is named by `WorkflowRuntimeBuilder::queue_name`;
+per-queue settings in `OpenOptions::queue_configs` (retention, lease
+duration, attempt limit) are keyed on that name when the `Queue` is
+opened.
+
 ## Examples
 
 ```bash
-cargo run -p taquba-workflow --example single_step
-cargo run -p taquba-workflow --example multi_step
-cargo run -p taquba-workflow --example crash_resume
-cargo run -p taquba-workflow --example durable_approvals
-cargo run -p taquba-workflow --example fanout_jobs
-ANTHROPIC_API_KEY=... cargo run -p taquba-workflow --example rig_agent
-OPENAI_API_KEY=...    cargo run -p taquba-workflow --example rig_agent
+cargo run -p taquba-workflow --example <name>
 ```
 
-`crash_resume` runs on the local filesystem and demonstrates recovery
-directly: start it, interrupt it during any stage and start it again.
-The second process resumes the same run, skips the stages already
-committed and serves the completed units of the interrupted stage from
-the memo store.
-
-`durable_approvals` runs an agent loop on the local filesystem and
-holds it for approval across processes: the first invocation
-investigates a claim one turn per step, proposes a refund and exits
-with the run waiting; a later invocation with `-- approve` or
-`-- reject <reason>` delivers the decision and resumes the run to
-completion. A decision delivered before the first invocation is
-buffered and consumed at registration, and a run that waits past its
-timeout escalates at the next plain invocation.
-
-`rig_agent` is a two-stage AI agent (research, then write) structured
-for between-step durability: step 0's research is persisted as queue
-state before step 1 begins, so on a persistent store a process that
-crashes between the steps resumes at step 1 without re-running the
-research. The example itself runs on the in-memory store; substitute a
-persistent `object_store` backend, as `crash_resume` does, to observe
-recovery across a process restart.
-
-`fanout_jobs` composes the runtime with typed jobs for fan-out
-inside one run: a step submits one typed job per URL to a shared
-`JobRunner`, joins the typed results, and memoizes the aggregate so a
-step retry does not re-submit the fan-out.
+The header of each file under [`examples/`](examples) states what it
+demonstrates.
 
 ## Step outcomes
 
 | Outcome | Effect |
 |---|---|
 | `StepOutcome::Continue { payload, when }` | Enqueue the next step; `when` (a `Trigger`) decides when it becomes claimable: `Trigger::Immediate`, `Trigger::After(delay)` or `Trigger::OnSignal { correlation_key, timeout }`. Constructors: `StepOutcome::continue_now(payload)`, `StepOutcome::continue_after(payload, delay)`, `StepOutcome::continue_on_signal(payload, key, timeout)`. |
-| `StepOutcome::Succeed { result }` | Ack; terminal hook fires `Succeeded`. |
-| `StepOutcome::Fail { reason }` | Ack; terminal hook fires `Failed`. Runner verdict: no dead-letter. |
-| `StepOutcome::Cancel { reason }` | Ack; terminal hook fires `Cancelled`. Runner verdict: no dead-letter. |
+| `StepOutcome::Succeed { result }` | Ack; the terminal hook observes `Succeeded`. |
+| `StepOutcome::Fail { reason }` | Ack; the terminal hook observes `Failed`. A runner verdict: no dead-letter. |
+| `StepOutcome::Cancel { reason }` | Ack; the terminal hook observes `Cancelled`. A runner verdict: no dead-letter. |
 | `Err(StepError::transient(_))` | Retry per backoff up to `max_attempts`, then dead-letter. |
 | `Err(StepError::permanent(_))` | Dead-letter immediately. |
 
-`StepOutcome::Fail` / `StepOutcome::Cancel` vs `Err(StepError::permanent)`:
-runner verdicts ack normally; an infrastructure error dead-letters so
-operators can find it via `queue.dead_jobs()`.
+`StepOutcome::Fail` and `StepOutcome::Cancel` are runner verdicts and
+acknowledge normally; an `Err(StepError::permanent)` is an infrastructure
+error and dead-letters, so operators find it through
+`Queue::dead_jobs`.
 
 ## The delivery
 
 A `Step` dereferences to its `Delivery`: the run id, the submitter's
-headers, the queue job id, the attempt count and limit, and the
-delivery's handles (the cancellation token, the lease, the per-step and
-run-scoped memos, the staged KV effects and committed KV reads). The
-typed contexts (`jobs::JobContext`, `bulk::BulkCtx`) dereference to the
-same type.
+headers, the queue job id, the attempt count and limit
+(`Delivery::is_last_attempt` reports whether a transient error from this
+attempt dead-letters the step) and the delivery's handles (the
+cancellation token, the lease, the per-step and run-scoped memos, the
+staged KV effects and committed KV reads). The typed contexts
+(`jobs::JobContext`, `bulk::BulkCtx`) dereference to the same type.
+`Delivery::detached` and `Step::detached` build instances bound to no
+queue, for tests.
+
+## Submissions
+
+`WorkflowRuntime::submit` takes a `RunSpec`: the first step's `input`, an
+optional `run_id` (1 to `MAX_RUN_ID_LEN` bytes of `[A-Za-z0-9_-]`; a ULID
+is generated when absent), `headers`, a `priority` and
+`max_attempts_per_step` overriding the queue's defaults for every step,
+a `run_at` before which the first step is not claimable and `kv_writes`
+applied with the enqueue. The returned `SubmitOutcome` names the run and
+the queue job currently representing it.
+
+`submit` is idempotent on `(run_id, input)`. A re-submission of an
+active run with the same input is a no-op and the returned
+`SubmitOutcome` has `newly_submitted = false`; one with a different
+input is rejected with `Error::InputMismatch`. Duplicates are caught by
+a durable per-run record written atomically with the step-0 enqueue
+(via Taquba's `enqueue_with_kv`), so they are caught across process
+restarts, even after step 0 has been claimed and its dedup key
+released. The record holds a SHA-256 of the original input for the
+mismatch check. A current-step pointer under `workflow/steps/` is
+written beside it, rewritten in the settlement that enqueues each next
+step and names the queue job `SubmitOutcome::job_id` reports for a
+duplicate; a `QueueReader` can read it to resolve a run's live job from
+outside the process. Both are removed when the run reaches a terminal
+state.
+
+`WorkflowRuntime::status` reads the record, the pointer and the step's
+queue job into a `RunStatus` (`Pending`, `Running` or `Cancelling`,
+with the current step number), so it answers after a restart and from
+any runtime over the same queue. A terminated run has no status.
 
 ## Cancellation
 
-Call `WorkflowRuntime::cancel(run_id)` to cancel an active run from
-outside the runner:
+`WorkflowRuntime::cancel(run_id)` cancels an active run from outside the
+runner. The request is recorded on the run's durable record, so it
+survives a restart and reaches the run from any runtime over the same
+queue; while termination is in flight, `status` reports
+`RunState::Cancelling`. It returns `Ok(false)` if the run is unknown or
+already terminal.
 
-- If the current step is **pending or scheduled**, the queued step job is
-  removed and the run's notification job is enqueued before the `cancel`
-  call returns.
-- If the current step is **running**, cancellation is delivered via
-  `Delivery::cancel_token` (a `tokio_util::sync::CancellationToken`).
-  Runners that watch the token can short-circuit immediately:
+- If the current step is pending or scheduled, the queued step job is
+  removed and the run's notification job is enqueued before the call
+  returns.
+- If the current step is running, the request is delivered through
+  `Delivery::cancel_token` (a `tokio_util::sync::CancellationToken`). A
+  runner that watches the token returns at once:
 
   ```rust,ignore
   tokio::select! {
@@ -208,27 +191,21 @@ outside the runner:
   }
   ```
 
-  Runners that ignore the token are allowed to run to completion (futures
-  cannot be safely aborted mid-step). In both cases the runner's
-  `StepOutcome` is discarded, any pending transient retry is suppressed,
-  and the worker settles the run as `Cancelled` once the step returns.
-  Watching the token only reduces cancellation latency for slow steps;
-  it doesn't change semantics.
-
-The request is recorded on the run's durable record, so a step claimed
-after it is settled as cancelled without running, and the request reaches
-the run after a restart and from any runtime over the same queue. While
-termination is in flight, `WorkflowRuntime::status` reports
-`RunState::Cancelling`.
-
-Returns `Ok(false)` if the run is unknown or already terminal.
+  A runner that ignores the token runs to completion (a future cannot be
+  aborted safely mid-step). In both cases the runner's `StepOutcome` is
+  discarded, any pending transient retry is suppressed and the worker
+  settles the run as `Cancelled` once the step returns. Watching the
+  token reduces the latency of cancelling a slow step; the semantics are
+  the same.
+- A step claimed after the request is settled as cancelled without
+  running.
 
 ## Long-running steps
 
 A step that outlives the queue's lease is re-queued by the reaper and
 delivered a second time. A long-running runner avoids this by extending
-its lease through `Delivery::lease`: call `LeaseHandle::ensure_at_least` at
-progress points, or once, with a slow call's timeout, before issuing
+its lease through `Delivery::lease`: call `LeaseHandle::ensure_at_least`
+at progress points, or once, with a slow call's timeout, before issuing
 the call.
 
 ## Durable signals
@@ -265,21 +242,21 @@ under its correlation key and consumed by the next waiter registered for
 it, so a signal that arrives before its waiter is not lost;
 `WorkflowRuntime::clear_signal` discards a buffered signal that is no
 longer wanted. A waiting run resumes under the runner hosted by the
-resuming process: the wait survives restarts of the agent, and a runner
-changed while the run waits is the caller's compatibility concern.
+resuming process, so a runner changed while the run waits is the
+caller's compatibility concern.
 
-Semantics: delivery follows the crate's at-least-once model (the woken
-step can be redelivered and observes the same `Step::signal` value on
-every attempt). One buffered signal is held per correlation key; a second
-signal before consumption replaces the first. One waiter is allowed per
-correlation key; registering a second one fails that run, so choose keys
-unique to the waiter (include the run id if uniqueness is uncertain). Signals are
+Delivery follows the crate's at-least-once model: the woken step can be
+redelivered and observes the same `Step::signal` value on every attempt.
+One buffered signal is held per correlation key; a second signal before
+consumption replaces the first. One waiter is allowed per correlation
+key; registering a second one fails that run, so choose keys unique to
+the waiter (include the run id if uniqueness is uncertain). Signals are
 scoped to the store: the signaller is the same process that hosts the
 runtime, per the single-process design.
 
 See [`examples/durable_approvals.rs`](examples/durable_approvals.rs)
 for a runnable approval flow covering all three delivery paths (signal,
-timeout, buffered) across process restarts.
+timeout and buffered) across process restarts.
 
 ## Application KV effects
 
@@ -338,14 +315,6 @@ through every step and reach the terminal hook on `RunOutcome::headers`.
 | `workflow.run_id` | Run identifier. |
 | `workflow.step` | Zero-based step number. |
 
-## Bulk processing
-
-The `bulk` module runs one `Pipeline` over many input items in parallel,
-one run per item with the pipeline's phases as memoized calls inside the
-item's single step, and adds batch-level progress, cost rollup, streamed
-output and a failure threshold. The module documentation covers the
-execution model, cost tracking, the failure policy and replay.
-
 ## Typed jobs
 
 The `jobs` module runs one typed async function as a single-step run and
@@ -354,8 +323,9 @@ fields, an `Output` and an `Error`, register it on a `JobRunner`, submit
 instances and await the `JobHandle`. The outcome record is stored in the
 run's memo, so `JobHandle::fetch_result` reads it after a restart, and a
 `Job::idempotency_key` collapses duplicate submissions before and after
-completion. The module documentation covers idempotent submission,
-retention and the handler context.
+completion. A handler that submits further jobs holds a `JobRunner` in
+its registered state. The module documentation covers idempotent
+submission, retention and the handler context.
 
 ```rust,ignore
 use taquba_workflow::jobs::{Job, JobContext, JobRunner};
@@ -381,21 +351,32 @@ let message_id = runner.submit(SendEmail { to: "user@example.com".into() }).awai
 worker.shutdown().await?;
 ```
 
+## Bulk processing
+
+The `bulk` module runs one `Pipeline` over many input items in parallel,
+one run per item with the pipeline's phases as memoized calls inside the
+item's single step, and adds batch-level progress, cost rollup, streamed
+output and a failure threshold. Every run is a batch identified by id: a
+second run of the same batch skips the items that succeeded and runs the
+failed ones again. The module documentation covers the execution model,
+batches, cost tracking, the failure policy and retention.
+
 ## Idempotency
 
 Each step is enqueued with `dedup_key = "run:{run_id}:{step_number}"`,
-preventing concurrent duplicate steps. But Taquba is at-least-once: a
-step can be claimed and executed twice if its lease expires before ack.
+so no two pending or scheduled jobs exist for the same step at the same
+time. Delivery is at-least-once, so a step can still be claimed and
+executed twice if its lease expires before its acknowledgement:
 **`StepRunner` implementations must be idempotent for the same
 `(run_id, step_number)`.**
 
 ## Memoizing within-step side effects
 
-Because retries can re-execute a step, expensive non-idempotent side
-effects (LLM calls, paid APIs, multi-stage processing) need a place to
-record their result so retries observe the cached value instead of
-paying twice. `Delivery::memo` is a per-step durable key-value store
-scoped to `(run_id, step_number)`:
+Because a retry can re-execute a step, an expensive non-idempotent side
+effect (an LLM call, a paid API, one stage of a multi-stage step) records
+its result so a retry observes the recorded value and does not repeat
+the call. `Delivery::memo` is a per-step durable key-value store scoped
+to `(run_id, step_number)`:
 
 ```rust,ignore
 // Inside StepRunner::run_step:
@@ -421,8 +402,14 @@ let draft: Draft = step
 ```
 
 When the natural memo key is the content of an input value,
-`Memo::content_get` and `Memo::content_put` serialize that input as
-MessagePack, hash it with SHA-256, and use the digest as the memo key:
+`Memo::memoized_by_content` (and the untyped `Memo::content_get` and
+`Memo::content_put`) serializes that input as MessagePack, hashes it
+with SHA-256 and uses the digest as the memo key. The entry remains
+scoped to `(run_id, step_number)`; it is not a cross-run cache. If
+several logical operations may receive identical inputs, include an
+operation name in the serialized input. `Memo::content_key` returns the
+derived key, for use with `Memo::get` and `Memo::put` or for locating an
+entry from outside the runtime.
 
 ```rust,ignore
 #[derive(serde::Serialize)]
@@ -431,65 +418,51 @@ struct DraftInput<'a> {
     payload: &'a [u8],
 }
 
-let input = DraftInput {
-    operation: "draft",
-    payload: &step.payload,
-};
-if let Some(cached) = step.memo.content_get(&input).await? {
-    return Ok(StepOutcome::Succeed { result: cached });
-}
-let draft = expensive_call(&step.payload).await?;
-step.memo.content_put(&input, &draft).await?;
-Ok(StepOutcome::Succeed { result: draft })
+let input = DraftInput { operation: "draft", payload: &step.payload };
+let draft: Draft = step
+    .memo
+    .memoized_by_content(&input, async { expensive_call(&step.payload).await })
+    .await?;
 ```
-
-Content-addressed memo keys remain scoped to `(run_id, step_number)`;
-they are not a cross-run cache. If multiple logical operations may
-receive identical inputs, include an operation name in the
-serialized input. `Memo::content_key` returns the derived key, for
-use with `Memo::get` and `Memo::put` or for locating an entry from
-outside the runtime, and `Memo::memoized_by_content` is the typed
-form over that key.
 
 `Delivery::run_memo` is the run-scoped variant: one namespace shared by
 every step of the run, for values a later step reads back (an
-accumulating journal, for example). Its entries live beside the
+accumulating journal, for example). Its entries are stored beside the
 per-step entries and are removed with them when the run's retention
 expires.
 
-Memo entries live in the object store passed to
+Memo entries are stored in the object store passed to
 `WorkflowRuntime::builder` under the path prefix configured by
-`WorkflowRuntimeBuilder::memo_prefix` (default `"workflow-memo"`).
-A memo is a retry-safety cache whose readers tolerate absence by
+`WorkflowRuntimeBuilder::memo_prefix` (default `"workflow-memo"`). A
+memo is a retry-safety cache whose readers tolerate absence by
 re-executing; the durable channel between steps is
 `StepOutcome::Continue`'s payload.
 
 ## Step-output replay
 
-`WorkflowRuntimeBuilder::step_output_replay` enables an additional
-runtime-managed replay record for every outcome the runner returns,
-including `Fail` and `Cancel`. Step errors (`StepError`) are not recorded,
-so retries still invoke the runner. The record is keyed by
+`WorkflowRuntimeBuilder::step_output_replay` enables a runtime-managed
+replay record for every outcome the runner returns, including `Fail`
+and `Cancel`. Step errors (`StepError`) are not recorded, so a retry
+still invokes the runner. The record is keyed by
 `(run_id, step_number, SHA-256(step payload))` and is written before the
 runtime applies the outcome. If the same step is delivered again after a
-crash before ack, the stored outcome is replayed without invoking the
-runner again. The record includes the effects staged through
-`Delivery::effects`, so a replayed outcome applies them as well. A replayed
-`Continue` with a `Trigger::After` delay reduces
-the delay by the time already elapsed since the outcome was stored,
-preserving the original schedule.
+crash before its acknowledgement, the stored outcome is replayed without
+invoking the runner. The record includes the effects staged through
+`Delivery::effects`, so a replayed outcome applies them as well. A
+replayed `Continue` with a `Trigger::After` delay reduces the delay by
+the time already elapsed since the outcome was stored, preserving the
+original schedule.
 
-This is disabled by default because it adds one object-store read per step
-delivery (the replay lookup) plus one write per recorded outcome, and makes
-that write part of step settlement. The replay records are scoped to one
-run and step; they are not a cross-run cache. They are cleared with the
-run's memo entries when memo retention is configured.
+Replay is disabled by default because it adds one object-store read per
+step delivery (the replay lookup) plus one write per recorded outcome,
+and makes that write part of step settlement. The records are scoped to
+one run and step, and are removed with the run's memo entries when memo
+retention is configured.
 
 ## Memo retention
 
-By default memo entries are retained indefinitely (appropriate for
-short-lived runs or workloads that manage cleanup externally). To
-enable automatic cleanup, configure a retention window via
+By default memo entries are retained indefinitely. To remove them
+automatically, configure a retention window via
 `WorkflowRuntimeBuilder::memo_retention`:
 
 ```rust,ignore
@@ -498,93 +471,54 @@ let runtime = WorkflowRuntime::builder(queue, store, runner, hook)
     .build();
 ```
 
-When retention is set, the runtime records a small terminal marker for
-every terminal state (Succeeded, Failed, Cancelled) and
-`WorkflowRuntime::run` spawns a background sweeper that reads those
-markers and clears the memo entries, step-output replay entries, and
-marker for any run whose marker is older than the retention window. The
-first sweep fires on startup so a restarted process catches markers left
-behind by an earlier one.
+When retention is set, every settlement that commits a terminal outcome
+(`Succeeded`, `Failed` or `Cancelled`) writes a terminal marker under
+`workflow/terminals/` in the queue's key-value namespace in the same
+transaction, so a marker exists exactly when the run's terminal outcome
+committed. `WorkflowRuntime::run` sweeps the markers on startup and on
+every retention interval, removing the memo entries, the step-output
+replay entries and the marker of every run whose marker is older than
+the window. The terminating timestamp precedes the run id in the key,
+so the sweep reads the expired set from the start of the range and
+stops at the first unexpired marker.
 
-A marker is a key under `workflow/terminals/` in the queue's key-value
-namespace, written in the same transaction that settles the run. It
-therefore exists exactly when the run's terminal outcome committed: a
-settlement that does not commit leaves no marker, and no path writes one
-for a run that is still executing. The terminating timestamp precedes
-the run id in the key, so the sweep reads the expired set from the start
-of the range and stops at the first unexpired marker.
+Because the sweep is keyed on terminal markers and a terminated run
+never resumes, the entries of an in-flight run are not removed, with
+one exception: entries are addressed by run id, and a terminated run
+releases its id, so a second run submitted under that id shares the
+first run's entries, and the first run's marker expires against them
+while the second run may still be executing. The second run re-executes
+the affected steps. Deletion is unguarded because every reader tolerates
+absence: a step that finds an entry absent re-executes the work, as it
+would under at-least-once delivery anyway.
 
-Because the sweep is keyed on those terminal markers, and a terminated
-run never resumes, it does not delete the memo or replay entries of an
-in-flight run that a resume may still read, with one exception given
-below. A resuming step that finds an entry absent re-executes the work
-(delivery is at-least-once regardless), so a missing entry is always
-safe to observe rather than a dangling reference: deletion is left
-unguarded precisely because every reader tolerates absence.
-
-The exception is a re-submitted run id. Entries are addressed by run id
-and a terminated run releases its id, so a second run submitted under
-that id shares the first run's entries, and the first run's marker
-expires against them while the second run may still be executing. The
-second run re-executes the affected steps. A run id's entries are
-therefore retained from the first run's termination, and every later run
-submitted under that id shares that window.
-
-Advanced cleanup policies (selective retention, externally-driven
-sweeps) can be built on `Queue::kv_scan` over that prefix and
+Other cleanup policies (selective retention, externally-driven sweeps)
+can be built on `Queue::kv_scan` over that prefix and
 `MemoStore::clear_memos_for_run`, without configuring
 `WorkflowRuntimeBuilder::memo_retention`.
 
 ## Time injection
 
-Every timestamp the runtime writes (the `submitted_at_ms` on the
-durable per-run record, the `run_at` it computes when a step
-continues with a `Trigger::After` delay, and the terminal-marker timestamps the
-memo-retention sweep consumes) is read through a `taquba::Clock`
-rather than `SystemTime::now()`. By default the runtime inherits
-the clock its `Queue` was opened with, so passing a `MockClock`
-to `OpenOptions::clock` virtualises both the queue and the
-workflow runtime in lockstep:
+Every timestamp the runtime writes (the `submitted_at_ms` on the durable
+per-run record, the `run_at` it computes for a `Trigger::After` delay and
+the terminal-marker timestamps the memo-retention sweep consumes) is read
+through a `taquba::Clock`. By default the runtime inherits the clock its
+`Queue` was opened with, so passing a `MockClock` to `OpenOptions::clock`
+virtualises both in lockstep, and `MockClock::advance` moves every
+time-based decision the runtime makes: `Trigger::After` delays, sweep
+eligibility and terminal-marker ages.
 
 ```rust,ignore
 let clock = MockClock::new(1_700_000_000_000);
 let opts = OpenOptions::default().clock(Arc::new(clock.clone()));
 let queue = Queue::open_with_options(store.clone(), "db", opts).await?;
 let runtime = WorkflowRuntime::builder(queue, store, runner, hook).build();
-// `runtime` reads the same clock as `queue`; `clock.advance(...)`
-// moves every time-based decision the runtime makes.
+// `runtime` reads the same clock as `queue`.
 ```
 
-Override the inherited default via `WorkflowRuntimeBuilder::clock`
-when a test or specialised setup needs the runtime on a different
-time source than the queue. The common case for production callers
-is to leave the default and let the queue's `SystemClock` flow
-through.
-
-This makes downstream tests deterministic: `Trigger::After` delays,
-memo-retention sweep eligibility, and terminal-marker ages all
-advance under explicit `MockClock::advance` calls rather than
-wall-clock waits.
-
-## Duplicate submissions
-
-`WorkflowRuntime::submit` is idempotent on `(run_id, spec.input)`. A
-re-submission of an active run that carries the same input is a no-op
-and the returned `SubmitOutcome` has `newly_submitted = false`. A
-re-submission that carries a *different* input is rejected with
-`Error::InputMismatch`: reusing a `run_id` with new content is a
-programmer error; choose a fresh `run_id` for a new run.
-
-Duplicates are caught by a **durable per-run record** written atomically
-with the step-0 enqueue (via Taquba's `enqueue_with_kv`), so they are
-caught across process restarts, even after step 0 has been claimed and its
-dedup key released. The record carries a SHA-256 of the original input for
-the mismatch check. A current-step pointer under `workflow/steps/` is
-written beside it, rewritten in the settlement that enqueues each next
-step, and names the queue job `SubmitOutcome::job_id` reports for a
-duplicate; a `QueueReader` can read it to resolve a run's live job from
-outside the process. Both are cleaned up when the run reaches a terminal
-state.
+`WorkflowRuntimeBuilder::clock` overrides the inherited default when a
+test or specialised setup needs the runtime on a different time source
+than the queue.
 
 ## Terminal hook
 
