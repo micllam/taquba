@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminate by `JobGroup::results` or returned in submission order by
   `JobGroup::join`, plus `status` and `forget`;
   `JobRunnerBuilder::group_retention` removes a group's state a window
-  after its members terminated. Members are keyed by the job's
+  after a consumer observed its last termination. Members are keyed by the job's
   idempotency key or `item-{i}`, and a member's job id is derived from
   the group id and its key. `Error::DuplicateMemberKey`,
   `GroupMismatch`, `GroupNotFound` and `InvalidGroupId` are its errors.
@@ -41,7 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `status` as a `GroupStatus`, `cancel` and `forget`), the mechanism
   under `jobs::JobGroup`, which gains `cancel`;
   `WorkflowRuntimeBuilder::group_retention` removes a group's state a
-  window after its members terminated.
+  window after a `results` consumer observed its last termination.
 - `WorkflowRuntime::outcome`: the committed `RunOutcome` of a terminated
   run, read from the run result record the worker writes to the run's
   memo under the reserved key `workflow.outcome` before every

@@ -300,11 +300,12 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     }
 
     /// Remove a [`RunGroup`]'s state (its manifest, member records and
-    /// the memo entries of its members) `retention` after every member
-    /// of the group terminated, through a sweep when the worker starts
-    /// and on every retention interval after that. When unset (default),
-    /// no group terminal marker is written and a group is retained until
-    /// [`RunGroup::forget`].
+    /// the memo entries of its members) `retention` after a
+    /// [`RunGroup::results`] consumer observed the last member's
+    /// termination, through a sweep when the worker starts and on every
+    /// retention interval after that. When unset (default), no group
+    /// terminal marker is written. A group whose results are never
+    /// consumed is retained until [`RunGroup::forget`] in either case.
     ///
     /// Panics if `retention < 1ms`.
     pub fn group_retention(mut self, retention: Duration) -> Self {

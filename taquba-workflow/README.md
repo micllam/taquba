@@ -346,8 +346,10 @@ member record per key under `workflow/groups/` in the queue's key-value
 namespace, written with the member's submission and rewritten with its
 status and error by the settlement that terminates it.
 `RunGroup::forget` removes it and `WorkflowRuntimeBuilder::group_retention`
-removes it a window after the members all terminated, through a sweep
-over `workflow/group-terminals/`.
+removes it a window after a `RunGroup::results` consumer observed the
+last termination, through a sweep over `workflow/group-terminals/`; a
+group whose results are never consumed is retained until it is
+forgotten.
 
 ## Typed jobs
 

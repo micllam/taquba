@@ -16,17 +16,10 @@ use crate::{Result, StepErrorKind};
 
 /// A [`RunGroup`] of jobs of one type, identified by a group id.
 /// Obtained from [`JobRunner::group`](crate::jobs::JobRunner::group) or
-/// [`JobRunner::new_group`](crate::jobs::JobRunner::new_group).
-///
-/// The group's members are identified by key: a job's
-/// [`idempotency_key`](Job::idempotency_key), or its position as
-/// `item-{i}`. A member's job id is derived from the group id and its
-/// key, so the same job submitted to two groups runs twice, and a
-/// second [`submit`](Self::submit) of the group runs again every member
-/// that did not succeed. The group's membership is a durable manifest,
-/// so [`join`](Self::join), [`status`](Self::status),
-/// [`cancel`](Self::cancel) and [`forget`](Self::forget) answer after a
-/// restart and from any runner over the same queue.
+/// [`JobRunner::new_group`](crate::jobs::JobRunner::new_group). Members
+/// are keyed by the job's [`idempotency_key`](Job::idempotency_key) or
+/// the positional `item-{i}`; see the [module
+/// documentation](crate::jobs#job-groups).
 pub struct JobGroup<J: Job> {
     inner: Arc<Inner>,
     id: String,

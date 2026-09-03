@@ -507,8 +507,11 @@ impl JobRunnerBuilder {
 
     /// Remove a job group's state (its manifest, member records and the
     /// memo entries and run result records of its members) `retention`
-    /// after every member of the group terminated. When unset (default),
-    /// a group is retained until [`JobGroup::forget`].
+    /// after a [`JobGroup::results`] or [`JobGroup::join`] consumer
+    /// observed the last member's termination; see
+    /// [`WorkflowRuntimeBuilder::group_retention`](crate::WorkflowRuntimeBuilder::group_retention).
+    /// When unset (default), a group is retained until
+    /// [`JobGroup::forget`].
     ///
     /// # Panics
     ///

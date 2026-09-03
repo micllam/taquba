@@ -141,7 +141,8 @@
 //! joins the recorded results of the members that completed.
 //! [`JobGroup::status`], [`JobGroup::cancel`] and [`JobGroup::forget`]
 //! are the run group's; [`JobRunnerBuilder::group_retention`] removes a
-//! group's state a window after its members all terminated.
+//! group's state a window after a consumer observed its last
+//! termination.
 //!
 //! ```ignore
 //! let group = runner.group::<FetchPage>(format!("fetch-{run_id}"))?;
