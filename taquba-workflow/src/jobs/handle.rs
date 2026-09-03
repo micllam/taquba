@@ -221,7 +221,10 @@ pub(crate) fn decode_result<J: Job>(
             Ok(Ok(rmp_serde::from_slice(&output)?))
         }
         TerminalStatus::Failed => Ok(Err(JobError {
-            kind: result.error_kind.unwrap_or(StepErrorKind::Permanent),
+            kind: result
+                .termination
+                .error_kind
+                .unwrap_or(StepErrorKind::Permanent),
             message: outcome.error.unwrap_or_default(),
         })),
         TerminalStatus::Cancelled => Ok(Err(JobError {

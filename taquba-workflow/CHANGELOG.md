@@ -14,8 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Step::detached(payload)` step 0 over it, for tests.
 - `Delivery::is_last_attempt`: whether a transient `StepError` from this
   attempt dead-letters the step.
-- `RunState::Terminated(RunTermination)`: the status, error and time of
-  termination of a terminated run, reported by `WorkflowRuntime::status`
+- `RunState::Terminated(RunTermination)`: the status, error, error kind
+  and time of termination of a terminated run, reported by `WorkflowRuntime::status`
   and `jobs::JobHandle::status` from a terminal record under
   `workflow/outcomes/{run_id}`. The record is written in the terminating
   settlement when `WorkflowRuntimeBuilder::memo_retention` is set and
@@ -47,9 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   memo under the reserved key `workflow.outcome` before every
   terminating settlement it performs; a cancellation of a pending step
   and a dead-letter outside the worker write none. The record holds the
-  result or error, the submitter's headers, the final step and the
-  input hash, and is removed with the run's memo entries by the memo
-  sweep.
+  result or error, the submitter's headers, the final step, the input
+  hash and the time and error kind of its termination, and is removed
+  with the run's memo entries by the memo sweep.
 
 ### Removed
 
@@ -72,6 +72,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The output sink, progress snapshot, fail threshold and cost rollup
   are folds the caller writes over the results, as
   `examples/group_document_pipeline.rs` does.
+
+### Fixed
+
+- Dead-step reconciliation identifies a step dead-lettered outside the
+  worker by the run's current-step pointer naming the dead job, rather
+  than by the run record's existence. A run id submitted again while
+  the earlier run's dead job was retained was terminated at once with
+  that job's error.
 
 ### Changed
 

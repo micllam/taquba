@@ -459,15 +459,16 @@ impl<'a, R: StepRunner, H: TerminalHook> RunGroup<'a, R, H> {
     }
 
     /// The run result record of a terminated member, when the worker
-    /// that terminated it wrote one. The record's status must match the
-    /// member record's: a record outlives a re-submission of the member
-    /// until the next termination overwrites it.
+    /// that terminated it wrote one. The record must belong to the
+    /// member record's termination: a record outlives a re-submission
+    /// of the member until the next termination overwrites it.
     pub(crate) async fn recorded_result(&self, member: &MemberState) -> Result<Option<RunResult>> {
+        let termination = member.record.terminated.clone().map(RunTermination::from);
         Ok(self
             .core()
             .run_result(&member.record.run_id)
             .await?
-            .filter(|result| Some(result.outcome.status) == member.status()))
+            .filter(|result| Some(&result.termination) == termination.as_ref()))
     }
 
     /// The group's durable state. Returns [`Error::GroupNotFound`] for a
@@ -620,6 +621,68 @@ mod tests {
         }
     }
 
+    /// Fails permanently.
+    struct Rejecting;
+
+    impl StepRunner for Rejecting {
+        async fn run_step(&self, _: &Step) -> std::result::Result<StepOutcome, StepError> {
+            Err(StepError::permanent("rejected"))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_result_record_of_an_earlier_termination_is_not_reported_for_a_re_run_member() {
+        let (queue, store, clock) = open_queue_at(10_000).await;
+        let runtime =
+            WorkflowRuntime::builder(queue.clone(), store, Rejecting, NoopTerminalHook).build();
+        let group = runtime.group("g").unwrap();
+        group
+            .submit(vec![member("a")], &MemberSpec::default())
+            .await
+            .unwrap();
+        let worker = runtime.spawn(std::future::pending::<()>());
+        let first: Vec<MemberResult> = tokio::time::timeout(Duration::from_secs(10), async {
+            group.results().await.unwrap().try_collect().await
+        })
+        .await
+        .expect("results finished in time")
+        .unwrap();
+        assert_eq!(first[0].termination.error.as_deref(), Some("rejected"));
+        assert_eq!(
+            first[0].termination.error_kind,
+            Some(crate::StepErrorKind::Permanent)
+        );
+        assert!(
+            first[0].outcome.is_some(),
+            "the worker recorded the failure"
+        );
+        worker.shutdown().await.unwrap();
+
+        // The member runs again and is dead-lettered inside the core, so
+        // reconciliation terminates it and no new record is written.
+        clock.advance(Duration::from_secs(1));
+        group
+            .submit(vec![member("a")], &MemberSpec::default())
+            .await
+            .unwrap();
+        let claim = queue
+            .claim("workflow-steps", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        queue.dead_letter(&claim, "hung").await.unwrap();
+        assert_eq!(runtime.inner.reconcile_dead_steps().await.unwrap(), 1);
+
+        let second: Vec<MemberResult> = group.results().await.unwrap().try_collect().await.unwrap();
+        assert_eq!(second[0].termination.error.as_deref(), Some("hung"));
+        assert_eq!(second[0].termination.error_kind, None);
+        assert_eq!(second[0].termination.terminated_at_ms, 11_000);
+        assert!(
+            second[0].outcome.is_none(),
+            "the first termination's record does not belong to the second",
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn membership_holds_across_steps_and_terminations_wait_for_the_last_one() {
         let (queue, store) = open_queue().await;
@@ -690,6 +753,7 @@ mod tests {
             RunTermination {
                 status: TerminalStatus::Cancelled,
                 error: None,
+                error_kind: None,
                 terminated_at_ms: 10_000,
             }
         );

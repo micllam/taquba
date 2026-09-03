@@ -210,15 +210,17 @@ impl From<DurableTerminalStatus> for TerminalStatus {
     }
 }
 
-/// The durable terminal record of a run, written under
-/// `workflow/outcomes/{run_id}` in the settlement that terminates the
-/// run when memo retention is set, and read by
+/// The stored form of a [`RunTermination`](crate::RunTermination) with
+/// the final step: the terminal record under `workflow/outcomes/{run_id}`,
+/// written in the settlement that terminates the run when memo
+/// retention is set and read by
 /// [`WorkflowRuntime::status`](crate::WorkflowRuntime::status) once the
-/// run record is gone.
+/// run record is gone, and the termination half of a member record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DurableTermination {
     pub(crate) status: DurableTerminalStatus,
     pub(crate) error: Option<String>,
+    pub(crate) error_kind: Option<DurableErrorKind>,
     pub(crate) final_step: u32,
     pub(crate) terminated_at_ms: u64,
 }
@@ -274,11 +276,13 @@ impl From<DurableErrorKind> for StepErrorKind {
 /// [`RUN_RESULT_MEMO_KEY`](crate::memo::RUN_RESULT_MEMO_KEY) by the
 /// worker before the settlement that terminates the run: the committed
 /// outcome, the SHA-256 of the run's input for an idempotent
-/// re-submission after completion and the kind of the [`StepError`]
-/// that terminated a run through a dead-letter.
+/// re-submission after completion, and the time and error kind of the
+/// termination, which with the outcome identify the termination the
+/// record belongs to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DurableRunResult {
     pub(crate) input_hash: [u8; 32],
+    pub(crate) terminated_at_ms: u64,
     pub(crate) error_kind: Option<DurableErrorKind>,
     pub(crate) outcome: DurableRunOutcome,
 }

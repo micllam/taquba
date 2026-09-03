@@ -158,32 +158,36 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         input_hash: [u8; 32],
     ) -> WorkerError {
         let outcome = claimed.failed(error.message.clone());
+        let termination = self.core.termination(&outcome, Some(error.kind));
         if let Err(err) = self
             .core
-            .store_run_result(&outcome, input_hash, Some(error.kind))
+            .store_run_result(&outcome, input_hash, &termination)
             .await
         {
             warn!(run_id = %claimed.run_id, "failed to write the run result record: {err}");
         }
-        let effects = self.terminate_collecting_effects(&outcome, claimed);
+        let effects = self.terminate_collecting_effects(&outcome, claimed, termination);
         FailWith::new(error.into_worker_error(), effects).into()
     }
 
     /// Terminate the run of `claimed` with `outcome` from an acking
     /// settlement: write the run result record, then build the
     /// settlement effects. A failed write is a transient error, so the
-    /// step is delivered again.
+    /// step is delivered again. `error_kind` classifies a `Failed`
+    /// outcome.
     async fn terminate_recorded(
         &self,
         claimed: &ClaimedStep<'_>,
         outcome: RunOutcome,
         input_hash: [u8; 32],
+        error_kind: Option<StepErrorKind>,
     ) -> std::result::Result<SettlementEffects, WorkerError> {
+        let termination = self.core.termination(&outcome, error_kind);
         self.core
-            .store_run_result(&outcome, input_hash, None)
+            .store_run_result(&outcome, input_hash, &termination)
             .await
             .map_err(|err| StepError::from(err).into_worker_error())?;
-        Ok(self.terminate_collecting_effects(&outcome, claimed))
+        Ok(self.terminate_collecting_effects(&outcome, claimed, termination))
     }
 
     /// Process a terminal-notification job: decode the committed
@@ -255,7 +259,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             })?;
         if record.cancel_requested {
             let mut effects = self
-                .terminate_recorded(&claimed, claimed.cancelled(None), record.input_hash)
+                .terminate_recorded(&claimed, claimed.cancelled(None), record.input_hash, None)
                 .await?;
             effects.kv_deletes.extend(signal_kv_deletes);
             return Ok(effects);
@@ -365,11 +369,11 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     ) -> std::result::Result<SettlementEffects, WorkerError> {
         match outcome {
             Ok(StepOutcome::Cancel { reason }) => {
-                self.terminate_recorded(claimed, claimed.cancelled(Some(reason)), input_hash)
+                self.terminate_recorded(claimed, claimed.cancelled(Some(reason)), input_hash, None)
                     .await
             }
             _ if external_cancel => {
-                self.terminate_recorded(claimed, claimed.cancelled(None), input_hash)
+                self.terminate_recorded(claimed, claimed.cancelled(None), input_hash, None)
                     .await
             }
             Ok(StepOutcome::Continue { payload, when }) => match when {
@@ -393,14 +397,19 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 }
             },
             Ok(StepOutcome::Succeed { result }) => {
-                self.terminate_recorded(claimed, claimed.succeeded(result), input_hash)
+                self.terminate_recorded(claimed, claimed.succeeded(result), input_hash, None)
                     .await
             }
             // A runner verdict: the step ran cleanly and is acknowledged;
             // the run terminates as `Failed` without a dead-letter.
             Ok(StepOutcome::Fail { reason }) => {
-                self.terminate_recorded(claimed, claimed.failed(reason), input_hash)
-                    .await
+                self.terminate_recorded(
+                    claimed,
+                    claimed.failed(reason),
+                    input_hash,
+                    Some(StepErrorKind::Permanent),
+                )
+                .await
             }
             // A permanent error, or a transient one on the last attempt,
             // dead-letters the step and terminates the run.

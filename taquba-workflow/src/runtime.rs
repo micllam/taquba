@@ -165,11 +165,10 @@ pub enum RunState {
 }
 
 /// A run result record as read back: the committed outcome, the hash
-/// of the run's input and the kind of the error that dead-lettered the
-/// run, when one did.
+/// of the run's input and the termination the record belongs to.
 pub(crate) struct RunResult {
     pub(crate) input_hash: [u8; 32],
-    pub(crate) error_kind: Option<StepErrorKind>,
+    pub(crate) termination: RunTermination,
     pub(crate) outcome: RunOutcome,
 }
 
@@ -183,6 +182,12 @@ pub struct RunTermination {
     /// [`StepOutcome::Cancel`]; `None` for a success and for an external
     /// cancellation.
     pub error: Option<String>,
+    /// The classification of a failure: the kind of the
+    /// [`StepError`](crate::StepError) that dead-lettered the run, or
+    /// [`StepErrorKind::Permanent`] for a [`StepOutcome::Fail`] verdict.
+    /// `None` for a success, a cancellation and a termination outside
+    /// the worker.
+    pub error_kind: Option<StepErrorKind>,
     /// The runtime clock's time at the terminating settlement, in
     /// milliseconds since the Unix epoch.
     pub terminated_at_ms: u64,
@@ -193,6 +198,7 @@ impl From<DurableTermination> for RunTermination {
         Self {
             status: record.status.into(),
             error: record.error,
+            error_kind: record.error_kind.map(Into::into),
             terminated_at_ms: record.terminated_at_ms,
         }
     }
@@ -735,9 +741,11 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             // `error` is `None`: external cancellation supplies no reason
             // at the API level. The effects are built before the outcome
             // is known; the queue applies them only on `Removed`.
+            let outcome = claimed.cancelled(None);
+            let termination = core.termination(&outcome, None);
             let effects = self
                 .inner
-                .terminate_collecting_effects(&claimed.cancelled(None), &claimed);
+                .terminate_collecting_effects(&outcome, &claimed, termination);
             match core.queue.cancel_with(&job.id, effects).await?.0 {
                 taquba::CancelOutcome::Removed | taquba::CancelOutcome::Requested => {
                     return Ok(true);
@@ -900,11 +908,19 @@ impl RuntimeCore {
             return Ok(None);
         };
         match rmp_serde::from_slice::<DurableRunResult>(&bytes) {
-            Ok(record) => Ok(Some(RunResult {
-                input_hash: record.input_hash,
-                error_kind: record.error_kind.map(Into::into),
-                outcome: record.outcome.into(),
-            })),
+            Ok(record) => {
+                let outcome = RunOutcome::from(record.outcome);
+                Ok(Some(RunResult {
+                    input_hash: record.input_hash,
+                    termination: RunTermination {
+                        status: outcome.status,
+                        error: outcome.error.clone(),
+                        error_kind: record.error_kind.map(Into::into),
+                        terminated_at_ms: record.terminated_at_ms,
+                    },
+                    outcome,
+                }))
+            }
             Err(err) => {
                 warn!(run_id, error = %err, "run result record failed to decode; treated as absent");
                 Ok(None)
@@ -912,16 +928,33 @@ impl RuntimeCore {
         }
     }
 
-    /// Write the run result record of `outcome`'s run.
+    /// The termination of `outcome`'s run at the clock's current time.
+    pub(crate) fn termination(
+        &self,
+        outcome: &RunOutcome,
+        error_kind: Option<StepErrorKind>,
+    ) -> DurableTermination {
+        DurableTermination {
+            status: outcome.status.into(),
+            error: outcome.error.clone(),
+            error_kind: error_kind.map(DurableErrorKind::from),
+            final_step: outcome.final_step,
+            terminated_at_ms: self.clock.now_ms(),
+        }
+    }
+
+    /// Write the run result record of `outcome`'s run, belonging to
+    /// `termination`.
     pub(crate) async fn store_run_result(
         &self,
         outcome: &RunOutcome,
         input_hash: [u8; 32],
-        error_kind: Option<StepErrorKind>,
+        termination: &DurableTermination,
     ) -> Result<()> {
         let record = DurableRunResult {
             input_hash,
-            error_kind: error_kind.map(DurableErrorKind::from),
+            terminated_at_ms: termination.terminated_at_ms,
+            error_kind: termination.error_kind,
             outcome: DurableRunOutcome::from(outcome),
         };
         self.memo_store
@@ -1138,7 +1171,8 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     /// for the settlement transaction. The notification job's payload
     /// is the committed outcome and the configured [`TerminalHook`]
     /// runs as its worker; `terminal_step` is the step that produced
-    /// the outcome, or the pending step a cancellation removes.
+    /// the outcome, or the pending step a cancellation removes, and
+    /// `termination` the record of the outcome the settlement writes.
     ///
     /// The effects are pure: nothing is written and no state is
     /// mutated here, so a caller that builds them and then commits a
@@ -1149,19 +1183,13 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         &self,
         outcome: &RunOutcome,
         terminal_step: &ClaimedStep<'_>,
+        termination: DurableTermination,
     ) -> SettlementEffects {
         let kv_deletes = vec![run_kv_key(&outcome.run_id), step_kv_key(&outcome.run_id)];
-        let terminated_at_ms = self.core.clock.now_ms();
-        let termination = DurableTermination {
-            status: outcome.status.into(),
-            error: outcome.error.clone(),
-            final_step: outcome.final_step,
-            terminated_at_ms,
-        };
         let mut kv_writes = HashMap::new();
         if self.core.memo_retention.is_some() {
             kv_writes.insert(
-                terminal_kv_key(&outcome.run_id, terminated_at_ms),
+                terminal_kv_key(&outcome.run_id, termination.terminated_at_ms),
                 Vec::new(),
             );
             kv_writes.insert(
@@ -1194,10 +1222,11 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     /// limit, or a claim dead-lettered by crash recovery when the queue
     /// was opened. Such a settlement runs no workflow code, so the run
     /// record and the current-step pointer survive it and no
-    /// notification is enqueued. A dead step job whose run record still
-    /// exists identifies the case exactly, because every worker-path
-    /// dead-letter deletes the record in its own transaction. The run
-    /// terminates as [`TerminalStatus::Failed`] with the queue record's
+    /// notification is enqueued. A dead step job that the run's
+    /// current-step pointer names identifies the case exactly, because
+    /// every worker-path dead-letter deletes the pointer in its own
+    /// transaction and a re-submission of the run id names a new job.
+    /// The run terminates as [`TerminalStatus::Failed`] with the queue record's
     /// last error, through the same effects as a worker-path
     /// termination committed as one transaction with no transition of
     /// their own; the runner's failure writes cannot apply, since no
@@ -1215,14 +1244,17 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 continue;
             };
             let run_id = claimed.run_id.as_str();
-            if core.queue.kv_get(&run_kv_key(run_id)).await?.is_none() {
+            let current = core.current_step_if_active(run_id).await?;
+            if current.is_none_or(|current| current.job_id != job.id) {
                 continue;
             }
             let error = job
                 .last_error
                 .clone()
                 .unwrap_or_else(|| "step dead-lettered outside the worker".to_string());
-            let effects = self.terminate_collecting_effects(&claimed.failed(error), &claimed);
+            let outcome = claimed.failed(error);
+            let termination = core.termination(&outcome, None);
+            let effects = self.terminate_collecting_effects(&outcome, &claimed, termination);
             core.queue.commit_effects(effects).await?;
             warn!(run_id = %run_id, step_number = claimed.step_number, job_id = %job.id, "terminated a run whose step was dead-lettered outside the worker");
             terminated += 1;
@@ -2890,6 +2922,7 @@ mod tests {
             RunState::Terminated(RunTermination {
                 status: TerminalStatus::Cancelled,
                 error: None,
+                error_kind: None,
                 terminated_at_ms: 10_000,
             }),
             "the terminal record commits with the removal",
@@ -3475,10 +3508,11 @@ mod tests {
                 RunState::Terminated(RunTermination {
                     status: TerminalStatus::Failed,
                     error: Some(ref error),
+                    error_kind: Some(StepErrorKind::Permanent),
                     ..
                 }) if error == "nope"
             ),
-            "the terminal record commits with the dead-letter",
+            "the terminal record commits with the dead-letter and carries the error kind",
         );
         let recorded = runtime.outcome(&handle.run_id).await.unwrap().unwrap();
         assert_eq!(recorded.status, TerminalStatus::Failed);
@@ -4158,8 +4192,25 @@ mod tests {
         assert!(queue.kv_get(&run_kv_key("hung")).await.unwrap().is_none());
         assert!(queue.kv_get(&step_kv_key("hung")).await.unwrap().is_none());
         assert!(runtime.status("hung").await.unwrap().is_none());
-
         let _ = shutdown.send(());
+
+        // The run id is submitted again while the dead job is retained:
+        // the pass identifies a core dead-letter by the current step's
+        // job, so the new run is left alone.
+        let again = runtime
+            .submit(RunSpec {
+                run_id: Some("hung".into()),
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(again.newly_submitted);
+        assert_eq!(runtime.inner.reconcile_dead_steps().await.unwrap(), 0);
+        assert!(
+            runtime.status("hung").await.unwrap().is_some(),
+            "the re-submitted run is active"
+        );
     }
 
     #[tokio::test(start_paused = true)]

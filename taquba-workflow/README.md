@@ -163,7 +163,7 @@ state.
 queue job into a `RunStatus` (`Pending`, `Running` or `Cancelling`,
 with the current step number), so it answers after a restart and from
 any runtime over the same queue. Under memo retention a terminated run
-reports `RunState::Terminated` with its status, error and time of
+reports `RunState::Terminated` with its status, error, error kind and time of
 termination, read from the terminal record described under
 [Memo retention](#memo-retention); without it, a terminated run has no
 status.
