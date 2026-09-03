@@ -3,6 +3,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures_util::TryStreamExt;
 use taquba::object_store::ObjectStore;
 use taquba::{
     Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, JobRecord, JobStatus, Queue,
@@ -24,6 +25,7 @@ use crate::keys::{
     validate_run_id,
 };
 use crate::memo::MemoStore;
+use crate::paging;
 use crate::registry::RunRegistry;
 use crate::runner::{StepOutcome, StepRunner, Trigger};
 use crate::sweep::Sweep;
@@ -1050,38 +1052,34 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         const PAGE: usize = 256;
         let core = &self.core;
         let mut terminated = 0usize;
-        let mut cursor: Option<Vec<u8>> = None;
-        loop {
-            let page = core
-                .queue
-                .list_jobs(&core.queue_name, JobStatus::Dead, cursor.as_deref(), PAGE)
-                .await?;
-            for job in &page.jobs {
-                if job.headers.contains_key(HEADER_TERMINAL) {
-                    continue;
-                }
-                let Ok(delivery) = StepDelivery::parse(job) else {
-                    continue;
-                };
-                let run_id = delivery.run_id.as_str();
-                if core.queue.kv_get(&run_kv_key(run_id)).await?.is_none() {
-                    continue;
-                }
-                let error = job
-                    .last_error
-                    .clone()
-                    .unwrap_or_else(|| "step dead-lettered outside the worker".to_string());
-                let effects = self.terminate_collecting_effects(&delivery.failed(error), Some(job));
-                core.queue.commit_effects(effects).await?;
-                core.forget_run(run_id);
-                warn!(run_id = %run_id, step_number = delivery.step_number, job_id = %job.id, "terminated a run whose step was dead-lettered outside the worker");
-                terminated += 1;
+        let mut dead = std::pin::pin!(paging::jobs(
+            &core.queue,
+            &core.queue_name,
+            JobStatus::Dead,
+            PAGE
+        ));
+        while let Some(job) = dead.try_next().await? {
+            if job.headers.contains_key(HEADER_TERMINAL) {
+                continue;
             }
-            match page.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => return Ok(terminated),
+            let Ok(delivery) = StepDelivery::parse(&job) else {
+                continue;
+            };
+            let run_id = delivery.run_id.as_str();
+            if core.queue.kv_get(&run_kv_key(run_id)).await?.is_none() {
+                continue;
             }
+            let error = job
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "step dead-lettered outside the worker".to_string());
+            let effects = self.terminate_collecting_effects(&delivery.failed(error), Some(&job));
+            core.queue.commit_effects(effects).await?;
+            core.forget_run(run_id);
+            warn!(run_id = %run_id, step_number = delivery.step_number, job_id = %job.id, "terminated a run whose step was dead-lettered outside the worker");
+            terminated += 1;
         }
+        Ok(terminated)
     }
 
     /// The reconciliation loop: a pass when the worker starts, then a

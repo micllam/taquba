@@ -575,6 +575,7 @@ mod keys;
 mod kv;
 mod memo;
 pub(crate) mod outcome;
+mod paging;
 mod registry;
 mod runner;
 mod runtime;

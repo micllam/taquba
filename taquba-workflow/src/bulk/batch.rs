@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::{MemoStore, RunSpec, RunnerHandle, TerminalStatus};
+use futures_util::TryStreamExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -30,6 +31,7 @@ use crate::keys::{
 use crate::outcome::{
     OutcomeRecord, StoredOutcome, Terminal, TypedRuntime, TypedRuntimeOptions, Unrecorded,
 };
+use crate::paging::kv_entries;
 use crate::sweep::Sweep;
 use crate::{Error, Result};
 
@@ -43,6 +45,8 @@ const DEFAULT_MAX_CONCURRENT: usize = 200;
 /// commit, and concurrent commits share WAL flushes, so at flush-bound
 /// latencies serial submission would cap at one item per flush.
 const SUBMIT_CONCURRENCY: usize = 32;
+/// Item markers read per page by [`Batch::status`] and [`BatchStore::forget`].
+const MARKER_PAGE_SIZE: usize = 1000;
 
 /// The workflow run id of an item: the hex SHA-256 digest of
 /// `{batch_id}/{key}`, so batches never share run state and any key string
@@ -184,23 +188,9 @@ impl BatchStore {
             }
         }
         let prefix = bulk_items_kv_prefix(id);
-        let mut cursor: Option<Vec<u8>> = None;
-        loop {
-            let page = self
-                .queue
-                .kv_scan(&prefix, cursor.as_deref(), 1000)
-                .await
-                .map_err(crate::Error::from)?;
-            for (key, _) in &page.entries {
-                self.queue
-                    .kv_delete(key)
-                    .await
-                    .map_err(crate::Error::from)?;
-            }
-            match page.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
+        let mut markers = std::pin::pin!(kv_entries(&self.queue, &prefix, MARKER_PAGE_SIZE));
+        while let Some((key, _)) = markers.try_next().await? {
+            self.queue.kv_delete(&key).await?;
         }
         self.manifests.delete(id).await
     }
@@ -651,35 +641,24 @@ impl<P: Pipeline> Batch<'_, P> {
             cost: CostReport::new(),
             failed_keys: Vec::new(),
         };
-        let mut cursor: Option<Vec<u8>> = None;
-        loop {
-            let page = inner
-                .store
-                .queue
-                .kv_scan(&prefix, cursor.as_deref(), 1000)
-                .await?;
-            for (kv_key, value) in &page.entries {
-                let key = String::from_utf8_lossy(&kv_key[prefix.len()..]).into_owned();
-                let marker: ItemMarker = match rmp_serde::from_slice(value) {
-                    Ok(marker) => marker,
-                    Err(err) => {
-                        warn!(batch_id = %self.id, key = %key, error = %err, "item marker failed to decode");
-                        continue;
-                    }
-                };
-                match marker.status {
-                    MarkerStatus::Succeeded => status.succeeded += 1,
-                    MarkerStatus::Failed => {
-                        status.failed += 1;
-                        status.failed_keys.push(key);
-                    }
+        let mut markers = std::pin::pin!(kv_entries(&inner.store.queue, &prefix, MARKER_PAGE_SIZE));
+        while let Some((kv_key, value)) = markers.try_next().await? {
+            let key = String::from_utf8_lossy(&kv_key[prefix.len()..]).into_owned();
+            let marker: ItemMarker = match rmp_serde::from_slice(&value) {
+                Ok(marker) => marker,
+                Err(err) => {
+                    warn!(batch_id = %self.id, key = %key, error = %err, "item marker failed to decode");
+                    continue;
                 }
-                status.cost.merge(&marker.cost);
+            };
+            match marker.status {
+                MarkerStatus::Succeeded => status.succeeded += 1,
+                MarkerStatus::Failed => {
+                    status.failed += 1;
+                    status.failed_keys.push(key);
+                }
             }
-            match page.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
+            status.cost.merge(&marker.cost);
         }
         Ok(status)
     }

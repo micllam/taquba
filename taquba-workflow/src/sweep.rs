@@ -13,12 +13,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::TryStreamExt;
 use taquba::{Clock, Queue};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::error::Result;
 use crate::keys::{parse_timestamped_kv_key, validate_run_id};
+use crate::paging::kv_entries;
 
 /// Terminal markers read per page by a sweep pass.
 const SWEEP_PAGE_SIZE: usize = 256;
@@ -91,45 +93,36 @@ impl Sweep {
             .now_ms()
             .saturating_sub(self.retention.as_millis() as u64);
         let mut cleared = 0usize;
-        let mut cursor: Option<Vec<u8>> = None;
-        loop {
-            let page = queue
-                .kv_scan(self.prefix, cursor.as_deref(), SWEEP_PAGE_SIZE)
-                .await?;
-            let exhausted = page.next_cursor.is_none();
-            cursor = page.next_cursor;
-            for (key, _) in page.entries {
-                let parsed = parse_timestamped_kv_key(self.prefix, &key)
-                    .filter(|(id, _)| validate_run_id(id).is_ok());
-                let Some((id, ts_ms)) = parsed else {
+        let mut markers = std::pin::pin!(kv_entries(queue, self.prefix, SWEEP_PAGE_SIZE));
+        while let Some((key, _)) = markers.try_next().await? {
+            let parsed = parse_timestamped_kv_key(self.prefix, &key)
+                .filter(|(id, _)| validate_run_id(id).is_ok());
+            let Some((id, ts_ms)) = parsed else {
+                warn!(
+                    key = %String::from_utf8_lossy(&key),
+                    "malformed marker; deleting without clearing",
+                );
+                if let Err(err) = queue.kv_delete(&key).await {
                     warn!(
                         key = %String::from_utf8_lossy(&key),
-                        "malformed marker; deleting without clearing",
+                        "malformed marker delete failed during sweep: {err}",
                     );
-                    if let Err(err) = queue.kv_delete(&key).await {
-                        warn!(
-                            key = %String::from_utf8_lossy(&key),
-                            "malformed marker delete failed during sweep: {err}",
-                        );
-                    }
-                    continue;
-                };
-                if ts_ms >= cutoff_ms {
-                    return Ok(cleared);
                 }
-                if let Err(err) = (self.clear)(id.clone()).await {
-                    warn!(id = %id, "clear failed during sweep: {err}");
-                    continue;
-                }
-                if let Err(err) = queue.kv_delete(&key).await {
-                    warn!(id = %id, "marker delete failed during sweep: {err}");
-                    continue;
-                }
-                cleared += 1;
+                continue;
+            };
+            if ts_ms >= cutoff_ms {
+                break;
             }
-            if exhausted {
-                return Ok(cleared);
+            if let Err(err) = (self.clear)(id.clone()).await {
+                warn!(id = %id, "clear failed during sweep: {err}");
+                continue;
             }
+            if let Err(err) = queue.kv_delete(&key).await {
+                warn!(id = %id, "marker delete failed during sweep: {err}");
+                continue;
+            }
+            cleared += 1;
         }
+        Ok(cleared)
     }
 }
