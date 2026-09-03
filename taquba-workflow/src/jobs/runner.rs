@@ -833,7 +833,7 @@ mod tests {
             other => panic!("expected JoinError::Job, got {other:?}"),
         }
         assert_eq!(count_jobs(&queue, JobStatus::Dead).await, 1);
-        assert!(job.status().await.is_none());
+        assert!(job.status().await.unwrap().is_none());
 
         handle.shutdown().await.unwrap();
     }
@@ -1127,7 +1127,7 @@ mod tests {
         // Long enough for the worker to claim, run and ack the job before
         // the wait starts.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(job.status().await.is_none());
+        assert!(job.status().await.unwrap().is_none());
 
         assert_eq!(job.await.unwrap(), 42);
 

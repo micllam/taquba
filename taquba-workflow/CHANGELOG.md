@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (source and storage):** run status and cancellation are
+  durable. `WorkflowRuntime::status` and `jobs::JobHandle::status`
+  return `Result<Option<RunStatus>>`, read from the run record, the
+  current-step pointer and the step's queue job, so they answer after
+  a restart and from any runtime over the same queue.
+  `WorkflowRuntime::cancel` records the request on the run record
+  (a new `cancel_requested` field, which changes the record's layout),
+  reaches a run after a restart, and a step claimed after the request
+  is settled as cancelled without running. The in-process run registry
+  is gone.
 - `RunnerHandle` is `taquba::WorkerHandle<Result<()>>`.
 - **Breaking (source):** `Step` is `#[non_exhaustive]`. A struct
   literal outside the crate moves to `Step::detached` and assigns its

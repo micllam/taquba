@@ -113,10 +113,10 @@ impl<J: Job> JobHandle<J> {
         self.newly_submitted
     }
 
-    /// The job's in-process status, or `None` once it has terminated or if
-    /// this runtime never observed it. Use
-    /// [`fetch_result`](Self::fetch_result) to read a terminal outcome.
-    pub async fn status(&self) -> Option<RunStatus> {
+    /// The job's status, read from its durable state, or `None` once it
+    /// has terminated. Use [`fetch_result`](Self::fetch_result) to read
+    /// a terminal outcome.
+    pub async fn status(&self) -> Result<Option<RunStatus>> {
         self.inner.typed.runtime.status(&self.id).await
     }
 

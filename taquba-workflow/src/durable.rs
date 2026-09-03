@@ -25,19 +25,22 @@ use crate::terminal::{RunOutcome, TerminalStatus};
 /// just enough state to detect duplicate submissions across runtime
 /// restarts and to reject re-submissions that change the input;
 /// the in-memory registry remains the source of truth for active-run
-/// status and cancellation while a runtime is up. Deleted with the
-/// settlement that terminates the run, staged in
-/// `terminate_collecting_effects`.
+/// status and cancellation. Deleted with the settlement that
+/// terminates the run, staged in `terminate_collecting_effects`.
 ///
 /// `run_id` keeps the record self-describing for ad hoc operator
 /// inspection; `submitted_at_ms` is useful for ordering and stale-record
 /// auditing; `input_hash` is the SHA-256 of the original `spec.input` and
 /// powers the `Error::InputMismatch` check on duplicate submissions.
+/// `cancel_requested` is set by `WorkflowRuntime::cancel` on this key
+/// so that the write conflicts with the termination's delete of the
+/// record and a request can never outlive the run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DurableRunRecord {
     pub(crate) run_id: String,
     pub(crate) submitted_at_ms: u64,
     pub(crate) input_hash: [u8; 32],
+    pub(crate) cancel_requested: bool,
 }
 
 /// Durable pointer from a run to the queue job currently representing

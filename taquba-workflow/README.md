@@ -206,13 +206,13 @@ outside the runner:
   Watching the token only reduces cancellation latency for slow steps;
   it doesn't change semantics.
 
-While termination is in flight, `WorkflowRuntime::status` reports a
-`RunState::Cancelling` overlay until the entry is dropped.
+The request is recorded on the run's durable record, so a step claimed
+after it is settled as cancelled without running, and the request reaches
+the run after a restart and from any runtime over the same queue. While
+termination is in flight, `WorkflowRuntime::status` reports
+`RunState::Cancelling`.
 
-Returns `Ok(false)` if the run is unknown or already terminal in this
-runtime. `cancel` only reaches runs submitted to this `WorkflowRuntime`
-instance; a second runtime in the same process (sharing the queue)
-maintains its own registry.
+Returns `Ok(false)` if the run is unknown or already terminal.
 
 ## Long-running steps
 
@@ -566,19 +566,16 @@ re-submission that carries a *different* input is rejected with
 `Error::InputMismatch`: reusing a `run_id` with new content is a
 programmer error; choose a fresh `run_id` for a new run.
 
-Duplicates are caught from two sources, in order:
-
-1. An in-process registry catches duplicates within the same runtime.
-2. A **durable per-run record** written atomically with the step-0 enqueue
-   (via Taquba's `enqueue_with_kv`) catches duplicates across process
-   restarts, even after step 0 has been claimed and its dedup key released.
-   The record carries a SHA-256 of the original input so the cross-restart
-   mismatch check works even when the in-memory registry is empty. A
-   current-step pointer under `workflow/steps/` is written beside it,
-   rewritten in the settlement that enqueues each next step, and names the
-   queue job `SubmitOutcome::job_id` reports for a duplicate; a
-   `QueueReader` can read it to resolve a run's live job from outside the
-   process. Both are cleaned up when the run reaches a terminal state.
+Duplicates are caught by a **durable per-run record** written atomically
+with the step-0 enqueue (via Taquba's `enqueue_with_kv`), so they are
+caught across process restarts, even after step 0 has been claimed and its
+dedup key released. The record carries a SHA-256 of the original input for
+the mismatch check. A current-step pointer under `workflow/steps/` is
+written beside it, rewritten in the settlement that enqueues each next
+step, and names the queue job `SubmitOutcome::job_id` reports for a
+duplicate; a `QueueReader` can read it to resolve a run's live job from
+outside the process. Both are cleaned up when the run reaches a terminal
+state.
 
 ## Terminal hook
 

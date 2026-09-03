@@ -125,20 +125,6 @@ impl<'a> StepDelivery<'a> {
 }
 
 impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
-    /// [`Self::terminate_collecting_effects`] for an outcome reached by
-    /// `delivery`, plus [`RuntimeCore::forget_run`](crate::runtime::RuntimeCore::forget_run):
-    /// the pairing every worker-path termination site performs before
-    /// its settlement commits.
-    pub(crate) fn worker_terminate(
-        &self,
-        delivery: &StepDelivery<'_>,
-        outcome: RunOutcome,
-    ) -> SettlementEffects {
-        let effects = self.terminate_collecting_effects(&outcome, Some(delivery.job));
-        self.core.forget_run(&outcome.run_id);
-        effects
-    }
-
     /// The error a step returns for a failure that terminates its run:
     /// the effects of the `Failed` termination plus `failure_writes`,
     /// carried on a [`FailWith`] so the core applies them only with the
@@ -149,7 +135,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         error: StepError,
         failure_writes: HashMap<Vec<u8>, Vec<u8>>,
     ) -> WorkerError {
-        let mut effects = self.worker_terminate(delivery, delivery.failed(error.message.clone()));
+        let mut effects = self.terminate_collecting_effects(
+            &delivery.failed(error.message.clone()),
+            Some(delivery.job),
+        );
         effects.kv_writes.extend(failure_writes);
         FailWith::new(error.into_worker_error(), effects).into()
     }
@@ -205,21 +194,35 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         let run_id = delivery.run_id.as_str();
         let step_number = delivery.step_number;
 
-        self.core
-            .registry
-            .mark_running(run_id, step_number, &job.id, &delivery.headers);
-
-        // `Queue::cancel` fires the claim's token, and a re-claim fires it
-        // again from the job's persisted `cancel_requested`. The runner
-        // receives a child, so a runner firing its own token is not
-        // treated as an external cancellation below.
-        let claim_cancel = lease.cancel_token().clone();
-
         let (step_signal, signal_kv_deletes) = self
             .core
             .resolve_step_signal(job, run_id, step_number)
             .await
             .map_err(|err| StepError::from(err).into_worker_error())?;
+
+        // A cancellation requested before this claim is recorded on the
+        // run record; the step is settled as cancelled without running.
+        let record = self
+            .core
+            .run_record(run_id)
+            .await
+            .map_err(|err| StepError::from(err).into_worker_error())?
+            .ok_or_else(|| {
+                StepError::from(Error::InconsistentRunState(run_id.to_string())).into_worker_error()
+            })?;
+        if record.cancel_requested {
+            let mut effects =
+                self.terminate_collecting_effects(&delivery.cancelled(None), Some(job));
+            effects.kv_deletes.extend(signal_kv_deletes);
+            return Ok(effects);
+        }
+
+        // A cancellation requested during the delivery fires the claim's
+        // token (`Queue::cancel`, and a re-claim from the job's persisted
+        // `cancel_requested`). The runner receives a child, so a runner
+        // firing its own token is not treated as an external
+        // cancellation below.
+        let claim_cancel = lease.cancel_token().clone();
 
         let effects_handle = EffectsHandle::for_delivery();
         let step = Step {
@@ -262,12 +265,9 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         let replayed_step_output = replayed_effects.is_some();
         let caller_effects = replayed_effects.unwrap_or(sealed.outcome);
 
-        // Both sources are required: the claim's token reports a
-        // cancellation after a restart, and the registry flag reports one
-        // after a step advance, which the job-scoped persisted flag
-        // cannot.
-        let external_cancel =
-            claim_cancel.is_cancelled() || self.core.registry.cancel_requested(run_id);
+        // A request that lands after this read is recorded on the run
+        // record and settles the next step before it runs.
+        let external_cancel = claim_cancel.is_cancelled();
 
         if self.core.step_output_replay
             && !replayed_step_output
@@ -319,10 +319,13 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         failure_writes: HashMap<Vec<u8>, Vec<u8>>,
     ) -> std::result::Result<SettlementEffects, WorkerError> {
         match outcome {
-            Ok(StepOutcome::Cancel { reason }) => {
-                Ok(self.worker_terminate(delivery, delivery.cancelled(Some(reason))))
-            }
-            _ if external_cancel => Ok(self.worker_terminate(delivery, delivery.cancelled(None))),
+            Ok(StepOutcome::Cancel { reason }) => Ok(self.terminate_collecting_effects(
+                &delivery.cancelled(Some(reason)),
+                Some(delivery.job),
+            )),
+            _ if external_cancel => Ok(
+                self.terminate_collecting_effects(&delivery.cancelled(None), Some(delivery.job))
+            ),
             Ok(StepOutcome::Continue { payload, when }) => match when {
                 Trigger::Immediate => Ok(self
                     .core
@@ -344,12 +347,13 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 }
             },
             Ok(StepOutcome::Succeed { result }) => {
-                Ok(self.worker_terminate(delivery, delivery.succeeded(result)))
+                Ok(self
+                    .terminate_collecting_effects(&delivery.succeeded(result), Some(delivery.job)))
             }
             // A runner verdict: the step ran cleanly and is acknowledged;
             // the run terminates as `Failed` without a dead-letter.
             Ok(StepOutcome::Fail { reason }) => {
-                Ok(self.worker_terminate(delivery, delivery.failed(reason)))
+                Ok(self.terminate_collecting_effects(&delivery.failed(reason), Some(delivery.job)))
             }
             // A permanent error, or a transient one on the last attempt,
             // dead-letters the step and terminates the run; the runner's
