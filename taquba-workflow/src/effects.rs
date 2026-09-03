@@ -39,12 +39,16 @@ pub struct EffectsHandle {
     inner: Arc<Mutex<EffectsState>>,
 }
 
+/// Size cap of a note, leaving room for the member record around it
+/// under [`taquba::MAX_KV_VALUE_SIZE`].
+pub(crate) const MAX_NOTE_SIZE: usize = taquba::MAX_KV_VALUE_SIZE - 1024;
+
 #[derive(Debug, Default)]
 struct EffectsState {
     staged: StagedEffects,
-    /// Writes under the reserved namespace applied only when the step's
-    /// failure terminates the run; see [`EffectsHandle::put_reserved_on_failure`].
-    on_failure: HashMap<Vec<u8>, Vec<u8>>,
+    /// Bytes recorded on the run's group member record when the step
+    /// terminates the run; see [`EffectsHandle::note`].
+    note: Option<Vec<u8>>,
     sealed: bool,
 }
 
@@ -64,40 +68,26 @@ impl EffectsState {
         Ok(())
     }
 
-    /// Stage a write under a key of the reserved namespace, for the
-    /// crate's own records; validated like [`put`](Self::put) otherwise.
-    fn put_reserved(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
-        self.check_reserved(&value)?;
-        self.staged.writes.insert(key, value);
-        Ok(())
-    }
-
-    /// Stage a reserved-namespace write into the failure set.
-    fn put_reserved_on_failure(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
-        self.check_reserved(&value)?;
-        self.on_failure.insert(key, value);
-        Ok(())
-    }
-
-    fn check_reserved(&self, value: &[u8]) -> Result<()> {
+    fn note(&mut self, bytes: Vec<u8>) -> Result<()> {
         if self.sealed {
             return Err(Error::EffectsSealed);
         }
-        if value.len() > taquba::MAX_KV_VALUE_SIZE {
+        if bytes.len() > MAX_NOTE_SIZE {
             return Err(Error::Queue(taquba::Error::KvValueTooLarge {
-                size: value.len(),
-                max: taquba::MAX_KV_VALUE_SIZE,
+                size: bytes.len(),
+                max: MAX_NOTE_SIZE,
             }));
         }
+        self.note = Some(bytes);
         Ok(())
     }
 
-    /// Seal the state and move out both staged sets.
+    /// Seal the state and move out everything staged.
     fn seal_and_take(&mut self) -> SealedEffects {
         self.sealed = true;
         SealedEffects {
             outcome: std::mem::take(&mut self.staged),
-            on_failure: std::mem::take(&mut self.on_failure),
+            note: self.note.take(),
         }
     }
 
@@ -131,12 +121,11 @@ pub(crate) struct StagedEffects {
 }
 
 /// Everything an [`EffectsHandle`] holds when its delivery returns: the
-/// effects of the returned outcome and the writes reserved for a
-/// terminating failure.
+/// effects of the returned outcome and the note.
 #[derive(Debug, Default)]
 pub(crate) struct SealedEffects {
     pub(crate) outcome: StagedEffects,
-    pub(crate) on_failure: HashMap<Vec<u8>, Vec<u8>>,
+    pub(crate) note: Option<Vec<u8>>,
 }
 
 impl EffectsHandle {
@@ -180,24 +169,14 @@ impl EffectsHandle {
         self.inner.lock().unwrap().delete(key.into())
     }
 
-    /// Stage a write under a key of the reserved `workflow/` namespace,
-    /// for the crate's own records, applied with the returned outcome
-    /// like [`put`](Self::put).
-    pub(crate) fn put_reserved(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
-        self.inner.lock().unwrap().put_reserved(key, value)
-    }
-
-    /// Stage a write under a key of the reserved `workflow/` namespace
-    /// that is applied only when the step returns a
-    /// [`StepError`](crate::StepError) that terminates the run: a
-    /// permanent error, or a transient one on the step's last attempt.
-    /// A retried attempt applies nothing, and the writes of an acking
-    /// outcome are the ones staged through [`put`](Self::put).
-    pub(crate) fn put_reserved_on_failure(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
-        self.inner
-            .lock()
-            .unwrap()
-            .put_reserved_on_failure(key, value)
+    /// Stage `bytes` as the note of the run's group member record,
+    /// written when this step terminates the run: with an acking
+    /// outcome, or with the dead-lettering settlement of a permanent
+    /// error or a transient one on the last attempt. A retried attempt
+    /// and an external cancellation record no note. A later call
+    /// replaces the note.
+    pub(crate) fn note(&self, bytes: Vec<u8>) -> Result<()> {
+        self.inner.lock().unwrap().note(bytes)
     }
 
     /// Seal the handle and move out everything staged. An effect staged
@@ -334,12 +313,17 @@ mod tests {
         let clone = handle.clone();
         clone.put("a", "v").unwrap();
         clone.delete("b").unwrap();
-        let staged = handle.seal_and_take().outcome;
-        assert_eq!(staged.writes.get(b"a".as_slice()), Some(&b"v".to_vec()));
-        assert!(staged.deletes.contains(b"b".as_slice()));
+        clone.note(b"n".to_vec()).unwrap();
+        let sealed = handle.seal_and_take();
+        assert_eq!(
+            sealed.outcome.writes.get(b"a".as_slice()),
+            Some(&b"v".to_vec())
+        );
+        assert!(sealed.outcome.deletes.contains(b"b".as_slice()));
+        assert_eq!(sealed.note, Some(b"n".to_vec()));
         assert!(matches!(clone.put("c", "v"), Err(Error::EffectsSealed)));
         assert!(matches!(
-            clone.put_reserved_on_failure(b"workflow/x".to_vec(), b"v".to_vec()),
+            clone.note(b"x".to_vec()),
             Err(Error::EffectsSealed)
         ));
         assert!(matches!(clone.delete("c"), Err(Error::EffectsSealed)));

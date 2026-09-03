@@ -181,6 +181,8 @@ pub(crate) struct DurableStepOutcomeRecord {
     /// recorded delivery, restored into the settlement when the outcome
     /// is replayed.
     pub(crate) effects: StagedEffects,
+    /// The note staged during the recorded delivery.
+    pub(crate) note: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -221,6 +223,19 @@ pub(crate) struct DurableTermination {
     pub(crate) error: Option<String>,
     pub(crate) final_step: u32,
     pub(crate) terminated_at_ms: u64,
+}
+
+/// The durable member record of a grouped run, written under
+/// `workflow/groups/{group_id}/{key}` with the member's submission and
+/// rewritten in the settlement that terminates it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DurableMember {
+    pub(crate) run_id: String,
+    /// The member's termination; `None` while it is active.
+    pub(crate) terminated: Option<DurableTermination>,
+    /// The bytes the terminating step staged through its effects
+    /// handle, for the layer that runs the member.
+    pub(crate) note: Option<Vec<u8>>,
 }
 
 /// Stored payload of a terminal-notification job: the committed

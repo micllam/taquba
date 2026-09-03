@@ -19,6 +19,7 @@ use serde::de::DeserializeOwned;
 use taquba::object_store::ObjectStore;
 use taquba::{Clock, Queue, WaitOutcome};
 
+use crate::group::RunGroup;
 use crate::keys::hash_input;
 use crate::memo::Memo;
 use crate::runtime::{RunnerHandle, RuntimeCore, WorkflowRuntime, WorkflowRuntimeBuilder};
@@ -77,9 +78,14 @@ impl<R: StepRunner + 'static> TypedRuntime<R> {
         &self.runtime.inner.core
     }
 
-    /// The clock the runtime reads its timestamps from.
-    pub(crate) fn clock(&self) -> &dyn Clock {
-        self.core().clock.as_ref()
+    /// The group named `id`; see [`WorkflowRuntime::group`].
+    pub(crate) fn group(&self, id: impl Into<String>) -> Result<RunGroup<'_, R, NoopTerminalHook>> {
+        self.runtime.group(id)
+    }
+
+    /// A group with a generated id; see [`WorkflowRuntime::new_group`].
+    pub(crate) fn new_group(&self) -> RunGroup<'_, R, NoopTerminalHook> {
+        self.runtime.new_group()
     }
 
     /// The run-scoped memo of `run_id`, which holds its outcome record.

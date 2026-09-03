@@ -103,28 +103,30 @@ pub enum Error {
     #[error("job `{0}` not found")]
     JobNotFound(String),
 
-    /// Two items of one bulk batch produced the same key.
-    #[error("duplicate item key `{0}` in batch")]
-    DuplicateItemKey(String),
+    /// Two members of one group (a bulk batch, a job group) produced
+    /// the same key.
+    #[error("duplicate member key `{0}` in group")]
+    DuplicateMemberKey(String),
 
-    /// A run of an existing bulk batch supplied a different item set than
-    /// the batch's manifest.
-    #[error("batch `{0}` exists with a different item set")]
-    BatchMismatch(String),
+    /// A submission to an existing group (a bulk batch, a job group)
+    /// supplied a different member set than the group's manifest.
+    #[error("group `{0}` exists with a different member set")]
+    GroupMismatch(String),
 
-    /// A bulk batch operation named a batch with no manifest.
-    #[error("batch `{0}` not found")]
-    BatchNotFound(String),
+    /// A group operation named a group (a bulk batch, a job group) with
+    /// no manifest.
+    #[error("group `{0}` not found")]
+    GroupNotFound(String),
 
     /// A run of a bulk batch was started while a run of the same batch
     /// was active in this process.
     #[error("batch `{0}` is already running in this process")]
     BatchRunning(String),
 
-    /// A bulk batch id was not 1 to [`crate::MAX_RUN_ID_LEN`] bytes of
-    /// `[A-Za-z0-9_-]`.
-    #[error("invalid batch id `{0}`: must be 1 to 128 bytes of `[A-Za-z0-9_-]`")]
-    InvalidBatchId(String),
+    /// A group id (a bulk batch id, a job group id) was not 1 to
+    /// [`crate::MAX_RUN_ID_LEN`] bytes of `[A-Za-z0-9_-]`.
+    #[error("invalid group id `{0}`: must be 1 to 128 bytes of `[A-Za-z0-9_-]`")]
+    InvalidGroupId(String),
 
     /// A bulk batch run completed but the share of failed items exceeded
     /// the configured
@@ -161,10 +163,10 @@ impl Error {
             | Self::Deserialization(_)
             | Self::Json(_)
             | Self::JobNotFound(_)
-            | Self::DuplicateItemKey(_)
-            | Self::BatchMismatch(_)
-            | Self::BatchNotFound(_)
-            | Self::InvalidBatchId(_)
+            | Self::DuplicateMemberKey(_)
+            | Self::GroupMismatch(_)
+            | Self::GroupNotFound(_)
+            | Self::InvalidGroupId(_)
             | Self::FailureThresholdExceeded { .. } => true,
             Self::Queue(e) => e.is_permanent(),
             Self::Store(_) | Self::Io(_) | Self::BatchRunning(_) => false,
@@ -246,11 +248,11 @@ mod tests {
                 true,
             ),
             (Error::JobNotFound("job-1".into()), true),
-            (Error::DuplicateItemKey("k".into()), true),
-            (Error::BatchMismatch("b".into()), true),
-            (Error::BatchNotFound("b".into()), true),
+            (Error::DuplicateMemberKey("k".into()), true),
+            (Error::GroupMismatch("b".into()), true),
+            (Error::GroupNotFound("b".into()), true),
             (Error::BatchRunning("b".into()), false),
-            (Error::InvalidBatchId("a/b".into()), true),
+            (Error::InvalidGroupId("a/b".into()), true),
             (
                 Error::FailureThresholdExceeded {
                     failed: 1,

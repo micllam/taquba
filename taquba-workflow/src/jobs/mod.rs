@@ -126,6 +126,30 @@
 //! Custom keys are appropriate when the dedup identity is narrower than
 //! the full payload (for example `"email:{recipient}:{date}"`).
 //!
+//! # Job groups
+//!
+//! A [`JobGroup`] submits many jobs of one type as one durable set and
+//! joins their typed results: [`JobRunner::group`] names the group,
+//! [`JobGroup::submit`] writes its manifest and submits the members, and
+//! [`JobGroup::join`] waits for every member and returns the results in
+//! submission order. Members are identified within the group by key
+//! (the job's [`Job::idempotency_key`], or the positional `item-{i}`),
+//! and a member's job id is derived from the group id and its key. A
+//! second submission of the same set runs again every member that did
+//! not succeed, so a step that fans out re-submits its group on a retry
+//! and joins the recorded results of the members that completed.
+//! [`JobGroup::status`] reads the group's durable state and
+//! [`JobGroup::forget`] removes it; [`JobRunnerBuilder::group_retention`]
+//! removes it a window after the group's members all terminated.
+//!
+//! ```ignore
+//! let group = runner.group::<FetchPage>(format!("fetch-{run_id}"))?;
+//! group.submit(urls.iter().map(|url| FetchPage { url: url.clone() })).await?;
+//! for member in group.join().await? {
+//!     println!("{}: {:?}", member.key, member.result);
+//! }
+//! ```
+//!
 //! # Retention
 //!
 //! [`JobRunnerBuilder::retention`] removes a job's outcome record and memo
@@ -207,6 +231,8 @@
 //! - [`JobHandle`]: returned from [`JobRunner::submit`]; await it for the
 //!   typed result, or read its [`status`](JobHandle::status) and
 //!   [`fetch_result`](JobHandle::fetch_result).
+//! - [`JobGroup`]: many jobs of one type submitted as one durable set and
+//!   joined together.
 //!
 //! # Retries and failure
 //!
@@ -218,12 +244,14 @@
 //! and per-submission [`SubmitOptions`] cover the per-job settings.
 
 mod context;
+mod group;
 mod handle;
 mod job;
 mod runner;
 
 pub use crate::RunnerHandle;
 pub use context::JobContext;
+pub use group::{GroupResult, GroupStatus, JobGroup};
 pub use handle::{JobError, JobHandle, JoinError};
 pub use job::{Job, payload_idempotency_key};
 pub use runner::{JobRunner, JobRunnerBuilder, SubmitOptions};

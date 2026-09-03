@@ -328,8 +328,12 @@ instances and await the `JobHandle`. The outcome record is stored in the
 run's memo, so `JobHandle::fetch_result` reads it after a restart, and a
 `Job::idempotency_key` collapses duplicate submissions before and after
 completion. A handler that submits further jobs holds a `JobRunner` in
-its registered state. The module documentation covers idempotent
-submission, retention and the handler context.
+its registered state. A `JobGroup` submits many jobs of one type as one
+durable set and joins their typed results in submission order; a second
+submission of the same set runs again only the members that did not
+succeed, which is how a step that fans out stays safe under a retry.
+The module documentation covers idempotent submission, job groups,
+retention and the handler context.
 
 ```rust,ignore
 use taquba_workflow::jobs::{Job, JobContext, JobRunner};
@@ -362,8 +366,17 @@ one run per item with the pipeline's phases as memoized calls inside the
 item's single step, and adds batch-level progress, cost rollup, streamed
 output and a failure threshold. Items are grouped in batches identified
 by id: a later `Batch::run` of the same batch skips the items that
-succeeded and runs the failed ones again. The module documentation covers the execution model,
-batches, cost tracking, the failure policy and retention.
+succeeded and runs the failed ones again. The module documentation
+covers the execution model, batches, cost tracking, the failure policy
+and retention.
+
+Batches and job groups are two presentations of one mechanism, a run
+group: a manifest of members in the object store, one member record per
+key under `workflow/groups/` in the queue's key-value namespace, written
+with the member's submission and rewritten with its status and error by
+the settlement that terminates it, and a retention sweep over
+`workflow/group-terminals/`. A member's run id is derived from the group
+id and its key, so groups never share run state.
 
 ## Idempotency
 

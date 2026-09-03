@@ -214,7 +214,7 @@ impl<J: Job> JobHandle<J> {
     }
 }
 
-fn decode_outcome<J: Job>(
+pub(crate) fn decode_outcome<J: Job>(
     outcome: StoredOutcome,
 ) -> Result<std::result::Result<J::Output, JobError>> {
     match outcome {

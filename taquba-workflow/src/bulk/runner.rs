@@ -5,8 +5,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::bulk::cost::CostReport;
 use crate::bulk::pipeline::{BulkCtx, Pipeline};
-use crate::bulk::progress::{ItemMarker, MarkerStatus};
-use crate::keys::bulk_item_kv_key;
 use crate::outcome::run_typed_step;
 
 /// The payload of an item's run: the batch and key that identify the item
@@ -36,10 +34,9 @@ pub(crate) struct ItemEnvelope<O> {
 /// [`Pipeline::run`] as memoized calls; the runner never emits
 /// [`StepOutcome::Continue`].
 ///
-/// The item's marker is staged on the step's effects: with the outcome
-/// for a success, and in the failure set for an error, so it commits with
-/// the acknowledgement or with the dead-lettering settlement and never
-/// with a retried attempt.
+/// The item's cost is staged as the note of its member record, so it
+/// commits with the acknowledgement or with the dead-lettering
+/// settlement and never with a retried attempt.
 pub(crate) struct PipelineRunner<P> {
     pipeline: P,
 }
@@ -71,26 +68,16 @@ impl<P: Pipeline> StepRunner for PipelineRunner<P> {
             })
         })
         .await;
-        let marker_key = bulk_item_kv_key(&batch_id, &key);
-        match &outcome {
+        let cost = match &outcome {
             Ok(StepOutcome::Succeed { result }) => {
-                let cost = rmp_serde::from_slice::<ItemEnvelope<P::Output>>(result)
+                rmp_serde::from_slice::<ItemEnvelope<P::Output>>(result)
                     .map(|envelope| envelope.cost)
-                    .unwrap_or_default();
-                let marker = ItemMarker::new(MarkerStatus::Succeeded, None, cost);
-                step.effects.put_reserved(marker_key, marker.encode()?)?;
+                    .unwrap_or_default()
             }
-            Err(err) => {
-                let marker = ItemMarker::new(
-                    MarkerStatus::Failed,
-                    Some(err.message.clone()),
-                    CostReport::new(),
-                );
-                step.effects
-                    .put_reserved_on_failure(marker_key, marker.encode()?)?;
-            }
-            Ok(_) => {}
-        }
+            _ => CostReport::new(),
+        };
+        let note = rmp_serde::to_vec_named(&cost).map_err(crate::Error::from)?;
+        step.effects.note(note)?;
         outcome
     }
 }

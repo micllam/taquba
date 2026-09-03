@@ -297,8 +297,13 @@
 //! [`jobs::JobHandle::fetch_result`] reads it after a restart, and a
 //! [`jobs::Job::idempotency_key`] collapses duplicate submissions before
 //! and after completion. A handler that submits further jobs holds a
-//! [`jobs::JobRunner`] in its registered state. The module documentation
-//! covers idempotent submission, retention and the handler context.
+//! [`jobs::JobRunner`] in its registered state. A [`jobs::JobGroup`]
+//! submits many jobs of one type as one durable set and joins their
+//! typed results in submission order; a second submission of the same
+//! set runs again only the members that did not succeed, which is how a
+//! step that fans out stays safe under a retry. The module
+//! documentation covers idempotent submission, job groups, retention and
+//! the handler context.
 //!
 //! ```ignore
 //! use taquba_workflow::jobs::{Job, JobContext, JobRunner};
@@ -331,9 +336,17 @@
 //! inside the item's single step, and adds batch-level progress, cost
 //! rollup, streamed output and a failure threshold. Items are grouped in
 //! batches identified by id: a later [`bulk::Batch::run`] of the same batch
-//! skips the items that succeeded and runs the failed ones again. The module documentation
-//! covers the execution model, batches, cost tracking, the failure policy
-//! and retention.
+//! skips the items that succeeded and runs the failed ones again. The
+//! module documentation covers the execution model, batches, cost
+//! tracking, the failure policy and retention.
+//!
+//! Batches and job groups are two presentations of one mechanism, a run
+//! group: a manifest of members in the object store, one member record
+//! per key under `workflow/groups/` in the queue's key-value namespace,
+//! written with the member's submission and rewritten with its status
+//! and error by the settlement that terminates it, and a retention
+//! sweep over `workflow/group-terminals/`. A member's run id is derived
+//! from the group id and its key, so groups never share run state.
 //!
 //! # Idempotency
 //!
@@ -553,6 +566,7 @@ pub mod bulk;
 mod durable;
 mod effects;
 mod error;
+mod group;
 pub mod jobs;
 mod keys;
 mod kv;

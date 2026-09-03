@@ -33,6 +33,13 @@ pub const HEADER_SIGNAL_WAIT: &str = "workflow.signal_wait";
 /// delivered record.
 pub const HEADER_SIGNAL_DELIVERED: &str = "workflow.signal_delivered";
 
+/// Header key naming the group a run is a member of, set on every step
+/// job of a grouped run.
+pub const HEADER_GROUP: &str = "workflow.group";
+/// Header key naming a grouped run's member key within its group, set
+/// beside [`HEADER_GROUP`].
+pub const HEADER_GROUP_KEY: &str = "workflow.group_key";
+
 pub(crate) const DEDUP_PREFIX: &str = "run:";
 
 /// Maximum length of a caller-supplied [`RunSpec::run_id`](crate::RunSpec::run_id), matching the
@@ -73,20 +80,20 @@ pub(crate) const TERMINAL_KV_PREFIX: &[u8] = b"workflow/terminals/";
 /// run's memo entries.
 pub(crate) const OUTCOME_KV_PREFIX: &[u8] = b"workflow/outcomes/";
 
-/// Prefix for the durable per-item markers of bulk batches:
-/// `workflow/bulk/batches/{batch_id}/items/{key}`, one per terminated
-/// item, written in the settlement that commits the item's terminal
-/// outcome.
-pub(crate) const BULK_KV_PREFIX: &[u8] = b"workflow/bulk/batches/";
+/// Prefix for the durable member records of run groups:
+/// `workflow/groups/{group_id}/{key}`, one per member, written with the
+/// member's submission and rewritten in the settlement that terminates
+/// it.
+pub(crate) const GROUP_KV_PREFIX: &[u8] = b"workflow/groups/";
 
-/// Prefix under which the markers of one batch's items are stored.
-pub(crate) fn bulk_items_kv_prefix(batch_id: &str) -> Vec<u8> {
-    prefixed(BULK_KV_PREFIX, &format!("{batch_id}/items/"))
+/// Prefix under which the member records of one group are stored.
+pub(crate) fn group_members_kv_prefix(group_id: &str) -> Vec<u8> {
+    prefixed(GROUP_KV_PREFIX, &format!("{group_id}/"))
 }
 
-/// Key of the marker of item `key` in batch `batch_id`.
-pub(crate) fn bulk_item_kv_key(batch_id: &str, key: &str) -> Vec<u8> {
-    prefixed(&bulk_items_kv_prefix(batch_id), key)
+/// Key of the member record of `key` in group `group_id`.
+pub(crate) fn group_member_kv_key(group_id: &str, key: &str) -> Vec<u8> {
+    prefixed(&group_members_kv_prefix(group_id), key)
 }
 
 /// Key of the terminal marker for `run_id`, terminated at
@@ -98,14 +105,14 @@ pub(crate) fn terminal_kv_key(run_id: &str, terminal_at_ms: u64) -> Vec<u8> {
     timestamped_kv_key(TERMINAL_KV_PREFIX, run_id, terminal_at_ms)
 }
 
-/// Prefix for the durable terminal markers of bulk batches, read by the
-/// batch retention sweep: `workflow/bulk/terminals/{ts:020}/{batch_id}`.
-pub(crate) const BULK_TERMINAL_KV_PREFIX: &[u8] = b"workflow/bulk/terminals/";
+/// Prefix for the durable terminal markers of run groups, read by the
+/// group retention sweep: `workflow/group-terminals/{ts:020}/{group_id}`.
+pub(crate) const GROUP_TERMINAL_KV_PREFIX: &[u8] = b"workflow/group-terminals/";
 
-/// Key of the terminal marker of batch `batch_id`, completed at
-/// `terminal_at_ms`.
-pub(crate) fn bulk_terminal_kv_key(batch_id: &str, terminal_at_ms: u64) -> Vec<u8> {
-    timestamped_kv_key(BULK_TERMINAL_KV_PREFIX, batch_id, terminal_at_ms)
+/// Key of the terminal marker of group `group_id`, whose members all
+/// terminated by `terminal_at_ms`.
+pub(crate) fn group_terminal_kv_key(group_id: &str, terminal_at_ms: u64) -> Vec<u8> {
+    timestamped_kv_key(GROUP_TERMINAL_KV_PREFIX, group_id, terminal_at_ms)
 }
 
 /// `{prefix}{ts:020}/{id}`: a marker whose zero-padded timestamp leads the
@@ -218,8 +225,8 @@ mod tests {
             SIGNAL_DELIVERED_KV_PREFIX,
             TERMINAL_KV_PREFIX,
             OUTCOME_KV_PREFIX,
-            BULK_KV_PREFIX,
-            BULK_TERMINAL_KV_PREFIX,
+            GROUP_KV_PREFIX,
+            GROUP_TERMINAL_KV_PREFIX,
         ] {
             assert!(
                 prefix.starts_with(RESERVED_KV_PREFIX.as_bytes()),

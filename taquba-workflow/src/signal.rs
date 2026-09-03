@@ -158,7 +158,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     return Err(self.terminating_failure(
                         claimed,
                         StepError::permanent(message),
-                        HashMap::new(),
+                        None,
                     ));
                 }
             }
@@ -170,7 +170,8 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         match self.core.queue.kv_get(&buf_key).await {
             Ok(Some(buffered)) => {
                 let opts = StepEnqueueOpts {
-                    reserved_headers: vec![(HEADER_SIGNAL_DELIVERED, "1".to_string())],
+                    reserved_headers: claimed
+                        .reserved_headers_with((HEADER_SIGNAL_DELIVERED, "1".to_string())),
                     ..claimed.next_step_opts()
                 };
                 let delivered_key =
@@ -188,7 +189,8 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             Ok(None) => {
                 let opts = StepEnqueueOpts {
                     run_at: Some(self.core.run_at_after(timeout)),
-                    reserved_headers: vec![(HEADER_SIGNAL_WAIT, correlation_key.to_string())],
+                    reserved_headers: claimed
+                        .reserved_headers_with((HEADER_SIGNAL_WAIT, correlation_key.to_string())),
                     ..claimed.next_step_opts()
                 };
                 let effects = self

@@ -14,6 +14,7 @@ use taquba::{Clock, Queue};
 
 use crate::Result;
 use crate::jobs::context::{JobContext, State};
+use crate::jobs::group::JobGroup;
 use crate::jobs::handle::JobHandle;
 use crate::jobs::job::Job;
 use crate::keys::{hash_input, hex_sha256};
@@ -64,16 +65,22 @@ pub(crate) struct Inner {
     pub(crate) typed: TypedRuntime<Dispatch>,
 }
 
+/// The run payload of `job`: its [`Job::NAME`] and its serialized
+/// fields.
+pub(crate) fn job_payload<J: Job>(job: &J) -> Result<Vec<u8>> {
+    Ok(rmp_serde::to_vec_named(&JobPayload {
+        name: J::NAME.to_string(),
+        input: rmp_serde::to_vec_named(job)?,
+    })?)
+}
+
 impl Inner {
     pub(crate) async fn submit<J: Job>(
         self: &Arc<Self>,
         job: J,
         opts: SubmitOptions,
     ) -> Result<JobHandle<J>> {
-        let payload = rmp_serde::to_vec_named(&JobPayload {
-            name: J::NAME.to_string(),
-            input: rmp_serde::to_vec_named(&job)?,
-        })?;
+        let payload = job_payload(&job)?;
         let key = job.idempotency_key();
         let run_id = key.as_deref().map(run_id_for_key);
 
@@ -244,6 +251,20 @@ impl JobRunner {
         self.inner.submit(job, opts).await
     }
 
+    /// The group of `J` jobs named `id`, which must be 1 to 128 bytes of
+    /// `[A-Za-z0-9_-]`; [`Error::InvalidGroupId`](crate::Error::InvalidGroupId)
+    /// otherwise.
+    pub fn group<J: Job>(&self, id: impl Into<String>) -> Result<JobGroup<J>> {
+        let id = self.inner.typed.group(id)?.id().to_string();
+        Ok(JobGroup::new(self.inner.clone(), id))
+    }
+
+    /// A group of `J` jobs with a generated id.
+    pub fn new_group<J: Job>(&self) -> JobGroup<J> {
+        let id = self.inner.typed.new_group().id().to_string();
+        JobGroup::new(self.inner.clone(), id)
+    }
+
     /// Spawn the worker task and return a handle for graceful shutdown.
     ///
     /// The worker claims and runs jobs concurrently (up to the configured
@@ -273,6 +294,7 @@ pub struct JobRunnerBuilder {
     concurrency: usize,
     poll_interval: Duration,
     retention: Option<Duration>,
+    group_retention: Option<Duration>,
     clock: Option<Arc<dyn Clock>>,
 }
 
@@ -288,6 +310,7 @@ impl JobRunnerBuilder {
             concurrency: DEFAULT_CONCURRENCY,
             poll_interval: DEFAULT_POLL_INTERVAL,
             retention: None,
+            group_retention: None,
             clock: None,
         }
     }
@@ -369,6 +392,19 @@ impl JobRunnerBuilder {
         self
     }
 
+    /// Remove a job group's state (its manifest, member records and the
+    /// memo entries and outcome records of its members) `retention`
+    /// after every member of the group terminated. When unset (default),
+    /// a group is retained until [`JobGroup::forget`].
+    ///
+    /// # Panics
+    ///
+    /// [`build`](Self::build) panics if `retention < 1ms`.
+    pub fn group_retention(mut self, retention: Duration) -> Self {
+        self.group_retention = Some(retention);
+        self
+    }
+
     /// Override the [`Clock`] the runner reads timestamps from. Defaults to
     /// the queue's clock ([`Queue::clock`]).
     pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
@@ -391,15 +427,17 @@ impl JobRunnerBuilder {
             handlers: self.handlers,
             state: self.state,
         };
-        let typed = options.build(
-            self.queue,
-            self.object_store,
-            dispatch,
-            |builder| match self.retention {
+        let (retention, group_retention) = (self.retention, self.group_retention);
+        let typed = options.build(self.queue, self.object_store, dispatch, |builder| {
+            let builder = match retention {
                 Some(retention) => builder.memo_retention(retention),
                 None => builder,
-            },
-        );
+            };
+            match group_retention {
+                Some(retention) => builder.group_retention(retention),
+                None => builder,
+            }
+        });
         JobRunner {
             inner: Arc::new(Inner { typed }),
         }

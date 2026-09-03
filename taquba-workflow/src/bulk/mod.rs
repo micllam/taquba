@@ -160,32 +160,35 @@
 //! record is a failure runs again. [`BatchReport::failed_keys`] is the set a
 //! later [`Batch::run`] re-executes.
 //!
-//! Before submitting any item, [`Batch::run`] writes the batch's manifest (its keys
-//! and serialized inputs) to `<memo_prefix>/batches/<batch_id>/manifest`;
-//! a [`Batch::run`] of an existing batch with a different item set is rejected with
-//! [`Error::BatchMismatch`](crate::Error::BatchMismatch). [`Batch::resume`]
-//! drives a batch from its
-//! manifest alone: completed items are answered from their outcome
-//! records, items still queued continue, and the rest run.
+//! A batch is a run group of the runtime. Before submitting any item,
+//! [`Batch::run`] writes the batch's manifest (its keys and serialized
+//! inputs) to `<memo_prefix>/groups/<batch_id>/manifest`; a
+//! [`Batch::run`] of an existing batch with a different item set is
+//! rejected with [`Error::GroupMismatch`](crate::Error::GroupMismatch).
+//! [`Batch::resume`] runs a batch from its manifest alone: completed
+//! items are answered from their outcome records, items still queued
+//! continue, and the rest run.
 //!
-//! The settlement that commits an item's terminal outcome also writes
-//! the item's marker (status, error, cost) to
-//! `workflow/bulk/batches/<batch_id>/items/<key>` in the queue's KV
-//! namespace: the acknowledgement of a success, or the dead-lettering
-//! settlement of a failure. An item cancelled from outside writes no
-//! marker and runs again in the next [`Batch::run`] of the batch. [`Batch::status`]
-//! reads the manifest and the markers, so a batch's durable state is
-//! available without running it and from another process through the
-//! same prefix. [`Batch::run`] observes each item's termination through
-//! the queue's in-process completion notification and reads the item's
-//! outcome record to stream its output; an item runs as one queue job.
+//! Each item has a member record under
+//! `workflow/groups/<batch_id>/<key>` in the queue's KV namespace,
+//! written with its submission and rewritten by the settlement that
+//! commits its terminal outcome (the acknowledgement of a success, the
+//! dead-lettering settlement of a failure, or the cancellation) with its
+//! status, error and, for a success or a failure, the cost its step
+//! recorded. An item cancelled from outside runs again in the next
+//! [`Batch::run`] of the batch. [`Batch::status`] reads the manifest and
+//! the member records, so a batch's durable state is available without
+//! running it and from another process through the same prefix.
+//! [`Batch::run`] observes each item's termination through the queue's
+//! in-process completion notification and reads the item's outcome
+//! record to stream its output; an item runs as one queue job.
 //!
 //! A batch's state is retained until [`Batch::forget`] removes it, or,
-//! under [`BulkRunnerBuilder::batch_retention`], until the window after the
-//! batch's completion has passed: a completing [`Batch::run`] writes a terminal
-//! marker to `workflow/bulk/terminals/<ts>/<batch_id>`, and the worker
-//! removes the batches whose markers have expired when it starts and on
-//! every retention interval after that.
+//! under [`BulkRunnerBuilder::batch_retention`], until the window after
+//! the batch's completion has passed: a completing [`Batch::run`] writes
+//! a terminal marker to `workflow/group-terminals/<ts>/<batch_id>`, and
+//! the worker removes the batches whose markers have expired when it
+//! starts and on every retention interval after that.
 //!
 //! # Failure policy
 //!
@@ -209,7 +212,6 @@
 mod batch;
 mod cost;
 mod io;
-mod manifest;
 mod pipeline;
 mod progress;
 mod runner;

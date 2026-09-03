@@ -18,10 +18,11 @@ use crate::durable::{
 };
 use crate::effects::StagedEffects;
 use crate::error::{Error, Result};
+use crate::group::{GroupStore, Membership, RunGroup, pending_member, terminated_member};
 use crate::keys::{
-    DEDUP_PREFIX, HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RESERVED_HEADER_PREFIX,
-    RESERVED_KV_PREFIX, TERMINAL_KV_PREFIX, hash_input, outcome_kv_key, run_kv_key, step_kv_key,
-    terminal_kv_key, validate_run_id,
+    DEDUP_PREFIX, GROUP_TERMINAL_KV_PREFIX, HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL,
+    RESERVED_HEADER_PREFIX, RESERVED_KV_PREFIX, TERMINAL_KV_PREFIX, hash_input, outcome_kv_key,
+    run_kv_key, step_kv_key, terminal_kv_key, validate_run_id,
 };
 use crate::memo::MemoStore;
 use crate::runner::{StepOutcome, StepRunner, Trigger};
@@ -201,9 +202,9 @@ pub struct WorkflowRuntimeBuilder<R, H> {
     max_concurrent_steps: usize,
     poll_interval: Duration,
     memo_retention: Option<Duration>,
+    group_retention: Option<Duration>,
     step_output_replay: bool,
     clock: Arc<dyn Clock>,
-    sweeps: Vec<Sweep>,
 }
 
 impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
@@ -289,18 +290,31 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
         self
     }
 
-    /// Add a retention sweep that [`WorkflowRuntime::run`] drives beside
-    /// the memo sweep, for a layer whose terminal markers live under its
-    /// own prefix.
-    pub(crate) fn sweep(mut self, sweep: Sweep) -> Self {
-        self.sweeps.push(sweep);
+    /// Remove a group's state (its manifest, member records and the
+    /// memo entries of its members) `retention` after every member of
+    /// the group terminated. When unset (default), no group terminal
+    /// marker is written and a group is retained until it is forgotten.
+    ///
+    /// Panics if `retention < 1ms`.
+    pub(crate) fn group_retention(mut self, retention: Duration) -> Self {
+        assert!(
+            retention >= Duration::from_millis(1),
+            "group_retention must be at least 1ms",
+        );
+        self.group_retention = Some(retention);
         self
     }
 
     /// Finalize the builder.
     pub fn build(self) -> WorkflowRuntime<R, H> {
-        let memo_store = MemoStore::new(self.object_store, self.memo_prefix);
-        let mut sweeps = self.sweeps;
+        let memo_store = MemoStore::new(self.object_store.clone(), self.memo_prefix.clone());
+        let group_store = GroupStore::new(
+            self.object_store,
+            self.memo_prefix,
+            memo_store.clone(),
+            self.queue.clone(),
+        );
+        let mut sweeps = Vec::new();
         if let Some(retention) = self.memo_retention {
             sweeps.push(Sweep::new(
                 TERMINAL_KV_PREFIX,
@@ -310,13 +324,22 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
                 },
             ));
         }
+        if let Some(retention) = self.group_retention {
+            sweeps.push(Sweep::new(
+                GROUP_TERMINAL_KV_PREFIX,
+                retention,
+                group_store.clone(),
+            ));
+        }
         let core = RuntimeCore {
             queue: self.queue,
             queue_name: self.queue_name,
             max_concurrent_steps: self.max_concurrent_steps,
             poll_interval: self.poll_interval,
             memo_store,
+            group_store,
             memo_retention: self.memo_retention,
+            group_retention: self.group_retention,
             sweeps,
             step_output_replay: self.step_output_replay,
             clock: self.clock,
@@ -378,13 +401,17 @@ pub(crate) struct RuntimeCore {
     max_concurrent_steps: usize,
     poll_interval: Duration,
     pub(crate) memo_store: MemoStore,
+    pub(crate) group_store: GroupStore,
     /// Window after a run reaches a terminal state during which its
     /// memo entries are retained for replay. `None` disables retention
     /// entirely (no terminal marker is written and no memo sweep runs).
     pub(crate) memo_retention: Option<Duration>,
+    /// Window after every member of a group terminated during which
+    /// the group's state is retained; `None` writes no group marker.
+    pub(crate) group_retention: Option<Duration>,
     /// The retention sweeps [`WorkflowRuntime::run`] drives: the memo
-    /// sweep when `memo_retention` is set, and every sweep a layer
-    /// registered through [`WorkflowRuntimeBuilder::sweep`].
+    /// sweep when `memo_retention` is set and the group sweep when
+    /// `group_retention` is set.
     sweeps: Vec<Sweep>,
     /// Whether runner-returned step outcomes are persisted and replayed
     /// by `(run_id, step_number, SHA-256(step payload))`.
@@ -426,9 +453,9 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             max_concurrent_steps: 16,
             poll_interval: Duration::from_millis(250),
             memo_retention: None,
+            group_retention: None,
             step_output_replay: false,
             clock,
-            sweeps: Vec::new(),
         }
     }
 
@@ -444,15 +471,42 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// pick a fresh `run_id` for a new run.
     #[instrument(skip(self, spec), fields(run_id))]
     pub async fn submit(&self, spec: RunSpec) -> Result<SubmitOutcome> {
+        let run_id = Self::validate_spec(&spec)?;
+        tracing::Span::current().record("run_id", run_id.as_str());
+        self.enqueue_run(&run_id, spec, None).await
+    }
+
+    /// [`Self::submit`] of a member of a group: the run's step jobs
+    /// hold the membership and its member record is written with the
+    /// enqueue.
+    pub(crate) async fn submit_member(
+        &self,
+        membership: &Membership,
+        spec: RunSpec,
+    ) -> Result<SubmitOutcome> {
+        let run_id = Self::validate_spec(&spec)?;
+        self.enqueue_run(&run_id, spec, Some(membership)).await
+    }
+
+    /// The group named `id`; [`Error::InvalidGroupId`] for an id outside
+    /// the run id rules.
+    pub(crate) fn group(&self, id: impl Into<String>) -> Result<RunGroup<'_, R, H>> {
+        let id = id.into();
+        validate_run_id(&id).map_err(|_| Error::InvalidGroupId(id.clone()))?;
+        Ok(RunGroup::new(self, id))
+    }
+
+    /// A group with a generated id.
+    pub(crate) fn new_group(&self) -> RunGroup<'_, R, H> {
+        RunGroup::new(self, ulid::Ulid::new().to_string())
+    }
+
+    /// Check `spec`'s run id, headers and KV keys; the run id, generated
+    /// when the spec names none.
+    fn validate_spec(spec: &RunSpec) -> Result<String> {
         if let Some(supplied) = spec.run_id.as_deref() {
             validate_run_id(supplied)?;
         }
-        let run_id = spec
-            .run_id
-            .clone()
-            .unwrap_or_else(|| ulid::Ulid::new().to_string());
-        tracing::Span::current().record("run_id", run_id.as_str());
-
         for k in spec.headers.keys() {
             if k.starts_with(RESERVED_HEADER_PREFIX) {
                 return Err(Error::ReservedHeaderInSubmit(k.clone()));
@@ -465,16 +519,25 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
                 ));
             }
         }
-
-        self.enqueue_run(&run_id, spec).await
+        Ok(spec
+            .run_id
+            .clone()
+            .unwrap_or_else(|| ulid::Ulid::new().to_string()))
     }
 
     /// Enqueue step 0 of `run_id` unless the run is active. The run
     /// record is written with the step-0 enqueue and deleted with the
     /// termination, so it identifies an active run whichever process
     /// submitted it, and the step's dedup key serialises two
-    /// submissions that both find no record.
-    async fn enqueue_run(&self, run_id: &str, spec: RunSpec) -> Result<SubmitOutcome> {
+    /// submissions that both find no record. A `membership` is set on
+    /// the step job and its pending member record is written with the
+    /// enqueue.
+    async fn enqueue_run(
+        &self,
+        run_id: &str,
+        spec: RunSpec,
+        membership: Option<&Membership>,
+    ) -> Result<SubmitOutcome> {
         let input_hash = hash_input(&spec.input);
         let duplicate = |job_id: String| SubmitOutcome {
             run_id: run_id.to_string(),
@@ -499,7 +562,9 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             run_at: spec.run_at,
             priority: spec.priority,
             max_attempts: spec.max_attempts_per_step,
-            reserved_headers: Vec::new(),
+            reserved_headers: membership
+                .map(Membership::reserved_headers)
+                .unwrap_or_default(),
         };
         let (request, job_id) =
             self.inner
@@ -515,6 +580,12 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         let mut kv = spec.kv_writes;
         kv.insert(run_kv_key(run_id), record_bytes);
         kv.insert(step_kv_key(run_id), current_step_bytes(0, &job_id));
+        if let Some(membership) = membership {
+            kv.insert(
+                membership.kv_key(),
+                durable::encode(&pending_member(run_id)),
+            );
+        }
 
         let job_id = match self
             .inner
@@ -633,9 +704,9 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             // `error` is `None`: external cancellation supplies no reason
             // at the API level. The effects are built before the outcome
             // is known; the queue applies them only on `Removed`.
-            let effects = self
-                .inner
-                .terminate_collecting_effects(&claimed.cancelled(None), Some(&job));
+            let effects =
+                self.inner
+                    .terminate_collecting_effects(&claimed.cancelled(None), &claimed, None);
             match core.queue.cancel_with(&job.id, effects).await?.0 {
                 taquba::CancelOutcome::Removed | taquba::CancelOutcome::Requested => {
                     return Ok(true);
@@ -762,7 +833,10 @@ impl RuntimeCore {
 
     /// The current-step pointer of `run_id`, `None` when the run is not
     /// active.
-    async fn current_step_if_active(&self, run_id: &str) -> Result<Option<DurableCurrentStep>> {
+    pub(crate) async fn current_step_if_active(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<DurableCurrentStep>> {
         match self.queue.kv_get(&step_kv_key(run_id)).await? {
             Some(bytes) => Ok(Some(rmp_serde::from_slice(&bytes)?)),
             None => Ok(None),
@@ -883,7 +957,7 @@ impl RuntimeCore {
         run_id: &str,
         step_number: u32,
         step_payload: &[u8],
-    ) -> Result<Option<(StepOutcome, StagedEffects)>> {
+    ) -> Result<Option<(StepOutcome, StagedEffects, Option<Vec<u8>>)>> {
         let Some(bytes) = self
             .memo_store
             .get_step_output(run_id, step_number, step_payload)
@@ -910,7 +984,7 @@ impl RuntimeCore {
                     }
                     _ => {}
                 }
-                Ok(Some((outcome, record.effects)))
+                Ok(Some((outcome, record.effects, record.note)))
             }
             Err(err) => {
                 warn!(
@@ -931,11 +1005,13 @@ impl RuntimeCore {
         step_payload: &[u8],
         outcome: &StepOutcome,
         effects: &StagedEffects,
+        note: Option<Vec<u8>>,
     ) -> Result<()> {
         let record = DurableStepOutcomeRecord {
             stored_at_ms: self.clock.now_ms(),
             outcome: DurableStepOutcome::from(outcome),
             effects: effects.clone(),
+            note,
         };
         let bytes = rmp_serde::to_vec_named(&record)?;
         self.memo_store
@@ -985,12 +1061,13 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     /// Settle a run into its terminal state: return the deletes of the
     /// durable run record and the current-step pointer, the writes of
     /// the terminal marker and the terminal record (when memo retention
-    /// is enabled) and the terminal-notification enqueue (when the hook
-    /// observes this outcome) as [`SettlementEffects`] for the
-    /// settlement transaction. The notification job's payload
+    /// is enabled), the write of the member record with `note` (when
+    /// the run is a group member) and the terminal-notification enqueue
+    /// (when the hook observes this outcome) as [`SettlementEffects`]
+    /// for the settlement transaction. The notification job's payload
     /// is the committed outcome and the configured [`TerminalHook`]
-    /// runs as its worker; `terminal_step` is the job of the step that
-    /// produced the outcome, `None` when a pending step was cancelled.
+    /// runs as its worker; `terminal_step` is the step that produced
+    /// the outcome, or the pending step a cancellation removes.
     ///
     /// The effects are pure: nothing is written and no state is
     /// mutated here, so a caller that builds them and then commits a
@@ -1000,34 +1077,38 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     pub(crate) fn terminate_collecting_effects(
         &self,
         outcome: &RunOutcome,
-        terminal_step: Option<&JobRecord>,
+        terminal_step: &ClaimedStep<'_>,
+        note: Option<Vec<u8>>,
     ) -> SettlementEffects {
         let kv_deletes = vec![run_kv_key(&outcome.run_id), step_kv_key(&outcome.run_id)];
-        let kv_writes = if self.core.memo_retention.is_some() {
-            let terminated_at_ms = self.core.clock.now_ms();
-            let termination = DurableTermination {
-                status: outcome.status.into(),
-                error: outcome.error.clone(),
-                final_step: outcome.final_step,
-                terminated_at_ms,
-            };
-            HashMap::from([
-                (
-                    terminal_kv_key(&outcome.run_id, terminated_at_ms),
-                    Vec::new(),
-                ),
-                (
-                    outcome_kv_key(&outcome.run_id),
-                    durable::encode(&termination),
-                ),
-            ])
-        } else {
-            HashMap::new()
+        let terminated_at_ms = self.core.clock.now_ms();
+        let termination = DurableTermination {
+            status: outcome.status.into(),
+            error: outcome.error.clone(),
+            final_step: outcome.final_step,
+            terminated_at_ms,
         };
+        let mut kv_writes = HashMap::new();
+        if self.core.memo_retention.is_some() {
+            kv_writes.insert(
+                terminal_kv_key(&outcome.run_id, terminated_at_ms),
+                Vec::new(),
+            );
+            kv_writes.insert(
+                outcome_kv_key(&outcome.run_id),
+                durable::encode(&termination),
+            );
+        }
+        if let Some(membership) = &terminal_step.membership {
+            kv_writes.insert(
+                membership.kv_key(),
+                durable::encode(&terminated_member(&outcome.run_id, termination, note)),
+            );
+        }
         let enqueues = if self.terminal_hook.observes(outcome) {
             vec![
                 self.core
-                    .notification_enqueue_request(outcome, terminal_step),
+                    .notification_enqueue_request(outcome, Some(terminal_step.job)),
             ]
         } else {
             Vec::new()
@@ -1071,7 +1152,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 .last_error
                 .clone()
                 .unwrap_or_else(|| "step dead-lettered outside the worker".to_string());
-            let effects = self.terminate_collecting_effects(&claimed.failed(error), Some(&job));
+            let effects = self.terminate_collecting_effects(&claimed.failed(error), &claimed, None);
             core.queue.commit_effects(effects).await?;
             warn!(run_id = %run_id, step_number = claimed.step_number, job_id = %job.id, "terminated a run whose step was dead-lettered outside the worker");
             terminated += 1;
@@ -1116,6 +1197,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
 mod tests {
     use super::*;
     use crate::effects::{EffectsHandle, TerminalEffects};
+    use crate::group::{ManifestMember, MemberSpec};
     use crate::keys::MAX_RUN_ID_LEN;
     use crate::keys::{
         TERMINAL_KV_PREFIX, parse_timestamped_kv_key, signal_buf_kv_key, signal_wait_kv_key,
@@ -3994,19 +4076,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn failure_writes_apply_only_with_the_terminating_failure() {
-        struct FailureStagingRunner;
+    async fn a_note_reaches_the_member_record_only_with_the_terminating_settlement() {
+        struct NotingRunner;
 
-        impl StepRunner for FailureStagingRunner {
+        impl StepRunner for NotingRunner {
             async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
                 step.effects
-                    .put(b"app/outcome".to_vec(), b"staged".to_vec())
-                    .map_err(|e| StepError::permanent(e.to_string()))?;
-                step.effects
-                    .put_reserved_on_failure(
-                        b"workflow/test/failed".to_vec(),
-                        step.attempts.to_string().into_bytes(),
-                    )
+                    .note(step.attempts.to_string().into_bytes())
                     .map_err(|e| StepError::permanent(e.to_string()))?;
                 Err(StepError::transient("still failing"))
             }
@@ -4014,21 +4090,23 @@ mod tests {
 
         let (queue, store) = open_queue_with(fast_options()).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store,
-            FailureStagingRunner,
-            ChannelHook { tx },
-        )
-        .build();
+        let runtime =
+            WorkflowRuntime::builder(queue.clone(), store, NotingRunner, ChannelHook { tx })
+                .build();
         let shutdown = spawn_runtime(runtime.clone());
 
-        runtime
-            .submit(RunSpec {
-                input: Vec::new(),
-                max_attempts_per_step: Some(2),
-                ..Default::default()
-            })
+        let group = runtime.group("g").unwrap();
+        group
+            .submit(
+                vec![ManifestMember {
+                    key: "m".to_string(),
+                    input: Vec::new(),
+                }],
+                &MemberSpec {
+                    max_attempts_per_step: Some(2),
+                    ..MemberSpec::default()
+                },
+            )
             .await
             .unwrap();
         let outcome = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -4044,17 +4122,13 @@ mod tests {
         }
         assert_eq!(queue.stats("workflow-steps").await.unwrap().dead, 1);
 
-        // The retried first attempt applied nothing; the exhausted second
-        // attempt applied its failure write and not its outcome write.
-        assert_eq!(
-            queue
-                .kv_get(b"workflow/test/failed")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some(b"2".as_slice()),
-        );
-        assert!(queue.kv_get(b"app/outcome").await.unwrap().is_none());
+        // The retried first attempt recorded nothing; the exhausted second
+        // attempt's note commits with the dead-letter.
+        let members = group.members().await.unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].key, "m");
+        assert_eq!(members[0].status(), Some(TerminalStatus::Failed));
+        assert_eq!(members[0].record.note.as_deref(), Some(b"2".as_slice()));
 
         let _ = shutdown.send(());
     }

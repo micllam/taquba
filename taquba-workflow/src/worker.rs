@@ -15,6 +15,7 @@ use tracing::{debug, warn};
 use crate::durable::DurableRunOutcome;
 use crate::effects::{EffectsHandle, TerminalEffects};
 use crate::error::Error;
+use crate::group::Membership;
 use crate::keys::{HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RESERVED_HEADER_PREFIX};
 use crate::kv::KvReadHandle;
 use crate::runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
@@ -38,11 +39,13 @@ impl<R: StepRunner + 'static, H: TerminalHook + 'static> Worker for StepWorker<R
 }
 
 /// One claimed step job as the worker path identifies it: the run and
-/// step named by the job's reserved headers, the submitter's headers
-/// with the reserved ones removed and the queue record itself.
+/// step named by the job's reserved headers, the run's group membership
+/// when it has one, the submitter's headers with the reserved ones
+/// removed and the queue record itself.
 pub(crate) struct ClaimedStep<'a> {
     pub(crate) run_id: String,
     pub(crate) step_number: u32,
+    pub(crate) membership: Option<Membership>,
     /// Submitter-supplied headers, without the reserved `workflow.` keys.
     pub(crate) headers: HashMap<String, String>,
     pub(crate) job: &'a JobRecord,
@@ -75,21 +78,40 @@ impl<'a> ClaimedStep<'a> {
         Ok(Self {
             run_id,
             step_number,
+            membership: Membership::from_headers(&job.headers),
             headers,
             job,
         })
     }
 
-    /// The enqueue options of the run's next step: this step's priority
-    /// and attempt limit, so a run's per-step settings carry across the
-    /// step boundary.
+    /// The enqueue options of the run's next step: this step's priority,
+    /// attempt limit and group membership, so a run's per-step settings
+    /// and its membership hold across the step boundary.
     pub(crate) fn next_step_opts(&self) -> StepEnqueueOpts {
         StepEnqueueOpts {
             run_at: None,
             priority: Some(self.job.priority),
             max_attempts: Some(self.job.max_attempts),
-            reserved_headers: Vec::new(),
+            reserved_headers: self.reserved_headers_with_none(),
         }
+    }
+
+    /// The reserved headers of the next step: the membership's, plus
+    /// `header`.
+    pub(crate) fn reserved_headers_with(
+        &self,
+        header: (&'static str, String),
+    ) -> Vec<(&'static str, String)> {
+        let mut headers = self.reserved_headers_with_none();
+        headers.push(header);
+        headers
+    }
+
+    fn reserved_headers_with_none(&self) -> Vec<(&'static str, String)> {
+        self.membership
+            .as_ref()
+            .map(Membership::reserved_headers)
+            .unwrap_or_default()
     }
 
     /// A `Succeeded` outcome of the run at this step.
@@ -126,20 +148,20 @@ impl<'a> ClaimedStep<'a> {
 
 impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     /// The error a step returns for a failure that terminates its run:
-    /// the effects of the `Failed` termination plus `failure_writes`,
-    /// carried on a [`FailWith`] so the core applies them only with the
+    /// the effects of the `Failed` termination, with the step's `note`,
+    /// on a [`FailWith`] so the core applies them only with the
     /// dead-lettering settlement.
     pub(crate) fn terminating_failure(
         &self,
         claimed: &ClaimedStep<'_>,
         error: StepError,
-        failure_writes: HashMap<Vec<u8>, Vec<u8>>,
+        note: Option<Vec<u8>>,
     ) -> WorkerError {
-        let mut effects = self.terminate_collecting_effects(
+        let effects = self.terminate_collecting_effects(
             &claimed.failed(error.message.clone()),
-            Some(claimed.job),
+            claimed,
+            note,
         );
-        effects.kv_writes.extend(failure_writes);
         FailWith::new(error.into_worker_error(), effects).into()
     }
 
@@ -212,7 +234,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             })?;
         if record.cancel_requested {
             let mut effects =
-                self.terminate_collecting_effects(&claimed.cancelled(None), Some(job));
+                self.terminate_collecting_effects(&claimed.cancelled(None), &claimed, None);
             effects.kv_deletes.extend(signal_kv_deletes);
             return Ok(effects);
         }
@@ -252,10 +274,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         } else {
             None
         };
-        let (outcome, replayed_effects) = match replayed {
-            Some((outcome, effects)) => {
+        let (outcome, replayed) = match replayed {
+            Some((outcome, effects, note)) => {
                 debug!(run_id = %run_id, step_number, "replaying stored step outcome");
-                (Ok(outcome), Some(effects))
+                (Ok(outcome), Some((effects, note)))
             }
             None => (self.runner.run_step(&step).await, None),
         };
@@ -264,8 +286,8 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         // through a retained handle clone after this point could not
         // join the settlement, so staging it errors.
         let sealed = effects_handle.seal_and_take();
-        let replayed_step_output = replayed_effects.is_some();
-        let caller_effects = replayed_effects.unwrap_or(sealed.outcome);
+        let replayed_step_output = replayed.is_some();
+        let (caller_effects, note) = replayed.unwrap_or((sealed.outcome, sealed.note));
 
         // A request that lands after this read is recorded on the run
         // record and settles the next step before it runs.
@@ -277,14 +299,21 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             && let Ok(ref outcome) = outcome
         {
             self.core
-                .store_step_output(run_id, step_number, &job.payload, outcome, &caller_effects)
+                .store_step_output(
+                    run_id,
+                    step_number,
+                    &job.payload,
+                    outcome,
+                    &caller_effects,
+                    note.clone(),
+                )
                 .await
                 .map_err(|err| StepError::from(err).into_worker_error())?;
         }
 
         let runner_cancelled = matches!(outcome, Ok(StepOutcome::Cancel { .. }));
         let settled = self
-            .settle_outcome(&claimed, outcome, external_cancel, sealed.on_failure)
+            .settle_outcome(&claimed, outcome, external_cancel, note)
             .await;
 
         // Durable signal entries scheduled for cleanup are deleted with the
@@ -305,8 +334,9 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
 
     /// The settlement of `outcome` for `claimed`: the effects of the
     /// run's transition on an acknowledging outcome, or the error that
-    /// retries or dead-letters the step. `failure_writes` are the
-    /// runner's reserved writes for a terminating failure.
+    /// retries or dead-letters the step. `note` is the step's staged
+    /// note, recorded on the run's member record by a terminating
+    /// settlement that commits the runner's outcome.
     ///
     /// Cancellation precedence: a runner-issued [`StepOutcome::Cancel`]
     /// wins and carries its reason on [`RunOutcome::error`]; otherwise
@@ -318,13 +348,16 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         claimed: &ClaimedStep<'_>,
         outcome: std::result::Result<StepOutcome, StepError>,
         external_cancel: bool,
-        failure_writes: HashMap<Vec<u8>, Vec<u8>>,
+        note: Option<Vec<u8>>,
     ) -> std::result::Result<SettlementEffects, WorkerError> {
         match outcome {
-            Ok(StepOutcome::Cancel { reason }) => Ok(self
-                .terminate_collecting_effects(&claimed.cancelled(Some(reason)), Some(claimed.job))),
+            Ok(StepOutcome::Cancel { reason }) => Ok(self.terminate_collecting_effects(
+                &claimed.cancelled(Some(reason)),
+                claimed,
+                note,
+            )),
             _ if external_cancel => {
-                Ok(self.terminate_collecting_effects(&claimed.cancelled(None), Some(claimed.job)))
+                Ok(self.terminate_collecting_effects(&claimed.cancelled(None), claimed, None))
             }
             Ok(StepOutcome::Continue { payload, when }) => match when {
                 Trigger::Immediate => Ok(self
@@ -346,19 +379,19 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                         .await
                 }
             },
-            Ok(StepOutcome::Succeed { result }) => Ok(
-                self.terminate_collecting_effects(&claimed.succeeded(result), Some(claimed.job))
-            ),
+            Ok(StepOutcome::Succeed { result }) => {
+                Ok(self.terminate_collecting_effects(&claimed.succeeded(result), claimed, note))
+            }
             // A runner verdict: the step ran cleanly and is acknowledged;
             // the run terminates as `Failed` without a dead-letter.
             Ok(StepOutcome::Fail { reason }) => {
-                Ok(self.terminate_collecting_effects(&claimed.failed(reason), Some(claimed.job)))
+                Ok(self.terminate_collecting_effects(&claimed.failed(reason), claimed, note))
             }
             // A permanent error, or a transient one on the last attempt,
-            // dead-letters the step and terminates the run; the runner's
-            // failure writes apply only with that settlement.
+            // dead-letters the step and terminates the run; the note is
+            // recorded only with that settlement.
             Err(err) if err.kind == StepErrorKind::Permanent || claimed.job.is_last_attempt() => {
-                Err(self.terminating_failure(claimed, err, failure_writes))
+                Err(self.terminating_failure(claimed, err, note))
             }
             Err(err) => Err(err.into_worker_error()),
         }

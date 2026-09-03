@@ -1,23 +1,18 @@
-//! Inner fan-out composing workflow steps with typed jobs: a workflow
-//! step submits N typed jobs to a shared [`JobRunner`], joins
-//! their typed results, and memoizes the aggregate so a step retry
-//! does not re-submit the fan-out.
+//! Inner fan-out composing workflow steps with a job group: a workflow
+//! step submits one typed job per URL as the members of a group named
+//! after the step, joins their typed results and continues with the
+//! aggregate.
 //!
 //! - **Step 0 (`fetch`)**: submits one `FetchPage` job per URL in the
-//!   run input, awaits every handle, and stores the joined results in
-//!   the step's memo before continuing.
+//!   run input to the group `fetch-{run_id}`, joins every result and
+//!   continues with the joined report.
 //! - **Step 1 (`report`)**: formats the aggregate into the run's final
 //!   result.
 //!
-//! Two mechanisms keep the fan-out safe under at-least-once delivery:
-//!
-//! - The joined aggregate is memoized under the step's memo key, so a
-//!   step retry after the join completed replays the cached aggregate
-//!   instead of re-submitting any jobs.
-//! - Each job carries an idempotency key, so a step retry that crashed
-//!   mid-fan-out (some jobs submitted, memo not yet written) collapses
-//!   its re-submissions onto the in-flight or completed jobs instead
-//!   of running them twice.
+//! The group keeps the fan-out safe under at-least-once delivery: a
+//! retry of step 0 submits the same group again, which runs only the
+//! members that did not succeed, and joins the recorded results of the
+//! rest without running them twice.
 //!
 //! Both layers consume one shared `Arc<Queue>`: the workflow runtime
 //! and the job runner are consumers of the same store, in the same
@@ -69,9 +64,6 @@ impl Job for FetchPage {
 const STEP_FETCH: u32 = 0;
 const STEP_REPORT: u32 = 1;
 
-/// Memo key holding the joined fan-out results for step 0.
-const FETCH_MEMO_KEY: &str = "fetch-results";
-
 struct FanoutRunner {
     jobs: Arc<JobRunner>,
 }
@@ -80,47 +72,33 @@ impl StepRunner for FanoutRunner {
     async fn run_step(&self, step: &Step) -> Result<StepOutcome, StepError> {
         match step.step_number {
             STEP_FETCH => {
-                let aggregate = if let Some(cached) = step.memo.get(FETCH_MEMO_KEY).await? {
-                    println!("[step 0] memo hit; fan-out not re-submitted");
-                    cached
-                } else {
-                    let input = std::str::from_utf8(&step.payload)
-                        .map_err(|e| StepError::permanent(format!("non-utf8 input: {e}")))?;
-                    let urls: Vec<&str> = input.lines().collect();
+                let input = std::str::from_utf8(&step.payload)
+                    .map_err(|e| StepError::permanent(format!("non-utf8 input: {e}")))?;
+                let urls: Vec<&str> = input.lines().collect();
 
-                    // Fan out: one typed job per URL on the shared runner.
-                    let mut handles = Vec::with_capacity(urls.len());
-                    for url in &urls {
-                        let handle = self
-                            .jobs
-                            .submit(FetchPage {
-                                url: (*url).to_string(),
-                            })
-                            .await
-                            .map_err(|e| StepError::transient(format!("submit failed: {e}")))?;
-                        handles.push(handle);
-                    }
+                // Fan out: one typed job per URL, as one group per step.
+                let group = self
+                    .jobs
+                    .group::<FetchPage>(format!("fetch-{}", step.run_id))?;
+                group
+                    .submit(urls.iter().map(|url| FetchPage {
+                        url: (*url).to_string(),
+                    }))
+                    .await?;
 
-                    // Join: await every typed result.
-                    let mut lines = Vec::with_capacity(urls.len());
-                    let mut total: u64 = 0;
-                    for (url, handle) in urls.iter().zip(handles) {
-                        let bytes = handle
-                            .await
-                            .map_err(|e| StepError::transient(format!("fetch failed: {e}")))?;
-                        println!("[step 0] fetched {url}: {bytes} bytes");
-                        lines.push(format!("{url}: {bytes} bytes"));
-                        total += bytes;
-                    }
-                    lines.push(format!("total: {total} bytes"));
-
-                    // Memoize the aggregate before continuing, so a retry
-                    // of this step replays it instead of re-submitting.
-                    let aggregate = lines.join("\n").into_bytes();
-                    step.memo.put(FETCH_MEMO_KEY, &aggregate).await?;
-                    aggregate
-                };
-                Ok(StepOutcome::continue_now(aggregate))
+                // Join: every typed result, in submission order.
+                let mut lines = Vec::with_capacity(urls.len());
+                let mut total: u64 = 0;
+                for member in group.join().await? {
+                    let bytes = member
+                        .result
+                        .map_err(|e| StepError::transient(format!("fetch failed: {e}")))?;
+                    println!("[step 0] fetched {}: {bytes} bytes", member.key);
+                    lines.push(format!("{}: {bytes} bytes", member.key));
+                    total += bytes;
+                }
+                lines.push(format!("total: {total} bytes"));
+                Ok(StepOutcome::continue_now(lines.join("\n").into_bytes()))
             }
             STEP_REPORT => {
                 let findings = std::str::from_utf8(&step.payload)
