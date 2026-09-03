@@ -41,8 +41,8 @@ use serde_json::json;
 use taquba::Queue;
 use taquba::object_store::memory::InMemory;
 use taquba_workflow::{
-    RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects, TerminalHook,
-    TerminalStatus, WorkflowRuntime,
+    RunOptions, RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects,
+    TerminalHook, TerminalStatus, WorkflowRuntime,
 };
 use tokio::sync::oneshot;
 
@@ -340,7 +340,10 @@ async fn main() -> Result<()> {
     let handle = runtime
         .submit(RunSpec {
             input: Vec::new(),
-            headers,
+            options: RunOptions {
+                headers,
+                ..Default::default()
+            },
             ..Default::default()
         })
         .await?;

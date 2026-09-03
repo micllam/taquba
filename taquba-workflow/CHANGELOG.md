@@ -36,13 +36,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   grouped run's group and member key on its step jobs.
 - `RunGroup`: many runs of one runtime submitted as one durable set
   (`WorkflowRuntime::group`, `WorkflowRuntime::new_group`,
-  `RunGroup::submit` with `GroupMember` and `MemberSpec`, `resume`,
+  `RunGroup::submit` with `GroupMember` and `RunOptions`, `resume`,
   `results` yielding a `MemberResult` per member as it terminates,
   `status` as a `GroupStatus`, `cancel` and `forget`), the mechanism
-  under `jobs::JobGroup`, which gains `cancel`; `MemberSpec` implements
-  `From<jobs::SubmitOptions>`;
+  under `jobs::JobGroup`, which gains `cancel`;
   `WorkflowRuntimeBuilder::group_retention` removes a group's state a
   window after a `results` consumer observed its last termination.
+- `RunOptions`: the settings of a run's steps (headers, priority,
+  attempt limit and earliest run time), carried by `RunSpec::options`
+  and taken by `RunGroup::submit`, `RunGroup::resume`,
+  `jobs::JobRunner::submit_with`, `jobs::JobGroup::submit_with` and
+  `jobs::JobGroup::resume_with`.
 - `WorkflowRuntime::wait` and `wait_timeout`: wait until a run
   terminates, following its current step across steps, and report a
   `RunEnd` (its `RunTermination` and committed `RunOutcome`, each when
@@ -61,6 +65,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **Breaking (source):** `jobs::SubmitOptions`; `jobs::JobRunner::submit_with`
+  takes `RunOptions`, whose `max_attempts_per_step` is the former
+  `max_attempts`.
 - **Breaking (source):** `jobs::JobContext::submit`. A handler that
   submits further jobs holds a `JobRunner` in its registered state, as
   the fan-out example does.
@@ -95,6 +102,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (source):** `RunSpec::{headers, priority,
+  max_attempts_per_step, run_at}` moved into `RunSpec::options`, a
+  `RunOptions`.
 - **Breaking (source):** `Error::JobNotFound` is `Error::RunNotFound`,
   reported by `WorkflowRuntime::wait` and `jobs::JobHandle::join` for a
   run the runtime has no record of.

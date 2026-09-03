@@ -69,7 +69,7 @@ pub struct RunOutcome {
     /// - When `status == Succeeded`: always `None`.
     pub error: Option<String>,
     /// Submitter-supplied metadata, threaded through from
-    /// [`crate::RunSpec::headers`].
+    /// [`crate::RunOptions::headers`].
     pub headers: HashMap<String, String>,
     /// Step number of the step that produced the terminal outcome (zero-based).
     pub final_step: u32,
@@ -210,7 +210,7 @@ mod webhook {
     /// under [`Self::URL_HEADER`] (default `"callback_url"`); runs
     /// without that header enqueue no notification at all. The default
     /// key intentionally avoids the reserved `workflow.*` prefix so
-    /// submitters can set it directly via [`crate::RunSpec::headers`].
+    /// submitters can set it directly via [`crate::RunOptions::headers`].
     ///
     /// The webhook enqueue is staged as a notification effect, so the
     /// delivery job is created exactly once, atomically with the
@@ -229,13 +229,13 @@ mod webhook {
     impl WebhookTerminalHook {
         /// Default header key the hook looks for on each [`RunOutcome`].
         /// Deliberately outside the reserved `workflow.*` prefix so submitters
-        /// can set it on [`crate::RunSpec::headers`] without being
+        /// can set it on [`crate::RunOptions::headers`] without being
         /// rejected.
         pub const URL_HEADER: &'static str = "callback_url";
 
         /// Build a hook that enqueues webhook deliveries onto
         /// `target_queue`. The submitter sets a callback URL per run via
-        /// the [`Self::URL_HEADER`] header on [`crate::RunSpec::headers`].
+        /// the [`Self::URL_HEADER`] header on [`crate::RunOptions::headers`].
         pub fn new(target_queue: impl Into<String>) -> Self {
             Self {
                 target_queue: target_queue.into(),

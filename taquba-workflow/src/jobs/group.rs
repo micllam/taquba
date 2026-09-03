@@ -6,12 +6,12 @@ use std::marker::PhantomData;
 
 use futures_util::{Stream, StreamExt, TryStreamExt};
 
-use crate::Result;
-use crate::group::{GroupMember, GroupStatus, MemberSpec, RunGroup};
+use crate::group::{GroupMember, GroupStatus, RunGroup};
 use crate::jobs::handle::{JobError, decode_end};
 use crate::jobs::job::Job;
-use crate::jobs::runner::{Dispatch, SubmitOptions, job_payload};
+use crate::jobs::runner::{Dispatch, job_payload};
 use crate::terminal::NoopTerminalHook;
+use crate::{Result, RunOptions};
 
 /// A [`RunGroup`] of jobs of one type, identified by a group id.
 /// Obtained from [`JobRunner::group`](crate::jobs::JobRunner::group) or
@@ -34,17 +34,6 @@ pub struct GroupResult<J: Job> {
     pub result: std::result::Result<J::Output, JobError>,
 }
 
-impl From<SubmitOptions> for MemberSpec {
-    fn from(opts: SubmitOptions) -> Self {
-        Self {
-            headers: opts.headers,
-            priority: opts.priority,
-            max_attempts_per_step: opts.max_attempts,
-            run_at: opts.run_at,
-        }
-    }
-}
-
 impl<J: Job> JobGroup<J> {
     pub(crate) fn new(group: RunGroup<Dispatch, NoopTerminalHook>) -> Self {
         Self {
@@ -61,7 +50,7 @@ impl<J: Job> JobGroup<J> {
     /// Submit `jobs` as the group's members with the queue's default
     /// options; see [`submit_with`](Self::submit_with).
     pub async fn submit(&self, jobs: impl IntoIterator<Item = J>) -> Result<()> {
-        self.submit_with(jobs, SubmitOptions::default()).await
+        self.submit_with(jobs, RunOptions::default()).await
     }
 
     /// Submit `jobs` as the group's members, as [`RunGroup::submit`]
@@ -72,13 +61,13 @@ impl<J: Job> JobGroup<J> {
     /// and two jobs with one key are rejected with
     /// [`Error::DuplicateMemberKey`](crate::Error::DuplicateMemberKey).
     ///
-    /// `opts` applies to every member; [`Job::max_attempts`] is not
-    /// consulted, so set [`SubmitOptions::max_attempts`] for a limit
-    /// other than the queue's.
+    /// `options` applies to every member; [`Job::max_attempts`] is not
+    /// consulted, so set [`RunOptions::max_attempts_per_step`] for a
+    /// limit other than the queue's.
     pub async fn submit_with(
         &self,
         jobs: impl IntoIterator<Item = J>,
-        opts: SubmitOptions,
+        options: RunOptions,
     ) -> Result<()> {
         let mut members = Vec::new();
         for (i, job) in jobs.into_iter().enumerate() {
@@ -87,22 +76,22 @@ impl<J: Job> JobGroup<J> {
                 input: job_payload(&job)?,
             });
         }
-        self.group.submit(members, &opts.into()).await
+        self.group.submit(members, &options).await
     }
 
     /// Submit the members of the group's manifest that did not succeed,
     /// with the queue's default options; see
     /// [`resume_with`](Self::resume_with).
     pub async fn resume(&self) -> Result<()> {
-        self.resume_with(SubmitOptions::default()).await
+        self.resume_with(RunOptions::default()).await
     }
 
     /// Submit the members of the group's manifest whose last recorded
     /// termination is not a success, without the jobs; see
-    /// [`RunGroup::resume`]. `opts` applies as in
+    /// [`RunGroup::resume`]. `options` applies as in
     /// [`submit_with`](Self::submit_with).
-    pub async fn resume_with(&self, opts: SubmitOptions) -> Result<()> {
-        self.group.resume(&opts.into()).await
+    pub async fn resume_with(&self, options: RunOptions) -> Result<()> {
+        self.group.resume(&options).await
     }
 
     /// The members' results as each one terminates, in completion

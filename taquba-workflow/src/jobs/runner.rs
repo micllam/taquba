@@ -4,11 +4,13 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{RunSpec, RunnerHandle, Step, StepError, StepOutcome, StepRunner, WorkflowRuntime};
+use crate::{
+    RunOptions, RunSpec, RunnerHandle, Step, StepError, StepOutcome, StepRunner, WorkflowRuntime,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use taquba::object_store::ObjectStore;
 use taquba::{Clock, Queue};
@@ -39,26 +41,6 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// the key, so any key maps onto the character set a run id accepts.
 fn run_id_for_key(key: &str) -> String {
     hex_sha256(&[key.as_bytes()])
-}
-
-/// Per-submission overrides for [`JobRunner::submit_with`].
-///
-/// Every field is optional; the defaults inherit the queue's configuration.
-/// Construct via [`SubmitOptions::default`] and struct-update syntax.
-#[derive(Debug, Clone, Default)]
-pub struct SubmitOptions {
-    /// Override the job type's and queue's `max_attempts` for this
-    /// submission. Takes precedence over [`Job::max_attempts`].
-    pub max_attempts: Option<u32>,
-    /// Override the queue's default priority. Lower numbers are claimed
-    /// first; see [`taquba::PRIORITY_HIGH`] and the other priority constants.
-    pub priority: Option<u32>,
-    /// Delay the job until this time. The job waits in the scheduled key
-    /// space until taquba's scheduler promotes it.
-    pub run_at: Option<SystemTime>,
-    /// Extra headers to attach to the job. Keys must not start with the
-    /// runtime's reserved `workflow.` prefix.
-    pub headers: HashMap<String, String>,
 }
 
 /// The state shared by the runner and every [`JobHandle`]: the runtime
@@ -102,7 +84,7 @@ impl Inner {
     pub(crate) async fn submit<J: Job>(
         self: &Arc<Self>,
         job: J,
-        opts: SubmitOptions,
+        options: RunOptions,
     ) -> Result<JobHandle<J>> {
         let payload = job_payload(&job)?;
         let key = job.idempotency_key();
@@ -126,10 +108,12 @@ impl Inner {
             .submit(RunSpec {
                 run_id,
                 input: payload,
-                headers: opts.headers,
-                priority: opts.priority,
-                max_attempts_per_step: opts.max_attempts.or_else(|| job.max_attempts()),
-                run_at: opts.run_at,
+                options: RunOptions {
+                    max_attempts_per_step: options
+                        .max_attempts_per_step
+                        .or_else(|| job.max_attempts()),
+                    ..options
+                },
                 kv_writes: HashMap::new(),
             })
             .await?;
@@ -277,12 +261,15 @@ impl JobRunner {
     ///
     /// Returns a [`JobHandle`] that can be awaited for the typed result.
     pub async fn submit<J: Job>(&self, job: J) -> Result<JobHandle<J>> {
-        self.inner.submit(job, SubmitOptions::default()).await
+        self.inner.submit(job, RunOptions::default()).await
     }
 
-    /// Submit a job with per-submission overrides (priority, schedule, etc.).
-    pub async fn submit_with<J: Job>(&self, job: J, opts: SubmitOptions) -> Result<JobHandle<J>> {
-        self.inner.submit(job, opts).await
+    /// Submit a job with `options`: its headers, priority, attempt limit
+    /// and earliest run time. [`RunOptions::max_attempts_per_step`] takes
+    /// precedence over [`Job::max_attempts`]; the queue's limit applies
+    /// when neither is set.
+    pub async fn submit_with<J: Job>(&self, job: J, options: RunOptions) -> Result<JobHandle<J>> {
+        self.inner.submit(job, options).await
     }
 
     /// The group of `J` jobs named `id`, which must be 1 to 128 bytes of
@@ -488,6 +475,7 @@ mod tests {
 
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::SystemTime;
 
     use serde::{Deserialize, Serialize};
     use taquba::object_store::{ObjectStore, memory::InMemory};
@@ -1075,9 +1063,9 @@ mod tests {
         let job = runner
             .submit_with(
                 Adder { a: 5, b: 7 },
-                SubmitOptions {
+                RunOptions {
                     run_at: Some(run_at),
-                    ..SubmitOptions::default()
+                    ..RunOptions::default()
                 },
             )
             .await

@@ -243,7 +243,8 @@
 //! with backoff up to the attempt limit, then dead-lettered) or
 //! [`StepErrorKind::Permanent`](crate::StepErrorKind::Permanent)
 //! (dead-lettered on that attempt). Backoff is a queue-level Taquba setting; [`Job::max_attempts`]
-//! and per-submission [`SubmitOptions`] cover the per-job settings.
+//! and per-submission [`RunOptions`](crate::RunOptions) cover the per-job
+//! settings.
 
 mod context;
 mod group;
@@ -256,4 +257,4 @@ pub use context::JobContext;
 pub use group::{GroupResult, JobGroup};
 pub use handle::{JobError, JobHandle, JoinError};
 pub use job::{Job, payload_idempotency_key};
-pub use runner::{JobRunner, JobRunnerBuilder, SubmitOptions};
+pub use runner::{JobRunner, JobRunnerBuilder};

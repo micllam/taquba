@@ -138,11 +138,12 @@ queue, for tests.
 
 `WorkflowRuntime::submit` takes a `RunSpec`: the first step's `input`, an
 optional `run_id` (1 to `MAX_RUN_ID_LEN` bytes of `[A-Za-z0-9_-]`; a ULID
-is generated when absent), `headers`, a `priority` and
-`max_attempts_per_step` overriding the queue's defaults for every step,
-a `run_at` before which the first step is not claimable and `kv_writes`
-applied with the enqueue. The returned `SubmitOutcome` names the run and
-the queue job currently representing it.
+is generated when absent), the `RunOptions` of its steps (`headers`, a
+`priority` and `max_attempts_per_step` overriding the queue's defaults
+for every step and a `run_at` before which the first step is not
+claimable) and `kv_writes` applied with the enqueue. The returned
+`SubmitOutcome` names the run and the queue job currently representing
+it.
 
 `submit` is idempotent on `(run_id, input)`. A re-submission of an
 active run with the same input is a no-op and the returned
@@ -325,7 +326,7 @@ order flow maintaining a status row through both surfaces.
 ## Reserved headers
 
 Step jobs reserve the `workflow.*` prefix; submission rejects user
-headers starting with it. Other headers on `RunSpec::headers` thread
+headers starting with it. Other headers on `RunOptions::headers` thread
 through every step and reach the terminal hook on `RunOutcome::headers`.
 
 | Key | Meaning |

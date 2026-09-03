@@ -62,6 +62,28 @@ pub(crate) struct StepEnqueueOpts {
     pub(crate) reserved_headers: Vec<(&'static str, String)>,
 }
 
+/// The settings of a run's steps, applied by [`WorkflowRuntime::submit`]
+/// through [`RunSpec::options`], by [`RunGroup::submit`] and
+/// [`RunGroup::resume`] to every member of a group and by
+/// [`jobs::JobRunner::submit_with`](crate::jobs::JobRunner::submit_with)
+/// to a job.
+#[derive(Debug, Clone, Default)]
+pub struct RunOptions {
+    /// Submitter-supplied metadata, threaded through every step of the
+    /// run and surfaced to the terminal hook. Reserved `workflow.*` keys
+    /// are rejected at submission with [`Error::ReservedHeaderInSubmit`].
+    pub headers: HashMap<String, String>,
+    /// Priority of every step; the queue's default when `None`.
+    pub priority: Option<u32>,
+    /// Attempt limit of every step; the queue's `max_attempts` when
+    /// `None`.
+    pub max_attempts_per_step: Option<u32>,
+    /// Earliest time the first step may run. The step-0 job waits in
+    /// the queue's scheduled state until the queue's clock passes this
+    /// time; `None` makes it claimable at once.
+    pub run_at: Option<SystemTime>,
+}
+
 /// Spec passed to [`WorkflowRuntime::submit`].
 #[derive(Debug, Clone, Default)]
 pub struct RunSpec {
@@ -81,18 +103,8 @@ pub struct RunSpec {
     pub run_id: Option<String>,
     /// Bytes handed to the runner as the first step's payload.
     pub input: Vec<u8>,
-    /// Submitter-supplied metadata, threaded through every step of the run
-    /// and surfaced to the terminal hook. Reserved `workflow.*` keys are
-    /// rejected at submission with [`Error::ReservedHeaderInSubmit`].
-    pub headers: HashMap<String, String>,
-    /// Override the queue's default priority for every step of this run.
-    pub priority: Option<u32>,
-    /// Override the queue's `max_attempts` for every step of this run.
-    pub max_attempts_per_step: Option<u32>,
-    /// Earliest time the first step may run. The step-0 job waits in the
-    /// queue's scheduled state until the queue's clock passes this time;
-    /// `None` makes it claimable at once.
-    pub run_at: Option<SystemTime>,
+    /// The settings of the run's steps.
+    pub options: RunOptions,
     /// Writes applied to the caller KV namespace in the same transaction
     /// as the step-0 enqueue. Applied only when the submission is new: a
     /// duplicate submission's writes are dropped, and the writes do not
@@ -541,7 +553,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         if let Some(supplied) = spec.run_id.as_deref() {
             validate_run_id(supplied)?;
         }
-        for k in spec.headers.keys() {
+        for k in spec.options.headers.keys() {
             if k.starts_with(RESERVED_HEADER_PREFIX) {
                 return Err(Error::ReservedHeaderInSubmit(k.clone()));
             }
@@ -593,17 +605,20 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         }
 
         let opts = StepEnqueueOpts {
-            run_at: spec.run_at,
-            priority: spec.priority,
-            max_attempts: spec.max_attempts_per_step,
+            run_at: spec.options.run_at,
+            priority: spec.options.priority,
+            max_attempts: spec.options.max_attempts_per_step,
             reserved_headers: membership
                 .map(Membership::reserved_headers)
                 .unwrap_or_default(),
         };
-        let (request, job_id) =
-            self.inner
-                .core
-                .step_enqueue_request(run_id, 0, spec.input, &spec.headers, opts);
+        let (request, job_id) = self.inner.core.step_enqueue_request(
+            run_id,
+            0,
+            spec.input,
+            &spec.options.headers,
+            opts,
+        );
 
         let record_bytes = durable::encode(&DurableRunRecord {
             run_id: run_id.to_string(),
@@ -1433,7 +1448,7 @@ mod tests {
     use super::*;
     use crate::durable::DurableMember;
     use crate::effects::{EffectsHandle, TerminalEffects};
-    use crate::group::{GroupMember, MemberSpec};
+    use crate::group::GroupMember;
     use crate::keys::{MAX_RUN_ID_LEN, group_member_kv_key};
     use crate::keys::{
         TERMINAL_KV_PREFIX, parse_timestamped_kv_key, signal_buf_kv_key, signal_wait_kv_key,
@@ -1744,10 +1759,13 @@ mod tests {
         let handle = runtime
             .submit(RunSpec {
                 input: b"start".to_vec(),
-                headers: HashMap::from([
-                    ("trace_id".to_string(), "abc-123".to_string()),
-                    ("tenant".to_string(), "acme".to_string()),
-                ]),
+                options: RunOptions {
+                    headers: HashMap::from([
+                        ("trace_id".to_string(), "abc-123".to_string()),
+                        ("tenant".to_string(), "acme".to_string()),
+                    ]),
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .await
@@ -2266,8 +2284,11 @@ mod tests {
         runtime
             .submit(RunSpec {
                 input: b"x".to_vec(),
-                priority: Some(3),
-                max_attempts_per_step: Some(5),
+                options: RunOptions {
+                    priority: Some(3),
+                    max_attempts_per_step: Some(5),
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .await
@@ -2412,7 +2433,10 @@ mod tests {
         runtime
             .submit(RunSpec {
                 input: b"x".to_vec(),
-                run_at: Some(UNIX_EPOCH + Duration::from_millis(t0 + 60_000)),
+                options: RunOptions {
+                    run_at: Some(UNIX_EPOCH + Duration::from_millis(t0 + 60_000)),
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .await
@@ -2462,7 +2486,10 @@ mod tests {
         let outcome = runtime
             .submit(RunSpec {
                 input: b"x".to_vec(),
-                max_attempts_per_step: Some(7),
+                options: RunOptions {
+                    max_attempts_per_step: Some(7),
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .await
@@ -2817,7 +2844,10 @@ mod tests {
         let handle = runtime
             .submit(RunSpec {
                 input: b"x".to_vec(),
-                max_attempts_per_step: Some(max_attempts),
+                options: RunOptions {
+                    max_attempts_per_step: Some(max_attempts),
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .await
@@ -3035,7 +3065,10 @@ mod tests {
         let handle = runtime
             .submit(RunSpec {
                 input: b"x".to_vec(),
-                headers,
+                options: RunOptions {
+                    headers,
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .await
@@ -3354,7 +3387,10 @@ mod tests {
         runtime
             .submit(RunSpec {
                 input: b"start".to_vec(),
-                max_attempts_per_step: Some(3),
+                options: RunOptions {
+                    max_attempts_per_step: Some(3),
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .await
@@ -3459,7 +3495,10 @@ mod tests {
         let err = runtime
             .submit(RunSpec {
                 input: b"x".to_vec(),
-                headers: HashMap::from([("workflow.run_id".to_string(), "evil".to_string())]),
+                options: RunOptions {
+                    headers: HashMap::from([("workflow.run_id".to_string(), "evil".to_string())]),
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .await
@@ -3710,7 +3749,10 @@ mod tests {
         let handle = runtime
             .submit(RunSpec {
                 input: b"x".to_vec(),
-                max_attempts_per_step: Some(3),
+                options: RunOptions {
+                    max_attempts_per_step: Some(3),
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .await
@@ -4287,7 +4329,10 @@ mod tests {
             .submit(RunSpec {
                 run_id: Some("hung".into()),
                 input: Vec::new(),
-                max_attempts_per_step: Some(1),
+                options: RunOptions {
+                    max_attempts_per_step: Some(1),
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .await
@@ -4497,9 +4542,9 @@ mod tests {
                     key: "m".to_string(),
                     input: Vec::new(),
                 }],
-                &MemberSpec {
+                &RunOptions {
                     max_attempts_per_step: Some(2),
-                    ..MemberSpec::default()
+                    ..RunOptions::default()
                 },
             )
             .await
@@ -4890,10 +4935,13 @@ mod tests {
             .submit(RunSpec {
                 run_id: Some("with-callback".to_string()),
                 input: Vec::new(),
-                headers: HashMap::from([(
-                    "callback_url".to_string(),
-                    "https://example.com/done".to_string(),
-                )]),
+                options: RunOptions {
+                    headers: HashMap::from([(
+                        "callback_url".to_string(),
+                        "https://example.com/done".to_string(),
+                    )]),
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .await

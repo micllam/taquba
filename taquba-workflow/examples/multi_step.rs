@@ -17,8 +17,8 @@ use std::time::Duration;
 use taquba::Queue;
 use taquba::object_store::memory::InMemory;
 use taquba_workflow::{
-    RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects, TerminalHook,
-    TerminalStatus, WorkflowRuntime,
+    RunOptions, RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects,
+    TerminalHook, TerminalStatus, WorkflowRuntime,
 };
 use tokio::sync::oneshot;
 
@@ -126,7 +126,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handle = runtime
         .submit(RunSpec {
             input: b"0/5".to_vec(),
-            headers,
+            options: RunOptions {
+                headers,
+                ..Default::default()
+            },
             ..Default::default()
         })
         .await?;

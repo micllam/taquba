@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use futures_util::stream::{self, FuturesUnordered, Stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
@@ -24,7 +23,9 @@ use crate::keys::{
 };
 use crate::memo::MemoStore;
 use crate::runner::StepRunner;
-use crate::runtime::{RunResult, RunSpec, RunTermination, RuntimeCore, WorkflowRuntime};
+use crate::runtime::{
+    RunOptions, RunResult, RunSpec, RunTermination, RuntimeCore, WorkflowRuntime,
+};
 use crate::sweep::Clearable;
 use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
 
@@ -93,20 +94,6 @@ pub struct GroupMember {
 pub(crate) struct Manifest {
     pub(crate) group_id: String,
     pub(crate) members: Vec<GroupMember>,
-}
-
-/// The submission settings applied to every member of a group; see the
-/// fields of [`RunSpec`].
-#[derive(Debug, Clone, Default)]
-pub struct MemberSpec {
-    /// Headers set on every step of every member.
-    pub headers: HashMap<String, String>,
-    /// Priority of every step; the queue's default when `None`.
-    pub priority: Option<u32>,
-    /// Attempt limit of every step; the queue's default when `None`.
-    pub max_attempts_per_step: Option<u32>,
-    /// Earliest time step 0 of every member runs; at once when `None`.
-    pub run_at: Option<SystemTime>,
 }
 
 /// The durable state of a group, read from its manifest and member
@@ -340,10 +327,10 @@ impl<R: StepRunner, H: TerminalHook> RunGroup<R, H> {
     /// same set submits every member whose last recorded termination is
     /// not a success, so a group is re-submitted after a crash or to run
     /// its failed members again. Two members with one key are rejected
-    /// with [`Error::DuplicateMemberKey`]. `spec` applies to every
+    /// with [`Error::DuplicateMemberKey`]. `options` applies to every
     /// member. A submission that fails returns after the members
     /// submitted so far.
-    pub async fn submit(&self, members: Vec<GroupMember>, spec: &MemberSpec) -> Result<()> {
+    pub async fn submit(&self, members: Vec<GroupMember>, options: &RunOptions) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
         for member in &members {
             if !seen.insert(member.key.as_str()) {
@@ -361,19 +348,19 @@ impl<R: StepRunner, H: TerminalHook> RunGroup<R, H> {
             Some(_) => {}
             None => self.store().write_manifest(&manifest).await?,
         }
-        self.submit_members(manifest.members, spec).await
+        self.submit_members(manifest.members, options).await
     }
 
     /// Submit the members of the group's manifest whose last recorded
     /// termination is not a success: a member still active continues,
     /// and the rest run. Returns [`Error::GroupNotFound`] for a group
-    /// never submitted. `spec` applies as in [`submit`](Self::submit).
-    pub async fn resume(&self, spec: &MemberSpec) -> Result<()> {
+    /// never submitted. `options` applies as in [`submit`](Self::submit).
+    pub async fn resume(&self, options: &RunOptions) -> Result<()> {
         let manifest = self.manifest().await?;
-        self.submit_members(manifest.members, spec).await
+        self.submit_members(manifest.members, options).await
     }
 
-    async fn submit_members(&self, members: Vec<GroupMember>, spec: &MemberSpec) -> Result<()> {
+    async fn submit_members(&self, members: Vec<GroupMember>, options: &RunOptions) -> Result<()> {
         let succeeded: std::collections::HashSet<String> = self
             .members()
             .await?
@@ -397,10 +384,7 @@ impl<R: StepRunner, H: TerminalHook> RunGroup<R, H> {
                     RunSpec {
                         run_id: Some(membership.run_id()),
                         input: member.input,
-                        headers: spec.headers.clone(),
-                        priority: spec.priority,
-                        max_attempts_per_step: spec.max_attempts_per_step,
-                        run_at: spec.run_at,
+                        options: options.clone(),
                         kv_writes: HashMap::new(),
                     },
                 )
@@ -632,7 +616,7 @@ mod tests {
             WorkflowRuntime::builder(queue.clone(), store, Rejecting, NoopTerminalHook).build();
         let group = runtime.group("g").unwrap();
         group
-            .submit(vec![member("a")], &MemberSpec::default())
+            .submit(vec![member("a")], &RunOptions::default())
             .await
             .unwrap();
         let worker = runtime.spawn(std::future::pending::<()>());
@@ -658,7 +642,7 @@ mod tests {
         // is written.
         clock.advance(Duration::from_secs(1));
         group
-            .submit(vec![member("a")], &MemberSpec::default())
+            .submit(vec![member("a")], &RunOptions::default())
             .await
             .unwrap();
         let claim = queue
@@ -687,7 +671,7 @@ mod tests {
             .build();
         let group = runtime.group("g").unwrap();
         group
-            .submit(vec![member("a"), member("b")], &MemberSpec::default())
+            .submit(vec![member("a"), member("b")], &RunOptions::default())
             .await
             .unwrap();
         let pending = group.members().await.unwrap();
@@ -696,7 +680,7 @@ mod tests {
         assert_eq!(pending[0].record.run_id, member_run_id("g", "a"));
 
         assert!(matches!(
-            group.submit(vec![member("a"), member("a")], &MemberSpec::default()).await,
+            group.submit(vec![member("a"), member("a")], &RunOptions::default()).await,
             Err(Error::DuplicateMemberKey(key)) if key == "a"
         ));
 
@@ -734,7 +718,7 @@ mod tests {
             WorkflowRuntime::builder(queue.clone(), store, TwoSteps, NoopTerminalHook).build();
         let group = runtime.group("g").unwrap();
         group
-            .submit(vec![member("a")], &MemberSpec::default())
+            .submit(vec![member("a")], &RunOptions::default())
             .await
             .unwrap();
         let run_id = member_run_id("g", "a");
@@ -761,7 +745,7 @@ mod tests {
         // The cancelled member is submitted again; a member is grouped by
         // its key, so a plain submission of the same run id is not.
         group
-            .submit(vec![member("a")], &MemberSpec::default())
+            .submit(vec![member("a")], &RunOptions::default())
             .await
             .unwrap();
         assert!(group.members().await.unwrap()[0].status().is_none());

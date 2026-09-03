@@ -104,10 +104,11 @@
 //!
 //! [`WorkflowRuntime::submit`] takes a [`RunSpec`]: the first step's
 //! `input`, an optional `run_id` (1 to [`MAX_RUN_ID_LEN`] bytes of
-//! `[A-Za-z0-9_-]`; a ULID is generated when absent), `headers`, a
-//! `priority` and `max_attempts_per_step` overriding the queue's defaults
-//! for every step, a `run_at` before which the first step is not
-//! claimable and `kv_writes` applied with the enqueue. The returned
+//! `[A-Za-z0-9_-]`; a ULID is generated when absent), the [`RunOptions`]
+//! of its steps (`headers`, a `priority` and `max_attempts_per_step`
+//! overriding the queue's defaults for every step and a `run_at` before
+//! which the first step is not claimable) and `kv_writes` applied with
+//! the enqueue. The returned
 //! [`SubmitOutcome`] names the run and the queue job currently
 //! representing it.
 //!
@@ -299,7 +300,7 @@
 //! Step jobs reserve the `workflow.*` header prefix
 //! ([`RESERVED_HEADER_PREFIX`]); submission rejects user headers starting
 //! with it. [`HEADER_RUN_ID`] and [`HEADER_STEP`] are set by the runtime
-//! on every step. Other headers on [`RunSpec::headers`] thread through
+//! on every step. Other headers on [`RunOptions::headers`] thread through
 //! every step and reach the terminal hook on [`RunOutcome::headers`].
 //!
 //! # Run groups
@@ -586,7 +587,7 @@
 //! callbacks via `taquba-webhooks`, staging the delivery enqueue as a
 //! notification effect so it is created exactly once with the
 //! acknowledgement; set the per-run URL on
-//! [`RunSpec::headers`]`["callback_url"]`. Runs without that header
+//! [`RunOptions::headers`]`["callback_url"]`. Runs without that header
 //! enqueue no notification.
 //!
 //! [Taquba]: https://docs.rs/taquba
@@ -613,7 +614,7 @@ mod worker;
 
 pub use effects::{EffectsHandle, TerminalEffects};
 pub use error::{Error, Result};
-pub use group::{GroupMember, GroupStatus, MemberResult, MemberSpec, RunGroup};
+pub use group::{GroupMember, GroupStatus, MemberResult, RunGroup};
 pub use keys::{
     HEADER_RUN_ID, HEADER_SIGNAL_DELIVERED, HEADER_SIGNAL_WAIT, HEADER_STEP, HEADER_TERMINAL,
     MAX_RUN_ID_LEN, RESERVED_HEADER_PREFIX, RESERVED_KV_PREFIX,
@@ -622,7 +623,7 @@ pub use kv::KvReadHandle;
 pub use memo::{Memo, MemoStore};
 pub use runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 pub use runtime::{
-    RunEnd, RunSpec, RunState, RunStatus, RunTermination, RunnerHandle, SubmitOutcome,
+    RunEnd, RunOptions, RunSpec, RunState, RunStatus, RunTermination, RunnerHandle, SubmitOutcome,
     WorkflowRuntime, WorkflowRuntimeBuilder,
 };
 pub use signal::SignalOutcome;
