@@ -42,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is settled as cancelled without running. The in-process run registry
   is gone.
 - `RunnerHandle` is `taquba::WorkerHandle<Result<()>>`.
+- **Breaking (source):** `bulk::Bulk` is `bulk::BulkRunner`,
+  `bulk::BulkBuilder` is `bulk::BulkRunnerBuilder` and
+  `bulk::BulkReport` is `bulk::BatchReport`.
 - **Breaking (source):** `Step` is `#[non_exhaustive]` and holds its
   delivery fields (`run_id`, `headers`, `job_id`, `attempts`,
   `max_attempts`, `cancel_token`, `lease`, `memo`, `run_memo`, `effects`,

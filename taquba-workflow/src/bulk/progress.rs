@@ -58,7 +58,7 @@ pub struct BatchStatus {
     pub failed_keys: Vec<String>,
 }
 
-/// A point-in-time view of a batch run's progress. Returned by
+/// A point-in-time view of a batch execution's progress. Returned by
 /// [`Batch::progress`](crate::bulk::Batch::progress) and suitable for a
 /// status line or a polling UI.
 #[derive(Debug, Clone)]
@@ -87,7 +87,7 @@ pub struct ProgressSnapshot {
 /// The outcome of a finished (or drained) bulk run, returned by
 /// [`Batch::run`](crate::bulk::Batch::run).
 #[derive(Debug, Clone)]
-pub struct BulkReport {
+pub struct BatchReport {
     /// The batch this report describes.
     pub batch_id: String,
     /// Number of items that were expected to complete.
@@ -98,17 +98,17 @@ pub struct BulkReport {
     pub failed: usize,
     /// Items that terminated cancelled.
     pub cancelled: usize,
-    /// Wall-clock duration of the run.
+    /// Wall-clock duration of the batch execution.
     pub elapsed: Duration,
     /// Cost counters rolled up across all completed items.
     pub cost: CostReport,
-    /// Keys of the items that failed. A later run of the same batch runs
-    /// them again and skips the items that succeeded.
+    /// Keys of the items that failed. A later `Batch::run` of the same
+    /// batch runs them again and skips the items that succeeded.
     pub failed_keys: Vec<String>,
 }
 
 /// Internal, mutex-guarded counters of a batch being run, updated as its
-/// items terminate and read by [`ProgressSnapshot`] / [`BulkReport`].
+/// items terminate and read by [`ProgressSnapshot`] / [`BatchReport`].
 #[derive(Debug)]
 pub(crate) struct ProgressState {
     pub total: usize,
@@ -165,8 +165,8 @@ impl ProgressState {
         }
     }
 
-    pub(crate) fn to_report(&self, batch_id: &str) -> BulkReport {
-        BulkReport {
+    pub(crate) fn to_report(&self, batch_id: &str) -> BatchReport {
+        BatchReport {
             batch_id: batch_id.to_string(),
             total: self.total,
             succeeded: self.succeeded,

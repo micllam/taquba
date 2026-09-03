@@ -97,7 +97,7 @@ pub struct BulkCtx<T> {
     /// The batch this item belongs to.
     pub batch_id: String,
     /// The item's key: the value of
-    /// [`BulkBuilder::key_fn`](crate::bulk::BulkBuilder::key_fn) for the
+    /// [`BulkRunnerBuilder::key_fn`](crate::bulk::BulkRunnerBuilder::key_fn) for the
     /// input, or the positional `item-{i}` default.
     pub key: String,
     /// The delivery this item runs under. Its `run_id` is derived from
@@ -166,7 +166,7 @@ impl<T> BulkCtx<T> {
     /// Add `amount` to the cost counter named `metric` for this item. The
     /// per-item totals roll up into the batch-level
     /// [`ProgressSnapshot`](crate::bulk::ProgressSnapshot) and
-    /// [`BulkReport`](crate::bulk::BulkReport).
+    /// [`BatchReport`](crate::bulk::BatchReport).
     pub fn record_cost(&self, metric: &str, amount: f64) {
         self.cost.record(metric, amount);
     }

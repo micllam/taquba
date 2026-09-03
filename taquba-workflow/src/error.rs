@@ -128,7 +128,7 @@ pub enum Error {
 
     /// A bulk batch run completed but the share of failed items exceeded
     /// the configured
-    /// [`fail_threshold`](crate::bulk::BulkBuilder::fail_threshold).
+    /// [`fail_threshold`](crate::bulk::BulkRunnerBuilder::fail_threshold).
     #[error("bulk run failed: {failed}/{total} items failed, over the {threshold:.1}% threshold")]
     FailureThresholdExceeded {
         /// Number of items that terminated failed.

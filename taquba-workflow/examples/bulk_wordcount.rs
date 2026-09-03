@@ -11,7 +11,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use taquba::{Queue, object_store::memory::InMemory};
 use taquba_workflow::StepError;
-use taquba_workflow::bulk::{Bulk, BulkCtx, JsonlSink, Pipeline, read_jsonl};
+use taquba_workflow::bulk::{BulkCtx, BulkRunner, JsonlSink, Pipeline, read_jsonl};
 
 #[derive(Serialize, Deserialize)]
 struct Document {
@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let queue = Arc::new(Queue::open(store.clone(), "db").await?);
 
     let sink = Arc::new(JsonlSink::new(BufWriter::new(stdout())));
-    let mut bulk = Bulk::builder(queue, store, WordCounter)
+    let mut bulk = BulkRunner::builder(queue, store, WordCounter)
         .output(sink)
         .key_fn(|doc| doc.id.clone())
         .build();

@@ -1,6 +1,6 @@
 //! Bulk multi-step processing on the workflow runtime.
 //!
-//! [`Bulk`] runs one [`Pipeline`] over many input items in parallel,
+//! [`BulkRunner`] runs one [`Pipeline`] over many input items in parallel,
 //! inside a single process, with per-item memoization, retry, streamed
 //! output, and a rolled-up cost report. It is the per-batch orchestrator for
 //! workloads that fan out 10-1000x per run: bulk LLM jobs (classify, look up,
@@ -71,7 +71,7 @@
 //! use std::sync::Arc;
 //! use serde::{Deserialize, Serialize};
 //! use taquba::{Queue, object_store::memory::InMemory};
-//! use taquba_workflow::bulk::{Bulk, BulkCtx, CostReport, Pipeline};
+//! use taquba_workflow::bulk::{BulkRunner, BulkCtx, CostReport, Pipeline};
 //! use taquba_workflow::StepError;
 //!
 //! #[derive(Serialize, Deserialize)]
@@ -103,7 +103,7 @@
 //! let store = Arc::new(InMemory::new());
 //! let queue = Arc::new(Queue::open(store.clone(), "db").await?);
 //!
-//! let mut bulk = Bulk::builder(queue, store, TicketPipeline)
+//! let mut bulk = BulkRunner::builder(queue, store, TicketPipeline)
 //!     .key_fn(|t| t.id.clone())
 //!     .max_concurrent(200)
 //!     .build();
@@ -123,7 +123,7 @@
 //!
 //! Pipelines report arbitrary named metrics via [`BulkCtx::record_cost`]
 //! (token counts, paid-API units, compute-seconds, dollars). Per-item totals
-//! roll up into [`ProgressSnapshot::cost`] and [`BulkReport::cost`], so the
+//! roll up into [`ProgressSnapshot::cost`] and [`BatchReport::cost`], so the
 //! batch cost is visible live and in the final report. See [`CostReport`].
 //! When counters are produced inside a memoized closure, return `(value,
 //! cost)` from [`BulkCtx::memoized_with_cached_cost`] or
@@ -144,25 +144,25 @@
 //!
 //! # Batches
 //!
-//! A [`Bulk`] runner spawns one worker ([`Bulk::spawn`]) and runs
-//! batches over it, several at a time if wanted: [`Bulk::run`] creates a
-//! batch with a generated id, [`Bulk::batch`] names one, and
+//! A [`BulkRunner`] spawns one worker ([`BulkRunner::spawn`]) and runs
+//! batches over it, several at a time if wanted: [`BulkRunner::run`] creates a
+//! batch with a generated id, [`BulkRunner::batch`] names one, and
 //! [`Batch::run`] submits the batch's items and waits until every one has
 //! terminated. Dropping that future stops the wait; the items keep
 //! running on the worker and keep their durable state. Items are
 //! identified within a batch by key
-//! ([`BulkBuilder::key_fn`], or the positional `item-{i}` default), and an
+//! ([`BulkRunnerBuilder::key_fn`], or the positional `item-{i}` default), and an
 //! item's workflow run id is the SHA-256 digest of `{batch_id}/{key}`, so
 //! batches never share run state. Each item writes an outcome record to its
-//! run memo before its settlement. A second run of the same batch reads
-//! those records: an item whose record is a success is counted and written
+//! run memo before its settlement. A later [`Batch::run`] of the same batch
+//! reads those records: an item whose record is a success is counted and written
 //! to the sink from the record without running again, and an item whose
-//! record is a failure runs again. [`BulkReport::failed_keys`] is the set a
-//! second run re-executes.
+//! record is a failure runs again. [`BatchReport::failed_keys`] is the set a
+//! later [`Batch::run`] re-executes.
 //!
-//! Before submitting any item, a run writes the batch's manifest (its keys
+//! Before submitting any item, [`Batch::run`] writes the batch's manifest (its keys
 //! and serialized inputs) to `<memo_prefix>/batches/<batch_id>/manifest`;
-//! a run of an existing batch with a different item set is rejected with
+//! a [`Batch::run`] of an existing batch with a different item set is rejected with
 //! [`Error::BatchMismatch`](crate::Error::BatchMismatch). [`Batch::resume`]
 //! drives a batch from its
 //! manifest alone: completed items are answered from their outcome
@@ -173,16 +173,16 @@
 //! `workflow/bulk/batches/<batch_id>/items/<key>` in the queue's KV
 //! namespace: the acknowledgement of a success, or the dead-lettering
 //! settlement of a failure. An item cancelled from outside writes no
-//! marker and runs again on the next run of the batch. [`Batch::status`]
+//! marker and runs again in the next [`Batch::run`] of the batch. [`Batch::status`]
 //! reads the manifest and the markers, so a batch's durable state is
 //! available without running it and from another process through the
-//! same prefix. A batch run observes each item's termination through
+//! same prefix. [`Batch::run`] observes each item's termination through
 //! the queue's in-process completion notification and reads the item's
 //! outcome record to stream its output; an item runs as one queue job.
 //!
 //! A batch's state is retained until [`Batch::forget`] removes it, or,
-//! under [`BulkBuilder::batch_retention`], until the window after the
-//! batch's completion has passed: a completing run writes a terminal
+//! under [`BulkRunnerBuilder::batch_retention`], until the window after the
+//! batch's completion has passed: a completing [`Batch::run`] writes a terminal
 //! marker to `workflow/bulk/terminals/<ts>/<batch_id>`, and the worker
 //! removes the batches whose markers have expired when it starts and on
 //! every retention interval after that.
@@ -191,8 +191,8 @@
 //!
 //! Per-item failures are recorded, not fatal: each failed item is written to
 //! the output sink with its error and its key is collected on
-//! [`BulkReport::failed_keys`]. Set [`BulkBuilder::fail_threshold`] to
-//! turn the batch run into an
+//! [`BatchReport::failed_keys`]. Set [`BulkRunnerBuilder::fail_threshold`] to
+//! make [`Batch::run`] return an
 //! [`Error::FailureThresholdExceeded`](crate::Error::FailureThresholdExceeded)
 //! when the
 //! share of failures crosses a percentage, so a silent mass failure
@@ -214,8 +214,8 @@ mod pipeline;
 mod progress;
 mod runner;
 
-pub use batch::{Batch, Bulk, BulkBuilder};
+pub use batch::{Batch, BulkRunner, BulkRunnerBuilder};
 pub use cost::CostReport;
 pub use io::{JsonlSink, NullSink, OutputRecord, OutputSink, read_jsonl};
 pub use pipeline::{BulkCtx, Pipeline};
-pub use progress::{BatchStatus, BulkReport, ProgressSnapshot};
+pub use progress::{BatchReport, BatchStatus, ProgressSnapshot};

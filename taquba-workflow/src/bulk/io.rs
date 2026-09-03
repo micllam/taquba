@@ -33,7 +33,7 @@ where
 #[derive(Debug)]
 pub struct OutputRecord<'a> {
     /// The completed item's key: the value of
-    /// [`BulkBuilder::key_fn`](crate::bulk::BulkBuilder::key_fn) for its
+    /// [`BulkRunnerBuilder::key_fn`](crate::bulk::BulkRunnerBuilder::key_fn) for its
     /// input, or the positional `item-{i}` default.
     pub key: &'a str,
     /// Terminal status, as the canonical lowercase string
@@ -51,10 +51,10 @@ pub struct OutputRecord<'a> {
 /// many tasks concurrently, so `write` takes `&self` and must handle its
 /// own synchronization.
 ///
-/// A batch run writes each of its items once. A later run of the same
-/// batch writes its items again, the succeeded ones from their outcome
-/// records, so consumers that must not double-apply a record across runs
-/// deduplicate on `key`.
+/// `Batch::run` writes each of the batch's items once. A later
+/// `Batch::run` of the same batch writes its items again, the succeeded
+/// ones from their outcome records, so consumers that must not
+/// double-apply a record across executions deduplicate on `key`.
 pub trait OutputSink: Send + Sync {
     /// Persist one completed item's record.
     fn write(&self, record: &OutputRecord<'_>) -> Result<()>;

@@ -28,7 +28,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use taquba::{OpenOptions, Queue, QueueConfig, object_store::memory::InMemory};
 use taquba_workflow::StepError;
-use taquba_workflow::bulk::{Bulk, BulkCtx, CostReport, JsonlSink, Pipeline};
+use taquba_workflow::bulk::{BulkCtx, BulkRunner, CostReport, JsonlSink, Pipeline};
 
 #[derive(Serialize, Deserialize)]
 struct Document {
@@ -232,7 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let sink = Arc::new(JsonlSink::new(BufWriter::new(stdout())));
-    let mut bulk = Bulk::builder(queue, store, pipeline)
+    let mut bulk = BulkRunner::builder(queue, store, pipeline)
         .output(sink)
         .key_fn(|doc: &Document| doc.id.clone())
         .queue_name("docs")

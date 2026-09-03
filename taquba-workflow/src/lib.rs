@@ -325,9 +325,9 @@
 //! The [`bulk`] module runs one [`bulk::Pipeline`] over many input items in
 //! parallel, one run per item with the pipeline's phases as memoized calls
 //! inside the item's single step, and adds batch-level progress, cost
-//! rollup, streamed output and a failure threshold. Every run is a batch
-//! identified by id: a second run of the same batch skips the items that
-//! succeeded and runs the failed ones again. The module documentation
+//! rollup, streamed output and a failure threshold. Items are grouped in
+//! batches identified by id: a later [`bulk::Batch::run`] of the same batch
+//! skips the items that succeeded and runs the failed ones again. The module documentation
 //! covers the execution model, batches, cost tracking, the failure policy
 //! and retention.
 //!

@@ -21,7 +21,7 @@ pub(crate) struct ItemPayload {
 /// The per-item result the runner writes as the workflow step's `Succeed`
 /// payload and into the item's outcome record. Carries both the user
 /// [`Output`](Pipeline::Output) and the cost accumulated while producing
-/// it, so the batch run can stream the output and roll the cost into the
+/// it, so `Batch::run` can stream the output and roll the cost into the
 /// batch total in one decode.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ItemEnvelope<O> {

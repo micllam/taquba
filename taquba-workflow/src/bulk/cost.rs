@@ -5,7 +5,7 @@
 //! counts, paid-API call units, compute-seconds, dollars) via
 //! [`crate::bulk::BulkCtx::record_cost`], and the bulk runner rolls the per-item
 //! reports up into a batch-level total surfaced on
-//! [`crate::bulk::ProgressSnapshot`] and [`crate::bulk::BulkReport`].
+//! [`crate::bulk::ProgressSnapshot`] and [`crate::bulk::BatchReport`].
 //! [`crate::bulk::BulkCtx::memoized_with_cached_cost`] stores value/cost pairs
 //! when counters should be replayed on memo hits.
 //!

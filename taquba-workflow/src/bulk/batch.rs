@@ -1,4 +1,4 @@
-//! The [`Bulk`] runner: a spawned worker over which batches of one
+//! The [`BulkRunner`] runner: a spawned worker over which batches of one
 //! pipeline are run, with per-batch progress and cost and streamed
 //! output as items complete.
 
@@ -22,7 +22,7 @@ use crate::bulk::io::{NullSink, OutputRecord, OutputSink};
 use crate::bulk::manifest::{Manifest, ManifestItem, ManifestStore};
 use crate::bulk::pipeline::Pipeline;
 use crate::bulk::progress::{
-    BatchStatus, BulkReport, ItemMarker, MarkerStatus, ProgressSnapshot, ProgressState,
+    BatchReport, BatchStatus, ItemMarker, MarkerStatus, ProgressSnapshot, ProgressState,
 };
 use crate::bulk::runner::{ItemEnvelope, ItemPayload, PipelineRunner};
 use crate::keys::{
@@ -222,8 +222,8 @@ impl Clearable for BatchStore {
 /// Closure that derives an item's key from its input.
 type KeyFn<I> = Box<dyn Fn(&I) -> String + Send + Sync>;
 
-/// Builder for a [`Bulk`] runner. Construct via [`Bulk::builder`].
-pub struct BulkBuilder<P: Pipeline> {
+/// Builder for a [`BulkRunner`] runner. Construct via [`BulkRunner::builder`].
+pub struct BulkRunnerBuilder<P: Pipeline> {
     queue: Arc<Queue>,
     object_store: Arc<dyn ObjectStore>,
     pipeline: P,
@@ -239,7 +239,7 @@ pub struct BulkBuilder<P: Pipeline> {
     clock: Option<Arc<dyn Clock>>,
 }
 
-impl<P: Pipeline> BulkBuilder<P> {
+impl<P: Pipeline> BulkRunnerBuilder<P> {
     /// Where completed item records are written. Defaults to
     /// [`NullSink`](crate::bulk::NullSink), which discards them.
     pub fn output(mut self, sink: Arc<dyn OutputSink>) -> Self {
@@ -249,7 +249,7 @@ impl<P: Pipeline> BulkBuilder<P> {
 
     /// Derive each item's key from its input. The default is positional
     /// (`item-0`, `item-1`, ...). Supply a key when items have a natural
-    /// identifier: a later run of the same batch matches items by key, so
+    /// identifier: a later `Batch::run` of the same batch matches items by key, so
     /// it skips the ones that succeeded and runs the failed ones again.
     /// Any string is accepted.
     pub fn key_fn(mut self, f: impl Fn(&P::Input) -> String + Send + Sync + 'static) -> Self {
@@ -294,7 +294,7 @@ impl<P: Pipeline> BulkBuilder<P> {
         self
     }
 
-    /// Fail a batch run if more than `percent` of its items terminate
+    /// Fail `Batch::run` if more than `percent` of the batch's items terminate
     /// failed.
     ///
     /// `percent` is on a 0 to 100 scale, e.g. pass `5.0` to fail when over
@@ -315,7 +315,7 @@ impl<P: Pipeline> BulkBuilder<P> {
     /// removes the batches whose markers have expired when it starts and
     /// on every retention interval after that. When unset (default),
     /// batches are retained until [`Batch::forget`]. The window counts
-    /// from the batch's first completion: a run of the same batch inside
+    /// from the batch's first completion: a `Batch::run` of the same batch inside
     /// the window completes against the same expiry.
     ///
     /// # Panics
@@ -334,7 +334,7 @@ impl<P: Pipeline> BulkBuilder<P> {
     }
 
     /// Finalize the builder.
-    pub fn build(self) -> Bulk<P> {
+    pub fn build(self) -> BulkRunner<P> {
         let sink: Arc<dyn OutputSink> = self.sink.unwrap_or_else(|| Arc::new(NullSink));
         let store = BatchStore {
             queue: self.queue.clone(),
@@ -361,7 +361,7 @@ impl<P: Pipeline> BulkBuilder<P> {
                 None => builder,
             },
         );
-        Bulk {
+        BulkRunner {
             inner: Arc::new(BulkInner {
                 typed,
                 store,
@@ -377,11 +377,11 @@ impl<P: Pipeline> BulkBuilder<P> {
 }
 
 /// Runs one [`Pipeline`] over many inputs in a single process. Build it
-/// with [`Bulk::builder`], [`spawn`](Self::spawn) the worker, then run
-/// batches through [`Bulk::batch`], [`Bulk::new_batch`] or [`Bulk::run`];
+/// with [`BulkRunner::builder`], [`spawn`](Self::spawn) the worker, then run
+/// batches through [`BulkRunner::batch`], [`BulkRunner::new_batch`] or [`BulkRunner::run`];
 /// several batches can run concurrently on one worker. One runner per
 /// process: taquba is single-writer.
-pub struct Bulk<P: Pipeline> {
+pub struct BulkRunner<P: Pipeline> {
     inner: Arc<BulkInner<P>>,
 }
 
@@ -398,16 +398,16 @@ struct BulkInner<P: Pipeline> {
     batch_retention: Option<Duration>,
 }
 
-impl<P: Pipeline> Bulk<P> {
+impl<P: Pipeline> BulkRunner<P> {
     /// Start configuring a runner over `pipeline`, with item steps and memo
     /// entries living in `queue` / `object_store`. Optional settings are set
-    /// on the returned [`BulkBuilder`].
+    /// on the returned [`BulkRunnerBuilder`].
     pub fn builder(
         queue: Arc<Queue>,
         object_store: Arc<dyn ObjectStore>,
         pipeline: P,
-    ) -> BulkBuilder<P> {
-        BulkBuilder {
+    ) -> BulkRunnerBuilder<P> {
+        BulkRunnerBuilder {
             queue,
             object_store,
             pipeline,
@@ -427,11 +427,11 @@ impl<P: Pipeline> Bulk<P> {
     /// Spawn the worker task and return a handle for graceful shutdown.
     ///
     /// The worker runs the items of every batch submitted to this runner,
-    /// concurrently up to [`BulkBuilder::max_concurrent`], until either
+    /// concurrently up to [`BulkRunnerBuilder::max_concurrent`], until either
     /// `shutdown` resolves or [`RunnerHandle::shutdown`] is called;
     /// in-flight items are allowed to finish. Under
-    /// [`BulkBuilder::batch_retention`] it also sweeps expired batches
-    /// when it starts and on every retention interval. A batch run
+    /// [`BulkRunnerBuilder::batch_retention`] it also sweeps expired batches
+    /// when it starts and on every retention interval. A `Batch::run`
     /// started before the worker is spawned waits for it.
     ///
     /// # Panics
@@ -446,7 +446,7 @@ impl<P: Pipeline> Bulk<P> {
 
     /// A handle on the batch named `id`, which must be 1 to 128 bytes of
     /// `[A-Za-z0-9_-]`. A batch groups the items of one submission: a
-    /// second run of the same batch skips the items that succeeded and runs
+    /// later `Batch::run` of the same batch skips the items that succeeded and runs
     /// the failed ones again.
     pub fn batch(&self, id: impl Into<String>) -> Result<Batch<'_, P>> {
         let id = id.into();
@@ -466,8 +466,8 @@ impl<P: Pipeline> Bulk<P> {
     }
 
     /// Run every input as a new batch with a generated id and return the
-    /// final [`BulkReport`]; see [`Batch::run`].
-    pub async fn run<I>(&self, inputs: I) -> Result<BulkReport>
+    /// final [`BatchReport`]; see [`Batch::run`].
+    pub async fn run<I>(&self, inputs: I) -> Result<BatchReport>
     where
         I: IntoIterator<Item = P::Input>,
     {
@@ -554,8 +554,8 @@ impl<P: Pipeline> BulkInner<P> {
     }
 }
 
-/// A handle on one batch of a [`Bulk`] runner. Obtained from
-/// [`Bulk::batch`] or [`Bulk::new_batch`].
+/// A handle on one batch of a [`BulkRunner`] runner. Obtained from
+/// [`BulkRunner::batch`] or [`BulkRunner::new_batch`].
 pub struct Batch<'a, P: Pipeline> {
     inner: &'a Arc<BulkInner<P>>,
     id: String,
@@ -568,22 +568,22 @@ impl<P: Pipeline> Batch<'_, P> {
     }
 
     /// Submit every input and wait until every item has terminated,
-    /// returning the final [`BulkReport`]. The batch's manifest is
-    /// written before any item is submitted; a run of an existing batch
+    /// returning the final [`BatchReport`]. The batch's manifest is
+    /// written before any item is submitted; a `Batch::run` of an existing batch
     /// with a different item set is rejected with
     /// [`Error::BatchMismatch`]. An item whose outcome record from an
-    /// earlier run of this batch is a success is counted and written to
+    /// earlier `Batch::run` of this batch is a success is counted and written to
     /// the sink from that record without running again; an item whose
     /// record is a failure runs again.
     ///
-    /// The items run on the worker spawned by [`Bulk::spawn`]. Dropping
+    /// The items run on the worker spawned by [`BulkRunner::spawn`]. Dropping
     /// the returned future stops waiting: the items already submitted
     /// keep running on the worker, keep their durable state and are
-    /// continued by a later run or [`resume`](Self::resume) of the
+    /// continued by a later [`run`](Self::run) or [`resume`](Self::resume) of the
     /// batch. A submission error returns after the items submitted so
     /// far, and those keep their durable state as well. A batch already
     /// running in this process is rejected with [`Error::BatchRunning`].
-    pub async fn run<I>(&self, inputs: I) -> Result<BulkReport>
+    pub async fn run<I>(&self, inputs: I) -> Result<BatchReport>
     where
         I: IntoIterator<Item = P::Input>,
     {
@@ -606,7 +606,7 @@ impl<P: Pipeline> Batch<'_, P> {
     /// continue, and the rest run. Returns [`Error::BatchNotFound`] when
     /// no manifest exists. Waits and stops waiting as [`run`](Self::run)
     /// does.
-    pub async fn resume(&self) -> Result<BulkReport> {
+    pub async fn resume(&self) -> Result<BatchReport> {
         let manifest = self
             .inner
             .store
@@ -668,8 +668,8 @@ impl<P: Pipeline> Batch<'_, P> {
     }
 
     /// Remove the batch's durable state: its manifest, item markers, memo
-    /// entries and outcome records. A later run of the same id starts
-    /// from nothing.
+    /// entries and outcome records. A later `Batch::run` under the same id
+    /// starts from nothing.
     pub async fn forget(&self) -> Result<()> {
         self.inner.store.forget(&self.id).await
     }
@@ -701,7 +701,7 @@ impl<P: Pipeline> Batch<'_, P> {
     /// Register the batch, drive every item to its terminal state and
     /// build the report. Items are driven concurrently; the first error
     /// stops the others and is returned.
-    async fn drive(&self, items: Vec<ManifestItem>) -> Result<BulkReport> {
+    async fn drive(&self, items: Vec<ManifestItem>) -> Result<BatchReport> {
         let inner = self.inner;
         let active = inner.activate(&self.id, items.len())?;
         let submits = Arc::new(Semaphore::new(SUBMIT_CONCURRENCY));
@@ -817,7 +817,7 @@ mod tests {
         }
     }
 
-    fn spawned<P: Pipeline>(mut bulk: Bulk<P>) -> (Bulk<P>, RunnerHandle) {
+    fn spawned<P: Pipeline>(mut bulk: BulkRunner<P>) -> (BulkRunner<P>, RunnerHandle) {
         let worker = bulk.spawn(std::future::pending::<()>());
         (bulk, worker)
     }
@@ -827,7 +827,7 @@ mod tests {
         let (queue, store) = open_queue().await;
         let sink = Arc::new(Collect::default());
         let (bulk, worker) = spawned(
-            Bulk::builder(queue, store, Doubler)
+            BulkRunner::builder(queue, store, Doubler)
                 .output(sink.clone())
                 .poll_interval(Duration::from_millis(10))
                 .build(),
@@ -857,7 +857,7 @@ mod tests {
         let (queue, store) = open_queue().await;
         let sink = Arc::new(Collect::default());
         let (bulk, worker) = spawned(
-            Bulk::builder(queue, store, Doubler)
+            BulkRunner::builder(queue, store, Doubler)
                 .output(sink.clone())
                 .poll_interval(Duration::from_millis(10))
                 .build(),
@@ -900,7 +900,7 @@ mod tests {
         let (queue, store) = open_queue().await;
         queue.kv_put(b"app/seed", b"seeded").await.unwrap();
         let (bulk, worker) = spawned(
-            Bulk::builder(queue.clone(), store, EffectsPipeline)
+            BulkRunner::builder(queue.clone(), store, EffectsPipeline)
                 .poll_interval(Duration::from_millis(10))
                 .build(),
         );
@@ -922,7 +922,7 @@ mod tests {
     async fn fail_threshold_trips_when_exceeded() {
         let (queue, store) = open_queue().await;
         let (bulk, worker) = spawned(
-            Bulk::builder(queue, store, Doubler)
+            BulkRunner::builder(queue, store, Doubler)
                 .poll_interval(Duration::from_millis(10))
                 .fail_threshold(20.0)
                 .build(),
@@ -950,7 +950,7 @@ mod tests {
         let (queue, store) = open_queue().await;
         let sink = Arc::new(Collect::default());
         let (bulk, worker) = spawned(
-            Bulk::builder(queue, store, Doubler)
+            BulkRunner::builder(queue, store, Doubler)
                 .output(sink.clone())
                 .key_fn(|item| format!("n-{}", item.n))
                 .poll_interval(Duration::from_millis(10))
@@ -983,7 +983,7 @@ mod tests {
         let (queue, store) = open_queue().await;
         let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let (bulk, worker) = spawned(
-            Bulk::builder(queue, store, Counting { runs: runs.clone() })
+            BulkRunner::builder(queue, store, Counting { runs: runs.clone() })
                 .poll_interval(Duration::from_millis(10))
                 .build(),
         );
@@ -1016,7 +1016,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_batch_running_in_this_process_is_rejected_until_its_run_is_dropped() {
         let (queue, store) = open_queue().await;
-        let mut bulk = Bulk::builder(queue, store, Doubler)
+        let mut bulk = BulkRunner::builder(queue, store, Doubler)
             .poll_interval(Duration::from_millis(10))
             .build();
         let inputs = || vec![Item { n: 1 }, Item { n: 2 }];
@@ -1073,7 +1073,7 @@ mod tests {
         let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let sink = Arc::new(Collect::default());
         let (bulk, worker) = spawned(
-            Bulk::builder(queue, store, Counting { runs: runs.clone() })
+            BulkRunner::builder(queue, store, Counting { runs: runs.clone() })
                 .output(sink.clone())
                 .poll_interval(Duration::from_millis(10))
                 .build(),
@@ -1116,7 +1116,7 @@ mod tests {
         let (queue, store) = open_queue().await;
         let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let (bulk, worker) = spawned(
-            Bulk::builder(queue, store, Counting { runs: runs.clone() })
+            BulkRunner::builder(queue, store, Counting { runs: runs.clone() })
                 .poll_interval(Duration::from_millis(10))
                 .build(),
         );
@@ -1143,7 +1143,7 @@ mod tests {
         let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let sink = Arc::new(Collect::default());
         let (bulk, worker) = spawned(
-            Bulk::builder(queue, store, Counting { runs: runs.clone() })
+            BulkRunner::builder(queue, store, Counting { runs: runs.clone() })
                 .output(sink.clone())
                 .poll_interval(Duration::from_millis(10))
                 .build(),
@@ -1180,7 +1180,7 @@ mod tests {
     async fn a_run_with_a_different_item_set_is_rejected() {
         let (queue, store) = open_queue().await;
         let (bulk, worker) = spawned(
-            Bulk::builder(queue, store, Doubler)
+            BulkRunner::builder(queue, store, Doubler)
                 .poll_interval(Duration::from_millis(10))
                 .build(),
         );
@@ -1211,7 +1211,7 @@ mod tests {
     async fn resume_of_an_unknown_batch_and_duplicate_keys_are_rejected() {
         let (queue, store) = open_queue().await;
         let (bulk, worker) = spawned(
-            Bulk::builder(queue, store, Doubler)
+            BulkRunner::builder(queue, store, Doubler)
                 .key_fn(|_| "same".to_string())
                 .build(),
         );
@@ -1232,7 +1232,7 @@ mod tests {
     async fn status_reports_the_last_recorded_outcome_of_each_item() {
         let (queue, store) = open_queue().await;
         let (bulk, worker) = spawned(
-            Bulk::builder(queue.clone(), store, Doubler)
+            BulkRunner::builder(queue.clone(), store, Doubler)
                 .poll_interval(Duration::from_millis(10))
                 .build(),
         );
@@ -1265,7 +1265,7 @@ mod tests {
         let (queue, store) = open_queue().await;
         let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let (bulk, worker) = spawned(
-            Bulk::builder(queue.clone(), store, Counting { runs: runs.clone() })
+            BulkRunner::builder(queue.clone(), store, Counting { runs: runs.clone() })
                 .poll_interval(Duration::from_millis(10))
                 .build(),
         );
@@ -1298,7 +1298,7 @@ mod tests {
         let retention = Duration::from_secs(60);
         let (queue, store, clock) = open_queue_at(t0).await;
         let (bulk, worker) = spawned(
-            Bulk::builder(queue.clone(), store, Doubler)
+            BulkRunner::builder(queue.clone(), store, Doubler)
                 .poll_interval(Duration::from_millis(10))
                 .batch_retention(retention)
                 .clock(Arc::new(clock.clone()))
@@ -1357,7 +1357,7 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_batch_id_is_rejected() {
         let (queue, store) = open_queue().await;
-        let (bulk, worker) = spawned(Bulk::builder(queue, store, Doubler).build());
+        let (bulk, worker) = spawned(BulkRunner::builder(queue, store, Doubler).build());
         assert!(matches!(
             bulk.batch("a/b").map(|b| b.id().to_string()),
             Err(Error::InvalidBatchId(id)) if id == "a/b"

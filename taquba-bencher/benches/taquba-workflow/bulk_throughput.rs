@@ -35,7 +35,7 @@ use std::time::Duration;
 use taquba::{OpenOptions, Queue, QueueConfig};
 use taquba_bencher::{env_var, init_tracing, store_from_env};
 use taquba_workflow::StepError;
-use taquba_workflow::bulk::{Bulk, BulkCtx, Pipeline};
+use taquba_workflow::bulk::{BulkCtx, BulkRunner, Pipeline};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Item {
@@ -94,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?,
     );
 
-    let mut bulk = Bulk::builder(queue.clone(), store, PhasesPipeline { n_phases })
+    let mut bulk = BulkRunner::builder(queue.clone(), store, PhasesPipeline { n_phases })
         .max_concurrent(max_concurrent)
         .build();
     let worker = bulk.spawn(std::future::pending::<()>());
