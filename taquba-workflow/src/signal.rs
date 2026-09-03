@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use taquba::{JobRecord, JobStatus, SettlementEffects, WorkerError};
-use tracing::warn;
+use taquba::{JobRecord, JobStatus, Queue, SettlementEffects, WorkerError};
+use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
 use crate::keys::{
@@ -43,6 +43,15 @@ pub enum SignalOutcome {
 /// acknowledgement commit, which these reads cover.
 const SIGNAL_WAIT_READ_ATTEMPTS: u32 = 10;
 const SIGNAL_WAIT_READ_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Remove the signal entry at `key` if it still holds `expected`. A
+/// failed removal is logged and otherwise ignored: the entry is
+/// residue that the next resolution of its key overwrites or drops.
+async fn remove_entry(queue: &Queue, key: &[u8], expected: &[u8]) {
+    if let Err(err) = queue.kv_compare_delete(key, expected).await {
+        debug!(key = %String::from_utf8_lossy(key), "signal entry removal failed: {err}");
+    }
+}
 
 impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// Deliver a signal for `correlation_key`, waking the run waiting on
@@ -79,20 +88,20 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
                 continue;
             };
             let Ok(job_id) = std::str::from_utf8(&waiter).map(str::to_string) else {
-                let _ = queue.kv_compare_delete(&wait_key, &waiter).await;
+                remove_entry(queue, &wait_key, &waiter).await;
                 return Ok(SignalOutcome::Buffered);
             };
             return match queue.wake_scheduled(&job_id, Some(payload.clone())).await? {
                 taquba::WakeOutcome::Woken => {
-                    let _ = queue.kv_compare_delete(&buf_key, &payload).await;
-                    let _ = queue.kv_compare_delete(&wait_key, &waiter).await;
+                    remove_entry(queue, &buf_key, &payload).await;
+                    remove_entry(queue, &wait_key, &waiter).await;
                     Ok(SignalOutcome::Delivered)
                 }
                 taquba::WakeOutcome::NotScheduled | taquba::WakeOutcome::NotFound => {
                     // Stale index entry: the waiter was already promoted or
                     // its run was cancelled. Remove the entry; the signal
                     // stays buffered.
-                    let _ = queue.kv_compare_delete(&wait_key, &waiter).await;
+                    remove_entry(queue, &wait_key, &waiter).await;
                     Ok(SignalOutcome::Buffered)
                 }
             };
@@ -218,10 +227,7 @@ impl RuntimeCore {
             return Ok((None, Vec::new()));
         };
         let wait_key = signal_wait_kv_key(correlation_key);
-        let _ = self
-            .queue
-            .kv_compare_delete(&wait_key, job.id.as_bytes())
-            .await;
+        remove_entry(&self.queue, &wait_key, job.id.as_bytes()).await;
 
         if job.woken_at.is_some() {
             // A signal promoted this job early. The payload is on the job
@@ -244,7 +250,7 @@ impl RuntimeCore {
         if let Some(buffered) = self.queue.kv_get(&buf_key).await? {
             let buffered = buffered.to_vec();
             self.queue.kv_put(&delivered_key, &buffered).await?;
-            let _ = self.queue.kv_compare_delete(&buf_key, &buffered).await;
+            remove_entry(&self.queue, &buf_key, &buffered).await;
             return Ok((Some(buffered), vec![delivered_key]));
         }
         Ok((None, Vec::new()))
