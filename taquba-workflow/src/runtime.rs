@@ -482,17 +482,16 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             return Ok(duplicate(current.job_id));
         }
 
-        let job_id = self.inner.core.queue.next_job_id();
-        let mut headers = spec.headers.clone();
-        headers.insert(HEADER_RUN_ID.to_string(), run_id.to_string());
-        headers.insert(HEADER_STEP.to_string(), "0".to_string());
-        let enqueue_opts = EnqueueOptions::default()
-            .headers(headers)
-            .run_at(spec.run_at)
-            .priority(spec.priority)
-            .max_attempts(spec.max_attempts_per_step)
-            .dedup_key(Some(format!("{DEDUP_PREFIX}{run_id}:0")))
-            .id_override(Some(job_id.clone()));
+        let opts = StepEnqueueOpts {
+            run_at: spec.run_at,
+            priority: spec.priority,
+            max_attempts: spec.max_attempts_per_step,
+            reserved_headers: Vec::new(),
+        };
+        let (request, job_id) =
+            self.inner
+                .core
+                .step_enqueue_request(run_id, 0, spec.input, &spec.headers, opts);
 
         let record_bytes = rmp_serde::to_vec_named(&DurableRunRecord {
             run_id: run_id.to_string(),
@@ -507,7 +506,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             .inner
             .core
             .queue
-            .enqueue_with_kv(&self.inner.core.queue_name, spec.input, enqueue_opts, kv)
+            .enqueue_with_kv(&request.queue, request.payload, request.options, kv)
             .await?
         {
             EnqueueResult::New(id) => id,
@@ -520,12 +519,10 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             EnqueueResult::AlreadyEnqueued(existing) => return Ok(duplicate(existing)),
         };
 
-        self.inner.core.registry.insert_submitted(
-            run_id,
-            &job_id,
-            spec.headers.clone(),
-            input_hash,
-        );
+        self.inner
+            .core
+            .registry
+            .insert_submitted(run_id, &job_id, spec.headers, input_hash);
 
         debug!(run_id = %run_id, job_id = %job_id, "run submitted");
         Ok(SubmitOutcome {
