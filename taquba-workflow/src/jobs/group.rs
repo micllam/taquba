@@ -8,10 +8,9 @@ use std::sync::Arc;
 use futures_util::{Stream, StreamExt, TryStreamExt};
 
 use crate::group::{ManifestMember, MemberSpec, MemberState, RunGroup};
-use crate::jobs::handle::{JobError, decode_outcome};
+use crate::jobs::handle::{JobError, decode_result};
 use crate::jobs::job::Job;
 use crate::jobs::runner::{Dispatch, Inner, SubmitOptions, job_payload};
-use crate::outcome::StoredOutcome;
 use crate::terminal::{NoopTerminalHook, TerminalStatus};
 use crate::{Error, Result, StepErrorKind};
 
@@ -78,7 +77,6 @@ impl<J: Job> JobGroup<J> {
 
     fn group(&self) -> RunGroup<'_, Dispatch, NoopTerminalHook> {
         self.inner
-            .typed
             .group(self.id.clone())
             .expect("a job group id is a valid group id")
     }
@@ -150,7 +148,7 @@ impl<J: Job> JobGroup<J> {
 
     /// The members' results as each one terminates, in completion
     /// order; a member already terminated is yielded at once. A member
-    /// that terminated without an outcome record (cancelled, or
+    /// that terminated without a run result record (cancelled, or
     /// dead-lettered outside its handler) is reported as a transient
     /// [`JobError`]. Returns [`Error::GroupNotFound`] for a group never
     /// submitted.
@@ -187,23 +185,16 @@ impl<J: Job> JobGroup<J> {
             .collect())
     }
 
-    /// The result of a terminated member: its outcome record decoded, or
+    /// The result of a terminated member: its run result record decoded, or
     /// a transient [`JobError`] from its member record.
     async fn member_result(
         &self,
         member: &MemberState,
     ) -> Result<std::result::Result<J::Output, JobError>> {
-        if let Some(record) = self.inner.typed.outcome(&member.record.run_id).await? {
-            let recorded = matches!(
-                (&record.outcome, member.status()),
-                (
-                    StoredOutcome::Success { .. },
-                    Some(TerminalStatus::Succeeded)
-                ) | (StoredOutcome::Failure { .. }, Some(TerminalStatus::Failed))
-            );
-            if recorded {
-                return decode_outcome::<J>(record.outcome);
-            }
+        if let Some(result) = self.inner.run_result(&member.record.run_id).await?
+            && Some(result.outcome.status) == member.status()
+        {
+            return decode_result::<J>(result);
         }
         let message = match member.status() {
             Some(TerminalStatus::Cancelled) => "job cancelled".to_string(),
@@ -245,7 +236,7 @@ impl<J: Job> JobGroup<J> {
     }
 
     /// Remove the group's state: its manifest, member records and the
-    /// memo entries and outcome records of its members. A later
+    /// memo entries and run result records of its members. A later
     /// [`submit`](Self::submit) under the same id starts from nothing.
     pub async fn forget(&self) -> Result<()> {
         self.group().forget().await

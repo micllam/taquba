@@ -5,8 +5,8 @@
 //! runs as one workflow run with a single step, so durability, retries,
 //! idempotent submission, memoization and retention are the workflow
 //! runtime's, and this crate adds the function abstraction: typed inputs
-//! and outputs, a type registry, a durable outcome record and an awaitable
-//! handle.
+//! and outputs, a type registry, a typed view of the runtime's run result
+//! record and an awaitable handle.
 //!
 //! Use a job when the caller awaits a typed return value, and a
 //! [`StepRunner`](crate::StepRunner) directly when one entity moves through
@@ -77,20 +77,21 @@
 //! the job's [`Job::NAME`] and its serialized fields, and whose single
 //! step routes by that name to the registered handler.
 //!
-//! A job's outcome is durable: the handler's step writes an outcome record
+//! A job's outcome is durable: the runtime writes the run result record
 //! (the serialized output, or the failure) to the run's memo in the object
-//! store before its settlement. Awaiting a [`JobHandle`] is in-process (it
+//! store before the settlement that terminates the run. Awaiting a
+//! [`JobHandle`] is in-process (it
 //! uses Taquba's in-process completion notification), but the outcome can
 //! be read back with [`JobHandle::fetch_result`] after a process restart.
 //!
 //! Delivery is at-least-once, inherited from Taquba: **job handlers must be
 //! idempotent.** A retried attempt that runs after an earlier attempt
-//! already wrote an outcome record overwrites it with the new attempt's
+//! already wrote a run result record overwrites it with the new attempt's
 //! outcome. The [`memo`](crate::Delivery::memo) gives a handler a durable
 //! memo for the results of expensive calls, so a retried attempt reads
 //! them back.
 //!
-//! Outcome records and memo entries are retained indefinitely by default;
+//! Run result records and memo entries are retained indefinitely by default;
 //! enable [`JobRunnerBuilder::retention`] (see [Retention]) to remove them
 //! on a schedule, or apply a lifecycle policy to the object-store prefix.
 //!
@@ -110,13 +111,13 @@
 //!   survives process restarts: the
 //!   SHA-256 of the serialized payload is stored in the workflow's run
 //!   record, atomically with the enqueue.
-//! - **After the original completes**: the outcome record holds the same
+//! - **After the original completes**: the run result record holds the same
 //!   hash, so a re-submission with a matching payload returns a handle to
 //!   the recorded outcome (success or terminal failure) without running
 //!   the job again, and a differing payload fails with
 //!   [`Error::InputMismatch`](crate::Error::InputMismatch).
 //!
-//! If [`JobRunnerBuilder::retention`] is configured and the outcome record
+//! If [`JobRunnerBuilder::retention`] is configured and the run result record
 //! has been removed, the re-submission runs the job again under the same
 //! id. Size the retention window to cover the longest gap callers need
 //! between the original submission and an idempotent re-submission.
@@ -152,7 +153,7 @@
 //!
 //! # Retention
 //!
-//! [`JobRunnerBuilder::retention`] removes a job's outcome record and memo
+//! [`JobRunnerBuilder::retention`] removes a job's run result record and memo
 //! entries a configured window after the job reaches a terminal state,
 //! through the workflow runtime's memo retention. When the option is unset
 //! (default), records are retained indefinitely.

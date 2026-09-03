@@ -139,6 +139,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         payload: Vec<u8>,
         correlation_key: &str,
         timeout: Duration,
+        input_hash: [u8; 32],
     ) -> std::result::Result<SettlementEffects, WorkerError> {
         let wait_key = signal_wait_kv_key(correlation_key);
 
@@ -155,7 +156,9 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     let message = format!(
                         "a waiter is already registered for correlation key `{correlation_key}`"
                     );
-                    return Err(self.terminating_failure(claimed, StepError::permanent(message)));
+                    return Err(self
+                        .terminating_failure(claimed, StepError::permanent(message), input_hash)
+                        .await);
                 }
             }
             Ok(None) => {}

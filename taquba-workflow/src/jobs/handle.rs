@@ -4,12 +4,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::{RunStatus, StepErrorKind};
+use crate::{RunStatus, StepErrorKind, TerminalStatus};
 use thiserror::Error;
 
 use crate::jobs::job::Job;
-use crate::jobs::runner::Inner;
-use crate::outcome::{StoredOutcome, Terminal, Unrecorded};
+use crate::jobs::runner::{Inner, Terminal, Unrecorded};
+use crate::runtime::RunResult;
 use crate::{Error, Result};
 
 /// The logical failure outcome of a job that ran and did not succeed.
@@ -58,7 +58,7 @@ pub enum JoinError {
 pub struct JobHandle<J: Job> {
     id: String,
     /// The queue job backing the delivery, or `None` for a submission
-    /// answered from a completed job's outcome record, which `join`
+    /// answered from a completed job's run result record, which `join`
     /// reads back without waiting.
     queue_job_id: Option<String>,
     inner: Arc<Inner>,
@@ -119,21 +119,21 @@ impl<J: Job> JobHandle<J> {
     /// retains its terminal record, and `None` otherwise. Use
     /// [`fetch_result`](Self::fetch_result) to read a terminal outcome.
     pub async fn status(&self) -> Result<Option<RunStatus>> {
-        self.inner.typed.runtime.status(&self.id).await
+        self.inner.runtime.status(&self.id).await
     }
 
-    /// Read the job's persisted outcome without waiting.
+    /// Read the job's persisted result without waiting.
     ///
-    /// Returns `None` when no outcome record exists for this job: it is
-    /// still pending or in flight, it terminated without a handler
-    /// recording an outcome (a lease expiry dead-lettered it, or it was
-    /// cancelled), or the record was removed by retention.
+    /// Returns `None` when no run result record exists for this job: it
+    /// is still pending or in flight, it terminated without a worker
+    /// recording a result (a lease expiry dead-lettered it, or it was
+    /// cancelled while pending), or the record was removed by retention.
     ///
     /// Reads from object storage, so it works across process restarts.
     pub async fn fetch_result(&self) -> Result<Option<std::result::Result<J::Output, JobError>>> {
-        match self.inner.typed.outcome(&self.id).await? {
+        match self.inner.run_result(&self.id).await? {
             None => Ok(None),
-            Some(record) => Ok(Some(decode_outcome::<J>(record.outcome)?)),
+            Some(result) => Ok(Some(decode_result::<J>(result)?)),
         }
     }
 
@@ -145,24 +145,20 @@ impl<J: Job> JobHandle<J> {
         let Some(queue_job_id) = &self.queue_job_id else {
             return self.recorded_outcome().await;
         };
-        let terminal = self
-            .inner
-            .typed
-            .wait_terminal(&self.id, queue_job_id)
-            .await?;
+        let terminal = self.inner.wait_terminal(&self.id, queue_job_id).await?;
         self.decode_terminal(terminal)
     }
 
     /// Wait up to `timeout` for the job to reach a terminal state.
     ///
     /// Returns `Ok(None)` if the timeout elapses first. On completion the
-    /// outcome record is returned; if the job reached a terminal state
+    /// run result record is returned; if the job reached a terminal state
     /// without one (a lease expiry dead-lettered it, or it was cancelled),
     /// the outcome is synthesized from the queue record as a transient
     /// [`JobError`].
     ///
     /// Returns [`Error::JobNotFound`] if the queue has no record of the job
-    /// and no outcome record exists.
+    /// and no run result record exists.
     pub async fn join_timeout(
         &self,
         timeout: Duration,
@@ -172,7 +168,6 @@ impl<J: Job> JobHandle<J> {
         };
         match self
             .inner
-            .typed
             .wait_terminal_within(&self.id, queue_job_id, timeout)
             .await?
         {
@@ -198,7 +193,7 @@ impl<J: Job> JobHandle<J> {
         terminal: Terminal,
     ) -> Result<std::result::Result<J::Output, JobError>> {
         match terminal {
-            Terminal::Recorded(record) => decode_outcome::<J>(record.outcome),
+            Terminal::Recorded(result) => decode_result::<J>(result),
             Terminal::Unrecorded(Unrecorded::NotFound) => Err(Error::JobNotFound(self.id.clone())),
             Terminal::Unrecorded(unrecorded) => {
                 let message = match unrecorded {
@@ -214,14 +209,24 @@ impl<J: Job> JobHandle<J> {
     }
 }
 
-pub(crate) fn decode_outcome<J: Job>(
-    outcome: StoredOutcome,
+/// The typed result of a run result record: the decoded output of a
+/// succeeded job, or the [`JobError`] of a failed or cancelled one.
+pub(crate) fn decode_result<J: Job>(
+    result: RunResult,
 ) -> Result<std::result::Result<J::Output, JobError>> {
-    match outcome {
-        StoredOutcome::Success { output } => Ok(Ok(rmp_serde::from_slice(&output)?)),
-        StoredOutcome::Failure { kind, message } => Ok(Err(JobError {
-            kind: kind.into(),
-            message,
+    let outcome = result.outcome;
+    match outcome.status {
+        TerminalStatus::Succeeded => {
+            let output = outcome.result.unwrap_or_default();
+            Ok(Ok(rmp_serde::from_slice(&output)?))
+        }
+        TerminalStatus::Failed => Ok(Err(JobError {
+            kind: result.error_kind.unwrap_or(StepErrorKind::Permanent),
+            message: outcome.error.unwrap_or_default(),
+        })),
+        TerminalStatus::Cancelled => Ok(Err(JobError {
+            kind: StepErrorKind::Transient,
+            message: outcome.error.unwrap_or_else(|| "job cancelled".to_string()),
         })),
     }
 }

@@ -8,17 +8,21 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{RunSpec, RunnerHandle, Step, StepError, StepOutcome, StepRunner};
+use crate::{RunSpec, RunnerHandle, Step, StepError, StepOutcome, StepRunner, WorkflowRuntime};
+use std::sync::atomic::{AtomicBool, Ordering};
+use taquba::WaitOutcome;
 use taquba::object_store::ObjectStore;
 use taquba::{Clock, Queue};
 
 use crate::Result;
+use crate::group::RunGroup;
 use crate::jobs::context::{JobContext, State};
 use crate::jobs::group::JobGroup;
 use crate::jobs::handle::JobHandle;
 use crate::jobs::job::Job;
 use crate::keys::{hash_input, hex_sha256};
-use crate::outcome::{TypedRuntime, TypedRuntimeOptions, run_typed_step};
+use crate::runtime::RunResult;
+use crate::terminal::NoopTerminalHook;
 
 /// The payload of a job's run: the job's [`Job::NAME`], by which the step
 /// runner routes the run to the registered handler, and the serialized
@@ -60,9 +64,107 @@ pub struct SubmitOptions {
 }
 
 /// The state shared by the runner and every [`JobHandle`]: the runtime
-/// a job runs as one step of.
+/// a job runs as one step of, whose terminal hook is
+/// [`NoopTerminalHook`], so a job enqueues no notification.
 pub(crate) struct Inner {
-    pub(crate) typed: TypedRuntime<Dispatch>,
+    pub(crate) runtime: WorkflowRuntime<Dispatch, NoopTerminalHook>,
+    spawned: AtomicBool,
+}
+
+/// How a job ended, as observed by an in-process waiter: with its run
+/// result record, or without one.
+pub(crate) enum Terminal {
+    Recorded(RunResult),
+    /// The run ended without the worker recording a result: it was
+    /// cancelled while pending, dead-lettered outside the worker or its
+    /// records are gone.
+    Unrecorded(Unrecorded),
+}
+
+pub(crate) enum Unrecorded {
+    /// The queue job was acknowledged.
+    Done,
+    /// The queue job was dead-lettered outside the worker, with the
+    /// queue record's last error.
+    Dead(Option<String>),
+    /// The queue job was removed by a cancellation before it was claimed.
+    Cancelled,
+    /// Neither a queue record nor a result record exists.
+    NotFound,
+}
+
+impl Inner {
+    /// The run result record of `run_id`, if one exists.
+    pub(crate) async fn run_result(&self, run_id: &str) -> Result<Option<RunResult>> {
+        self.runtime.inner.core.run_result(run_id).await
+    }
+
+    /// The group named `id`; see [`WorkflowRuntime::group`].
+    pub(crate) fn group(
+        &self,
+        id: impl Into<String>,
+    ) -> Result<RunGroup<'_, Dispatch, NoopTerminalHook>> {
+        self.runtime.group(id)
+    }
+
+    /// A group with a generated id; see [`WorkflowRuntime::new_group`].
+    pub(crate) fn new_group(&self) -> RunGroup<'_, Dispatch, NoopTerminalHook> {
+        self.runtime.new_group()
+    }
+
+    /// Spawn the worker. Panics on a second call: the runtime is
+    /// single-writer and its runner spawns one worker.
+    pub(crate) fn spawn_once<F>(&self, shutdown: F) -> RunnerHandle
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        assert!(
+            !self.spawned.swap(true, Ordering::SeqCst),
+            "spawn may only be called once"
+        );
+        self.runtime.spawn(shutdown)
+    }
+
+    /// Wait up to `timeout` for the run `run_id`, whose step job is
+    /// `job_id`, to reach a terminal state, then read its result record.
+    /// Returns `Ok(None)` when the timeout elapses first.
+    pub(crate) async fn wait_terminal_within(
+        &self,
+        run_id: &str,
+        job_id: &str,
+        timeout: Duration,
+    ) -> Result<Option<Terminal>> {
+        let queue = &self.runtime.inner.core.queue;
+        match queue.wait_for_completion_timeout(job_id, timeout).await? {
+            Some(outcome) => Ok(Some(self.terminal(run_id, outcome).await?)),
+            None => Ok(None),
+        }
+    }
+
+    /// [`Self::wait_terminal_within`] without a bound.
+    pub(crate) async fn wait_terminal(&self, run_id: &str, job_id: &str) -> Result<Terminal> {
+        let outcome = self
+            .runtime
+            .inner
+            .core
+            .queue
+            .wait_for_completion(job_id)
+            .await?;
+        self.terminal(run_id, outcome).await
+    }
+
+    async fn terminal(&self, run_id: &str, outcome: WaitOutcome) -> Result<Terminal> {
+        let unrecorded = match outcome {
+            WaitOutcome::Done(_) => Unrecorded::Done,
+            WaitOutcome::Dead(record) => Unrecorded::Dead(record.last_error),
+            WaitOutcome::Cancelled => Unrecorded::Cancelled,
+            WaitOutcome::NotFound => Unrecorded::NotFound,
+        };
+        Ok(match self.run_result(run_id).await? {
+            Some(result) => Terminal::Recorded(result),
+            None => Terminal::Unrecorded(unrecorded),
+        })
+    }
 }
 
 /// The run payload of `job`: its [`Job::NAME`] and its serialized
@@ -84,13 +186,13 @@ impl Inner {
         let key = job.idempotency_key();
         let run_id = key.as_deref().map(run_id_for_key);
 
-        // A completed job with this key answers from its outcome record,
+        // A completed job with this key answers from its result record,
         // which outlives the run record the workflow deletes at
         // termination.
         if let Some(run_id) = &run_id
-            && let Some(record) = self.typed.outcome(run_id).await?
+            && let Some(result) = self.run_result(run_id).await?
         {
-            if record.input_hash != hash_input(&payload) {
+            if result.input_hash != hash_input(&payload) {
                 return Err(crate::Error::InputMismatch(run_id.clone()));
             }
             tracing::debug!(job_id = %run_id, job_type = J::NAME, "submit matched a completed job");
@@ -98,7 +200,6 @@ impl Inner {
         }
 
         let outcome = self
-            .typed
             .runtime
             .submit(RunSpec {
                 run_id,
@@ -154,13 +255,19 @@ impl<J: Job> ErasedHandler for TypedHandler<J> {
     }
 }
 
-/// Run a single job of a known type and record its outcome.
+/// Run a single job of a known type: decode `input`, the serialized
+/// job carried in the step's payload, run it and encode its output as
+/// the step's result. An input that does not decode and an output that
+/// does not encode are permanent errors, since a retry cannot change
+/// either.
 async fn run_typed<J: Job>(
     state: &State,
     step: &Step,
     input: Vec<u8>,
 ) -> std::result::Result<StepOutcome, StepError> {
-    run_typed_step(step, J::NAME, &input, |input: J| async move {
+    let input: J = rmp_serde::from_slice(&input)
+        .map_err(|err| StepError::permanent(format!("invalid input for `{}`: {err}", J::NAME)))?;
+    let output = {
         let ctx = JobContext::new(state, &step.delivery);
         tracing::info!(
             job_id = %step.run_id,
@@ -171,7 +278,7 @@ async fn run_typed<J: Job>(
         match input.run(ctx).await {
             Ok(output) => {
                 tracing::info!(job_id = %step.run_id, job_type = J::NAME, "job completed");
-                Ok(output)
+                output
             }
             Err(error) => {
                 let message = error.to_string();
@@ -182,11 +289,17 @@ async fn run_typed<J: Job>(
                     attempt = step.attempts,
                     "job failed ({kind:?}): {message}"
                 );
-                Err(StepError { message, kind })
+                return Err(StepError { message, kind });
             }
         }
-    })
-    .await
+    };
+    let result = rmp_serde::to_vec_named(&output).map_err(|err| {
+        StepError::permanent(format!(
+            "`{}` produced an output that failed to serialize: {err}",
+            J::NAME
+        ))
+    })?;
+    Ok(StepOutcome::Succeed { result })
 }
 
 /// The step runner of the workflow runtime: routes each run's single step
@@ -255,13 +368,13 @@ impl JobRunner {
     /// `[A-Za-z0-9_-]`; [`Error::InvalidGroupId`](crate::Error::InvalidGroupId)
     /// otherwise.
     pub fn group<J: Job>(&self, id: impl Into<String>) -> Result<JobGroup<J>> {
-        let id = self.inner.typed.group(id)?.id().to_string();
+        let id = self.inner.group(id)?.id().to_string();
         Ok(JobGroup::new(self.inner.clone(), id))
     }
 
     /// A group of `J` jobs with a generated id.
     pub fn new_group<J: Job>(&self) -> JobGroup<J> {
-        let id = self.inner.typed.new_group().id().to_string();
+        let id = self.inner.new_group().id().to_string();
         JobGroup::new(self.inner.clone(), id)
     }
 
@@ -279,7 +392,7 @@ impl JobRunner {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.inner.typed.spawn_once(shutdown)
+        self.inner.spawn_once(shutdown)
     }
 }
 
@@ -342,7 +455,7 @@ impl JobRunnerBuilder {
         self
     }
 
-    /// The object-store prefix job memos and outcome records are written
+    /// The object-store prefix job memos and run result records are written
     /// under. Defaults to `"{queue_name}-memo"`.
     pub fn memo_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.memo_prefix = Some(prefix.into());
@@ -376,7 +489,7 @@ impl JobRunnerBuilder {
         self
     }
 
-    /// Remove a job's memo and outcome record `retention` after it reaches
+    /// Remove a job's memo and run result record `retention` after it reaches
     /// a terminal state. When unset (default), records are retained
     /// indefinitely.
     ///
@@ -393,7 +506,7 @@ impl JobRunnerBuilder {
     }
 
     /// Remove a job group's state (its manifest, member records and the
-    /// memo entries and outcome records of its members) `retention`
+    /// memo entries and run result records of its members) `retention`
     /// after every member of the group terminated. When unset (default),
     /// a group is retained until [`JobGroup::forget`].
     ///
@@ -414,32 +527,33 @@ impl JobRunnerBuilder {
 
     /// Build the runner.
     pub fn build(self) -> JobRunner {
-        let options = TypedRuntimeOptions {
-            memo_prefix: self
-                .memo_prefix
-                .unwrap_or_else(|| format!("{}-memo", self.queue_name)),
-            queue_name: self.queue_name,
-            max_concurrent: self.concurrency,
-            poll_interval: self.poll_interval,
-            clock: self.clock,
-        };
+        let memo_prefix = self
+            .memo_prefix
+            .unwrap_or_else(|| format!("{}-memo", self.queue_name));
         let dispatch = Dispatch {
             handlers: self.handlers,
             state: self.state,
         };
-        let (retention, group_retention) = (self.retention, self.group_retention);
-        let typed = options.build(self.queue, self.object_store, dispatch, |builder| {
-            let builder = match retention {
-                Some(retention) => builder.memo_retention(retention),
-                None => builder,
-            };
-            match group_retention {
-                Some(retention) => builder.group_retention(retention),
-                None => builder,
-            }
-        });
+        let mut builder =
+            WorkflowRuntime::builder(self.queue, self.object_store, dispatch, NoopTerminalHook)
+                .queue_name(self.queue_name)
+                .memo_prefix(memo_prefix)
+                .max_concurrent_steps(self.concurrency)
+                .poll_interval(self.poll_interval);
+        if let Some(clock) = self.clock {
+            builder = builder.clock(clock);
+        }
+        if let Some(retention) = self.retention {
+            builder = builder.memo_retention(retention);
+        }
+        if let Some(retention) = self.group_retention {
+            builder = builder.group_retention(retention);
+        }
         JobRunner {
-            inner: Arc::new(Inner { typed }),
+            inner: Arc::new(Inner {
+                runtime: builder.build(),
+                spawned: AtomicBool::new(false),
+            }),
         }
     }
 }
@@ -908,13 +1022,13 @@ mod tests {
         assert_eq!(first.await.unwrap(), 5);
         assert_eq!(runs.load(Ordering::SeqCst), 1);
 
-        // The retention sweep removing the outcome record.
+        // The retention sweep removing the run result record.
         MemoStore::new(store, format!("{queue_name}-memo"))
             .clear_memos_for_run(&first_id)
             .await
             .unwrap();
 
-        // The re-submission finds no outcome record and runs the job
+        // The re-submission finds no run result record and runs the job
         // again under the same id.
         let second = runner.submit(CountedKeyed { n: 5 }).await.unwrap();
         assert!(second.newly_submitted());

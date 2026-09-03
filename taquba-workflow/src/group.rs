@@ -417,7 +417,7 @@ impl<'a, R: StepRunner, H: TerminalHook> RunGroup<'a, R, H> {
     }
 
     /// Remove the group's state: its manifest, member records and the
-    /// memo entries and outcome records of its members.
+    /// memo entries and run result records of its members.
     pub(crate) async fn forget(&self) -> Result<()> {
         self.store().forget(&self.id).await
     }

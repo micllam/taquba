@@ -31,6 +31,11 @@
 //!   step-output replay entries written by the workflow runtime when
 //!   enabled.
 //!
+//! # Reserved key
+//!
+//! [`RUN_RESULT_MEMO_KEY`] in a run-scoped memo holds the run result
+//! record the runtime writes; a handler's run memo must not use it.
+//!
 //! # Cleanup
 //!
 //! The [`Memo`] primitive has no lifecycle management of its own.
@@ -52,6 +57,10 @@ use taquba::object_store::{ObjectStore, path::Path};
 use crate::blob::ObjectPrefix;
 use crate::error::{Error, Result};
 use crate::keys::hex_sha256;
+
+/// Run-memo key of the run result record. Handlers receive the run
+/// memo as well, so the key is reserved and documented.
+pub(crate) const RUN_RESULT_MEMO_KEY: &str = "workflow.outcome";
 
 /// Backing store for [`Memo`] entries, parametrised by an
 /// [`ObjectStore`] and a path prefix. Builds per-step [`Memo`]

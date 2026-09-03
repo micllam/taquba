@@ -40,7 +40,7 @@ pub enum Error {
 
     /// A re-submission of `run_id` carried `spec.input` bytes that differ
     /// from the original submission's: the run is active, or it is a
-    /// typed job whose outcome record is retained. Reusing a `run_id`
+    /// typed job whose run result record is retained. Reusing a `run_id`
     /// with new input is treated as a programmer error: pick a fresh
     /// `run_id` for a new run.
     #[error("run `{0}` exists with a different input; pick a fresh run_id")]

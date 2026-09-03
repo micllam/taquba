@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 
 use crate::durable::{
-    self, DurableCurrentStep, DurableRunOutcome, DurableRunRecord, DurableStepOutcome,
-    DurableStepOutcomeRecord, DurableTermination,
+    self, DurableCurrentStep, DurableErrorKind, DurableRunOutcome, DurableRunRecord,
+    DurableRunResult, DurableStepOutcome, DurableStepOutcomeRecord, DurableTermination,
 };
 use crate::effects::StagedEffects;
 use crate::error::{Error, Result};
@@ -24,8 +24,8 @@ use crate::keys::{
     RESERVED_HEADER_PREFIX, RESERVED_KV_PREFIX, TERMINAL_KV_PREFIX, hash_input, outcome_kv_key,
     run_kv_key, step_kv_key, terminal_kv_key, validate_run_id,
 };
-use crate::memo::MemoStore;
-use crate::runner::{StepOutcome, StepRunner, Trigger};
+use crate::memo::{MemoStore, RUN_RESULT_MEMO_KEY};
+use crate::runner::{StepErrorKind, StepOutcome, StepRunner, Trigger};
 use crate::sweep::{Clearable, Sweep, run_periodically};
 use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
 use crate::worker::{ClaimedStep, StepWorker};
@@ -162,6 +162,15 @@ pub enum RunState {
     /// [`WorkflowRuntimeBuilder::memo_retention`] and is removed with the
     /// run's memo entries when the window elapses.
     Terminated(RunTermination),
+}
+
+/// A run result record as read back: the committed outcome, the hash
+/// of the run's input and the kind of the error that dead-lettered the
+/// run, when one did.
+pub(crate) struct RunResult {
+    pub(crate) input_hash: [u8; 32],
+    pub(crate) error_kind: Option<StepErrorKind>,
+    pub(crate) outcome: RunOutcome,
 }
 
 /// The committed terminal outcome of a run, as
@@ -650,6 +659,24 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         }))
     }
 
+    /// The committed outcome of a terminated run, read from its run
+    /// result record: the result the runner returned or the error that
+    /// ended the run, with the submitter's headers and the final step.
+    /// The record is written by the worker that terminates the run
+    /// before the terminating settlement and is removed with the run's
+    /// memo entries; `None` for a run that is unknown, still active or
+    /// was terminated without a worker (a cancellation of a pending
+    /// step, a dead-letter outside the worker), whose status
+    /// [`Self::status`] reports.
+    pub async fn outcome(&self, run_id: &str) -> Result<Option<RunOutcome>> {
+        Ok(self
+            .inner
+            .core
+            .run_result(run_id)
+            .await?
+            .map(|result| result.outcome))
+    }
+
     /// Request cancellation of an active run.
     ///
     /// Returns `Ok(true)` once the request is recorded on the run's
@@ -855,6 +882,48 @@ impl RuntimeCore {
             current_step: record.final_step,
             state: RunState::Terminated(record.into()),
         }))
+    }
+
+    /// The run result record of `run_id`; a record that fails to decode
+    /// is treated as absent.
+    pub(crate) async fn run_result(&self, run_id: &str) -> Result<Option<RunResult>> {
+        let Some(bytes) = self
+            .memo_store
+            .new_run_memo(run_id)
+            .get(RUN_RESULT_MEMO_KEY)
+            .await?
+        else {
+            return Ok(None);
+        };
+        match rmp_serde::from_slice::<DurableRunResult>(&bytes) {
+            Ok(record) => Ok(Some(RunResult {
+                input_hash: record.input_hash,
+                error_kind: record.error_kind.map(Into::into),
+                outcome: record.outcome.into(),
+            })),
+            Err(err) => {
+                warn!(run_id, error = %err, "run result record failed to decode; treated as absent");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Write the run result record of `outcome`'s run.
+    pub(crate) async fn store_run_result(
+        &self,
+        outcome: &RunOutcome,
+        input_hash: [u8; 32],
+        error_kind: Option<StepErrorKind>,
+    ) -> Result<()> {
+        let record = DurableRunResult {
+            input_hash,
+            error_kind: error_kind.map(DurableErrorKind::from),
+            outcome: DurableRunOutcome::from(outcome),
+        };
+        self.memo_store
+            .new_run_memo(&outcome.run_id)
+            .put(RUN_RESULT_MEMO_KEY, &durable::encode(&record))
+            .await
     }
 
     /// The durable record of `run_id`, when the run is active.
@@ -1527,6 +1596,15 @@ mod tests {
         assert_eq!(outcome.headers.get("tenant").unwrap(), "acme");
         assert!(!outcome.headers.contains_key(HEADER_RUN_ID));
         assert!(!outcome.headers.contains_key(HEADER_STEP));
+
+        let recorded =
+            runtime.outcome(&handle.run_id).await.unwrap().expect(
+                "the worker writes the run result record before the terminating settlement",
+            );
+        assert_eq!(recorded.status, TerminalStatus::Succeeded);
+        assert_eq!(recorded.final_step, 2);
+        assert_eq!(recorded.result.as_deref(), Some(b"final".as_slice()));
+        assert_eq!(recorded.headers, outcome.headers);
 
         let _ = shutdown.send(());
     }
@@ -2814,6 +2892,10 @@ mod tests {
         );
         assert_eq!(status.current_step, 0);
         assert!(
+            runtime.outcome(&handle.run_id).await.unwrap().is_none(),
+            "no worker terminated the run, so no run result record exists",
+        );
+        assert!(
             !runtime.cancel(&handle.run_id).await.unwrap(),
             "a second cancel finds no run record",
         );
@@ -3394,6 +3476,9 @@ mod tests {
             ),
             "the terminal record commits with the dead-letter",
         );
+        let recorded = runtime.outcome(&handle.run_id).await.unwrap().unwrap();
+        assert_eq!(recorded.status, TerminalStatus::Failed);
+        assert_eq!(recorded.error.as_deref(), Some("nope"));
 
         // The notification was enqueued by the dead-letter transaction, so
         // the dead job and the marker are already visible, and the staged

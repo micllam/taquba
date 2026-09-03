@@ -149,15 +149,41 @@ impl<'a> ClaimedStep<'a> {
 impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     /// The error a step returns for a failure that terminates its run:
     /// the effects of the `Failed` termination on a [`FailWith`], so the
-    /// core applies them only with the dead-lettering settlement.
-    pub(crate) fn terminating_failure(
+    /// core applies them only with the dead-lettering settlement. The
+    /// run result record is written first; a failed write is logged.
+    pub(crate) async fn terminating_failure(
         &self,
         claimed: &ClaimedStep<'_>,
         error: StepError,
+        input_hash: [u8; 32],
     ) -> WorkerError {
-        let effects =
-            self.terminate_collecting_effects(&claimed.failed(error.message.clone()), claimed);
+        let outcome = claimed.failed(error.message.clone());
+        if let Err(err) = self
+            .core
+            .store_run_result(&outcome, input_hash, Some(error.kind))
+            .await
+        {
+            warn!(run_id = %claimed.run_id, "failed to write the run result record: {err}");
+        }
+        let effects = self.terminate_collecting_effects(&outcome, claimed);
         FailWith::new(error.into_worker_error(), effects).into()
+    }
+
+    /// Terminate the run of `claimed` with `outcome` from an acking
+    /// settlement: write the run result record, then build the
+    /// settlement effects. A failed write is a transient error, so the
+    /// step is delivered again.
+    async fn terminate_recorded(
+        &self,
+        claimed: &ClaimedStep<'_>,
+        outcome: RunOutcome,
+        input_hash: [u8; 32],
+    ) -> std::result::Result<SettlementEffects, WorkerError> {
+        self.core
+            .store_run_result(&outcome, input_hash, None)
+            .await
+            .map_err(|err| StepError::from(err).into_worker_error())?;
+        Ok(self.terminate_collecting_effects(&outcome, claimed))
     }
 
     /// Process a terminal-notification job: decode the committed
@@ -228,7 +254,9 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 StepError::from(Error::InconsistentRunState(run_id.to_string())).into_worker_error()
             })?;
         if record.cancel_requested {
-            let mut effects = self.terminate_collecting_effects(&claimed.cancelled(None), &claimed);
+            let mut effects = self
+                .terminate_recorded(&claimed, claimed.cancelled(None), record.input_hash)
+                .await?;
             effects.kv_deletes.extend(signal_kv_deletes);
             return Ok(effects);
         }
@@ -300,7 +328,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
 
         let runner_cancelled = matches!(outcome, Ok(StepOutcome::Cancel { .. }));
         let settled = self
-            .settle_outcome(&claimed, outcome, external_cancel)
+            .settle_outcome(&claimed, outcome, external_cancel, record.input_hash)
             .await;
 
         // Durable signal entries scheduled for cleanup are deleted with the
@@ -333,13 +361,16 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         claimed: &ClaimedStep<'_>,
         outcome: std::result::Result<StepOutcome, StepError>,
         external_cancel: bool,
+        input_hash: [u8; 32],
     ) -> std::result::Result<SettlementEffects, WorkerError> {
         match outcome {
             Ok(StepOutcome::Cancel { reason }) => {
-                Ok(self.terminate_collecting_effects(&claimed.cancelled(Some(reason)), claimed))
+                self.terminate_recorded(claimed, claimed.cancelled(Some(reason)), input_hash)
+                    .await
             }
             _ if external_cancel => {
-                Ok(self.terminate_collecting_effects(&claimed.cancelled(None), claimed))
+                self.terminate_recorded(claimed, claimed.cancelled(None), input_hash)
+                    .await
             }
             Ok(StepOutcome::Continue { payload, when }) => match when {
                 Trigger::Immediate => Ok(self
@@ -357,22 +388,24 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     correlation_key,
                     timeout,
                 } => {
-                    self.advance_on_signal(claimed, payload, &correlation_key, timeout)
+                    self.advance_on_signal(claimed, payload, &correlation_key, timeout, input_hash)
                         .await
                 }
             },
             Ok(StepOutcome::Succeed { result }) => {
-                Ok(self.terminate_collecting_effects(&claimed.succeeded(result), claimed))
+                self.terminate_recorded(claimed, claimed.succeeded(result), input_hash)
+                    .await
             }
             // A runner verdict: the step ran cleanly and is acknowledged;
             // the run terminates as `Failed` without a dead-letter.
             Ok(StepOutcome::Fail { reason }) => {
-                Ok(self.terminate_collecting_effects(&claimed.failed(reason), claimed))
+                self.terminate_recorded(claimed, claimed.failed(reason), input_hash)
+                    .await
             }
             // A permanent error, or a transient one on the last attempt,
             // dead-letters the step and terminates the run.
             Err(err) if err.kind == StepErrorKind::Permanent || claimed.job.is_last_attempt() => {
-                Err(self.terminating_failure(claimed, err))
+                Err(self.terminating_failure(claimed, err, input_hash).await)
             }
             Err(err) => Err(err.into_worker_error()),
         }

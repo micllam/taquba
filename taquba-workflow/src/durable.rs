@@ -17,7 +17,7 @@ pub(crate) fn encode<T: Serialize>(record: &T) -> Vec<u8> {
 }
 
 use crate::effects::StagedEffects;
-use crate::runner::{StepOutcome, Trigger};
+use crate::runner::{StepErrorKind, StepOutcome, Trigger};
 use crate::terminal::{RunOutcome, TerminalStatus};
 
 /// Durable per-run record written atomically with the step-0 enqueue in
@@ -233,9 +233,9 @@ pub(crate) struct DurableMember {
     pub(crate) terminated: Option<DurableTermination>,
 }
 
-/// Stored payload of a terminal-notification job: the committed
-/// [`RunOutcome`], self-contained so the notification survives restarts
-/// and redeliveries.
+/// Stored form of a [`RunOutcome`]: the payload of a terminal-notification
+/// job and the outcome half of the run result record, self-contained so
+/// both survive restarts and redeliveries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DurableRunOutcome {
     run_id: String,
@@ -244,6 +244,43 @@ pub(crate) struct DurableRunOutcome {
     error: Option<String>,
     headers: HashMap<String, String>,
     final_step: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum DurableErrorKind {
+    Transient,
+    Permanent,
+}
+
+impl From<StepErrorKind> for DurableErrorKind {
+    fn from(kind: StepErrorKind) -> Self {
+        match kind {
+            StepErrorKind::Transient => Self::Transient,
+            StepErrorKind::Permanent => Self::Permanent,
+        }
+    }
+}
+
+impl From<DurableErrorKind> for StepErrorKind {
+    fn from(kind: DurableErrorKind) -> Self {
+        match kind {
+            DurableErrorKind::Transient => Self::Transient,
+            DurableErrorKind::Permanent => Self::Permanent,
+        }
+    }
+}
+
+/// The run result record, stored in the run memo under
+/// [`RUN_RESULT_MEMO_KEY`](crate::memo::RUN_RESULT_MEMO_KEY) by the
+/// worker before the settlement that terminates the run: the committed
+/// outcome, the SHA-256 of the run's input for an idempotent
+/// re-submission after completion and the kind of the [`StepError`]
+/// that terminated a run through a dead-letter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DurableRunResult {
+    pub(crate) input_hash: [u8; 32],
+    pub(crate) error_kind: Option<DurableErrorKind>,
+    pub(crate) outcome: DurableRunOutcome,
 }
 
 impl From<&RunOutcome> for DurableRunOutcome {

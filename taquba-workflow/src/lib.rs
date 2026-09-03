@@ -136,6 +136,15 @@
 //! [Memo retention](#memo-retention); without it, a terminated run has
 //! no status.
 //!
+//! [`WorkflowRuntime::outcome`] returns the committed [`RunOutcome`] of a
+//! terminated run (its result or error, the submitter's headers and the
+//! final step) from the run result record the worker writes to the run's
+//! memo, under the reserved key `workflow.outcome`, before every
+//! terminating settlement it performs. A run terminated without a worker
+//! (a cancellation of a pending step, a step dead-lettered outside the
+//! worker) has no record. The record is removed with the run's memo
+//! entries by the memo sweep.
+//!
 //! # Cancellation
 //!
 //! [`WorkflowRuntime::cancel`] cancels an active run from outside the
@@ -291,8 +300,8 @@
 //! and returns its result to an awaiting caller: define a [`jobs::Job`]
 //! with typed input fields, an `Output` and an `Error`, register it on a
 //! [`jobs::JobRunner`], submit instances and await the
-//! [`jobs::JobHandle`]. The outcome record is stored in the run's memo, so
-//! [`jobs::JobHandle::fetch_result`] reads it after a restart, and a
+//! [`jobs::JobHandle`]. The result is the run result record in the run's
+//! memo, so [`jobs::JobHandle::fetch_result`] reads it after a restart, and a
 //! [`jobs::Job::idempotency_key`] collapses duplicate submissions before
 //! and after completion. A handler that submits further jobs holds a
 //! [`jobs::JobRunner`] in its registered state. The module documentation
@@ -417,9 +426,10 @@
 //!
 //! [`Delivery::run_memo`] is the run-scoped variant: one namespace shared
 //! by every step of the run, for values a later step reads back (an
-//! accumulating journal, for example). Its entries are stored beside the
-//! per-step entries and are removed with them when the run's retention
-//! expires.
+//! accumulating journal, for example); the key `workflow.outcome` in it
+//! is reserved for the run result record. Its entries are stored beside
+//! the per-step entries and are removed with them when the run's
+//! retention expires.
 //!
 //! Memo entries are stored in the object store passed to
 //! [`WorkflowRuntime::builder`] under the path prefix configured by
@@ -571,7 +581,6 @@ pub mod jobs;
 mod keys;
 mod kv;
 mod memo;
-pub(crate) mod outcome;
 mod runner;
 mod runtime;
 mod signal;

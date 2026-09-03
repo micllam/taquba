@@ -34,6 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GroupMismatch`, `GroupNotFound` and `InvalidGroupId` are its errors.
 - `HEADER_GROUP` and `HEADER_GROUP_KEY`: the reserved headers naming a
   grouped run's group and member key on its step jobs.
+- `WorkflowRuntime::outcome`: the committed `RunOutcome` of a terminated
+  run, read from the run result record the worker writes to the run's
+  memo under the reserved key `workflow.outcome` before every
+  terminating settlement it performs; a cancellation of a pending step
+  and a dead-letter outside the worker write none. The record holds the
+  result or error, the submitter's headers, the final step and the
+  input hash, and is removed with the run's memo entries by the memo
+  sweep.
 
 ### Removed
 
@@ -70,6 +78,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is settled as cancelled without running. The in-process run registry
   is gone.
 - `RunnerHandle` is `taquba::WorkerHandle<Result<()>>`.
+- **Breaking (storage):** a typed job's outcome record is the runtime's
+  run result record, written by the worker for every run under the same
+  run-memo key with a different layout; `jobs::JobHandle::fetch_result`,
+  `jobs::JobHandle::join` and `jobs::JobGroup::results` read it.
 - **Breaking (source):** `Step` is `#[non_exhaustive]` and holds its
   delivery fields (`run_id`, `headers`, `job_id`, `attempts`,
   `max_attempts`, `cancel_token`, `lease`, `memo`, `run_memo`, `effects`,
