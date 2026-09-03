@@ -919,28 +919,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn records_failed_items() {
-        let (queue, store) = open_queue().await;
-        let (bulk, worker) = spawned(
-            Bulk::builder(queue, store, Doubler)
-                .poll_interval(Duration::from_millis(10))
-                .build(),
-        );
-
-        let inputs = vec![Item { n: 1 }, Item { n: 13 }, Item { n: 3 }];
-        let report = tokio::time::timeout(Duration::from_secs(10), bulk.run(inputs))
-            .await
-            .expect("run finished in time")
-            .unwrap();
-
-        assert_eq!(report.total, 3);
-        assert_eq!(report.succeeded, 2);
-        assert_eq!(report.failed, 1);
-        assert_eq!(report.failed_keys, vec!["item-1".to_string()]);
-        worker.shutdown().await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn fail_threshold_trips_when_exceeded() {
         let (queue, store) = open_queue().await;
         let (bulk, worker) = spawned(

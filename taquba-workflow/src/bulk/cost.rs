@@ -108,18 +108,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn record_accumulates_per_metric() {
+    fn get_sums_recorded_values_and_is_zero_for_an_unknown_metric() {
         let report = CostReport::new();
         report.record("tokens", 100.0);
         report.record("tokens", 50.0);
         report.record("calls", 1.0);
         assert_eq!(report.get("tokens"), 150.0);
         assert_eq!(report.get("calls"), 1.0);
-    }
-
-    #[test]
-    fn get_returns_zero_for_unknown_metric() {
-        let report = CostReport::new();
         assert_eq!(report.get("missing"), 0.0);
     }
 

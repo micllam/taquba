@@ -329,18 +329,20 @@ mod tests {
     }
 
     #[test]
-    fn a_sealed_handle_rejects_staging() {
+    fn a_clone_stages_into_the_shared_accumulator_until_the_seal() {
         let handle = EffectsHandle::for_delivery();
         let clone = handle.clone();
-        handle.put("a", "v").unwrap();
-        let sealed = handle.seal_and_take();
-        assert_eq!(sealed.outcome.writes.len(), 1);
-        assert!(matches!(clone.put("b", "v"), Err(Error::EffectsSealed)));
+        clone.put("a", "v").unwrap();
+        clone.delete("b").unwrap();
+        let staged = handle.seal_and_take().outcome;
+        assert_eq!(staged.writes.get(b"a".as_slice()), Some(&b"v".to_vec()));
+        assert!(staged.deletes.contains(b"b".as_slice()));
+        assert!(matches!(clone.put("c", "v"), Err(Error::EffectsSealed)));
         assert!(matches!(
             clone.put_reserved_on_failure(b"workflow/x".to_vec(), b"v".to_vec()),
             Err(Error::EffectsSealed)
         ));
-        assert!(matches!(clone.delete("b"), Err(Error::EffectsSealed)));
+        assert!(matches!(clone.delete("c"), Err(Error::EffectsSealed)));
     }
 
     #[test]
@@ -381,16 +383,5 @@ mod tests {
             }),
             Err(Error::EffectsSealed)
         ));
-    }
-
-    #[test]
-    fn clones_share_one_accumulator() {
-        let handle = EffectsHandle::for_delivery();
-        let clone = handle.clone();
-        clone.put("a", "v").unwrap();
-        clone.delete("b").unwrap();
-        let staged = handle.seal_and_take().outcome;
-        assert_eq!(staged.writes.get(b"a".as_slice()), Some(&b"v".to_vec()));
-        assert!(staged.deletes.contains(b"b".as_slice()));
     }
 }

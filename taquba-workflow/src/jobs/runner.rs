@@ -651,23 +651,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn submit_run_and_join_success() {
-        let (queue, store) = open_queue().await;
-        let mut runner = JobRunner::builder(queue, store)
-            .state("ok")
-            .register::<Adder>()
-            .build();
-        let handle = runner.spawn(std::future::pending::<()>());
-
-        let job = runner.submit(Adder { a: 2, b: 3 }).await.unwrap();
-        assert_eq!(job.join().await.unwrap().unwrap(), 5);
-        let awaited = runner.submit(Adder { a: 10, b: 7 }).await.unwrap();
-        assert_eq!(awaited.await.unwrap(), 17);
-
-        handle.shutdown().await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn a_handler_uses_its_memo_and_effects_across_a_retry() {
         let cfg = QueueConfig::default()
             .max_attempts(3)
@@ -748,23 +731,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn idempotency_key_collapses_duplicate_submissions() {
-        let (queue, store) = open_queue().await;
-        // No spawn: jobs stay pending so the run is still active.
-        let runner = JobRunner::builder(queue, store).build();
-
-        let first = runner.submit(Keyed { n: 1 }).await.unwrap();
-        assert!(first.newly_submitted());
-        let second = runner.submit(Keyed { n: 1 }).await.unwrap();
-        assert_eq!(first.id(), second.id());
-        assert!(!second.newly_submitted());
-
-        let different = runner.submit(Keyed { n: 2 }).await.unwrap();
-        assert_ne!(first.id(), different.id());
-        assert!(different.newly_submitted());
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn a_duplicate_submission_joins_the_in_flight_job() {
         let (queue, store) = open_queue().await;
         let runs = Arc::new(AtomicU32::new(0));
@@ -773,43 +739,27 @@ mod tests {
             .register::<CountedKeyed>()
             .build();
 
+        // No worker yet: the jobs stay pending, so the runs are active.
         let first = runner.submit(CountedKeyed { n: 3 }).await.unwrap();
+        assert!(first.newly_submitted());
         let second = runner.submit(CountedKeyed { n: 3 }).await.unwrap();
         assert!(!second.newly_submitted());
+        assert_eq!(first.id(), second.id());
+        let different = runner.submit(CountedKeyed { n: 4 }).await.unwrap();
+        assert!(different.newly_submitted());
+        assert_ne!(first.id(), different.id());
         let handle = runner.spawn(std::future::pending::<()>());
 
         assert_eq!(second.await.unwrap(), 3);
         assert_eq!(first.await.unwrap(), 3);
-        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(different.await.unwrap(), 4);
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
 
         handle.shutdown().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
-    async fn input_mismatch_on_same_key_different_payload() {
-        let (queue, store) = open_queue().await;
-        let runner = JobRunner::builder(queue, store).build();
-
-        runner
-            .submit(FixedKey {
-                content: "alpha".into(),
-            })
-            .await
-            .unwrap();
-        let result = runner
-            .submit(FixedKey {
-                content: "beta".into(),
-            })
-            .await;
-        match result {
-            Err(Error::InputMismatch(id)) => assert_eq!(id, run_id_for_key("fixed")),
-            Err(other) => panic!("expected InputMismatch, got Err({other:?})"),
-            Ok(_) => panic!("expected InputMismatch, got Ok(_)"),
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn input_mismatch_survives_restart() {
+    async fn input_mismatch_names_the_run_id_and_survives_restart() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let queue_name = "test-mismatch-restart";
 
@@ -832,29 +782,10 @@ mod tests {
             })
             .await;
         match result {
-            Err(Error::InputMismatch(_)) => {}
+            Err(Error::InputMismatch(id)) => assert_eq!(id, run_id_for_key("fixed")),
             Err(other) => panic!("expected InputMismatch across restart, got Err({other:?})"),
             Ok(_) => panic!("expected InputMismatch across restart, got Ok(_)"),
         }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn idempotency_key_short_circuits_to_cached_success_after_completion() {
-        let (queue, store) = open_queue().await;
-        let mut runner = JobRunner::builder(queue, store).register::<Keyed>().build();
-        let handle = runner.spawn(std::future::pending::<()>());
-
-        let first = runner.submit(Keyed { n: 42 }).await.unwrap();
-        assert!(first.newly_submitted());
-        let first_id = first.id().to_string();
-        assert_eq!(first.await.unwrap(), 42);
-
-        let second = runner.submit(Keyed { n: 42 }).await.unwrap();
-        assert!(!second.newly_submitted());
-        assert_eq!(second.id(), first_id);
-        assert_eq!(second.await.unwrap(), 42);
-
-        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

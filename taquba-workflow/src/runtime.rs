@@ -1289,7 +1289,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn single_step_succeeds_and_fires_hook() {
+    async fn single_step_succeeds_and_writes_no_marker_without_retention() {
         let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
@@ -1320,12 +1320,13 @@ mod tests {
         assert_eq!(outcome.result.as_deref(), Some(b"done".as_slice()));
         assert_eq!(outcome.final_step, 0);
         assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
+        assert!(terminal_markers(&runtime.inner.core.queue).await.is_empty());
 
         let _ = shutdown.send(());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn multi_step_run_advances_through_continue() {
+    async fn multi_step_run_advances_through_continue_with_its_headers() {
         let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
@@ -1346,6 +1347,10 @@ mod tests {
         let handle = runtime
             .submit(RunSpec {
                 input: b"start".to_vec(),
+                headers: HashMap::from([
+                    ("trace_id".to_string(), "abc-123".to_string()),
+                    ("tenant".to_string(), "acme".to_string()),
+                ]),
                 ..Default::default()
             })
             .await
@@ -1359,6 +1364,10 @@ mod tests {
         assert_eq!(outcome.final_step, 2);
         assert_eq!(outcome.status, TerminalStatus::Succeeded);
         assert_eq!(outcome.result.as_deref(), Some(b"final".as_slice()));
+        assert_eq!(outcome.headers.get("trace_id").unwrap(), "abc-123");
+        assert_eq!(outcome.headers.get("tenant").unwrap(), "acme");
+        assert!(!outcome.headers.contains_key(HEADER_RUN_ID));
+        assert!(!outcome.headers.contains_key(HEADER_STEP));
 
         let _ = shutdown.send(());
     }
@@ -1637,14 +1646,20 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn signal_before_waiter_is_buffered_and_consumed_at_registration() {
+    async fn a_buffered_signal_is_consumed_at_registration_and_a_later_one_replaces_it() {
         let (queue, store, _clock) = open_queue_at(1_700_000_000_000).await;
         let (runtime, observed, mut rx) =
             signal_probe_runtime(queue.clone(), store, "order-3", Duration::from_secs(3600));
         let shutdown = spawn_runtime(runtime.clone());
 
-        let outcome = runtime.signal("order-3", b"early".to_vec()).await.unwrap();
-        assert_eq!(outcome, SignalOutcome::Buffered);
+        assert_eq!(
+            runtime.signal("order-3", b"first".to_vec()).await.unwrap(),
+            SignalOutcome::Buffered
+        );
+        assert_eq!(
+            runtime.signal("order-3", b"second".to_vec()).await.unwrap(),
+            SignalOutcome::Buffered
+        );
 
         runtime
             .submit(RunSpec {
@@ -1663,7 +1678,7 @@ mod tests {
         assert_eq!(terminal.status, TerminalStatus::Succeeded);
         assert_eq!(
             observed.lock().unwrap().as_slice(),
-            &[Some(b"early".to_vec())]
+            &[Some(b"second".to_vec())]
         );
 
         assert!(
@@ -1672,43 +1687,6 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
-        );
-
-        let _ = shutdown.send(());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn second_signal_before_consumption_replaces_first() {
-        let (queue, store, _clock) = open_queue_at(1_700_000_000_000).await;
-        let (runtime, observed, mut rx) =
-            signal_probe_runtime(queue.clone(), store, "order-4", Duration::from_secs(3600));
-        let shutdown = spawn_runtime(runtime.clone());
-
-        assert_eq!(
-            runtime.signal("order-4", b"first".to_vec()).await.unwrap(),
-            SignalOutcome::Buffered
-        );
-        assert_eq!(
-            runtime.signal("order-4", b"second".to_vec()).await.unwrap(),
-            SignalOutcome::Buffered
-        );
-
-        runtime
-            .submit(RunSpec {
-                input: Vec::new(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        let terminal = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(terminal.status, TerminalStatus::Succeeded);
-        assert_eq!(
-            observed.lock().unwrap().as_slice(),
-            &[Some(b"second".to_vec())]
         );
 
         let _ = shutdown.send(());
@@ -1869,45 +1847,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn permanent_failure_dead_letters_and_fires_hook() {
-        let (queue, store) = open_queue().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store.clone(),
-            FixedRunner::new(Err(StepError::permanent("nope"))),
-            ChannelHook { tx },
-        )
-        .build();
-        let shutdown = spawn_runtime(runtime.clone());
-
-        let handle = runtime
-            .submit(RunSpec {
-                input: b"x".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(outcome.run_id, handle.run_id);
-        assert_eq!(outcome.status, TerminalStatus::Failed);
-        assert_eq!(outcome.error.as_deref(), Some("nope"));
-        assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
-
-        // Permanent runner errors *do* dead-letter the step, and the
-        // notification the hook ran from was enqueued by that same
-        // dead-letter transaction, so the record is already visible.
-        let stats = queue.stats("workflow-steps").await.unwrap();
-        assert_eq!(stats.dead, 1, "permanent error should dead-letter");
-
-        let _ = shutdown.send(());
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn a_failure_notification_inherits_the_step_limits() {
         let (queue, store) = open_queue().await;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1947,103 +1886,42 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn fail_outcome_terminates_run_without_dead_letter() {
-        // StepOutcome::Fail is the runner's *verdict* path, not an
-        // infrastructure error: the hook fires with Failed, but the step
-        // is acked normally so no dead job is left behind for operators
-        // to inspect.
-
+    async fn a_duplicate_submit_is_idempotent_drops_its_kv_writes_and_rejects_a_changed_input() {
         let (queue, store) = open_queue().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
-            store.clone(),
-            ScriptedRunner::new(vec![StepOutcome::Fail {
-                reason: "agent declined the task".to_string(),
-            }]),
-            ChannelHook { tx },
+            store,
+            ScriptedRunner::new(vec![]),
+            NoopTerminalHook,
         )
         .build();
-        let shutdown = spawn_runtime(runtime.clone());
+        // No worker loop runs, so the step stays queued and the run is
+        // active for every later submit.
+        let spec = |input: &[u8], key: &[u8]| RunSpec {
+            run_id: Some("fixed-id".to_string()),
+            input: input.to_vec(),
+            kv_writes: HashMap::from([(key.to_vec(), b"1".to_vec())]),
+            ..Default::default()
+        };
 
-        let handle = runtime
-            .submit(RunSpec {
-                input: b"x".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        let first = runtime.submit(spec(b"x", b"app/first")).await.unwrap();
+        assert!(first.newly_submitted);
+        assert!(runtime.status("fixed-id").await.unwrap().is_some());
+        assert_eq!(
+            queue.kv_get(b"app/first").await.unwrap().as_deref(),
+            Some(b"1".as_slice())
+        );
 
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("hook fired in time")
-            .expect("hook channel open");
+        let duplicate = runtime.submit(spec(b"x", b"app/second")).await.unwrap();
+        assert_eq!(duplicate.run_id, "fixed-id");
+        assert!(!duplicate.newly_submitted);
+        assert_eq!(duplicate.job_id, first.job_id);
+        assert!(queue.kv_get(b"app/second").await.unwrap().is_none());
 
-        assert_eq!(outcome.run_id, handle.run_id);
-        assert_eq!(outcome.status, TerminalStatus::Failed);
-        assert_eq!(outcome.error.as_deref(), Some("agent declined the task"));
-        assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
-
-        // Crucially: no dead-letter, distinguishing runner verdict from
-        // infrastructure failure at the queue level.
-        let stats = queue.stats("workflow-steps").await.unwrap();
-        assert_eq!(stats.dead, 0, "Fail verdict must not dead-letter");
-
-        let _ = shutdown.send(());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn duplicate_submit_in_process_is_idempotent_and_rejects_a_changed_input() {
-        // Pause forever on the first step so the run stays active while
-        // we attempt the duplicate submit.
-
-        let (queue, store) = open_queue().await;
-        let runtime =
-            WorkflowRuntime::builder(queue, store.clone(), PauseRunner, NoopTerminalHook).build();
-        let shutdown = spawn_runtime(runtime.clone());
-
-        let handle = runtime
-            .submit(RunSpec {
-                run_id: Some("fixed-id".to_string()),
-                input: b"x".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        // Wait for the worker to start the step so the status reports the
-        // run as Running (or at least Pending).
-        for _ in 0..40 {
-            if runtime.status(&handle.run_id).await.unwrap().is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        assert!(runtime.status(&handle.run_id).await.unwrap().is_some());
-
-        let outcome = runtime
-            .submit(RunSpec {
-                run_id: Some("fixed-id".to_string()),
-                input: b"x".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(outcome.run_id, "fixed-id");
-        assert!(!outcome.newly_submitted);
-        assert_eq!(outcome.job_id, handle.job_id);
-
-        let err = runtime
-            .submit(RunSpec {
-                run_id: Some("fixed-id".to_string()),
-                input: b"y".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .unwrap_err();
+        let err = runtime.submit(spec(b"y", b"app/third")).await.unwrap_err();
         assert!(matches!(&err, Error::InputMismatch(id) if id == "fixed-id"));
         assert!(err.is_permanent());
-
-        let _ = shutdown.send(());
+        assert!(queue.kv_get(b"app/third").await.unwrap().is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -2212,142 +2090,6 @@ mod tests {
         assert!(!same.newly_submitted);
         assert_eq!(same.job_id, first.job_id);
         assert!(matches!(changed, Err(Error::InputMismatch(id)) if id == "raced"));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn duplicate_submit_across_restart_is_idempotent_and_rejects_a_changed_input() {
-        // Build a runtime, submit a run, then drop the runtime entirely
-        // (simulating a process restart of the workflow layer) while
-        // keeping the underlying Queue alive. The next runtime instance
-        // must treat a re-submit as idempotent because the durable run
-        // record persists through the enqueue_with_kv path.
-
-        let (queue, store) = open_queue().await;
-
-        // Submit via the first runtime, drop it without starting its
-        // worker loop or going terminal.
-        {
-            let runtime = WorkflowRuntime::builder(
-                queue.clone(),
-                store.clone(),
-                PauseRunner,
-                NoopTerminalHook,
-            )
-            .build();
-            runtime
-                .submit(RunSpec {
-                    run_id: Some("durable-id".to_string()),
-                    input: b"x".to_vec(),
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-        }
-
-        // The durable record is queryable independently of any runtime.
-        assert!(
-            queue
-                .kv_get(&run_kv_key("durable-id"))
-                .await
-                .unwrap()
-                .is_some(),
-            "durable run record must persist past runtime drop"
-        );
-
-        // Fresh runtime, same queue. The duplicate verdict comes from the
-        // durable KV record.
-        let runtime2 =
-            WorkflowRuntime::builder(queue.clone(), store.clone(), PauseRunner, NoopTerminalHook)
-                .build();
-        let outcome = runtime2
-            .submit(RunSpec {
-                run_id: Some("durable-id".to_string()),
-                input: b"x".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(outcome.run_id, "durable-id");
-        assert!(!outcome.newly_submitted);
-
-        let err = runtime2
-            .submit(RunSpec {
-                run_id: Some("durable-id".to_string()),
-                input: b"y".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(&err, Error::InputMismatch(id) if id == "durable-id"));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn reserved_header_on_submit_is_rejected() {
-        let (queue, store) = open_queue().await;
-        let runtime: WorkflowRuntime<ScriptedRunner, NoopTerminalHook> = WorkflowRuntime::builder(
-            queue,
-            store.clone(),
-            ScriptedRunner::new(vec![]),
-            NoopTerminalHook,
-        )
-        .build();
-        let mut headers = HashMap::new();
-        headers.insert("workflow.run_id".to_string(), "evil".to_string());
-
-        let err = runtime
-            .submit(RunSpec {
-                input: b"x".to_vec(),
-                headers,
-                ..Default::default()
-            })
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&err, Error::ReservedHeaderInSubmit(k) if k == "workflow.run_id"),
-            "got: {err:?}"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn user_headers_thread_through_to_terminal_hook() {
-        let (queue, store) = open_queue().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue,
-            store.clone(),
-            ScriptedRunner::new(vec![
-                StepOutcome::continue_now(vec![]),
-                StepOutcome::Succeed { result: vec![] },
-            ]),
-            ChannelHook { tx },
-        )
-        .build();
-        let shutdown = spawn_runtime(runtime.clone());
-
-        let mut headers = HashMap::new();
-        headers.insert("trace_id".to_string(), "abc-123".to_string());
-        headers.insert("tenant".to_string(), "acme".to_string());
-
-        runtime
-            .submit(RunSpec {
-                input: b"x".to_vec(),
-                headers,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(outcome.headers.get("trace_id").unwrap(), "abc-123");
-        assert_eq!(outcome.headers.get("tenant").unwrap(), "acme");
-        // Reserved keys must not leak through.
-        assert!(!outcome.headers.contains_key(HEADER_RUN_ID));
-        assert!(!outcome.headers.contains_key(HEADER_STEP));
-
-        let _ = shutdown.send(());
     }
 
     #[tokio::test(start_paused = true)]
@@ -2717,49 +2459,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancel_outcome_terminates_run_without_dead_letter() {
-        // `StepOutcome::Cancel` is the runner's cancellation verdict path:
-        // the hook fires with Cancelled, the step is acked, and no dead
-        // job is left behind.
-
-        let (queue, store) = open_queue().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store.clone(),
-            ScriptedRunner::new(vec![StepOutcome::Cancel {
-                reason: "upstream aborted".to_string(),
-            }]),
-            ChannelHook { tx },
-        )
-        .build();
-        let shutdown = spawn_runtime(runtime.clone());
-
-        let handle = runtime
-            .submit(RunSpec {
-                input: b"x".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("hook fired in time")
-            .expect("hook channel open");
-
-        assert_eq!(outcome.run_id, handle.run_id);
-        assert_eq!(outcome.status, TerminalStatus::Cancelled);
-        assert_eq!(outcome.error.as_deref(), Some("upstream aborted"));
-        assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
-
-        let stats = queue.stats("workflow-steps").await.unwrap();
-        assert_eq!(stats.dead, 0, "Cancel verdict must not dead-letter");
-
-        let _ = shutdown.send(());
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn a_cancellation_survives_a_restart() {
         // Models a restart: the request recorded on the run record and
         // the job's persisted `cancel_requested` survive while a fresh
@@ -2906,7 +2605,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancelling_a_pending_run_commits_its_marker_and_fires_the_hook() {
+    async fn cancelling_a_pending_run_commits_its_marker_and_fires_the_hook_once() {
         // Pending case: a run sits in the queue, we call `cancel()` before
         // any worker claims it. `cancel` removes the step job and enqueues
         // the notification before returning.
@@ -2945,6 +2644,10 @@ mod tests {
         let was_cancelled = runtime.cancel(&handle.run_id).await.unwrap();
         assert!(was_cancelled);
         assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
+        assert!(
+            !runtime.cancel(&handle.run_id).await.unwrap(),
+            "a second cancel finds no run record",
+        );
 
         // The marker and the run record's delete commit with the removal,
         // before the notification is processed.
@@ -2973,62 +2676,19 @@ mod tests {
         // External cancellation carries no reason: `error` is `None`.
         assert!(outcome.error.is_none());
         assert_eq!(outcome.headers.get("tenant").unwrap(), "acme");
+        assert!(
+            queue
+                .claim("workflow-steps", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_none(),
+            "the cancel enqueues one notification",
+        );
+        assert!(rx.try_recv().is_err());
 
         let stats = queue.stats("workflow-steps").await.unwrap();
         assert_eq!(stats.dead, 0, "cancel must not dead-letter");
         assert_eq!(stats.pending, 0, "cancelled job must be removed");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn cancel_during_running_step_overrides_outcome() {
-        // Running case: the step is in-flight when cancel is called. The
-        // runner's eventual outcome is discarded; the worker fires Cancelled.
-
-        let (queue, store) = open_queue().await;
-        let (runner, gate) = GatedRunner::new(Ok(StepOutcome::Succeed {
-            result: b"would-have-succeeded".to_vec(),
-        }));
-        let (hook_tx, mut hook_rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store.clone(),
-            runner,
-            ChannelHook { tx: hook_tx },
-        )
-        .build();
-        let shutdown = spawn_runtime(runtime.clone());
-
-        let handle = runtime
-            .submit(RunSpec {
-                input: b"x".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        gate.claimed().await;
-
-        let was_cancelled = runtime.cancel(&handle.run_id).await.unwrap();
-        assert!(was_cancelled);
-
-        // Let the runner finish. The worker should observe `cancel_requested`
-        // and fire Cancelled rather than advancing or firing Succeeded.
-        gate.release();
-
-        let outcome = tokio::time::timeout(Duration::from_secs(2), hook_rx.recv())
-            .await
-            .expect("hook fired")
-            .expect("hook channel open");
-        assert_eq!(outcome.status, TerminalStatus::Cancelled);
-        assert!(
-            outcome.result.is_none(),
-            "succeed payload must be discarded"
-        );
-        assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
-
-        let stats = queue.stats("workflow-steps").await.unwrap();
-        assert_eq!(stats.dead, 0);
-
-        let _ = shutdown.send(());
     }
 
     /// Drive a single step that blocks on a gate, calls `cancel(run_id)`
@@ -3158,7 +2818,6 @@ mod tests {
             .await
             .expect("runner observed token");
 
-        let start = std::time::Instant::now();
         let was_cancelled = runtime.cancel(&handle.run_id).await.unwrap();
         assert!(was_cancelled);
 
@@ -3166,83 +2825,17 @@ mod tests {
             .await
             .expect("hook fired well before the 30s sleep would have")
             .expect("hook channel open");
-        let elapsed = start.elapsed();
 
         assert_eq!(outcome.status, TerminalStatus::Cancelled);
         // Runner-issued Cancel wins precedence over external cancel, so
         // the runner's reason surfaces.
         assert_eq!(outcome.error.as_deref(), Some("cooperative"));
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "cooperative cancel must short-circuit the 30s sleep (took {elapsed:?})",
-        );
         assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
 
         let stats = queue.stats("workflow-steps").await.unwrap();
         assert_eq!(stats.dead, 0);
 
         let _ = shutdown.send(());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn double_cancel_fires_hook_once_and_second_call_returns_false() {
-        // Submit a run and cancel twice while it sits pending. The first
-        // call removes the queued step, fires the hook, and deletes the
-        // run record. The second call must see no record and report
-        // `Ok(false)`; crucially, the hook must NOT fire a second
-        // time.
-
-        let (queue, store) = open_queue().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store.clone(),
-            UnreachableRunner,
-            ChannelHook { tx },
-        )
-        .build();
-        // Deliberately do not spawn the worker loop, so step 0 stays
-        // Pending while both cancels race.
-
-        let handle = runtime
-            .submit(RunSpec {
-                input: b"x".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        let first = runtime.cancel(&handle.run_id).await.unwrap();
-        assert!(first, "first cancel initiates termination");
-
-        let second = runtime.cancel(&handle.run_id).await.unwrap();
-        assert!(
-            !second,
-            "second cancel must report Ok(false): the first removed the run record",
-        );
-
-        // Exactly one notification job exists for the double-cancelled run.
-        let notification = queue
-            .claim("workflow-steps", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .expect("the first cancel enqueued the notification");
-        let effects = runtime
-            .inner
-            .process_step(&notification, &LeaseHandle::detached())
-            .await
-            .unwrap();
-        queue.ack_with(&notification, effects).await.unwrap();
-        let _ = rx.recv().await.unwrap();
-        assert!(
-            queue
-                .claim("workflow-steps", Duration::from_secs(30))
-                .await
-                .unwrap()
-                .is_none(),
-            "a double-cancelled run must enqueue one notification",
-        );
-        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test(start_paused = true)]
@@ -3292,66 +2885,6 @@ mod tests {
         );
 
         assert!(!runtime.cancel("never-submitted").await.unwrap());
-
-        let _ = shutdown.send(());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn status_reports_cancelling_while_termination_in_flight() {
-        // Once `cancel()` has been called but the terminal hook hasn't
-        // fired yet, `status()` should report `RunState::Cancelling` so
-        // external observers can see termination is in progress. A gated
-        // runner holds the cancellation window open long enough to
-        // observe it deterministically.
-
-        let (queue, store) = open_queue().await;
-        let (runner, gate) = GatedRunner::new(Ok(StepOutcome::Succeed {
-            result: b"would-have-succeeded".to_vec(),
-        }));
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime =
-            WorkflowRuntime::builder(queue, store.clone(), runner, ChannelHook { tx }).build();
-        let shutdown = spawn_runtime(runtime.clone());
-
-        let handle = runtime
-            .submit(RunSpec {
-                input: b"x".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        gate.claimed().await;
-
-        // Before cancel: runner is in flight, state is Running.
-        let before = runtime
-            .status(&handle.run_id)
-            .await
-            .unwrap()
-            .expect("active");
-        assert_eq!(before.state, RunState::Running);
-
-        runtime.cancel(&handle.run_id).await.unwrap();
-
-        // After cancel but before the gate is released: the step is still
-        // in flight, but the cancellation overlay must dominate the
-        // reported state.
-        let during = runtime
-            .status(&handle.run_id)
-            .await
-            .unwrap()
-            .expect("entry retained while termination is in flight");
-        assert_eq!(during.state, RunState::Cancelling);
-
-        // Release the runner; the worker observes cancel_requested and
-        // settles the run as Cancelled, removing the entry.
-        gate.release();
-
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("hook fired")
-            .expect("hook channel open");
-        assert_eq!(outcome.status, TerminalStatus::Cancelled);
-        assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
 
         let _ = shutdown.send(());
     }
@@ -3419,76 +2952,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn no_terminal_marker_when_memo_retention_is_unset() {
-        let (queue, store) = open_queue().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue,
-            store.clone(),
-            ScriptedRunner::new(vec![StepOutcome::Succeed {
-                result: b"done".to_vec(),
-            }]),
-            ChannelHook { tx },
-        )
-        .build();
-        let shutdown = spawn_runtime(runtime.clone());
-
-        runtime
-            .submit(RunSpec {
-                input: b"in".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert!(terminal_markers(&runtime.inner.core.queue).await.is_empty());
-
-        let _ = shutdown.send(());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn terminal_marker_is_written_for_failed_runs_too() {
-        // Retention isn't just for successful runs: replay-from-cached-state
-        // is precisely the failed-run use case.
-        let (queue, store) = open_queue().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue,
-            store.clone(),
-            ScriptedRunner::new(vec![StepOutcome::Fail {
-                reason: "boom".into(),
-            }]),
-            ChannelHook { tx },
-        )
-        .memo_retention(Duration::from_secs(60))
-        .build();
-        let shutdown = spawn_runtime(runtime.clone());
-
-        let handle = runtime
-            .submit(RunSpec {
-                input: b"in".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(outcome.status, TerminalStatus::Failed);
-
-        let markers = terminal_markers(&runtime.inner.core.queue).await;
-        assert_eq!(markers.len(), 1);
-        assert_eq!(markers[0].0, handle.run_id);
-
-        let _ = shutdown.send(());
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn terminal_marker_is_written_at_the_runtime_clock() {
         // The queue's MockClock is shared into the runtime by default
         // (via Queue::clock()), so a `clock.advance` between submit and
@@ -3531,7 +2994,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn submit_rejects_an_unusable_run_id() {
+    async fn submit_rejects_reserved_headers_reserved_kv_keys_and_unusable_run_ids() {
         let (queue, store, _clock) = open_queue_at(10_000).await;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
@@ -3571,49 +3034,29 @@ mod tests {
             })
             .await;
         assert!(ok.is_ok(), "a run id at the limit must be accepted");
-    }
 
-    #[tokio::test(start_paused = true)]
-    async fn an_empty_run_id_cannot_reach_the_retention_sweep() {
-        // An empty run id would resolve to the memo prefix itself, and the
-        // sweep would then remove every run's entries.
-        let (queue, store, clock) = open_queue_at(10_000).await;
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store.clone(),
-            ScriptedRunner::new(vec![]),
-            ChannelHook { tx },
-        )
-        .memo_retention(Duration::from_secs(60))
-        .build();
-
-        let memos = MemoStore::new(store, "workflow-memo");
-        memos
-            .new_memo("bystander", 0)
-            .put("k", b"expensive")
+        let err = runtime
+            .submit(RunSpec {
+                input: b"x".to_vec(),
+                headers: HashMap::from([("workflow.run_id".to_string(), "evil".to_string())]),
+                ..Default::default()
+            })
             .await
-            .unwrap();
-
+            .unwrap_err();
         assert!(
-            runtime
-                .submit(RunSpec {
-                    run_id: Some(String::new()),
-                    input: b"x".to_vec(),
-                    ..Default::default()
-                })
-                .await
-                .is_err()
+            matches!(&err, Error::ReservedHeaderInSubmit(k) if k == "workflow.run_id"),
+            "got: {err:?}"
         );
-        assert!(terminal_markers(&queue).await.is_empty());
 
-        advance(&clock, Duration::from_secs(3_600)).await;
-        runtime.inner.core.sweep_once().await.unwrap();
-        assert_eq!(
-            memos.new_memo("bystander", 0).get("k").await.unwrap(),
-            Some(b"expensive".to_vec()),
-            "an unrelated run's memo entries must survive",
-        );
+        let err = runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                kv_writes: HashMap::from([(b"workflow/x".to_vec(), b"v".to_vec())]),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::ReservedKvKey(_)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -3655,33 +3098,15 @@ mod tests {
         assert!(queue.kv_get(&unparseable).await.unwrap().is_none());
     }
 
-    #[tokio::test]
-    async fn clear_memos_for_run_rejects_an_empty_run_id() {
-        let store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
-        let memos = MemoStore::new(store, "workflow-memo");
-        memos
-            .new_memo("bystander", 0)
-            .put("k", b"expensive")
-            .await
-            .unwrap();
-        assert!(matches!(
-            memos.clear_memos_for_run("").await,
-            Err(Error::InvalidRunId { .. })
-        ));
-        assert_eq!(
-            memos.new_memo("bystander", 0).get("k").await.unwrap(),
-            Some(b"expensive".to_vec()),
-        );
-    }
-
     #[tokio::test(start_paused = true)]
-    async fn cancelling_a_running_step_writes_no_terminal_marker_until_it_settles() {
-        // The `Requested` arm: the queue must discard the effects, since
-        // a marker written here would mark a still-executing run.
-
+    async fn cancelling_a_running_step_overrides_its_outcome_and_writes_its_marker_at_settlement() {
+        // Between the request and the settlement the run reports
+        // Cancelling and holds its record with no marker (the queue
+        // discards the effects on the `Requested` arm); the settlement
+        // then commits Cancelled in place of the runner's outcome.
         let (queue, store, _clock) = open_queue_at(10_000).await;
         let (runner, gate) = GatedRunner::new(Ok(StepOutcome::Succeed {
-            result: b"done".to_vec(),
+            result: b"would-have-succeeded".to_vec(),
         }));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime =
@@ -3698,8 +3123,26 @@ mod tests {
             .await
             .unwrap();
         gate.claimed().await;
+        assert_eq!(
+            runtime
+                .status(&handle.run_id)
+                .await
+                .unwrap()
+                .expect("active")
+                .state,
+            RunState::Running
+        );
 
         assert!(runtime.cancel(&handle.run_id).await.unwrap());
+        assert_eq!(
+            runtime
+                .status(&handle.run_id)
+                .await
+                .unwrap()
+                .expect("entry retained while termination is in flight")
+                .state,
+            RunState::Cancelling
+        );
         assert!(
             terminal_markers(&queue).await.is_empty(),
             "a run still executing its step must have no terminal marker",
@@ -3719,23 +3162,29 @@ mod tests {
             .expect("hook fired")
             .expect("hook channel open");
         assert_eq!(outcome.status, TerminalStatus::Cancelled);
+        assert!(
+            outcome.result.is_none(),
+            "succeed payload must be discarded"
+        );
+        assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
         assert_eq!(
             terminal_markers(&queue).await,
             vec![(handle.run_id.clone(), 10_000)],
             "the worker's settlement writes it",
         );
+        assert_eq!(queue.stats("workflow-steps").await.unwrap().dead, 0);
 
         let _ = shutdown.send(());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_permanent_step_error_commits_its_terminal_marker() {
+    async fn a_permanent_step_error_dead_letters_with_its_marker_and_no_staged_effects() {
         let (queue, store, _clock) = open_queue_at(10_000).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
-            store.clone(),
-            FixedRunner::new(Err(StepError::permanent("nope"))),
+            store,
+            EffectStagingRunner::new(vec![Err(StepError::permanent("nope"))]),
             ChannelHook { tx },
         )
         .memo_retention(Duration::from_secs(60))
@@ -3753,15 +3202,20 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(outcome.run_id, handle.run_id);
         assert_eq!(outcome.status, TerminalStatus::Failed);
+        assert_eq!(outcome.error.as_deref(), Some("nope"));
+        assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
 
-        // The notification exists only because the dead-letter committed,
-        // so the marker and the dead job are already observable.
+        // The notification was enqueued by the dead-letter transaction, so
+        // the dead job and the marker are already visible, and the staged
+        // effect was discarded with the failure.
+        assert_eq!(queue.stats("workflow-steps").await.unwrap().dead, 1);
         assert_eq!(
             terminal_markers(&queue).await,
             vec![(handle.run_id.clone(), 10_000)],
         );
-        assert_eq!(queue.stats("workflow-steps").await.unwrap().dead, 1);
+        assert!(queue.kv_get(b"app/step-0").await.unwrap().is_none());
 
         let _ = shutdown.send(());
     }
@@ -3869,24 +3323,6 @@ mod tests {
         assert_eq!(
             memos.new_memo("young", 0).get("k").await.unwrap(),
             Some(b"v".to_vec()),
-        );
-    }
-
-    #[test]
-    fn terminal_marker_keys_sort_oldest_first_and_round_trip() {
-        let old = terminal_kv_key("run-b", 1_000);
-        let young = terminal_kv_key("run-a", 2_000);
-        assert!(
-            old < young,
-            "ordering must follow the timestamp ahead of the id"
-        );
-        assert_eq!(
-            parse_timestamped_kv_key(TERMINAL_KV_PREFIX, &young),
-            Some(("run-a".to_string(), 2_000)),
-        );
-        assert_eq!(
-            parse_timestamped_kv_key(TERMINAL_KV_PREFIX, b"workflow/runs/run-a"),
-            None
         );
     }
 
@@ -4061,63 +3497,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn submit_kv_writes_apply_only_to_a_new_submission() {
-        let (queue, store) = open_queue().await;
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store,
-            ScriptedRunner::new(vec![]),
-            NoopTerminalHook,
-        )
-        .build();
-        // No worker loop runs, so the step stays queued and the second
-        // submit is a duplicate of an active run.
-        let first = runtime
-            .submit(RunSpec {
-                run_id: Some("kv-run".to_string()),
-                input: b"in".to_vec(),
-                kv_writes: HashMap::from([(b"app/first".to_vec(), b"1".to_vec())]),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(first.newly_submitted);
-        assert_eq!(
-            queue.kv_get(b"app/first").await.unwrap().as_deref(),
-            Some(b"1".as_slice())
-        );
-
-        let duplicate = runtime
-            .submit(RunSpec {
-                run_id: Some("kv-run".to_string()),
-                input: b"in".to_vec(),
-                kv_writes: HashMap::from([(b"app/second".to_vec(), b"2".to_vec())]),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(!duplicate.newly_submitted);
-        assert!(queue.kv_get(b"app/second").await.unwrap().is_none());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_reserved_kv_key_in_submit_is_rejected() {
-        let (queue, store) = open_queue().await;
-        let runtime =
-            WorkflowRuntime::builder(queue, store, ScriptedRunner::new(vec![]), NoopTerminalHook)
-                .build();
-        let err = runtime
-            .submit(RunSpec {
-                input: Vec::new(),
-                kv_writes: HashMap::from([(b"workflow/x".to_vec(), b"v".to_vec())]),
-                ..Default::default()
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::ReservedKvKey(_)));
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn step_effects_commit_with_the_acking_settlement() {
         let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -4255,7 +3634,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn step_effects_commit_when_the_runner_fails_the_run() {
+    async fn a_fail_verdict_acks_with_its_effects_and_no_dead_letter() {
         let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
@@ -4269,7 +3648,7 @@ mod tests {
         .build();
         let shutdown = spawn_runtime(runtime.clone());
 
-        runtime
+        let handle = runtime
             .submit(RunSpec {
                 input: Vec::new(),
                 ..Default::default()
@@ -4280,9 +3659,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(outcome.run_id, handle.run_id);
         assert_eq!(outcome.status, TerminalStatus::Failed);
         assert_eq!(outcome.error.as_deref(), Some("denied"));
+        assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
         assert_eq!(wait_for_kv(&queue, b"app/step-0").await, b"done");
+        assert_eq!(
+            queue.stats("workflow-steps").await.unwrap().dead,
+            0,
+            "a Fail verdict must not dead-letter"
+        );
 
         let _ = shutdown.send(());
     }
@@ -4335,7 +3721,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_runner_issued_cancel_keeps_its_staged_effects() {
+    async fn a_cancel_verdict_acks_with_its_effects_and_no_dead_letter() {
         let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
@@ -4349,7 +3735,7 @@ mod tests {
         .build();
         let shutdown = spawn_runtime(runtime.clone());
 
-        runtime
+        let handle = runtime
             .submit(RunSpec {
                 input: Vec::new(),
                 ..Default::default()
@@ -4360,9 +3746,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(outcome.run_id, handle.run_id);
         assert_eq!(outcome.status, TerminalStatus::Cancelled);
         assert_eq!(outcome.error.as_deref(), Some("obsolete"));
+        assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
         assert_eq!(wait_for_kv(&queue, b"app/step-0").await, b"done");
+        assert_eq!(
+            queue.stats("workflow-steps").await.unwrap().dead,
+            0,
+            "a Cancel verdict must not dead-letter"
+        );
 
         let _ = shutdown.send(());
     }
@@ -4426,21 +3819,15 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_run_dead_lettered_by_the_reaper_is_terminated_by_reconciliation() {
-        let clock = MockClock::new(1_700_000_000_000);
-        let opts = OpenOptions::default()
-            .clock(Arc::new(clock.clone()))
-            .default_queue_config(
+        let (queue, store, clock) = open_queue_at_with(
+            1_700_000_000_000,
+            fast_options().default_queue_config(
                 QueueConfig::default()
                     .retry_backoff_base(Duration::ZERO)
                     .lease_duration(Duration::from_secs(1)),
-            )
-            .reaper_interval(Duration::from_millis(50));
-        let store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
-        let queue = Arc::new(
-            Queue::open_with_options(store.clone(), "test", opts)
-                .await
-                .unwrap(),
-        );
+            ),
+        )
+        .await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime =
             WorkflowRuntime::builder(queue.clone(), store, PauseRunner, ChannelHook { tx })
@@ -4490,44 +3877,6 @@ mod tests {
         assert!(queue.kv_get(&run_kv_key("hung")).await.unwrap().is_none());
         assert!(queue.kv_get(&step_kv_key("hung")).await.unwrap().is_none());
         assert!(runtime.status("hung").await.unwrap().is_none());
-
-        let _ = shutdown.send(());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_step_error_applies_no_staged_effects() {
-        let (queue, store) = open_queue().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store,
-            EffectStagingRunner::new(vec![Err(StepError::permanent("permanent failure"))]),
-            ChannelHook { tx },
-        )
-        .build();
-        let shutdown = spawn_runtime(runtime.clone());
-
-        runtime
-            .submit(RunSpec {
-                input: Vec::new(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(outcome.status, TerminalStatus::Failed);
-
-        for _ in 0..200 {
-            if queue.stats("workflow-steps").await.unwrap().dead == 1 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(queue.stats("workflow-steps").await.unwrap().dead, 1);
-        assert!(queue.kv_get(b"app/step-0").await.unwrap().is_none());
 
         let _ = shutdown.send(());
     }

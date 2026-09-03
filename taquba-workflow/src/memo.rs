@@ -515,22 +515,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn content_put_then_content_get_round_trips() {
-        let memo = make_memo();
-        let input = ContentInput {
-            operation: "draft",
-            payload: b"hello",
-        };
-
-        memo.content_put(&input, b"value").await.unwrap();
-
-        assert_eq!(
-            memo.content_get(&input).await.unwrap(),
-            Some(b"value".to_vec()),
-        );
-    }
-
-    #[tokio::test]
     async fn content_key_distinguishes_serialized_inputs() {
         let memo = make_memo();
         let first = ContentInput {
@@ -711,6 +695,24 @@ mod tests {
         assert_eq!(
             store.new_memo("run-suffix", 0).get("k").await.unwrap(),
             Some(b"long".to_vec()),
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_memos_for_run_rejects_an_empty_run_id() {
+        let memos = MemoStore::new(Arc::new(InMemory::new()), "memo");
+        memos
+            .new_memo("bystander", 0)
+            .put("k", b"expensive")
+            .await
+            .unwrap();
+        assert!(matches!(
+            memos.clear_memos_for_run("").await,
+            Err(crate::Error::InvalidRunId { .. })
+        ));
+        assert_eq!(
+            memos.new_memo("bystander", 0).get("k").await.unwrap(),
+            Some(b"expensive".to_vec()),
         );
     }
 }

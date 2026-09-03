@@ -179,75 +179,88 @@ pub type Result<T> = std::result::Result<T, Error>;
 mod tests {
     use super::*;
 
-    #[test]
-    fn workflow_variants_are_permanent() {
-        assert!(Error::MissingHeader("workflow.run_id").is_permanent());
-        assert!(
-            Error::InvalidRunId {
-                run_id: String::new(),
-                reason: "run id must not be empty",
-            }
-            .is_permanent()
-        );
-        assert!(
-            Error::InvalidStepHeader {
-                header: "workflow.step",
-                value: "not-a-u32".into(),
-            }
-            .is_permanent()
-        );
-        assert!(Error::ReservedHeaderInSubmit("workflow.foo".into()).is_permanent());
-        assert!(Error::InputMismatch("run-1".into()).is_permanent());
-        assert!(Error::ReservedKvKey("workflow/x".into()).is_permanent());
-        assert!(Error::ConflictingKvEffect("k".into()).is_permanent());
-        assert!(Error::EffectsSealed.is_permanent());
-        assert!(Error::JobNotFound("job-1".into()).is_permanent());
-        assert!(Error::DuplicateItemKey("k".into()).is_permanent());
-        assert!(Error::BatchMismatch("b".into()).is_permanent());
-        assert!(Error::BatchNotFound("b".into()).is_permanent());
-        assert!(Error::InvalidBatchId("a/b".into()).is_permanent());
-        assert!(
-            Error::FailureThresholdExceeded {
-                failed: 1,
-                total: 2,
-                threshold: 10.0,
-            }
-            .is_permanent()
-        );
-        assert!(!Error::BatchRunning("b".into()).is_permanent());
+    struct BadSerialize;
+
+    impl serde::Serialize for BadSerialize {
+        fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("serialization failed"))
+        }
     }
 
     #[test]
-    fn queue_classifies_per_inner_variant() {
-        assert!(Error::Queue(taquba::Error::JobNotFound("job-1".into())).is_permanent());
-        assert!(Error::Queue(taquba::Error::InvalidState).is_permanent());
-        assert!(Error::Queue(taquba::Error::KvValueTooLarge { size: 10, max: 5 }).is_permanent());
-    }
-
-    #[test]
-    fn store_and_io_are_transient() {
+    fn is_permanent_classifies_every_variant() {
         let store_err = taquba::object_store::Error::NotFound {
             path: "x".into(),
             source: "missing".into(),
         };
-        assert!(!Error::Store(store_err).is_permanent());
-        assert!(!Error::Io(std::io::Error::other("disk")).is_permanent());
-    }
-
-    #[test]
-    fn serialization_is_permanent() {
-        struct BadSerialize;
-
-        impl serde::Serialize for BadSerialize {
-            fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
-            where
-                S: serde::Serializer,
-            {
-                Err(serde::ser::Error::custom("serialization failed"))
-            }
+        for (error, permanent) in [
+            (Error::MissingHeader("workflow.run_id"), true),
+            (
+                Error::InvalidStepHeader {
+                    header: "workflow.step",
+                    value: "not-a-u32".into(),
+                },
+                true,
+            ),
+            (Error::ReservedHeaderInSubmit("workflow.foo".into()), true),
+            (
+                Error::InvalidRunId {
+                    run_id: String::new(),
+                    reason: "run id must not be empty",
+                },
+                true,
+            ),
+            (Error::InputMismatch("run-1".into()), true),
+            (Error::InconsistentRunState("run-1".into()), true),
+            (Error::ReservedKvKey("workflow/x".into()), true),
+            (Error::ConflictingKvEffect("k".into()), true),
+            (Error::EffectsSealed, true),
+            (
+                Error::Queue(taquba::Error::JobNotFound("job-1".into())),
+                true,
+            ),
+            (Error::Queue(taquba::Error::InvalidState), true),
+            (
+                Error::Queue(taquba::Error::KvValueTooLarge { size: 10, max: 5 }),
+                true,
+            ),
+            (
+                Error::Queue(taquba::Error::StoreNotInitialized { path: "x".into() }),
+                false,
+            ),
+            (Error::Store(store_err), false),
+            (
+                Error::Serialization(rmp_serde::to_vec_named(&BadSerialize).unwrap_err()),
+                true,
+            ),
+            (
+                Error::Deserialization(rmp_serde::from_slice::<u32>(b"").unwrap_err()),
+                true,
+            ),
+            (Error::Io(std::io::Error::other("disk")), false),
+            (
+                Error::Json(serde_json::from_str::<u32>("x").unwrap_err()),
+                true,
+            ),
+            (Error::JobNotFound("job-1".into()), true),
+            (Error::DuplicateItemKey("k".into()), true),
+            (Error::BatchMismatch("b".into()), true),
+            (Error::BatchNotFound("b".into()), true),
+            (Error::BatchRunning("b".into()), false),
+            (Error::InvalidBatchId("a/b".into()), true),
+            (
+                Error::FailureThresholdExceeded {
+                    failed: 1,
+                    total: 2,
+                    threshold: 10.0,
+                },
+                true,
+            ),
+        ] {
+            assert_eq!(error.is_permanent(), permanent, "{error}");
         }
-
-        let err = rmp_serde::to_vec_named(&BadSerialize).unwrap_err();
-        assert!(Error::Serialization(err).is_permanent());
     }
 }

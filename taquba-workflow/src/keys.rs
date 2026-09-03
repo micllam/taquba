@@ -202,6 +202,7 @@ mod tests {
     fn internal_kv_prefixes_are_under_the_reserved_prefix() {
         for prefix in [
             RUN_KV_PREFIX,
+            STEP_KV_PREFIX,
             SIGNAL_WAIT_KV_PREFIX,
             SIGNAL_BUF_KV_PREFIX,
             SIGNAL_DELIVERED_KV_PREFIX,
@@ -215,5 +216,23 @@ mod tests {
                 String::from_utf8_lossy(prefix),
             );
         }
+    }
+
+    #[test]
+    fn terminal_marker_keys_sort_oldest_first_and_round_trip() {
+        let old = terminal_kv_key("run-b", 1_000);
+        let young = terminal_kv_key("run-a", 2_000);
+        assert!(
+            old < young,
+            "ordering must follow the timestamp ahead of the id"
+        );
+        assert_eq!(
+            parse_timestamped_kv_key(TERMINAL_KV_PREFIX, &young),
+            Some(("run-a".to_string(), 2_000)),
+        );
+        assert_eq!(
+            parse_timestamped_kv_key(TERMINAL_KV_PREFIX, b"workflow/runs/run-a"),
+            None
+        );
     }
 }
