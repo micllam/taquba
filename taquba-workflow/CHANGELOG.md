@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The terminal-notification job of a run terminated by a dead-lettered
+  step (a permanent step error, a transient one on the last attempt, a
+  second waiter on a correlation key, or a step the queue dead-lettered
+  outside the worker) inherits the step's `max_attempts` as well as its
+  priority. It inherited only the priority before, so a transiently
+  failing hook retried under the queue default.
+
 ## [0.11.0] - 2026-09-02
 
 ### Added

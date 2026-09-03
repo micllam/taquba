@@ -581,6 +581,7 @@ mod runtime;
 mod signal;
 mod sweep;
 mod terminal;
+mod worker;
 
 pub use effects::{EffectsHandle, TerminalEffects};
 pub use error::{Error, Result};

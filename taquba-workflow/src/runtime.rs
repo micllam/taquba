@@ -5,8 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use taquba::object_store::ObjectStore;
 use taquba::{
-    Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, FailWith, JobRecord, JobStatus,
-    LeaseHandle, PermanentFailure, Queue, SettlementEffects, Worker, WorkerError,
+    Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, JobRecord, JobStatus, Queue,
+    SettlementEffects,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -16,19 +16,19 @@ use crate::durable::{
     DurableCurrentStep, DurableRunOutcome, DurableRunRecord, DurableStepOutcome,
     DurableStepOutcomeRecord,
 };
-use crate::effects::{EffectsHandle, StagedEffects, TerminalEffects};
+use crate::effects::StagedEffects;
 use crate::error::{Error, Result};
 use crate::keys::{
     DEDUP_PREFIX, HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RESERVED_HEADER_PREFIX,
     RESERVED_KV_PREFIX, TERMINAL_KV_PREFIX, hash_input, run_kv_key, step_kv_key, terminal_kv_key,
     validate_run_id,
 };
-use crate::kv::KvReadHandle;
 use crate::memo::MemoStore;
 use crate::registry::RunRegistry;
-use crate::runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
+use crate::runner::{StepOutcome, StepRunner, Trigger};
 use crate::sweep::Sweep;
 use crate::terminal::{RunOutcome, TerminalHook};
+use crate::worker::{StepDelivery, StepWorker};
 
 /// The encoded current-step pointer for `job_id` at `step_number`.
 fn current_step_bytes(step_number: u32, job_id: &str) -> Result<Vec<u8>> {
@@ -187,7 +187,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
         self
     }
 
-    /// The object-store path prefix [`Step::memo`] entries live under.
+    /// The object-store path prefix [`Step::memo`](crate::Step::memo) entries live under.
     /// Defaults to `"workflow-memo"`. Pick a distinct value when multiple
     /// runtimes share an object store, so their memo namespaces don't
     /// collide.
@@ -237,7 +237,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     /// scoped to `(run_id, step_number, SHA-256(step payload))`. If the
     /// same step is delivered again after a crash before ack, the stored
     /// outcome is replayed without invoking the runner again. The record
-    /// includes the effects staged through [`Step::effects`], so a
+    /// includes the effects staged through [`Step::effects`](crate::Step::effects), so a
     /// replayed outcome applies them as well. A replayed
     /// [`StepOutcome::Continue`] with a [`Trigger::After`] delay reduces
     /// the delay by the time already elapsed since the outcome was
@@ -318,8 +318,8 @@ impl<R, H> Clone for WorkflowRuntime<R, H> {
 /// A runtime's [`StepRunner`] and [`TerminalHook`], with the shared
 /// [`RuntimeCore`] they operate on.
 pub(crate) struct RuntimeInner<R, H> {
-    runner: R,
-    terminal_hook: H,
+    pub(crate) runner: R,
+    pub(crate) terminal_hook: H,
     pub(crate) core: RuntimeCore,
 }
 
@@ -350,7 +350,7 @@ pub(crate) struct RuntimeCore {
     sweeps: Vec<Sweep>,
     /// Whether runner-returned step outcomes are persisted and replayed
     /// by `(run_id, step_number, SHA-256(step payload))`.
-    step_output_replay: bool,
+    pub(crate) step_output_replay: bool,
     /// Time source. Defaults to the queue's clock; tests can substitute
     /// a [`MockClock`](taquba::MockClock) to virtualise time.
     pub(crate) clock: Arc<dyn Clock>,
@@ -569,10 +569,10 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     ///   whose step is already claimed keeps its durable state until
     ///   the worker settles it.
     /// - **Running step**: cancellation is delivered to the runner via
-    ///   [`Step::cancel_token`]; runners that watch the token short-circuit
+    ///   [`Step::cancel_token`](crate::Step::cancel_token); runners that watch the token short-circuit
     ///   immediately. Runners that ignore the token are allowed to run to
     ///   completion (futures cannot be safely aborted mid-step). In both
-    ///   cases the runner's [`StepOutcome`] / [`StepError`] is discarded
+    ///   cases the runner's [`StepOutcome`] / [`StepError`](crate::StepError) is discarded
     ///   and the worker settles the run once the step returns, with
     ///   any pending transient retry suppressed and the step acked rather
     ///   than nacked.
@@ -597,7 +597,6 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         // known; the queue applies them only on `Removed`.
         let effects = self.inner.terminate_collecting_effects(
             &RunOutcome::cancelled(run_id.to_string(), None, headers, current_step),
-            None,
             None,
         );
         match self.inner.core.queue.cancel_with(&job_id, effects).await?.0 {
@@ -754,45 +753,6 @@ impl RunnerHandle {
     }
 }
 
-struct StepWorker<R, H> {
-    inner: Arc<RuntimeInner<R, H>>,
-}
-
-impl<R: StepRunner + 'static, H: TerminalHook + 'static> Worker for StepWorker<R, H> {
-    async fn process_with_effects(
-        &self,
-        job: &JobRecord,
-        lease: &LeaseHandle,
-    ) -> std::result::Result<SettlementEffects, WorkerError> {
-        self.inner.process_step(job, lease).await
-    }
-}
-
-fn split_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
-    headers
-        .iter()
-        .filter(|(k, _)| !k.starts_with(RESERVED_HEADER_PREFIX))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
-}
-
-fn parse_step_headers(job: &JobRecord) -> std::result::Result<(String, u32), Error> {
-    let run_id = job
-        .headers
-        .get(HEADER_RUN_ID)
-        .ok_or(Error::MissingHeader(HEADER_RUN_ID))?
-        .to_string();
-    let step_str = job
-        .headers
-        .get(HEADER_STEP)
-        .ok_or(Error::MissingHeader(HEADER_STEP))?;
-    let step_number: u32 = step_str.parse().map_err(|_| Error::InvalidStepHeader {
-        header: HEADER_STEP,
-        value: step_str.clone(),
-    })?;
-    Ok((run_id, step_number))
-}
-
 impl RuntimeCore {
     /// One pass of every retention sweep; the number of entities cleared.
     #[cfg(test)]
@@ -869,13 +829,12 @@ impl RuntimeCore {
     }
 
     /// Build the enqueue request for a run's terminal-notification job.
-    /// `priority` and `max_attempts` are inherited from the terminal
-    /// step when one exists.
+    /// The priority and attempt limit are inherited from `terminal_step`,
+    /// the job of the step that produced the outcome, when one exists.
     fn notification_enqueue_request(
         &self,
         outcome: &RunOutcome,
-        priority: Option<u32>,
-        max_attempts: Option<u32>,
+        terminal_step: Option<&JobRecord>,
     ) -> Result<EnqueueRequest> {
         let payload = rmp_serde::to_vec_named(&DurableRunOutcome::from(outcome))?;
         let mut headers = HashMap::new();
@@ -886,10 +845,16 @@ impl RuntimeCore {
             payload,
             options: EnqueueOptions::default()
                 .headers(headers)
-                .priority(priority)
-                .max_attempts(max_attempts)
+                .priority(terminal_step.map(|job| job.priority))
+                .max_attempts(terminal_step.map(|job| job.max_attempts))
                 .dedup_key(Some(format!("{DEDUP_PREFIX}{}:terminal", outcome.run_id))),
         })
+    }
+
+    /// The instant `delay` after the runtime's clock now, as a
+    /// [`SystemTime`] for an enqueue's `run_at`.
+    pub(crate) fn run_at_after(&self, delay: Duration) -> SystemTime {
+        UNIX_EPOCH + Duration::from_millis(self.clock.now_ms()) + delay
     }
 
     /// Remove the run's registry entry as part of terminating it.
@@ -904,7 +869,7 @@ impl RuntimeCore {
         self.registry.forget(run_id);
     }
 
-    async fn load_step_output(
+    pub(crate) async fn load_step_output(
         &self,
         run_id: &str,
         step_number: u32,
@@ -950,7 +915,7 @@ impl RuntimeCore {
         }
     }
 
-    async fn store_step_output(
+    pub(crate) async fn store_step_output(
         &self,
         run_id: &str,
         step_number: u32,
@@ -969,26 +934,23 @@ impl RuntimeCore {
             .await
     }
 
-    /// Build the effects that advance the run to `next_step`: the next
-    /// step's enqueue joins the current step's acknowledgement
-    /// transaction, so the transition is atomic. The pre-assigned job
-    /// id is recorded on the registry before the settlement commits;
-    /// if the settlement fails because the claim was lost to the
-    /// reaper, the redelivered step's [`Self::registry_mark_running`]
-    /// rewinds the entry, and a cancel issued in the window falls back
-    /// to the registry's `cancel_requested` flag.
-    async fn advance(
+    /// Build the effects that advance the run of `delivery` to its next
+    /// step: the next step's enqueue joins the current step's
+    /// acknowledgement transaction, so the transition is atomic. The
+    /// pre-assigned job id is recorded on the registry before the
+    /// settlement commits; if the settlement fails because the claim
+    /// was lost to the reaper, the redelivered step's
+    /// [`RunRegistry::mark_running`] rewinds the entry, and a cancel
+    /// issued in the window falls back to the registry's
+    /// `cancel_requested` flag.
+    pub(crate) async fn advance(
         &self,
-        run_id: &str,
-        next_step: u32,
+        delivery: &StepDelivery<'_>,
         payload: Vec<u8>,
-        user_headers: &HashMap<String, String>,
         opts: StepEnqueueOpts,
     ) -> SettlementEffects {
-        self.advance_with_kv(run_id, next_step, payload, user_headers, opts, |_| {
-            HashMap::new()
-        })
-        .await
+        self.advance_with_kv(delivery, payload, opts, |_| HashMap::new())
+            .await
     }
 
     /// [`Self::advance`] with caller KV writes joined to the same
@@ -996,15 +958,15 @@ impl RuntimeCore {
     /// pre-assigned job id so the writes can reference it.
     pub(crate) async fn advance_with_kv(
         &self,
-        run_id: &str,
-        next_step: u32,
+        delivery: &StepDelivery<'_>,
         payload: Vec<u8>,
-        user_headers: &HashMap<String, String>,
         opts: StepEnqueueOpts,
         kv_writes: impl FnOnce(&str) -> HashMap<Vec<u8>, Vec<u8>>,
     ) -> SettlementEffects {
+        let run_id = delivery.run_id.as_str();
+        let next_step = delivery.step_number + 1;
         let (request, next_job_id) =
-            self.step_enqueue_request(run_id, next_step, payload, user_headers, opts);
+            self.step_enqueue_request(run_id, next_step, payload, &delivery.headers, opts);
         let mut kv_writes = kv_writes(&next_job_id);
         // The pointer's encoding cannot fail for a step number and an id.
         if let Ok(pointer) = current_step_bytes(next_step, &next_job_id) {
@@ -1025,19 +987,19 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     /// (when the hook observes this outcome) as [`SettlementEffects`]
     /// for the settlement transaction. The notification job's payload
     /// is the committed outcome and the configured [`TerminalHook`]
-    /// runs as its worker.
+    /// runs as its worker; `terminal_step` is the job of the step that
+    /// produced the outcome, `None` when a pending step was cancelled.
     ///
     /// The effects are pure: nothing is written and no state is
     /// mutated here, so a caller that builds them and then commits a
     /// non-terminal outcome leaves no trace. Dropping the run's
-    /// registry entry is the caller's own [`RuntimeCore::forget_run`] call. A
-    /// settlement that fails redelivers the step, which re-terminates
-    /// and rebuilds the same effects.
+    /// registry entry is the caller's own [`RuntimeCore::forget_run`]
+    /// call. A settlement that fails redelivers the step, which
+    /// re-terminates and rebuilds the same effects.
     pub(crate) fn terminate_collecting_effects(
         &self,
         outcome: &RunOutcome,
-        priority: Option<u32>,
-        max_attempts: Option<u32>,
+        terminal_step: Option<&JobRecord>,
     ) -> SettlementEffects {
         let kv_deletes = vec![run_kv_key(&outcome.run_id), step_kv_key(&outcome.run_id)];
         let kv_writes = if self.core.memo_retention.is_some() {
@@ -1051,7 +1013,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         let enqueues = if self.terminal_hook.observes(outcome) {
             match self
                 .core
-                .notification_enqueue_request(outcome, priority, max_attempts)
+                .notification_enqueue_request(outcome, terminal_step)
             {
                 Ok(request) => vec![request],
                 Err(err) => {
@@ -1069,20 +1031,6 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .enqueues(enqueues)
             .kv_writes(kv_writes)
             .kv_deletes(kv_deletes)
-    }
-
-    /// [`Self::terminate_collecting_effects`] plus
-    /// [`RuntimeCore::forget_run`]: the pairing every worker-path
-    /// termination site performs before its settlement commits.
-    pub(crate) fn worker_terminate(
-        &self,
-        outcome: RunOutcome,
-        priority: Option<u32>,
-        max_attempts: Option<u32>,
-    ) -> SettlementEffects {
-        let effects = self.terminate_collecting_effects(&outcome, priority, max_attempts);
-        self.core.forget_run(&outcome.run_id);
-        effects
     }
 
     /// Terminate every run whose step job the queue dead-lettered
@@ -1112,26 +1060,21 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 if job.headers.contains_key(HEADER_TERMINAL) {
                     continue;
                 }
-                let Ok((run_id, step_number)) = parse_step_headers(job) else {
+                let Ok(delivery) = StepDelivery::parse(job) else {
                     continue;
                 };
-                if core.queue.kv_get(&run_kv_key(&run_id)).await?.is_none() {
+                let run_id = delivery.run_id.as_str();
+                if core.queue.kv_get(&run_kv_key(run_id)).await?.is_none() {
                     continue;
                 }
                 let error = job
                     .last_error
                     .clone()
                     .unwrap_or_else(|| "step dead-lettered outside the worker".to_string());
-                let outcome = RunOutcome::failed(
-                    run_id.clone(),
-                    error,
-                    split_headers(&job.headers),
-                    step_number,
-                );
-                let effects = self.terminate_collecting_effects(&outcome, Some(job.priority), None);
+                let effects = self.terminate_collecting_effects(&delivery.failed(error), Some(job));
                 core.queue.commit_effects(effects).await?;
-                core.forget_run(&run_id);
-                warn!(run_id = %run_id, step_number, job_id = %job.id, "terminated a run whose step was dead-lettered outside the worker");
+                core.forget_run(run_id);
+                warn!(run_id = %run_id, step_number = delivery.step_number, job_id = %job.id, "terminated a run whose step was dead-lettered outside the worker");
                 terminated += 1;
             }
             match page.next_cursor {
@@ -1165,314 +1108,24 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             }
         }
     }
-
-    /// Process a terminal-notification job: decode the committed
-    /// outcome and run the configured [`TerminalHook`] as the job's
-    /// worker. Effects the hook stages join this job's acknowledgement.
-    /// A transient hook error retries the job per the queue's backoff;
-    /// a permanent one dead-letters it.
-    async fn process_notification(
-        &self,
-        job: &JobRecord,
-    ) -> std::result::Result<SettlementEffects, WorkerError> {
-        let outcome: RunOutcome = match rmp_serde::from_slice::<DurableRunOutcome>(&job.payload) {
-            Ok(durable) => durable.into(),
-            Err(err) => {
-                warn!(job_id = %job.id, error = %err, "terminal notification has a malformed payload");
-                return Err(PermanentFailure::new(err.to_string()).into());
-            }
-        };
-        let effects = TerminalEffects::for_delivery();
-        let result = self.terminal_hook.on_termination(&outcome, &effects).await;
-        let (staged, enqueues) = effects.seal_and_take();
-        match result {
-            Ok(()) => Ok(SettlementEffects::default()
-                .enqueues(enqueues)
-                .kv_writes(staged.writes)
-                .kv_deletes(staged.deletes.into_iter().collect())),
-            Err(StepError {
-                message,
-                kind: StepErrorKind::Permanent,
-            }) => Err(PermanentFailure::new(message).into()),
-            Err(StepError {
-                message,
-                kind: StepErrorKind::Transient,
-            }) => Err(message.into()),
-        }
-    }
-
-    async fn process_step(
-        &self,
-        job: &JobRecord,
-        lease: &LeaseHandle,
-    ) -> std::result::Result<SettlementEffects, WorkerError> {
-        if job.headers.contains_key(HEADER_TERMINAL) {
-            return self.process_notification(job).await;
-        }
-
-        let (run_id, step_number) = match parse_step_headers(job) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(job_id = %job.id, error = %e, "workflow step has malformed headers");
-                if e.is_permanent() {
-                    return Err(PermanentFailure::new(e.to_string()).into());
-                }
-                return Err(e.to_string().into());
-            }
-        };
-
-        let user_headers = split_headers(&job.headers);
-
-        self.core
-            .registry
-            .mark_running(&run_id, step_number, &job.id, &user_headers);
-
-        // `Queue::cancel` fires the claim's token, and a re-claim fires it
-        // again from the job's persisted `cancel_requested`. The runner
-        // receives a child, so a runner firing its own token is not
-        // treated as an external cancellation below.
-        let claim_cancel = lease.cancel_token().clone();
-        let cancel_token = claim_cancel.child_token();
-
-        let (step_signal, signal_kv_deletes) = match self
-            .core
-            .resolve_step_signal(job, &run_id, step_number)
-            .await
-        {
-            Ok(v) => v,
-            // Transient: the step retries and resolves again.
-            Err(e) => return Err(e.to_string().into()),
-        };
-
-        let effects_handle = EffectsHandle::for_delivery();
-        let step = Step {
-            run_id: run_id.clone(),
-            step_number,
-            payload: job.payload.clone(),
-            headers: user_headers.clone(),
-            job_id: job.id.clone(),
-            attempts: job.attempts,
-            max_attempts: job.max_attempts,
-            cancel_token,
-            lease: lease.clone(),
-            memo: self.core.memo_store.new_memo(&run_id, step_number),
-            run_memo: self.core.memo_store.new_run_memo(&run_id),
-            effects: effects_handle.clone(),
-            kv: KvReadHandle::for_delivery(self.core.queue.clone()),
-            signal: step_signal,
-        };
-
-        // Preserve the run's per-step priority and max_attempts across the
-        // boundary by re-using the values from the just-processed job.
-        let inherit_opts = || StepEnqueueOpts {
-            run_at: None,
-            priority: Some(job.priority),
-            max_attempts: Some(job.max_attempts),
-            reserved_headers: Vec::new(),
-        };
-
-        let mut replayed_step_output = false;
-        let mut replayed_effects = StagedEffects::default();
-        let outcome = if self.core.step_output_replay {
-            match self
-                .core
-                .load_step_output(&run_id, step_number, &job.payload)
-                .await
-            {
-                Ok(Some((outcome, effects))) => {
-                    replayed_step_output = true;
-                    replayed_effects = effects;
-                    debug!(
-                        run_id = %run_id,
-                        step_number,
-                        "replaying stored step outcome",
-                    );
-                    Ok(outcome)
-                }
-                Ok(None) => self.runner.run_step(&step).await,
-                Err(err) => return Err(err.to_string().into()),
-            }
-        } else {
-            self.runner.run_step(&step).await
-        };
-
-        // Sealed as soon as the runner has returned: an effect staged
-        // through a retained handle clone after this point could not
-        // join the settlement, so staging it errors.
-        let sealed = effects_handle.seal_and_take();
-        let failure_writes = sealed.on_failure;
-        let caller_effects = if replayed_step_output {
-            replayed_effects
-        } else {
-            sealed.outcome
-        };
-
-        // Both sources are required: the claim's token reports a
-        // cancellation after a restart, and the registry flag reports one
-        // after a step advance, which the job-scoped persisted flag
-        // cannot.
-        let external_cancel =
-            claim_cancel.is_cancelled() || self.core.registry.cancel_requested(&run_id);
-
-        if self.core.step_output_replay
-            && !replayed_step_output
-            && !external_cancel
-            && let Ok(ref outcome) = outcome
-            && let Err(err) = self
-                .core
-                .store_step_output(&run_id, step_number, &job.payload, outcome, &caller_effects)
-                .await
-        {
-            if err.is_permanent() {
-                return Err(PermanentFailure::new(err.to_string()).into());
-            }
-            return Err(err.to_string().into());
-        }
-
-        let runner_cancelled = matches!(outcome, Ok(StepOutcome::Cancel { .. }));
-
-        // Cancellation precedence:
-        // 1. A runner-issued `StepOutcome::Cancel` wins (it carries an
-        //    in-step reason that we surface on `RunOutcome::error`).
-        // 2. Otherwise an external `WorkflowRuntime::cancel` overrides
-        //    whatever outcome the runner returned (including transient
-        //    retries and permanent dead-letters), with `error: None` so
-        //    consumers can distinguish external vs. runner-issued cancel.
-        let settled = match outcome {
-            Ok(StepOutcome::Cancel { reason }) => Ok(self.worker_terminate(
-                RunOutcome::cancelled(run_id.clone(), Some(reason), user_headers, step_number),
-                Some(job.priority),
-                Some(job.max_attempts),
-            )),
-            _ if external_cancel => Ok(self.worker_terminate(
-                RunOutcome::cancelled(run_id.clone(), None, user_headers, step_number),
-                Some(job.priority),
-                Some(job.max_attempts),
-            )),
-            Ok(StepOutcome::Continue { payload, when }) => match when {
-                Trigger::Immediate => Ok(self
-                    .core
-                    .advance(
-                        &run_id,
-                        step_number + 1,
-                        payload,
-                        &user_headers,
-                        inherit_opts(),
-                    )
-                    .await),
-                Trigger::After(delay) => {
-                    let now = UNIX_EPOCH + Duration::from_millis(self.core.clock.now_ms());
-                    let opts = StepEnqueueOpts {
-                        run_at: Some(now + delay),
-                        ..inherit_opts()
-                    };
-                    Ok(self
-                        .core
-                        .advance(&run_id, step_number + 1, payload, &user_headers, opts)
-                        .await)
-                }
-                Trigger::OnSignal {
-                    correlation_key,
-                    timeout,
-                } => {
-                    self.advance_on_signal(
-                        &run_id,
-                        step_number + 1,
-                        payload,
-                        &user_headers,
-                        inherit_opts(),
-                        &correlation_key,
-                        timeout,
-                    )
-                    .await
-                }
-            },
-            Ok(StepOutcome::Succeed { result }) => Ok(self.worker_terminate(
-                RunOutcome::succeeded(run_id.clone(), result, user_headers, step_number),
-                Some(job.priority),
-                Some(job.max_attempts),
-            )),
-            Ok(StepOutcome::Fail { reason }) => {
-                // Runner verdict: workflow failed but the step itself ran
-                // cleanly. Ack the step (no dead-letter); the run
-                // terminates as `Failed`.
-                Ok(self.worker_terminate(
-                    RunOutcome::failed(run_id.clone(), reason, user_headers, step_number),
-                    Some(job.priority),
-                    Some(job.max_attempts),
-                ))
-            }
-            // The two terminating failures carry the runner's failure
-            // writes beside the termination effects; the core applies
-            // them only with the dead-lettering settlement.
-            Err(StepError {
-                message,
-                kind: StepErrorKind::Permanent,
-            }) => {
-                let mut effects = self.worker_terminate(
-                    RunOutcome::failed(run_id.clone(), message.clone(), user_headers, step_number),
-                    Some(job.priority),
-                    None,
-                );
-                effects.kv_writes.extend(failure_writes);
-                Err(FailWith::new(PermanentFailure::new(message), effects).into())
-            }
-            Err(StepError {
-                message,
-                kind: StepErrorKind::Transient,
-            }) => {
-                // Last attempt: this nack will dead-letter. Build the
-                // effects while the registry entry and headers are in
-                // hand; `nack_with` decides whether they apply. The
-                // attempts test applies only to the registry removal.
-                if job.attempts >= job.max_attempts {
-                    let mut effects = self.worker_terminate(
-                        RunOutcome::failed(
-                            run_id.clone(),
-                            message.clone(),
-                            user_headers,
-                            step_number,
-                        ),
-                        Some(job.priority),
-                        None,
-                    );
-                    effects.kv_writes.extend(failure_writes);
-                    return Err(FailWith::new(WorkerError::from(message), effects).into());
-                }
-                Err(message.into())
-            }
-        };
-        // Durable signal entries scheduled for cleanup are deleted with the
-        // step's settlement; on retry paths they survive for redelivery.
-        settled.map(|mut effects| {
-            effects.kv_deletes.extend(signal_kv_deletes);
-            // The external-cancel override commits Cancelled in place of
-            // the runner's outcome; the staged effects describe that
-            // outcome and are discarded with it. A runner-issued Cancel
-            // keeps its effects.
-            if runner_cancelled || !external_cancel {
-                effects.kv_writes.extend(caller_effects.writes);
-                effects.kv_deletes.extend(caller_effects.deletes);
-            }
-            effects
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effects::{EffectsHandle, TerminalEffects};
     use crate::keys::MAX_RUN_ID_LEN;
     use crate::keys::{
         TERMINAL_KV_PREFIX, parse_timestamped_kv_key, signal_buf_kv_key, signal_wait_kv_key,
     };
+    use crate::runner::{Step, StepError};
     use crate::signal::SignalOutcome;
     use crate::terminal::NoopTerminalHook;
     use crate::terminal::TerminalStatus;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicU32, Ordering};
     use taquba::object_store::memory::InMemory;
-    use taquba::{MockClock, OpenOptions, QueueConfig};
+    use taquba::{LeaseHandle, MockClock, OpenOptions, QueueConfig};
     use tokio::sync::oneshot;
 
     /// Recording terminal hook backed by an mpsc channel.
@@ -2302,6 +1955,48 @@ mod tests {
         assert_eq!(stats.dead, 1, "permanent error should dead-letter");
 
         let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_notification_inherits_the_step_limits() {
+        struct FailingRunner;
+        impl StepRunner for FailingRunner {
+            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                Err(StepError::permanent("nope"))
+            }
+        }
+
+        let (queue, store) = fresh_queue().await;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime =
+            WorkflowRuntime::builder(queue.clone(), store, FailingRunner, ChannelHook { tx })
+                .build();
+        runtime
+            .submit(RunSpec {
+                input: b"x".to_vec(),
+                priority: Some(3),
+                max_attempts_per_step: Some(5),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let job = queue
+            .claim("workflow-steps", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let err = runtime
+            .inner
+            .process_step(&job, &LeaseHandle::detached())
+            .await
+            .unwrap_err();
+        let failure = err
+            .downcast_ref::<taquba::FailWith>()
+            .expect("a terminating failure carries its effects");
+        let notification = &failure.effects.enqueues[0];
+        assert_eq!(notification.options.priority, Some(3));
+        assert_eq!(notification.options.max_attempts, Some(5));
     }
 
     #[tokio::test(start_paused = true)]

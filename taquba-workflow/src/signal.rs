@@ -10,9 +10,9 @@
 //! time.
 
 use std::collections::HashMap;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
-use taquba::{FailWith, JobRecord, JobStatus, PermanentFailure, SettlementEffects, WorkerError};
+use taquba::{JobRecord, JobStatus, SettlementEffects, WorkerError};
 use tracing::warn;
 
 use crate::error::Result;
@@ -20,9 +20,10 @@ use crate::keys::{
     HEADER_SIGNAL_DELIVERED, HEADER_SIGNAL_WAIT, signal_buf_kv_key, signal_delivered_kv_key,
     signal_wait_kv_key,
 };
-use crate::runner::StepRunner;
+use crate::runner::{StepErrorKind, StepRunner};
 use crate::runtime::{RuntimeCore, RuntimeInner, StepEnqueueOpts, WorkflowRuntime};
-use crate::terminal::{RunOutcome, TerminalHook};
+use crate::terminal::TerminalHook;
+use crate::worker::StepDelivery;
 
 /// Outcome of [`WorkflowRuntime::signal`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,21 +117,17 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
 }
 
 impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
-    /// Build the effects that advance the run to a step that waits for a
-    /// signal for `correlation_key`. When a buffered signal already exists it is
-    /// consumed: the next step is enqueued immediately, the payload is
-    /// recorded under the durable delivered key and the buffer entry is
-    /// deleted, all in the acknowledgement transaction. Otherwise the next
-    /// step is scheduled `timeout` from now and the waiter index entry
-    /// joins the same transaction.
-    #[allow(clippy::too_many_arguments)]
+    /// Build the effects that advance the run of `delivery` to a step
+    /// that waits for a signal for `correlation_key`. When a buffered
+    /// signal already exists it is consumed: the next step is enqueued
+    /// immediately, the payload is recorded under the durable delivered
+    /// key and the buffer entry is deleted, all in the acknowledgement
+    /// transaction. Otherwise the next step is scheduled `timeout` from
+    /// now and the waiter index entry joins the same transaction.
     pub(crate) async fn advance_on_signal(
         &self,
-        run_id: &str,
-        next_step: u32,
+        delivery: &StepDelivery<'_>,
         payload: Vec<u8>,
-        user_headers: &HashMap<String, String>,
-        base_opts: StepEnqueueOpts,
         correlation_key: &str,
         timeout: Duration,
     ) -> std::result::Result<SettlementEffects, WorkerError> {
@@ -149,17 +146,12 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     let message = format!(
                         "a waiter is already registered for correlation key `{correlation_key}`"
                     );
-                    let effects = self.worker_terminate(
-                        RunOutcome::failed(
-                            run_id.to_string(),
-                            message.clone(),
-                            user_headers.clone(),
-                            next_step.saturating_sub(1),
-                        ),
-                        base_opts.priority,
-                        None,
-                    );
-                    return Err(FailWith::new(PermanentFailure::new(message), effects).into());
+                    return Err(self.terminating_failure(
+                        delivery,
+                        message,
+                        StepErrorKind::Permanent,
+                        HashMap::new(),
+                    ));
                 }
             }
             Ok(None) => {}
@@ -171,13 +163,14 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             Ok(Some(buffered)) => {
                 let opts = StepEnqueueOpts {
                     reserved_headers: vec![(HEADER_SIGNAL_DELIVERED, "1".to_string())],
-                    ..base_opts
+                    ..delivery.next_step_opts()
                 };
-                let delivered_key = signal_delivered_kv_key(run_id, next_step);
+                let delivered_key =
+                    signal_delivered_kv_key(&delivery.run_id, delivery.step_number + 1);
                 let buffered = buffered.to_vec();
                 let mut effects = self
                     .core
-                    .advance_with_kv(run_id, next_step, payload, user_headers, opts, |_| {
+                    .advance_with_kv(delivery, payload, opts, |_| {
                         HashMap::from([(delivered_key, buffered)])
                     })
                     .await;
@@ -185,15 +178,14 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 Ok(effects)
             }
             Ok(None) => {
-                let now = UNIX_EPOCH + Duration::from_millis(self.core.clock.now_ms());
                 let opts = StepEnqueueOpts {
-                    run_at: Some(now + timeout),
+                    run_at: Some(self.core.run_at_after(timeout)),
                     reserved_headers: vec![(HEADER_SIGNAL_WAIT, correlation_key.to_string())],
-                    ..base_opts
+                    ..delivery.next_step_opts()
                 };
                 let effects = self
                     .core
-                    .advance_with_kv(run_id, next_step, payload, user_headers, opts, |job_id| {
+                    .advance_with_kv(delivery, payload, opts, |job_id| {
                         HashMap::from([(wait_key, job_id.as_bytes().to_vec())])
                     })
                     .await;
