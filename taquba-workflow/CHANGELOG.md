@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Step::is_last_attempt`: whether a transient `StepError` from this
   attempt dead-letters the step.
 
+### Removed
+
+- **Breaking (source):** `jobs::JobContext::submit`. A handler that
+  submits further jobs holds a `JobRunner` in its registered state, as
+  the fan-out example does.
+
 ### Changed
 
 - **Breaking (source and storage):** run status and cancellation are

@@ -718,6 +718,12 @@ impl<P: Pipeline> Batch<'_, P> {
             while let Some(joined) = set.join_next().await {
                 match joined {
                     Ok(Ok(())) => {}
+                    // Leaving the loop drops the set and aborts the
+                    // remaining item tasks, possibly inside a submit.
+                    // That is safe because `enqueue_with_kv` is
+                    // cancel-safe: an aborted submit either committed
+                    // its run or wrote nothing, and `resume` drives
+                    // either state.
                     Ok(Err(err)) => {
                         result = Err(err);
                         break;

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -58,12 +58,10 @@ pub struct SubmitOptions {
     pub headers: HashMap<String, String>,
 }
 
-/// The state shared by the runner, every [`JobHandle`] and every
-/// [`JobContext`]: the runtime a job runs as one step of and the
-/// registered application state.
+/// The state shared by the runner and every [`JobHandle`]: the runtime
+/// a job runs as one step of.
 pub(crate) struct Inner {
     pub(crate) typed: TypedRuntime<Dispatch>,
-    pub(crate) state: State,
 }
 
 impl Inner {
@@ -128,7 +126,7 @@ type DispatchFuture<'a> =
 trait ErasedHandler: Send + Sync {
     fn dispatch<'a>(
         &'a self,
-        inner: Arc<Inner>,
+        state: &'a State,
         step: &'a Step,
         input: Vec<u8>,
     ) -> DispatchFuture<'a>;
@@ -141,22 +139,22 @@ struct TypedHandler<J: Job> {
 impl<J: Job> ErasedHandler for TypedHandler<J> {
     fn dispatch<'a>(
         &'a self,
-        inner: Arc<Inner>,
+        state: &'a State,
         step: &'a Step,
         input: Vec<u8>,
     ) -> DispatchFuture<'a> {
-        Box::pin(run_typed::<J>(inner, step, input))
+        Box::pin(run_typed::<J>(state, step, input))
     }
 }
 
 /// Run a single job of a known type and record its outcome.
 async fn run_typed<J: Job>(
-    inner: Arc<Inner>,
+    state: &State,
     step: &Step,
     input: Vec<u8>,
 ) -> std::result::Result<StepOutcome, StepError> {
     run_typed_step(step, J::NAME, &input, |input: J| async move {
-        let ctx = JobContext::new(inner, step);
+        let ctx = JobContext::new(state, step);
         tracing::info!(
             job_id = %step.run_id,
             job_type = J::NAME,
@@ -185,10 +183,11 @@ async fn run_typed<J: Job>(
 }
 
 /// The step runner of the workflow runtime: routes each run's single step
-/// to the handler registered for its job type.
+/// to the handler registered for its job type, with the registered
+/// application state.
 pub(crate) struct Dispatch {
     handlers: HashMap<&'static str, Box<dyn ErasedHandler>>,
-    inner: Weak<Inner>,
+    state: State,
 }
 
 impl StepRunner for Dispatch {
@@ -202,14 +201,7 @@ impl StepRunner for Dispatch {
         let handler = self.handlers.get(name.as_str()).ok_or_else(|| {
             StepError::permanent(format!("no handler registered for job type `{name}`"))
         })?;
-        // The worker task holds the runner's shared state for as long as it
-        // runs, so the upgrade fails only for a delivery in flight after
-        // shutdown.
-        let inner = self
-            .inner
-            .upgrade()
-            .ok_or_else(|| StepError::transient("the job runner has shut down"))?;
-        handler.dispatch(inner, step, input).await
+        handler.dispatch(&self.state, step, input).await
     }
 }
 
@@ -395,26 +387,22 @@ impl JobRunnerBuilder {
             poll_interval: self.poll_interval,
             clock: self.clock,
         };
-        let inner = Arc::new_cyclic(|weak: &Weak<Inner>| {
-            let dispatch = Dispatch {
-                handlers: self.handlers,
-                inner: weak.clone(),
-            };
-            let typed = options.build(
-                self.queue,
-                self.object_store,
-                dispatch,
-                |builder| match self.retention {
-                    Some(retention) => builder.memo_retention(retention),
-                    None => builder,
-                },
-            );
-            Inner {
-                typed,
-                state: self.state,
-            }
-        });
-        JobRunner { inner }
+        let dispatch = Dispatch {
+            handlers: self.handlers,
+            state: self.state,
+        };
+        let typed = options.build(
+            self.queue,
+            self.object_store,
+            dispatch,
+            |builder| match self.retention {
+                Some(retention) => builder.memo_retention(retention),
+                None => builder,
+            },
+        );
+        JobRunner {
+            inner: Arc::new(Inner { typed }),
+        }
     }
 }
 
@@ -488,26 +476,6 @@ mod tests {
     }
 
     #[derive(Serialize, Deserialize)]
-    struct Increment {
-        n: i64,
-    }
-
-    impl Job for Increment {
-        const NAME: &'static str = "test.increment";
-        type Output = ();
-        type Error = TestError;
-
-        async fn run(&self, ctx: JobContext<'_>) -> std::result::Result<(), TestError> {
-            ctx.state::<Arc<AtomicU32>>().fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn idempotency_key(&self) -> Option<String> {
-            Some(format!("increment:{}", self.n))
-        }
-    }
-
-    #[derive(Serialize, Deserialize)]
     struct Renewing;
 
     #[derive(Default)]
@@ -528,26 +496,6 @@ mod tests {
             let gate = ctx.state::<Arc<RenewGate>>();
             gate.renewed.notify_one();
             gate.release.notified().await;
-            Ok(())
-        }
-    }
-
-    #[derive(Serialize, Deserialize)]
-    struct Coordinator {
-        children: i64,
-    }
-
-    impl Job for Coordinator {
-        const NAME: &'static str = "test.coordinator";
-        type Output = ();
-        type Error = TestError;
-
-        async fn run(&self, ctx: JobContext<'_>) -> std::result::Result<(), TestError> {
-            for n in 0..self.children {
-                ctx.submit(Increment { n })
-                    .await
-                    .map_err(|e| TestError(e.to_string()))?;
-            }
             Ok(())
         }
     }
@@ -1147,45 +1095,6 @@ mod tests {
         let hex_part = same_a.split_once(':').unwrap().1;
         assert_eq!(hex_part.len(), 64);
         assert!(hex_part.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn fan_out_from_handler_runs_children() {
-        let cfg = QueueConfig::default()
-            .lease_duration(Duration::from_secs(300))
-            .max_attempts(1)
-            .retry_backoff_base(Duration::ZERO);
-        let (queue, store) = open_queue_with_config("test-fanout", cfg).await;
-        let counter = Arc::new(AtomicU32::new(0));
-        let mut runner = JobRunner::builder(queue, store)
-            .state(counter.clone())
-            .register::<Coordinator>()
-            .register::<Increment>()
-            .build();
-        let handle = runner.spawn(std::future::pending::<()>());
-
-        runner
-            .submit(Coordinator { children: 3 })
-            .await
-            .unwrap()
-            .await
-            .unwrap();
-
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while counter.load(Ordering::SeqCst) < 3 {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "expected counter to reach 3, got {}",
-                counter.load(Ordering::SeqCst)
-            )
-        });
-        assert_eq!(counter.load(Ordering::SeqCst), 3);
-
-        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

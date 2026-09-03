@@ -12,9 +12,8 @@
 //! [`StepRunner`](crate::StepRunner) directly when one entity moves through
 //! several durable steps with cancellation and a terminal hook. The word
 //! "job" names the typed function here; the queue job that delivers a step
-//! is [`Step::job_id`](crate::Step::job_id). Chaining jobs
-//! through [`JobContext::submit`] to model a multi-step process is a sign
-//! the work belongs in a workflow.
+//! is [`Step::job_id`](crate::Step::job_id). Chaining jobs to model a
+//! multi-step process is a sign the work belongs in a workflow.
 //!
 //! # Quick start
 //!
@@ -191,10 +190,9 @@
 //! delivery's lease and cancellation token, a durable [`JobContext::memo`]
 //! for the results of expensive calls, staged KV effects
 //! ([`JobContext::effects`]) applied atomically with the job's successful
-//! completion, committed KV reads ([`JobContext::kv_get`]) and follow-up
-//! submission ([`JobContext::submit`]). Child submissions are independent:
-//! they are not awaited as part of the parent and survive the parent's
-//! completion.
+//! completion and committed KV reads ([`JobContext::kv_get`]). A handler
+//! that submits further jobs holds a [`JobRunner`] in its registered
+//! state.
 //!
 //! # Core types
 //!

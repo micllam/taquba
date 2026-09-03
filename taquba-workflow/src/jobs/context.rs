@@ -7,9 +7,6 @@ use taquba::LeaseHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::Result;
-use crate::jobs::handle::JobHandle;
-use crate::jobs::job::Job;
-use crate::jobs::runner::{Inner, SubmitOptions};
 
 /// Type-erased application state shared with every job handler.
 #[derive(Default)]
@@ -29,22 +26,22 @@ impl State {
     }
 }
 
-/// The per-call context handed to [`Job::run`].
+/// The per-call context handed to [`Job::run`](crate::jobs::Job::run).
 ///
 /// Provides access to application state registered on the
 /// [`JobRunner`](crate::jobs::JobRunner), the job's identity and attempt count,
-/// the delivery's lease and cancellation token, the job's memo and staged
-/// KV effects, and follow-up submission. It holds no domain-specific
-/// clients (HTTP, LLM, etc.); those belong to the application's
-/// registered state or to layers built on top.
+/// the delivery's lease and cancellation token, and the job's memo and
+/// staged KV effects. It holds no domain-specific clients (HTTP, LLM,
+/// etc.); those belong to the application's registered state or to
+/// layers built on top.
 pub struct JobContext<'a> {
-    inner: Arc<Inner>,
+    state: &'a State,
     step: &'a Step,
 }
 
 impl<'a> JobContext<'a> {
-    pub(crate) fn new(inner: Arc<Inner>, step: &'a Step) -> Self {
-        Self { inner, step }
+    pub(crate) fn new(state: &'a State, step: &'a Step) -> Self {
+        Self { state, step }
     }
 
     /// Borrow a piece of application state by type.
@@ -68,11 +65,11 @@ impl<'a> JobContext<'a> {
     /// Borrow a piece of application state by type, returning `None` if no
     /// value of type `T` was registered.
     pub fn try_state<T: Any + Send + Sync>(&self) -> Option<&T> {
-        self.inner.state.get::<T>()
+        self.state.get::<T>()
     }
 
     /// The identifier of the job currently executing, equal to
-    /// [`JobHandle::id`] of its handle.
+    /// [`JobHandle::id`](crate::jobs::JobHandle::id) of its handle.
     pub fn id(&self) -> &str {
         &self.step.run_id
     }
@@ -120,16 +117,5 @@ impl<'a> JobContext<'a> {
     /// staged by this job are not visible until it completes.
     pub async fn kv_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         Ok(self.step.kv.get(key).await?.map(|bytes| bytes.to_vec()))
-    }
-
-    /// Submit a follow-up job from within a handler.
-    ///
-    /// Used for chaining (one job triggers the next) or fan-out (call this
-    /// in a loop to submit N independent children). Returns a [`JobHandle`]
-    /// to the newly submitted job. The child job is independent: it is not
-    /// awaited as part of the current job and survives the current job's
-    /// completion.
-    pub async fn submit<J: Job>(&self, job: J) -> Result<JobHandle<J>> {
-        self.inner.submit(job, SubmitOptions::default()).await
     }
 }
