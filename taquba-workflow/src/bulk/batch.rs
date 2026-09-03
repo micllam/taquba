@@ -739,7 +739,7 @@ impl<P: Pipeline> Batch<'_, P> {
         driven?;
 
         if inner.batch_retention.is_some() {
-            let key = bulk_terminal_kv_key(&self.id, inner.typed.clock.now_ms());
+            let key = bulk_terminal_kv_key(&self.id, inner.typed.clock().now_ms());
             if let Err(err) = inner.store.queue.kv_put(&key, b"").await {
                 warn!(batch_id = %self.id, "batch terminal marker write failed: {err}");
             }

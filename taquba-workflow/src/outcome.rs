@@ -20,8 +20,8 @@ use taquba::object_store::ObjectStore;
 use taquba::{Clock, Queue, WaitOutcome};
 
 use crate::keys::hash_input;
-use crate::memo::{Memo, MemoStore};
-use crate::runtime::{RunnerHandle, WorkflowRuntime, WorkflowRuntimeBuilder};
+use crate::memo::Memo;
+use crate::runtime::{RunnerHandle, RuntimeCore, WorkflowRuntime, WorkflowRuntimeBuilder};
 use crate::terminal::NoopTerminalHook;
 use crate::{Result, Step, StepError, StepErrorKind, StepOutcome, StepRunner};
 
@@ -53,42 +53,42 @@ impl TypedRuntimeOptions {
             WorkflowRuntimeBuilder<R, NoopTerminalHook>,
         ) -> WorkflowRuntimeBuilder<R, NoopTerminalHook>,
     ) -> TypedRuntime<R> {
-        let clock = self.clock.unwrap_or_else(|| queue.clock());
-        let memo_store = MemoStore::new(object_store.clone(), self.memo_prefix.clone());
-        let builder =
-            WorkflowRuntime::builder(queue.clone(), object_store, runner, NoopTerminalHook)
-                .queue_name(self.queue_name)
-                .memo_prefix(self.memo_prefix)
-                .max_concurrent_steps(self.max_concurrent)
-                .poll_interval(self.poll_interval)
-                .clock(clock.clone());
+        let mut builder = WorkflowRuntime::builder(queue, object_store, runner, NoopTerminalHook)
+            .queue_name(self.queue_name)
+            .memo_prefix(self.memo_prefix)
+            .max_concurrent_steps(self.max_concurrent)
+            .poll_interval(self.poll_interval);
+        if let Some(clock) = self.clock {
+            builder = builder.clock(clock);
+        }
         TypedRuntime {
             runtime: configure(builder).build(),
-            queue,
-            memo_store,
-            clock,
             spawned: AtomicBool::new(false),
         }
     }
 }
 
-/// The workflow runtime a typed single-step layer runs over, with the
-/// handles its submissions, waits and reads need: the queue whose
-/// completion waiter reports a run's terminal state, the memo store
-/// holding the outcome records and the runtime's clock. The terminal
-/// hook is [`NoopTerminalHook`], so a run enqueues no notification.
+/// The workflow runtime a typed single-step layer runs over. The
+/// terminal hook is [`NoopTerminalHook`], so a run enqueues no
+/// notification.
 pub(crate) struct TypedRuntime<R: StepRunner> {
     pub(crate) runtime: WorkflowRuntime<R, NoopTerminalHook>,
-    pub(crate) queue: Arc<Queue>,
-    pub(crate) memo_store: MemoStore,
-    pub(crate) clock: Arc<dyn Clock>,
     spawned: AtomicBool,
 }
 
 impl<R: StepRunner + 'static> TypedRuntime<R> {
+    fn core(&self) -> &RuntimeCore {
+        &self.runtime.inner.core
+    }
+
+    /// The clock the runtime reads its timestamps from.
+    pub(crate) fn clock(&self) -> &dyn Clock {
+        self.core().clock.as_ref()
+    }
+
     /// The run-scoped memo of `run_id`, which holds its outcome record.
     pub(crate) fn run_memo(&self, run_id: &str) -> Memo {
-        self.memo_store.new_run_memo(run_id)
+        self.core().memo_store.new_run_memo(run_id)
     }
 
     /// The outcome record of `run_id`, if one exists.
@@ -118,7 +118,12 @@ impl<R: StepRunner + 'static> TypedRuntime<R> {
         job_id: &str,
         timeout: Duration,
     ) -> Result<Option<Terminal>> {
-        let unrecorded = match self.queue.wait_for_completion(job_id, timeout).await? {
+        let unrecorded = match self
+            .core()
+            .queue
+            .wait_for_completion(job_id, timeout)
+            .await?
+        {
             WaitOutcome::TimedOut => return Ok(None),
             WaitOutcome::Done(_) => Unrecorded::Done,
             WaitOutcome::Dead(record) => Unrecorded::Dead(record.last_error),
