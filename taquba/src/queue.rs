@@ -3,6 +3,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::Stream;
 use slatedb::config::{ScanOptions, Settings};
 use slatedb::object_store::ObjectStore;
 use slatedb::{Db, IsolationLevel};
@@ -1234,6 +1235,25 @@ impl Queue {
             limit,
         )
         .await
+    }
+
+    /// Every job of `queue` in `status`, in the order [`Self::list_jobs`]
+    /// pages them, as one stream that reads `page_size` jobs at a time.
+    /// A consumer that stops reading fetches no further page; the
+    /// listing semantics are those of `list_jobs`.
+    pub fn jobs<'a>(
+        &'a self,
+        queue: &'a str,
+        status: JobStatus,
+        page_size: usize,
+    ) -> impl Stream<Item = Result<JobRecord>> + 'a {
+        crate::read::jobs(
+            self.core.db.as_ref(),
+            &self.core.payload_store,
+            queue,
+            status,
+            page_size,
+        )
     }
 
     /// Return a job's recorded delivery history, in write order.

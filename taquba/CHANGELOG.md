@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `JobRecord::is_last_attempt`: whether a transient failure of the
   current attempt dead-letters the job.
+- `Queue::kv_entries` and `Queue::jobs`, with the same methods on
+  `QueueReader`: the `kv_scan` and `list_jobs` listings as streams
+  that fetch one page at a time and no further page once the consumer
+  stops reading.
 
 ## [0.12.0] - 2026-09-02
 

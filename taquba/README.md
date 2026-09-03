@@ -291,9 +291,10 @@ concurrent replacement is never deleted by mistake, and
 (or is still absent), the read-modify-write primitive that makes concurrent
 updates of one entry lose no writes. `Queue::kv_scan` lists entries under a
 key prefix in pages, for enumerating live state and for exporting the
-namespace. `Queue::commit_effects` applies a `SettlementEffects` (enqueues,
-KV writes and deletes) as one transaction with no job transition, for state
-that must move in one step when no transition of its own carries it.
+namespace, and `Queue::kv_entries` reads the same listing as one stream.
+`Queue::commit_effects` applies a `SettlementEffects` (enqueues, KV writes
+and deletes) as one transaction with no job transition, for state that must
+move in one step when no transition of its own carries it.
 
 `Queue::ack_with` extends the same atomicity to settlement: it acknowledges a
 claimed job and, in the same transaction, enqueues follow-up jobs and applies
@@ -339,7 +340,8 @@ The queue exposes its state for operational triage: `Queue::list_queues`
 names every queue that has ever held a job, `Queue::stats` returns per-state
 job counts for one queue, `Queue::get_job` looks up a single job by ID in
 any state, `Queue::list_jobs` pages through one queue's jobs in one
-lifecycle state and `Queue::dead_jobs` pages through the dead-letter set.
+lifecycle state (`Queue::jobs` reads the same listing as one stream) and
+`Queue::dead_jobs` pages through the dead-letter set.
 `Queue::attempt_history` returns a job's recorded delivery history: one
 `JobAttempt` per settled attempt (retry, dead-letter, lease expiry,
 interruption at open, operator requeue, completion on a queue with

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use slatedb::config::DbReaderOptions;
 use slatedb::manifest::SsTableId;
 use slatedb::object_store::ObjectStore;
@@ -328,6 +328,17 @@ impl QueueReader {
         .await
     }
 
+    /// Every job of `queue` in `status` as one stream, read `page_size`
+    /// jobs at a time; see [`Queue::jobs`](crate::Queue::jobs).
+    pub fn jobs<'a>(
+        &'a self,
+        queue: &'a str,
+        status: JobStatus,
+        page_size: usize,
+    ) -> impl Stream<Item = Result<JobRecord>> + 'a {
+        crate::read::jobs(&self.reader, &self.payload_store, queue, status, page_size)
+    }
+
     /// Return a page of dead-letter jobs for the given queue.
     ///
     /// Cursor and ordering semantics are those of
@@ -375,6 +386,17 @@ impl QueueReader {
         limit: usize,
     ) -> Result<KvPage> {
         crate::read::kv_scan(&self.reader, prefix, cursor, limit).await
+    }
+
+    /// Every entry of the user KV namespace under `prefix` as one
+    /// stream, read `page_size` entries at a time; see
+    /// [`Queue::kv_entries`](crate::Queue::kv_entries).
+    pub fn kv_entries<'a>(
+        &'a self,
+        prefix: &'a [u8],
+        page_size: usize,
+    ) -> impl Stream<Item = Result<(Vec<u8>, Bytes)>> + 'a {
+        crate::read::kv_entries(&self.reader, prefix, page_size)
     }
 
     /// Close the reader, stopping its manifest polling and releasing

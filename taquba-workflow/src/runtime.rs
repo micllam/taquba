@@ -24,7 +24,6 @@ use crate::keys::{
     validate_run_id,
 };
 use crate::memo::MemoStore;
-use crate::paging;
 use crate::registry::RunRegistry;
 use crate::runner::{StepOutcome, StepRunner, Trigger};
 use crate::sweep::Sweep;
@@ -990,12 +989,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         const PAGE: usize = 256;
         let core = &self.core;
         let mut terminated = 0usize;
-        let mut dead = std::pin::pin!(paging::jobs(
-            &core.queue,
-            &core.queue_name,
-            JobStatus::Dead,
-            PAGE
-        ));
+        let mut dead = std::pin::pin!(core.queue.jobs(&core.queue_name, JobStatus::Dead, PAGE));
         while let Some(job) = dead.try_next().await? {
             if job.headers.contains_key(HEADER_TERMINAL) {
                 continue;

@@ -6,9 +6,11 @@
 //! read method on either type is added here and delegated from both, so
 //! the two surfaces cannot drift.
 
+use std::future::Future;
 use std::ops::Bound;
 
 use bytes::Bytes;
+use futures_util::stream::{self, Stream, TryStreamExt};
 use slatedb::{Db, DbIterator, DbReader};
 
 use crate::error::{Error, Result};
@@ -311,10 +313,107 @@ pub(crate) async fn kv_scan<H: ReadHandle>(
     })
 }
 
+/// The items of a paged read as one stream, fetched one page at a
+/// time: `fetch` takes the cursor of the page to read, `None` for the
+/// first, and returns the page's items with the cursor of the next
+/// page, `None` once the read is exhausted. A consumer that stops
+/// reading fetches no further page.
+fn pages<T, F, Fut>(fetch: F) -> impl Stream<Item = Result<T>>
+where
+    F: FnMut(Option<Vec<u8>>) -> Fut,
+    Fut: Future<Output = Result<(Vec<T>, Option<Vec<u8>>)>>,
+{
+    // The outer `Option` is `None` once the read is exhausted; the
+    // inner one is the cursor `fetch` takes.
+    stream::try_unfold((Some(None), fetch), |(cursor, mut fetch)| async move {
+        let Some(cursor) = cursor else {
+            return Ok::<_, Error>(None);
+        };
+        let (items, next) = fetch(cursor).await?;
+        Ok(Some((
+            stream::iter(items.into_iter().map(Ok::<T, Error>)),
+            (next.map(Some), fetch),
+        )))
+    })
+    .try_flatten()
+}
+
+/// Body of `kv_entries`: every entry under `prefix`, in ascending key
+/// order, read through [`kv_scan`] `page_size` entries at a time.
+pub(crate) fn kv_entries<'a, H: ReadHandle>(
+    handle: &'a H,
+    prefix: &'a [u8],
+    page_size: usize,
+) -> impl Stream<Item = Result<(Vec<u8>, Bytes)>> + 'a {
+    pages(move |cursor| async move {
+        let page = kv_scan(handle, prefix, cursor.as_deref(), page_size).await?;
+        Ok((page.entries, page.next_cursor))
+    })
+}
+
+/// Body of `jobs`: every job of `queue` in `status`, in the order
+/// [`list_jobs`] pages them, read `page_size` jobs at a time.
+pub(crate) fn jobs<'a, H: ReadHandle>(
+    handle: &'a H,
+    payloads: &'a PayloadStore,
+    queue: &'a str,
+    status: JobStatus,
+    page_size: usize,
+) -> impl Stream<Item = Result<JobRecord>> + 'a {
+    pages(move |cursor| async move {
+        let page = list_jobs(
+            handle,
+            payloads,
+            queue,
+            status,
+            cursor.as_deref(),
+            page_size,
+        )
+        .await?;
+        Ok((page.jobs, page.next_cursor))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_util::*;
+
+    #[tokio::test]
+    async fn kv_entries_cross_page_boundaries_in_key_order() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        for i in 0..5u8 {
+            q.kv_put(&[b'p', b'/', b'0' + i], b"v").await.unwrap();
+        }
+        q.kv_put(b"q/0", b"v").await.unwrap();
+
+        let keys: Vec<Vec<u8>> = q
+            .kv_entries(b"p/", 2)
+            .map_ok(|(key, _)| key)
+            .try_collect()
+            .await
+            .unwrap();
+        let expected: Vec<Vec<u8>> = (0..5u8).map(|i| vec![b'p', b'/', b'0' + i]).collect();
+        assert_eq!(keys, expected);
+    }
+
+    #[tokio::test]
+    async fn jobs_cross_page_boundaries_in_listing_order() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let mut ids = Vec::new();
+        for i in 0..5u8 {
+            ids.push(q.enqueue("alpha", vec![i]).await.unwrap());
+        }
+        q.enqueue("beta", b"x".to_vec()).await.unwrap();
+
+        let listed: Vec<String> = q
+            .jobs("alpha", JobStatus::Pending, 2)
+            .map_ok(|job| job.id)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(listed, ids);
+    }
 
     #[tokio::test]
     async fn test_list_queues() {

@@ -20,7 +20,6 @@ use tracing::warn;
 
 use crate::error::Result;
 use crate::keys::{parse_timestamped_kv_key, validate_run_id};
-use crate::paging::kv_entries;
 
 /// Terminal markers read per page by a sweep pass.
 const SWEEP_PAGE_SIZE: usize = 256;
@@ -108,7 +107,7 @@ impl Sweep {
             .now_ms()
             .saturating_sub(self.retention.as_millis() as u64);
         let mut cleared = 0usize;
-        let mut markers = std::pin::pin!(kv_entries(queue, self.prefix, SWEEP_PAGE_SIZE));
+        let mut markers = std::pin::pin!(queue.kv_entries(self.prefix, SWEEP_PAGE_SIZE));
         while let Some((key, _)) = markers.try_next().await? {
             let parsed = parse_timestamped_kv_key(self.prefix, &key)
                 .filter(|(id, _)| validate_run_id(id).is_ok());

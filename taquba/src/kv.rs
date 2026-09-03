@@ -6,6 +6,7 @@
 //! fields of [`SettlementEffects`](crate::SettlementEffects).
 
 use bytes::Bytes;
+use futures_util::Stream;
 use slatedb::{DbTransaction, IsolationLevel};
 
 use crate::error::{Error, Result};
@@ -195,6 +196,19 @@ impl Queue {
         limit: usize,
     ) -> Result<KvPage> {
         crate::read::kv_scan(self.core.db.as_ref(), prefix, cursor, limit).await
+    }
+
+    /// Every entry of the user KV namespace under `prefix`, in ascending
+    /// byte order of the keys, as one stream that reads through
+    /// [`Self::kv_scan`] `page_size` entries at a time. A consumer that
+    /// stops reading fetches no further page; the listing semantics are
+    /// those of `kv_scan`.
+    pub fn kv_entries<'a>(
+        &'a self,
+        prefix: &'a [u8],
+        page_size: usize,
+    ) -> impl Stream<Item = Result<(Vec<u8>, Bytes)>> + 'a {
+        crate::read::kv_entries(self.core.db.as_ref(), prefix, page_size)
     }
 }
 

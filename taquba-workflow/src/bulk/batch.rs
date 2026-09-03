@@ -31,7 +31,6 @@ use crate::keys::{
 use crate::outcome::{
     OutcomeRecord, StoredOutcome, Terminal, TypedRuntime, TypedRuntimeOptions, Unrecorded,
 };
-use crate::paging::kv_entries;
 use crate::sweep::{Clearable, Sweep};
 use crate::{Error, Result};
 
@@ -204,7 +203,7 @@ impl BatchStore {
             }
         }
         let prefix = bulk_items_kv_prefix(id);
-        let mut markers = std::pin::pin!(kv_entries(&self.queue, &prefix, MARKER_PAGE_SIZE));
+        let mut markers = std::pin::pin!(self.queue.kv_entries(&prefix, MARKER_PAGE_SIZE));
         while let Some((key, _)) = markers.try_next().await? {
             self.queue.kv_delete(&key).await?;
         }
@@ -646,7 +645,7 @@ impl<P: Pipeline> Batch<'_, P> {
             cost: CostReport::new(),
             failed_keys: Vec::new(),
         };
-        let mut markers = std::pin::pin!(kv_entries(&inner.store.queue, &prefix, MARKER_PAGE_SIZE));
+        let mut markers = std::pin::pin!(inner.store.queue.kv_entries(&prefix, MARKER_PAGE_SIZE));
         while let Some((kv_key, value)) = markers.try_next().await? {
             let key = String::from_utf8_lossy(&kv_key[prefix.len()..]).into_owned();
             let marker: ItemMarker = match rmp_serde::from_slice(&value) {
