@@ -7,13 +7,14 @@ use futures_util::Stream;
 use slatedb::config::{ScanOptions, Settings};
 use slatedb::object_store::ObjectStore;
 use slatedb::{Db, IsolationLevel};
+use tokio::sync::oneshot;
 use tracing::{debug, instrument, warn};
 use ulid::Ulid;
 
 use crate::background::BackgroundTask;
 use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
-use crate::completion::CompletionWaiters;
+use crate::completion::{CompletionWaiters, Registration};
 use crate::effects::{PreparedEffects, PreparedJob, SettlementEffects};
 use crate::error::{Error, Result};
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
@@ -256,11 +257,22 @@ pub enum WaitOutcome {
     /// The job was removed by [`Queue::cancel`] before it was claimed.
     /// No record survives the removal.
     Cancelled,
-    /// The wait elapsed before the job reached a terminal state. The
-    /// job is still pending, scheduled, or claimed somewhere.
-    TimedOut,
     /// No job with this ID was present at the start of the call.
     NotFound,
+}
+
+/// The state of a job at the start of a completion wait: its outcome
+/// when already terminal, otherwise the registration its outcome will
+/// arrive on.
+enum Completion {
+    Settled(WaitOutcome),
+    Pending(Registration),
+}
+
+/// The outcome a registration received. The sender is consumed only by
+/// a settlement, so the channel cannot close without an outcome.
+fn delivered(received: std::result::Result<WaitOutcome, oneshot::error::RecvError>) -> WaitOutcome {
+    received.expect("a completion sender is consumed only by a settlement")
 }
 
 /// The committed outcome of [`Queue::settle_claim`]'s transaction.
@@ -1373,8 +1385,7 @@ impl Queue {
             .map(|(expires_at, _)| expires_at)
     }
 
-    /// Wait until the given job reaches a terminal state, or until
-    /// `timeout` elapses.
+    /// Wait until the given job reaches a terminal state.
     ///
     /// Wake-up is notification-based: every terminal transition in the
     /// queue (`ack`, `nack` past `max_attempts`, `dead_letter`,
@@ -1385,7 +1396,8 @@ impl Queue {
     /// scheduled job) do **not** wake the wait: they are not terminal.
     ///
     /// See [`WaitOutcome`] for the transition each variant reports and
-    /// whether it carries a record.
+    /// whether it carries a record. [`Self::wait_for_completion_timeout`]
+    /// bounds the wait.
     ///
     /// # Multiple waiters per job
     ///
@@ -1404,7 +1416,32 @@ impl Queue {
     /// The completion signal is in-process. A wait in process A on a job
     /// being worked in process B is not supported; taquba is
     /// single-process by design.
-    pub async fn wait_for_completion(&self, id: &str, timeout: Duration) -> Result<WaitOutcome> {
+    pub async fn wait_for_completion(&self, id: &str) -> Result<WaitOutcome> {
+        match self.completion(id).await? {
+            Completion::Settled(outcome) => Ok(outcome),
+            Completion::Pending(mut registration) => Ok(delivered(registration.receiver().await)),
+        }
+    }
+
+    /// [`Self::wait_for_completion`] bounded by `timeout`: `None` when
+    /// the timeout elapses before the job reaches a terminal state.
+    pub async fn wait_for_completion_timeout(
+        &self,
+        id: &str,
+        timeout: Duration,
+    ) -> Result<Option<WaitOutcome>> {
+        match self.completion(id).await? {
+            Completion::Settled(outcome) => Ok(Some(outcome)),
+            Completion::Pending(mut registration) => {
+                Ok(tokio::time::timeout(timeout, registration.receiver())
+                    .await
+                    .ok()
+                    .map(delivered))
+            }
+        }
+    }
+
+    async fn completion(&self, id: &str) -> Result<Completion> {
         // Registered before the storage read: a terminal transition
         // that commits after the read then reaches the registration,
         // and one that commits before it is visible in the read.
@@ -1412,24 +1449,17 @@ impl Queue {
 
         match self.get_job(id).await? {
             Some(job) => match job.status {
-                JobStatus::Done => return Ok(WaitOutcome::Done(Box::new(job))),
-                JobStatus::Dead => return Ok(WaitOutcome::Dead(Box::new(job))),
-                _ => {}
+                JobStatus::Done => Ok(Completion::Settled(WaitOutcome::Done(Box::new(job)))),
+                JobStatus::Dead => Ok(Completion::Settled(WaitOutcome::Dead(Box::new(job)))),
+                _ => Ok(Completion::Pending(registration)),
             },
             // A transition that removed the record between the
             // registration and the read has delivered its outcome, or
             // is about to; the registration is consulted before the ID
             // is reported absent.
-            None => {
-                return Ok(registration.try_outcome().unwrap_or(WaitOutcome::NotFound));
-            }
-        }
-
-        match tokio::time::timeout(timeout, registration.receiver()).await {
-            // The sender is consumed only by a settlement, so the
-            // channel cannot close without an outcome.
-            Ok(delivered) => Ok(delivered.unwrap_or(WaitOutcome::TimedOut)),
-            Err(_) => Ok(WaitOutcome::TimedOut),
+            None => Ok(Completion::Settled(
+                registration.try_outcome().unwrap_or(WaitOutcome::NotFound),
+            )),
         }
     }
 

@@ -162,10 +162,7 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_completion_unknown_id_is_not_found() {
         let q = Queue::open(make_store(), "test").await.unwrap();
-        let outcome = q
-            .wait_for_completion("does-not-exist", Duration::from_millis(50))
-            .await
-            .unwrap();
+        let outcome = q.wait_for_completion("does-not-exist").await.unwrap();
         assert!(matches!(outcome, WaitOutcome::NotFound), "{outcome:?}");
         q.close().await.unwrap();
     }
@@ -175,10 +172,10 @@ mod tests {
         let q = Queue::open(make_store(), "test").await.unwrap();
         let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
         let outcome = q
-            .wait_for_completion(&id, Duration::from_secs(60))
+            .wait_for_completion_timeout(&id, Duration::from_secs(60))
             .await
             .unwrap();
-        assert!(matches!(outcome, WaitOutcome::TimedOut), "{outcome:?}");
+        assert!(outcome.is_none(), "{outcome:?}");
         q.close().await.unwrap();
     }
 
@@ -189,7 +186,7 @@ mod tests {
         let q = Queue::open(make_store(), "test").await.unwrap();
         let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
 
-        let waiter = q.wait_for_completion(&id, Duration::from_secs(5));
+        let waiter = q.wait_for_completion(&id);
         tokio::pin!(waiter);
         assert!(poll_once(waiter.as_mut()).is_pending());
 
@@ -226,7 +223,7 @@ mod tests {
             .unwrap();
         let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
 
-        let waiter = q.wait_for_completion(&id, Duration::from_secs(5));
+        let waiter = q.wait_for_completion(&id);
         tokio::pin!(waiter);
         assert!(poll_once(waiter.as_mut()).is_pending());
 
@@ -252,7 +249,7 @@ mod tests {
         let q = Queue::open(make_store(), "test").await.unwrap();
         let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
 
-        let waiter = q.wait_for_completion(&id, Duration::from_secs(5));
+        let waiter = q.wait_for_completion(&id);
         tokio::pin!(waiter);
         assert!(poll_once(waiter.as_mut()).is_pending());
 
@@ -275,7 +272,7 @@ mod tests {
             .unwrap();
         let id = job.id.clone();
 
-        let waiter = q.wait_for_completion(&id, Duration::from_secs(5));
+        let waiter = q.wait_for_completion(&id);
         tokio::pin!(waiter);
         assert!(poll_once(waiter.as_mut()).is_pending());
 
@@ -298,11 +295,7 @@ mod tests {
         let id = job.id.clone();
         q.dead_letter(&job, "permanent").await.unwrap();
 
-        match q
-            .wait_for_completion(&id, Duration::from_millis(0))
-            .await
-            .unwrap()
-        {
+        match q.wait_for_completion(&id).await.unwrap() {
             WaitOutcome::Dead(record) => {
                 assert_eq!(record.id, id);
                 assert_eq!(record.status, JobStatus::Dead);
@@ -319,7 +312,7 @@ mod tests {
 
         let mut waiters = Vec::new();
         for _ in 0..4 {
-            let mut waiter = Box::pin(q.wait_for_completion(&id, Duration::from_secs(5)));
+            let mut waiter = Box::pin(q.wait_for_completion(&id));
             assert!(poll_once(waiter.as_mut()).is_pending());
             waiters.push(waiter);
         }
@@ -363,7 +356,7 @@ mod tests {
         let payload = vec![7u8; 256];
 
         let id = q.enqueue("work", payload.clone()).await.unwrap();
-        let waiter = q.wait_for_completion(&id, Duration::from_secs(5));
+        let waiter = q.wait_for_completion(&id);
         tokio::pin!(waiter);
         assert!(poll_once(waiter.as_mut()).is_pending());
         let job = q
@@ -379,7 +372,7 @@ mod tests {
         }
 
         let id = q.enqueue("work", payload.clone()).await.unwrap();
-        let waiter = q.wait_for_completion(&id, Duration::from_secs(5));
+        let waiter = q.wait_for_completion(&id);
         tokio::pin!(waiter);
         assert!(poll_once(waiter.as_mut()).is_pending());
         let job = q
@@ -400,7 +393,7 @@ mod tests {
             .unwrap()
             .unwrap();
         drop(job);
-        let waiter = q.wait_for_completion(&id, Duration::from_secs(5));
+        let waiter = q.wait_for_completion(&id);
         tokio::pin!(waiter);
         assert!(poll_once(waiter.as_mut()).is_pending());
         clock.advance(Duration::from_secs(11));

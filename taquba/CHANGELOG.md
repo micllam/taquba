@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `shutdown` or the shutdown future given to `spawn` and joined with
   `wait`.
 
+### Changed
+
+- **Breaking (source):** `Queue::wait_for_completion(id)` waits without
+  a bound. The bounded wait is `Queue::wait_for_completion_timeout(id,
+  timeout)`, which returns `None` when the timeout elapses first, and
+  `WaitOutcome::TimedOut` is removed.
+
 ## [0.12.0] - 2026-09-02
 
 ### Added

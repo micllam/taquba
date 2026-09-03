@@ -90,7 +90,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     for id in [&phased_id, &bounded_id] {
-        q.wait_for_completion(id, Duration::from_secs(15)).await?;
+        q.wait_for_completion_timeout(id, Duration::from_secs(15))
+            .await?;
     }
     let _ = shutdown_tx.send(());
     let _ = handle.await;

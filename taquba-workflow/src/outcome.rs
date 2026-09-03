@@ -25,10 +25,6 @@ use crate::runtime::{RunnerHandle, RuntimeCore, WorkflowRuntime, WorkflowRuntime
 use crate::terminal::NoopTerminalHook;
 use crate::{Result, Step, StepError, StepErrorKind, StepOutcome, StepRunner};
 
-/// An unbounded wait for a run's terminal state runs in chunks of this
-/// length; `Queue::wait_for_completion` needs a finite timeout.
-const WAIT_CHUNK: Duration = Duration::from_secs(3600);
-
 /// The settings a typed single-step layer forwards to the workflow
 /// runtime it runs over. Each layer's builder collects them under its
 /// own vocabulary and defaults.
@@ -118,34 +114,36 @@ impl<R: StepRunner + 'static> TypedRuntime<R> {
         job_id: &str,
         timeout: Duration,
     ) -> Result<Option<Terminal>> {
-        let unrecorded = match self
+        match self
             .core()
             .queue
-            .wait_for_completion(job_id, timeout)
+            .wait_for_completion_timeout(job_id, timeout)
             .await?
         {
-            WaitOutcome::TimedOut => return Ok(None),
+            Some(outcome) => Ok(Some(self.terminal(run_id, outcome).await?)),
+            None => Ok(None),
+        }
+    }
+
+    /// [`Self::wait_terminal_within`] without a bound.
+    pub(crate) async fn wait_terminal(&self, run_id: &str, job_id: &str) -> Result<Terminal> {
+        let outcome = self.core().queue.wait_for_completion(job_id).await?;
+        self.terminal(run_id, outcome).await
+    }
+
+    /// The terminal state of the run `run_id` whose step job settled
+    /// with `outcome`: the outcome record when the step wrote one.
+    async fn terminal(&self, run_id: &str, outcome: WaitOutcome) -> Result<Terminal> {
+        let unrecorded = match outcome {
             WaitOutcome::Done(_) => Unrecorded::Done,
             WaitOutcome::Dead(record) => Unrecorded::Dead(record.last_error),
             WaitOutcome::Cancelled => Unrecorded::Cancelled,
             WaitOutcome::NotFound => Unrecorded::NotFound,
         };
-        Ok(Some(match self.outcome(run_id).await? {
+        Ok(match self.outcome(run_id).await? {
             Some(record) => Terminal::Recorded(record),
             None => Terminal::Unrecorded(unrecorded),
-        }))
-    }
-
-    /// [`Self::wait_terminal_within`] without a bound.
-    pub(crate) async fn wait_terminal(&self, run_id: &str, job_id: &str) -> Result<Terminal> {
-        loop {
-            if let Some(terminal) = self
-                .wait_terminal_within(run_id, job_id, WAIT_CHUNK)
-                .await?
-            {
-                return Ok(terminal);
-            }
-        }
+        })
     }
 }
 

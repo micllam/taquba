@@ -2109,11 +2109,7 @@ mod tests {
 
         let waiter = tokio::spawn({
             let queue = queue.clone();
-            async move {
-                queue
-                    .wait_for_completion(&job_id, Duration::from_secs(600))
-                    .await
-            }
+            async move { queue.wait_for_completion(&job_id).await }
         });
         advance(&clock, Duration::from_secs(120)).await;
         assert!(matches!(
@@ -2154,10 +2150,7 @@ mod tests {
             .await
             .unwrap();
         let job_id = outcome.job_id;
-        queue
-            .wait_for_completion(&job_id, Duration::from_secs(60))
-            .await
-            .unwrap();
+        queue.wait_for_completion(&job_id).await.unwrap();
         assert_eq!(*seen.lock().unwrap(), Some(7));
 
         let _ = shutdown.send(());
