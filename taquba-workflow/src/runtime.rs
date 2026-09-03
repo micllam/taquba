@@ -9,7 +9,6 @@ use taquba::{
     Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, JobRecord, JobStatus, Queue,
     SettlementEffects,
 };
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 
@@ -286,7 +285,6 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
             max_concurrent_steps: self.max_concurrent_steps,
             poll_interval: self.poll_interval,
             registry: RunRegistry::default(),
-            submit_locks: std::sync::Mutex::new(HashMap::new()),
             memo_store,
             memo_retention: self.memo_retention,
             sweeps,
@@ -334,13 +332,6 @@ pub(crate) struct RuntimeCore {
     max_concurrent_steps: usize,
     poll_interval: Duration,
     pub(crate) registry: RunRegistry,
-    /// Per-run-id submission locks. Each lock is held across the
-    /// duplicate checks and the step-0 enqueue of its run, so two
-    /// concurrent submits of the same run cannot both pass the checks
-    /// before either commits, while submits of distinct runs proceed
-    /// concurrently. Run ids are unbounded, so entries are removed
-    /// once no submit references them.
-    submit_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pub(crate) memo_store: MemoStore,
     /// Window after a run reaches a terminal state during which its
     /// memo entries are retained for replay. `None` disables retention
@@ -430,38 +421,31 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             }
         }
 
-        // Hold this run's submit lock across the duplicate checks and
-        // the enqueue, so two concurrent submits with the same `run_id`
-        // cannot both pass the checks before either commits. The lock
-        // is per run id: submits of distinct runs (e.g. a bulk batch)
-        // proceed concurrently and share WAL group commits instead of
-        // serialising at one durable enqueue per flush interval.
-        let lock = self.inner.core.submit_lock_for(&run_id);
-        let result = {
-            let _guard = lock.lock().await;
-            self.submit_under_lock(&run_id, spec).await
-        };
-        drop(lock);
-        self.inner.core.release_submit_lock(&run_id);
-        result
+        self.enqueue_run(&run_id, spec).await
     }
 
-    async fn submit_under_lock(&self, run_id: &str, spec: RunSpec) -> Result<SubmitOutcome> {
+    /// Enqueue step 0 of `run_id` unless the run is active. The run
+    /// record is written with the step-0 enqueue and deleted with the
+    /// termination, so it identifies an active run whichever process
+    /// submitted it, and the step's dedup key serialises two
+    /// submissions that both find no record.
+    async fn enqueue_run(&self, run_id: &str, spec: RunSpec) -> Result<SubmitOutcome> {
         let input_hash = hash_input(&spec.input);
         let duplicate = |job_id: String| SubmitOutcome {
             run_id: run_id.to_string(),
             newly_submitted: false,
             job_id,
         };
-
-        // The run record is written with the step-0 enqueue and deleted
-        // with the termination, so it identifies an active run whether
-        // it was submitted by this process or an earlier one.
-        if let Some(bytes) = self.inner.core.queue.kv_get(&run_kv_key(run_id)).await? {
-            let existing: DurableRunRecord = rmp_serde::from_slice(&bytes)?;
-            if existing.input_hash != input_hash {
-                return Err(Error::InputMismatch(run_id.to_string()));
+        let check_input = |existing: DurableRunRecord| {
+            if existing.input_hash == input_hash {
+                Ok(())
+            } else {
+                Err(Error::InputMismatch(run_id.to_string()))
             }
+        };
+
+        if let Some(existing) = self.inner.core.run_record(run_id).await? {
+            check_input(existing)?;
             let current = self.inner.core.current_step(run_id).await?;
             return Ok(duplicate(current.job_id));
         }
@@ -494,13 +478,16 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             .await?
         {
             EnqueueResult::New(id) => id,
-            // A dedup_key hit without our durable record means either
-            // another writer beat us, or a prior run on `(run_id, step 0)`
-            // released its dedup key (job claimed) but the durable record
-            // is missing, which only happens if the run terminated
-            // without going through `terminate`. Either way the safe
-            // verdict is duplicate.
-            EnqueueResult::AlreadyEnqueued(existing) => return Ok(duplicate(existing)),
+            // A concurrent submission committed first; its record holds
+            // the input to check against. A dedup hit without a record
+            // is a store this runtime did not write, reported as a
+            // duplicate.
+            EnqueueResult::AlreadyEnqueued(existing) => {
+                if let Some(record) = self.inner.core.run_record(run_id).await? {
+                    check_input(record)?;
+                }
+                return Ok(duplicate(existing));
+            }
         };
 
         self.inner
@@ -748,23 +735,11 @@ impl RuntimeCore {
         Ok(rmp_serde::from_slice(&bytes)?)
     }
 
-    /// Returns the per-run-id submit lock for `run_id`, creating it on
-    /// first access.
-    fn submit_lock_for(&self, run_id: &str) -> Arc<Mutex<()>> {
-        let mut map = self.submit_locks.lock().unwrap();
-        map.entry(run_id.to_string()).or_default().clone()
-    }
-
-    /// Drop `run_id`'s submit lock entry once no submit references it.
-    /// Callers drop their clone of the lock first; a concurrent submit
-    /// that has already cloned the entry keeps it alive and removes it
-    /// when it finishes.
-    fn release_submit_lock(&self, run_id: &str) {
-        let mut map = self.submit_locks.lock().unwrap();
-        if let Some(lock) = map.get(run_id)
-            && Arc::strong_count(lock) == 1
-        {
-            map.remove(run_id);
+    /// The durable record of `run_id`, when the run is active.
+    async fn run_record(&self, run_id: &str) -> Result<Option<DurableRunRecord>> {
+        match self.queue.kv_get(&run_kv_key(run_id)).await? {
+            Some(bytes) => Ok(Some(rmp_serde::from_slice(&bytes)?)),
+            None => Ok(None),
         }
     }
 
@@ -2224,7 +2199,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn submit_releases_its_per_run_lock_entry() {
+    async fn concurrent_submits_of_one_run_admit_one_and_reject_a_changed_input() {
         struct PauseRunner;
         impl StepRunner for PauseRunner {
             async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
@@ -2235,23 +2210,23 @@ mod tests {
         let (queue, store) = fresh_queue().await;
         let runtime =
             WorkflowRuntime::builder(queue, store.clone(), PauseRunner, NoopTerminalHook).build();
+        let spec = |input: &[u8]| RunSpec {
+            run_id: Some("raced".to_string()),
+            input: input.to_vec(),
+            ..Default::default()
+        };
 
-        runtime
-            .submit(RunSpec {
-                input: b"x".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        runtime
-            .submit(RunSpec {
-                input: b"y".to_vec(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        assert!(runtime.inner.core.submit_locks.lock().unwrap().is_empty());
+        let (first, same, changed) = tokio::join!(
+            runtime.submit(spec(b"x")),
+            runtime.submit(spec(b"x")),
+            runtime.submit(spec(b"y")),
+        );
+        let first = first.unwrap();
+        let same = same.unwrap();
+        assert!(first.newly_submitted);
+        assert!(!same.newly_submitted);
+        assert_eq!(same.job_id, first.job_id);
+        assert!(matches!(changed, Err(Error::InputMismatch(id)) if id == "raced"));
     }
 
     #[tokio::test(start_paused = true)]
