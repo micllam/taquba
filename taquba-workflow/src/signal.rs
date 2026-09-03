@@ -15,12 +15,12 @@ use std::time::Duration;
 use taquba::{JobRecord, JobStatus, SettlementEffects, WorkerError};
 use tracing::warn;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::keys::{
     HEADER_SIGNAL_DELIVERED, HEADER_SIGNAL_WAIT, signal_buf_kv_key, signal_delivered_kv_key,
     signal_wait_kv_key,
 };
-use crate::runner::{StepErrorKind, StepRunner};
+use crate::runner::{StepError, StepRunner};
 use crate::runtime::{RuntimeCore, RuntimeInner, StepEnqueueOpts, WorkflowRuntime};
 use crate::terminal::TerminalHook;
 use crate::worker::StepDelivery;
@@ -148,14 +148,13 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     );
                     return Err(self.terminating_failure(
                         delivery,
-                        message,
-                        StepErrorKind::Permanent,
+                        StepError::permanent(message),
                         HashMap::new(),
                     ));
                 }
             }
             Ok(None) => {}
-            Err(e) => return Err(e.to_string().into()),
+            Err(e) => return Err(StepError::from(Error::Queue(e)).into_worker_error()),
         }
 
         let buf_key = signal_buf_kv_key(correlation_key);
@@ -191,7 +190,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     .await;
                 Ok(effects)
             }
-            Err(e) => Err(e.to_string().into()),
+            Err(e) => Err(StepError::from(Error::Queue(e)).into_worker_error()),
         }
     }
 }

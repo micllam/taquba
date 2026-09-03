@@ -124,24 +124,6 @@ impl<'a> StepDelivery<'a> {
     }
 }
 
-/// The worker error reporting `err`: a [`PermanentFailure`] when a
-/// retry cannot change the outcome, a retrying error otherwise.
-fn worker_error(err: &Error) -> WorkerError {
-    if err.is_permanent() {
-        PermanentFailure::new(err.to_string()).into()
-    } else {
-        err.to_string().into()
-    }
-}
-
-/// The worker error reporting a failure of `kind` with `message`.
-fn failure_error(message: String, kind: StepErrorKind) -> WorkerError {
-    match kind {
-        StepErrorKind::Permanent => PermanentFailure::new(message).into(),
-        StepErrorKind::Transient => message.into(),
-    }
-}
-
 impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     /// [`Self::terminate_collecting_effects`] for an outcome reached by
     /// `delivery`, plus [`RuntimeCore::forget_run`](crate::runtime::RuntimeCore::forget_run):
@@ -164,13 +146,12 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     pub(crate) fn terminating_failure(
         &self,
         delivery: &StepDelivery<'_>,
-        message: String,
-        kind: StepErrorKind,
+        error: StepError,
         failure_writes: HashMap<Vec<u8>, Vec<u8>>,
     ) -> WorkerError {
-        let mut effects = self.worker_terminate(delivery, delivery.failed(message.clone()));
+        let mut effects = self.worker_terminate(delivery, delivery.failed(error.message.clone()));
         effects.kv_writes.extend(failure_writes);
-        FailWith::new(failure_error(message, kind), effects).into()
+        FailWith::new(error.into_worker_error(), effects).into()
     }
 
     /// Process a terminal-notification job: decode the committed
@@ -197,7 +178,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 .enqueues(enqueues)
                 .kv_writes(staged.writes)
                 .kv_deletes(staged.deletes.into_iter().collect())),
-            Err(StepError { message, kind }) => Err(failure_error(message, kind)),
+            Err(err) => Err(err.into_worker_error()),
         }
     }
 
@@ -218,7 +199,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             Ok(delivery) => delivery,
             Err(err) => {
                 warn!(job_id = %job.id, error = %err, "workflow step has malformed headers");
-                return Err(worker_error(&err));
+                return Err(StepError::from(err).into_worker_error());
             }
         };
         let run_id = delivery.run_id.as_str();
@@ -238,8 +219,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .core
             .resolve_step_signal(job, run_id, step_number)
             .await
-            // Transient: the step retries and resolves again.
-            .map_err(|err| WorkerError::from(err.to_string()))?;
+            .map_err(|err| StepError::from(err).into_worker_error())?;
 
         let effects_handle = EffectsHandle::for_delivery();
         let step = Step {
@@ -263,7 +243,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             self.core
                 .load_step_output(run_id, step_number, &job.payload)
                 .await
-                .map_err(|err| WorkerError::from(err.to_string()))?
+                .map_err(|err| StepError::from(err).into_worker_error())?
         } else {
             None
         };
@@ -297,7 +277,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             self.core
                 .store_step_output(run_id, step_number, &job.payload, outcome, &caller_effects)
                 .await
-                .map_err(|err| worker_error(&err))?;
+                .map_err(|err| StepError::from(err).into_worker_error())?;
         }
 
         let runner_cancelled = matches!(outcome, Ok(StepOutcome::Cancel { .. }));
@@ -374,17 +354,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             // A permanent error, or a transient one on the last attempt,
             // dead-letters the step and terminates the run; the runner's
             // failure writes apply only with that settlement.
-            Err(StepError {
-                message,
-                kind: kind @ StepErrorKind::Permanent,
-            }) => Err(self.terminating_failure(delivery, message, kind, failure_writes)),
-            Err(StepError {
-                message,
-                kind: kind @ StepErrorKind::Transient,
-            }) if delivery.job.is_last_attempt() => {
-                Err(self.terminating_failure(delivery, message, kind, failure_writes))
+            Err(err) if err.kind == StepErrorKind::Permanent || delivery.job.is_last_attempt() => {
+                Err(self.terminating_failure(delivery, err, failure_writes))
             }
-            Err(StepError { message, .. }) => Err(message.into()),
+            Err(err) => Err(err.into_worker_error()),
         }
     }
 }

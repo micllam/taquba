@@ -3,8 +3,8 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use taquba::LeaseHandle;
 use taquba::object_store::memory::InMemory;
+use taquba::{LeaseHandle, PermanentFailure, WorkerError};
 use tokio_util::sync::CancellationToken;
 
 use crate::effects::EffectsHandle;
@@ -330,6 +330,15 @@ impl StepError {
         Self {
             message: message.into(),
             kind: StepErrorKind::Permanent,
+        }
+    }
+
+    /// The worker error reporting this failure: a [`PermanentFailure`]
+    /// for a permanent one, a retrying error otherwise.
+    pub(crate) fn into_worker_error(self) -> WorkerError {
+        match self.kind {
+            StepErrorKind::Permanent => PermanentFailure::new(self.message).into(),
+            StepErrorKind::Transient => self.message.into(),
         }
     }
 }
