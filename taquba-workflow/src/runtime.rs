@@ -115,8 +115,8 @@ pub struct SubmitOutcome {
     /// The run's identifier (generated if the spec didn't carry one).
     pub run_id: String,
     /// `true` if this call enqueued a new run; `false` if a run with this
-    /// id was already active (in this runtime's registry or in the
-    /// durable cross-restart record) and this call was a no-op. Call
+    /// id was already active (its durable run record exists) and this
+    /// call was a no-op. Call
     /// [`WorkflowRuntime::status`] for the run's current state when
     /// needed.
     pub newly_submitted: bool,
@@ -399,9 +399,9 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// Submit a new run. Enqueues step 0 with payload `spec.input`.
     ///
     /// Idempotent on `(run_id, spec.input)`: if a run with the same id is
-    /// already active (either in this runtime's in-memory registry or in
-    /// the durable cross-restart record written to Taquba's user KV
-    /// namespace) and `spec.input` matches the original submission, this
+    /// already active (its durable run record in Taquba's user KV
+    /// namespace exists, whichever process submitted it) and
+    /// `spec.input` matches the original submission, this
     /// call is a no-op and the returned [`SubmitOutcome`] has
     /// `newly_submitted = false`. A re-submission of an active `run_id`
     /// with a *different* input is rejected with [`Error::InputMismatch`];
@@ -454,25 +454,9 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             job_id,
         };
 
-        // A worker-resumed entry stores no hash and reports `None`; fall
-        // through to the durable-record check below, which always
-        // includes it.
-        if let Some(existing) = self.inner.core.registry.known_input_hash(run_id) {
-            if existing != input_hash {
-                return Err(Error::InputMismatch(run_id.to_string()));
-            }
-            let job_id = self
-                .inner
-                .core
-                .registry
-                .current_job_id(run_id)
-                .ok_or_else(|| Error::InconsistentRunState(run_id.to_string()))?;
-            return Ok(duplicate(job_id));
-        }
-
-        // Cross-restart duplicate check. The submit lock above closes
-        // the in-process race window; this read closes the across-restart
-        // one (same queue, fresh runtime).
+        // The run record is written with the step-0 enqueue and deleted
+        // with the termination, so it identifies an active run whether
+        // it was submitted by this process or an earlier one.
         if let Some(bytes) = self.inner.core.queue.kv_get(&run_kv_key(run_id)).await? {
             let existing: DurableRunRecord = rmp_serde::from_slice(&bytes)?;
             if existing.input_hash != input_hash {
@@ -522,7 +506,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         self.inner
             .core
             .registry
-            .insert_submitted(run_id, &job_id, spec.headers, input_hash);
+            .insert_submitted(run_id, &job_id, spec.headers);
 
         debug!(run_id = %run_id, job_id = %job_id, "run submitted");
         Ok(SubmitOutcome {

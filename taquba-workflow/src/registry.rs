@@ -20,13 +20,6 @@ struct RegistryEntry {
     current_job_id: String,
     user_headers: HashMap<String, String>,
     cancel_requested: bool,
-    /// SHA-256 of the original `spec.input`. `Some` for entries created
-    /// by [`WorkflowRuntime::submit`](crate::WorkflowRuntime::submit);
-    /// `None` for entries created by a worker resuming a step after
-    /// restart, which does not have access to the original input. The
-    /// duplicate-submit check falls through to the durable record
-    /// (which always includes the hash) when this is `None`.
-    input_hash: Option<[u8; 32]>,
 }
 
 /// The map of active runs, keyed by run id. Terminal runs are removed
@@ -38,27 +31,6 @@ pub(crate) struct RunRegistry {
 }
 
 impl RunRegistry {
-    /// The stored input hash of `run_id`, when an entry created by
-    /// `submit` exists. `None` for an unknown run and for a
-    /// worker-resumed entry, which stores no hash.
-    pub(crate) fn known_input_hash(&self, run_id: &str) -> Option<[u8; 32]> {
-        self.runs
-            .lock()
-            .unwrap()
-            .get(run_id)
-            .and_then(|entry| entry.input_hash)
-    }
-
-    /// The id of the queue job backing the run's current step, when the
-    /// run is tracked.
-    pub(crate) fn current_job_id(&self, run_id: &str) -> Option<String> {
-        self.runs
-            .lock()
-            .unwrap()
-            .get(run_id)
-            .map(|entry| entry.current_job_id.clone())
-    }
-
     /// Record a newly submitted run: step 0, [`RunState::Pending`],
     /// backed by `job_id`.
     pub(crate) fn insert_submitted(
@@ -66,7 +38,6 @@ impl RunRegistry {
         run_id: &str,
         job_id: &str,
         user_headers: HashMap<String, String>,
-        input_hash: [u8; 32],
     ) {
         self.runs.lock().unwrap().insert(
             run_id.to_string(),
@@ -79,7 +50,6 @@ impl RunRegistry {
                 current_job_id: job_id.to_string(),
                 user_headers,
                 cancel_requested: false,
-                input_hash: Some(input_hash),
             },
         );
     }
@@ -126,7 +96,7 @@ impl RunRegistry {
     /// Transition the entry for `run_id` into [`RunState::Running`] for
     /// `step_number`, recording the Taquba job id backing the step so a
     /// concurrent cancellation can target it. Creates a fresh entry,
-    /// with no input hash and no cancellation flag, when the run is
+    /// with no cancellation flag, when the run is
     /// unknown to this registry (a worker resuming after a restart
     /// first learns of the run by claiming its step).
     pub(crate) fn mark_running(
@@ -155,7 +125,6 @@ impl RunRegistry {
                         current_job_id: job_id.to_string(),
                         user_headers: user_headers.clone(),
                         cancel_requested: false,
-                        input_hash: None,
                     },
                 );
             }
