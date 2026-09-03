@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 
 use crate::durable::{
-    DurableCurrentStep, DurableRunOutcome, DurableRunRecord, DurableStepOutcome,
+    self, DurableCurrentStep, DurableRunOutcome, DurableRunRecord, DurableStepOutcome,
     DurableStepOutcomeRecord,
 };
 use crate::effects::StagedEffects;
@@ -33,11 +33,11 @@ use crate::terminal::{RunOutcome, TerminalHook};
 use crate::worker::{StepDelivery, StepWorker};
 
 /// The encoded current-step pointer for `job_id` at `step_number`.
-fn current_step_bytes(step_number: u32, job_id: &str) -> Result<Vec<u8>> {
-    Ok(rmp_serde::to_vec_named(&DurableCurrentStep {
+fn current_step_bytes(step_number: u32, job_id: &str) -> Vec<u8> {
+    durable::encode(&DurableCurrentStep {
         step_number,
         job_id: job_id.to_string(),
-    })?)
+    })
 }
 
 /// The portion of `delay` still ahead of `now_ms`, measured from
@@ -493,14 +493,14 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
                 .core
                 .step_enqueue_request(run_id, 0, spec.input, &spec.headers, opts);
 
-        let record_bytes = rmp_serde::to_vec_named(&DurableRunRecord {
+        let record_bytes = durable::encode(&DurableRunRecord {
             run_id: run_id.to_string(),
             submitted_at_ms: self.inner.core.clock.now_ms(),
             input_hash,
-        })?;
+        });
         let mut kv = spec.kv_writes;
         kv.insert(run_kv_key(run_id), record_bytes);
-        kv.insert(step_kv_key(run_id), current_step_bytes(0, &job_id)?);
+        kv.insert(step_kv_key(run_id), current_step_bytes(0, &job_id));
 
         let job_id = match self
             .inner
@@ -825,12 +825,12 @@ impl RuntimeCore {
         &self,
         outcome: &RunOutcome,
         terminal_step: Option<&JobRecord>,
-    ) -> Result<EnqueueRequest> {
-        let payload = rmp_serde::to_vec_named(&DurableRunOutcome::from(outcome))?;
+    ) -> EnqueueRequest {
+        let payload = durable::encode(&DurableRunOutcome::from(outcome));
         let mut headers = HashMap::new();
         headers.insert(HEADER_RUN_ID.to_string(), outcome.run_id.clone());
         headers.insert(HEADER_TERMINAL.to_string(), "1".to_string());
-        Ok(EnqueueRequest {
+        EnqueueRequest {
             queue: self.queue_name.clone(),
             payload,
             options: EnqueueOptions::default()
@@ -838,7 +838,7 @@ impl RuntimeCore {
                 .priority(terminal_step.map(|job| job.priority))
                 .max_attempts(terminal_step.map(|job| job.max_attempts))
                 .dedup_key(Some(format!("{DEDUP_PREFIX}{}:terminal", outcome.run_id))),
-        })
+        }
     }
 
     /// The instant `delay` after the runtime's clock now, as a
@@ -958,10 +958,10 @@ impl RuntimeCore {
         let (request, next_job_id) =
             self.step_enqueue_request(run_id, next_step, payload, &delivery.headers, opts);
         let mut kv_writes = kv_writes(&next_job_id);
-        // The pointer's encoding cannot fail for a step number and an id.
-        if let Ok(pointer) = current_step_bytes(next_step, &next_job_id) {
-            kv_writes.insert(step_kv_key(run_id), pointer);
-        }
+        kv_writes.insert(
+            step_kv_key(run_id),
+            current_step_bytes(next_step, &next_job_id),
+        );
         self.registry.mark_pending(run_id, next_step, next_job_id);
         SettlementEffects::default()
             .enqueues(vec![request])
@@ -1001,19 +1001,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             HashMap::new()
         };
         let enqueues = if self.terminal_hook.observes(outcome) {
-            match self
-                .core
-                .notification_enqueue_request(outcome, terminal_step)
-            {
-                Ok(request) => vec![request],
-                Err(err) => {
-                    warn!(
-                        run_id = %outcome.run_id,
-                        "failed to build the terminal notification: {err}"
-                    );
-                    Vec::new()
-                }
-            }
+            vec![
+                self.core
+                    .notification_enqueue_request(outcome, terminal_step),
+            ]
         } else {
             Vec::new()
         };

@@ -9,6 +9,13 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+/// Encode one of the crate's own records as MessagePack with named
+/// fields. The record types here hold strings, bytes, integers and
+/// enumerations, whose encoding cannot fail.
+pub(crate) fn encode<T: Serialize>(record: &T) -> Vec<u8> {
+    rmp_serde::to_vec_named(record).expect("a durable record encodes")
+}
+
 use crate::effects::StagedEffects;
 use crate::runner::{StepOutcome, Trigger};
 use crate::terminal::{RunOutcome, TerminalStatus};
