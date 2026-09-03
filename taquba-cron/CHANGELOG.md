@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `CronScheduler::spawn`: run the scheduler as a Tokio task, returning
+  a `taquba::WorkerHandle` that stops it.
+
 ## [0.8.0] - 2026-09-02
 
 ### Added

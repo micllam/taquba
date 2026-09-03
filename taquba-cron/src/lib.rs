@@ -22,6 +22,9 @@
 //! # Ok(()) }
 //! ```
 //!
+//! [`CronScheduler::spawn`] runs the scheduler as a Tokio task instead
+//! and returns a [`taquba::WorkerHandle`] that stops it.
+//!
 //! # Per-schedule options
 //!
 //! [`CronScheduler::schedule_with`] accepts a [`ScheduleOptions`] for
@@ -126,7 +129,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use croner::Cron;
-use taquba::{EnqueueOptions, EnqueueResult, Queue};
+use taquba::{EnqueueOptions, EnqueueResult, Queue, WorkerHandle};
 use tokio::time::sleep;
 use tracing::{debug, error, warn};
 
@@ -340,6 +343,15 @@ impl CronScheduler {
     /// schedule start over at the current time on its next run.
     pub async fn clear_watermark(queue: &Queue, name: &str) -> taquba::Result<()> {
         queue.kv_delete(&watermark_key(name)).await
+    }
+
+    /// Spawn [`Self::run`] as a Tokio task and return the handle that
+    /// stops it.
+    pub fn spawn<F>(self, shutdown: F) -> WorkerHandle<Result<()>>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        WorkerHandle::spawn(shutdown, |stop| self.run(stop.cancelled_owned()))
     }
 
     /// Run the scheduler until `shutdown` resolves.

@@ -165,6 +165,21 @@
 //! job, so the poll interval only bounds the latency of out-of-band
 //! events such as a scheduled job becoming due.
 //!
+//! [`WorkerHandle::spawn`] runs either loop as a Tokio task. The closure
+//! receives a cancellation token to pass to the loop as its shutdown
+//! future; the handle's [`shutdown`](WorkerHandle::shutdown) stops the
+//! loop and waits for it, and [`wait`](WorkerHandle::wait) joins a loop
+//! that stops on its own. Dropping the handle leaves the loop running.
+//!
+//! ```rust,ignore
+//! let handle = WorkerHandle::spawn(std::future::pending::<()>(), |stop| async move {
+//!     run_worker_concurrent(&queue, "emails", Arc::new(EmailWorker), 8,
+//!         Duration::from_millis(250), stop.cancelled_owned())
+//!         .await
+//! });
+//! handle.shutdown().await?;
+//! ```
+//!
 //! Claims serialise per queue. The claim lock is held across the scan
 //! and the commit, so a queue's claim rate is the batch size divided by
 //! the scan-and-commit latency and does not increase with the number of
@@ -416,7 +431,8 @@ mod test_util;
 mod txn;
 /// Worker-loop primitives: the [`worker::Worker`] trait, plus the
 /// [`worker::run_worker`] / [`worker::run_worker_concurrent`] drivers that
-/// own the claim -> process -> ack/nack lifecycle and graceful shutdown.
+/// own the claim -> process -> ack/nack lifecycle and graceful shutdown,
+/// and the [`worker::WorkerHandle`] that runs a loop as a Tokio task.
 pub mod worker;
 
 pub use clock::{Clock, MockClock, SystemClock};
@@ -438,7 +454,8 @@ pub use queue::{
 pub use reader::{QueueReader, ReaderMode, ReaderOptions};
 pub use stats::QueueStats;
 pub use worker::{
-    FailWith, PermanentFailure, Worker, WorkerError, run_worker, run_worker_concurrent,
+    FailWith, PermanentFailure, Worker, WorkerError, WorkerHandle, run_worker,
+    run_worker_concurrent,
 };
 
 pub use slatedb::object_store;

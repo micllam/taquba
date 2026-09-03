@@ -7,7 +7,7 @@ use futures_util::TryStreamExt;
 use taquba::object_store::ObjectStore;
 use taquba::{
     Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, JobRecord, JobStatus, Queue,
-    SettlementEffects,
+    SettlementEffects, WorkerHandle,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
@@ -26,7 +26,7 @@ use crate::keys::{
 use crate::memo::MemoStore;
 use crate::registry::RunRegistry;
 use crate::runner::{StepOutcome, StepRunner, Trigger};
-use crate::sweep::Sweep;
+use crate::sweep::{Sweep, run_periodically};
 use crate::terminal::{RunOutcome, TerminalHook};
 use crate::worker::{StepDelivery, StepWorker};
 
@@ -593,19 +593,10 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         R: 'static,
         H: 'static,
     {
-        let token = CancellationToken::new();
-        let worker_token = token.clone();
         let runtime = self.clone();
-        let join = tokio::spawn(async move {
-            let combined_shutdown = async move {
-                tokio::select! {
-                    _ = shutdown => {}
-                    _ = worker_token.cancelled() => {}
-                }
-            };
-            runtime.run(combined_shutdown).await
-        });
-        RunnerHandle::new(token, join)
+        WorkerHandle::spawn(shutdown, |stop| async move {
+            runtime.run(stop.cancelled_owned()).await
+        })
     }
 
     /// Drive the step worker loop until `shutdown` resolves. Spawns up
@@ -682,36 +673,9 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
 ///
 /// Dropping a `RunnerHandle` does not stop the worker: the task
 /// continues until the `shutdown` future passed to `spawn` resolves.
-/// Call [`shutdown`](Self::shutdown) or [`wait`](Self::wait) to stop or
-/// join the worker explicitly.
-pub struct RunnerHandle {
-    token: CancellationToken,
-    join: tokio::task::JoinHandle<Result<()>>,
-}
-
-impl RunnerHandle {
-    pub(crate) fn new(token: CancellationToken, join: tokio::task::JoinHandle<Result<()>>) -> Self {
-        Self { token, join }
-    }
-
-    /// Signal the worker to stop and wait for it to drain: it stops
-    /// claiming, lets in-flight steps finish and returns once the task
-    /// has exited.
-    pub async fn shutdown(self) -> Result<()> {
-        self.token.cancel();
-        self.wait().await
-    }
-
-    /// Wait for the worker task to exit on its own, because the
-    /// `shutdown` future passed to [`WorkflowRuntime::spawn`] resolved
-    /// or a claim error ended the loop.
-    pub async fn wait(self) -> Result<()> {
-        match self.join.await {
-            Ok(result) => result,
-            Err(join_error) => std::panic::resume_unwind(join_error.into_panic()),
-        }
-    }
-}
+/// Call [`shutdown`](WorkerHandle::shutdown) or
+/// [`wait`](WorkerHandle::wait) to stop or join the worker explicitly.
+pub type RunnerHandle = WorkerHandle<Result<()>>;
 
 impl RuntimeCore {
     /// One pass of every retention sweep; the number of entities cleared.
@@ -1020,23 +984,30 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     /// cancelled.
     async fn run_dead_step_reconciliation(&self, stop: CancellationToken) {
         let core = &self.core;
-        let mut reconciled_at: Option<i64> = None;
-        loop {
-            match core.queue.stats(&core.queue_name).await {
-                Ok(stats) if reconciled_at != Some(stats.dead) => {
-                    match self.reconcile_dead_steps().await {
-                        Ok(_) => reconciled_at = Some(stats.dead),
-                        Err(err) => warn!("dead-step reconciliation failed: {err}"),
+        run_periodically(
+            core.poll_interval,
+            &stop,
+            None,
+            |reconciled_at: Option<i64>| async move {
+                match core.queue.stats(&core.queue_name).await {
+                    Ok(stats) if reconciled_at != Some(stats.dead) => {
+                        match self.reconcile_dead_steps().await {
+                            Ok(_) => Some(stats.dead),
+                            Err(err) => {
+                                warn!("dead-step reconciliation failed: {err}");
+                                reconciled_at
+                            }
+                        }
+                    }
+                    Ok(_) => reconciled_at,
+                    Err(err) => {
+                        warn!("dead-step reconciliation could not read queue stats: {err}");
+                        reconciled_at
                     }
                 }
-                Ok(_) => {}
-                Err(err) => warn!("dead-step reconciliation could not read queue stats: {err}"),
-            }
-            tokio::select! {
-                _ = stop.cancelled() => return,
-                _ = tokio::time::sleep(core.poll_interval) => {}
-            }
-        }
+            },
+        )
+        .await;
     }
 }
 

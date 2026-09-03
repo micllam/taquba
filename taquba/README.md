@@ -253,6 +253,20 @@ wait on a queue-scoped notification that wakes one waiting worker per
 inserted job, so `poll_interval` only bounds the latency of out-of-band
 events such as a scheduled job becoming due.
 
+`WorkerHandle::spawn` runs either loop as a Tokio task. The closure
+receives a cancellation token to pass to the loop as its shutdown future;
+the handle's `shutdown` stops the loop and waits for it, and `wait` joins
+a loop that stops on its own. Dropping the handle leaves the loop running.
+
+```rust
+let handle = WorkerHandle::spawn(std::future::pending::<()>(), |stop| async move {
+    run_worker_concurrent(&queue, "emails", Arc::new(EmailWorker), 8,
+        Duration::from_millis(250), stop.cancelled_owned())
+        .await
+});
+handle.shutdown().await?;
+```
+
 Claims serialise per queue. The claim lock is held across the scan and
 the commit, so a queue's claim rate is the batch size divided by the
 scan-and-commit latency and does not increase with the number of

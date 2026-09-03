@@ -1,8 +1,11 @@
 use std::future::Future;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::FutureExt;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::effects::SettlementEffects;
@@ -392,6 +395,68 @@ async fn process_and_settle<W: Worker>(
 /// signal arrived while a claim was in flight.
 fn check_shutdown<F: Future<Output = ()>>(shutdown: std::pin::Pin<&mut F>) -> bool {
     shutdown.now_or_never().is_some()
+}
+
+/// A loop spawned as a Tokio task by [`WorkerHandle::spawn`].
+///
+/// Dropping the handle does not stop the loop: the task runs until the
+/// `shutdown` future passed to `spawn` resolves, the loop returns on
+/// its own or [`shutdown`](Self::shutdown) is called.
+pub struct WorkerHandle<T = Result<()>> {
+    stop: CancellationToken,
+    join: JoinHandle<T>,
+}
+
+impl<T: Send + 'static> WorkerHandle<T> {
+    /// Spawn the loop `run` builds as a Tokio task. The token passed to
+    /// `run` is cancelled when `shutdown` resolves or
+    /// [`shutdown`](Self::shutdown) is called; the loop is expected to
+    /// return once it observes the cancellation, for instance by passing
+    /// `stop.cancelled_owned()` to [`run_worker`].
+    ///
+    /// ```rust,ignore
+    /// let handle = WorkerHandle::spawn(tokio::signal::ctrl_c().map(|_| ()), |stop| async move {
+    ///     run_worker(&queue, "emails", &worker, poll, stop.cancelled_owned()).await
+    /// });
+    /// handle.wait().await?;
+    /// ```
+    pub fn spawn<S, F, Fut>(shutdown: S, run: F) -> Self
+    where
+        S: Future<Output = ()> + Send + 'static,
+        F: FnOnce(CancellationToken) -> Fut,
+        Fut: Future<Output = T> + Send + 'static,
+    {
+        let stop = CancellationToken::new();
+        let task = run(stop.clone());
+        let token = stop.clone();
+        let join = tokio::spawn(async move {
+            let mut task = pin!(task);
+            tokio::select! {
+                output = &mut task => output,
+                _ = shutdown => {
+                    token.cancel();
+                    task.await
+                }
+            }
+        });
+        Self { stop, join }
+    }
+
+    /// Signal the loop to stop and wait for it to return.
+    pub async fn shutdown(self) -> T {
+        self.stop.cancel();
+        self.wait().await
+    }
+
+    /// Wait for the loop to return on its own, because the `shutdown`
+    /// future passed to [`spawn`](Self::spawn) resolved or the loop
+    /// ended by itself. A panic in the loop is resumed here.
+    pub async fn wait(self) -> T {
+        match self.join.await {
+            Ok(output) => output,
+            Err(join_error) => std::panic::resume_unwind(join_error.into_panic()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1008,5 +1073,39 @@ mod tests {
 
         q.ack(&job).await.unwrap();
         q.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_the_loop_and_returns_its_output() {
+        let handle = WorkerHandle::spawn(std::future::pending(), |stop| async move {
+            stop.cancelled().await;
+            7u32
+        });
+        assert_eq!(handle.shutdown().await, 7);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_shutdown_future_cancels_the_loop() {
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async move {
+            let _ = released.await;
+        };
+        let handle = WorkerHandle::spawn(shutdown, |stop| async move {
+            stop.cancelled().await;
+            7u32
+        });
+        release.send(()).unwrap();
+        assert_eq!(handle.wait().await, 7);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_handle_leaves_the_loop_running() {
+        let (report, reported) = tokio::sync::oneshot::channel::<bool>();
+        let handle = WorkerHandle::spawn(std::future::pending(), |stop| async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = report.send(stop.is_cancelled());
+        });
+        drop(handle);
+        assert!(!reported.await.unwrap());
     }
 }

@@ -82,18 +82,12 @@ impl Sweep {
     /// pass every `retention` until `stop` is cancelled. A failed pass
     /// is logged; the next pass retries.
     pub(crate) async fn run(&self, queue: &Queue, clock: &dyn Clock, stop: CancellationToken) {
-        let mut ticker = tokio::time::interval(self.retention);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                _ = stop.cancelled() => return,
-                _ = ticker.tick() => {
-                    if let Err(err) = self.pass(queue, clock).await {
-                        warn!(prefix = %String::from_utf8_lossy(self.prefix), "retention sweep failed: {err}");
-                    }
-                }
+        run_periodically(self.retention, &stop, (), |()| async move {
+            if let Err(err) = self.pass(queue, clock).await {
+                warn!(prefix = %String::from_utf8_lossy(self.prefix), "retention sweep failed: {err}");
             }
-        }
+        })
+        .await;
     }
 
     /// One pass: clear every entity whose marker is more than `retention`
@@ -138,5 +132,25 @@ impl Sweep {
             cleared += 1;
         }
         Ok(cleared)
+    }
+}
+
+/// Run `pass` immediately and then once per `interval`, until `stop`
+/// is cancelled. Each pass receives the state the previous one
+/// returned, `state` for the first.
+pub(crate) async fn run_periodically<S, Fut>(
+    interval: Duration,
+    stop: &CancellationToken,
+    mut state: S,
+    mut pass: impl FnMut(S) -> Fut,
+) where
+    Fut: Future<Output = S>,
+{
+    loop {
+        state = pass(state).await;
+        tokio::select! {
+            _ = stop.cancelled() => return,
+            _ = tokio::time::sleep(interval) => {}
+        }
     }
 }

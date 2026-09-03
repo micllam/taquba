@@ -42,6 +42,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+`CronScheduler::spawn` runs the scheduler as a Tokio task instead and
+returns a `taquba::WorkerHandle` that stops it.
+
 ## Per-schedule options
 
 `schedule_with` accepts a `ScheduleOptions` for per-schedule overrides

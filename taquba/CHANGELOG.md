@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `QueueReader`: the `kv_scan` and `list_jobs` listings as streams
   that fetch one page at a time and no further page once the consumer
   stops reading.
+- `WorkerHandle`: a loop spawned as a Tokio task, stopped through
+  `shutdown` or the shutdown future given to `spawn` and joined with
+  `wait`.
 
 ## [0.12.0] - 2026-09-02
 

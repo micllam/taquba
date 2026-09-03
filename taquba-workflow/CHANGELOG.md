@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `RunnerHandle` is `taquba::WorkerHandle<Result<()>>`.
 - **Breaking (source):** `Step` is `#[non_exhaustive]`. A struct
   literal outside the crate moves to `Step::detached` and assigns its
   fields.
