@@ -210,6 +210,19 @@ impl From<DurableTerminalStatus> for TerminalStatus {
     }
 }
 
+/// The durable terminal record of a run, written under
+/// `workflow/outcomes/{run_id}` in the settlement that terminates the
+/// run when memo retention is set, and read by
+/// [`WorkflowRuntime::status`](crate::WorkflowRuntime::status) once the
+/// run record is gone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DurableTermination {
+    pub(crate) status: DurableTerminalStatus,
+    pub(crate) error: Option<String>,
+    pub(crate) final_step: u32,
+    pub(crate) terminated_at_ms: u64,
+}
+
 /// Stored payload of a terminal-notification job: the committed
 /// [`RunOutcome`], self-contained so the notification survives restarts
 /// and redeliveries.

@@ -164,7 +164,11 @@ state.
 `WorkflowRuntime::status` reads the record, the pointer and the step's
 queue job into a `RunStatus` (`Pending`, `Running` or `Cancelling`,
 with the current step number), so it answers after a restart and from
-any runtime over the same queue. A terminated run has no status.
+any runtime over the same queue. Under memo retention a terminated run
+reports `RunState::Terminated` with its status, error and time of
+termination, read from the terminal record described under
+[Memo retention](#memo-retention); without it, a terminated run has no
+status.
 
 ## Cancellation
 
@@ -472,15 +476,17 @@ let runtime = WorkflowRuntime::builder(queue, store, runner, hook)
 ```
 
 When retention is set, every settlement that commits a terminal outcome
-(`Succeeded`, `Failed` or `Cancelled`) writes a terminal marker under
-`workflow/terminals/` in the queue's key-value namespace in the same
-transaction, so a marker exists exactly when the run's terminal outcome
+(`Succeeded`, `Failed` or `Cancelled`) writes two keys in the queue's
+key-value namespace in the same transaction: a terminal marker under
+`workflow/terminals/` and a terminal record under `workflow/outcomes/`
+holding the status, the error, the final step and the time of
+termination, so both exist exactly when the run's terminal outcome
 committed. `WorkflowRuntime::run` sweeps the markers on startup and on
 every retention interval, removing the memo entries, the step-output
-replay entries and the marker of every run whose marker is older than
-the window. The terminating timestamp precedes the run id in the key,
-so the sweep reads the expired set from the start of the range and
-stops at the first unexpired marker.
+replay entries, the terminal record and the marker of every run whose
+marker is older than the window. The terminating timestamp precedes the
+run id in the marker key, so the sweep reads the expired set from the
+start of the range and stops at the first unexpired marker.
 
 Because the sweep is keyed on terminal markers and a terminated run
 never resumes, the entries of an in-flight run are not removed, with

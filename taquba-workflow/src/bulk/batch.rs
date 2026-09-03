@@ -214,8 +214,8 @@ impl BatchStore {
 impl Clearable for BatchStore {
     type Error = Error;
 
-    async fn clear(&self, batch_id: &str) -> Result<()> {
-        self.forget(batch_id).await
+    async fn clear(&self, batch_id: &str) -> Result<Vec<Vec<u8>>> {
+        self.forget(batch_id).await.map(|()| Vec::new())
     }
 }
 

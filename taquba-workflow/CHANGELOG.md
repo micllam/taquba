@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Step::detached(payload)` step 0 over it, for tests.
 - `Delivery::is_last_attempt`: whether a transient `StepError` from this
   attempt dead-letters the step.
+- `RunState::Terminated(RunTermination)`: the status, error and time of
+  termination of a terminated run, reported by `WorkflowRuntime::status`
+  and `jobs::JobHandle::status` from a terminal record under
+  `workflow/outcomes/{run_id}`. The record is written in the terminating
+  settlement when `WorkflowRuntimeBuilder::memo_retention` is set and
+  removed by the memo sweep with the run's memo entries. `RunState` no
+  longer implements `Copy`.
 - `StepError` implements `Clone`.
 
 ### Removed

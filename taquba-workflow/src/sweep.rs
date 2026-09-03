@@ -4,8 +4,9 @@
 //! entity's state ([`Clearable`]). Markers are `{prefix}{ts:020}/{id}`
 //! keys in the caller KV namespace (see
 //! [`crate::keys::timestamped_kv_key`]), so a prefix scan reads them
-//! oldest first; a pass removes each expired entity's state and then
-//! its marker, and stops at the first unexpired marker.
+//! oldest first; a pass removes each expired entity's object-store
+//! state, then its KV state and its marker in one transaction, and
+//! stops at the first unexpired marker.
 //! Deletion is unguarded by design: every consumer of a swept entry
 //! tolerates its absence and re-executes the step.
 
@@ -14,7 +15,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use futures_util::TryStreamExt;
-use taquba::{Clock, Queue};
+use taquba::{Clock, Queue, SettlementEffects};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -26,7 +27,7 @@ const SWEEP_PAGE_SIZE: usize = 256;
 
 type ClearError = Box<dyn std::error::Error + Send + Sync>;
 type ClearFuture<'a> =
-    Pin<Box<dyn Future<Output = std::result::Result<(), ClearError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = std::result::Result<Vec<Vec<u8>>, ClearError>> + Send + 'a>>;
 
 /// The store of one kind of entity's retained state, able to remove
 /// the state of the entity a terminal marker names.
@@ -34,8 +35,13 @@ pub(crate) trait Clearable: Send + Sync + 'static {
     /// The store's own error; a pass only logs it.
     type Error: Into<ClearError>;
 
-    /// Remove the state of the entity `id`.
-    fn clear(&self, id: &str) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send;
+    /// Remove the object-store state of the entity `id` and return the
+    /// KV keys of its remaining state, which the pass deletes with the
+    /// entity's marker in one transaction.
+    fn clear(
+        &self,
+        id: &str,
+    ) -> impl Future<Output = std::result::Result<Vec<Vec<u8>>, Self::Error>> + Send;
 }
 
 /// [`Clearable`] behind a boxed future, so sweeps over different stores
@@ -121,11 +127,18 @@ impl Sweep {
             if ts_ms >= cutoff_ms {
                 break;
             }
-            if let Err(err) = self.store.clear_dyn(&id).await {
-                warn!(id = %id, "clear failed during sweep: {err}");
-                continue;
-            }
-            if let Err(err) = queue.kv_delete(&key).await {
+            let mut kv_deletes = match self.store.clear_dyn(&id).await {
+                Ok(keys) => keys,
+                Err(err) => {
+                    warn!(id = %id, "clear failed during sweep: {err}");
+                    continue;
+                }
+            };
+            kv_deletes.push(key);
+            if let Err(err) = queue
+                .commit_effects(SettlementEffects::default().kv_deletes(kv_deletes))
+                .await
+            {
                 warn!(id = %id, "marker delete failed during sweep: {err}");
                 continue;
             }

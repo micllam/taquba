@@ -67,6 +67,12 @@ pub(crate) const SIGNAL_DELIVERED_KV_PREFIX: &[u8] = b"workflow/signal-delivered
 /// is set, in the same transaction that settles the run.
 pub(crate) const TERMINAL_KV_PREFIX: &[u8] = b"workflow/terminals/";
 
+/// Prefix for the durable terminal record of a run:
+/// `workflow/outcomes/{run_id}`, written in the settlement that
+/// terminates the run when memo retention is set and removed with the
+/// run's memo entries.
+pub(crate) const OUTCOME_KV_PREFIX: &[u8] = b"workflow/outcomes/";
+
 /// Prefix for the durable per-item markers of bulk batches:
 /// `workflow/bulk/batches/{batch_id}/items/{key}`, one per terminated
 /// item, written in the settlement that commits the item's terminal
@@ -179,6 +185,10 @@ pub(crate) fn step_kv_key(run_id: &str) -> Vec<u8> {
     prefixed(STEP_KV_PREFIX, run_id)
 }
 
+pub(crate) fn outcome_kv_key(run_id: &str) -> Vec<u8> {
+    prefixed(OUTCOME_KV_PREFIX, run_id)
+}
+
 pub(crate) fn signal_wait_kv_key(correlation_key: &str) -> Vec<u8> {
     prefixed(SIGNAL_WAIT_KV_PREFIX, correlation_key)
 }
@@ -207,6 +217,7 @@ mod tests {
             SIGNAL_BUF_KV_PREFIX,
             SIGNAL_DELIVERED_KV_PREFIX,
             TERMINAL_KV_PREFIX,
+            OUTCOME_KV_PREFIX,
             BULK_KV_PREFIX,
             BULK_TERMINAL_KV_PREFIX,
         ] {
