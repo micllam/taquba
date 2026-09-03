@@ -14,8 +14,11 @@ pub enum TerminalStatus {
     /// - the runner returned [`crate::StepOutcome::Fail`] (runner verdict);
     /// - a step returned [`crate::StepError::permanent`];
     /// - a step exhausted its transient-retry budget; or
-    /// - the worker hit a permanent runtime error (e.g. malformed step
-    ///   headers).
+    /// - a step was dead-lettered outside the runner (its lease expired
+    ///   past the attempt limit, crash recovery at open, or a permanent
+    ///   runtime error before the runner ran) and the worker's
+    ///   reconciliation terminated the run with the queue record's
+    ///   last error.
     Failed,
     /// The run was cancelled. Either:
     /// - [`crate::WorkflowRuntime::cancel`] was called for this run; or

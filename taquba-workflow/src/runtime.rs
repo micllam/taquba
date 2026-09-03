@@ -119,8 +119,7 @@ pub struct SubmitOutcome {
     pub newly_submitted: bool,
     /// The id of the queue job currently representing the run: its
     /// first step for a new submission, and the step the run has reached
-    /// for a duplicate, whether the run is tracked in process or known
-    /// only from its durable record.
+    /// for a duplicate, read from the run's durable current-step pointer.
     pub job_id: String,
 }
 

@@ -42,7 +42,7 @@
 //!     query: &ctx.input.body,
 //! };
 //! let response = ctx
-//!     .memo()
+//!     .memo
 //!     .memoized_by_content(&key, async {
 //!         Ok::<_, StepError>(lookup(&ctx.input.body).await?)
 //!     })
