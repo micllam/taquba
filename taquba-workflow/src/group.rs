@@ -1,9 +1,9 @@
 //! Run groups: a durable set of runs of one runtime, identified by a
 //! group id, whose membership is a manifest in the object store and
 //! whose per-member state is a record in the queue's KV namespace.
-//! [`RunGroup`] submits the members, waits for their terminations and
-//! removes the group's state; [`jobs::JobGroup`](crate::jobs::JobGroup)
-//! presents it.
+//! [`RunGroup`] submits the members, yields their results, cancels them
+//! and removes the group's state; [`jobs::JobGroup`](crate::jobs::JobGroup)
+//! is its typed presentation.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,12 +24,12 @@ use crate::keys::{
 };
 use crate::memo::MemoStore;
 use crate::runner::StepRunner;
-use crate::runtime::{RunSpec, RuntimeCore, WorkflowRuntime};
+use crate::runtime::{RunResult, RunSpec, RunTermination, RuntimeCore, WorkflowRuntime};
 use crate::sweep::Clearable;
-use crate::terminal::{TerminalHook, TerminalStatus};
+use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
 
-/// Member submissions in flight at once. Each blocks on a durable
-/// enqueue commit, and concurrent commits share WAL flushes.
+/// Member submissions and cancellations in flight at once. Each blocks
+/// on a durable commit, and concurrent commits share WAL flushes.
 const SUBMIT_CONCURRENCY: usize = 32;
 /// Member records read per page, and deleted per transaction by
 /// [`GroupStore::forget`].
@@ -73,27 +73,67 @@ impl Membership {
     }
 }
 
-/// One member of a group's manifest: its key and the input of its run.
+/// One member of a [`RunGroup`]: its key, unique within the group, and
+/// the input of its run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ManifestMember {
-    pub(crate) key: String,
-    pub(crate) input: Vec<u8>,
+pub struct GroupMember {
+    /// The member's key.
+    pub key: String,
+    /// The input of the member's step 0.
+    pub input: Vec<u8>,
 }
 
 /// The members of one group, in submission order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Manifest {
     pub(crate) group_id: String,
-    pub(crate) members: Vec<ManifestMember>,
+    pub(crate) members: Vec<GroupMember>,
 }
 
-/// The submission settings applied to every member of a group.
+/// The submission settings applied to every member of a group; see the
+/// fields of [`RunSpec`].
 #[derive(Debug, Clone, Default)]
-pub(crate) struct MemberSpec {
-    pub(crate) headers: HashMap<String, String>,
-    pub(crate) priority: Option<u32>,
-    pub(crate) max_attempts_per_step: Option<u32>,
-    pub(crate) run_at: Option<SystemTime>,
+pub struct MemberSpec {
+    /// Headers set on every step of every member.
+    pub headers: HashMap<String, String>,
+    /// Priority of every step; the queue's default when `None`.
+    pub priority: Option<u32>,
+    /// Attempt limit of every step; the queue's default when `None`.
+    pub max_attempts_per_step: Option<u32>,
+    /// Earliest time step 0 of every member runs; at once when `None`.
+    pub run_at: Option<SystemTime>,
+}
+
+/// The durable state of a group, read from its manifest and member
+/// records by [`RunGroup::status`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupStatus {
+    /// The group id.
+    pub group_id: String,
+    /// Number of members in the group's manifest.
+    pub total: usize,
+    /// Members submitted and not yet terminated.
+    pub pending: usize,
+    /// Members whose last recorded termination is a success.
+    pub succeeded: usize,
+    /// Members whose last recorded termination is a failure.
+    pub failed: usize,
+    /// Members whose last recorded termination is a cancellation.
+    pub cancelled: usize,
+}
+
+/// A terminated member of a group, yielded by [`RunGroup::results`].
+#[derive(Debug, Clone)]
+pub struct MemberResult {
+    /// The member's key.
+    pub key: String,
+    /// The run id of the member's run.
+    pub run_id: String,
+    /// The member's last recorded termination.
+    pub termination: RunTermination,
+    /// The member's committed outcome, read as [`WorkflowRuntime::outcome`]
+    /// reads it; `None` for a member terminated without a worker.
+    pub outcome: Option<RunOutcome>,
 }
 
 /// A member record as read back, with the key it is stored under.
@@ -223,9 +263,18 @@ impl Clearable for GroupStore {
     }
 }
 
-/// A group of runs of one runtime. Obtained from
-/// [`WorkflowRuntime::group`] or [`WorkflowRuntime::new_group`].
-pub(crate) struct RunGroup<'a, R, H> {
+/// A group of runs of one runtime, identified by a group id. Obtained
+/// from [`WorkflowRuntime::group`] or [`WorkflowRuntime::new_group`].
+///
+/// The group's members are identified by key. A member's run id is
+/// derived from the group id and its key, so the same input submitted
+/// to two groups runs twice, and a second [`submit`](Self::submit) of
+/// the group runs again every member that did not succeed. The group's
+/// membership is a durable manifest, so [`results`](Self::results),
+/// [`status`](Self::status), [`cancel`](Self::cancel) and
+/// [`forget`](Self::forget) answer after a restart and from any runtime
+/// over the same queue.
+pub struct RunGroup<'a, R, H> {
     runtime: &'a WorkflowRuntime<R, H>,
     id: String,
 }
@@ -244,7 +293,8 @@ impl<'a, R: StepRunner, H: TerminalHook> RunGroup<'a, R, H> {
         Self { runtime, id }
     }
 
-    pub(crate) fn id(&self) -> &str {
+    /// The group id.
+    pub fn id(&self) -> &str {
         &self.id
     }
 
@@ -269,15 +319,22 @@ impl<'a, R: StepRunner, H: TerminalHook> RunGroup<'a, R, H> {
         self.store().members(&self.id).await
     }
 
-    /// Write the manifest, or check `members` against the existing one,
-    /// and submit every member whose record is absent or terminated
-    /// other than `Succeeded`. A submission that fails returns after the
-    /// members submitted so far.
-    pub(crate) async fn submit(
-        &self,
-        members: Vec<ManifestMember>,
-        spec: &MemberSpec,
-    ) -> Result<()> {
+    /// Submit `members` as the group's members. The first submission
+    /// writes the group's manifest; a later one with a different member
+    /// set is rejected with [`Error::GroupMismatch`], and one with the
+    /// same set submits every member whose last recorded termination is
+    /// not a success, so a group is re-submitted after a crash or to run
+    /// its failed members again. Two members with one key are rejected
+    /// with [`Error::DuplicateMemberKey`]. `spec` applies to every
+    /// member. A submission that fails returns after the members
+    /// submitted so far.
+    pub async fn submit(&self, members: Vec<GroupMember>, spec: &MemberSpec) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for member in &members {
+            if !seen.insert(member.key.as_str()) {
+                return Err(Error::DuplicateMemberKey(member.key.clone()));
+            }
+        }
         let manifest = Manifest {
             group_id: self.id.clone(),
             members,
@@ -292,13 +349,16 @@ impl<'a, R: StepRunner, H: TerminalHook> RunGroup<'a, R, H> {
         self.submit_members(manifest.members, spec).await
     }
 
-    /// [`Self::submit`] from the stored manifest.
-    pub(crate) async fn resume(&self, spec: &MemberSpec) -> Result<()> {
+    /// Submit the members of the group's manifest whose last recorded
+    /// termination is not a success: a member still active continues,
+    /// and the rest run. Returns [`Error::GroupNotFound`] for a group
+    /// never submitted. `spec` applies as in [`submit`](Self::submit).
+    pub async fn resume(&self, spec: &MemberSpec) -> Result<()> {
         let manifest = self.manifest().await?;
         self.submit_members(manifest.members, spec).await
     }
 
-    async fn submit_members(&self, members: Vec<ManifestMember>, spec: &MemberSpec) -> Result<()> {
+    async fn submit_members(&self, members: Vec<GroupMember>, spec: &MemberSpec) -> Result<()> {
         let succeeded: std::collections::HashSet<String> = self
             .members()
             .await?
@@ -371,6 +431,87 @@ impl<'a, R: StepRunner, H: TerminalHook> RunGroup<'a, R, H> {
         Ok(waits.chain(marker))
     }
 
+    /// The members' results as each one terminates, in completion
+    /// order; a member already terminated is yielded at once. Returns
+    /// [`Error::GroupNotFound`] for a group never submitted.
+    pub async fn results(
+        &self,
+    ) -> Result<impl Stream<Item = Result<MemberResult>> + use<'a, R, H>> {
+        let terminations = self.terminations().await?;
+        let group = self.clone();
+        Ok(terminations.then(move |member| {
+            let group = group.clone();
+            async move {
+                let member = member?;
+                let outcome = group.recorded_result(&member).await?;
+                let termination = member
+                    .record
+                    .terminated
+                    .ok_or_else(|| Error::InconsistentRunState(member.record.run_id.clone()))?;
+                Ok(MemberResult {
+                    key: member.key,
+                    run_id: member.record.run_id,
+                    termination: termination.into(),
+                    outcome: outcome.map(|result| result.outcome),
+                })
+            }
+        }))
+    }
+
+    /// The run result record of a terminated member, when the worker
+    /// that terminated it wrote one. The record's status must match the
+    /// member record's: a record outlives a re-submission of the member
+    /// until the next termination overwrites it.
+    pub(crate) async fn recorded_result(&self, member: &MemberState) -> Result<Option<RunResult>> {
+        Ok(self
+            .core()
+            .run_result(&member.record.run_id)
+            .await?
+            .filter(|result| Some(result.outcome.status) == member.status()))
+    }
+
+    /// The group's durable state. Returns [`Error::GroupNotFound`] for a
+    /// group never submitted.
+    pub async fn status(&self) -> Result<GroupStatus> {
+        let manifest = self.manifest().await?;
+        let mut status = GroupStatus {
+            group_id: self.id.clone(),
+            total: manifest.members.len(),
+            pending: 0,
+            succeeded: 0,
+            failed: 0,
+            cancelled: 0,
+        };
+        for member in self.members().await? {
+            match member.status() {
+                None => status.pending += 1,
+                Some(TerminalStatus::Succeeded) => status.succeeded += 1,
+                Some(TerminalStatus::Failed) => status.failed += 1,
+                Some(TerminalStatus::Cancelled) => status.cancelled += 1,
+            }
+        }
+        Ok(status)
+    }
+
+    /// Request cancellation of every active member, as
+    /// [`WorkflowRuntime::cancel`] does for one run. Returns the number
+    /// of members whose request was recorded.
+    pub async fn cancel(&self) -> Result<usize> {
+        let mut cancellations = stream::iter(
+            self.members()
+                .await?
+                .into_iter()
+                .filter(|member| member.status().is_none()),
+        )
+        .map(|member| async move { self.runtime.cancel(&member.record.run_id).await })
+        .buffer_unordered(SUBMIT_CONCURRENCY);
+        let mut cancelled = 0;
+        while let Some(recorded) = cancellations.try_next().await? {
+            cancelled += usize::from(recorded);
+        }
+        Ok(cancelled)
+    }
+
     /// Wait until the member `key` terminates and return its record.
     async fn wait_member(&self, key: &str) -> Result<DurableMember> {
         let core = self.core();
@@ -417,8 +558,9 @@ impl<'a, R: StepRunner, H: TerminalHook> RunGroup<'a, R, H> {
     }
 
     /// Remove the group's state: its manifest, member records and the
-    /// memo entries and run result records of its members.
-    pub(crate) async fn forget(&self) -> Result<()> {
+    /// memo entries and run result records of its members. A later
+    /// [`submit`](Self::submit) under the same id starts from nothing.
+    pub async fn forget(&self) -> Result<()> {
         self.store().forget(&self.id).await
     }
 }
@@ -471,8 +613,8 @@ mod tests {
         }
     }
 
-    fn member(key: &str) -> ManifestMember {
-        ManifestMember {
+    fn member(key: &str) -> GroupMember {
+        GroupMember {
             key: key.to_string(),
             input: key.as_bytes().to_vec(),
         }
@@ -494,37 +636,40 @@ mod tests {
         assert!(pending.iter().all(|m| m.status().is_none()));
         assert_eq!(pending[0].record.run_id, member_run_id("g", "a"));
 
+        assert!(matches!(
+            group.submit(vec![member("a"), member("a")], &MemberSpec::default()).await,
+            Err(Error::DuplicateMemberKey(key)) if key == "a"
+        ));
+
         let worker = runtime.spawn(std::future::pending::<()>());
-        let terminated: Vec<MemberState> = tokio::time::timeout(Duration::from_secs(10), async {
-            group.terminations().await.unwrap().try_collect().await
+        let terminated: Vec<MemberResult> = tokio::time::timeout(Duration::from_secs(10), async {
+            group.results().await.unwrap().try_collect().await
         })
         .await
-        .expect("terminations finished in time")
+        .expect("results finished in time")
         .unwrap();
         assert_eq!(terminated.len(), 2);
         for m in &terminated {
-            assert_eq!(m.status(), Some(TerminalStatus::Succeeded));
-            let termination = m.record.terminated.as_ref().unwrap();
+            assert_eq!(m.termination.status, TerminalStatus::Succeeded);
+            let outcome = m.outcome.as_ref().expect("the worker recorded the outcome");
+            assert_eq!(outcome.run_id, m.run_id);
             assert_eq!(
-                termination.final_step, 1,
+                outcome.final_step, 1,
                 "the member terminated at its second step"
             );
+            assert_eq!(outcome.result.as_deref(), Some(b"1".as_slice()));
         }
+        let status = group.status().await.unwrap();
+        assert_eq!((status.total, status.succeeded, status.pending), (2, 2, 0));
 
         // A member already terminated is yielded again at once.
-        let again: Vec<MemberState> = group
-            .terminations()
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
+        let again: Vec<MemberResult> = group.results().await.unwrap().try_collect().await.unwrap();
         assert_eq!(again.len(), 2);
         worker.shutdown().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_external_cancellation_records_the_member_cancelled() {
+    async fn a_group_cancellation_records_the_member_cancelled() {
         let (queue, store, _clock) = open_queue_at(10_000).await;
         let runtime =
             WorkflowRuntime::builder(queue.clone(), store, TwoSteps, NoopTerminalHook).build();
@@ -534,18 +679,23 @@ mod tests {
             .await
             .unwrap();
         let run_id = member_run_id("g", "a");
-        assert!(runtime.cancel(&run_id).await.unwrap());
+        assert_eq!(group.cancel().await.unwrap(), 1);
+        assert_eq!(group.cancel().await.unwrap(), 0, "no member is active");
 
-        let members = group.members().await.unwrap();
-        assert_eq!(members[0].status(), Some(TerminalStatus::Cancelled));
+        let results: Vec<MemberResult> =
+            group.results().await.unwrap().try_collect().await.unwrap();
+        assert_eq!(results[0].run_id, run_id);
         assert_eq!(
-            members[0]
-                .record
-                .terminated
-                .as_ref()
-                .unwrap()
-                .terminated_at_ms,
-            10_000
+            results[0].termination,
+            RunTermination {
+                status: TerminalStatus::Cancelled,
+                error: None,
+                terminated_at_ms: 10_000,
+            }
+        );
+        assert!(
+            results[0].outcome.is_none(),
+            "a pending step is cancelled without a worker, so no result is recorded",
         );
 
         // The cancelled member is submitted again; a member is grouped by

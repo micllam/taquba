@@ -299,13 +299,15 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
         self
     }
 
-    /// Remove a group's state (its manifest, member records and the
-    /// memo entries of its members) `retention` after every member of
-    /// the group terminated. When unset (default), no group terminal
-    /// marker is written and a group is retained until it is forgotten.
+    /// Remove a [`RunGroup`]'s state (its manifest, member records and
+    /// the memo entries of its members) `retention` after every member
+    /// of the group terminated, through a sweep when the worker starts
+    /// and on every retention interval after that. When unset (default),
+    /// no group terminal marker is written and a group is retained until
+    /// [`RunGroup::forget`].
     ///
     /// Panics if `retention < 1ms`.
-    pub(crate) fn group_retention(mut self, retention: Duration) -> Self {
+    pub fn group_retention(mut self, retention: Duration) -> Self {
         assert!(
             retention >= Duration::from_millis(1),
             "group_retention must be at least 1ms",
@@ -497,16 +499,17 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         self.enqueue_run(&run_id, spec, Some(membership)).await
     }
 
-    /// The group named `id`; [`Error::InvalidGroupId`] for an id outside
-    /// the run id rules.
-    pub(crate) fn group(&self, id: impl Into<String>) -> Result<RunGroup<'_, R, H>> {
+    /// The group named `id`, which must be 1 to
+    /// [`MAX_RUN_ID_LEN`](crate::MAX_RUN_ID_LEN) bytes of `[A-Za-z0-9_-]`;
+    /// [`Error::InvalidGroupId`] otherwise.
+    pub fn group(&self, id: impl Into<String>) -> Result<RunGroup<'_, R, H>> {
         let id = id.into();
         validate_run_id(&id).map_err(|_| Error::InvalidGroupId(id.clone()))?;
         Ok(RunGroup::new(self, id))
     }
 
     /// A group with a generated id.
-    pub(crate) fn new_group(&self) -> RunGroup<'_, R, H> {
+    pub fn new_group(&self) -> RunGroup<'_, R, H> {
         RunGroup::new(self, ulid::Ulid::new().to_string())
     }
 
@@ -1264,7 +1267,7 @@ mod tests {
     use super::*;
     use crate::durable::DurableMember;
     use crate::effects::{EffectsHandle, TerminalEffects};
-    use crate::group::{ManifestMember, MemberSpec};
+    use crate::group::{GroupMember, MemberSpec};
     use crate::keys::{MAX_RUN_ID_LEN, group_member_kv_key};
     use crate::keys::{
         TERMINAL_KV_PREFIX, parse_timestamped_kv_key, signal_buf_kv_key, signal_wait_kv_key,
@@ -4197,7 +4200,7 @@ mod tests {
         let group = runtime.group("g").unwrap();
         group
             .submit(
-                vec![ManifestMember {
+                vec![GroupMember {
                     key: "m".to_string(),
                     input: Vec::new(),
                 }],

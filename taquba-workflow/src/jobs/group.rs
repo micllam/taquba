@@ -7,15 +7,15 @@ use std::sync::Arc;
 
 use futures_util::{Stream, StreamExt, TryStreamExt};
 
-use crate::group::{ManifestMember, MemberSpec, MemberState, RunGroup};
+use crate::group::{GroupMember, GroupStatus, MemberSpec, MemberState, RunGroup};
 use crate::jobs::handle::{JobError, decode_result};
 use crate::jobs::job::Job;
 use crate::jobs::runner::{Dispatch, Inner, SubmitOptions, job_payload};
 use crate::terminal::{NoopTerminalHook, TerminalStatus};
-use crate::{Error, Result, StepErrorKind};
+use crate::{Result, StepErrorKind};
 
-/// A group of jobs of one type, identified by a group id. Obtained from
-/// [`JobRunner::group`](crate::jobs::JobRunner::group) or
+/// A [`RunGroup`] of jobs of one type, identified by a group id.
+/// Obtained from [`JobRunner::group`](crate::jobs::JobRunner::group) or
 /// [`JobRunner::new_group`](crate::jobs::JobRunner::new_group).
 ///
 /// The group's members are identified by key: a job's
@@ -24,31 +24,13 @@ use crate::{Error, Result, StepErrorKind};
 /// key, so the same job submitted to two groups runs twice, and a
 /// second [`submit`](Self::submit) of the group runs again every member
 /// that did not succeed. The group's membership is a durable manifest,
-/// so [`join`](Self::join), [`status`](Self::status) and
-/// [`forget`](Self::forget) answer after a restart and from any runner
-/// over the same queue.
+/// so [`join`](Self::join), [`status`](Self::status),
+/// [`cancel`](Self::cancel) and [`forget`](Self::forget) answer after a
+/// restart and from any runner over the same queue.
 pub struct JobGroup<J: Job> {
     inner: Arc<Inner>,
     id: String,
     _marker: PhantomData<fn() -> J>,
-}
-
-/// The durable state of a job group, read from its manifest and member
-/// records by [`JobGroup::status`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GroupStatus {
-    /// The group id.
-    pub group_id: String,
-    /// Number of members in the group's manifest.
-    pub total: usize,
-    /// Members submitted and not yet terminated.
-    pub pending: usize,
-    /// Members whose last recorded outcome is a success.
-    pub succeeded: usize,
-    /// Members whose last recorded outcome is a failure.
-    pub failed: usize,
-    /// Members whose last recorded outcome is a cancellation.
-    pub cancelled: usize,
 }
 
 /// The result of one member of a job group, yielded by
@@ -87,13 +69,13 @@ impl<J: Job> JobGroup<J> {
         self.submit_with(jobs, SubmitOptions::default()).await
     }
 
-    /// Submit `jobs` as the group's members. The first submission
-    /// writes the group's manifest; a later one with a different member
-    /// set is rejected with [`Error::GroupMismatch`], and one with the
-    /// same set submits every member whose last recorded outcome is not
-    /// a success, so a group is re-submitted after a crash or to run its
-    /// failed members again. Two jobs with one key are rejected with
-    /// [`Error::DuplicateMemberKey`].
+    /// Submit `jobs` as the group's members, as [`RunGroup::submit`]
+    /// submits members: the first submission writes the group's
+    /// manifest, a later one with a different member set is rejected
+    /// with [`Error::GroupMismatch`](crate::Error::GroupMismatch), one with the same set submits
+    /// every member whose last recorded termination is not a success
+    /// and two jobs with one key are rejected with
+    /// [`Error::DuplicateMemberKey`](crate::Error::DuplicateMemberKey).
     ///
     /// `opts` applies to every member; [`Job::max_attempts`] is not
     /// consulted, so set [`SubmitOptions::max_attempts`] for a limit
@@ -103,15 +85,10 @@ impl<J: Job> JobGroup<J> {
         jobs: impl IntoIterator<Item = J>,
         opts: SubmitOptions,
     ) -> Result<()> {
-        let mut seen = std::collections::HashSet::new();
         let mut members = Vec::new();
         for (i, job) in jobs.into_iter().enumerate() {
-            let key = job.idempotency_key().unwrap_or_else(|| format!("item-{i}"));
-            if !seen.insert(key.clone()) {
-                return Err(Error::DuplicateMemberKey(key));
-            }
-            members.push(ManifestMember {
-                key,
+            members.push(GroupMember {
+                key: job.idempotency_key().unwrap_or_else(|| format!("item-{i}")),
                 input: job_payload(&job)?,
             });
         }
@@ -132,9 +109,8 @@ impl<J: Job> JobGroup<J> {
     }
 
     /// Submit the members of the group's manifest whose last recorded
-    /// outcome is not a success, without the jobs: a member still active
-    /// continues, and the rest run. Returns [`Error::GroupNotFound`] for
-    /// a group never submitted. `opts` applies as in
+    /// termination is not a success, without the jobs; see
+    /// [`RunGroup::resume`]. `opts` applies as in
     /// [`submit_with`](Self::submit_with).
     pub async fn resume_with(&self, opts: SubmitOptions) -> Result<()> {
         let spec = MemberSpec {
@@ -150,7 +126,7 @@ impl<J: Job> JobGroup<J> {
     /// order; a member already terminated is yielded at once. A member
     /// that terminated without a run result record (cancelled, or
     /// dead-lettered outside its handler) is reported as a transient
-    /// [`JobError`]. Returns [`Error::GroupNotFound`] for a group never
+    /// [`JobError`]. Returns [`Error::GroupNotFound`](crate::Error::GroupNotFound) for a group never
     /// submitted.
     pub async fn results(&self) -> Result<impl Stream<Item = Result<GroupResult<J>>> + '_> {
         let terminations = self.group().terminations().await?;
@@ -191,9 +167,7 @@ impl<J: Job> JobGroup<J> {
         &self,
         member: &MemberState,
     ) -> Result<std::result::Result<J::Output, JobError>> {
-        if let Some(result) = self.inner.run_result(&member.record.run_id).await?
-            && Some(result.outcome.status) == member.status()
-        {
+        if let Some(result) = self.group().recorded_result(member).await? {
             return decode_result::<J>(result);
         }
         let message = match member.status() {
@@ -211,33 +185,18 @@ impl<J: Job> JobGroup<J> {
         }))
     }
 
-    /// The group's durable state. Returns [`Error::GroupNotFound`] for a
-    /// group never submitted.
+    /// The group's durable state; see [`RunGroup::status`].
     pub async fn status(&self) -> Result<GroupStatus> {
-        let group = self.group();
-        let manifest = group.manifest().await?;
-        let mut status = GroupStatus {
-            group_id: self.id.clone(),
-            total: manifest.members.len(),
-            pending: 0,
-            succeeded: 0,
-            failed: 0,
-            cancelled: 0,
-        };
-        for member in group.members().await? {
-            match member.status() {
-                None => status.pending += 1,
-                Some(TerminalStatus::Succeeded) => status.succeeded += 1,
-                Some(TerminalStatus::Failed) => status.failed += 1,
-                Some(TerminalStatus::Cancelled) => status.cancelled += 1,
-            }
-        }
-        Ok(status)
+        self.group().status().await
     }
 
-    /// Remove the group's state: its manifest, member records and the
-    /// memo entries and run result records of its members. A later
-    /// [`submit`](Self::submit) under the same id starts from nothing.
+    /// Request cancellation of every active member; see
+    /// [`RunGroup::cancel`].
+    pub async fn cancel(&self) -> Result<usize> {
+        self.group().cancel().await
+    }
+
+    /// Remove the group's state; see [`RunGroup::forget`].
     pub async fn forget(&self) -> Result<()> {
         self.group().forget().await
     }

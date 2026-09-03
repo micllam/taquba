@@ -326,6 +326,29 @@ through every step and reach the terminal hook on `RunOutcome::headers`.
 | `workflow.run_id` | Run identifier. |
 | `workflow.step` | Zero-based step number. |
 
+## Run groups
+
+A `RunGroup` is a durable set of runs of one runtime, identified by a
+group id: `WorkflowRuntime::group` names it, `RunGroup::submit` writes
+its manifest (the members' keys and inputs) and submits the members,
+`RunGroup::results` yields each member's `MemberResult` (its termination
+and, when a worker recorded one, its `RunOutcome`) as it terminates,
+`RunGroup::cancel` cancels every active member and `RunGroup::status`
+counts the members by state. A member's run id is derived from the group
+id and its key, so groups never share run state. A second submission of
+the same set, or `RunGroup::resume` from the manifest alone, runs again
+only the members that did not succeed, which is how a step that fans out
+stays safe under a retry and how a batch of inputs is run again after a
+partial failure.
+
+The group's durable state is the manifest in the object store and one
+member record per key under `workflow/groups/` in the queue's key-value
+namespace, written with the member's submission and rewritten with its
+status and error by the settlement that terminates it.
+`RunGroup::forget` removes it and `WorkflowRuntimeBuilder::group_retention`
+removes it a window after the members all terminated, through a sweep
+over `workflow/group-terminals/`.
+
 ## Typed jobs
 
 The `jobs` module runs one typed async function as a single-step run and
@@ -365,27 +388,14 @@ worker.shutdown().await?;
 
 ## Job groups
 
-A `JobGroup` submits many jobs of one type as one durable set:
-`JobRunner::group` names it, `JobGroup::submit` writes its manifest (the
-members' keys and inputs) and submits the members, `JobGroup::results`
-yields each member's typed result as it terminates and `JobGroup::join`
-returns them in submission order. Members are keyed by the job's
-idempotency key or the positional `item-{i}`, and a member's job id is
-derived from the group id and its key, so groups never share run state.
-A second submission of the same set, or `JobGroup::resume` from the
-manifest alone, runs again only the members that did not succeed, which
-is how a step that fans out stays safe under a retry and how a batch of
-inputs is run again after a partial failure.
-
-The group's durable state is the manifest in the object store and one
-member record per key under `workflow/groups/` in the queue's key-value
-namespace, written with the member's submission and rewritten with its
-status and error by the settlement that terminates it; `JobGroup::status`
-reads it, `JobGroup::forget` removes it and
-`JobRunnerBuilder::group_retention` removes it a window after the members
-all terminated, through a sweep over `workflow/group-terminals/`.
-Streamed output, progress, a failure threshold and a cost rollup are
-folds the caller writes over the results;
+A `JobGroup` is a [run group](#run-groups) of jobs of one type:
+`JobRunner::group` names it, `JobGroup::submit` takes the jobs, keyed by
+the job's idempotency key or the positional `item-{i}`,
+`JobGroup::results` yields each member's typed result as it terminates
+and `JobGroup::join` returns them in submission order; `resume`,
+`status`, `cancel`, `forget` and `JobRunnerBuilder::group_retention` are
+the run group's. Streamed output, progress, a failure threshold and a
+cost rollup are folds the caller writes over the results;
 [`examples/group_document_pipeline.rs`](examples/group_document_pipeline.rs)
 shows a per-document pipeline of memoized stages with counters rolled up
 by the caller.

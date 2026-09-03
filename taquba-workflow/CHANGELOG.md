@@ -34,6 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GroupMismatch`, `GroupNotFound` and `InvalidGroupId` are its errors.
 - `HEADER_GROUP` and `HEADER_GROUP_KEY`: the reserved headers naming a
   grouped run's group and member key on its step jobs.
+- `RunGroup`: many runs of one runtime submitted as one durable set
+  (`WorkflowRuntime::group`, `WorkflowRuntime::new_group`,
+  `RunGroup::submit` with `GroupMember` and `MemberSpec`, `resume`,
+  `results` yielding a `MemberResult` per member as it terminates,
+  `status` as a `GroupStatus`, `cancel` and `forget`), the mechanism
+  under `jobs::JobGroup`, which gains `cancel`;
+  `WorkflowRuntimeBuilder::group_retention` removes a group's state a
+  window after its members terminated.
 - `WorkflowRuntime::outcome`: the committed `RunOutcome` of a terminated
   run, read from the run result record the worker writes to the run's
   memo under the reserved key `workflow.outcome` before every
