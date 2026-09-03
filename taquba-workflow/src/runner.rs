@@ -342,7 +342,7 @@ impl StepOutcome {
 }
 
 /// Failure outcomes the runner can return.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StepError {
     /// Human-readable message recorded on the underlying job's `last_error`.
     pub message: String,

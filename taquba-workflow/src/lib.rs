@@ -588,6 +588,8 @@ mod runtime;
 mod signal;
 mod sweep;
 mod terminal;
+#[cfg(test)]
+mod test_util;
 mod worker;
 
 pub use effects::{EffectsHandle, TerminalEffects};

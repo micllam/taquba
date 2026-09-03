@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Step::detached(payload)` step 0 over it, for tests.
 - `Delivery::is_last_attempt`: whether a transient `StepError` from this
   attempt dead-letters the step.
+- `StepError` implements `Clone`.
 
 ### Removed
 

@@ -1045,6 +1045,9 @@ mod tests {
     use crate::signal::SignalOutcome;
     use crate::terminal::NoopTerminalHook;
     use crate::terminal::TerminalStatus;
+    use crate::test_util::{
+        advance, fast_options, open_queue, open_queue_at, open_queue_at_with, open_queue_with,
+    };
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicU32, Ordering};
     use taquba::object_store::memory::InMemory;
@@ -1087,6 +1090,113 @@ mod tests {
         }
     }
 
+    /// Runner that returns a clone of `result` on every step and counts
+    /// its calls.
+    struct FixedRunner {
+        result: std::result::Result<StepOutcome, StepError>,
+        calls: Arc<AtomicU32>,
+    }
+
+    impl FixedRunner {
+        fn new(result: std::result::Result<StepOutcome, StepError>) -> Self {
+            Self {
+                result,
+                calls: Arc::new(AtomicU32::new(0)),
+            }
+        }
+    }
+
+    impl StepRunner for FixedRunner {
+        async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.result.clone()
+        }
+    }
+
+    /// Runner whose step never returns.
+    struct PauseRunner;
+
+    impl StepRunner for PauseRunner {
+        async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
+            std::future::pending().await
+        }
+    }
+
+    /// Runner whose step must not be claimed.
+    struct UnreachableRunner;
+
+    impl StepRunner for UnreachableRunner {
+        async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
+            unreachable!("worker must not claim the step");
+        }
+    }
+
+    /// Runner that reports the claim of its step, holds the step until
+    /// its [`Gate`] is released and then returns a clone of `result`.
+    struct GatedRunner {
+        claimed: Arc<tokio::sync::Notify>,
+        release: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        result: std::result::Result<StepOutcome, StepError>,
+        calls: Arc<AtomicU32>,
+    }
+
+    /// The test's side of a [`GatedRunner`].
+    struct Gate {
+        claimed: Arc<tokio::sync::Notify>,
+        release: StdMutex<Option<oneshot::Sender<()>>>,
+        calls: Arc<AtomicU32>,
+    }
+
+    impl GatedRunner {
+        fn new(result: std::result::Result<StepOutcome, StepError>) -> (Self, Gate) {
+            let claimed = Arc::new(tokio::sync::Notify::new());
+            let calls = Arc::new(AtomicU32::new(0));
+            let (release_tx, release_rx) = oneshot::channel();
+            let runner = Self {
+                claimed: claimed.clone(),
+                release: tokio::sync::Mutex::new(Some(release_rx)),
+                result,
+                calls: calls.clone(),
+            };
+            let gate = Gate {
+                claimed,
+                release: StdMutex::new(Some(release_tx)),
+                calls,
+            };
+            (runner, gate)
+        }
+    }
+
+    impl StepRunner for GatedRunner {
+        async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.claimed.notify_one();
+            let rx = self
+                .release
+                .lock()
+                .await
+                .take()
+                .expect("gate consumed twice");
+            let _ = rx.await;
+            self.result.clone()
+        }
+    }
+
+    impl Gate {
+        /// Wait until the runner holds the step.
+        async fn claimed(&self) {
+            tokio::time::timeout(Duration::from_secs(2), self.claimed.notified())
+                .await
+                .expect("runner reached gate");
+        }
+
+        fn release(&self) {
+            if let Some(tx) = self.release.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
     /// Every terminal marker in the queue's KV namespace, as
     /// `(run_id, terminal_at_ms)` pairs in key order (oldest first).
     async fn terminal_markers(queue: &Queue) -> Vec<(String, u64)> {
@@ -1100,82 +1210,6 @@ mod tests {
                 parse_timestamped_kv_key(TERMINAL_KV_PREFIX, key).expect("well-formed marker key")
             })
             .collect()
-    }
-
-    async fn fresh_queue() -> (Arc<Queue>, Arc<dyn taquba::object_store::ObjectStore>) {
-        let store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
-        let queue = Arc::new(Queue::open(store.clone(), "test").await.unwrap());
-        (queue, store)
-    }
-
-    /// Queue + object store + a [`MockClock`] wired into the queue. Use
-    /// [`advance`] to move both the mock clock and tokio's paused time
-    /// in lockstep.
-    async fn fresh_queue_with_mock_clock(
-        initial_ms: u64,
-    ) -> (
-        Arc<Queue>,
-        Arc<dyn taquba::object_store::ObjectStore>,
-        MockClock,
-    ) {
-        let clock = MockClock::new(initial_ms);
-        let opts = OpenOptions::default().clock(Arc::new(clock.clone()));
-        let store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
-        let queue = Arc::new(
-            Queue::open_with_options(store.clone(), "test", opts)
-                .await
-                .unwrap(),
-        );
-        (queue, store, clock)
-    }
-
-    /// Advance both a [`MockClock`] and tokio's paused time by `by`, so
-    /// timestamp reads and `tokio::time::sleep` / `interval` move
-    /// together in tests.
-    async fn advance(clock: &MockClock, by: Duration) {
-        clock.advance(by);
-        tokio::time::advance(by).await;
-    }
-
-    /// [`fresh_queue_fast_retry`] with a [`MockClock`] wired in, for
-    /// multi-attempt tests that read the clock's value as well as
-    /// depending on retries being prompt.
-    async fn fresh_queue_fast_retry_with_mock_clock(
-        initial_ms: u64,
-    ) -> (
-        Arc<Queue>,
-        Arc<dyn taquba::object_store::ObjectStore>,
-        MockClock,
-    ) {
-        let clock = MockClock::new(initial_ms);
-        let opts = OpenOptions::default()
-            .clock(Arc::new(clock.clone()))
-            .default_queue_config(QueueConfig::default().retry_backoff_base(Duration::ZERO))
-            .reaper_interval(Duration::from_millis(50))
-            .scheduler_interval(Duration::from_millis(50));
-        let store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
-        let queue = Arc::new(
-            Queue::open_with_options(store.clone(), "test", opts)
-                .await
-                .unwrap(),
-        );
-        (queue, store, clock)
-    }
-
-    /// Queue with zero retry backoff and a tight reaper, so multi-attempt
-    /// tests run in well under a second.
-    async fn fresh_queue_fast_retry() -> (Arc<Queue>, Arc<dyn taquba::object_store::ObjectStore>) {
-        let opts = OpenOptions::default()
-            .default_queue_config(QueueConfig::default().retry_backoff_base(Duration::ZERO))
-            .reaper_interval(Duration::from_millis(50))
-            .scheduler_interval(Duration::from_millis(50));
-        let store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
-        let queue = Arc::new(
-            Queue::open_with_options(store.clone(), "test", opts)
-                .await
-                .unwrap(),
-        );
-        (queue, store)
     }
 
     fn spawn_runtime<R, H>(runtime: WorkflowRuntime<R, H>) -> oneshot::Sender<()>
@@ -1218,7 +1252,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_step_runner_extends_its_lease_through_the_step() {
         let base = 1_700_000_000_000;
-        let (queue, store, _clock) = fresh_queue_with_mock_clock(base).await;
+        let (queue, store, _clock) = open_queue_at(base).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (hook_tx, mut hook_rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
@@ -1256,7 +1290,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn single_step_succeeds_and_fires_hook() {
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue,
@@ -1292,7 +1326,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn multi_step_run_advances_through_continue() {
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue,
@@ -1332,7 +1366,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn continue_after_delays_next_step_until_promotion() {
         let initial = 1_700_000_000_000u64;
-        let (queue, store, clock) = fresh_queue_with_mock_clock(initial).await;
+        let (queue, store, clock) = open_queue_at(initial).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -1443,7 +1477,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn signal_wakes_waiting_run_early_with_payload() {
-        let (queue, store, _clock) = fresh_queue_with_mock_clock(1_700_000_000_000).await;
+        let (queue, store, _clock) = open_queue_at(1_700_000_000_000).await;
         let (runtime, observed, mut rx) =
             signal_probe_runtime(queue.clone(), store, "order-1", Duration::from_secs(3600));
         let shutdown = spawn_runtime(runtime.clone());
@@ -1567,7 +1601,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn signal_timeout_delivers_none() {
-        let (queue, store, clock) = fresh_queue_with_mock_clock(1_700_000_000_000).await;
+        let (queue, store, clock) = open_queue_at(1_700_000_000_000).await;
         let (runtime, observed, mut rx) =
             signal_probe_runtime(queue.clone(), store, "order-2", Duration::from_secs(60));
         let shutdown = spawn_runtime(runtime.clone());
@@ -1604,7 +1638,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn signal_before_waiter_is_buffered_and_consumed_at_registration() {
-        let (queue, store, _clock) = fresh_queue_with_mock_clock(1_700_000_000_000).await;
+        let (queue, store, _clock) = open_queue_at(1_700_000_000_000).await;
         let (runtime, observed, mut rx) =
             signal_probe_runtime(queue.clone(), store, "order-3", Duration::from_secs(3600));
         let shutdown = spawn_runtime(runtime.clone());
@@ -1645,7 +1679,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn second_signal_before_consumption_replaces_first() {
-        let (queue, store, _clock) = fresh_queue_with_mock_clock(1_700_000_000_000).await;
+        let (queue, store, _clock) = open_queue_at(1_700_000_000_000).await;
         let (runtime, observed, mut rx) =
             signal_probe_runtime(queue.clone(), store, "order-4", Duration::from_secs(3600));
         let shutdown = spawn_runtime(runtime.clone());
@@ -1682,7 +1716,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn clear_signal_discards_buffered_signal() {
-        let (queue, store, _clock) = fresh_queue_with_mock_clock(1_700_000_000_000).await;
+        let (queue, store, _clock) = open_queue_at(1_700_000_000_000).await;
         let (runtime, _observed, _rx) =
             signal_probe_runtime(queue.clone(), store, "order-5", Duration::from_secs(60));
 
@@ -1703,7 +1737,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn duplicate_waiter_registration_fails_the_run() {
-        let (queue, store, _clock) = fresh_queue_with_mock_clock(1_700_000_000_000).await;
+        let (queue, store, _clock) = open_queue_at(1_700_000_000_000).await;
         let (runtime, _observed, mut rx) =
             signal_probe_runtime(queue.clone(), store, "order-6", Duration::from_secs(3600));
         let shutdown = spawn_runtime(runtime.clone());
@@ -1758,7 +1792,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn buffered_signal_missed_by_the_wake_is_delivered_at_timeout() {
-        let (queue, store, clock) = fresh_queue_with_mock_clock(1_700_000_000_000).await;
+        let (queue, store, clock) = open_queue_at(1_700_000_000_000).await;
         let (runtime, observed, mut rx) =
             signal_probe_runtime(queue.clone(), store, "order-7", Duration::from_secs(60));
         let shutdown = spawn_runtime(runtime.clone());
@@ -1797,7 +1831,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cancelled_waiter_leaves_no_live_index_for_the_next_signal() {
-        let (queue, store, _clock) = fresh_queue_with_mock_clock(1_700_000_000_000).await;
+        let (queue, store, _clock) = open_queue_at(1_700_000_000_000).await;
         let (runtime, _observed, mut rx) =
             signal_probe_runtime(queue.clone(), store, "order-8", Duration::from_secs(3600));
         let shutdown = spawn_runtime(runtime.clone());
@@ -1836,19 +1870,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn permanent_failure_dead_letters_and_fires_hook() {
-        struct FailingRunner;
-        impl StepRunner for FailingRunner {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                Err(StepError::permanent("nope"))
-            }
-        }
-
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store.clone(),
-            FailingRunner,
+            FixedRunner::new(Err(StepError::permanent("nope"))),
             ChannelHook { tx },
         )
         .build();
@@ -1882,18 +1909,15 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_failure_notification_inherits_the_step_limits() {
-        struct FailingRunner;
-        impl StepRunner for FailingRunner {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                Err(StepError::permanent("nope"))
-            }
-        }
-
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime =
-            WorkflowRuntime::builder(queue.clone(), store, FailingRunner, ChannelHook { tx })
-                .build();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            FixedRunner::new(Err(StepError::permanent("nope"))),
+            ChannelHook { tx },
+        )
+        .build();
         runtime
             .submit(RunSpec {
                 input: b"x".to_vec(),
@@ -1928,21 +1952,15 @@ mod tests {
         // infrastructure error: the hook fires with Failed, but the step
         // is acked normally so no dead job is left behind for operators
         // to inspect.
-        struct VerdictRunner;
-        impl StepRunner for VerdictRunner {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                Ok(StepOutcome::Fail {
-                    reason: "agent declined the task".to_string(),
-                })
-            }
-        }
 
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store.clone(),
-            VerdictRunner,
+            ScriptedRunner::new(vec![StepOutcome::Fail {
+                reason: "agent declined the task".to_string(),
+            }]),
             ChannelHook { tx },
         )
         .build();
@@ -1978,14 +1996,8 @@ mod tests {
     async fn duplicate_submit_in_process_is_idempotent_and_rejects_a_changed_input() {
         // Pause forever on the first step so the run stays active while
         // we attempt the duplicate submit.
-        struct PauseRunner;
-        impl StepRunner for PauseRunner {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                std::future::pending().await
-            }
-        }
 
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let runtime =
             WorkflowRuntime::builder(queue, store.clone(), PauseRunner, NoopTerminalHook).build();
         let shutdown = spawn_runtime(runtime.clone());
@@ -2036,7 +2048,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_duplicate_known_only_from_the_durable_record_reports_the_current_job() {
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         // Step 0 continues into a step scheduled an hour out, so the run
         // rests at step 1 with a job the second runtime never saw.
@@ -2108,7 +2120,7 @@ mod tests {
         }
 
         let t0 = 1_700_000_000_000;
-        let (queue, store, clock) = fresh_queue_with_mock_clock(t0).await;
+        let (queue, store, clock) = open_queue_at(t0).await;
         let runtime =
             WorkflowRuntime::builder(queue.clone(), store, Echo, NoopTerminalHook).build();
         let shutdown = spawn_runtime(runtime.clone());
@@ -2153,7 +2165,7 @@ mod tests {
         }
 
         let seen = Arc::new(std::sync::Mutex::new(None));
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store,
@@ -2180,14 +2192,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn concurrent_submits_of_one_run_admit_one_and_reject_a_changed_input() {
-        struct PauseRunner;
-        impl StepRunner for PauseRunner {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                std::future::pending().await
-            }
-        }
-
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let runtime =
             WorkflowRuntime::builder(queue, store.clone(), PauseRunner, NoopTerminalHook).build();
         let spec = |input: &[u8]| RunSpec {
@@ -2216,14 +2221,8 @@ mod tests {
         // keeping the underlying Queue alive. The next runtime instance
         // must treat a re-submit as idempotent because the durable run
         // record persists through the enqueue_with_kv path.
-        struct PauseRunner;
-        impl StepRunner for PauseRunner {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                std::future::pending().await
-            }
-        }
 
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
 
         // Submit via the first runtime, drop it without starting its
         // worker loop or going terminal.
@@ -2284,7 +2283,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn reserved_header_on_submit_is_rejected() {
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let runtime: WorkflowRuntime<ScriptedRunner, NoopTerminalHook> = WorkflowRuntime::builder(
             queue,
             store.clone(),
@@ -2311,7 +2310,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn user_headers_thread_through_to_terminal_hook() {
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue,
@@ -2362,23 +2361,6 @@ mod tests {
         // gate while signalling shutdown to A so A enters drain mode without
         // ever claiming step 1. Then the gate is opened, A's spawned step-0
         // task finishes (enqueueing step 1 + acking step 0) and A exits.
-        struct GatedRunner {
-            gate: tokio::sync::Mutex<Option<oneshot::Receiver<Vec<u8>>>>,
-        }
-
-        impl StepRunner for GatedRunner {
-            async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                match step.step_number {
-                    0 => {
-                        let rx = self.gate.lock().await.take().expect("gate consumed twice");
-                        let payload = rx.await.expect("gate sender dropped");
-                        Ok(StepOutcome::continue_now(payload))
-                    }
-                    _ => std::future::pending().await,
-                }
-            }
-        }
-
         struct CompleteOnStep1;
         impl StepRunner for CompleteOnStep1 {
             async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
@@ -2390,19 +2372,14 @@ mod tests {
             }
         }
 
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
 
-        let (gate_tx, gate_rx) = oneshot::channel::<Vec<u8>>();
-        let runtime_a = WorkflowRuntime::builder(
-            queue.clone(),
-            store.clone(),
-            GatedRunner {
-                gate: tokio::sync::Mutex::new(Some(gate_rx)),
-            },
-            NoopTerminalHook,
-        )
-        .max_concurrent_steps(1)
-        .build();
+        let (runner, gate) =
+            GatedRunner::new(Ok(StepOutcome::continue_now(b"step1-payload".to_vec())));
+        let runtime_a =
+            WorkflowRuntime::builder(queue.clone(), store.clone(), runner, NoopTerminalHook)
+                .max_concurrent_steps(1)
+                .build();
 
         let (shutdown_a_tx, shutdown_a_rx) = oneshot::channel::<()>();
         let worker_a = {
@@ -2424,17 +2401,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Wait for runtime A to claim step 0 and reach the gate (status
-        // shows Running for step 0).
-        for _ in 0..80 {
-            if let Some(s) = runtime_a.status(&handle.run_id).await.unwrap()
-                && s.state == RunState::Running
-                && s.current_step == 0
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+        gate.claimed().await;
         let s = runtime_a
             .status(&handle.run_id)
             .await
@@ -2447,7 +2414,7 @@ mod tests {
         // first, then open the gate so step 0 finishes processing inside
         // drain mode (A will not claim step 1).
         let _ = shutdown_a_tx.send(());
-        let _ = gate_tx.send(b"step1-payload".to_vec());
+        gate.release();
 
         worker_a.await.expect("runtime A drained cleanly");
 
@@ -2482,23 +2449,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn step_output_replay_skips_runner_after_crash_before_ack() {
-        struct ContinueRunner {
-            calls: Arc<AtomicU32>,
-        }
-
-        impl StepRunner for ContinueRunner {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                Ok(StepOutcome::continue_now(b"step1-payload".to_vec()))
-            }
-        }
-
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let calls = Arc::new(AtomicU32::new(0));
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store.clone(),
-            ContinueRunner {
+            FixedRunner {
+                result: Ok(StepOutcome::continue_now(b"step1-payload".to_vec())),
                 calls: calls.clone(),
             },
             NoopTerminalHook,
@@ -2561,23 +2518,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn corrupt_step_output_replay_entry_falls_back_to_runner() {
-        struct ContinueRunner {
-            calls: Arc<AtomicU32>,
-        }
-
-        impl StepRunner for ContinueRunner {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                Ok(StepOutcome::continue_now(b"step1-payload".to_vec()))
-            }
-        }
-
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let calls = Arc::new(AtomicU32::new(0));
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store.clone(),
-            ContinueRunner {
+            FixedRunner {
+                result: Ok(StepOutcome::continue_now(b"step1-payload".to_vec())),
                 calls: calls.clone(),
             },
             NoopTerminalHook,
@@ -2630,26 +2577,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn step_output_replay_of_terminal_outcome_skips_runner() {
-        struct SucceedRunner {
-            calls: Arc<AtomicU32>,
-        }
-
-        impl StepRunner for SucceedRunner {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                Ok(StepOutcome::Succeed {
-                    result: b"final".to_vec(),
-                })
-            }
-        }
-
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let calls = Arc::new(AtomicU32::new(0));
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store.clone(),
-            SucceedRunner {
+            FixedRunner {
+                result: Ok(StepOutcome::Succeed {
+                    result: b"final".to_vec(),
+                }),
                 calls: calls.clone(),
             },
             ChannelHook { tx },
@@ -2713,23 +2650,14 @@ mod tests {
     /// propagation) and that the terminal hook fires Failed exactly once on
     /// the final attempt (fire-once-on-last-attempt logic).
     async fn assert_transient_retries_until_max(max_attempts: u32) {
-        struct AlwaysTransient {
-            calls: Arc<AtomicU32>,
-        }
-        impl StepRunner for AlwaysTransient {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                Err(StepError::transient("flaky"))
-            }
-        }
-
-        let (queue, store) = fresh_queue_fast_retry().await;
+        let (queue, store) = open_queue_with(fast_options()).await;
         let calls = Arc::new(AtomicU32::new(0));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store.clone(),
-            AlwaysTransient {
+            FixedRunner {
+                result: Err(StepError::transient("flaky")),
                 calls: calls.clone(),
             },
             ChannelHook { tx },
@@ -2793,21 +2721,15 @@ mod tests {
         // `StepOutcome::Cancel` is the runner's cancellation verdict path:
         // the hook fires with Cancelled, the step is acked, and no dead
         // job is left behind.
-        struct CancellingRunner;
-        impl StepRunner for CancellingRunner {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                Ok(StepOutcome::Cancel {
-                    reason: "upstream aborted".to_string(),
-                })
-            }
-        }
 
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store.clone(),
-            CancellingRunner,
+            ScriptedRunner::new(vec![StepOutcome::Cancel {
+                reason: "upstream aborted".to_string(),
+            }]),
             ChannelHook { tx },
         )
         .build();
@@ -2843,7 +2765,7 @@ mod tests {
         // the job's persisted `cancel_requested` survive while a fresh
         // runtime starts with no process state. The runner returns
         // Succeed, so a Cancelled outcome shows the request was read.
-        let (queue, store, _clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (queue, store, _clock) = open_queue_at(10_000).await;
         let (tx_a, _rx_a) = tokio::sync::mpsc::unbounded_channel();
         let before = WorkflowRuntime::builder(
             queue.clone(),
@@ -2915,7 +2837,7 @@ mod tests {
         // A request recorded after that read does not affect the
         // advancing settlement; it is read from the run record when the
         // next step is claimed, which is then settled without running.
-        let (queue, store, _clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (queue, store, _clock) = open_queue_at(10_000).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -2988,14 +2910,8 @@ mod tests {
         // Pending case: a run sits in the queue, we call `cancel()` before
         // any worker claims it. `cancel` removes the step job and enqueues
         // the notification before returning.
-        struct UnreachableRunner;
-        impl StepRunner for UnreachableRunner {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                unreachable!("worker must not claim the cancelled step");
-            }
-        }
 
-        let (queue, store, _clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (queue, store, _clock) = open_queue_at(10_000).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -3067,35 +2983,16 @@ mod tests {
     async fn cancel_during_running_step_overrides_outcome() {
         // Running case: the step is in-flight when cancel is called. The
         // runner's eventual outcome is discarded; the worker fires Cancelled.
-        struct GatedRunner {
-            claimed: Arc<tokio::sync::Notify>,
-            gate: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
-        }
-        impl StepRunner for GatedRunner {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                self.claimed.notify_one();
-                let rx = self.gate.lock().await.take().expect("gate consumed twice");
-                let _ = rx.await;
-                // The runner "successfully completes" the step, but cancel
-                // was requested mid-flight so the outcome should be ignored
-                // and the hook should fire Cancelled instead.
-                Ok(StepOutcome::Succeed {
-                    result: b"would-have-succeeded".to_vec(),
-                })
-            }
-        }
 
-        let (queue, store) = fresh_queue().await;
-        let claimed = Arc::new(tokio::sync::Notify::new());
-        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        let (queue, store) = open_queue().await;
+        let (runner, gate) = GatedRunner::new(Ok(StepOutcome::Succeed {
+            result: b"would-have-succeeded".to_vec(),
+        }));
         let (hook_tx, mut hook_rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store.clone(),
-            GatedRunner {
-                claimed: claimed.clone(),
-                gate: tokio::sync::Mutex::new(Some(gate_rx)),
-            },
+            runner,
             ChannelHook { tx: hook_tx },
         )
         .build();
@@ -3108,16 +3005,14 @@ mod tests {
             })
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), claimed.notified())
-            .await
-            .expect("runner reached gate");
+        gate.claimed().await;
 
         let was_cancelled = runtime.cancel(&handle.run_id).await.unwrap();
         assert!(was_cancelled);
 
         // Let the runner finish. The worker should observe `cancel_requested`
         // and fire Cancelled rather than advancing or firing Succeeded.
-        let _ = gate_tx.send(());
+        gate.release();
 
         let outcome = tokio::time::timeout(Duration::from_secs(2), hook_rx.recv())
             .await
@@ -3144,41 +3039,13 @@ mod tests {
     /// and the worker returns `Ok` (no retry, no PermanentFailure
     /// propagation).
     async fn assert_cancel_suppresses_runner_error(error: StepError) {
-        struct GatedErrRunner {
-            claimed: Arc<tokio::sync::Notify>,
-            gate: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
-            calls: Arc<AtomicU32>,
-            error: StdMutex<Option<StepError>>,
-        }
-        impl StepRunner for GatedErrRunner {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                self.claimed.notify_one();
-                let rx = self.gate.lock().await.take().expect("gate consumed twice");
-                let _ = rx.await;
-                Err(self
-                    .error
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .expect("error consumed twice"))
-            }
-        }
-
-        let (queue, store) = fresh_queue_fast_retry().await;
-        let claimed = Arc::new(tokio::sync::Notify::new());
-        let calls = Arc::new(AtomicU32::new(0));
-        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        let (queue, store) = open_queue_with(fast_options()).await;
+        let (runner, gate) = GatedRunner::new(Err(error));
         let (hook_tx, mut hook_rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store.clone(),
-            GatedErrRunner {
-                claimed: claimed.clone(),
-                gate: tokio::sync::Mutex::new(Some(gate_rx)),
-                calls: calls.clone(),
-                error: StdMutex::new(Some(error)),
-            },
+            runner,
             ChannelHook { tx: hook_tx },
         )
         .build();
@@ -3191,9 +3058,7 @@ mod tests {
             })
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), claimed.notified())
-            .await
-            .expect("runner reached gate");
+        gate.claimed().await;
 
         let was_cancelled = runtime.cancel(&handle.run_id).await.unwrap();
         assert!(was_cancelled);
@@ -3201,7 +3066,7 @@ mod tests {
         // Release the runner. It returns Err; without cancellation this
         // would either dead-letter (permanent) or nack for retry
         // (transient). Cancellation must suppress both.
-        let _ = gate_tx.send(());
+        gate.release();
 
         let outcome = tokio::time::timeout(Duration::from_secs(2), hook_rx.recv())
             .await
@@ -3218,7 +3083,7 @@ mod tests {
         // duplicate hook fires after the terminal one.
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
-            calls.load(Ordering::SeqCst),
+            gate.calls.load(Ordering::SeqCst),
             1,
             "cancellation must suppress retries",
         );
@@ -3268,7 +3133,7 @@ mod tests {
             }
         }
 
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let claimed = Arc::new(tokio::sync::Notify::new());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
@@ -3326,14 +3191,8 @@ mod tests {
         // run record. The second call must see no record and report
         // `Ok(false)`; crucially, the hook must NOT fire a second
         // time.
-        struct UnreachableRunner;
-        impl StepRunner for UnreachableRunner {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                unreachable!("worker must not claim the cancelled step");
-            }
-        }
 
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -3392,7 +3251,7 @@ mod tests {
         // hook, then call `cancel`. The run record was deleted with the
         // success, so `cancel` must report `Ok(false)` and must not fire
         // a second hook.
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue,
@@ -3444,35 +3303,14 @@ mod tests {
         // external observers can see termination is in progress. A gated
         // runner holds the cancellation window open long enough to
         // observe it deterministically.
-        struct GatedRunner {
-            claimed: Arc<tokio::sync::Notify>,
-            gate: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
-        }
-        impl StepRunner for GatedRunner {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                self.claimed.notify_one();
-                let rx = self.gate.lock().await.take().expect("gate consumed twice");
-                let _ = rx.await;
-                Ok(StepOutcome::Succeed {
-                    result: b"would-have-succeeded".to_vec(),
-                })
-            }
-        }
 
-        let (queue, store) = fresh_queue().await;
-        let claimed = Arc::new(tokio::sync::Notify::new());
-        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        let (queue, store) = open_queue().await;
+        let (runner, gate) = GatedRunner::new(Ok(StepOutcome::Succeed {
+            result: b"would-have-succeeded".to_vec(),
+        }));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue,
-            store.clone(),
-            GatedRunner {
-                claimed: claimed.clone(),
-                gate: tokio::sync::Mutex::new(Some(gate_rx)),
-            },
-            ChannelHook { tx },
-        )
-        .build();
+        let runtime =
+            WorkflowRuntime::builder(queue, store.clone(), runner, ChannelHook { tx }).build();
         let shutdown = spawn_runtime(runtime.clone());
 
         let handle = runtime
@@ -3482,9 +3320,7 @@ mod tests {
             })
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), claimed.notified())
-            .await
-            .expect("runner reached gate");
+        gate.claimed().await;
 
         // Before cancel: runner is in flight, state is Running.
         let before = runtime
@@ -3508,7 +3344,7 @@ mod tests {
 
         // Release the runner; the worker observes cancel_requested and
         // settles the run as Cancelled, removing the entry.
-        let _ = gate_tx.send(());
+        gate.release();
 
         let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -3555,7 +3391,7 @@ mod tests {
             }
         }
 
-        let (queue, store) = fresh_queue_fast_retry().await;
+        let (queue, store) = open_queue_with(fast_options()).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime =
             WorkflowRuntime::builder(queue, store, MemoRetryRunner, ChannelHook { tx }).build();
@@ -3584,7 +3420,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn no_terminal_marker_when_memo_retention_is_unset() {
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue,
@@ -3618,7 +3454,7 @@ mod tests {
     async fn terminal_marker_is_written_for_failed_runs_too() {
         // Retention isn't just for successful runs: replay-from-cached-state
         // is precisely the failed-run use case.
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue,
@@ -3657,7 +3493,7 @@ mod tests {
         // The queue's MockClock is shared into the runtime by default
         // (via Queue::clock()), so a `clock.advance` between submit and
         // terminate is visible in the marker's terminal_at_ms.
-        let (queue, store, clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (queue, store, clock) = open_queue_at(10_000).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue,
@@ -3696,7 +3532,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn submit_rejects_an_unusable_run_id() {
-        let (queue, store, _clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (queue, store, _clock) = open_queue_at(10_000).await;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue,
@@ -3741,7 +3577,7 @@ mod tests {
     async fn an_empty_run_id_cannot_reach_the_retention_sweep() {
         // An empty run id would resolve to the memo prefix itself, and the
         // sweep would then remove every run's entries.
-        let (queue, store, clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (queue, store, clock) = open_queue_at(10_000).await;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -3782,7 +3618,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_malformed_terminal_marker_is_deleted_without_clearing_memos() {
-        let (queue, store, clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (queue, store, clock) = open_queue_at(10_000).await;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -3842,36 +3678,16 @@ mod tests {
     async fn cancelling_a_running_step_writes_no_terminal_marker_until_it_settles() {
         // The `Requested` arm: the queue must discard the effects, since
         // a marker written here would mark a still-executing run.
-        struct GatedRunner {
-            claimed: Arc<tokio::sync::Notify>,
-            gate: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
-        }
-        impl StepRunner for GatedRunner {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                self.claimed.notify_one();
-                let rx = self.gate.lock().await.take().expect("gate consumed twice");
-                let _ = rx.await;
-                Ok(StepOutcome::Succeed {
-                    result: b"done".to_vec(),
-                })
-            }
-        }
 
-        let (queue, store, _clock) = fresh_queue_with_mock_clock(10_000).await;
-        let claimed = Arc::new(tokio::sync::Notify::new());
-        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        let (queue, store, _clock) = open_queue_at(10_000).await;
+        let (runner, gate) = GatedRunner::new(Ok(StepOutcome::Succeed {
+            result: b"done".to_vec(),
+        }));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store.clone(),
-            GatedRunner {
-                claimed: claimed.clone(),
-                gate: tokio::sync::Mutex::new(Some(gate_rx)),
-            },
-            ChannelHook { tx },
-        )
-        .memo_retention(Duration::from_secs(60))
-        .build();
+        let runtime =
+            WorkflowRuntime::builder(queue.clone(), store.clone(), runner, ChannelHook { tx })
+                .memo_retention(Duration::from_secs(60))
+                .build();
         let shutdown = spawn_runtime(runtime.clone());
 
         let handle = runtime
@@ -3881,9 +3697,7 @@ mod tests {
             })
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), claimed.notified())
-            .await
-            .expect("runner reached gate");
+        gate.claimed().await;
 
         assert!(runtime.cancel(&handle.run_id).await.unwrap());
         assert!(
@@ -3899,7 +3713,7 @@ mod tests {
             "the run record must survive a cancel the worker has to finish",
         );
 
-        let _ = gate_tx.send(());
+        gate.release();
         let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("hook fired")
@@ -3916,19 +3730,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_permanent_step_error_commits_its_terminal_marker() {
-        struct FailingRunner;
-        impl StepRunner for FailingRunner {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                Err(StepError::permanent("nope"))
-            }
-        }
-
-        let (queue, store, _clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (queue, store, _clock) = open_queue_at(10_000).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store.clone(),
-            FailingRunner,
+            FixedRunner::new(Err(StepError::permanent("nope"))),
             ChannelHook { tx },
         )
         .memo_retention(Duration::from_secs(60))
@@ -3986,7 +3793,7 @@ mod tests {
             }
         }
 
-        let (queue, store, clock) = fresh_queue_fast_retry_with_mock_clock(10_000).await;
+        let (queue, store, clock) = open_queue_at_with(10_000, fast_options()).await;
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
@@ -4031,7 +3838,7 @@ mod tests {
     async fn the_sweep_clears_only_markers_older_than_the_cutoff() {
         // Markers sort by timestamp, so the sweep scans from the start
         // of the range and returns at the first unexpired marker.
-        let (queue, store, _clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (queue, store, _clock) = open_queue_at(10_000).await;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -4109,7 +3916,7 @@ mod tests {
         // yet expired, so the sweep must skip it. Advancing past the
         // boundary must then clear the marker and the run's memo
         // entries.
-        let (queue, store, clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (queue, store, clock) = open_queue_at(10_000).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue,
@@ -4172,7 +3979,7 @@ mod tests {
         // out from under a resume, even past the retention window. Here
         // a memo entry exists for a run with no terminal marker;
         // advancing well past retention must leave it in place.
-        let (queue, store, clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (queue, store, clock) = open_queue_at(10_000).await;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue,
@@ -4255,7 +4062,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn submit_kv_writes_apply_only_to_a_new_submission() {
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store,
@@ -4295,7 +4102,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_reserved_kv_key_in_submit_is_rejected() {
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let runtime =
             WorkflowRuntime::builder(queue, store, ScriptedRunner::new(vec![]), NoopTerminalHook)
                 .build();
@@ -4312,7 +4119,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn step_effects_commit_with_the_acking_settlement() {
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -4376,7 +4183,7 @@ mod tests {
             }
         }
 
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let read_under_staging = Arc::new(StdMutex::new(None));
         let runtime = WorkflowRuntime::builder(
@@ -4424,7 +4231,7 @@ mod tests {
             }
         }
 
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime =
             WorkflowRuntime::builder(queue, store, JournalRunner, ChannelHook { tx }).build();
@@ -4449,7 +4256,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn step_effects_commit_when_the_runner_fails_the_run() {
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -4498,7 +4305,7 @@ mod tests {
             }
         }
 
-        let (queue, store, _clock) = fresh_queue_with_mock_clock(10_000).await;
+        let (queue, store, _clock) = open_queue_at(10_000).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -4529,7 +4336,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_runner_issued_cancel_keeps_its_staged_effects() {
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -4577,7 +4384,7 @@ mod tests {
             }
         }
 
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
@@ -4619,14 +4426,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_run_dead_lettered_by_the_reaper_is_terminated_by_reconciliation() {
-        struct Hang;
-
-        impl StepRunner for Hang {
-            async fn run_step(&self, _step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                std::future::pending().await
-            }
-        }
-
         let clock = MockClock::new(1_700_000_000_000);
         let opts = OpenOptions::default()
             .clock(Arc::new(clock.clone()))
@@ -4643,9 +4442,10 @@ mod tests {
                 .unwrap(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(queue.clone(), store, Hang, ChannelHook { tx })
-            .poll_interval(Duration::from_millis(10))
-            .build();
+        let runtime =
+            WorkflowRuntime::builder(queue.clone(), store, PauseRunner, ChannelHook { tx })
+                .poll_interval(Duration::from_millis(10))
+                .build();
         let shutdown = spawn_runtime(runtime.clone());
 
         let submitted = runtime
@@ -4696,7 +4496,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_step_error_applies_no_staged_effects() {
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -4751,7 +4551,7 @@ mod tests {
             }
         }
 
-        let (queue, store) = fresh_queue_fast_retry().await;
+        let (queue, store) = open_queue_with(fast_options()).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -4817,7 +4617,7 @@ mod tests {
             }
         }
 
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let calls = Arc::new(AtomicU32::new(0));
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -4899,7 +4699,7 @@ mod tests {
             }
         }
 
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (running_tx, mut running_rx) = tokio::sync::mpsc::unbounded_channel();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
@@ -5004,7 +4804,7 @@ mod tests {
             }
         }
 
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store,
@@ -5059,7 +4859,7 @@ mod tests {
             }
         }
 
-        let (queue, store) = fresh_queue_fast_retry().await;
+        let (queue, store) = open_queue_with(fast_options()).await;
         let calls = Arc::new(AtomicU32::new(0));
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -5089,7 +4889,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_noop_hook_enqueues_no_notification() {
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store,
@@ -5130,7 +4930,7 @@ mod tests {
     async fn the_webhook_hook_stages_its_delivery_as_a_notification_effect() {
         use crate::terminal::WebhookTerminalHook;
 
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store,
@@ -5212,7 +5012,7 @@ mod tests {
             }
         }
 
-        let (queue, store) = fresh_queue().await;
+        let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let escaped = Arc::new(StdMutex::new(None));
         let runtime = WorkflowRuntime::builder(

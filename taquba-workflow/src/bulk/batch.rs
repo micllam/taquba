@@ -772,8 +772,8 @@ mod tests {
     use super::*;
     use crate::StepError;
     use crate::bulk::pipeline::BulkCtx;
+    use crate::test_util::{open_queue, open_queue_at};
     use serde::Deserialize;
-    use taquba::object_store::memory::InMemory;
 
     #[derive(Serialize, Deserialize)]
     struct Item {
@@ -822,15 +822,9 @@ mod tests {
         (bulk, worker)
     }
 
-    async fn fresh() -> (Arc<Queue>, Arc<dyn ObjectStore>) {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let queue = Arc::new(Queue::open(store.clone(), "db").await.unwrap());
-        (queue, store)
-    }
-
     #[tokio::test(start_paused = true)]
     async fn runs_all_items_and_rolls_up_cost() {
-        let (queue, store) = fresh().await;
+        let (queue, store) = open_queue().await;
         let sink = Arc::new(Collect::default());
         let (bulk, worker) = spawned(
             Bulk::builder(queue, store, Doubler)
@@ -860,7 +854,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn large_batch_submits_with_bounded_concurrency() {
-        let (queue, store) = fresh().await;
+        let (queue, store) = open_queue().await;
         let sink = Arc::new(Collect::default());
         let (bulk, worker) = spawned(
             Bulk::builder(queue, store, Doubler)
@@ -903,7 +897,7 @@ mod tests {
             }
         }
 
-        let (queue, store) = fresh().await;
+        let (queue, store) = open_queue().await;
         queue.kv_put(b"app/seed", b"seeded").await.unwrap();
         let (bulk, worker) = spawned(
             Bulk::builder(queue.clone(), store, EffectsPipeline)
@@ -926,7 +920,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn records_failed_items() {
-        let (queue, store) = fresh().await;
+        let (queue, store) = open_queue().await;
         let (bulk, worker) = spawned(
             Bulk::builder(queue, store, Doubler)
                 .poll_interval(Duration::from_millis(10))
@@ -948,7 +942,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn fail_threshold_trips_when_exceeded() {
-        let (queue, store) = fresh().await;
+        let (queue, store) = open_queue().await;
         let (bulk, worker) = spawned(
             Bulk::builder(queue, store, Doubler)
                 .poll_interval(Duration::from_millis(10))
@@ -975,7 +969,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn custom_key_fn_sets_item_keys() {
-        let (queue, store) = fresh().await;
+        let (queue, store) = open_queue().await;
         let sink = Arc::new(Collect::default());
         let (bulk, worker) = spawned(
             Bulk::builder(queue, store, Doubler)
@@ -1008,7 +1002,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn concurrent_batches_on_one_worker_report_independently() {
-        let (queue, store) = fresh().await;
+        let (queue, store) = open_queue().await;
         let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let (bulk, worker) = spawned(
             Bulk::builder(queue, store, Counting { runs: runs.clone() })
@@ -1043,7 +1037,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_batch_running_in_this_process_is_rejected_until_its_run_is_dropped() {
-        let (queue, store) = fresh().await;
+        let (queue, store) = open_queue().await;
         let mut bulk = Bulk::builder(queue, store, Doubler)
             .poll_interval(Duration::from_millis(10))
             .build();
@@ -1097,7 +1091,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_second_run_of_a_batch_skips_succeeded_items_and_reruns_failed_ones() {
-        let (queue, store) = fresh().await;
+        let (queue, store) = open_queue().await;
         let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let sink = Arc::new(Collect::default());
         let (bulk, worker) = spawned(
@@ -1141,7 +1135,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn batches_with_the_same_keys_do_not_share_state() {
-        let (queue, store) = fresh().await;
+        let (queue, store) = open_queue().await;
         let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let (bulk, worker) = spawned(
             Bulk::builder(queue, store, Counting { runs: runs.clone() })
@@ -1167,7 +1161,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn resume_runs_a_batch_from_its_manifest() {
-        let (queue, store) = fresh().await;
+        let (queue, store) = open_queue().await;
         let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let sink = Arc::new(Collect::default());
         let (bulk, worker) = spawned(
@@ -1206,7 +1200,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_run_with_a_different_item_set_is_rejected() {
-        let (queue, store) = fresh().await;
+        let (queue, store) = open_queue().await;
         let (bulk, worker) = spawned(
             Bulk::builder(queue, store, Doubler)
                 .poll_interval(Duration::from_millis(10))
@@ -1237,7 +1231,7 @@ mod tests {
 
     #[tokio::test]
     async fn resume_of_an_unknown_batch_and_duplicate_keys_are_rejected() {
-        let (queue, store) = fresh().await;
+        let (queue, store) = open_queue().await;
         let (bulk, worker) = spawned(
             Bulk::builder(queue, store, Doubler)
                 .key_fn(|_| "same".to_string())
@@ -1258,7 +1252,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn status_reports_the_last_recorded_outcome_of_each_item() {
-        let (queue, store) = fresh().await;
+        let (queue, store) = open_queue().await;
         let (bulk, worker) = spawned(
             Bulk::builder(queue.clone(), store, Doubler)
                 .poll_interval(Duration::from_millis(10))
@@ -1288,21 +1282,9 @@ mod tests {
         worker.shutdown().await.unwrap();
     }
 
-    async fn fresh_with_clock(t0: u64) -> (Arc<Queue>, Arc<dyn ObjectStore>, taquba::MockClock) {
-        let clock = taquba::MockClock::new(t0);
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let opts = taquba::OpenOptions::default().clock(Arc::new(clock.clone()));
-        let queue = Arc::new(
-            Queue::open_with_options(store.clone(), "db", opts)
-                .await
-                .unwrap(),
-        );
-        (queue, store, clock)
-    }
-
     #[tokio::test(start_paused = true)]
     async fn forget_removes_the_batch_state_and_a_later_run_starts_over() {
-        let (queue, store) = fresh().await;
+        let (queue, store) = open_queue().await;
         let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let (bulk, worker) = spawned(
             Bulk::builder(queue.clone(), store, Counting { runs: runs.clone() })
@@ -1336,7 +1318,7 @@ mod tests {
     async fn an_expired_batch_is_swept_on_the_retention_interval() {
         let t0 = 1_700_000_000_000;
         let retention = Duration::from_secs(60);
-        let (queue, store, clock) = fresh_with_clock(t0).await;
+        let (queue, store, clock) = open_queue_at(t0).await;
         let (bulk, worker) = spawned(
             Bulk::builder(queue.clone(), store, Doubler)
                 .poll_interval(Duration::from_millis(10))
@@ -1396,7 +1378,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_invalid_batch_id_is_rejected() {
-        let (queue, store) = fresh().await;
+        let (queue, store) = open_queue().await;
         let (bulk, worker) = spawned(Bulk::builder(queue, store, Doubler).build());
         assert!(matches!(
             bulk.batch("a/b").map(|b| b.id().to_string()),

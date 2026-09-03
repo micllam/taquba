@@ -417,11 +417,12 @@ mod tests {
 
     use serde::{Deserialize, Serialize};
     use taquba::object_store::{ObjectStore, memory::InMemory};
-    use taquba::{JobStatus, MockClock, OpenOptions, Queue, QueueConfig};
+    use taquba::{JobStatus, OpenOptions, Queue, QueueConfig};
 
     use crate::StepErrorKind;
     use crate::jobs::handle::JoinError;
     use crate::jobs::job::payload_idempotency_key;
+    use crate::test_util::{fast_options, open_queue, open_queue_at_with, open_queue_with};
 
     #[derive(Debug, thiserror::Error)]
     #[error("{0}")]
@@ -628,45 +629,6 @@ mod tests {
         }
     }
 
-    async fn open_queue(name: &str) -> (Arc<Queue>, Arc<dyn ObjectStore>) {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let queue = Arc::new(Queue::open(store.clone(), name).await.unwrap());
-        (queue, store)
-    }
-
-    async fn open_queue_with_config(
-        name: &str,
-        cfg: QueueConfig,
-    ) -> (Arc<Queue>, Arc<dyn ObjectStore>) {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let opts = OpenOptions::default().default_queue_config(cfg);
-        let queue = Arc::new(
-            Queue::open_with_options(store.clone(), name, opts)
-                .await
-                .unwrap(),
-        );
-        (queue, store)
-    }
-
-    async fn open_queue_with_clock(
-        name: &str,
-        clock: MockClock,
-        cfg: QueueConfig,
-    ) -> (Arc<Queue>, Arc<dyn ObjectStore>) {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let opts = OpenOptions::default()
-            .clock(Arc::new(clock))
-            .scheduler_interval(Duration::from_millis(10))
-            .reaper_interval(Duration::from_millis(10))
-            .default_queue_config(cfg);
-        let queue = Arc::new(
-            Queue::open_with_options(store.clone(), name, opts)
-                .await
-                .unwrap(),
-        );
-        (queue, store)
-    }
-
     async fn count_jobs(queue: &Queue, status: JobStatus) -> usize {
         queue
             .list_jobs(DEFAULT_QUEUE_NAME, status, None, 100)
@@ -678,7 +640,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn submit_without_idempotency_key_is_always_newly_submitted() {
-        let (queue, store) = open_queue("test-no-idem").await;
+        let (queue, store) = open_queue().await;
         let runner = JobRunner::builder(queue, store).state("ok").build();
 
         let first = runner.submit(Adder { a: 1, b: 2 }).await.unwrap();
@@ -690,7 +652,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn submit_run_and_join_success() {
-        let (queue, store) = open_queue("test-success").await;
+        let (queue, store) = open_queue().await;
         let mut runner = JobRunner::builder(queue, store)
             .state("ok")
             .register::<Adder>()
@@ -710,7 +672,8 @@ mod tests {
         let cfg = QueueConfig::default()
             .max_attempts(3)
             .retry_backoff_base(Duration::ZERO);
-        let (queue, store) = open_queue_with_config("test-memo", cfg).await;
+        let (queue, store) =
+            open_queue_with(OpenOptions::default().default_queue_config(cfg)).await;
         let calls = Arc::new(AtomicU32::new(0));
         let mut runner = JobRunner::builder(queue.clone(), store)
             .state(calls.clone())
@@ -733,8 +696,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_handler_extends_its_lease_through_the_context() {
         let base = 1_700_000_000_000;
-        let (queue, store) =
-            open_queue_with_clock("test-renew", MockClock::new(base), QueueConfig::default()).await;
+        let (queue, store, _clock) = open_queue_at_with(base, fast_options()).await;
         let gate = Arc::new(RenewGate::default());
         let mut runner = JobRunner::builder(queue.clone(), store)
             .state(gate.clone())
@@ -765,7 +727,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn permanent_failure_is_dead_lettered_with_recorded_outcome() {
-        let (queue, store) = open_queue("test-failure").await;
+        let (queue, store) = open_queue().await;
         let mut runner = JobRunner::builder(queue.clone(), store)
             .register::<AlwaysFails>()
             .build();
@@ -787,7 +749,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn idempotency_key_collapses_duplicate_submissions() {
-        let (queue, store) = open_queue("test-idempotency").await;
+        let (queue, store) = open_queue().await;
         // No spawn: jobs stay pending so the run is still active.
         let runner = JobRunner::builder(queue, store).build();
 
@@ -804,7 +766,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_duplicate_submission_joins_the_in_flight_job() {
-        let (queue, store) = open_queue("test-dup-join").await;
+        let (queue, store) = open_queue().await;
         let runs = Arc::new(AtomicU32::new(0));
         let mut runner = JobRunner::builder(queue, store)
             .state(runs.clone())
@@ -825,7 +787,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn input_mismatch_on_same_key_different_payload() {
-        let (queue, store) = open_queue("test-mismatch").await;
+        let (queue, store) = open_queue().await;
         let runner = JobRunner::builder(queue, store).build();
 
         runner
@@ -878,7 +840,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn idempotency_key_short_circuits_to_cached_success_after_completion() {
-        let (queue, store) = open_queue("test-cached-success").await;
+        let (queue, store) = open_queue().await;
         let mut runner = JobRunner::builder(queue, store).register::<Keyed>().build();
         let handle = runner.spawn(std::future::pending::<()>());
 
@@ -897,9 +859,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn idempotency_key_short_circuits_to_cached_failure_after_completion() {
-        let (queue, store) = open_queue_with_config(
-            "test-cached-failure",
-            QueueConfig::default().max_attempts(1),
+        let (queue, store) = open_queue_with(
+            OpenOptions::default().default_queue_config(QueueConfig::default().max_attempts(1)),
         )
         .await;
         let mut runner = JobRunner::builder(queue, store)
@@ -963,7 +924,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn idempotent_resubmit_after_result_swept_reruns() {
         let queue_name = "test-resubmit-after-sweep";
-        let (queue, store) = open_queue(queue_name).await;
+        let (queue, store) = open_queue().await;
         let runs = Arc::new(AtomicU32::new(0));
         let mut runner = JobRunner::builder(queue, store.clone())
             .queue_name(queue_name)
@@ -998,9 +959,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn retention_removes_the_outcome_record() {
         let t0 = 1_700_000_000_000;
-        let clock = MockClock::new(t0);
-        let (queue, store) =
-            open_queue_with_clock("test-retention", clock.clone(), QueueConfig::default()).await;
+        let (queue, store, clock) = open_queue_at_with(t0, fast_options()).await;
         let mut runner = JobRunner::builder(queue, store)
             .state("ok")
             .retention(Duration::from_secs(60))
@@ -1027,7 +986,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn unknown_job_type_is_dead_lettered() {
-        let (queue, store) = open_queue("test-unknown").await;
+        let (queue, store) = open_queue().await;
         let mut runner = JobRunner::builder(queue.clone(), store).build();
         let handle = runner.spawn(std::future::pending::<()>());
 
@@ -1045,7 +1004,8 @@ mod tests {
         let cfg = QueueConfig::default()
             .max_attempts(2)
             .retry_backoff_base(Duration::ZERO);
-        let (queue, store) = open_queue_with_config("test-transient-exhaust", cfg).await;
+        let (queue, store) =
+            open_queue_with(OpenOptions::default().default_queue_config(cfg)).await;
         let mut runner = JobRunner::builder(queue.clone(), store)
             .register::<AlwaysFailsTransient>()
             .build();
@@ -1063,7 +1023,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn await_after_the_run_terminated_reads_the_outcome_record() {
-        let (queue, store) = open_queue("test-notfound-fallback").await;
+        let (queue, store) = open_queue().await;
         let mut runner = JobRunner::builder(queue, store)
             .state("ok")
             .register::<Adder>()
@@ -1099,9 +1059,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn scheduled_job_runs_when_clock_passes_run_at() {
         let t0_ms = 1_700_000_000_000_u64;
-        let clock = MockClock::new(t0_ms);
-        let (queue, store) =
-            open_queue_with_clock("test-scheduled", clock.clone(), QueueConfig::default()).await;
+        let (queue, store, clock) = open_queue_at_with(t0_ms, fast_options()).await;
         let mut runner = JobRunner::builder(queue.clone(), store)
             .state("ok")
             .register::<Adder>()
@@ -1131,12 +1089,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn lease_expiry_triggers_reaper_requeue() {
         let t0_ms = 1_700_000_000_000_u64;
-        let clock = MockClock::new(t0_ms);
         let cfg = QueueConfig::default()
             .lease_duration(Duration::from_secs(10))
             .max_attempts(5)
             .retry_backoff_base(Duration::ZERO);
-        let (queue, store) = open_queue_with_clock("test-lease", clock.clone(), cfg).await;
+        let (queue, store, clock) =
+            open_queue_at_with(t0_ms, fast_options().default_queue_config(cfg)).await;
         let attempts = Arc::new(AtomicU32::new(0));
         let mut runner = JobRunner::builder(queue, store)
             .state(attempts.clone())
