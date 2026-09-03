@@ -51,6 +51,7 @@ use taquba::object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreEx
 
 use crate::error::{Error, Result};
 use crate::keys::hex_sha256;
+use crate::sweep::Clearable;
 
 /// Backing store for [`Memo`] entries, parametrised by an
 /// [`ObjectStore`] and a path prefix. Builds per-step [`Memo`]
@@ -203,6 +204,14 @@ impl MemoStore {
         self.step_outputs_run_prefix(run_id)
             .join(step_number.to_string())
             .join(hex_sha256(&[step_payload]))
+    }
+}
+
+impl Clearable for MemoStore {
+    type Error = Error;
+
+    async fn clear(&self, run_id: &str) -> Result<()> {
+        self.clear_memos_for_run(run_id).await.map(|_| ())
     }
 }
 

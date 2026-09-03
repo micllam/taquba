@@ -32,7 +32,7 @@ use crate::outcome::{
     OutcomeRecord, StoredOutcome, Terminal, TypedRuntime, TypedRuntimeOptions, Unrecorded,
 };
 use crate::paging::kv_entries;
-use crate::sweep::Sweep;
+use crate::sweep::{Clearable, Sweep};
 use crate::{Error, Result};
 
 /// Default queue name for bulk item steps.
@@ -196,6 +196,14 @@ impl BatchStore {
     }
 }
 
+impl Clearable for BatchStore {
+    type Error = Error;
+
+    async fn clear(&self, batch_id: &str) -> Result<()> {
+        self.forget(batch_id).await
+    }
+}
+
 /// Closure that derives an item's key from its input.
 type KeyFn<I> = Box<dyn Fn(&I) -> String + Send + Sync>;
 
@@ -326,13 +334,9 @@ impl<P: Pipeline> BulkBuilder<P> {
             clock: self.clock,
         };
         let runner = PipelineRunner::new(self.pipeline);
-        let batch_sweep = self.batch_retention.map(|retention| {
-            let store = store.clone();
-            Sweep::new(BULK_TERMINAL_KV_PREFIX, retention, move |id| {
-                let store = store.clone();
-                async move { store.forget(&id).await }
-            })
-        });
+        let batch_sweep = self
+            .batch_retention
+            .map(|retention| Sweep::new(BULK_TERMINAL_KV_PREFIX, retention, store.clone()));
         let typed = options.build(
             self.queue,
             self.object_store,

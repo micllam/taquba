@@ -1,16 +1,16 @@
 //! Retention sweeps. A [`Sweep`] names the marker prefix of one kind of
 //! entity (a run, a batch), the window after an entity's terminal marker
-//! during which its state is retained and the removal of one entity's
-//! state. Markers are `{prefix}{ts:020}/{id}` keys in the caller KV
-//! namespace (see [`crate::keys::timestamped_kv_key`]), so a prefix scan
-//! reads them oldest first; a pass removes each expired entity's state
-//! and then its marker, and stops at the first unexpired marker.
+//! during which its state is retained and the store that removes one
+//! entity's state ([`Clearable`]). Markers are `{prefix}{ts:020}/{id}`
+//! keys in the caller KV namespace (see
+//! [`crate::keys::timestamped_kv_key`]), so a prefix scan reads them
+//! oldest first; a pass removes each expired entity's state and then
+//! its marker, and stops at the first unexpired marker.
 //! Deletion is unguarded by design: every consumer of a swept entry
 //! tolerates its absence and re-executes the step.
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::TryStreamExt;
@@ -26,29 +26,47 @@ use crate::paging::kv_entries;
 const SWEEP_PAGE_SIZE: usize = 256;
 
 type ClearError = Box<dyn std::error::Error + Send + Sync>;
-type ClearFuture = Pin<Box<dyn Future<Output = std::result::Result<(), ClearError>> + Send>>;
-type ClearFn = Arc<dyn Fn(String) -> ClearFuture + Send + Sync>;
+type ClearFuture<'a> =
+    Pin<Box<dyn Future<Output = std::result::Result<(), ClearError>> + Send + 'a>>;
+
+/// The store of one kind of entity's retained state, able to remove
+/// the state of the entity a terminal marker names.
+pub(crate) trait Clearable: Send + Sync + 'static {
+    /// The store's own error; a pass only logs it.
+    type Error: Into<ClearError>;
+
+    /// Remove the state of the entity `id`.
+    fn clear(&self, id: &str) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send;
+}
+
+/// [`Clearable`] behind a boxed future, so sweeps over different stores
+/// share one type.
+trait DynClearable: Send + Sync {
+    fn clear_dyn<'a>(&'a self, id: &'a str) -> ClearFuture<'a>;
+}
+
+impl<C: Clearable> DynClearable for C {
+    fn clear_dyn<'a>(&'a self, id: &'a str) -> ClearFuture<'a> {
+        Box::pin(async move { self.clear(id).await.map_err(Into::into) })
+    }
+}
 
 /// One retention sweep: which markers it reads, how long an entity is
-/// retained after its marker and how an entity's state is removed.
+/// retained after its marker and the store that removes an entity's
+/// state.
 pub(crate) struct Sweep {
     prefix: &'static [u8],
     retention: Duration,
-    clear: ClearFn,
+    store: Box<dyn DynClearable>,
 }
 
 impl Sweep {
-    /// A sweep over the markers under `prefix`, removing an entity's
-    /// state with `clear` once its marker is older than `retention`.
+    /// A sweep over the markers under `prefix`, clearing an entity from
+    /// `store` once its marker is older than `retention`.
     ///
     /// Panics if `retention < 1ms`: smaller values would turn the sweep
     /// loop into a hot spin.
-    pub(crate) fn new<F, Fut, E>(prefix: &'static [u8], retention: Duration, clear: F) -> Self
-    where
-        F: Fn(String) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = std::result::Result<(), E>> + Send + 'static,
-        E: Into<ClearError>,
-    {
+    pub(crate) fn new(prefix: &'static [u8], retention: Duration, store: impl Clearable) -> Self {
         assert!(
             retention >= Duration::from_millis(1),
             "retention must be at least 1ms",
@@ -56,10 +74,7 @@ impl Sweep {
         Self {
             prefix,
             retention,
-            clear: Arc::new(move |id| {
-                let fut = clear(id);
-                Box::pin(async move { fut.await.map_err(Into::into) })
-            }),
+            store: Box::new(store),
         }
     }
 
@@ -113,7 +128,7 @@ impl Sweep {
             if ts_ms >= cutoff_ms {
                 break;
             }
-            if let Err(err) = (self.clear)(id.clone()).await {
+            if let Err(err) = self.store.clear_dyn(&id).await {
                 warn!(id = %id, "clear failed during sweep: {err}");
                 continue;
             }

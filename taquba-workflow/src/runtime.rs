@@ -274,11 +274,11 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
         let memo_store = MemoStore::new(self.object_store, self.memo_prefix);
         let mut sweeps = self.sweeps;
         if let Some(retention) = self.memo_retention {
-            let memos = memo_store.clone();
-            sweeps.push(Sweep::new(TERMINAL_KV_PREFIX, retention, move |run_id| {
-                let memos = memos.clone();
-                async move { memos.clear_memos_for_run(&run_id).await.map(|_| ()) }
-            }));
+            sweeps.push(Sweep::new(
+                TERMINAL_KV_PREFIX,
+                retention,
+                memo_store.clone(),
+            ));
         }
         let core = RuntimeCore {
             queue: self.queue,
