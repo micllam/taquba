@@ -1,22 +1,148 @@
 //! The typed single-step run shared by the [`jobs`](crate::jobs) and
-//! [`bulk`](crate::bulk) modules: the adapter that decodes a typed
+//! [`bulk`](crate::bulk) modules: the runtime such a layer runs over
+//! ([`TypedRuntime`]) and the settings it forwards to the workflow
+//! runtime ([`TypedRuntimeOptions`]), the adapter that decodes a typed
 //! input, runs a typed handler and encodes its output
-//! ([`run_typed_step`]), the durable outcome record it writes
-//! before its settlement, stored in the run-scoped memo under a key
-//! reserved by this crate, and the in-process wait for the run's
-//! terminal state ([`wait_terminal`]).
+//! ([`run_typed_step`]), the durable outcome record it writes before
+//! its settlement, stored in the run-scoped memo under a key reserved
+//! by this crate, and the in-process wait for a run's terminal state
+//! ([`TypedRuntime::wait_terminal`]).
 
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use taquba::{Queue, WaitOutcome};
+use taquba::object_store::ObjectStore;
+use taquba::{Clock, Queue, WaitOutcome};
 
 use crate::keys::hash_input;
-use crate::memo::Memo;
-use crate::{Result, Step, StepError, StepErrorKind, StepOutcome};
+use crate::memo::{Memo, MemoStore};
+use crate::runtime::{RunnerHandle, WorkflowRuntime, WorkflowRuntimeBuilder};
+use crate::terminal::NoopTerminalHook;
+use crate::{Result, Step, StepError, StepErrorKind, StepOutcome, StepRunner};
+
+/// An unbounded wait for a run's terminal state runs in chunks of this
+/// length; `Queue::wait_for_completion` needs a finite timeout.
+const WAIT_CHUNK: Duration = Duration::from_secs(3600);
+
+/// The settings a typed single-step layer forwards to the workflow
+/// runtime it runs over. Each layer's builder collects them under its
+/// own vocabulary and defaults.
+pub(crate) struct TypedRuntimeOptions {
+    pub(crate) queue_name: String,
+    pub(crate) memo_prefix: String,
+    pub(crate) max_concurrent: usize,
+    pub(crate) poll_interval: Duration,
+    /// The clock the runtime reads; the queue's when `None`.
+    pub(crate) clock: Option<Arc<dyn Clock>>,
+}
+
+impl TypedRuntimeOptions {
+    /// Build the runtime over `runner`; `configure` applies the
+    /// layer's own builder settings before the build.
+    pub(crate) fn build<R: StepRunner>(
+        self,
+        queue: Arc<Queue>,
+        object_store: Arc<dyn ObjectStore>,
+        runner: R,
+        configure: impl FnOnce(
+            WorkflowRuntimeBuilder<R, NoopTerminalHook>,
+        ) -> WorkflowRuntimeBuilder<R, NoopTerminalHook>,
+    ) -> TypedRuntime<R> {
+        let clock = self.clock.unwrap_or_else(|| queue.clock());
+        let memo_store = MemoStore::new(object_store.clone(), self.memo_prefix.clone());
+        let builder =
+            WorkflowRuntime::builder(queue.clone(), object_store, runner, NoopTerminalHook)
+                .queue_name(self.queue_name)
+                .memo_prefix(self.memo_prefix)
+                .max_concurrent_steps(self.max_concurrent)
+                .poll_interval(self.poll_interval)
+                .clock(clock.clone());
+        TypedRuntime {
+            runtime: configure(builder).build(),
+            queue,
+            memo_store,
+            clock,
+            spawned: AtomicBool::new(false),
+        }
+    }
+}
+
+/// The workflow runtime a typed single-step layer runs over, with the
+/// handles its submissions, waits and reads need: the queue whose
+/// completion waiter reports a run's terminal state, the memo store
+/// holding the outcome records and the runtime's clock. The terminal
+/// hook is [`NoopTerminalHook`], so a run enqueues no notification.
+pub(crate) struct TypedRuntime<R: StepRunner> {
+    pub(crate) runtime: WorkflowRuntime<R, NoopTerminalHook>,
+    pub(crate) queue: Arc<Queue>,
+    pub(crate) memo_store: MemoStore,
+    pub(crate) clock: Arc<dyn Clock>,
+    spawned: AtomicBool,
+}
+
+impl<R: StepRunner + 'static> TypedRuntime<R> {
+    /// The run-scoped memo of `run_id`, which holds its outcome record.
+    pub(crate) fn run_memo(&self, run_id: &str) -> Memo {
+        self.memo_store.new_run_memo(run_id)
+    }
+
+    /// The outcome record of `run_id`, if one exists.
+    pub(crate) async fn outcome(&self, run_id: &str) -> Result<Option<OutcomeRecord>> {
+        read_outcome(&self.run_memo(run_id)).await
+    }
+
+    /// Spawn the worker. Panics on a second call: the runtime is
+    /// single-writer and its layer spawns one worker.
+    pub(crate) fn spawn_once<F>(&self, shutdown: F) -> RunnerHandle
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        assert!(
+            !self.spawned.swap(true, Ordering::SeqCst),
+            "spawn may only be called once"
+        );
+        self.runtime.spawn(shutdown)
+    }
+
+    /// Wait up to `timeout` for the run `run_id`, whose step job is
+    /// `job_id`, to reach a terminal state, then read its outcome
+    /// record. Returns `Ok(None)` when the timeout elapses first.
+    pub(crate) async fn wait_terminal_within(
+        &self,
+        run_id: &str,
+        job_id: &str,
+        timeout: Duration,
+    ) -> Result<Option<Terminal>> {
+        let unrecorded = match self.queue.wait_for_completion(job_id, timeout).await? {
+            WaitOutcome::TimedOut => return Ok(None),
+            WaitOutcome::Done(_) => Unrecorded::Done,
+            WaitOutcome::Dead(record) => Unrecorded::Dead(record.last_error),
+            WaitOutcome::Cancelled => Unrecorded::Cancelled,
+            WaitOutcome::NotFound => Unrecorded::NotFound,
+        };
+        Ok(Some(match self.outcome(run_id).await? {
+            Some(record) => Terminal::Recorded(record),
+            None => Terminal::Unrecorded(unrecorded),
+        }))
+    }
+
+    /// [`Self::wait_terminal_within`] without a bound.
+    pub(crate) async fn wait_terminal(&self, run_id: &str, job_id: &str) -> Result<Terminal> {
+        loop {
+            if let Some(terminal) = self
+                .wait_terminal_within(run_id, job_id, WAIT_CHUNK)
+                .await?
+            {
+                return Ok(terminal);
+            }
+        }
+    }
+}
 
 /// Run-memo key of the outcome record. Runners receive the step-scoped
 /// memo only, so no caller key can collide with it.
@@ -178,26 +304,4 @@ pub(crate) enum Unrecorded {
     Cancelled,
     /// Neither a queue record nor an outcome record exists.
     NotFound,
-}
-
-/// Wait up to `timeout` for the typed single-step run whose step job is
-/// `job_id` to reach a terminal state, then read its outcome record.
-/// Returns `Ok(None)` when the timeout elapses first.
-pub(crate) async fn wait_terminal(
-    queue: &Queue,
-    run_memo: &Memo,
-    job_id: &str,
-    timeout: Duration,
-) -> Result<Option<Terminal>> {
-    let unrecorded = match queue.wait_for_completion(job_id, timeout).await? {
-        WaitOutcome::TimedOut => return Ok(None),
-        WaitOutcome::Done(_) => Unrecorded::Done,
-        WaitOutcome::Dead(record) => Unrecorded::Dead(record.last_error),
-        WaitOutcome::Cancelled => Unrecorded::Cancelled,
-        WaitOutcome::NotFound => Unrecorded::NotFound,
-    };
-    Ok(Some(match read_outcome(run_memo).await? {
-        Some(record) => Terminal::Recorded(record),
-        None => Terminal::Unrecorded(unrecorded),
-    }))
 }

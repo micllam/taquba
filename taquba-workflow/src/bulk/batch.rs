@@ -7,7 +7,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::{MemoStore, NoopTerminalHook, RunSpec, RunnerHandle, TerminalStatus, WorkflowRuntime};
+use crate::{MemoStore, RunSpec, RunnerHandle, TerminalStatus};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -28,7 +28,7 @@ use crate::keys::{
     BULK_TERMINAL_KV_PREFIX, bulk_items_kv_prefix, bulk_terminal_kv_key, hex_sha256,
 };
 use crate::outcome::{
-    OutcomeRecord, StoredOutcome, Terminal, Unrecorded, read_outcome, wait_terminal,
+    OutcomeRecord, StoredOutcome, Terminal, TypedRuntime, TypedRuntimeOptions, Unrecorded,
 };
 use crate::sweep::Sweep;
 use crate::{Error, Result};
@@ -43,9 +43,6 @@ const DEFAULT_MAX_CONCURRENT: usize = 200;
 /// commit, and concurrent commits share WAL flushes, so at flush-bound
 /// latencies serial submission would cap at one item per flush.
 const SUBMIT_CONCURRENCY: usize = 32;
-/// An item's wait runs in chunks of this length; `wait_for_completion`
-/// needs a finite timeout, so an unbounded wait loops over bounded ones.
-const WAIT_CHUNK: Duration = Duration::from_secs(3600);
 
 /// The workflow run id of an item: the hex SHA-256 digest of
 /// `{batch_id}/{key}`, so batches never share run state and any key string
@@ -331,25 +328,33 @@ impl<P: Pipeline> BulkBuilder<P> {
             memo_store: MemoStore::new(self.object_store.clone(), self.memo_prefix.clone()),
             manifests: ManifestStore::new(self.object_store.clone(), self.memo_prefix.clone()),
         };
+        let options = TypedRuntimeOptions {
+            queue_name: self.queue_name,
+            memo_prefix: self.memo_prefix,
+            max_concurrent: self.max_concurrent,
+            poll_interval: self.poll_interval,
+            clock: self.clock,
+        };
         let runner = PipelineRunner::new(self.pipeline);
-        let clock = self.clock.unwrap_or_else(|| self.queue.clock());
-        let mut builder =
-            WorkflowRuntime::builder(self.queue, self.object_store, runner, NoopTerminalHook)
-                .queue_name(self.queue_name)
-                .memo_prefix(self.memo_prefix)
-                .max_concurrent_steps(self.max_concurrent)
-                .poll_interval(self.poll_interval)
-                .clock(clock.clone());
-        if let Some(retention) = self.batch_retention {
+        let batch_sweep = self.batch_retention.map(|retention| {
             let store = store.clone();
-            builder = builder.sweep(Sweep::new(BULK_TERMINAL_KV_PREFIX, retention, move |id| {
+            Sweep::new(BULK_TERMINAL_KV_PREFIX, retention, move |id| {
                 let store = store.clone();
                 async move { store.forget(&id).await }
-            }));
-        }
+            })
+        });
+        let typed = options.build(
+            self.queue,
+            self.object_store,
+            runner,
+            |builder| match batch_sweep {
+                Some(sweep) => builder.sweep(sweep),
+                None => builder,
+            },
+        );
         Bulk {
             inner: Arc::new(BulkInner {
-                runtime: builder.build(),
+                typed,
                 store,
                 batches: Arc::default(),
                 sink,
@@ -357,9 +362,7 @@ impl<P: Pipeline> BulkBuilder<P> {
                 headers: self.headers,
                 fail_threshold: self.fail_threshold,
                 batch_retention: self.batch_retention,
-                clock,
             }),
-            spawned: false,
         }
     }
 }
@@ -371,13 +374,12 @@ impl<P: Pipeline> BulkBuilder<P> {
 /// process: taquba is single-writer.
 pub struct Bulk<P: Pipeline> {
     inner: Arc<BulkInner<P>>,
-    spawned: bool,
 }
 
 /// The state shared by the runner, its batch handles and the spawned
 /// worker task.
 struct BulkInner<P: Pipeline> {
-    runtime: WorkflowRuntime<PipelineRunner<P>, NoopTerminalHook>,
+    typed: TypedRuntime<PipelineRunner<P>>,
     store: BatchStore,
     batches: Arc<ActiveBatches>,
     sink: Arc<dyn OutputSink>,
@@ -385,7 +387,6 @@ struct BulkInner<P: Pipeline> {
     headers: HashMap<String, String>,
     fail_threshold: Option<f64>,
     batch_retention: Option<Duration>,
-    clock: Arc<dyn Clock>,
 }
 
 impl<P: Pipeline> Bulk<P> {
@@ -431,9 +432,7 @@ impl<P: Pipeline> Bulk<P> {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        assert!(!self.spawned, "Bulk::spawn may only be called once");
-        self.spawned = true;
-        self.inner.runtime.spawn(shutdown)
+        self.inner.typed.spawn_once(shutdown)
     }
 
     /// A handle on the batch named `id`, which must be 1 to 128 bytes of
@@ -499,8 +498,7 @@ impl<P: Pipeline> BulkInner<P> {
     ) -> Result<()> {
         let ManifestItem { key, input } = item;
         let run_id = item_run_id(batch_id, &key);
-        let run_memo = self.store.memo_store.new_run_memo(&run_id);
-        if let Some(record) = read_outcome(&run_memo).await?
+        if let Some(record) = self.typed.outcome(&run_id).await?
             && matches!(record.outcome, StoredOutcome::Success { .. })
         {
             record_outcome::<P::Output>(state, self.sink.as_ref(), &key, record);
@@ -516,23 +514,17 @@ impl<P: Pipeline> BulkInner<P> {
                 .acquire()
                 .await
                 .expect("the semaphore is never closed");
-            self.runtime
+            self.typed
+                .runtime
                 .submit(RunSpec {
-                    run_id: Some(run_id),
+                    run_id: Some(run_id.clone()),
                     input: payload,
                     headers: self.headers.clone(),
                     ..RunSpec::default()
                 })
                 .await?
         };
-        let terminal = loop {
-            let waited =
-                wait_terminal(&self.store.queue, &run_memo, &submitted.job_id, WAIT_CHUNK).await?;
-            if let Some(terminal) = waited {
-                break terminal;
-            }
-        };
-        match terminal {
+        match self.typed.wait_terminal(&run_id, &submitted.job_id).await? {
             Terminal::Recorded(record) => {
                 record_outcome::<P::Output>(state, self.sink.as_ref(), &key, record);
             }
@@ -763,7 +755,7 @@ impl<P: Pipeline> Batch<'_, P> {
         driven?;
 
         if inner.batch_retention.is_some() {
-            let key = bulk_terminal_kv_key(&self.id, inner.clock.now_ms());
+            let key = bulk_terminal_kv_key(&self.id, inner.typed.clock.now_ms());
             if let Err(err) = inner.store.queue.kv_put(&key, b"").await {
                 warn!(batch_id = %self.id, "batch terminal marker write failed: {err}");
             }

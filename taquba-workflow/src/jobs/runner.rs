@@ -8,10 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    Memo, MemoStore, NoopTerminalHook, RunSpec, RunnerHandle, Step, StepError, StepOutcome,
-    StepRunner, WorkflowRuntime,
-};
+use crate::{RunSpec, RunnerHandle, Step, StepError, StepOutcome, StepRunner};
 use taquba::object_store::ObjectStore;
 use taquba::{Clock, Queue};
 
@@ -20,7 +17,7 @@ use crate::jobs::context::{JobContext, State};
 use crate::jobs::handle::JobHandle;
 use crate::jobs::job::Job;
 use crate::keys::{hash_input, hex_sha256};
-use crate::outcome::{read_outcome, run_typed_step};
+use crate::outcome::{TypedRuntime, TypedRuntimeOptions, run_typed_step};
 
 /// The payload of a job's run: the job's [`Job::NAME`], by which the step
 /// runner routes the run to the registered handler, and the serialized
@@ -62,33 +59,14 @@ pub struct SubmitOptions {
 }
 
 /// The state shared by the runner, every [`JobHandle`] and every
-/// [`JobContext`]: the workflow runtime a job runs as one step of, the
-/// memo store its outcome record is read from, and the registered
-/// application state.
+/// [`JobContext`]: the runtime a job runs as one step of and the
+/// registered application state.
 pub(crate) struct Inner {
-    runtime: WorkflowRuntime<Dispatch, NoopTerminalHook>,
-    queue: Arc<Queue>,
-    memo_store: MemoStore,
-    state: State,
+    pub(crate) typed: TypedRuntime<Dispatch>,
+    pub(crate) state: State,
 }
 
 impl Inner {
-    pub(crate) fn runtime(&self) -> &WorkflowRuntime<Dispatch, NoopTerminalHook> {
-        &self.runtime
-    }
-
-    pub(crate) fn queue(&self) -> &Arc<Queue> {
-        &self.queue
-    }
-
-    pub(crate) fn state(&self) -> &State {
-        &self.state
-    }
-
-    pub(crate) fn run_memo(&self, id: &str) -> Memo {
-        self.memo_store.new_run_memo(id)
-    }
-
     pub(crate) async fn submit<J: Job>(
         self: &Arc<Self>,
         job: J,
@@ -105,7 +83,7 @@ impl Inner {
         // which outlives the run record the workflow deletes at
         // termination.
         if let Some(run_id) = &run_id
-            && let Some(record) = read_outcome(&self.run_memo(run_id)).await?
+            && let Some(record) = self.typed.outcome(run_id).await?
         {
             if record.input_hash != hash_input(&payload) {
                 return Err(crate::Error::InputMismatch(run_id.clone()));
@@ -115,6 +93,7 @@ impl Inner {
         }
 
         let outcome = self
+            .typed
             .runtime
             .submit(RunSpec {
                 run_id,
@@ -243,7 +222,6 @@ impl StepRunner for Dispatch {
 /// spawning.
 pub struct JobRunner {
     inner: Arc<Inner>,
-    spawned: bool,
 }
 
 impl JobRunner {
@@ -288,9 +266,7 @@ impl JobRunner {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        assert!(!self.spawned, "JobRunner::spawn may only be called once");
-        self.spawned = true;
-        self.inner.runtime.spawn(shutdown)
+        self.inner.typed.spawn_once(shutdown)
     }
 }
 
@@ -410,42 +386,35 @@ impl JobRunnerBuilder {
 
     /// Build the runner.
     pub fn build(self) -> JobRunner {
-        let prefix = self
-            .memo_prefix
-            .unwrap_or_else(|| format!("{}-memo", self.queue_name));
-        let memo_store = MemoStore::new(self.object_store.clone(), prefix.clone());
+        let options = TypedRuntimeOptions {
+            memo_prefix: self
+                .memo_prefix
+                .unwrap_or_else(|| format!("{}-memo", self.queue_name)),
+            queue_name: self.queue_name,
+            max_concurrent: self.concurrency,
+            poll_interval: self.poll_interval,
+            clock: self.clock,
+        };
         let inner = Arc::new_cyclic(|weak: &Weak<Inner>| {
             let dispatch = Dispatch {
                 handlers: self.handlers,
                 inner: weak.clone(),
             };
-            let mut builder = WorkflowRuntime::builder(
-                self.queue.clone(),
+            let typed = options.build(
+                self.queue,
                 self.object_store,
                 dispatch,
-                NoopTerminalHook,
-            )
-            .queue_name(self.queue_name)
-            .memo_prefix(prefix)
-            .max_concurrent_steps(self.concurrency)
-            .poll_interval(self.poll_interval);
-            if let Some(retention) = self.retention {
-                builder = builder.memo_retention(retention);
-            }
-            if let Some(clock) = self.clock {
-                builder = builder.clock(clock);
-            }
+                |builder| match self.retention {
+                    Some(retention) => builder.memo_retention(retention),
+                    None => builder,
+                },
+            );
             Inner {
-                runtime: builder.build(),
-                queue: self.queue,
-                memo_store,
+                typed,
                 state: self.state,
             }
         });
-        JobRunner {
-            inner,
-            spawned: false,
-        }
+        JobRunner { inner }
     }
 }
 
@@ -453,7 +422,7 @@ impl JobRunnerBuilder {
 mod tests {
     use super::*;
 
-    use crate::Error;
+    use crate::{Error, MemoStore};
 
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};

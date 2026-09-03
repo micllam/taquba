@@ -68,7 +68,7 @@ impl<'a> JobContext<'a> {
     /// Borrow a piece of application state by type, returning `None` if no
     /// value of type `T` was registered.
     pub fn try_state<T: Any + Send + Sync>(&self) -> Option<&T> {
-        self.inner.state().get::<T>()
+        self.inner.state.get::<T>()
     }
 
     /// The identifier of the job currently executing, equal to
