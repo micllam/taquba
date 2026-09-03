@@ -10,8 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `Delivery`: the run identity, attempt count and handles a handler runs
-  under. `Step`, `jobs::JobContext` and `bulk::BulkCtx` dereference to
-  it. `Delivery::detached()` builds one bound to no queue and
+  under. `Step` and `jobs::JobContext` dereference to it. `Delivery::detached()` builds one bound to no queue and
   `Step::detached(payload)` step 0 over it, for tests.
 - `Delivery::is_last_attempt`: whether a transient `StepError` from this
   attempt dead-letters the step.
@@ -24,15 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer implements `Copy`.
 - `StepError` implements `Clone`.
 - `jobs::JobGroup`: many jobs of one type submitted as one durable set
-  (`JobRunner::group`, `JobRunner::new_group`), joined in submission
-  order by `JobGroup::join`, with `status` and `forget`;
+  (`JobRunner::group`, `JobRunner::new_group`, `JobGroup::submit`,
+  `submit_with` and `resume`), with their results yielded as they
+  terminate by `JobGroup::results` or returned in submission order by
+  `JobGroup::join`, plus `status` and `forget`;
   `JobRunnerBuilder::group_retention` removes a group's state a window
   after its members terminated. Members are keyed by the job's
   idempotency key or `item-{i}`, and a member's job id is derived from
-  the group id and its key.
+  the group id and its key. `Error::DuplicateMemberKey`,
+  `GroupMismatch`, `GroupNotFound` and `InvalidGroupId` are its errors.
 - `HEADER_GROUP` and `HEADER_GROUP_KEY`: the reserved headers naming a
   grouped run's group and member key on its step jobs.
-- `bulk::BatchStatus` gains `pending` and `cancelled`.
 
 ### Removed
 
@@ -40,11 +41,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   submits further jobs holds a `JobRunner` in its registered state, as
   the fan-out example does.
 - **Breaking (source):** the accessors `jobs::JobContext::{id, attempt,
-  cancel_token, lease, memo, effects, kv_get}` and
-  `bulk::BulkCtx::{memo, cancel_token, lease, effects, kv_get}`, and the
-  `bulk::BulkCtx::run_id` and `headers` fields. Both types dereference
+  cancel_token, lease, memo, effects, kv_get}`. The context dereferences
   to `Delivery`, which holds them as fields: `ctx.run_id`,
   `ctx.attempts`, `ctx.memo`, `ctx.effects`, `ctx.kv.get(..)`.
+- **Breaking (source):** the `bulk` module, with `Error::{Io, Json,
+  DuplicateItemKey, BatchMismatch, BatchNotFound, BatchRunning,
+  InvalidBatchId, FailureThresholdExceeded}` and the `serde_json`
+  dependency. A batch is a `jobs::JobGroup`: a `Pipeline` becomes a
+  `Job` whose handler state is read through `JobContext::state`,
+  `Batch::run` is `JobGroup::submit` followed by `JobGroup::results` or
+  `join`, `Batch::resume` is `JobGroup::resume`, `Batch::status` is
+  `JobGroup::status`, `Batch::forget` is `JobGroup::forget` and
+  `BulkBuilder::batch_retention` is `JobRunnerBuilder::group_retention`.
+  The output sink, progress snapshot, fail threshold and cost rollup
+  are folds the caller writes over the results, as
+  `examples/group_document_pipeline.rs` does.
 
 ### Changed
 
@@ -59,20 +70,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is settled as cancelled without running. The in-process run registry
   is gone.
 - `RunnerHandle` is `taquba::WorkerHandle<Result<()>>`.
-- **Breaking (source):** `bulk::Bulk` is `bulk::BulkRunner`,
-  `bulk::BulkBuilder` is `bulk::BulkRunnerBuilder` and
-  `bulk::BulkReport` is `bulk::BatchReport`.
-- **Breaking (source and storage):** a bulk batch is a run group, the
-  mechanism `jobs::JobGroup` shares. `Error::DuplicateItemKey`,
-  `BatchMismatch`, `BatchNotFound` and `InvalidBatchId` are
-  `DuplicateMemberKey`, `GroupMismatch`, `GroupNotFound` and
-  `InvalidGroupId`. A batch's manifest is stored under
-  `<memo_prefix>/groups/<batch_id>/manifest`, its per-item state under
-  `workflow/groups/<batch_id>/<key>` (a member record written with the
-  submission and rewritten with the termination, in place of the item
-  marker) and its terminal marker under `workflow/group-terminals/`; a
-  cancelled item is recorded as cancelled. The step-output replay
-  record changes layout.
 - **Breaking (source):** `Step` is `#[non_exhaustive]` and holds its
   delivery fields (`run_id`, `headers`, `job_id`, `attempts`,
   `max_attempts`, `cancel_token`, `lease`, `memo`, `run_memo`, `effects`,

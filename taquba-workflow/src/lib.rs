@@ -23,16 +23,15 @@
 //! event-sourced engine (no event-history replay; a side effect is
 //! recorded only where the runner memoizes it).
 //!
-//! Two typed presentations of the runtime are included. The [`jobs`]
-//! module runs one typed async function as a single-step run and returns
-//! its result to an awaiting caller. The [`bulk`] module runs one pipeline
-//! over many inputs with batch progress and cost rollup. Use a job when
-//! the caller awaits a typed return value and there are no intermediate
-//! steps to persist; a step runner, even for a single step, when the
-//! caller observes the run through cancellation, headers and a terminal
-//! hook; and bulk when each item is a multi-phase pipeline whose completed
-//! phases must survive a retry and the batch needs progress, cost rollup
-//! and a failure threshold.
+//! The [`jobs`] module is the typed presentation of the runtime: it runs
+//! one typed async function as a single-step run and returns its result
+//! to an awaiting caller, and a [`jobs::JobGroup`] submits many such
+//! jobs as one durable set. Use a job when the caller awaits a typed
+//! return value and there are no intermediate steps to persist, a job
+//! group when many inputs go through one function and the caller reads
+//! the results as they complete, and a step runner, even for a single
+//! step, when the caller observes the run through cancellation, headers
+//! and a terminal hook.
 //!
 //! # Quick start
 //!
@@ -97,9 +96,8 @@
 //! ([`Delivery::is_last_attempt`] reports whether a transient error from
 //! this attempt dead-letters the step) and the delivery's handles (the
 //! cancellation token, the lease, the per-step and run-scoped memos, the
-//! staged KV effects and committed KV reads). The typed contexts
-//! ([`jobs::JobContext`], [`bulk::BulkCtx`]) dereference to the same
-//! type. [`Delivery::detached`] and [`Step::detached`] build instances
+//! staged KV effects and committed KV reads). [`jobs::JobContext`]
+//! dereferences to the same type. [`Delivery::detached`] and [`Step::detached`] build instances
 //! bound to no queue, for tests.
 //!
 //! # Submissions
@@ -297,13 +295,8 @@
 //! [`jobs::JobHandle::fetch_result`] reads it after a restart, and a
 //! [`jobs::Job::idempotency_key`] collapses duplicate submissions before
 //! and after completion. A handler that submits further jobs holds a
-//! [`jobs::JobRunner`] in its registered state. A [`jobs::JobGroup`]
-//! submits many jobs of one type as one durable set and joins their
-//! typed results in submission order; a second submission of the same
-//! set runs again only the members that did not succeed, which is how a
-//! step that fans out stays safe under a retry. The module
-//! documentation covers idempotent submission, job groups, retention and
-//! the handler context.
+//! [`jobs::JobRunner`] in its registered state. The module documentation
+//! covers idempotent submission, retention and the handler context.
 //!
 //! ```ignore
 //! use taquba_workflow::jobs::{Job, JobContext, JobRunner};
@@ -329,24 +322,32 @@
 //! worker.shutdown().await?;
 //! ```
 //!
-//! # Bulk processing
+//! # Job groups
 //!
-//! The [`bulk`] module runs one [`bulk::Pipeline`] over many input items in
-//! parallel, one run per item with the pipeline's phases as memoized calls
-//! inside the item's single step, and adds batch-level progress, cost
-//! rollup, streamed output and a failure threshold. Items are grouped in
-//! batches identified by id: a later [`bulk::Batch::run`] of the same batch
-//! skips the items that succeeded and runs the failed ones again. The
-//! module documentation covers the execution model, batches, cost
-//! tracking, the failure policy and retention.
+//! A [`jobs::JobGroup`] submits many jobs of one type as one durable
+//! set: [`jobs::JobRunner::group`] names it, [`jobs::JobGroup::submit`]
+//! writes its manifest (the members' keys and inputs) and submits the
+//! members, [`jobs::JobGroup::results`] yields each member's typed
+//! result as it terminates and [`jobs::JobGroup::join`] returns them in
+//! submission order. Members are keyed by the job's idempotency key or
+//! the positional `item-{i}`, and a member's job id is derived from the
+//! group id and its key, so groups never share run state. A second
+//! submission of the same set, or [`jobs::JobGroup::resume`] from the
+//! manifest alone, runs again only the members that did not succeed,
+//! which is how a step that fans out stays safe under a retry and how a
+//! batch of inputs is run again after a partial failure.
 //!
-//! Batches and job groups are two presentations of one mechanism, a run
-//! group: a manifest of members in the object store, one member record
-//! per key under `workflow/groups/` in the queue's key-value namespace,
-//! written with the member's submission and rewritten with its status
-//! and error by the settlement that terminates it, and a retention
-//! sweep over `workflow/group-terminals/`. A member's run id is derived
-//! from the group id and its key, so groups never share run state.
+//! The group's durable state is the manifest in the object store and one
+//! member record per key under `workflow/groups/` in the queue's
+//! key-value namespace, written with the member's submission and
+//! rewritten with its status and error by the settlement that terminates
+//! it; [`jobs::JobGroup::status`] reads it, [`jobs::JobGroup::forget`]
+//! removes it and [`jobs::JobRunnerBuilder::group_retention`] removes it a
+//! window after the members all terminated, through a sweep over
+//! `workflow/group-terminals/`. Streamed output, progress, a failure
+//! threshold and a cost rollup are folds the caller writes over the
+//! results; `examples/group_document_pipeline.rs` shows a per-document
+//! pipeline of memoized stages with counters rolled up by the caller.
 //!
 //! # Idempotency
 //!
@@ -562,7 +563,6 @@
 #![warn(missing_docs)]
 
 mod blob;
-pub mod bulk;
 mod durable;
 mod effects;
 mod error;

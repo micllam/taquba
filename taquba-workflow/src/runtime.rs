@@ -704,9 +704,9 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             // `error` is `None`: external cancellation supplies no reason
             // at the API level. The effects are built before the outcome
             // is known; the queue applies them only on `Removed`.
-            let effects =
-                self.inner
-                    .terminate_collecting_effects(&claimed.cancelled(None), &claimed, None);
+            let effects = self
+                .inner
+                .terminate_collecting_effects(&claimed.cancelled(None), &claimed);
             match core.queue.cancel_with(&job.id, effects).await?.0 {
                 taquba::CancelOutcome::Removed | taquba::CancelOutcome::Requested => {
                     return Ok(true);
@@ -957,7 +957,7 @@ impl RuntimeCore {
         run_id: &str,
         step_number: u32,
         step_payload: &[u8],
-    ) -> Result<Option<(StepOutcome, StagedEffects, Option<Vec<u8>>)>> {
+    ) -> Result<Option<(StepOutcome, StagedEffects)>> {
         let Some(bytes) = self
             .memo_store
             .get_step_output(run_id, step_number, step_payload)
@@ -984,7 +984,7 @@ impl RuntimeCore {
                     }
                     _ => {}
                 }
-                Ok(Some((outcome, record.effects, record.note)))
+                Ok(Some((outcome, record.effects)))
             }
             Err(err) => {
                 warn!(
@@ -1005,13 +1005,11 @@ impl RuntimeCore {
         step_payload: &[u8],
         outcome: &StepOutcome,
         effects: &StagedEffects,
-        note: Option<Vec<u8>>,
     ) -> Result<()> {
         let record = DurableStepOutcomeRecord {
             stored_at_ms: self.clock.now_ms(),
             outcome: DurableStepOutcome::from(outcome),
             effects: effects.clone(),
-            note,
         };
         let bytes = rmp_serde::to_vec_named(&record)?;
         self.memo_store
@@ -1061,8 +1059,8 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     /// Settle a run into its terminal state: return the deletes of the
     /// durable run record and the current-step pointer, the writes of
     /// the terminal marker and the terminal record (when memo retention
-    /// is enabled), the write of the member record with `note` (when
-    /// the run is a group member) and the terminal-notification enqueue
+    /// is enabled), the write of the member record (when the run is a
+    /// group member) and the terminal-notification enqueue
     /// (when the hook observes this outcome) as [`SettlementEffects`]
     /// for the settlement transaction. The notification job's payload
     /// is the committed outcome and the configured [`TerminalHook`]
@@ -1078,7 +1076,6 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         &self,
         outcome: &RunOutcome,
         terminal_step: &ClaimedStep<'_>,
-        note: Option<Vec<u8>>,
     ) -> SettlementEffects {
         let kv_deletes = vec![run_kv_key(&outcome.run_id), step_kv_key(&outcome.run_id)];
         let terminated_at_ms = self.core.clock.now_ms();
@@ -1102,7 +1099,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         if let Some(membership) = &terminal_step.membership {
             kv_writes.insert(
                 membership.kv_key(),
-                durable::encode(&terminated_member(&outcome.run_id, termination, note)),
+                durable::encode(&terminated_member(&outcome.run_id, termination)),
             );
         }
         let enqueues = if self.terminal_hook.observes(outcome) {
@@ -1152,7 +1149,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 .last_error
                 .clone()
                 .unwrap_or_else(|| "step dead-lettered outside the worker".to_string());
-            let effects = self.terminate_collecting_effects(&claimed.failed(error), &claimed, None);
+            let effects = self.terminate_collecting_effects(&claimed.failed(error), &claimed);
             core.queue.commit_effects(effects).await?;
             warn!(run_id = %run_id, step_number = claimed.step_number, job_id = %job.id, "terminated a run whose step was dead-lettered outside the worker");
             terminated += 1;
@@ -1196,9 +1193,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::durable::DurableMember;
     use crate::effects::{EffectsHandle, TerminalEffects};
     use crate::group::{ManifestMember, MemberSpec};
-    use crate::keys::MAX_RUN_ID_LEN;
+    use crate::keys::{MAX_RUN_ID_LEN, group_member_kv_key};
     use crate::keys::{
         TERMINAL_KV_PREFIX, parse_timestamped_kv_key, signal_buf_kv_key, signal_wait_kv_key,
     };
@@ -4076,23 +4074,39 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_note_reaches_the_member_record_only_with_the_terminating_settlement() {
-        struct NotingRunner;
+    async fn a_member_record_is_rewritten_only_by_the_terminating_settlement() {
+        struct RecordReadingRunner {
+            pending_seen: Arc<StdMutex<Vec<bool>>>,
+        }
 
-        impl StepRunner for NotingRunner {
+        impl StepRunner for RecordReadingRunner {
             async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
-                step.effects
-                    .note(step.attempts.to_string().into_bytes())
-                    .map_err(|e| StepError::permanent(e.to_string()))?;
+                let record = step
+                    .kv
+                    .get(&group_member_kv_key("g", "m"))
+                    .await?
+                    .expect("the member record is written with the submission");
+                let member: DurableMember = rmp_serde::from_slice(&record).unwrap();
+                self.pending_seen
+                    .lock()
+                    .unwrap()
+                    .push(member.terminated.is_none());
                 Err(StepError::transient("still failing"))
             }
         }
 
         let (queue, store) = open_queue_with(fast_options()).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime =
-            WorkflowRuntime::builder(queue.clone(), store, NotingRunner, ChannelHook { tx })
-                .build();
+        let pending_seen = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            RecordReadingRunner {
+                pending_seen: pending_seen.clone(),
+            },
+            ChannelHook { tx },
+        )
+        .build();
         let shutdown = spawn_runtime(runtime.clone());
 
         let group = runtime.group("g").unwrap();
@@ -4122,13 +4136,24 @@ mod tests {
         }
         assert_eq!(queue.stats("workflow-steps").await.unwrap().dead, 1);
 
-        // The retried first attempt recorded nothing; the exhausted second
-        // attempt's note commits with the dead-letter.
+        // The retried first attempt left the record pending; the
+        // exhausted second attempt's termination commits with the
+        // dead-letter.
+        assert_eq!(*pending_seen.lock().unwrap(), vec![true, true]);
         let members = group.members().await.unwrap();
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].key, "m");
         assert_eq!(members[0].status(), Some(TerminalStatus::Failed));
-        assert_eq!(members[0].record.note.as_deref(), Some(b"2".as_slice()));
+        assert_eq!(
+            members[0]
+                .record
+                .terminated
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("still failing")
+        );
 
         let _ = shutdown.send(());
     }

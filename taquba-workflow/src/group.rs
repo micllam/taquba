@@ -2,8 +2,8 @@
 //! group id, whose membership is a manifest in the object store and
 //! whose per-member state is a record in the queue's KV namespace.
 //! [`RunGroup`] submits the members, waits for their terminations and
-//! removes the group's state; the typed layers present it as a bulk
-//! batch and as a job group.
+//! removes the group's state; [`jobs::JobGroup`](crate::jobs::JobGroup)
+//! presents it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -230,6 +230,15 @@ pub(crate) struct RunGroup<'a, R, H> {
     id: String,
 }
 
+impl<R, H> Clone for RunGroup<'_, R, H> {
+    fn clone(&self) -> Self {
+        Self {
+            runtime: self.runtime,
+            id: self.id.clone(),
+        }
+    }
+}
+
 impl<'a, R: StepRunner, H: TerminalHook> RunGroup<'a, R, H> {
     pub(crate) fn new(runtime: &'a WorkflowRuntime<R, H>, id: String) -> Self {
         Self { runtime, id }
@@ -330,23 +339,36 @@ impl<'a, R: StepRunner, H: TerminalHook> RunGroup<'a, R, H> {
 
     /// The members of the manifest as each one terminates, in
     /// completion order; a member already terminated is yielded at
-    /// once. Every member must have been submitted.
+    /// once. Every member must have been submitted. Once every member
+    /// has been yielded, the group's terminal marker is written, from
+    /// which the group retention sweep counts the window; a failed
+    /// marker write is logged.
     pub(crate) async fn terminations(
         &self,
-    ) -> Result<impl Stream<Item = Result<MemberState>> + '_> {
+    ) -> Result<impl Stream<Item = Result<MemberState>> + use<'a, R, H>> {
         let manifest = self.manifest().await?;
         let waits: FuturesUnordered<_> = manifest
             .members
             .into_iter()
-            .map(|member| async move {
-                let record = self.wait_member(&member.key).await?;
-                Ok(MemberState {
-                    key: member.key,
-                    record,
-                })
+            .map(|member| {
+                let group = self.clone();
+                async move {
+                    let record = group.wait_member(&member.key).await?;
+                    Ok(MemberState {
+                        key: member.key,
+                        record,
+                    })
+                }
             })
             .collect();
-        Ok(waits)
+        let group = self.clone();
+        let marker = stream::once(async move {
+            if let Err(err) = group.mark_terminated().await {
+                warn!(group_id = %group.id, "group terminal marker write failed: {err}");
+            }
+        })
+        .filter_map(|()| async { None::<Result<MemberState>> });
+        Ok(waits.chain(marker))
     }
 
     /// Wait until the member `key` terminates and return its record.
@@ -383,10 +405,9 @@ impl<'a, R: StepRunner, H: TerminalHook> RunGroup<'a, R, H> {
         }
     }
 
-    /// Write the group's terminal marker, from which the group retention
-    /// sweep counts the window; no marker is written without
+    /// Write the group's terminal marker; no marker is written without
     /// [`WorkflowRuntimeBuilder::group_retention`](crate::WorkflowRuntimeBuilder::group_retention).
-    pub(crate) async fn mark_terminated(&self) -> Result<()> {
+    async fn mark_terminated(&self) -> Result<()> {
         let core = self.core();
         if core.group_retention.is_some() {
             let key = group_terminal_kv_key(&self.id, core.clock.now_ms());
@@ -414,20 +435,14 @@ pub(crate) fn pending_member(run_id: &str) -> DurableMember {
     DurableMember {
         run_id: run_id.to_string(),
         terminated: None,
-        note: None,
     }
 }
 
 /// The member record written by the settlement that terminates a member.
-pub(crate) fn terminated_member(
-    run_id: &str,
-    termination: DurableTermination,
-    note: Option<Vec<u8>>,
-) -> DurableMember {
+pub(crate) fn terminated_member(run_id: &str, termination: DurableTermination) -> DurableMember {
     DurableMember {
         run_id: run_id.to_string(),
         terminated: Some(termination),
-        note,
     }
 }
 
@@ -446,9 +461,6 @@ mod tests {
 
     impl StepRunner for TwoSteps {
         async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
-            step.effects
-                .note(step.step_number.to_string().into_bytes())
-                .map_err(|e| StepError::permanent(e.to_string()))?;
             if step.step_number == 0 {
                 Ok(StepOutcome::continue_now(step.payload.clone()))
             } else {
@@ -497,7 +509,6 @@ mod tests {
                 termination.final_step, 1,
                 "the member terminated at its second step"
             );
-            assert_eq!(m.record.note.as_deref(), Some(b"1".as_slice()));
         }
 
         // A member already terminated is yielded again at once.
@@ -513,7 +524,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_external_cancellation_records_the_member_without_a_note() {
+    async fn an_external_cancellation_records_the_member_cancelled() {
         let (queue, store, _clock) = open_queue_at(10_000).await;
         let runtime =
             WorkflowRuntime::builder(queue.clone(), store, TwoSteps, NoopTerminalHook).build();
@@ -527,7 +538,6 @@ mod tests {
 
         let members = group.members().await.unwrap();
         assert_eq!(members[0].status(), Some(TerminalStatus::Cancelled));
-        assert_eq!(members[0].record.note, None);
         assert_eq!(
             members[0]
                 .record

@@ -90,56 +90,28 @@ pub enum Error {
     #[error("deserialization error: {0}")]
     Deserialization(#[from] rmp_serde::decode::Error),
 
-    /// Reading a bulk input source or writing an output sink failed.
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-
-    /// Parsing or serializing JSON for a bulk input or output line failed.
-    #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
-
     /// A [`jobs::JobHandle`](crate::jobs::JobHandle) was awaited for a
     /// job the runtime has no record of.
     #[error("job `{0}` not found")]
     JobNotFound(String),
 
-    /// Two members of one group (a bulk batch, a job group) produced
-    /// the same key.
+    /// Two members of one job group produced the same key.
     #[error("duplicate member key `{0}` in group")]
     DuplicateMemberKey(String),
 
-    /// A submission to an existing group (a bulk batch, a job group)
-    /// supplied a different member set than the group's manifest.
+    /// A submission to an existing job group supplied a different
+    /// member set than the group's manifest.
     #[error("group `{0}` exists with a different member set")]
     GroupMismatch(String),
 
-    /// A group operation named a group (a bulk batch, a job group) with
-    /// no manifest.
+    /// A job group operation named a group with no manifest.
     #[error("group `{0}` not found")]
     GroupNotFound(String),
 
-    /// A run of a bulk batch was started while a run of the same batch
-    /// was active in this process.
-    #[error("batch `{0}` is already running in this process")]
-    BatchRunning(String),
-
-    /// A group id (a bulk batch id, a job group id) was not 1 to
-    /// [`crate::MAX_RUN_ID_LEN`] bytes of `[A-Za-z0-9_-]`.
+    /// A job group id was not 1 to [`crate::MAX_RUN_ID_LEN`] bytes of
+    /// `[A-Za-z0-9_-]`.
     #[error("invalid group id `{0}`: must be 1 to 128 bytes of `[A-Za-z0-9_-]`")]
     InvalidGroupId(String),
-
-    /// A bulk batch run completed but the share of failed items exceeded
-    /// the configured
-    /// [`fail_threshold`](crate::bulk::BulkRunnerBuilder::fail_threshold).
-    #[error("bulk run failed: {failed}/{total} items failed, over the {threshold:.1}% threshold")]
-    FailureThresholdExceeded {
-        /// Number of items that terminated failed.
-        failed: usize,
-        /// Total number of items submitted.
-        total: usize,
-        /// The configured threshold, as a percentage.
-        threshold: f64,
-    },
 }
 
 impl Error {
@@ -161,15 +133,13 @@ impl Error {
             | Self::EffectsSealed
             | Self::Serialization(_)
             | Self::Deserialization(_)
-            | Self::Json(_)
             | Self::JobNotFound(_)
             | Self::DuplicateMemberKey(_)
             | Self::GroupMismatch(_)
             | Self::GroupNotFound(_)
-            | Self::InvalidGroupId(_)
-            | Self::FailureThresholdExceeded { .. } => true,
+            | Self::InvalidGroupId(_) => true,
             Self::Queue(e) => e.is_permanent(),
-            Self::Store(_) | Self::Io(_) | Self::BatchRunning(_) => false,
+            Self::Store(_) => false,
         }
     }
 }
@@ -242,25 +212,11 @@ mod tests {
                 Error::Deserialization(rmp_serde::from_slice::<u32>(b"").unwrap_err()),
                 true,
             ),
-            (Error::Io(std::io::Error::other("disk")), false),
-            (
-                Error::Json(serde_json::from_str::<u32>("x").unwrap_err()),
-                true,
-            ),
             (Error::JobNotFound("job-1".into()), true),
             (Error::DuplicateMemberKey("k".into()), true),
             (Error::GroupMismatch("b".into()), true),
             (Error::GroupNotFound("b".into()), true),
-            (Error::BatchRunning("b".into()), false),
             (Error::InvalidGroupId("a/b".into()), true),
-            (
-                Error::FailureThresholdExceeded {
-                    failed: 1,
-                    total: 2,
-                    threshold: 10.0,
-                },
-                true,
-            ),
         ] {
             assert_eq!(error.is_permanent(), permanent, "{error}");
         }

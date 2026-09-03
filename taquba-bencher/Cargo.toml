@@ -76,8 +76,8 @@ path = "benches/taquba-workflow/step_transitions.rs"
 harness = false
 
 [[bench]]
-name = "bulk_throughput"
-path = "benches/taquba-workflow/bulk_throughput.rs"
+name = "group_throughput"
+path = "benches/taquba-workflow/group_throughput.rs"
 harness = false
 
 [[bench]]

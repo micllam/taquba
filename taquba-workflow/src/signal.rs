@@ -155,11 +155,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     let message = format!(
                         "a waiter is already registered for correlation key `{correlation_key}`"
                     );
-                    return Err(self.terminating_failure(
-                        claimed,
-                        StepError::permanent(message),
-                        None,
-                    ));
+                    return Err(self.terminating_failure(claimed, StepError::permanent(message)));
                 }
             }
             Ok(None) => {}

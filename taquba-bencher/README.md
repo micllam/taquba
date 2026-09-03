@@ -37,12 +37,12 @@ documented in the header comment of its source file.
 |---|---|---|
 | `step_transitions` | Submit `N_RUNS` runs of `N_STEPS` steps each; the runner returns `Continue` immediately, so only the runtime's own overhead is measured | What does a step transition cost (persisting the transition, enqueuing the next step, the claim / dispatch round trip), and does it hold while many runs progress concurrently? |
 
-### taquba-workflow bulk processing (`bulk` module)
+### taquba-workflow job groups (`jobs` module)
 
 | Benchmark | Workload | Question it answers |
 |---|---|---|
-| `bulk_throughput` | Run `N_ITEMS` items through a pipeline of `N_PHASES` memoized phases that do no work | What is the per-item orchestration overhead (run submission, the single workflow step, one memo write per phase, terminal accounting), and what item throughput does it bound? |
-| `resume_replay` | Each item fails transiently on its first attempt after completing `FAIL_AT` phases of `PHASE_WORK_MS` simulated work; the retry re-enters the pipeline. `MEMO=0` runs the identical workload without memoization | How much completed work does `Memo::memoized` save a retried item? The memoized run should re-execute zero completed phases; the `MEMO=0` run re-pays them. |
+| `group_throughput` | Run `N_ITEMS` jobs of one group through `N_PHASES` memoized phases that do no work | What is the per-item orchestration overhead (run submission, the single workflow step, one memo write per phase, terminal accounting, the result read), and what item throughput does it bound? |
+| `resume_replay` | Each job of a group fails transiently on its first attempt after completing `FAIL_AT` phases of `PHASE_WORK_MS` simulated work; the retry re-enters the handler. `MEMO=0` runs the identical workload without memoization | How much completed work does `Memo::memoized` save a retried item? The memoized run should re-execute zero completed phases; the `MEMO=0` run re-pays them. |
 
 ### taquba-workflow typed jobs (`jobs` module)
 
@@ -140,10 +140,10 @@ FLUSH_INTERVAL_MS=100 STORE_LATENCY_MS=20 \
 N_RUNS=200 N_STEPS=20 MAX_CONCURRENT_STEPS=32 \
     cargo bench -p taquba-bencher --bench step_transitions > steps.csv
 
-# Bulk per-item overhead (500 items, 3 no-op phases).
-cargo bench -p taquba-bencher --bench bulk_throughput > bulk.csv
+# Job group per-item overhead (500 items, 3 no-op phases).
+cargo bench -p taquba-bencher --bench group_throughput > group.csv
 
-# Bulk resume: every item retries after 2 of 4 phases; compare the
+# Job group resume: every item retries after 2 of 4 phases; compare the
 # phase execution count against the same run with MEMO=0.
 cargo bench -p taquba-bencher --bench resume_replay > resume.csv
 MEMO=0 cargo bench -p taquba-bencher --bench resume_replay > resume_bare.csv
@@ -314,7 +314,7 @@ it, in microseconds, where the transition latency of step k is the
 time between step k-1 and step k of the same run completing. A summary
 (steps/s, run end-to-end percentiles) prints to stderr.
 
-For `bulk_throughput` and `resume_replay`:
+For `group_throughput` and `resume_replay`:
 
 ```
 window_sec,completed
@@ -322,7 +322,7 @@ window_sec,completed
 
 One row per second with the cumulative number of terminal items. The
 summary printed to stderr reports items/s and succeeded / failed
-counts for `bulk_throughput`, and items/s plus the phase execution
+counts for `group_throughput`, and items/s plus the phase execution
 count against the no-retry floor for `resume_replay` (executions above
 the floor are phases a retry re-executed).
 

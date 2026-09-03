@@ -1,5 +1,5 @@
-//! The typed single-step run shared by the [`jobs`](crate::jobs) and
-//! [`bulk`](crate::bulk) modules: the runtime such a layer runs over
+//! The typed single-step run of the [`jobs`](crate::jobs) module: the
+//! runtime it runs over
 //! ([`TypedRuntime`]) and the settings it forwards to the workflow
 //! runtime ([`TypedRuntimeOptions`]), the adapter that decodes a typed
 //! input, runs a typed handler and encodes its output

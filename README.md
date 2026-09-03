@@ -162,7 +162,7 @@ already use the stack.
 
 | Tier | Crate | What it does | Best for |
 |---|---|---|---|
-| Execution | [`taquba-workflow`](./taquba-workflow) | Runs one durable multi-step process: a sequence of steps with per-step memoization, retries, durable signals and a terminal hook. Its `jobs` module runs one typed async function as a single-step run and returns the result to an awaiting caller; its `bulk` module applies one pipeline to many inputs in parallel with batch progress, cost rollup and streamed output | LLM agent runs, payment flows, document pipelines, typed background tasks, bulk LLM and document workloads |
+| Execution | [`taquba-workflow`](./taquba-workflow) | Runs one durable multi-step process: a sequence of steps with per-step memoization, retries, durable signals and a terminal hook. Its `jobs` module runs one typed async function as a single-step run and returns the result to an awaiting caller, and submits many such jobs as one durable group whose results stream back as they complete | LLM agent runs, payment flows, document pipelines, typed background tasks, batch LLM and document workloads |
 | Substrate | [`taquba`](./taquba) | Durable task queue with transactional KV, leases, retries, scheduling and dead-letter | Building your own execution layer, or background jobs with opaque payloads |
 | Component | [`taquba-cron`](./taquba-cron) | POSIX cron scheduling onto a Taquba queue | Periodic enqueues (reports, sweeps, reminders) |
 | Component | [`taquba-webhooks`](./taquba-webhooks) | HTTP webhook delivery with retries and dead-letter | Outbound webhook fan-out with durable retries |
@@ -179,17 +179,16 @@ Every crate above the substrate consumes one `Arc<Queue>`.
   pipeline can be approximated by chaining. Chained jobs share no run
   identity, no end-to-end terminal status and no resume point; a process
   modelled by chaining belongs in a step runner.
-- **Job fan-out or bulk.** Submitting N typed jobs and awaiting their
-  handles yields N independent typed results. Use the `bulk` module when
-  each item is itself a multi-phase pipeline whose completed phases must
-  survive a retry, and the batch needs progress, cost rollup and a
-  failure threshold.
-- **Fan-out inside one run.** Compose steps with typed jobs: a workflow
-  step submits N typed jobs, joins their results and memoizes the
-  aggregate so a step retry does not re-submit. The
-  reference agent uses this for its parallel page-fetch phase and cancels
-  in-flight jobs when the surrounding run is cancelled. It is a manual
-  pattern, demonstrated in
+- **Independent jobs or a job group.** Submitting N typed jobs and
+  awaiting their handles yields N independent results. A job group
+  submits the N as one durable set: a second submission runs again only
+  the members that did not succeed, the results stream back as they
+  complete, and each member's completed phases survive a retry through
+  its memo.
+- **Fan-out inside one run.** A workflow step opens a job group named
+  after the step, submits one job per item and joins the results; a
+  retry of the step re-submits the group and joins the recorded results
+  of the members that completed. Demonstrated in
   [`taquba-workflow/examples/fanout_jobs.rs`](./taquba-workflow/examples/fanout_jobs.rs).
 
 ## Stability

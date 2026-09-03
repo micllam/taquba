@@ -1,13 +1,13 @@
-// cargo bench -p taquba-bencher --bench bulk_throughput > bulk.csv
+// cargo bench -p taquba-bencher --bench group_throughput > group.csv
 //
-// Batch throughput benchmark for the bulk orchestrator. Runs N_ITEMS
-// items through a pipeline of N_PHASES memoized phases that do no
-// work, so the measured cost is the per-item overhead: run
-// submission, the single workflow step, one memo write per phase, and
-// terminal accounting. A watcher samples progress once per second.
+// Group throughput benchmark for typed jobs. Runs N_ITEMS jobs of a
+// group through N_PHASES memoized phases that do no work, so the
+// measured cost is the per-item overhead: run submission, the single
+// workflow step, one memo write per phase, terminal accounting and the
+// result read. Completions are counted per second.
 //
 // Parameters (env vars, all optional).
-//   N_ITEMS             input items in the batch (default 500).
+//   N_ITEMS             jobs in the group (default 500).
 //   N_PHASES            memoized phases per item (default 3).
 //   MAX_CONCURRENT      items processed in parallel (default 16).
 //   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1).
@@ -29,41 +29,61 @@
 // (items/s, succeeded / failed counts) goes to stderr so stdout stays
 // a clean data stream.
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use futures_util::TryStreamExt;
 use taquba::{OpenOptions, Queue, QueueConfig};
 use taquba_bencher::{env_var, init_tracing, store_from_env};
-use taquba_workflow::StepError;
-use taquba_workflow::bulk::{BulkCtx, BulkRunner, Pipeline};
+use taquba_workflow::jobs::{Job, JobContext, JobRunner};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Item {
     idx: u32,
 }
 
-struct PhasesPipeline {
-    n_phases: usize,
-}
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+struct BenchError(#[from] taquba_workflow::Error);
 
-impl Pipeline for PhasesPipeline {
-    type Input = Item;
+/// The phase count, registered as handler state.
+struct Phases(usize);
+
+impl Job for Item {
+    const NAME: &'static str = "bench.phases";
     type Output = u32;
-    type Error = StepError;
+    type Error = BenchError;
 
-    async fn run(&self, ctx: &BulkCtx<Item>) -> Result<u32, StepError> {
-        let mut acc = ctx.input.idx;
-        for phase in 0..self.n_phases {
+    async fn run(&self, ctx: JobContext<'_>) -> Result<u32, BenchError> {
+        let n_phases = ctx.state::<Phases>().0;
+        let mut acc = self.idx;
+        for phase in 0..n_phases {
             let value = acc;
             acc = ctx
                 .memo
                 .memoized(&format!("phase-{phase}"), async move {
-                    Ok::<_, StepError>(value.wrapping_add(1))
+                    Ok::<_, BenchError>(value.wrapping_add(1))
                 })
                 .await?;
         }
         Ok(acc)
     }
+}
+
+/// Cumulative completions per elapsed second, from the completion
+/// instants of a run.
+fn progress_rows(started: Instant, completions: &[Instant]) -> Vec<(u64, usize)> {
+    let mut rows = Vec::new();
+    let mut completed = 0;
+    for at in completions {
+        completed += 1;
+        let sec = at.duration_since(started).as_secs();
+        match rows.last_mut() {
+            Some((last, count)) if *last == sec => *count = completed,
+            _ => rows.push((sec, completed)),
+        }
+    }
+    rows
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -77,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store_latency_ms: u64 = env_var("STORE_LATENCY_MS", 0);
 
     eprintln!(
-        "bulk_throughput: items={n_items}, phases={n_phases}, \
+        "group_throughput: items={n_items}, phases={n_phases}, \
          max_concurrent={max_concurrent}, flush_interval={flush_interval_ms}ms, \
          store_latency={store_latency_ms}ms",
     );
@@ -94,62 +114,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?,
     );
 
-    let mut bulk = BulkRunner::builder(queue.clone(), store, PhasesPipeline { n_phases })
-        .max_concurrent(max_concurrent)
+    let mut runner = JobRunner::builder(queue.clone(), store)
+        .register::<Item>()
+        .state(Phases(n_phases))
+        .max_concurrent_jobs(max_concurrent)
         .build();
-    let worker = bulk.spawn(std::future::pending::<()>());
-    let bulk = Arc::new(bulk);
-    let batch_id = bulk.new_batch().id().to_string();
+    let worker = runner.spawn(std::future::pending::<()>());
 
-    // Watcher: sample cumulative progress once per second.
-    let progress_rows: Arc<Mutex<Vec<(u64, usize)>>> = Arc::new(Mutex::new(Vec::new()));
-    let watcher = {
-        let bulk = bulk.clone();
-        let batch_id = batch_id.clone();
-        let progress_rows = progress_rows.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(1));
-            tick.tick().await; // skip immediate first tick
-            loop {
-                tick.tick().await;
-                let Some(p) = bulk.batch(batch_id.clone()).unwrap().progress() else {
-                    continue;
-                };
-                let sec = p.elapsed.as_secs();
-                progress_rows.lock().unwrap().push((sec, p.completed));
+    let started = Instant::now();
+    let group = runner.new_group::<Item>();
+    group
+        .submit((0..n_items as u32).map(|idx| Item { idx }))
+        .await?;
+    let (mut succeeded, mut failed) = (0usize, 0usize);
+    let mut completions = Vec::with_capacity(n_items);
+    {
+        let mut results = std::pin::pin!(group.results().await?);
+        while let Some(result) = results.try_next().await? {
+            completions.push(Instant::now());
+            match result.result {
+                Ok(_) => succeeded += 1,
+                Err(_) => failed += 1,
+            }
+            if completions.len() % 100 == 0 {
                 eprintln!(
-                    "  t={sec}s completed={}/{} ({:.0}/s)",
-                    p.completed, p.total, p.rate_per_sec,
+                    "  t={}s completed={}/{n_items}",
+                    started.elapsed().as_secs(),
+                    completions.len()
                 );
             }
-        })
-    };
-
-    let inputs = (0..n_items as u32).map(|idx| Item { idx });
-    let report = bulk.batch(batch_id.clone())?.run(inputs).await?;
-    watcher.abort();
-    // Await the aborted watcher so its `bulk` clone is dropped before the
-    // queue refcount check below. `abort()` only requests cancellation, so
-    // without this the task can still hold a `bulk` clone (and through it a
-    // `queue` clone) when `Arc::try_unwrap` runs.
-    let _ = watcher.await;
+        }
+    }
+    let elapsed = started.elapsed();
     worker.shutdown().await?;
 
     println!("window_sec,completed");
-    for (sec, completed) in progress_rows.lock().unwrap().iter() {
+    for (sec, completed) in progress_rows(started, &completions) {
         println!("{sec},{completed}");
     }
 
-    let secs = report.elapsed.as_secs_f64();
+    let secs = elapsed.as_secs_f64();
     eprintln!(
-        "summary: {} items ({} succeeded, {} failed) in {secs:.2}s ({:.0} items/s)",
-        report.total,
-        report.succeeded,
-        report.failed,
-        report.total as f64 / secs,
+        "summary: {n_items} items ({succeeded} succeeded, {failed} failed) in {secs:.2}s \
+         ({:.0} items/s)",
+        n_items as f64 / secs,
     );
 
-    drop(bulk);
+    drop(group);
+    drop(runner);
     let queue =
         Arc::try_unwrap(queue).map_err(|_| "queue still has outstanding references at shutdown")?;
     queue.close().await?;

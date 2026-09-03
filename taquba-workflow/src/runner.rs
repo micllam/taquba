@@ -14,9 +14,9 @@ use crate::memo::{Memo, MemoStore};
 
 /// The delivery a handler runs under: the identity of the run and of
 /// the queue job delivering it, the attempt count and the delivery's
-/// handles. [`Step`], [`jobs::JobContext`](crate::jobs::JobContext) and
-/// [`bulk::BulkCtx`](crate::bulk::BulkCtx) dereference to it. It holds
-/// handles only; no queue is reachable through it.
+/// handles. [`Step`] and [`jobs::JobContext`](crate::jobs::JobContext)
+/// dereference to it. It holds handles only; no queue is reachable
+/// through it.
 ///
 /// Constructed by the runtime. A test constructs one with
 /// [`Delivery::detached`] and assigns the fields it needs.

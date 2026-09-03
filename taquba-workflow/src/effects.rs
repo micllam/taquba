@@ -39,16 +39,9 @@ pub struct EffectsHandle {
     inner: Arc<Mutex<EffectsState>>,
 }
 
-/// Size cap of a note, leaving room for the member record around it
-/// under [`taquba::MAX_KV_VALUE_SIZE`].
-pub(crate) const MAX_NOTE_SIZE: usize = taquba::MAX_KV_VALUE_SIZE - 1024;
-
 #[derive(Debug, Default)]
 struct EffectsState {
     staged: StagedEffects,
-    /// Bytes recorded on the run's group member record when the step
-    /// terminates the run; see [`EffectsHandle::note`].
-    note: Option<Vec<u8>>,
     sealed: bool,
 }
 
@@ -68,27 +61,10 @@ impl EffectsState {
         Ok(())
     }
 
-    fn note(&mut self, bytes: Vec<u8>) -> Result<()> {
-        if self.sealed {
-            return Err(Error::EffectsSealed);
-        }
-        if bytes.len() > MAX_NOTE_SIZE {
-            return Err(Error::Queue(taquba::Error::KvValueTooLarge {
-                size: bytes.len(),
-                max: MAX_NOTE_SIZE,
-            }));
-        }
-        self.note = Some(bytes);
-        Ok(())
-    }
-
     /// Seal the state and move out everything staged.
-    fn seal_and_take(&mut self) -> SealedEffects {
+    fn seal_and_take(&mut self) -> StagedEffects {
         self.sealed = true;
-        SealedEffects {
-            outcome: std::mem::take(&mut self.staged),
-            note: self.note.take(),
-        }
+        std::mem::take(&mut self.staged)
     }
 
     fn delete(&mut self, key: Vec<u8>) -> Result<()> {
@@ -118,14 +94,6 @@ impl EffectsState {
 pub(crate) struct StagedEffects {
     pub(crate) writes: HashMap<Vec<u8>, Vec<u8>>,
     pub(crate) deletes: HashSet<Vec<u8>>,
-}
-
-/// Everything an [`EffectsHandle`] holds when its delivery returns: the
-/// effects of the returned outcome and the note.
-#[derive(Debug, Default)]
-pub(crate) struct SealedEffects {
-    pub(crate) outcome: StagedEffects,
-    pub(crate) note: Option<Vec<u8>>,
 }
 
 impl EffectsHandle {
@@ -169,20 +137,10 @@ impl EffectsHandle {
         self.inner.lock().unwrap().delete(key.into())
     }
 
-    /// Stage `bytes` as the note of the run's group member record,
-    /// written when this step terminates the run: with an acking
-    /// outcome, or with the dead-lettering settlement of a permanent
-    /// error or a transient one on the last attempt. A retried attempt
-    /// and an external cancellation record no note. A later call
-    /// replaces the note.
-    pub(crate) fn note(&self, bytes: Vec<u8>) -> Result<()> {
-        self.inner.lock().unwrap().note(bytes)
-    }
-
     /// Seal the handle and move out everything staged. An effect staged
     /// after the seal could not join the settlement, so later staging
     /// attempts return [`Error::EffectsSealed`].
-    pub(crate) fn seal_and_take(&self) -> SealedEffects {
+    pub(crate) fn seal_and_take(&self) -> StagedEffects {
         self.inner.lock().unwrap().seal_and_take()
     }
 }
@@ -266,8 +224,8 @@ impl TerminalEffects {
     /// Seal the handle and move out everything staged.
     pub(crate) fn seal_and_take(&self) -> (StagedEffects, Vec<EnqueueRequest>) {
         let mut state = self.inner.lock().unwrap();
-        let sealed = state.kv.seal_and_take();
-        (sealed.outcome, std::mem::take(&mut state.enqueues))
+        let staged = state.kv.seal_and_take();
+        (staged, std::mem::take(&mut state.enqueues))
     }
 }
 
@@ -313,19 +271,10 @@ mod tests {
         let clone = handle.clone();
         clone.put("a", "v").unwrap();
         clone.delete("b").unwrap();
-        clone.note(b"n".to_vec()).unwrap();
-        let sealed = handle.seal_and_take();
-        assert_eq!(
-            sealed.outcome.writes.get(b"a".as_slice()),
-            Some(&b"v".to_vec())
-        );
-        assert!(sealed.outcome.deletes.contains(b"b".as_slice()));
-        assert_eq!(sealed.note, Some(b"n".to_vec()));
+        let staged = handle.seal_and_take();
+        assert_eq!(staged.writes.get(b"a".as_slice()), Some(&b"v".to_vec()));
+        assert!(staged.deletes.contains(b"b".as_slice()));
         assert!(matches!(clone.put("c", "v"), Err(Error::EffectsSealed)));
-        assert!(matches!(
-            clone.note(b"x".to_vec()),
-            Err(Error::EffectsSealed)
-        ));
         assert!(matches!(clone.delete("c"), Err(Error::EffectsSealed)));
     }
 

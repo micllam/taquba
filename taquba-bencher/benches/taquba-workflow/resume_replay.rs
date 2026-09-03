@@ -1,16 +1,16 @@
 // cargo bench -p taquba-bencher --bench resume_replay > resume.csv
 //
-// Resume benchmark for per-item memoization. Every item's pipeline
+// Resume benchmark for per-item memoization. Every job of a group
 // runs N_PHASES memoized phases of PHASE_WORK_MS simulated work each;
-// when FAIL_AT is above 0, each item fails transiently on its first
+// when FAIL_AT is above 0, each job fails transiently on its first
 // attempt after completing FAIL_AT phases, so the retry re-enters the
-// pipeline and resumes through memo hits instead of re-paying the
+// handler and resumes through memo hits without re-paying the
 // completed phases. Setting MEMO=0 runs the identical workload
 // without memoization, so the difference between the two runs is the
 // work that memoization saves a retried item.
 //
 // Parameters (env vars, all optional).
-//   N_ITEMS             input items in the batch (default 200).
+//   N_ITEMS             jobs in the group (default 200).
 //   N_PHASES            memoized phases per item (default 4).
 //   FAIL_AT             phases each item completes before its injected
 //                       first-attempt transient failure; 0 disables
@@ -43,42 +43,50 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use futures_util::TryStreamExt;
 use taquba::{OpenOptions, Queue, QueueConfig};
 use taquba_bencher::{env_var, init_tracing, store_from_env};
-use taquba_workflow::StepError;
-use taquba_workflow::bulk::{BulkCtx, BulkRunner, Pipeline};
+use taquba_workflow::jobs::{Job, JobContext, JobRunner};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Item {
     idx: u32,
 }
 
-struct ResumePipeline {
+#[derive(Debug, thiserror::Error)]
+enum BenchError {
+    #[error("{0}")]
+    Transient(&'static str),
+    #[error(transparent)]
+    Runtime(#[from] taquba_workflow::Error),
+}
+
+/// The workload settings and counters, registered as handler state.
+struct Resume {
     n_phases: usize,
     fail_at: usize,
     phase_work: Duration,
     memoize: bool,
-    /// Number of times a phase body actually ran (memo hits excluded).
-    executions: Arc<AtomicUsize>,
+    /// Number of times a phase body ran (memo hits excluded).
+    executions: AtomicUsize,
     /// Items that have already taken their injected failure.
     failed_once: Mutex<HashSet<u32>>,
 }
 
-impl ResumePipeline {
+impl Resume {
     async fn run_phase(
         &self,
-        ctx: &BulkCtx<Item>,
+        ctx: &JobContext<'_>,
         phase: usize,
         value: u32,
-    ) -> Result<u32, StepError> {
-        let executions = self.executions.clone();
+    ) -> Result<u32, BenchError> {
         let work = self.phase_work;
         let body = async move {
-            executions.fetch_add(1, Ordering::SeqCst);
+            self.executions.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(work).await;
-            Ok::<_, StepError>(value.wrapping_add(1))
+            Ok::<_, BenchError>(value.wrapping_add(1))
         };
         if self.memoize {
             ctx.memo.memoized(&format!("phase-{phase}"), body).await
@@ -88,24 +96,41 @@ impl ResumePipeline {
     }
 }
 
-impl Pipeline for ResumePipeline {
-    type Input = Item;
+impl Job for Item {
+    const NAME: &'static str = "bench.resume";
     type Output = u32;
-    type Error = StepError;
+    type Error = BenchError;
 
-    async fn run(&self, ctx: &BulkCtx<Item>) -> Result<u32, StepError> {
-        let mut acc = ctx.input.idx;
-        for phase in 0..self.n_phases {
-            if self.fail_at > 0
-                && phase == self.fail_at
-                && self.failed_once.lock().unwrap().insert(ctx.input.idx)
+    async fn run(&self, ctx: JobContext<'_>) -> Result<u32, BenchError> {
+        let resume = ctx.state::<Arc<Resume>>();
+        let mut acc = self.idx;
+        for phase in 0..resume.n_phases {
+            if resume.fail_at > 0
+                && phase == resume.fail_at
+                && resume.failed_once.lock().unwrap().insert(self.idx)
             {
-                return Err(StepError::transient("injected first-attempt failure"));
+                return Err(BenchError::Transient("injected first-attempt failure"));
             }
-            acc = self.run_phase(ctx, phase, acc).await?;
+            acc = resume.run_phase(&ctx, phase, acc).await?;
         }
         Ok(acc)
     }
+}
+
+/// Cumulative completions per elapsed second, from the completion
+/// instants of a run.
+fn progress_rows(started: Instant, completions: &[Instant]) -> Vec<(u64, usize)> {
+    let mut rows = Vec::new();
+    let mut completed = 0;
+    for at in completions {
+        completed += 1;
+        let sec = at.duration_since(started).as_secs();
+        match rows.last_mut() {
+            Some((last, count)) if *last == sec => *count = completed,
+            _ => rows.push((sec, completed)),
+        }
+    }
+    rows
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -150,61 +175,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?,
     );
 
-    let executions = Arc::new(AtomicUsize::new(0));
-    let mut bulk = BulkRunner::builder(
-        queue.clone(),
-        store,
-        ResumePipeline {
-            n_phases,
-            fail_at,
-            phase_work: Duration::from_millis(phase_work_ms),
-            memoize,
-            executions: executions.clone(),
-            failed_once: Mutex::new(HashSet::new()),
-        },
-    )
-    .max_concurrent(max_concurrent)
-    .build();
-    let worker = bulk.spawn(std::future::pending::<()>());
-    let bulk = Arc::new(bulk);
-    let batch_id = bulk.new_batch().id().to_string();
+    let resume = Arc::new(Resume {
+        n_phases,
+        fail_at,
+        phase_work: Duration::from_millis(phase_work_ms),
+        memoize,
+        executions: AtomicUsize::new(0),
+        failed_once: Mutex::new(HashSet::new()),
+    });
+    let mut runner = JobRunner::builder(queue.clone(), store)
+        .register::<Item>()
+        .state(resume.clone())
+        .max_concurrent_jobs(max_concurrent)
+        .build();
+    let worker = runner.spawn(std::future::pending::<()>());
 
-    // Watcher: sample cumulative progress once per second.
-    let progress_rows: Arc<Mutex<Vec<(u64, usize)>>> = Arc::new(Mutex::new(Vec::new()));
-    let watcher = {
-        let bulk = bulk.clone();
-        let batch_id = batch_id.clone();
-        let progress_rows = progress_rows.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(1));
-            tick.tick().await; // skip immediate first tick
-            loop {
-                tick.tick().await;
-                let Some(p) = bulk.batch(batch_id.clone()).unwrap().progress() else {
-                    continue;
-                };
-                let sec = p.elapsed.as_secs();
-                progress_rows.lock().unwrap().push((sec, p.completed));
+    let started = Instant::now();
+    let group = runner.new_group::<Item>();
+    group
+        .submit((0..n_items as u32).map(|idx| Item { idx }))
+        .await?;
+    let (mut succeeded, mut failed) = (0usize, 0usize);
+    let mut completions = Vec::with_capacity(n_items);
+    {
+        let mut results = std::pin::pin!(group.results().await?);
+        while let Some(result) = results.try_next().await? {
+            completions.push(Instant::now());
+            match result.result {
+                Ok(_) => succeeded += 1,
+                Err(_) => failed += 1,
+            }
+            if completions.len() % 100 == 0 {
                 eprintln!(
-                    "  t={sec}s completed={}/{} ({:.0}/s)",
-                    p.completed, p.total, p.rate_per_sec,
+                    "  t={}s completed={}/{n_items}",
+                    started.elapsed().as_secs(),
+                    completions.len()
                 );
             }
-        })
-    };
-
-    let inputs = (0..n_items as u32).map(|idx| Item { idx });
-    let report = bulk.batch(batch_id.clone())?.run(inputs).await?;
-    watcher.abort();
-    // Await the aborted watcher so its `bulk` clone is dropped before the
-    // queue refcount check below. `abort()` only requests cancellation, so
-    // without this the task can still hold a `bulk` clone (and through it a
-    // `queue` clone) when `Arc::try_unwrap` runs.
-    let _ = watcher.await;
+        }
+    }
+    let elapsed = started.elapsed();
     worker.shutdown().await?;
 
     println!("window_sec,completed");
-    for (sec, completed) in progress_rows.lock().unwrap().iter() {
+    for (sec, completed) in progress_rows(started, &completions) {
         println!("{sec},{completed}");
     }
 
@@ -212,20 +226,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // difference between the executions a retry-free run needs and
     // the executions this run performed.
     let floor = n_items * n_phases;
-    let executed = executions.load(Ordering::SeqCst);
-    let secs = report.elapsed.as_secs_f64();
+    let executed = resume.executions.load(Ordering::SeqCst);
+    let secs = elapsed.as_secs_f64();
     eprintln!(
-        "summary: {} items ({} succeeded, {} failed) in {secs:.2}s ({:.0} items/s); \
-         phase executions {executed} against a no-retry floor of {floor} \
+        "summary: {n_items} items ({succeeded} succeeded, {failed} failed) in {secs:.2}s \
+         ({:.0} items/s); phase executions {executed} against a no-retry floor of {floor} \
          ({} re-executed)",
-        report.total,
-        report.succeeded,
-        report.failed,
-        report.total as f64 / secs,
+        n_items as f64 / secs,
         executed - floor,
     );
 
-    drop(bulk);
+    drop(group);
+    drop(runner);
     let queue =
         Arc::try_unwrap(queue).map_err(|_| "queue still has outstanding references at shutdown")?;
     queue.close().await?;

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use futures_util::TryStreamExt;
+use futures_util::{Stream, StreamExt, TryStreamExt};
 
 use crate::group::{ManifestMember, MemberSpec, MemberState, RunGroup};
 use crate::jobs::handle::{JobError, decode_outcome};
@@ -52,8 +52,8 @@ pub struct GroupStatus {
     pub cancelled: usize,
 }
 
-/// The result of one member of a job group, returned by
-/// [`JobGroup::join`].
+/// The result of one member of a job group, yielded by
+/// [`JobGroup::results`] and returned by [`JobGroup::join`].
 #[derive(Debug)]
 pub struct GroupResult<J: Job> {
     /// The member's key.
@@ -126,19 +126,54 @@ impl<J: Job> JobGroup<J> {
         self.group().submit(members, &spec).await
     }
 
-    /// Wait until every member has terminated and return their results
-    /// in submission order. A member that terminated without an outcome
-    /// record (cancelled, or dead-lettered outside its handler) is
-    /// reported as a transient [`JobError`]. Returns
-    /// [`Error::GroupNotFound`] for a group never submitted.
-    pub async fn join(&self) -> Result<Vec<GroupResult<J>>> {
-        let group = self.group();
-        let manifest = group.manifest().await?;
-        let mut results: HashMap<String, std::result::Result<J::Output, JobError>> = HashMap::new();
-        let mut terminations = std::pin::pin!(group.terminations().await?);
-        while let Some(member) = terminations.try_next().await? {
+    /// Submit the members of the group's manifest that did not succeed,
+    /// with the queue's default options; see
+    /// [`resume_with`](Self::resume_with).
+    pub async fn resume(&self) -> Result<()> {
+        self.resume_with(SubmitOptions::default()).await
+    }
+
+    /// Submit the members of the group's manifest whose last recorded
+    /// outcome is not a success, without the jobs: a member still active
+    /// continues, and the rest run. Returns [`Error::GroupNotFound`] for
+    /// a group never submitted. `opts` applies as in
+    /// [`submit_with`](Self::submit_with).
+    pub async fn resume_with(&self, opts: SubmitOptions) -> Result<()> {
+        let spec = MemberSpec {
+            headers: opts.headers,
+            priority: opts.priority,
+            max_attempts_per_step: opts.max_attempts,
+            run_at: opts.run_at,
+        };
+        self.group().resume(&spec).await
+    }
+
+    /// The members' results as each one terminates, in completion
+    /// order; a member already terminated is yielded at once. A member
+    /// that terminated without an outcome record (cancelled, or
+    /// dead-lettered outside its handler) is reported as a transient
+    /// [`JobError`]. Returns [`Error::GroupNotFound`] for a group never
+    /// submitted.
+    pub async fn results(&self) -> Result<impl Stream<Item = Result<GroupResult<J>>> + '_> {
+        let terminations = self.group().terminations().await?;
+        Ok(terminations.then(move |member| async move {
+            let member = member?;
             let result = self.member_result(&member).await?;
-            results.insert(member.key, result);
+            Ok(GroupResult {
+                key: member.key,
+                result,
+            })
+        }))
+    }
+
+    /// Wait until every member has terminated and return their results
+    /// in submission order; see [`results`](Self::results).
+    pub async fn join(&self) -> Result<Vec<GroupResult<J>>> {
+        let manifest = self.group().manifest().await?;
+        let mut results: HashMap<String, std::result::Result<J::Output, JobError>> = HashMap::new();
+        let mut stream = std::pin::pin!(self.results().await?);
+        while let Some(result) = stream.try_next().await? {
+            results.insert(result.key, result.result);
         }
         Ok(manifest
             .members
@@ -222,6 +257,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    use futures_util::TryStreamExt;
     use serde::{Deserialize, Serialize};
 
     use crate::jobs::{Job, JobContext, JobRunner};
@@ -311,8 +347,26 @@ mod tests {
             Err(Error::InvalidGroupId(_))
         ));
 
+        // A resume from the manifest runs the failed member once more,
+        // and the results stream yields the succeeded ones at once.
+        group.resume().await.unwrap();
+        let mut streamed = 0;
+        let mut results = std::pin::pin!(group.results().await.unwrap());
+        while let Some(result) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), results.try_next())
+                .await
+                .expect("results finished in time")
+                .unwrap()
+        {
+            streamed += 1;
+            assert_eq!(result.result.is_ok(), result.key != "square:13");
+        }
+        assert_eq!(streamed, 3);
+        assert_eq!(runs.load(Ordering::SeqCst), 5);
+
         group.forget().await.unwrap();
         assert!(matches!(group.status().await, Err(Error::GroupNotFound(_))));
+        assert!(matches!(group.resume().await, Err(Error::GroupNotFound(_))));
         worker.shutdown().await.unwrap();
     }
 }
