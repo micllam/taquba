@@ -76,8 +76,8 @@ pub(crate) const TERMINAL_KV_PREFIX: &[u8] = b"workflow/terminals/";
 
 /// Prefix for the durable terminal record of a run:
 /// `workflow/outcomes/{run_id}`, written in the settlement that
-/// terminates the run when memo retention is set and removed with the
-/// run's memo entries.
+/// terminates the run and removed with the run's memo entries by the
+/// memo sweep.
 pub(crate) const OUTCOME_KV_PREFIX: &[u8] = b"workflow/outcomes/";
 
 /// Prefix for the durable member records of run groups:

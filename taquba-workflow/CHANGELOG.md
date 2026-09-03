@@ -17,10 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RunState::Terminated(RunTermination)`: the status, error, error kind
   and time of termination of a terminated run, reported by `WorkflowRuntime::status`
   and `jobs::JobHandle::status` from a terminal record under
-  `workflow/outcomes/{run_id}`. The record is written in the terminating
-  settlement when `WorkflowRuntimeBuilder::memo_retention` is set and
-  removed by the memo sweep with the run's memo entries. `RunState` no
-  longer implements `Copy`.
+  `workflow/outcomes/{run_id}`. The record is written in every
+  terminating settlement and removed by the memo sweep with the run's
+  memo entries under `WorkflowRuntimeBuilder::memo_retention`.
+  `RunState` no longer implements `Copy`.
 - `StepError` implements `Clone`.
 - `jobs::JobGroup`: many jobs of one type submitted as one durable set
   (`JobRunner::group`, `JobRunner::new_group`, `JobGroup::submit`,
@@ -49,9 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `jobs::JobGroup::resume_with`.
 - `WorkflowRuntime::wait` and `wait_timeout`: wait until a run
   terminates, following its current step across steps, and report a
-  `RunEnd` (its `RunTermination` and committed `RunOutcome`, each when
-  a record remains); `Error::RunNotFound` for a run the runtime has no
-  record of. `jobs::JobHandle::join` and `join_timeout` are this wait.
+  `RunEnd` (its `RunTermination` and committed `RunOutcome`, each until
+  the memo sweep removes the record); `Error::RunNotFound` for a run
+  the runtime has no record of. `jobs::JobHandle::join` and `join_timeout` are this wait.
 - `Error::MemberNotSubmitted`: a group's results were read while a
   member of the manifest had no record; `resume` submits it.
 - `WorkflowRuntime::outcome`: the committed `RunOutcome` of a terminated

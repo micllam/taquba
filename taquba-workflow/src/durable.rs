@@ -212,8 +212,7 @@ impl From<DurableTerminalStatus> for TerminalStatus {
 
 /// The stored form of a [`RunTermination`](crate::RunTermination) with
 /// the final step: the terminal record under `workflow/outcomes/{run_id}`,
-/// written in the settlement that terminates the run when memo
-/// retention is set and read by
+/// written in the settlement that terminates the run and read by
 /// [`WorkflowRuntime::status`](crate::WorkflowRuntime::status) once the
 /// run record is gone, and the termination half of a member record.
 #[derive(Debug, Clone, Serialize, Deserialize)]

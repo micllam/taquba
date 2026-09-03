@@ -481,10 +481,10 @@ mod tests {
     use taquba::object_store::{ObjectStore, memory::InMemory};
     use taquba::{JobStatus, OpenOptions, Queue, QueueConfig};
 
-    use crate::StepErrorKind;
     use crate::jobs::handle::JoinError;
     use crate::jobs::job::payload_idempotency_key;
     use crate::test_util::{fast_options, open_queue, open_queue_at_with, open_queue_with};
+    use crate::{RunState, StepErrorKind, TerminalStatus};
 
     #[derive(Debug, thiserror::Error)]
     #[error("{0}")]
@@ -787,7 +787,10 @@ mod tests {
             other => panic!("expected JoinError::Job, got {other:?}"),
         }
         assert_eq!(count_jobs(&queue, JobStatus::Dead).await, 1);
-        assert!(job.status().await.unwrap().is_none());
+        assert!(matches!(
+            job.status().await.unwrap().map(|s| s.state),
+            Some(RunState::Terminated(termination)) if termination.status == TerminalStatus::Failed
+        ));
 
         handle.shutdown().await.unwrap();
     }
@@ -1027,7 +1030,10 @@ mod tests {
         // Long enough for the worker to claim, run and ack the job before
         // the wait starts.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(job.status().await.unwrap().is_none());
+        assert!(matches!(
+            job.status().await.unwrap().map(|s| s.state),
+            Some(RunState::Terminated(_))
+        ));
 
         assert_eq!(job.await.unwrap(), 42);
 

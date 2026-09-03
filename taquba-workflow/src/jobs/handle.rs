@@ -106,8 +106,8 @@ impl<J: Job> JobHandle<J> {
 
     /// The job's status, read from its durable state. A terminated job
     /// reports [`RunState::Terminated`](crate::RunState::Terminated)
-    /// while [`JobRunnerBuilder::retention`](crate::jobs::JobRunnerBuilder::retention)
-    /// retains its terminal record, and `None` otherwise. Use
+    /// until [`JobRunnerBuilder::retention`](crate::jobs::JobRunnerBuilder::retention)
+    /// removes its terminal record. Use
     /// [`fetch_result`](Self::fetch_result) to read a terminal outcome.
     pub async fn status(&self) -> Result<Option<RunStatus>> {
         self.inner.runtime.status(&self.id).await

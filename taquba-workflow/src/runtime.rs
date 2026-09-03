@@ -170,9 +170,9 @@ pub enum RunState {
     /// `run_step` returns, and the run terminates at that point.
     Cancelling,
     /// The run reached a terminal state. Reported from the run's terminal
-    /// record, which exists only under
-    /// [`WorkflowRuntimeBuilder::memo_retention`] and is removed with the
-    /// run's memo entries when the window elapses.
+    /// record, written with the terminating settlement and removed with
+    /// the run's memo entries by the memo sweep under
+    /// [`WorkflowRuntimeBuilder::memo_retention`].
     Terminated(RunTermination),
 }
 
@@ -220,11 +220,8 @@ impl From<DurableTermination> for RunTermination {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct RunEnd {
-    /// The run's termination: from its terminal record while memo
-    /// retention retains one, otherwise from its run result record,
-    /// otherwise from the queue record of a final step dead-lettered
-    /// outside the worker while the wait observed it. `None` when no
-    /// record of the termination remains.
+    /// The run's termination, from its terminal record; `None` once the
+    /// memo sweep has removed it.
     pub termination: Option<RunTermination>,
     /// The committed outcome, when the worker that terminated the run
     /// recorded one; see [`WorkflowRuntime::outcome`].
@@ -283,11 +280,11 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     }
 
     /// Enable memo retention with the given window. When set, the
-    /// runtime writes a terminal marker and a terminal record for every
-    /// run that reaches a terminal state, and the in-process sweeper
-    /// clears that run's memo entries and terminal record `retention`
-    /// after termination. When unset (default), neither is written and
-    /// memo entries are retained indefinitely.
+    /// runtime writes a terminal marker for every run that reaches a
+    /// terminal state, and the in-process sweeper clears that run's memo
+    /// entries and terminal record `retention` after termination. When
+    /// unset (default), no marker is written and memo entries and
+    /// terminal records are retained indefinitely.
     ///
     /// Panics if `retention < 1ms`: smaller values would turn the sweep
     /// loop into a hot spin.
@@ -448,8 +445,9 @@ pub(crate) struct RuntimeCore {
     pub(crate) memo_store: MemoStore,
     pub(crate) group_store: GroupStore,
     /// Window after a run reaches a terminal state during which its
-    /// memo entries are retained for replay. `None` disables retention
-    /// entirely (no terminal marker is written and no memo sweep runs).
+    /// memo entries and terminal record are retained. `None` disables
+    /// retention entirely (no terminal marker is written and no memo
+    /// sweep runs).
     pub(crate) memo_retention: Option<Duration>,
     /// Window after every member of a group terminated during which
     /// the group's state is retained; `None` writes no group marker.
@@ -666,10 +664,9 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
 
     /// The status of a run, read from its durable state, so it answers
     /// after a restart and from any runtime over the same queue. A
-    /// terminated run reports [`RunState::Terminated`] while its terminal
-    /// record is retained, which requires
-    /// [`WorkflowRuntimeBuilder::memo_retention`]; `None` for a run that
-    /// is unknown or whose termination was not recorded.
+    /// terminated run reports [`RunState::Terminated`] until the memo
+    /// sweep removes its terminal record; `None` for a run that is
+    /// unknown or swept.
     ///
     /// A run with a pending cancellation request reports
     /// [`RunState::Cancelling`] whatever its step's lifecycle position,
@@ -726,8 +723,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// reconciliation, which the wait polls for at the poll interval.
     ///
     /// Returns [`Error::RunNotFound`] for a run the runtime has no
-    /// record of: never submitted, or terminated with no record
-    /// retained.
+    /// record of: never submitted, or terminated and swept.
     pub async fn wait(&self, run_id: &str) -> Result<RunEnd> {
         self.inner
             .core
@@ -972,17 +968,14 @@ impl RuntimeCore {
     /// dead-lettered outside the worker is polled at the poll interval
     /// until reconciliation terminates the run.
     pub(crate) async fn wait_run(&self, run_id: &str) -> Result<Option<RunEnd>> {
-        let mut observed = false;
         let mut absent_job: Option<String> = None;
-        let mut dead_step: Option<JobRecord> = None;
         loop {
             let Some(current) = self.current_step_if_active(run_id).await? else {
-                return self.run_end(run_id, observed, dead_step).await;
+                return self.run_end(run_id).await;
             };
-            observed = true;
             match self.queue.wait_for_completion(&current.job_id).await? {
                 WaitOutcome::Done(_) | WaitOutcome::Cancelled => {}
-                WaitOutcome::Dead(record) => {
+                WaitOutcome::Dead(_) => {
                     // A worker-path dead-letter deletes the pointer with
                     // its settlement; a pointer that still names the dead
                     // job identifies a dead-letter outside the worker,
@@ -994,7 +987,6 @@ impl RuntimeCore {
                     if unreconciled {
                         tokio::time::sleep(self.poll_interval).await;
                     }
-                    dead_step = Some(*record);
                 }
                 WaitOutcome::NotFound => {
                     // The pointer and the job change in one transaction:
@@ -1009,33 +1001,16 @@ impl RuntimeCore {
         }
     }
 
-    /// The end of the terminated run `run_id` from its records, or from
-    /// `dead_step`, the queue record of its final step when the wait
-    /// observed a dead-letter outside the worker. `None` when nothing
-    /// remains and the wait never `observed` the run active.
-    async fn run_end(
-        &self,
-        run_id: &str,
-        observed: bool,
-        dead_step: Option<JobRecord>,
-    ) -> Result<Option<RunEnd>> {
+    /// The end of the terminated run `run_id` from its terminal record
+    /// and its run result record; `None` when neither remains.
+    async fn run_end(&self, run_id: &str) -> Result<Option<RunEnd>> {
         let result = self.run_result(run_id).await?;
         let termination = match self.terminal_record(run_id).await? {
             Some(record) => Some(record.into()),
-            None => result
-                .as_ref()
-                .map(|result| result.termination.clone())
-                .or_else(|| {
-                    dead_step.map(|job| RunTermination {
-                        status: TerminalStatus::Failed,
-                        error: job.last_error,
-                        error_kind: None,
-                        terminated_at_ms: job.failed_at.unwrap_or_default(),
-                    })
-                }),
+            None => result.as_ref().map(|result| result.termination.clone()),
         };
         let outcome = result.map(|result| result.outcome);
-        if termination.is_none() && outcome.is_none() && !observed {
+        if termination.is_none() && outcome.is_none() {
             return Ok(None);
         }
         Ok(Some(RunEnd {
@@ -1312,7 +1287,7 @@ impl RuntimeCore {
 impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     /// Settle a run into its terminal state: return the deletes of the
     /// durable run record and the current-step pointer, the writes of
-    /// the terminal marker and the terminal record (when memo retention
+    /// the terminal record and the terminal marker (when memo retention
     /// is enabled), the write of the member record (when the run is a
     /// group member) and the terminal-notification enqueue
     /// (when the hook observes this outcome) as [`SettlementEffects`]
@@ -1335,14 +1310,14 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     ) -> SettlementEffects {
         let kv_deletes = vec![run_kv_key(&outcome.run_id), step_kv_key(&outcome.run_id)];
         let mut kv_writes = HashMap::new();
+        kv_writes.insert(
+            outcome_kv_key(&outcome.run_id),
+            durable::encode(&termination),
+        );
         if self.core.memo_retention.is_some() {
             kv_writes.insert(
                 terminal_kv_key(&outcome.run_id, termination.terminated_at_ms),
                 Vec::new(),
-            );
-            kv_writes.insert(
-                outcome_kv_key(&outcome.run_id),
-                durable::encode(&termination),
             );
         }
         if let Some(membership) = &terminal_step.membership {
@@ -1624,6 +1599,18 @@ mod tests {
             .collect()
     }
 
+    /// The terminal status `status` reports for `run_id`; `None` while
+    /// the run is active or unknown.
+    async fn terminal_status_of<R: StepRunner, H: TerminalHook>(
+        runtime: &WorkflowRuntime<R, H>,
+        run_id: &str,
+    ) -> Option<TerminalStatus> {
+        match runtime.status(run_id).await.unwrap().map(|s| s.state) {
+            Some(RunState::Terminated(termination)) => Some(termination.status),
+            _ => None,
+        }
+    }
+
     fn spawn_runtime<R, H>(runtime: WorkflowRuntime<R, H>) -> oneshot::Sender<()>
     where
         R: StepRunner + 'static,
@@ -1731,7 +1718,11 @@ mod tests {
         assert_eq!(outcome.status, TerminalStatus::Succeeded);
         assert_eq!(outcome.result.as_deref(), Some(b"done".as_slice()));
         assert_eq!(outcome.final_step, 0);
-        assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
+        assert_eq!(
+            terminal_status_of(&runtime, &handle.run_id).await,
+            Some(TerminalStatus::Succeeded),
+            "the terminal record is written without retention",
+        );
         assert!(terminal_markers(&runtime.inner.core.queue).await.is_empty());
 
         let _ = shutdown.send(());
@@ -3037,7 +3028,10 @@ mod tests {
         let outcome = rx.recv().await.unwrap();
         assert_eq!(outcome.status, TerminalStatus::Cancelled);
         assert_eq!(outcome.final_step, 1);
-        assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
+        assert_eq!(
+            terminal_status_of(&runtime, &handle.run_id).await,
+            Some(outcome.status)
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -3191,7 +3185,10 @@ mod tests {
             outcome.error.is_none(),
             "external cancel must carry no reason (Some(_) would imply runner-issued StepOutcome::Cancel)",
         );
-        assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
+        assert_eq!(
+            terminal_status_of(&runtime, &handle.run_id).await,
+            Some(outcome.status)
+        );
 
         // Settle window: assert no retry attempt and no dead-letter or
         // duplicate hook fires after the terminal one.
@@ -3284,7 +3281,10 @@ mod tests {
         // Runner-issued Cancel wins precedence over external cancel, so
         // the runner's reason surfaces.
         assert_eq!(outcome.error.as_deref(), Some("cooperative"));
-        assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
+        assert_eq!(
+            terminal_status_of(&runtime, &handle.run_id).await,
+            Some(outcome.status)
+        );
 
         let stats = queue.stats("workflow-steps").await.unwrap();
         assert_eq!(stats.dead, 0);
@@ -3324,7 +3324,10 @@ mod tests {
             .expect("Succeeded hook fired")
             .expect("hook channel open");
         assert_eq!(outcome.status, TerminalStatus::Succeeded);
-        assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
+        assert_eq!(
+            terminal_status_of(&runtime, &handle.run_id).await,
+            Some(outcome.status)
+        );
 
         let was_cancelled = runtime.cancel(&handle.run_id).await.unwrap();
         assert!(
@@ -4152,7 +4155,10 @@ mod tests {
         assert_eq!(outcome.run_id, handle.run_id);
         assert_eq!(outcome.status, TerminalStatus::Failed);
         assert_eq!(outcome.error.as_deref(), Some("denied"));
-        assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
+        assert_eq!(
+            terminal_status_of(&runtime, &handle.run_id).await,
+            Some(outcome.status)
+        );
         assert_eq!(wait_for_kv(&queue, b"app/step-0").await, b"done");
         assert_eq!(
             queue.stats("workflow-steps").await.unwrap().dead,
@@ -4239,7 +4245,10 @@ mod tests {
         assert_eq!(outcome.run_id, handle.run_id);
         assert_eq!(outcome.status, TerminalStatus::Cancelled);
         assert_eq!(outcome.error.as_deref(), Some("obsolete"));
-        assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
+        assert_eq!(
+            terminal_status_of(&runtime, &handle.run_id).await,
+            Some(outcome.status)
+        );
         assert_eq!(wait_for_kv(&queue, b"app/step-0").await, b"done");
         assert_eq!(
             queue.stats("workflow-steps").await.unwrap().dead,
@@ -4369,7 +4378,10 @@ mod tests {
         );
         assert!(queue.kv_get(&run_kv_key("hung")).await.unwrap().is_none());
         assert!(queue.kv_get(&step_kv_key("hung")).await.unwrap().is_none());
-        assert!(runtime.status("hung").await.unwrap().is_none());
+        assert_eq!(
+            terminal_status_of(&runtime, "hung").await,
+            Some(TerminalStatus::Failed)
+        );
         let _ = shutdown.send(());
 
         // The run id is submitted again while the dead job is retained:
@@ -4490,12 +4502,13 @@ mod tests {
                 error_kind: None,
                 terminated_at_ms: 10_000,
             }),
-            "the termination is read from the dead job's record",
+            "the termination is read from the terminal record",
         );
         assert!(end.outcome.is_none());
-        assert!(
-            matches!(runtime.wait("hung").await, Err(Error::RunNotFound(_))),
-            "without memo retention no record of the termination remains",
+        assert_eq!(
+            runtime.wait("hung").await.unwrap().termination,
+            end.termination,
+            "the record is retained without memo retention",
         );
     }
 

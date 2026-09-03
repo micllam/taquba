@@ -131,11 +131,11 @@
 //! step's queue job into a [`RunStatus`] ([`RunState::Pending`],
 //! [`RunState::Running`] or [`RunState::Cancelling`], with the current
 //! step number), so it answers after a restart and from any runtime over
-//! the same queue. Under memo retention a terminated run reports
-//! [`RunState::Terminated`] with its status, error, error kind and time of
-//! termination, read from the terminal record described under
-//! [Memo retention](#memo-retention); without it, a terminated run has
-//! no status.
+//! the same queue. A terminated run reports [`RunState::Terminated`]
+//! with its status, error, error kind and time of termination, read
+//! from the terminal record written with the terminating settlement,
+//! which [Memo retention](#memo-retention) removes with the run's memo
+//! entries.
 //!
 //! [`WorkflowRuntime::wait`] waits until a run terminates, following its
 //! current step across steps, and reports a [`RunEnd`]: the termination
@@ -493,12 +493,12 @@
 //!     .build();
 //! ```
 //!
-//! When retention is set, every settlement that commits a terminal
-//! outcome (`Succeeded`, `Failed` or `Cancelled`) writes two keys in the
-//! queue's key-value namespace in the same transaction: a terminal
-//! marker under `workflow/terminals/` and a terminal record under
-//! `workflow/outcomes/` holding the status, the error, the final step
-//! and the time of termination, so both exist exactly when the run's
+//! Every settlement that commits a terminal outcome (`Succeeded`,
+//! `Failed` or `Cancelled`) writes a terminal record under
+//! `workflow/outcomes/` in the queue's key-value namespace, holding the
+//! status, the error, the final step and the time of termination. When
+//! retention is set, the same transaction writes a terminal marker under
+//! `workflow/terminals/`, so the marker exists exactly when the run's
 //! terminal outcome committed. [`WorkflowRuntime::run`] sweeps the
 //! markers on startup and on every retention interval, removing the
 //! memo entries, the step-output replay entries, the terminal record and
