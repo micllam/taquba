@@ -448,6 +448,11 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
 
     async fn submit_under_lock(&self, run_id: &str, spec: RunSpec) -> Result<SubmitOutcome> {
         let input_hash = hash_input(&spec.input);
+        let duplicate = |job_id: String| SubmitOutcome {
+            run_id: run_id.to_string(),
+            newly_submitted: false,
+            job_id,
+        };
 
         // A worker-resumed entry stores no hash and reports `None`; fall
         // through to the durable-record check below, which always
@@ -462,11 +467,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
                 .registry
                 .current_job_id(run_id)
                 .ok_or_else(|| Error::InconsistentRunState(run_id.to_string()))?;
-            return Ok(SubmitOutcome {
-                run_id: run_id.to_string(),
-                newly_submitted: false,
-                job_id,
-            });
+            return Ok(duplicate(job_id));
         }
 
         // Cross-restart duplicate check. The submit lock above closes
@@ -478,11 +479,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
                 return Err(Error::InputMismatch(run_id.to_string()));
             }
             let current = self.inner.core.current_step(run_id).await?;
-            return Ok(SubmitOutcome {
-                run_id: run_id.to_string(),
-                newly_submitted: false,
-                job_id: current.job_id,
-            });
+            return Ok(duplicate(current.job_id));
         }
 
         let job_id = self.inner.core.queue.next_job_id();
@@ -520,13 +517,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             // is missing, which only happens if the run terminated
             // without going through `terminate`. Either way the safe
             // verdict is duplicate.
-            EnqueueResult::AlreadyEnqueued(existing) => {
-                return Ok(SubmitOutcome {
-                    run_id: run_id.to_string(),
-                    newly_submitted: false,
-                    job_id: existing,
-                });
-            }
+            EnqueueResult::AlreadyEnqueued(existing) => return Ok(duplicate(existing)),
         };
 
         self.inner.core.registry.insert_submitted(

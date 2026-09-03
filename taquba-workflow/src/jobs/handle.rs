@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::jobs::job::Job;
 use crate::jobs::runner::Inner;
-use crate::outcome::{StoredErrorKind, StoredOutcome, Terminal, Unrecorded};
+use crate::outcome::{StoredOutcome, Terminal, Unrecorded};
 use crate::{Error, Result};
 
 /// The logical failure outcome of a job that ran and did not succeed.
@@ -218,10 +218,7 @@ fn decode_outcome<J: Job>(
     match outcome {
         StoredOutcome::Success { output } => Ok(Ok(rmp_serde::from_slice(&output)?)),
         StoredOutcome::Failure { kind, message } => Ok(Err(JobError {
-            kind: match kind {
-                StoredErrorKind::Transient => StepErrorKind::Transient,
-                StoredErrorKind::Permanent => StepErrorKind::Permanent,
-            },
+            kind: kind.into(),
             message,
         })),
     }

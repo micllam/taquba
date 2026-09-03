@@ -183,6 +183,15 @@ impl From<StepErrorKind> for StoredErrorKind {
     }
 }
 
+impl From<StoredErrorKind> for StepErrorKind {
+    fn from(kind: StoredErrorKind) -> Self {
+        match kind {
+            StoredErrorKind::Transient => Self::Transient,
+            StoredErrorKind::Permanent => Self::Permanent,
+        }
+    }
+}
+
 /// Run one typed single-step delivery: decode `input`, the serialized
 /// typed input carried in the step's payload, as `I`, run `handler` on it
 /// and encode its `O` as the step's result, recording the outcome through

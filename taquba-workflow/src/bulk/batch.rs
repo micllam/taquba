@@ -116,6 +116,38 @@ struct TerminalItem<'a> {
     cost: Option<CostReport>,
 }
 
+impl<'a> TerminalItem<'a> {
+    fn succeeded(key: &'a str, output: Option<Value>, cost: Option<CostReport>) -> Self {
+        Self {
+            key,
+            status: TerminalStatus::Succeeded,
+            output,
+            error: None,
+            cost,
+        }
+    }
+
+    fn failed(key: &'a str, error: &'a str) -> Self {
+        Self {
+            key,
+            status: TerminalStatus::Failed,
+            output: None,
+            error: Some(error),
+            cost: None,
+        }
+    }
+
+    fn cancelled(key: &'a str) -> Self {
+        Self {
+            key,
+            status: TerminalStatus::Cancelled,
+            output: None,
+            error: None,
+            cost: None,
+        }
+    }
+}
+
 /// Decode a succeeded item's envelope into its JSON output and cost.
 fn decode_envelope<O>(key: &str, bytes: &[u8]) -> (Option<Value>, Option<CostReport>)
 where
@@ -142,27 +174,11 @@ where
     match record.outcome {
         StoredOutcome::Success { output } => {
             let (output, cost) = decode_envelope::<O>(key, &output);
-            state.record(
-                sink,
-                TerminalItem {
-                    key,
-                    status: TerminalStatus::Succeeded,
-                    output,
-                    error: None,
-                    cost,
-                },
-            );
+            state.record(sink, TerminalItem::succeeded(key, output, cost));
         }
-        StoredOutcome::Failure { message, .. } => state.record(
-            sink,
-            TerminalItem {
-                key,
-                status: TerminalStatus::Failed,
-                output: None,
-                error: Some(&message),
-                cost: None,
-            },
-        ),
+        StoredOutcome::Failure { message, .. } => {
+            state.record(sink, TerminalItem::failed(key, &message));
+        }
     }
 }
 
@@ -525,30 +541,15 @@ impl<P: Pipeline> BulkInner<P> {
             // A run dead-lettered outside its step (its lease expired
             // past the attempt limit) failed without a record; every
             // other unrecorded end is a cancellation.
-            Terminal::Unrecorded(Unrecorded::Dead(error)) => state.record(
-                self.sink.as_ref(),
-                TerminalItem {
-                    key: &key,
-                    status: TerminalStatus::Failed,
-                    output: None,
-                    error: Some(
-                        error
-                            .as_deref()
-                            .unwrap_or("dead-lettered without an outcome"),
-                    ),
-                    cost: None,
-                },
-            ),
-            Terminal::Unrecorded(_) => state.record(
-                self.sink.as_ref(),
-                TerminalItem {
-                    key: &key,
-                    status: TerminalStatus::Cancelled,
-                    output: None,
-                    error: None,
-                    cost: None,
-                },
-            ),
+            Terminal::Unrecorded(Unrecorded::Dead(error)) => {
+                let error = error
+                    .as_deref()
+                    .unwrap_or("dead-lettered without an outcome");
+                state.record(self.sink.as_ref(), TerminalItem::failed(&key, error));
+            }
+            Terminal::Unrecorded(_) => {
+                state.record(self.sink.as_ref(), TerminalItem::cancelled(&key));
+            }
         }
         Ok(())
     }
