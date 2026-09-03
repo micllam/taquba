@@ -7,8 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Step::detached(payload)`: a step bound to no delivery, for driving a
+  `StepRunner` in tests.
+
 ### Changed
 
+- **Breaking (source):** `Step` is `#[non_exhaustive]`. A struct
+  literal outside the crate moves to `Step::detached` and assigns its
+  fields.
 - The terminal-notification job of a run terminated by a dead-lettered
   step (a permanent step error, a transient one on the last attempt, a
   second waiter on a correlation key, or a step the queue dead-lettered

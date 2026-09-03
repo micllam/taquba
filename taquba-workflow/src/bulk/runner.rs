@@ -98,11 +98,6 @@ impl<P: Pipeline> StepRunner for PipelineRunner<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MemoStore;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use taquba::object_store::memory::InMemory;
-    use tokio_util::sync::CancellationToken;
 
     #[derive(Serialize, Deserialize)]
     struct Doubler;
@@ -131,29 +126,13 @@ mod tests {
     }
 
     fn step_with_input(input: Vec<u8>) -> Step {
-        let memo_store = MemoStore::new(Arc::new(InMemory::new()), "memo");
         let payload = rmp_serde::to_vec_named(&ItemPayload {
             batch_id: "b".into(),
             key: "item-1".into(),
             input,
         })
         .unwrap();
-        Step {
-            run_id: "run-1".into(),
-            step_number: 0,
-            payload,
-            headers: HashMap::new(),
-            job_id: "job-1".into(),
-            attempts: 1,
-            max_attempts: 3,
-            cancel_token: CancellationToken::new(),
-            lease: taquba::LeaseHandle::detached(),
-            memo: memo_store.new_memo("run-1", 0),
-            run_memo: memo_store.new_run_memo("run-1"),
-            effects: crate::EffectsHandle::detached(),
-            kv: crate::KvReadHandle::detached(),
-            signal: None,
-        }
+        Step::detached(payload)
     }
 
     #[tokio::test]

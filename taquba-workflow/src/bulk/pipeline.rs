@@ -247,22 +247,10 @@ mod tests {
     }
 
     fn test_step(store: &MemoStore) -> Step {
-        Step {
-            run_id: "run-1".into(),
-            step_number: 0,
-            payload: Vec::new(),
-            headers: HashMap::new(),
-            job_id: "job-1".into(),
-            attempts: 1,
-            max_attempts: 3,
-            cancel_token: CancellationToken::new(),
-            lease: taquba::LeaseHandle::detached(),
-            memo: store.new_memo("run-1", 0),
-            run_memo: store.new_run_memo("run-1"),
-            effects: EffectsHandle::detached(),
-            kv: KvReadHandle::detached(),
-            signal: None,
-        }
+        let mut step = Step::detached(Vec::new());
+        step.memo = store.new_memo(&step.run_id, 0);
+        step.run_memo = store.new_run_memo(&step.run_id);
+        step
     }
 
     fn ctx_for_tests() -> BulkCtx<()> {
