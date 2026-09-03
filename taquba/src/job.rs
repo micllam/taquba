@@ -212,6 +212,12 @@ impl std::ops::Deref for Claim {
 }
 
 impl JobRecord {
+    /// Whether the current attempt is the job's last: a transient
+    /// failure of it dead-letters the job instead of retrying.
+    pub fn is_last_attempt(&self) -> bool {
+        self.attempts >= self.max_attempts
+    }
+
     /// Construct a fresh record in the pending state with every other
     /// field at its initial value.
     pub(crate) fn new_pending(

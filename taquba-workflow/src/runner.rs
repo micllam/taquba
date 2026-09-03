@@ -143,6 +143,13 @@ pub struct Step {
 }
 
 impl Step {
+    /// Whether this attempt is the step's last: a transient
+    /// [`StepError`] returned from it dead-letters the step and ends
+    /// the run.
+    pub fn is_last_attempt(&self) -> bool {
+        self.attempts >= self.max_attempts
+    }
+
     /// A step bound to no delivery, for driving a [`StepRunner`] in
     /// tests: step 0 of run `detached`, first of three attempts, with
     /// `payload`, no headers, no signal, a fresh cancellation token,

@@ -92,12 +92,6 @@ impl<'a> StepDelivery<'a> {
         }
     }
 
-    /// Whether a transient failure of this attempt dead-letters the
-    /// step.
-    pub(crate) fn is_last_attempt(&self) -> bool {
-        self.job.attempts >= self.job.max_attempts
-    }
-
     /// A `Succeeded` outcome of the run at this step.
     pub(crate) fn succeeded(&self, result: Vec<u8>) -> RunOutcome {
         RunOutcome::succeeded(
@@ -387,7 +381,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             Err(StepError {
                 message,
                 kind: kind @ StepErrorKind::Transient,
-            }) if delivery.is_last_attempt() => {
+            }) if delivery.job.is_last_attempt() => {
                 Err(self.terminating_failure(delivery, message, kind, failure_writes))
             }
             Err(StepError { message, .. }) => Err(message.into()),

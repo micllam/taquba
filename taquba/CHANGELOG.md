@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `JobRecord::is_last_attempt`: whether a transient failure of the
+  current attempt dead-letters the job.
+
 ## [0.12.0] - 2026-09-02
 
 ### Added

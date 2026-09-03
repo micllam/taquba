@@ -88,7 +88,7 @@ fn unsettled_claim_end<'a>(
     outcome: AttemptOutcome,
     error: &'a str,
 ) -> ClaimEnd<'a> {
-    if job.attempts >= job.max_attempts {
+    if job.is_last_attempt() {
         ClaimEnd::Dead { error }
     } else {
         ClaimEnd::Retry {

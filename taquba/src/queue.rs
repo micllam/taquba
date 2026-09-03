@@ -1025,7 +1025,7 @@ impl Queue {
     ) -> Result<NackOutcome> {
         let (job, results) = self
             .settle_claim(claim, effects, |stored, now| {
-                if stored.attempts >= stored.max_attempts {
+                if stored.is_last_attempt() {
                     return ClaimEnd::Dead { error };
                 }
                 let cfg = self.queue_config(&stored.queue);

@@ -253,8 +253,7 @@ where
             Ok(StepOutcome::Succeed { result: bytes })
         }
         Err(err) => {
-            let exhausted = step.attempts >= step.max_attempts;
-            if matches!(err.kind, StepErrorKind::Permanent) || exhausted {
+            if matches!(err.kind, StepErrorKind::Permanent) || step.is_last_attempt() {
                 let record = OutcomeRecord {
                     input_hash,
                     outcome: StoredOutcome::Failure {

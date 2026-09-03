@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `Step::detached(payload)`: a step bound to no delivery, for driving a
   `StepRunner` in tests.
+- `Step::is_last_attempt`: whether a transient `StepError` from this
+  attempt dead-letters the step.
 
 ### Changed
 
