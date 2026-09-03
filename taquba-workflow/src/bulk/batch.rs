@@ -258,7 +258,7 @@ impl<P: Pipeline> BulkBuilder<P> {
     }
 
     /// Submitter metadata applied to every item, threaded through to the
-    /// pipeline via [`BulkCtx::headers`](crate::bulk::BulkCtx::headers). Keys
+    /// pipeline via [`Delivery::headers`](crate::Delivery::headers). Keys
     /// must not start with the runtime's reserved `workflow.` prefix.
     pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
         self.headers = headers;
@@ -895,9 +895,9 @@ mod tests {
             type Error = StepError;
 
             async fn run(&self, ctx: &BulkCtx<Item>) -> std::result::Result<u32, StepError> {
-                let seed = ctx.kv_get(b"app/seed").await?.unwrap_or_default();
-                ctx.effects()
-                    .put(format!("app/items/{}", ctx.key), seed)
+                let seed = ctx.kv.get(b"app/seed").await?.unwrap_or_default();
+                ctx.effects
+                    .put(format!("app/items/{}", ctx.key), seed.to_vec())
                     .map_err(StepError::from)?;
                 Ok(ctx.input.n)
             }

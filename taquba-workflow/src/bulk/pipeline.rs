@@ -1,13 +1,11 @@
 //! The [`Pipeline`] contract and the per-item [`BulkCtx`] handed to it.
 
-use std::collections::HashMap;
 use std::future::Future;
+use std::ops::Deref;
 
-use crate::{EffectsHandle, KvReadHandle, Memo, Step, StepError};
+use crate::{Delivery, StepError};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use taquba::LeaseHandle;
-use tokio_util::sync::CancellationToken;
 
 use crate::bulk::cost::CostReport;
 
@@ -18,10 +16,11 @@ use crate::bulk::cost::CostReport;
 /// A `Pipeline` is a single async [`run`](Pipeline::run) method: the bulk
 /// runner deserializes one input item, builds a [`BulkCtx`] around it, and
 /// awaits `run`. The expensive logical steps inside `run` (LLM calls, paid
-/// APIs, CPU-bound work) are wrapped in [`Memo::memoized`] or
-/// [`Memo::memoized_by_content`] on [`BulkCtx::memo`], so an at-least-once
-/// retry of the item reads the completed steps back and pays for none of
-/// them twice.
+/// APIs, CPU-bound work) are wrapped in
+/// [`Memo::memoized`](crate::Memo::memoized) or
+/// [`Memo::memoized_by_content`](crate::Memo::memoized_by_content) on the
+/// item's [`memo`](Delivery::memo), so an at-least-once retry of the item
+/// reads the completed steps back and pays for none of them twice.
 ///
 /// # Error classification
 ///
@@ -78,22 +77,20 @@ pub trait Pipeline: Send + Sync + 'static {
     type Error: Into<StepError> + Send + 'static;
 
     /// Process one input item. Wrap expensive logical steps in
-    /// [`Memo::memoized`] or [`Memo::memoized_by_content`] on
-    /// [`BulkCtx::memo`] to make retries cheap.
+    /// [`Memo::memoized`](crate::Memo::memoized) or
+    /// [`Memo::memoized_by_content`](crate::Memo::memoized_by_content) on
+    /// the item's [`memo`](Delivery::memo) to make retries cheap.
     fn run(
         &self,
         ctx: &BulkCtx<Self::Input>,
     ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send;
 }
 
-/// Per-item execution context handed to [`Pipeline::run`].
-///
-/// Wraps the typed input together with the durable per-item
-/// [memo](crate::Memo), a [cost accumulator](CostReport), the
-/// run's cooperative [cancellation token](CancellationToken), the
-/// delivery's [lease handle](LeaseHandle), the item's staged
-/// [KV effects](EffectsHandle) and read access to the caller KV
-/// namespace.
+/// Per-item execution context handed to [`Pipeline::run`]: the typed
+/// input, the item's identity within its batch, a [cost
+/// accumulator](CostReport) and the [`Delivery`] the item runs under,
+/// which it dereferences to (run identity, memo, cancellation token,
+/// lease, staged KV effects and committed KV reads).
 pub struct BulkCtx<T> {
     /// The deserialized input item for this run.
     pub input: T,
@@ -103,53 +100,40 @@ pub struct BulkCtx<T> {
     /// [`BulkBuilder::key_fn`](crate::bulk::BulkBuilder::key_fn) for the
     /// input, or the positional `item-{i}` default.
     pub key: String,
-    /// The workflow run identifier of this item, derived from the batch id
-    /// and the key.
-    pub run_id: String,
-    /// Submitter-supplied metadata threaded through from the bulk run.
-    pub headers: HashMap<String, String>,
-    memo: Memo,
+    /// The delivery this item runs under. Its `run_id` is derived from
+    /// the batch id and the key.
+    pub delivery: Delivery,
     cost: CostReport,
-    cancel_token: CancellationToken,
-    lease: LeaseHandle,
-    effects: EffectsHandle,
-    kv: KvReadHandle,
+}
+
+impl<T> Deref for BulkCtx<T> {
+    type Target = Delivery;
+
+    fn deref(&self) -> &Delivery {
+        &self.delivery
+    }
 }
 
 impl<T> BulkCtx<T> {
-    pub(crate) fn new(batch_id: &str, key: &str, input: T, step: &Step) -> Self {
+    pub(crate) fn new(batch_id: &str, key: &str, input: T, delivery: Delivery) -> Self {
         Self {
             input,
             batch_id: batch_id.to_string(),
             key: key.to_string(),
-            run_id: step.run_id.clone(),
-            headers: step.headers.clone(),
-            memo: step.memo.clone(),
+            delivery,
             cost: CostReport::new(),
-            cancel_token: step.cancel_token.clone(),
-            lease: step.lease.clone(),
-            effects: step.effects.clone(),
-            kv: step.kv.clone(),
         }
     }
 
-    /// The item's durable memo. Wrap each expensive phase of
-    /// [`Pipeline::run`] in [`Memo::memoized`] or
-    /// [`Memo::memoized_by_content`] so a retried item reads the completed
-    /// phases back. Calls to [`record_cost`](Self::record_cost) inside a
-    /// memoized future run only when the future runs; use
-    /// [`memoized_with_cached_cost`](Self::memoized_with_cached_cost) when
-    /// memoized results must also contribute to the cost report.
-    pub fn memo(&self) -> &Memo {
-        &self.memo
-    }
-
-    /// Run `f` once and memoize both its value and counters under `key`,
-    /// or return the memoized value and replay its counters on a retry.
+    /// Run `f` once and memoize both its value and counters under `key`
+    /// in the item's [`memo`](Delivery::memo), or return the memoized
+    /// value and replay its counters on a retry.
     ///
     /// `f` returns `(value, cost)`, and the counters are recorded after
     /// memoization returns, so they are included whether the phase runs or
-    /// reads its memo entry.
+    /// reads its memo entry. Calls to [`record_cost`](Self::record_cost)
+    /// inside a plain [`Memo::memoized`](crate::Memo::memoized) future run
+    /// only when the future runs.
     pub async fn memoized_with_cached_cost<R, F, E>(&self, key: &str, f: F) -> Result<R, E>
     where
         R: Serialize + DeserializeOwned,
@@ -161,8 +145,8 @@ impl<T> BulkCtx<T> {
         Ok(value)
     }
 
-    /// [`Self::memoized_with_cached_cost`] under [`Memo::content_key`] of
-    /// `input`.
+    /// [`Self::memoized_with_cached_cost`] under
+    /// [`Memo::content_key`](crate::Memo::content_key) of `input`.
     pub async fn memoized_by_content_with_cached_cost<K, R, F, E>(
         &self,
         input: &K,
@@ -187,45 +171,6 @@ impl<T> BulkCtx<T> {
         self.cost.record(metric, amount);
     }
 
-    /// The run's cooperative cancellation token. Watch it to short-circuit a
-    /// long-running step when the bulk run is draining (e.g. on spot
-    /// preemption); see [`crate::Step::cancel_token`].
-    pub fn cancel_token(&self) -> &CancellationToken {
-        &self.cancel_token
-    }
-
-    /// The lease handle for this item's delivery. A long-running
-    /// pipeline calls [`LeaseHandle::ensure_at_least`] at progress
-    /// points (or once, with a slow call's timeout, before issuing it)
-    /// so the item is not re-queued while it still runs; see
-    /// [`crate::Step::lease`].
-    pub fn lease(&self) -> &LeaseHandle {
-        &self.lease
-    }
-
-    /// The item's staged application KV effects. Writes and deletes
-    /// staged here are applied atomically with the item's successful
-    /// completion; an item that fails applies nothing, and a staged
-    /// value must be correct when applied more than once, since
-    /// delivery is at-least-once. See [`EffectsHandle`] for the
-    /// staging rules.
-    pub fn effects(&self) -> &EffectsHandle {
-        &self.effects
-    }
-
-    /// Read the committed value under `key` from the caller KV
-    /// namespace, `None` when no value exists. Effects staged by this
-    /// item become readable only once its completion commits; see
-    /// [`crate::KvReadHandle`] for the read semantics.
-    pub async fn kv_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StepError> {
-        Ok(self
-            .kv
-            .get(key)
-            .await
-            .map_err(StepError::from)?
-            .map(|bytes| bytes.to_vec()))
-    }
-
     /// Snapshot of the cost accumulated so far for this item.
     pub(crate) fn cost(&self) -> CostReport {
         self.cost.clone()
@@ -246,23 +191,23 @@ mod tests {
         payload: &'a [u8],
     }
 
-    fn test_step(store: &MemoStore) -> Step {
-        let mut step = Step::detached(Vec::new());
-        step.memo = store.new_memo(&step.run_id, 0);
-        step.run_memo = store.new_run_memo(&step.run_id);
-        step
+    fn test_delivery(store: &MemoStore) -> Delivery {
+        let mut delivery = Delivery::detached();
+        delivery.memo = store.new_memo(&delivery.run_id, 0);
+        delivery.run_memo = store.new_run_memo(&delivery.run_id);
+        delivery
     }
 
     fn ctx_for_tests() -> BulkCtx<()> {
         let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        BulkCtx::new("b", "item-1", (), &test_step(&store))
+        BulkCtx::new("b", "item-1", (), test_delivery(&store))
     }
 
     #[tokio::test]
     async fn memoized_with_cached_cost_records_cost_on_compute_and_memo_hit() {
         let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        let first_ctx = BulkCtx::new("b", "item-1", (), &test_step(&store));
-        let replay_ctx = BulkCtx::new("b", "item-1", (), &test_step(&store));
+        let first_ctx = BulkCtx::new("b", "item-1", (), test_delivery(&store));
+        let replay_ctx = BulkCtx::new("b", "item-1", (), test_delivery(&store));
         let calls = AtomicU32::new(0);
 
         let first = first_ctx
@@ -296,8 +241,8 @@ mod tests {
     #[tokio::test]
     async fn memoized_by_content_with_cached_cost_records_cost_on_compute_and_memo_hit() {
         let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        let first_ctx = BulkCtx::new("b", "item-1", (), &test_step(&store));
-        let replay_ctx = BulkCtx::new("b", "item-1", (), &test_step(&store));
+        let first_ctx = BulkCtx::new("b", "item-1", (), test_delivery(&store));
+        let replay_ctx = BulkCtx::new("b", "item-1", (), test_delivery(&store));
         let calls = AtomicU32::new(0);
         let input = ContentInput {
             operation: "classify",

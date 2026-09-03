@@ -10,7 +10,7 @@ use crate::keys::RESERVED_KV_PREFIX;
 /// Application KV effects staged during a step, applied in the same
 /// transaction as the settlement that commits the step's outcome.
 ///
-/// Obtained through [`Step::effects`](crate::Step::effects). Writes and
+/// Obtained through [`Delivery::effects`](crate::Delivery::effects). Writes and
 /// deletes staged here are applied atomically with the acknowledgement
 /// of the [`StepOutcome`](crate::StepOutcome) the runner returns
 /// (`Continue`, `Succeed`, `Fail` and `Cancel`): either the settlement

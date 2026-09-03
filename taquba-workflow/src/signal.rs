@@ -23,7 +23,7 @@ use crate::keys::{
 use crate::runner::{StepError, StepRunner};
 use crate::runtime::{RuntimeCore, RuntimeInner, StepEnqueueOpts, WorkflowRuntime};
 use crate::terminal::TerminalHook;
-use crate::worker::StepDelivery;
+use crate::worker::ClaimedStep;
 
 /// Outcome of [`WorkflowRuntime::signal`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,7 +126,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
 }
 
 impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
-    /// Build the effects that advance the run of `delivery` to a step
+    /// Build the effects that advance the run of `claimed` to a step
     /// that waits for a signal for `correlation_key`. When a buffered
     /// signal already exists it is consumed: the next step is enqueued
     /// immediately, the payload is recorded under the durable delivered
@@ -135,7 +135,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     /// now and the waiter index entry joins the same transaction.
     pub(crate) async fn advance_on_signal(
         &self,
-        delivery: &StepDelivery<'_>,
+        claimed: &ClaimedStep<'_>,
         payload: Vec<u8>,
         correlation_key: &str,
         timeout: Duration,
@@ -156,7 +156,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                         "a waiter is already registered for correlation key `{correlation_key}`"
                     );
                     return Err(self.terminating_failure(
-                        delivery,
+                        claimed,
                         StepError::permanent(message),
                         HashMap::new(),
                     ));
@@ -171,14 +171,14 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             Ok(Some(buffered)) => {
                 let opts = StepEnqueueOpts {
                     reserved_headers: vec![(HEADER_SIGNAL_DELIVERED, "1".to_string())],
-                    ..delivery.next_step_opts()
+                    ..claimed.next_step_opts()
                 };
                 let delivered_key =
-                    signal_delivered_kv_key(&delivery.run_id, delivery.step_number + 1);
+                    signal_delivered_kv_key(&claimed.run_id, claimed.step_number + 1);
                 let buffered = buffered.to_vec();
                 let mut effects = self
                     .core
-                    .advance_with_kv(delivery, payload, opts, |_| {
+                    .advance_with_kv(claimed, payload, opts, |_| {
                         HashMap::from([(delivered_key, buffered)])
                     })
                     .await;
@@ -189,11 +189,11 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 let opts = StepEnqueueOpts {
                     run_at: Some(self.core.run_at_after(timeout)),
                     reserved_headers: vec![(HEADER_SIGNAL_WAIT, correlation_key.to_string())],
-                    ..delivery.next_step_opts()
+                    ..claimed.next_step_opts()
                 };
                 let effects = self
                     .core
-                    .advance_with_kv(delivery, payload, opts, |job_id| {
+                    .advance_with_kv(claimed, payload, opts, |job_id| {
                         HashMap::from([(wait_key, job_id.as_bytes().to_vec())])
                     })
                     .await;

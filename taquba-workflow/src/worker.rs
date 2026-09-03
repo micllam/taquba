@@ -1,6 +1,6 @@
 //! The worker path: how a claimed job is identified, run and settled.
 //! [`StepWorker`] is the [`Worker`] the runtime drives; a step job is
-//! parsed into a [`StepDelivery`], run through the [`StepRunner`] and
+//! parsed into a [`ClaimedStep`], run through the [`StepRunner`] and
 //! settled into the [`SettlementEffects`] of its outcome, and a
 //! terminal-notification job runs the [`TerminalHook`].
 
@@ -17,7 +17,7 @@ use crate::effects::{EffectsHandle, TerminalEffects};
 use crate::error::Error;
 use crate::keys::{HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RESERVED_HEADER_PREFIX};
 use crate::kv::KvReadHandle;
-use crate::runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
+use crate::runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 use crate::runtime::{RuntimeInner, StepEnqueueOpts};
 use crate::terminal::{RunOutcome, TerminalHook};
 
@@ -40,7 +40,7 @@ impl<R: StepRunner + 'static, H: TerminalHook + 'static> Worker for StepWorker<R
 /// One claimed step job as the worker path identifies it: the run and
 /// step named by the job's reserved headers, the submitter's headers
 /// with the reserved ones removed and the queue record itself.
-pub(crate) struct StepDelivery<'a> {
+pub(crate) struct ClaimedStep<'a> {
     pub(crate) run_id: String,
     pub(crate) step_number: u32,
     /// Submitter-supplied headers, without the reserved `workflow.` keys.
@@ -48,8 +48,8 @@ pub(crate) struct StepDelivery<'a> {
     pub(crate) job: &'a JobRecord,
 }
 
-impl<'a> StepDelivery<'a> {
-    /// Identify the delivery from `job`'s headers. Fails, permanently,
+impl<'a> ClaimedStep<'a> {
+    /// Identify the claimed step from `job`'s headers. Fails, permanently,
     /// for a job without the run id header or with a step header that
     /// is not a `u32`.
     pub(crate) fn parse(job: &'a JobRecord) -> std::result::Result<Self, Error> {
@@ -131,13 +131,13 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     /// dead-lettering settlement.
     pub(crate) fn terminating_failure(
         &self,
-        delivery: &StepDelivery<'_>,
+        claimed: &ClaimedStep<'_>,
         error: StepError,
         failure_writes: HashMap<Vec<u8>, Vec<u8>>,
     ) -> WorkerError {
         let mut effects = self.terminate_collecting_effects(
-            &delivery.failed(error.message.clone()),
-            Some(delivery.job),
+            &claimed.failed(error.message.clone()),
+            Some(claimed.job),
         );
         effects.kv_writes.extend(failure_writes);
         FailWith::new(error.into_worker_error(), effects).into()
@@ -184,15 +184,15 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             return self.process_notification(job).await;
         }
 
-        let delivery = match StepDelivery::parse(job) {
-            Ok(delivery) => delivery,
+        let claimed = match ClaimedStep::parse(job) {
+            Ok(claimed) => claimed,
             Err(err) => {
                 warn!(job_id = %job.id, error = %err, "workflow step has malformed headers");
                 return Err(StepError::from(err).into_worker_error());
             }
         };
-        let run_id = delivery.run_id.as_str();
-        let step_number = delivery.step_number;
+        let run_id = claimed.run_id.as_str();
+        let step_number = claimed.step_number;
 
         let (step_signal, signal_kv_deletes) = self
             .core
@@ -212,7 +212,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             })?;
         if record.cancel_requested {
             let mut effects =
-                self.terminate_collecting_effects(&delivery.cancelled(None), Some(job));
+                self.terminate_collecting_effects(&claimed.cancelled(None), Some(job));
             effects.kv_deletes.extend(signal_kv_deletes);
             return Ok(effects);
         }
@@ -226,19 +226,21 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
 
         let effects_handle = EffectsHandle::for_delivery();
         let step = Step {
-            run_id: run_id.to_string(),
+            delivery: Delivery {
+                run_id: run_id.to_string(),
+                headers: claimed.headers.clone(),
+                job_id: job.id.clone(),
+                attempts: job.attempts,
+                max_attempts: job.max_attempts,
+                cancel_token: claim_cancel.child_token(),
+                lease: lease.clone(),
+                memo: self.core.memo_store.new_memo(run_id, step_number),
+                run_memo: self.core.memo_store.new_run_memo(run_id),
+                effects: effects_handle.clone(),
+                kv: KvReadHandle::for_delivery(self.core.queue.clone()),
+            },
             step_number,
             payload: job.payload.clone(),
-            headers: delivery.headers.clone(),
-            job_id: job.id.clone(),
-            attempts: job.attempts,
-            max_attempts: job.max_attempts,
-            cancel_token: claim_cancel.child_token(),
-            lease: lease.clone(),
-            memo: self.core.memo_store.new_memo(run_id, step_number),
-            run_memo: self.core.memo_store.new_run_memo(run_id),
-            effects: effects_handle.clone(),
-            kv: KvReadHandle::for_delivery(self.core.queue.clone()),
             signal: step_signal,
         };
 
@@ -282,7 +284,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
 
         let runner_cancelled = matches!(outcome, Ok(StepOutcome::Cancel { .. }));
         let settled = self
-            .settle_outcome(&delivery, outcome, external_cancel, sealed.on_failure)
+            .settle_outcome(&claimed, outcome, external_cancel, sealed.on_failure)
             .await;
 
         // Durable signal entries scheduled for cleanup are deleted with the
@@ -301,7 +303,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         })
     }
 
-    /// The settlement of `outcome` for `delivery`: the effects of the
+    /// The settlement of `outcome` for `claimed`: the effects of the
     /// run's transition on an acknowledging outcome, or the error that
     /// retries or dead-letters the step. `failure_writes` are the
     /// runner's reserved writes for a terminating failure.
@@ -313,53 +315,50 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     /// `error: None` so consumers can distinguish the two.
     async fn settle_outcome(
         &self,
-        delivery: &StepDelivery<'_>,
+        claimed: &ClaimedStep<'_>,
         outcome: std::result::Result<StepOutcome, StepError>,
         external_cancel: bool,
         failure_writes: HashMap<Vec<u8>, Vec<u8>>,
     ) -> std::result::Result<SettlementEffects, WorkerError> {
         match outcome {
-            Ok(StepOutcome::Cancel { reason }) => Ok(self.terminate_collecting_effects(
-                &delivery.cancelled(Some(reason)),
-                Some(delivery.job),
-            )),
-            _ if external_cancel => Ok(
-                self.terminate_collecting_effects(&delivery.cancelled(None), Some(delivery.job))
-            ),
+            Ok(StepOutcome::Cancel { reason }) => Ok(self
+                .terminate_collecting_effects(&claimed.cancelled(Some(reason)), Some(claimed.job))),
+            _ if external_cancel => {
+                Ok(self.terminate_collecting_effects(&claimed.cancelled(None), Some(claimed.job)))
+            }
             Ok(StepOutcome::Continue { payload, when }) => match when {
                 Trigger::Immediate => Ok(self
                     .core
-                    .advance(delivery, payload, delivery.next_step_opts())
+                    .advance(claimed, payload, claimed.next_step_opts())
                     .await),
                 Trigger::After(delay) => {
                     let opts = StepEnqueueOpts {
                         run_at: Some(self.core.run_at_after(delay)),
-                        ..delivery.next_step_opts()
+                        ..claimed.next_step_opts()
                     };
-                    Ok(self.core.advance(delivery, payload, opts).await)
+                    Ok(self.core.advance(claimed, payload, opts).await)
                 }
                 Trigger::OnSignal {
                     correlation_key,
                     timeout,
                 } => {
-                    self.advance_on_signal(delivery, payload, &correlation_key, timeout)
+                    self.advance_on_signal(claimed, payload, &correlation_key, timeout)
                         .await
                 }
             },
-            Ok(StepOutcome::Succeed { result }) => {
-                Ok(self
-                    .terminate_collecting_effects(&delivery.succeeded(result), Some(delivery.job)))
-            }
+            Ok(StepOutcome::Succeed { result }) => Ok(
+                self.terminate_collecting_effects(&claimed.succeeded(result), Some(claimed.job))
+            ),
             // A runner verdict: the step ran cleanly and is acknowledged;
             // the run terminates as `Failed` without a dead-letter.
             Ok(StepOutcome::Fail { reason }) => {
-                Ok(self.terminate_collecting_effects(&delivery.failed(reason), Some(delivery.job)))
+                Ok(self.terminate_collecting_effects(&claimed.failed(reason), Some(claimed.job)))
             }
             // A permanent error, or a transient one on the last attempt,
             // dead-letters the step and terminates the run; the runner's
             // failure writes apply only with that settlement.
-            Err(err) if err.kind == StepErrorKind::Permanent || delivery.job.is_last_attempt() => {
-                Err(self.terminating_failure(delivery, err, failure_writes))
+            Err(err) if err.kind == StepErrorKind::Permanent || claimed.job.is_last_attempt() => {
+                Err(self.terminating_failure(claimed, err, failure_writes))
             }
             Err(err) => Err(err.into_worker_error()),
         }

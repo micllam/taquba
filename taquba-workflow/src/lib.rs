@@ -106,6 +106,15 @@
 //! # Ok(()) }
 //! ```
 //!
+//! # The delivery
+//!
+//! A [`Step`] dereferences to its [`Delivery`]: the run id, the
+//! submitter's headers, the queue job id, the attempt count and limit,
+//! and the delivery's handles (the cancellation token, the lease, the
+//! per-step and run-scoped memos, the staged KV effects and committed KV
+//! reads). The typed contexts ([`jobs::JobContext`], [`bulk::BulkCtx`])
+//! dereference to the same type.
+//!
 //! # Cancellation
 //!
 //! Call [`WorkflowRuntime::cancel`] to cancel an active run from outside
@@ -115,7 +124,7 @@
 //!   is removed and the run's notification job is enqueued before the
 //!   `cancel` call returns.
 //! - If the current step is **running**, cancellation is delivered via
-//!   [`Step::cancel_token`] (a `tokio_util::sync::CancellationToken`).
+//!   [`Delivery::cancel_token`] (a `tokio_util::sync::CancellationToken`).
 //!   Runners that watch the token can short-circuit immediately:
 //!
 //!   ```ignore
@@ -189,7 +198,7 @@
 //!
 //! A step that outlives the queue's lease is re-queued by the reaper
 //! and delivered a second time. A long-running runner avoids this by
-//! extending its lease through [`Step::lease`]: call
+//! extending its lease through [`Delivery::lease`]: call
 //! [`taquba::LeaseHandle::ensure_at_least`] at progress points, or
 //! once, with a slow call's timeout, before issuing the call.
 //!
@@ -253,7 +262,7 @@
 //!
 //! - [`RunSpec::kv_writes`]: writes applied atomically with the step-0
 //!   enqueue. A duplicate submission drops its writes.
-//! - [`Step::effects`]: an [`EffectsHandle`] that stages writes and
+//! - [`Delivery::effects`]: an [`EffectsHandle`] that stages writes and
 //!   deletes during a step. Everything staged is applied in the
 //!   settlement transaction that commits the outcome the runner
 //!   returned, whichever outcome that is (`Continue`, `Succeed`,
@@ -283,7 +292,7 @@
 //!   replay record stores the staged effects with the outcome, so a
 //!   replayed delivery applies them without invoking the runner.
 //!
-//! The written values are readable inside a step through [`Step::kv`]
+//! The written values are readable inside a step through [`Delivery::kv`]
 //! (a [`KvReadHandle`] exposing `get` only, answering from committed
 //! state, so effects staged by the running step are excluded), through
 //! [`taquba::Queue::kv_get`] and, from another process, through a
@@ -351,7 +360,7 @@
 //! Because retries can re-execute a step, expensive non-idempotent side
 //! effects (LLM calls, paid APIs, multi-stage processing) need a place
 //! to record their result so retries observe the cached value instead
-//! of paying twice. [`Step::memo`] is a per-step durable key-value
+//! of paying twice. [`Delivery::memo`] is a per-step durable key-value
 //! store scoped to `(run_id, step_number)`:
 //!
 //! ```ignore
@@ -410,7 +419,7 @@
 //! from outside the runtime, and [`Memo::memoized_by_content`] is the
 //! typed form over that key.
 //!
-//! [`Step::run_memo`] is the run-scoped variant: one namespace shared
+//! [`Delivery::run_memo`] is the run-scoped variant: one namespace shared
 //! by every step of the run, for values a later step reads back (an
 //! accumulating journal, for example). Its entries live beside the
 //! per-step entries and are removed with them when the run's retention
@@ -433,7 +442,7 @@
 //! the runtime applies the outcome. If the same step is delivered again
 //! after a crash before ack, the stored outcome is replayed without
 //! invoking the runner again. The record includes the effects staged
-//! through [`Step::effects`], so a replayed outcome applies them as
+//! through [`Delivery::effects`], so a replayed outcome applies them as
 //! well. A replayed [`StepOutcome::Continue`] with a
 //! [`Trigger::After`] delay reduces the delay by the time already elapsed
 //! since the outcome was stored, preserving the original schedule.
@@ -589,7 +598,7 @@ pub use keys::{
 };
 pub use kv::KvReadHandle;
 pub use memo::{Memo, MemoStore};
-pub use runner::{Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
+pub use runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 pub use runtime::{
     RunSpec, RunState, RunStatus, RunnerHandle, SubmitOutcome, WorkflowRuntime,
     WorkflowRuntimeBuilder,

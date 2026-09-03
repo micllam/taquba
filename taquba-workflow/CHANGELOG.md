@@ -9,9 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `Step::detached(payload)`: a step bound to no delivery, for driving a
-  `StepRunner` in tests.
-- `Step::is_last_attempt`: whether a transient `StepError` from this
+- `Delivery`: the run identity, attempt count and handles a handler runs
+  under. `Step`, `jobs::JobContext` and `bulk::BulkCtx` dereference to
+  it. `Delivery::detached()` builds one bound to no queue and
+  `Step::detached(payload)` step 0 over it, for tests.
+- `Delivery::is_last_attempt`: whether a transient `StepError` from this
   attempt dead-letters the step.
 
 ### Removed
@@ -19,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (source):** `jobs::JobContext::submit`. A handler that
   submits further jobs holds a `JobRunner` in its registered state, as
   the fan-out example does.
+- **Breaking (source):** the accessors `jobs::JobContext::{id, attempt,
+  cancel_token, lease, memo, effects, kv_get}` and
+  `bulk::BulkCtx::{memo, cancel_token, lease, effects, kv_get}`, and the
+  `bulk::BulkCtx::run_id` and `headers` fields. Both types dereference
+  to `Delivery`, which holds them as fields: `ctx.run_id`,
+  `ctx.attempts`, `ctx.memo`, `ctx.effects`, `ctx.kv.get(..)`.
 
 ### Changed
 
@@ -33,9 +41,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is settled as cancelled without running. The in-process run registry
   is gone.
 - `RunnerHandle` is `taquba::WorkerHandle<Result<()>>`.
-- **Breaking (source):** `Step` is `#[non_exhaustive]`. A struct
-  literal outside the crate moves to `Step::detached` and assigns its
-  fields.
+- **Breaking (source):** `Step` is `#[non_exhaustive]` and holds its
+  delivery fields (`run_id`, `headers`, `job_id`, `attempts`,
+  `max_attempts`, `cancel_token`, `lease`, `memo`, `run_memo`, `effects`,
+  `kv`) on `Step::delivery`, reachable through the dereference. A
+  struct literal outside the crate moves to `Step::detached` and
+  assigns its fields.
 - The terminal-notification job of a run terminated by a dead-lettered
   step (a permanent step error, a transient one on the last attempt, a
   second waiter on a correlation key, or a step the queue dead-lettered

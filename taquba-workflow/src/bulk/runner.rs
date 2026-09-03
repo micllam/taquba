@@ -63,7 +63,7 @@ impl<P: Pipeline> StepRunner for PipelineRunner<P> {
             ))
         })?;
         let outcome = run_typed_step(step, "bulk item", &input, |input: P::Input| async {
-            let ctx = BulkCtx::new(&batch_id, &key, input, step);
+            let ctx = BulkCtx::new(&batch_id, &key, input, step.delivery.clone());
             let output = self.pipeline.run(&ctx).await.map_err(Into::into)?;
             Ok(ItemEnvelope {
                 output,

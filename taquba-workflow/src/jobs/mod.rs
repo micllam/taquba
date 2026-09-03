@@ -12,7 +12,7 @@
 //! [`StepRunner`](crate::StepRunner) directly when one entity moves through
 //! several durable steps with cancellation and a terminal hook. The word
 //! "job" names the typed function here; the queue job that delivers a step
-//! is [`Step::job_id`](crate::Step::job_id). Chaining jobs to model a
+//! is [`Delivery::job_id`](crate::Delivery::job_id). Chaining jobs to model a
 //! multi-step process is a sign the work belongs in a workflow.
 //!
 //! # Quick start
@@ -86,8 +86,9 @@
 //! Delivery is at-least-once, inherited from Taquba: **job handlers must be
 //! idempotent.** A retried attempt that runs after an earlier attempt
 //! already wrote an outcome record overwrites it with the new attempt's
-//! outcome. [`JobContext::memo`] gives a handler a durable memo for the
-//! results of expensive calls, so a retried attempt reads them back.
+//! outcome. The [`memo`](crate::Delivery::memo) gives a handler a durable
+//! memo for the results of expensive calls, so a retried attempt reads
+//! them back.
 //!
 //! Outcome records and memo entries are retained indefinitely by default;
 //! enable [`JobRunnerBuilder::retention`] (see [Retention]) to remove them
@@ -186,13 +187,14 @@
 //!
 //! # The handler context
 //!
-//! [`JobContext`] gives a handler its registered application state, the
-//! delivery's lease and cancellation token, a durable [`JobContext::memo`]
-//! for the results of expensive calls, staged KV effects
-//! ([`JobContext::effects`]) applied atomically with the job's successful
-//! completion and committed KV reads ([`JobContext::kv_get`]). A handler
-//! that submits further jobs holds a [`JobRunner`] in its registered
-//! state.
+//! [`JobContext`] gives a handler its registered application state and
+//! dereferences to the job's [`Delivery`](crate::Delivery): the job's
+//! identity and attempt count, the delivery's lease and cancellation
+//! token, a durable [`memo`](crate::Delivery::memo) for the results of
+//! expensive calls, staged KV effects ([`effects`](crate::Delivery::effects))
+//! applied atomically with the job's successful completion and committed
+//! KV reads ([`kv`](crate::Delivery::kv)). A handler that submits further
+//! jobs holds a [`JobRunner`] in its registered state.
 //!
 //! # Core types
 //!

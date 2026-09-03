@@ -1,12 +1,9 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::Arc;
 
-use crate::{EffectsHandle, Memo, Step};
-use taquba::LeaseHandle;
-use tokio_util::sync::CancellationToken;
-
-use crate::Result;
+use crate::Delivery;
 
 /// Type-erased application state shared with every job handler.
 #[derive(Default)]
@@ -26,22 +23,21 @@ impl State {
     }
 }
 
-/// The per-call context handed to [`Job::run`](crate::jobs::Job::run).
-///
-/// Provides access to application state registered on the
-/// [`JobRunner`](crate::jobs::JobRunner), the job's identity and attempt count,
-/// the delivery's lease and cancellation token, and the job's memo and
-/// staged KV effects. It holds no domain-specific clients (HTTP, LLM,
-/// etc.); those belong to the application's registered state or to
-/// layers built on top.
+/// The per-call context handed to [`Job::run`](crate::jobs::Job::run):
+/// the application state registered on the
+/// [`JobRunner`](crate::jobs::JobRunner) and the [`Delivery`] the job
+/// runs under, which it dereferences to (identity, attempt count, lease,
+/// cancellation token, memo, staged KV effects and committed KV reads).
+/// It holds no domain-specific clients (HTTP, LLM, etc.); those belong
+/// to the application's registered state or to layers built on top.
 pub struct JobContext<'a> {
     state: &'a State,
-    step: &'a Step,
+    delivery: &'a Delivery,
 }
 
 impl<'a> JobContext<'a> {
-    pub(crate) fn new(state: &'a State, step: &'a Step) -> Self {
-        Self { state, step }
+    pub(crate) fn new(state: &'a State, delivery: &'a Delivery) -> Self {
+        Self { state, delivery }
     }
 
     /// Borrow a piece of application state by type.
@@ -67,55 +63,12 @@ impl<'a> JobContext<'a> {
     pub fn try_state<T: Any + Send + Sync>(&self) -> Option<&T> {
         self.state.get::<T>()
     }
+}
 
-    /// The identifier of the job currently executing, equal to
-    /// [`JobHandle::id`](crate::jobs::JobHandle::id) of its handle.
-    pub fn id(&self) -> &str {
-        &self.step.run_id
-    }
+impl Deref for JobContext<'_> {
+    type Target = Delivery;
 
-    /// How many delivery attempts have been made for this job, including the
-    /// current one. `1` on the first attempt.
-    pub fn attempt(&self) -> u32 {
-        self.step.attempts
-    }
-
-    /// The cooperative cancellation token for this job.
-    ///
-    /// `select!` on [`CancellationToken::cancelled`] to short-circuit when
-    /// the job is cancelled. Cancellation is cooperative: a handler that
-    /// ignores the token runs to completion.
-    pub fn cancel_token(&self) -> &CancellationToken {
-        &self.step.cancel_token
-    }
-
-    /// The lease handle for this delivery.
-    ///
-    /// A long-running handler calls
-    /// [`LeaseHandle::ensure_at_least`] at progress points (or once,
-    /// with a slow call's timeout, before issuing it) so the lease
-    /// covers the remaining work and the job is not re-queued while it
-    /// still runs.
-    pub fn lease(&self) -> &LeaseHandle {
-        &self.step.lease
-    }
-
-    /// The job's durable memo, scoped to this job. A handler records the
-    /// results of expensive calls in it, and a retried attempt reads them
-    /// back without repeating the calls; see [`Memo::memoized`].
-    pub fn memo(&self) -> &Memo {
-        &self.step.memo
-    }
-
-    /// The job's staged application KV effects, applied atomically with
-    /// the job's successful completion; a failing attempt applies nothing.
-    pub fn effects(&self) -> &EffectsHandle {
-        &self.step.effects
-    }
-
-    /// Read a committed value from Taquba's caller KV namespace. Effects
-    /// staged by this job are not visible until it completes.
-    pub async fn kv_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.step.kv.get(key).await?.map(|bytes| bytes.to_vec()))
+    fn deref(&self) -> &Delivery {
+        self.delivery
     }
 }

@@ -7,7 +7,7 @@ use crate::error::Result;
 
 /// Read access to Taquba's caller KV namespace during a step.
 ///
-/// Obtained through [`Step::kv`](crate::Step::kv). [`get`](Self::get)
+/// Obtained through [`Delivery::kv`](crate::Delivery::kv). [`get`](Self::get)
 /// answers from committed state: a value written by an earlier
 /// settlement (a previous step's [`EffectsHandle`](crate::EffectsHandle)
 /// writes, a [`RunSpec::kv_writes`](crate::RunSpec::kv_writes) entry, a

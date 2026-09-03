@@ -27,7 +27,7 @@ use crate::memo::MemoStore;
 use crate::runner::{StepOutcome, StepRunner, Trigger};
 use crate::sweep::{Sweep, run_periodically};
 use crate::terminal::{RunOutcome, TerminalHook};
-use crate::worker::{StepDelivery, StepWorker};
+use crate::worker::{ClaimedStep, StepWorker};
 
 /// The encoded current-step pointer for `job_id` at `step_number`.
 fn current_step_bytes(step_number: u32, job_id: &str) -> Vec<u8> {
@@ -185,10 +185,10 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
         self
     }
 
-    /// The object-store path prefix [`Step::memo`](crate::Step::memo) entries live under.
-    /// Defaults to `"workflow-memo"`. Pick a distinct value when multiple
-    /// runtimes share an object store, so their memo namespaces don't
-    /// collide.
+    /// The object-store path prefix [`Delivery::memo`](crate::Delivery::memo)
+    /// entries live under. Defaults to `"workflow-memo"`. Pick a distinct value
+    /// when multiple runtimes share an object store, so their memo namespaces
+    /// don't collide.
     pub fn memo_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.memo_prefix = prefix.into();
         self
@@ -235,7 +235,8 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     /// scoped to `(run_id, step_number, SHA-256(step payload))`. If the
     /// same step is delivered again after a crash before ack, the stored
     /// outcome is replayed without invoking the runner again. The record
-    /// includes the effects staged through [`Step::effects`](crate::Step::effects), so a
+    /// includes the effects staged through
+    /// [`Delivery::effects`](crate::Delivery::effects), so a
     /// replayed outcome applies them as well. A replayed
     /// [`StepOutcome::Continue`] with a [`Trigger::After`] delay reduces
     /// the delay by the time already elapsed since the outcome was
@@ -349,15 +350,15 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// (Taquba queue, object store, [`StepRunner`], [`TerminalHook`]); optional
     /// fields are set via [`WorkflowRuntimeBuilder`] methods before [`build`].
     ///
-    /// The object store backs [`Step::memo`]; it does **not** need to be the
-    /// same store the [`Queue`] was opened with, though sharing one store is
-    /// the common case (just clone the `Arc`). Use a distinct
-    /// [`WorkflowRuntimeBuilder::memo_prefix`] when multiple runtimes share
-    /// one store.
+    /// The object store backs [`Delivery::memo`]; it does **not** need to be
+    /// the same store the [`Queue`] was opened with, though sharing one store
+    /// is the common case (just clone the `Arc`). Use a distinct
+    /// [`WorkflowRuntimeBuilder::memo_prefix`] when multiple runtimes share one
+    /// store.
     ///
     /// Use [`crate::NoopTerminalHook`] if you don't need terminal callbacks.
     ///
-    /// [`Step::memo`]: crate::Step::memo
+    /// [`Delivery::memo`]: crate::Delivery::memo
     /// [`build`]: WorkflowRuntimeBuilder::build
     pub fn builder(
         queue: Arc<Queue>,
@@ -540,13 +541,13 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     ///   and the notification enqueued in one transaction before this
     ///   call returns; the hook runs from a worker afterwards.
     /// - **Running step**: cancellation is delivered to the runner via
-    ///   [`Step::cancel_token`](crate::Step::cancel_token); runners that watch the token short-circuit
-    ///   immediately. Runners that ignore the token are allowed to run to
-    ///   completion (futures cannot be safely aborted mid-step). In both
-    ///   cases the runner's [`StepOutcome`] / [`StepError`](crate::StepError) is discarded
-    ///   and the worker settles the run once the step returns, with
-    ///   any pending transient retry suppressed and the step acked rather
-    ///   than nacked.
+    ///   [`Delivery::cancel_token`](crate::Delivery::cancel_token); runners
+    ///   that watch the token short-circuit immediately. Runners that ignore
+    ///   the token are allowed to run to completion (futures cannot be safely
+    ///   aborted mid-step). In both cases the runner's [`StepOutcome`] /
+    ///   [`StepError`](crate::StepError) is discarded and the worker settles
+    ///   the run once the step returns, with any pending transient retry
+    ///   suppressed and the step acked rather than nacked.
     /// - A step claimed after the request is settled as cancelled
     ///   without running.
     ///
@@ -560,7 +561,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         }
         // Settle the current step now: remove it while it is queued, or
         // fire the claim's cancellation token, the parent of
-        // `Step::cancel_token`, while it runs. A step that settles in
+        // `Delivery::cancel_token`, while it runs. A step that settles in
         // between is followed to its successor; a step claimed after the
         // request terminates the run on its own.
         let mut absent: Option<String> = None;
@@ -576,13 +577,13 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
                 absent = Some(current.job_id);
                 continue;
             };
-            let delivery = StepDelivery::parse(&job)?;
+            let claimed = ClaimedStep::parse(&job)?;
             // `error` is `None`: external cancellation supplies no reason
             // at the API level. The effects are built before the outcome
             // is known; the queue applies them only on `Removed`.
             let effects = self
                 .inner
-                .terminate_collecting_effects(&delivery.cancelled(None), Some(&job));
+                .terminate_collecting_effects(&claimed.cancelled(None), Some(&job));
             match core.queue.cancel_with(&job.id, effects).await?.0 {
                 taquba::CancelOutcome::Removed | taquba::CancelOutcome::Requested => {
                     return Ok(true);
@@ -876,16 +877,16 @@ impl RuntimeCore {
             .await
     }
 
-    /// Build the effects that advance the run of `delivery` to its next
+    /// Build the effects that advance the run of `claimed` to its next
     /// step: the next step's enqueue joins the current step's
     /// acknowledgement transaction, so the transition is atomic.
     pub(crate) async fn advance(
         &self,
-        delivery: &StepDelivery<'_>,
+        claimed: &ClaimedStep<'_>,
         payload: Vec<u8>,
         opts: StepEnqueueOpts,
     ) -> SettlementEffects {
-        self.advance_with_kv(delivery, payload, opts, |_| HashMap::new())
+        self.advance_with_kv(claimed, payload, opts, |_| HashMap::new())
             .await
     }
 
@@ -894,15 +895,15 @@ impl RuntimeCore {
     /// pre-assigned job id so the writes can reference it.
     pub(crate) async fn advance_with_kv(
         &self,
-        delivery: &StepDelivery<'_>,
+        claimed: &ClaimedStep<'_>,
         payload: Vec<u8>,
         opts: StepEnqueueOpts,
         kv_writes: impl FnOnce(&str) -> HashMap<Vec<u8>, Vec<u8>>,
     ) -> SettlementEffects {
-        let run_id = delivery.run_id.as_str();
-        let next_step = delivery.step_number + 1;
+        let run_id = claimed.run_id.as_str();
+        let next_step = claimed.step_number + 1;
         let (request, next_job_id) =
-            self.step_enqueue_request(run_id, next_step, payload, &delivery.headers, opts);
+            self.step_enqueue_request(run_id, next_step, payload, &claimed.headers, opts);
         let mut kv_writes = kv_writes(&next_job_id);
         kv_writes.insert(
             step_kv_key(run_id),
@@ -980,10 +981,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             if job.headers.contains_key(HEADER_TERMINAL) {
                 continue;
             }
-            let Ok(delivery) = StepDelivery::parse(&job) else {
+            let Ok(claimed) = ClaimedStep::parse(&job) else {
                 continue;
             };
-            let run_id = delivery.run_id.as_str();
+            let run_id = claimed.run_id.as_str();
             if core.queue.kv_get(&run_kv_key(run_id)).await?.is_none() {
                 continue;
             }
@@ -991,9 +992,9 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 .last_error
                 .clone()
                 .unwrap_or_else(|| "step dead-lettered outside the worker".to_string());
-            let effects = self.terminate_collecting_effects(&delivery.failed(error), Some(&job));
+            let effects = self.terminate_collecting_effects(&claimed.failed(error), Some(&job));
             core.queue.commit_effects(effects).await?;
-            warn!(run_id = %run_id, step_number = delivery.step_number, job_id = %job.id, "terminated a run whose step was dead-lettered outside the worker");
+            warn!(run_id = %run_id, step_number = claimed.step_number, job_id = %job.id, "terminated a run whose step was dead-lettered outside the worker");
             terminated += 1;
         }
         Ok(terminated)

@@ -42,7 +42,7 @@ documented in the header comment of its source file.
 | Benchmark | Workload | Question it answers |
 |---|---|---|
 | `bulk_throughput` | Run `N_ITEMS` items through a pipeline of `N_PHASES` memoized phases that do no work | What is the per-item orchestration overhead (run submission, the single workflow step, one memo write per phase, terminal accounting), and what item throughput does it bound? |
-| `resume_replay` | Each item fails transiently on its first attempt after completing `FAIL_AT` phases of `PHASE_WORK_MS` simulated work; the retry re-enters the pipeline. `MEMO=0` runs the identical workload without memoization | How much completed work does `BulkCtx::memoized` save a retried item? The memoized run should re-execute zero completed phases; the `MEMO=0` run re-pays them. |
+| `resume_replay` | Each item fails transiently on its first attempt after completing `FAIL_AT` phases of `PHASE_WORK_MS` simulated work; the retry re-enters the pipeline. `MEMO=0` runs the identical workload without memoization | How much completed work does `Memo::memoized` save a retried item? The memoized run should re-execute zero completed phases; the `MEMO=0` run re-pays them. |
 
 ### taquba-workflow typed jobs (`jobs` module)
 

@@ -7,7 +7,7 @@
 //!   - submission writes `received` in the same transaction as the
 //!     step-0 enqueue (`RunSpec::kv_writes`), together with a pending
 //!     marker;
-//!   - the validation step stages `validated` through `Step::effects`,
+//!   - the validation step stages `validated` through `Delivery::effects`,
 //!     so the new status commits with the settlement that enqueues the
 //!     fulfilment step;
 //!   - the fulfilment step stages `fulfilled` and deletes the pending

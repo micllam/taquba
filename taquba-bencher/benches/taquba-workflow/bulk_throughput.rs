@@ -56,7 +56,7 @@ impl Pipeline for PhasesPipeline {
         for phase in 0..self.n_phases {
             let value = acc;
             acc = ctx
-                .memo()
+                .memo
                 .memoized(&format!("phase-{phase}"), async move {
                     Ok::<_, StepError>(value.wrapping_add(1))
                 })

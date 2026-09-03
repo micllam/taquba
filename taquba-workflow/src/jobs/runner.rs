@@ -154,7 +154,7 @@ async fn run_typed<J: Job>(
     input: Vec<u8>,
 ) -> std::result::Result<StepOutcome, StepError> {
     run_typed_step(step, J::NAME, &input, |input: J| async move {
-        let ctx = JobContext::new(state, step);
+        let ctx = JobContext::new(state, &step.delivery);
         tracing::info!(
             job_id = %step.run_id,
             job_type = J::NAME,
@@ -490,7 +490,7 @@ mod tests {
         type Error = TestError;
 
         async fn run(&self, ctx: JobContext<'_>) -> std::result::Result<(), TestError> {
-            ctx.lease()
+            ctx.lease
                 .ensure_at_least(Duration::from_secs(600))
                 .map_err(|e| TestError(e.to_string()))?;
             let gate = ctx.state::<Arc<RenewGate>>();
@@ -549,13 +549,12 @@ mod tests {
 
         async fn run(&self, ctx: JobContext<'_>) -> std::result::Result<u32, TestError> {
             ctx.state::<Arc<AtomicU32>>().fetch_add(1, Ordering::SeqCst);
-            let attempt = ctx.attempt();
-            if attempt == 1 {
+            if ctx.attempts == 1 {
                 // Past the lease under virtual time; later attempts return
                 // at once.
                 tokio::time::sleep(Duration::from_secs(300)).await;
             }
-            Ok(attempt)
+            Ok(ctx.attempts)
         }
     }
 
@@ -612,17 +611,17 @@ mod tests {
         async fn run(&self, ctx: JobContext<'_>) -> std::result::Result<u32, TestError> {
             let calls = ctx.state::<Arc<AtomicU32>>().clone();
             let value = ctx
-                .memo()
+                .memo
                 .memoized("expensive", async move {
                     calls.fetch_add(1, Ordering::SeqCst);
                     Ok::<_, crate::Error>(7u32)
                 })
                 .await
                 .map_err(|e| TestError(e.to_string()))?;
-            ctx.effects()
+            ctx.effects
                 .put(b"jobs-test/marker".to_vec(), b"done".to_vec())
                 .map_err(|e| TestError(e.to_string()))?;
-            if ctx.attempt() == 1 {
+            if ctx.attempts == 1 {
                 return Err(TestError("retry once".to_string()));
             }
             Ok(value)

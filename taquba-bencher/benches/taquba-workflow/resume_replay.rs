@@ -81,7 +81,7 @@ impl ResumePipeline {
             Ok::<_, StepError>(value.wrapping_add(1))
         };
         if self.memoize {
-            ctx.memo().memoized(&format!("phase-{phase}"), body).await
+            ctx.memo.memoized(&format!("phase-{phase}"), body).await
         } else {
             body.await
         }

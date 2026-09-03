@@ -101,7 +101,7 @@ impl Pipeline for DocPipeline {
 
         // Stage 3: validation; a plain memoized call with no cost counters.
         let warnings: Vec<String> = ctx
-            .memo()
+            .memo
             .memoized("validate:v1", async {
                 self.validate_runs.fetch_add(1, Ordering::Relaxed);
                 Ok::<_, StepError>(validate(&extracted, &class))

@@ -10,17 +10,17 @@
 //!
 //! # Execution model: one item, one run, one step
 //!
-//! Each input item becomes one [`crate`] run whose single step
-//! invokes [`Pipeline::run`]. The pipeline's own logical steps live inside
-//! that method as [`Memo::memoized`](crate::Memo::memoized) calls on
-//! [`BulkCtx::memo`]. Taquba delivers at-least-once, so
-//! a step may run again if its lease expires before it acks; memoization makes
-//! that replay inexpensive, because each completed logical step returns its
-//! cached result instead of repeating a paid call. A pipeline error retries with
+//! Each input item becomes one [`crate`] run whose single step invokes
+//! [`Pipeline::run`]. The pipeline's own logical steps live inside that method
+//! as [`Memo::memoized`](crate::Memo::memoized) calls on the item's
+//! [`memo`](crate::Delivery::memo). Taquba delivers at-least-once, so a step
+//! may run again if its lease expires before it acks; memoization makes that
+//! replay inexpensive, because each completed logical step returns its cached
+//! result instead of repeating a paid call. A pipeline error retries with
 //! backoff and then dead-letters the item (terminating it failed); the rest of
 //! the batch is unaffected.
 //!
-//! [`BulkCtx::memo`] is the run's per-step memo applied at a finer
+//! That memo is the run's per-step memo applied at a finer
 //! granularity: the item's single step holds one memo entry per logical
 //! phase, so the phases of [`Pipeline::run`] resume individually even
 //! though the workflow sees one step.
@@ -132,14 +132,15 @@
 //!
 //! # Application KV effects and reads
 //!
-//! [`BulkCtx::effects`] stages writes and deletes to Taquba's caller KV
-//! namespace, applied atomically with the item's successful completion,
-//! so per-item application state (a result marker, a status row) cannot
-//! diverge from the item's outcome on a crash; a failing item applies
-//! nothing. [`BulkCtx::kv_get`] reads a committed value from the same
-//! namespace; effects staged by the running item are excluded. Both
-//! surfaces delegate to [`crate`]'s KV effects, whose staging
-//! rules ([`EffectsHandle`](crate::EffectsHandle)) apply unchanged.
+//! [`BulkCtx`] dereferences to the item's [`Delivery`](crate::Delivery).
+//! Its [`effects`](crate::Delivery::effects) stage writes and deletes to
+//! Taquba's caller KV namespace, applied atomically with the item's
+//! successful completion, so per-item application state (a result
+//! marker, a status row) cannot diverge from the item's outcome on a
+//! crash; a failing item applies nothing. Its [`kv`](crate::Delivery::kv)
+//! reads a committed value from the same namespace; effects staged by the
+//! running item are excluded. Both are [`crate`]'s KV effects, whose
+//! staging rules ([`EffectsHandle`](crate::EffectsHandle)) apply unchanged.
 //!
 //! # Batches
 //!
