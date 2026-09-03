@@ -7,7 +7,7 @@ use futures_util::TryStreamExt;
 use taquba::object_store::ObjectStore;
 use taquba::{
     Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, JobRecord, JobStatus, Queue,
-    SettlementEffects, WorkerHandle,
+    SettlementEffects, WaitOutcome, WorkerHandle,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
@@ -202,6 +202,21 @@ impl From<DurableTermination> for RunTermination {
             terminated_at_ms: record.terminated_at_ms,
         }
     }
+}
+
+/// The end of a run, as [`WorkflowRuntime::wait`] reports it.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RunEnd {
+    /// The run's termination: from its terminal record while memo
+    /// retention retains one, otherwise from its run result record,
+    /// otherwise from the queue record of a final step dead-lettered
+    /// outside the worker while the wait observed it. `None` when no
+    /// record of the termination remains.
+    pub termination: Option<RunTermination>,
+    /// The committed outcome, when the worker that terminated the run
+    /// recorded one; see [`WorkflowRuntime::outcome`].
+    pub outcome: Option<RunOutcome>,
 }
 
 /// Builder for [`WorkflowRuntime`].
@@ -687,12 +702,42 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             .map(|result| result.outcome))
     }
 
+    /// Wait until the run `run_id` terminates and report its end. The
+    /// wait follows the run's current step across its steps, so it
+    /// answers for a run of any length, after a restart and from any
+    /// runtime over the same queue; a run already terminated is
+    /// reported at once from its records. A step dead-lettered outside
+    /// the worker is terminated by the worker's dead-step
+    /// reconciliation, which the wait polls for at the poll interval.
+    ///
+    /// Returns [`Error::RunNotFound`] for a run the runtime has no
+    /// record of: never submitted, or terminated with no record
+    /// retained.
+    pub async fn wait(&self, run_id: &str) -> Result<RunEnd> {
+        self.inner
+            .core
+            .wait_run(run_id)
+            .await?
+            .ok_or_else(|| Error::RunNotFound(run_id.to_string()))
+    }
+
+    /// [`Self::wait`] bounded by `timeout`; `Ok(None)` when the timeout
+    /// elapses first.
+    pub async fn wait_timeout(&self, run_id: &str, timeout: Duration) -> Result<Option<RunEnd>> {
+        match tokio::time::timeout(timeout, self.wait(run_id)).await {
+            Ok(end) => end.map(Some),
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Request cancellation of an active run.
     ///
     /// Returns `Ok(true)` once the request is recorded on the run's
     /// durable record, or `Ok(false)` if the run is unknown or already
-    /// terminal. The request reaches a run after a restart and from any
-    /// runtime over the same queue.
+    /// terminal, including a run whose current step the queue
+    /// dead-lettered outside the worker, which the worker's dead-step
+    /// reconciliation terminates as failed. The request reaches a run
+    /// after a restart and from any runtime over the same queue.
     ///
     /// The run terminates as [`TerminalStatus::Cancelled`](crate::TerminalStatus::Cancelled) and its
     /// notification job is enqueued for the terminal hook:
@@ -737,6 +782,12 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
                 absent = Some(current.job_id);
                 continue;
             };
+            if job.status == JobStatus::Dead {
+                // Dead-lettered by the queue outside the worker;
+                // reconciliation terminates the run and the request is
+                // not honoured.
+                return Ok(false);
+            }
             let claimed = ClaimedStep::parse(&job)?;
             // `error` is `None`: external cancellation supplies no reason
             // at the API level. The effects are built before the outcome
@@ -882,17 +933,99 @@ impl RuntimeCore {
         }
     }
 
+    /// The terminal record of `run_id`; `None` when no record exists.
+    async fn terminal_record(&self, run_id: &str) -> Result<Option<DurableTermination>> {
+        match self.queue.kv_get(&outcome_kv_key(run_id)).await? {
+            Some(bytes) => Ok(Some(rmp_serde::from_slice(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
     /// The status of a terminated run from its terminal record; `None`
     /// when no record exists.
     async fn terminated_status(&self, run_id: &str) -> Result<Option<RunStatus>> {
-        let Some(bytes) = self.queue.kv_get(&outcome_kv_key(run_id)).await? else {
-            return Ok(None);
-        };
-        let record: DurableTermination = rmp_serde::from_slice(&bytes)?;
-        Ok(Some(RunStatus {
+        Ok(self.terminal_record(run_id).await?.map(|record| RunStatus {
             run_id: run_id.to_string(),
             current_step: record.final_step,
             state: RunState::Terminated(record.into()),
+        }))
+    }
+
+    /// Wait until `run_id` terminates, following its current step
+    /// across steps, and report its end; `None` for a run with no
+    /// current step and no record. A current step the queue
+    /// dead-lettered outside the worker is polled at the poll interval
+    /// until reconciliation terminates the run.
+    pub(crate) async fn wait_run(&self, run_id: &str) -> Result<Option<RunEnd>> {
+        let mut observed = false;
+        let mut absent_job: Option<String> = None;
+        let mut dead_step: Option<JobRecord> = None;
+        loop {
+            let Some(current) = self.current_step_if_active(run_id).await? else {
+                return self.run_end(run_id, observed, dead_step).await;
+            };
+            observed = true;
+            match self.queue.wait_for_completion(&current.job_id).await? {
+                WaitOutcome::Done(_) | WaitOutcome::Cancelled => {}
+                WaitOutcome::Dead(record) => {
+                    // A worker-path dead-letter deletes the pointer with
+                    // its settlement; a pointer that still names the dead
+                    // job identifies a dead-letter outside the worker,
+                    // which reconciliation terminates.
+                    let unreconciled = self
+                        .current_step_if_active(run_id)
+                        .await?
+                        .is_some_and(|step| step.job_id == current.job_id);
+                    if unreconciled {
+                        tokio::time::sleep(self.poll_interval).await;
+                    }
+                    dead_step = Some(*record);
+                }
+                WaitOutcome::NotFound => {
+                    // The pointer and the job change in one transaction:
+                    // a second read of the same pointer over a missing
+                    // job is a store the runtime did not write.
+                    if absent_job.as_deref() == Some(current.job_id.as_str()) {
+                        return Err(Error::InconsistentRunState(run_id.to_string()));
+                    }
+                    absent_job = Some(current.job_id);
+                }
+            }
+        }
+    }
+
+    /// The end of the terminated run `run_id` from its records, or from
+    /// `dead_step`, the queue record of its final step when the wait
+    /// observed a dead-letter outside the worker. `None` when nothing
+    /// remains and the wait never `observed` the run active.
+    async fn run_end(
+        &self,
+        run_id: &str,
+        observed: bool,
+        dead_step: Option<JobRecord>,
+    ) -> Result<Option<RunEnd>> {
+        let result = self.run_result(run_id).await?;
+        let termination = match self.terminal_record(run_id).await? {
+            Some(record) => Some(record.into()),
+            None => result
+                .as_ref()
+                .map(|result| result.termination.clone())
+                .or_else(|| {
+                    dead_step.map(|job| RunTermination {
+                        status: TerminalStatus::Failed,
+                        error: job.last_error,
+                        error_kind: None,
+                        terminated_at_ms: job.failed_at.unwrap_or_default(),
+                    })
+                }),
+        };
+        let outcome = result.map(|result| result.outcome);
+        if termination.is_none() && outcome.is_none() && !observed {
+            return Ok(None);
+        }
+        Ok(Some(RunEnd {
+            termination,
+            outcome,
         }))
     }
 
@@ -4171,7 +4304,7 @@ mod tests {
         );
 
         // The lease expires past the attempt limit: the reaper dead-letters
-        // the step inside the core, with no worker in the loop.
+        // the step outside the worker, with no worker in the loop.
         advance(&clock, Duration::from_secs(2)).await;
         let outcome = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
@@ -4195,8 +4328,8 @@ mod tests {
         let _ = shutdown.send(());
 
         // The run id is submitted again while the dead job is retained:
-        // the pass identifies a core dead-letter by the current step's
-        // job, so the new run is left alone.
+        // the pass identifies a dead-letter outside the worker by the
+        // current step's job, so the new run is left alone.
         let again = runtime
             .submit(RunSpec {
                 run_id: Some("hung".into()),
@@ -4210,6 +4343,114 @@ mod tests {
         assert!(
             runtime.status("hung").await.unwrap().is_some(),
             "the re-submitted run is active"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_follows_the_run_across_its_steps() {
+        let (queue, store) = open_queue().await;
+        let runtime = WorkflowRuntime::builder(
+            queue,
+            store,
+            ScriptedRunner::new(vec![
+                StepOutcome::continue_now(b"next".to_vec()),
+                StepOutcome::Succeed {
+                    result: b"done".to_vec(),
+                },
+            ]),
+            NoopTerminalHook,
+        )
+        .build();
+        assert!(matches!(
+            runtime.wait("absent").await,
+            Err(Error::RunNotFound(id)) if id == "absent"
+        ));
+        let shutdown = spawn_runtime(runtime.clone());
+
+        runtime
+            .submit(RunSpec {
+                run_id: Some("two".into()),
+                input: b"x".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(5), runtime.wait("two"))
+            .await
+            .expect("the wait resolved")
+            .unwrap();
+        let outcome = end.outcome.expect("the worker recorded the outcome");
+        assert_eq!(
+            (outcome.final_step, outcome.result.as_deref()),
+            (1, Some(b"done".as_slice()))
+        );
+        let termination = end.termination.expect("from the run result record");
+        assert_eq!(termination.status, TerminalStatus::Succeeded);
+
+        // A run already terminated is reported at once.
+        let again = runtime.wait("two").await.unwrap();
+        assert_eq!(again.termination, Some(termination));
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_step_dead_lettered_outside_the_worker_is_waited_for_until_reconciliation() {
+        let (queue, store, _clock) = open_queue_at(10_000).await;
+        let runtime =
+            WorkflowRuntime::builder(queue.clone(), store, UnreachableRunner, NoopTerminalHook)
+                .poll_interval(Duration::from_millis(10))
+                .build();
+        runtime
+            .submit(RunSpec {
+                run_id: Some("hung".into()),
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let claim = queue
+            .claim("workflow-steps", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        queue.dead_letter(&claim, "hung").await.unwrap();
+
+        let waiting = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runtime.wait("hung").await }
+        });
+        assert!(
+            !runtime.cancel("hung").await.unwrap(),
+            "the request is not honoured"
+        );
+        assert!(
+            runtime
+                .wait_timeout("hung", Duration::from_secs(1))
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing terminates the run without a worker"
+        );
+        assert_eq!(runtime.inner.reconcile_dead_steps().await.unwrap(), 1);
+        let end = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the wait resolved")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            end.termination,
+            Some(RunTermination {
+                status: TerminalStatus::Failed,
+                error: Some("hung".into()),
+                error_kind: None,
+                terminated_at_ms: 10_000,
+            }),
+            "the termination is read from the dead job's record",
+        );
+        assert!(end.outcome.is_none());
+        assert!(
+            matches!(runtime.wait("hung").await, Err(Error::RunNotFound(_))),
+            "without memo retention no record of the termination remains",
         );
     }
 

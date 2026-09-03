@@ -42,6 +42,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under `jobs::JobGroup`, which gains `cancel`;
   `WorkflowRuntimeBuilder::group_retention` removes a group's state a
   window after a `results` consumer observed its last termination.
+- `WorkflowRuntime::wait` and `wait_timeout`: wait until a run
+  terminates, following its current step across steps, and report a
+  `RunEnd` (its `RunTermination` and committed `RunOutcome`, each when
+  a record remains); `Error::RunNotFound` for a run the runtime has no
+  record of. `jobs::JobHandle::join` and `join_timeout` are this wait.
+- `Error::MemberNotSubmitted`: a group's results were read while a
+  member of the manifest had no record; `resume` submits it.
 - `WorkflowRuntime::outcome`: the committed `RunOutcome` of a terminated
   run, read from the run result record the worker writes to the run's
   memo under the reserved key `workflow.outcome` before every
@@ -75,6 +82,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `WorkflowRuntime::cancel`, `RunGroup::results` and
+  `jobs::JobGroup::results` no longer spin on a step the queue
+  dead-lettered outside the worker: `cancel` returns `false` for such a
+  run and the waits poll for its reconciliation at the poll interval.
 - Dead-step reconciliation identifies a step dead-lettered outside the
   worker by the run's current-step pointer naming the dead job, rather
   than by the run record's existence. A run id submitted again while
@@ -83,6 +94,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (source):** `Error::JobNotFound` is `Error::RunNotFound`,
+  reported by `WorkflowRuntime::wait` and `jobs::JobHandle::join` for a
+  run the runtime has no record of.
 - **Breaking (source and storage):** run status and cancellation are
   durable. `WorkflowRuntime::status` and `jobs::JobHandle::status`
   return `Result<Option<RunStatus>>`, read from the run record, the

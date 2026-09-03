@@ -12,7 +12,7 @@ use std::time::SystemTime;
 use futures_util::stream::{self, FuturesUnordered, Stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use taquba::object_store::{ObjectStore, path::Path};
-use taquba::{Queue, SettlementEffects, WaitOutcome};
+use taquba::{Queue, SettlementEffects};
 use tracing::warn;
 
 use crate::blob::ObjectPrefix;
@@ -403,7 +403,7 @@ impl<'a, R: StepRunner, H: TerminalHook> RunGroup<'a, R, H> {
     /// has been yielded, the group's terminal marker is written, from
     /// which the group retention sweep counts the window; a failed
     /// marker write is logged.
-    pub(crate) async fn terminations(
+    async fn terminations(
         &self,
     ) -> Result<impl Stream<Item = Result<MemberState>> + use<'a, R, H>> {
         let manifest = self.manifest().await?;
@@ -462,7 +462,7 @@ impl<'a, R: StepRunner, H: TerminalHook> RunGroup<'a, R, H> {
     /// that terminated it wrote one. The record must belong to the
     /// member record's termination: a record outlives a re-submission
     /// of the member until the next termination overwrites it.
-    pub(crate) async fn recorded_result(&self, member: &MemberState) -> Result<Option<RunResult>> {
+    async fn recorded_result(&self, member: &MemberState) -> Result<Option<RunResult>> {
         let termination = member.record.terminated.clone().map(RunTermination::from);
         Ok(self
             .core()
@@ -514,37 +514,28 @@ impl<'a, R: StepRunner, H: TerminalHook> RunGroup<'a, R, H> {
     }
 
     /// Wait until the member `key` terminates and return its record.
+    /// Returns [`Error::MemberNotSubmitted`] for a member of the
+    /// manifest without a record.
     async fn wait_member(&self, key: &str) -> Result<DurableMember> {
-        let core = self.core();
-        let run_id = member_run_id(&self.id, key);
-        let mut absent_job: Option<String> = None;
-        let mut missing_pointer = false;
-        loop {
-            let member = self
-                .store()
-                .member(&self.id, key)
-                .await?
-                .ok_or_else(|| Error::InconsistentRunState(run_id.clone()))?;
-            if member.terminated.is_some() {
-                return Ok(member);
-            }
-            let Some(current) = core.current_step_if_active(&run_id).await? else {
-                // The pointer and the member record change in one
-                // transaction: a second read without either is a store
-                // the runtime did not write.
-                if missing_pointer {
-                    return Err(Error::InconsistentRunState(run_id));
-                }
-                missing_pointer = true;
-                continue;
-            };
-            if let WaitOutcome::NotFound = core.queue.wait_for_completion(&current.job_id).await? {
-                if absent_job.as_deref() == Some(current.job_id.as_str()) {
-                    return Err(Error::InconsistentRunState(run_id));
-                }
-                absent_job = Some(current.job_id);
-            }
+        let member = |member: Option<DurableMember>| {
+            member.ok_or_else(|| Error::MemberNotSubmitted {
+                group_id: self.id.clone(),
+                key: key.to_string(),
+            })
+        };
+        let record = member(self.store().member(&self.id, key).await?)?;
+        if record.terminated.is_some() {
+            return Ok(record);
         }
+        let run_id = member_run_id(&self.id, key);
+        self.core().wait_run(&run_id).await?;
+        // The pointer and the member record change in one transaction,
+        // so the record of a run without a pointer is terminated.
+        let record = member(self.store().member(&self.id, key).await?)?;
+        if record.terminated.is_none() {
+            return Err(Error::InconsistentRunState(run_id));
+        }
+        Ok(record)
     }
 
     /// Write the group's terminal marker; no marker is written without
@@ -658,8 +649,9 @@ mod tests {
         );
         worker.shutdown().await.unwrap();
 
-        // The member runs again and is dead-lettered inside the core, so
-        // reconciliation terminates it and no new record is written.
+        // The member runs again and the queue dead-letters it outside
+        // the worker, so reconciliation terminates it and no new record
+        // is written.
         clock.advance(Duration::from_secs(1));
         group
             .submit(vec![member("a")], &MemberSpec::default())

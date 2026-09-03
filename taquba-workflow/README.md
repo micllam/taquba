@@ -168,6 +168,13 @@ termination, read from the terminal record described under
 [Memo retention](#memo-retention); without it, a terminated run has no
 status.
 
+`WorkflowRuntime::wait` waits until a run terminates, following its
+current step across steps, and reports a `RunEnd`: the termination and
+the committed outcome, each when a record of it remains. A run already
+terminated is reported at once, and `WorkflowRuntime::wait_timeout`
+bounds the wait. The wait relies on the queue's in-process completion
+notification, so it runs in the process that runs the worker.
+
 `WorkflowRuntime::outcome` returns the committed `RunOutcome` of a
 terminated run (its result or error, the submitter's headers and the
 final step) from the run result record the worker writes to the run's

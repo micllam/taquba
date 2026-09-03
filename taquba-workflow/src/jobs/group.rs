@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 use futures_util::{Stream, StreamExt, TryStreamExt};
 
-use crate::group::{GroupMember, GroupStatus, MemberSpec, MemberState, RunGroup};
-use crate::jobs::handle::{JobError, decode_result};
+use crate::Result;
+use crate::group::{GroupMember, GroupStatus, MemberSpec, RunGroup};
+use crate::jobs::handle::{JobError, decode_end};
 use crate::jobs::job::Job;
 use crate::jobs::runner::{Dispatch, Inner, SubmitOptions, job_payload};
-use crate::terminal::{NoopTerminalHook, TerminalStatus};
-use crate::{Result, StepErrorKind};
+use crate::terminal::NoopTerminalHook;
 
 /// A [`RunGroup`] of jobs of one type, identified by a group id.
 /// Obtained from [`JobRunner::group`](crate::jobs::JobRunner::group) or
@@ -122,13 +122,12 @@ impl<J: Job> JobGroup<J> {
     /// [`JobError`]. Returns [`Error::GroupNotFound`](crate::Error::GroupNotFound) for a group never
     /// submitted.
     pub async fn results(&self) -> Result<impl Stream<Item = Result<GroupResult<J>>> + '_> {
-        let terminations = self.group().terminations().await?;
-        Ok(terminations.then(move |member| async move {
+        let results = self.group().results().await?;
+        Ok(results.map(|member| {
             let member = member?;
-            let result = self.member_result(&member).await?;
             Ok(GroupResult {
                 key: member.key,
-                result,
+                result: decode_end::<J>(Some(member.termination), member.outcome)?,
             })
         }))
     }
@@ -152,30 +151,6 @@ impl<J: Job> JobGroup<J> {
                 })
             })
             .collect())
-    }
-
-    /// The result of a terminated member: its run result record decoded, or
-    /// a transient [`JobError`] from its member record.
-    async fn member_result(
-        &self,
-        member: &MemberState,
-    ) -> Result<std::result::Result<J::Output, JobError>> {
-        if let Some(result) = self.group().recorded_result(member).await? {
-            return decode_result::<J>(result);
-        }
-        let message = match member.status() {
-            Some(TerminalStatus::Cancelled) => "job cancelled".to_string(),
-            _ => member
-                .record
-                .terminated
-                .as_ref()
-                .and_then(|termination| termination.error.clone())
-                .unwrap_or_else(|| "job terminated without recording an outcome".to_string()),
-        };
-        Ok(Err(JobError {
-            kind: StepErrorKind::Transient,
-            message,
-        }))
     }
 
     /// The group's durable state; see [`RunGroup::status`].

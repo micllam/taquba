@@ -4,15 +4,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::{RunStatus, StepErrorKind, TerminalStatus};
+use crate::{RunOutcome, RunStatus, RunTermination, StepErrorKind, TerminalStatus};
 use thiserror::Error;
 
 use crate::jobs::job::Job;
-use crate::jobs::runner::{Inner, Terminal, Unrecorded};
-use crate::runtime::RunResult;
+use crate::jobs::runner::Inner;
 use crate::{Error, Result};
 
-/// The logical failure outcome of a job that ran and did not succeed.
+/// The logical failure outcome of a job that did not succeed.
 ///
 /// Distinct from [`Error`](enum@Error), which is an infrastructure
 /// failure: a `JobError` means the job terminated unsuccessfully. The
@@ -23,6 +22,7 @@ use crate::{Error, Result};
 pub struct JobError {
     /// Whether the failure was classified transient (the job exhausted its
     /// attempts) or permanent (dead-lettered on the failing attempt).
+    /// Transient for a job cancelled or terminated outside its handler.
     pub kind: StepErrorKind,
     /// The failure message.
     pub message: String,
@@ -51,16 +51,14 @@ pub enum JoinError {
 /// [`fetch_result`](Self::fetch_result) and [`status`](Self::status) for
 /// more control.
 ///
-/// Awaiting is in-process: it relies on Taquba's in-process completion
-/// notification, so a handle is awaited in the same process that runs the
-/// job. The outcome is durable regardless: [`fetch_result`](Self::fetch_result)
-/// reads it back from object storage after a restart.
+/// Awaiting is [`WorkflowRuntime::wait`](crate::WorkflowRuntime::wait)
+/// on the job's run, which relies on Taquba's in-process completion
+/// notification, so a handle is awaited in the same process that runs
+/// the job. The outcome is durable regardless:
+/// [`fetch_result`](Self::fetch_result) reads it back from object
+/// storage after a restart.
 pub struct JobHandle<J: Job> {
     id: String,
-    /// The queue job backing the delivery, or `None` for a submission
-    /// answered from a completed job's run result record, which `join`
-    /// reads back without waiting.
-    queue_job_id: Option<String>,
     inner: Arc<Inner>,
     newly_submitted: bool,
     _marker: PhantomData<fn() -> J>,
@@ -70,7 +68,6 @@ impl<J: Job> Clone for JobHandle<J> {
     fn clone(&self) -> Self {
         Self {
             id: self.id.clone(),
-            queue_job_id: self.queue_job_id.clone(),
             inner: self.inner.clone(),
             newly_submitted: self.newly_submitted,
             _marker: PhantomData,
@@ -79,15 +76,9 @@ impl<J: Job> Clone for JobHandle<J> {
 }
 
 impl<J: Job> JobHandle<J> {
-    pub(crate) fn new(
-        id: String,
-        queue_job_id: Option<String>,
-        inner: Arc<Inner>,
-        newly_submitted: bool,
-    ) -> Self {
+    pub(crate) fn new(id: String, inner: Arc<Inner>, newly_submitted: bool) -> Self {
         Self {
             id,
-            queue_job_id,
             inner,
             newly_submitted,
             _marker: PhantomData,
@@ -133,7 +124,9 @@ impl<J: Job> JobHandle<J> {
     pub async fn fetch_result(&self) -> Result<Option<std::result::Result<J::Output, JobError>>> {
         match self.inner.run_result(&self.id).await? {
             None => Ok(None),
-            Some(result) => Ok(Some(decode_result::<J>(result)?)),
+            Some(result) => {
+                decode_end::<J>(Some(result.termination), Some(result.outcome)).map(Some)
+            }
         }
     }
 
@@ -142,96 +135,64 @@ impl<J: Job> JobHandle<J> {
     /// Waits indefinitely. Use [`join_timeout`](Self::join_timeout) to bound
     /// the wait.
     pub async fn join(&self) -> Result<std::result::Result<J::Output, JobError>> {
-        let Some(queue_job_id) = &self.queue_job_id else {
-            return self.recorded_outcome().await;
-        };
-        let terminal = self.inner.wait_terminal(&self.id, queue_job_id).await?;
-        self.decode_terminal(terminal)
+        let end = self.inner.runtime.wait(&self.id).await?;
+        decode_end::<J>(end.termination, end.outcome)
     }
 
     /// Wait up to `timeout` for the job to reach a terminal state.
     ///
-    /// Returns `Ok(None)` if the timeout elapses first. On completion the
-    /// run result record is returned; if the job reached a terminal state
-    /// without one (a lease expiry dead-lettered it, or it was cancelled),
-    /// the outcome is synthesized from the queue record as a transient
-    /// [`JobError`].
+    /// Returns `Ok(None)` if the timeout elapses first. On completion
+    /// the run result record is decoded; a job that reached a terminal
+    /// state without one (a lease expiry dead-lettered it, or it was
+    /// cancelled) is reported as a transient [`JobError`] from the
+    /// termination the runtime retains, or with a generic message when
+    /// it retains none.
     ///
-    /// Returns [`Error::JobNotFound`] if the queue has no record of the job
-    /// and no run result record exists.
+    /// Returns [`Error::RunNotFound`] if the runtime has no record of
+    /// the job.
     pub async fn join_timeout(
         &self,
         timeout: Duration,
     ) -> Result<Option<std::result::Result<J::Output, JobError>>> {
-        let Some(queue_job_id) = &self.queue_job_id else {
-            return self.recorded_outcome().await.map(Some);
-        };
-        match self
-            .inner
-            .wait_terminal_within(&self.id, queue_job_id, timeout)
-            .await?
-        {
+        match self.inner.runtime.wait_timeout(&self.id, timeout).await? {
             None => Ok(None),
-            Some(terminal) => self.decode_terminal(terminal).map(Some),
-        }
-    }
-
-    /// The outcome of a handle without a queue job: its recorded
-    /// outcome, or [`Error::JobNotFound`] when the record is gone.
-    async fn recorded_outcome(&self) -> Result<std::result::Result<J::Output, JobError>> {
-        match self.fetch_result().await? {
-            Some(outcome) => Ok(outcome),
-            None => Err(Error::JobNotFound(self.id.clone())),
-        }
-    }
-
-    /// The outcome of a terminated job: its record decoded, or a
-    /// transient [`JobError`] synthesized from the queue record when the
-    /// job terminated without recording one.
-    fn decode_terminal(
-        &self,
-        terminal: Terminal,
-    ) -> Result<std::result::Result<J::Output, JobError>> {
-        match terminal {
-            Terminal::Recorded(result) => decode_result::<J>(result),
-            Terminal::Unrecorded(Unrecorded::NotFound) => Err(Error::JobNotFound(self.id.clone())),
-            Terminal::Unrecorded(unrecorded) => {
-                let message = match unrecorded {
-                    Unrecorded::Dead(Some(error)) => error,
-                    _ => "job terminated without recording an outcome".to_string(),
-                };
-                Ok(Err(JobError {
-                    kind: StepErrorKind::Transient,
-                    message,
-                }))
-            }
+            Some(end) => decode_end::<J>(end.termination, end.outcome).map(Some),
         }
     }
 }
 
-/// The typed result of a run result record: the decoded output of a
-/// succeeded job, or the [`JobError`] of a failed or cancelled one.
-pub(crate) fn decode_result<J: Job>(
-    result: RunResult,
+/// The typed result of a terminated job: the decoded output of a
+/// succeeded job, or the [`JobError`] of one that failed, was cancelled
+/// or terminated without recording an outcome.
+pub(crate) fn decode_end<J: Job>(
+    termination: Option<RunTermination>,
+    outcome: Option<RunOutcome>,
 ) -> Result<std::result::Result<J::Output, JobError>> {
-    let outcome = result.outcome;
-    match outcome.status {
-        TerminalStatus::Succeeded => {
-            let output = outcome.result.unwrap_or_default();
-            Ok(Ok(rmp_serde::from_slice(&output)?))
-        }
-        TerminalStatus::Failed => Ok(Err(JobError {
-            kind: result
-                .termination
-                .error_kind
-                .unwrap_or(StepErrorKind::Permanent),
-            message: outcome.error.unwrap_or_default(),
-        })),
-        TerminalStatus::Cancelled => Ok(Err(JobError {
-            kind: StepErrorKind::Transient,
-            message: outcome.error.unwrap_or_else(|| "job cancelled".to_string()),
-        })),
+    if let Some(outcome) = outcome
+        && outcome.status == TerminalStatus::Succeeded
+    {
+        let output = outcome.result.unwrap_or_default();
+        return Ok(Ok(rmp_serde::from_slice(&output)?));
     }
+    let (status, error, kind) = match termination {
+        Some(termination) => (
+            Some(termination.status),
+            termination.error,
+            termination.error_kind,
+        ),
+        None => (None, None, None),
+    };
+    let message = error.unwrap_or_else(|| {
+        match status {
+            Some(TerminalStatus::Cancelled) => "job cancelled",
+            _ => "job terminated without recording an outcome",
+        }
+        .to_string()
+    });
+    Ok(Err(JobError {
+        kind: kind.unwrap_or(StepErrorKind::Transient),
+        message,
+    }))
 }
 
 impl<J: Job> IntoFuture for JobHandle<J> {

@@ -90,10 +90,21 @@ pub enum Error {
     #[error("deserialization error: {0}")]
     Deserialization(#[from] rmp_serde::decode::Error),
 
-    /// A [`jobs::JobHandle`](crate::jobs::JobHandle) was awaited for a
-    /// job the runtime has no record of.
-    #[error("job `{0}` not found")]
-    JobNotFound(String),
+    /// A wait named a run the runtime has no record of: never
+    /// submitted, or terminated with no record retained.
+    #[error("run `{0}` not found")]
+    RunNotFound(String),
+
+    /// A group operation waited on a member of the manifest that was
+    /// not submitted; [`RunGroup::resume`](crate::RunGroup::resume)
+    /// submits it.
+    #[error("member `{key}` of group `{group_id}` was not submitted")]
+    MemberNotSubmitted {
+        /// The group id.
+        group_id: String,
+        /// The member's key.
+        key: String,
+    },
 
     /// Two members of one job group produced the same key.
     #[error("duplicate member key `{0}` in group")]
@@ -133,7 +144,8 @@ impl Error {
             | Self::EffectsSealed
             | Self::Serialization(_)
             | Self::Deserialization(_)
-            | Self::JobNotFound(_)
+            | Self::RunNotFound(_)
+            | Self::MemberNotSubmitted { .. }
             | Self::DuplicateMemberKey(_)
             | Self::GroupMismatch(_)
             | Self::GroupNotFound(_)
@@ -212,10 +224,17 @@ mod tests {
                 Error::Deserialization(rmp_serde::from_slice::<u32>(b"").unwrap_err()),
                 true,
             ),
-            (Error::JobNotFound("job-1".into()), true),
             (Error::DuplicateMemberKey("k".into()), true),
             (Error::GroupMismatch("b".into()), true),
             (Error::GroupNotFound("b".into()), true),
+            (Error::RunNotFound("run-1".into()), true),
+            (
+                Error::MemberNotSubmitted {
+                    group_id: "b".into(),
+                    key: "k".into(),
+                },
+                true,
+            ),
             (Error::InvalidGroupId("a/b".into()), true),
         ] {
             assert_eq!(error.is_permanent(), permanent, "{error}");

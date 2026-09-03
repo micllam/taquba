@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{RunSpec, RunnerHandle, Step, StepError, StepOutcome, StepRunner, WorkflowRuntime};
 use std::sync::atomic::{AtomicBool, Ordering};
-use taquba::WaitOutcome;
 use taquba::object_store::ObjectStore;
 use taquba::{Clock, Queue};
 
@@ -71,28 +70,6 @@ pub(crate) struct Inner {
     spawned: AtomicBool,
 }
 
-/// How a job ended, as observed by an in-process waiter: with its run
-/// result record, or without one.
-pub(crate) enum Terminal {
-    Recorded(RunResult),
-    /// The run ended without the worker recording a result: it was
-    /// cancelled while pending, dead-lettered outside the worker or its
-    /// records are gone.
-    Unrecorded(Unrecorded),
-}
-
-pub(crate) enum Unrecorded {
-    /// The queue job was acknowledged.
-    Done,
-    /// The queue job was dead-lettered outside the worker, with the
-    /// queue record's last error.
-    Dead(Option<String>),
-    /// The queue job was removed by a cancellation before it was claimed.
-    Cancelled,
-    /// Neither a queue record nor a result record exists.
-    NotFound,
-}
-
 impl Inner {
     /// The run result record of `run_id`, if one exists.
     pub(crate) async fn run_result(&self, run_id: &str) -> Result<Option<RunResult>> {
@@ -123,47 +100,6 @@ impl Inner {
             "spawn may only be called once"
         );
         self.runtime.spawn(shutdown)
-    }
-
-    /// Wait up to `timeout` for the run `run_id`, whose step job is
-    /// `job_id`, to reach a terminal state, then read its result record.
-    /// Returns `Ok(None)` when the timeout elapses first.
-    pub(crate) async fn wait_terminal_within(
-        &self,
-        run_id: &str,
-        job_id: &str,
-        timeout: Duration,
-    ) -> Result<Option<Terminal>> {
-        let queue = &self.runtime.inner.core.queue;
-        match queue.wait_for_completion_timeout(job_id, timeout).await? {
-            Some(outcome) => Ok(Some(self.terminal(run_id, outcome).await?)),
-            None => Ok(None),
-        }
-    }
-
-    /// [`Self::wait_terminal_within`] without a bound.
-    pub(crate) async fn wait_terminal(&self, run_id: &str, job_id: &str) -> Result<Terminal> {
-        let outcome = self
-            .runtime
-            .inner
-            .core
-            .queue
-            .wait_for_completion(job_id)
-            .await?;
-        self.terminal(run_id, outcome).await
-    }
-
-    async fn terminal(&self, run_id: &str, outcome: WaitOutcome) -> Result<Terminal> {
-        let unrecorded = match outcome {
-            WaitOutcome::Done(_) => Unrecorded::Done,
-            WaitOutcome::Dead(record) => Unrecorded::Dead(record.last_error),
-            WaitOutcome::Cancelled => Unrecorded::Cancelled,
-            WaitOutcome::NotFound => Unrecorded::NotFound,
-        };
-        Ok(match self.run_result(run_id).await? {
-            Some(result) => Terminal::Recorded(result),
-            None => Terminal::Unrecorded(unrecorded),
-        })
     }
 }
 
@@ -196,7 +132,7 @@ impl Inner {
                 return Err(crate::Error::InputMismatch(run_id.clone()));
             }
             tracing::debug!(job_id = %run_id, job_type = J::NAME, "submit matched a completed job");
-            return Ok(JobHandle::new(run_id.clone(), None, self.clone(), false));
+            return Ok(JobHandle::new(run_id.clone(), self.clone(), false));
         }
 
         let outcome = self
@@ -219,7 +155,6 @@ impl Inner {
         );
         Ok(JobHandle::new(
             outcome.run_id,
-            Some(outcome.job_id),
             self.clone(),
             outcome.newly_submitted,
         ))
