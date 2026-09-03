@@ -75,17 +75,12 @@ pub(crate) const BULK_KV_PREFIX: &[u8] = b"workflow/bulk/batches/";
 
 /// Prefix under which the markers of one batch's items are stored.
 pub(crate) fn bulk_items_kv_prefix(batch_id: &str) -> Vec<u8> {
-    let mut k = Vec::from(BULK_KV_PREFIX);
-    k.extend_from_slice(batch_id.as_bytes());
-    k.extend_from_slice(b"/items/");
-    k
+    prefixed(BULK_KV_PREFIX, &format!("{batch_id}/items/"))
 }
 
 /// Key of the marker of item `key` in batch `batch_id`.
 pub(crate) fn bulk_item_kv_key(batch_id: &str, key: &str) -> Vec<u8> {
-    let mut k = bulk_items_kv_prefix(batch_id);
-    k.extend_from_slice(key.as_bytes());
-    k
+    prefixed(&bulk_items_kv_prefix(batch_id), key)
 }
 
 /// Key of the terminal marker for `run_id`, terminated at
@@ -110,10 +105,7 @@ pub(crate) fn bulk_terminal_kv_key(batch_id: &str, terminal_at_ms: u64) -> Vec<u
 /// `{prefix}{ts:020}/{id}`: a marker whose zero-padded timestamp leads the
 /// suffix, so a prefix scan returns markers oldest first.
 pub(crate) fn timestamped_kv_key(prefix: &[u8], id: &str, ts_ms: u64) -> Vec<u8> {
-    let mut k = Vec::from(prefix);
-    k.extend_from_slice(format!("{ts_ms:020}/").as_bytes());
-    k.extend_from_slice(id.as_bytes());
-    k
+    prefixed(prefix, &format!("{ts_ms:020}/{id}"))
 }
 
 /// The `(id, ts_ms)` of a key built by [`timestamped_kv_key`].
@@ -171,40 +163,35 @@ pub(crate) fn validate_run_id(run_id: &str) -> Result<()> {
     })
 }
 
-pub(crate) fn run_kv_key(run_id: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(RUN_KV_PREFIX.len() + run_id.len());
-    k.extend_from_slice(RUN_KV_PREFIX);
-    k.extend_from_slice(run_id.as_bytes());
+/// `{prefix}{suffix}`.
+fn prefixed(prefix: &[u8], suffix: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(prefix.len() + suffix.len());
+    k.extend_from_slice(prefix);
+    k.extend_from_slice(suffix.as_bytes());
     k
+}
+
+pub(crate) fn run_kv_key(run_id: &str) -> Vec<u8> {
+    prefixed(RUN_KV_PREFIX, run_id)
 }
 
 pub(crate) fn step_kv_key(run_id: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(STEP_KV_PREFIX.len() + run_id.len());
-    k.extend_from_slice(STEP_KV_PREFIX);
-    k.extend_from_slice(run_id.as_bytes());
-    k
+    prefixed(STEP_KV_PREFIX, run_id)
 }
 
 pub(crate) fn signal_wait_kv_key(correlation_key: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(SIGNAL_WAIT_KV_PREFIX.len() + correlation_key.len());
-    k.extend_from_slice(SIGNAL_WAIT_KV_PREFIX);
-    k.extend_from_slice(correlation_key.as_bytes());
-    k
+    prefixed(SIGNAL_WAIT_KV_PREFIX, correlation_key)
 }
 
 pub(crate) fn signal_buf_kv_key(correlation_key: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(SIGNAL_BUF_KV_PREFIX.len() + correlation_key.len());
-    k.extend_from_slice(SIGNAL_BUF_KV_PREFIX);
-    k.extend_from_slice(correlation_key.as_bytes());
-    k
+    prefixed(SIGNAL_BUF_KV_PREFIX, correlation_key)
 }
 
 pub(crate) fn signal_delivered_kv_key(run_id: &str, step_number: u32) -> Vec<u8> {
-    let mut k = Vec::from(SIGNAL_DELIVERED_KV_PREFIX);
-    k.extend_from_slice(run_id.as_bytes());
-    k.push(b'/');
-    k.extend_from_slice(step_number.to_string().as_bytes());
-    k
+    prefixed(
+        SIGNAL_DELIVERED_KV_PREFIX,
+        &format!("{run_id}/{step_number}"),
+    )
 }
 
 #[cfg(test)]
