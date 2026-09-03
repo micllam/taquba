@@ -566,6 +566,7 @@
 
 #![warn(missing_docs)]
 
+mod blob;
 pub mod bulk;
 mod durable;
 mod effects;

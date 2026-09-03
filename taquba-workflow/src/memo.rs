@@ -47,8 +47,9 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use taquba::object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, path::Path};
+use taquba::object_store::{ObjectStore, path::Path};
 
+use crate::blob::ObjectPrefix;
 use crate::error::{Error, Result};
 use crate::keys::hex_sha256;
 use crate::sweep::Clearable;
@@ -61,8 +62,7 @@ use crate::sweep::Clearable;
 /// the path layout.
 #[derive(Clone)]
 pub struct MemoStore {
-    store: Arc<dyn ObjectStore>,
-    prefix: String,
+    objects: ObjectPrefix,
 }
 
 impl std::fmt::Debug for MemoStore {
@@ -70,7 +70,7 @@ impl std::fmt::Debug for MemoStore {
         // The object store doesn't implement Debug; show the prefix
         // (the operationally interesting part) and elide the rest.
         f.debug_struct("MemoStore")
-            .field("prefix", &self.prefix)
+            .field("prefix", &self.objects.prefix())
             .finish_non_exhaustive()
     }
 }
@@ -83,30 +83,8 @@ impl MemoStore {
     /// other consumer of the same store.
     pub fn new(store: Arc<dyn ObjectStore>, prefix: impl Into<String>) -> Self {
         Self {
-            store,
-            prefix: prefix.into(),
+            objects: ObjectPrefix::new(store, prefix),
         }
-    }
-
-    /// Read the object at `path`, or `Ok(None)` when it does not
-    /// exist. A missing object is not an error: the retention sweep
-    /// may remove any entry at any time and every reader tolerates
-    /// absence by re-executing.
-    async fn read_opt(&self, path: &Path) -> Result<Option<Vec<u8>>> {
-        match self.store.get(path).await {
-            Ok(result) => {
-                let bytes = result.bytes().await?;
-                Ok(Some(bytes.to_vec()))
-            }
-            Err(ObjectStoreError::NotFound { .. }) => Ok(None),
-            Err(err) => Err(Error::Store(err)),
-        }
-    }
-
-    /// Write `value` at `path`, overwriting any prior object.
-    async fn write(&self, path: &Path, value: &[u8]) -> Result<()> {
-        self.store.put(path, value.to_vec().into()).await?;
-        Ok(())
     }
 
     /// Build a [`Memo`] bound to `(run_id, step_number)`.
@@ -138,13 +116,13 @@ impl MemoStore {
     }
 
     async fn clear_prefix(&self, run_id: &str, prefix: Path, kind: &'static str) -> Result<usize> {
-        let mut stream = self.store.list(Some(&prefix));
+        let mut stream = self.objects.list(&prefix);
         let mut deleted = 0usize;
         while let Some(item) = stream.next().await {
             let meta = item.map_err(Error::Store)?;
-            match self.store.delete(&meta.location).await {
-                Ok(()) => deleted += 1,
-                Err(ObjectStoreError::NotFound { .. }) => {}
+            match self.objects.delete(&meta.location).await {
+                Ok(true) => deleted += 1,
+                Ok(false) => {}
                 Err(err) => {
                     tracing::warn!(
                         run_id = %run_id,
@@ -164,7 +142,8 @@ impl MemoStore {
         step_number: u32,
         step_payload: &[u8],
     ) -> Result<Option<Vec<u8>>> {
-        self.read_opt(&self.step_output_path(run_id, step_number, step_payload))
+        self.objects
+            .get(&self.step_output_path(run_id, step_number, step_payload))
             .await
     }
 
@@ -175,11 +154,12 @@ impl MemoStore {
         step_payload: &[u8],
         value: &[u8],
     ) -> Result<()> {
-        self.write(
-            &self.step_output_path(run_id, step_number, step_payload),
-            value,
-        )
-        .await
+        self.objects
+            .put(
+                &self.step_output_path(run_id, step_number, step_payload),
+                value,
+            )
+            .await
     }
 
     fn memo_path(&self, run_id: &str, scope: MemoScope, key: &str) -> Path {
@@ -193,11 +173,11 @@ impl MemoStore {
     }
 
     fn memos_run_prefix(&self, run_id: &str) -> Path {
-        Path::from(format!("{}/memos/{}", self.prefix, run_id))
+        self.objects.path(&format!("memos/{run_id}"))
     }
 
     fn step_outputs_run_prefix(&self, run_id: &str) -> Path {
-        Path::from(format!("{}/step-outputs/{}", self.prefix, run_id))
+        self.objects.path(&format!("step-outputs/{run_id}"))
     }
 
     fn step_output_path(&self, run_id: &str, step_number: u32, step_payload: &[u8]) -> Path {
@@ -259,7 +239,8 @@ impl Memo {
     /// none has been written.
     pub async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.store
-            .read_opt(&self.store.memo_path(&self.run_id, self.scope, key))
+            .objects
+            .get(&self.store.memo_path(&self.run_id, self.scope, key))
             .await
     }
 
@@ -271,7 +252,8 @@ impl Memo {
     /// reflects whatever the most recent attempt wrote.
     pub async fn put(&self, key: &str, value: &[u8]) -> Result<()> {
         self.store
-            .write(&self.store.memo_path(&self.run_id, self.scope, key), value)
+            .objects
+            .put(&self.store.memo_path(&self.run_id, self.scope, key), value)
             .await
     }
 
