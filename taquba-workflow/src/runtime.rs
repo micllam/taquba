@@ -524,15 +524,15 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// The group named `id`, which must be 1 to
     /// [`MAX_RUN_ID_LEN`](crate::MAX_RUN_ID_LEN) bytes of `[A-Za-z0-9_-]`;
     /// [`Error::InvalidGroupId`] otherwise.
-    pub fn group(&self, id: impl Into<String>) -> Result<RunGroup<'_, R, H>> {
+    pub fn group(&self, id: impl Into<String>) -> Result<RunGroup<R, H>> {
         let id = id.into();
         validate_run_id(&id).map_err(|_| Error::InvalidGroupId(id.clone()))?;
-        Ok(RunGroup::new(self, id))
+        Ok(RunGroup::new(self.clone(), id))
     }
 
     /// A group with a generated id.
-    pub fn new_group(&self) -> RunGroup<'_, R, H> {
-        RunGroup::new(self, ulid::Ulid::new().to_string())
+    pub fn new_group(&self) -> RunGroup<R, H> {
+        RunGroup::new(self.clone(), ulid::Ulid::new().to_string())
     }
 
     /// Check `spec`'s run id, headers and KV keys; the run id, generated

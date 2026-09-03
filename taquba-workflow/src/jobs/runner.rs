@@ -14,7 +14,6 @@ use taquba::object_store::ObjectStore;
 use taquba::{Clock, Queue};
 
 use crate::Result;
-use crate::group::RunGroup;
 use crate::jobs::context::{JobContext, State};
 use crate::jobs::group::JobGroup;
 use crate::jobs::handle::JobHandle;
@@ -74,19 +73,6 @@ impl Inner {
     /// The run result record of `run_id`, if one exists.
     pub(crate) async fn run_result(&self, run_id: &str) -> Result<Option<RunResult>> {
         self.runtime.inner.core.run_result(run_id).await
-    }
-
-    /// The group named `id`; see [`WorkflowRuntime::group`].
-    pub(crate) fn group(
-        &self,
-        id: impl Into<String>,
-    ) -> Result<RunGroup<'_, Dispatch, NoopTerminalHook>> {
-        self.runtime.group(id)
-    }
-
-    /// A group with a generated id; see [`WorkflowRuntime::new_group`].
-    pub(crate) fn new_group(&self) -> RunGroup<'_, Dispatch, NoopTerminalHook> {
-        self.runtime.new_group()
     }
 
     /// Spawn the worker. Panics on a second call: the runtime is
@@ -303,14 +289,12 @@ impl JobRunner {
     /// `[A-Za-z0-9_-]`; [`Error::InvalidGroupId`](crate::Error::InvalidGroupId)
     /// otherwise.
     pub fn group<J: Job>(&self, id: impl Into<String>) -> Result<JobGroup<J>> {
-        let id = self.inner.group(id)?.id().to_string();
-        Ok(JobGroup::new(self.inner.clone(), id))
+        Ok(JobGroup::new(self.inner.runtime.group(id)?))
     }
 
     /// A group of `J` jobs with a generated id.
     pub fn new_group<J: Job>(&self) -> JobGroup<J> {
-        let id = self.inner.new_group().id().to_string();
-        JobGroup::new(self.inner.clone(), id)
+        JobGroup::new(self.inner.runtime.new_group())
     }
 
     /// Spawn the worker task and return a handle for graceful shutdown.

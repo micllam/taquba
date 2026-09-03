@@ -39,7 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RunGroup::submit` with `GroupMember` and `MemberSpec`, `resume`,
   `results` yielding a `MemberResult` per member as it terminates,
   `status` as a `GroupStatus`, `cancel` and `forget`), the mechanism
-  under `jobs::JobGroup`, which gains `cancel`;
+  under `jobs::JobGroup`, which gains `cancel`; `MemberSpec` implements
+  `From<jobs::SubmitOptions>`;
   `WorkflowRuntimeBuilder::group_retention` removes a group's state a
   window after a `results` consumer observed its last termination.
 - `WorkflowRuntime::wait` and `wait_timeout`: wait until a run

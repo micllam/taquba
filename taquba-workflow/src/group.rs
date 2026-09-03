@@ -71,6 +71,11 @@ impl Membership {
     pub(crate) fn kv_key(&self) -> Vec<u8> {
         group_member_kv_key(&self.group_id, &self.key)
     }
+
+    /// The run id of this member.
+    pub(crate) fn run_id(&self) -> String {
+        member_run_id(&self.group_id, &self.key)
+    }
 }
 
 /// One member of a [`RunGroup`]: its key, unique within the group, and
@@ -240,17 +245,26 @@ impl GroupStore {
             }
         }
         let prefix = group_members_kv_prefix(group_id);
-        loop {
-            let page = self.queue.kv_scan(&prefix, None, MEMBER_PAGE_SIZE).await?;
-            if page.entries.is_empty() {
-                break;
+        let mut entries = std::pin::pin!(self.queue.kv_entries(&prefix, MEMBER_PAGE_SIZE));
+        let mut keys = Vec::new();
+        while let Some((key, _)) = entries.try_next().await? {
+            keys.push(key);
+            if keys.len() == MEMBER_PAGE_SIZE {
+                self.delete_members(std::mem::take(&mut keys)).await?;
             }
-            let keys = page.entries.into_iter().map(|(key, _)| key).collect();
-            self.queue
-                .commit_effects(SettlementEffects::default().kv_deletes(keys))
-                .await?;
+        }
+        if !keys.is_empty() {
+            self.delete_members(keys).await?;
         }
         self.objects.delete(&self.manifest_path(group_id)).await?;
+        Ok(())
+    }
+
+    /// Delete the member records under `keys` in one transaction.
+    async fn delete_members(&self, keys: Vec<Vec<u8>>) -> Result<()> {
+        self.queue
+            .commit_effects(SettlementEffects::default().kv_deletes(keys))
+            .await?;
         Ok(())
     }
 }
@@ -264,7 +278,8 @@ impl Clearable for GroupStore {
 }
 
 /// A group of runs of one runtime, identified by a group id. Obtained
-/// from [`WorkflowRuntime::group`] or [`WorkflowRuntime::new_group`].
+/// from [`WorkflowRuntime::group`] or [`WorkflowRuntime::new_group`];
+/// cheap to clone.
 ///
 /// The group's members are identified by key. A member's run id is
 /// derived from the group id and its key, so the same input submitted
@@ -274,22 +289,22 @@ impl Clearable for GroupStore {
 /// [`status`](Self::status), [`cancel`](Self::cancel) and
 /// [`forget`](Self::forget) answer after a restart and from any runtime
 /// over the same queue.
-pub struct RunGroup<'a, R, H> {
-    runtime: &'a WorkflowRuntime<R, H>,
+pub struct RunGroup<R, H> {
+    runtime: WorkflowRuntime<R, H>,
     id: String,
 }
 
-impl<R, H> Clone for RunGroup<'_, R, H> {
+impl<R, H> Clone for RunGroup<R, H> {
     fn clone(&self) -> Self {
         Self {
-            runtime: self.runtime,
+            runtime: self.runtime.clone(),
             id: self.id.clone(),
         }
     }
 }
 
-impl<'a, R: StepRunner, H: TerminalHook> RunGroup<'a, R, H> {
-    pub(crate) fn new(runtime: &'a WorkflowRuntime<R, H>, id: String) -> Self {
+impl<R: StepRunner, H: TerminalHook> RunGroup<R, H> {
+    pub(crate) fn new(runtime: WorkflowRuntime<R, H>, id: String) -> Self {
         Self { runtime, id }
     }
 
@@ -403,9 +418,7 @@ impl<'a, R: StepRunner, H: TerminalHook> RunGroup<'a, R, H> {
     /// has been yielded, the group's terminal marker is written, from
     /// which the group retention sweep counts the window; a failed
     /// marker write is logged.
-    async fn terminations(
-        &self,
-    ) -> Result<impl Stream<Item = Result<MemberState>> + use<'a, R, H>> {
+    async fn terminations(&self) -> Result<impl Stream<Item = Result<MemberState>> + use<R, H>> {
         let manifest = self.manifest().await?;
         let waits: FuturesUnordered<_> = manifest
             .members
@@ -434,9 +447,7 @@ impl<'a, R: StepRunner, H: TerminalHook> RunGroup<'a, R, H> {
     /// The members' results as each one terminates, in completion
     /// order; a member already terminated is yielded at once. Returns
     /// [`Error::GroupNotFound`] for a group never submitted.
-    pub async fn results(
-        &self,
-    ) -> Result<impl Stream<Item = Result<MemberResult>> + use<'a, R, H>> {
+    pub async fn results(&self) -> Result<impl Stream<Item = Result<MemberResult>> + use<R, H>> {
         let terminations = self.terminations().await?;
         let group = self.clone();
         Ok(terminations.then(move |member| {
@@ -554,13 +565,6 @@ impl<'a, R: StepRunner, H: TerminalHook> RunGroup<'a, R, H> {
     /// [`submit`](Self::submit) under the same id starts from nothing.
     pub async fn forget(&self) -> Result<()> {
         self.store().forget(&self.id).await
-    }
-}
-
-impl Membership {
-    /// The run id of this member.
-    pub(crate) fn run_id(&self) -> String {
-        member_run_id(&self.group_id, &self.key)
     }
 }
 

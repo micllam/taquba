@@ -106,20 +106,20 @@ pub enum Error {
         key: String,
     },
 
-    /// Two members of one job group produced the same key.
+    /// Two members of one group have the same key.
     #[error("duplicate member key `{0}` in group")]
     DuplicateMemberKey(String),
 
-    /// A submission to an existing job group supplied a different
-    /// member set than the group's manifest.
+    /// A submission to an existing group supplied a different member
+    /// set than the group's manifest.
     #[error("group `{0}` exists with a different member set")]
     GroupMismatch(String),
 
-    /// A job group operation named a group with no manifest.
+    /// A group operation named a group with no manifest.
     #[error("group `{0}` not found")]
     GroupNotFound(String),
 
-    /// A job group id was not 1 to [`crate::MAX_RUN_ID_LEN`] bytes of
+    /// A group id was not 1 to [`crate::MAX_RUN_ID_LEN`] bytes of
     /// `[A-Za-z0-9_-]`.
     #[error("invalid group id `{0}`: must be 1 to 128 bytes of `[A-Za-z0-9_-]`")]
     InvalidGroupId(String),

@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 use futures_util::{Stream, StreamExt, TryStreamExt};
 
@@ -11,7 +10,7 @@ use crate::Result;
 use crate::group::{GroupMember, GroupStatus, MemberSpec, RunGroup};
 use crate::jobs::handle::{JobError, decode_end};
 use crate::jobs::job::Job;
-use crate::jobs::runner::{Dispatch, Inner, SubmitOptions, job_payload};
+use crate::jobs::runner::{Dispatch, SubmitOptions, job_payload};
 use crate::terminal::NoopTerminalHook;
 
 /// A [`RunGroup`] of jobs of one type, identified by a group id.
@@ -21,8 +20,7 @@ use crate::terminal::NoopTerminalHook;
 /// the positional `item-{i}`; see the [module
 /// documentation](crate::jobs#job-groups).
 pub struct JobGroup<J: Job> {
-    inner: Arc<Inner>,
-    id: String,
+    group: RunGroup<Dispatch, NoopTerminalHook>,
     _marker: PhantomData<fn() -> J>,
 }
 
@@ -36,24 +34,28 @@ pub struct GroupResult<J: Job> {
     pub result: std::result::Result<J::Output, JobError>,
 }
 
-impl<J: Job> JobGroup<J> {
-    pub(crate) fn new(inner: Arc<Inner>, id: String) -> Self {
+impl From<SubmitOptions> for MemberSpec {
+    fn from(opts: SubmitOptions) -> Self {
         Self {
-            inner,
-            id,
+            headers: opts.headers,
+            priority: opts.priority,
+            max_attempts_per_step: opts.max_attempts,
+            run_at: opts.run_at,
+        }
+    }
+}
+
+impl<J: Job> JobGroup<J> {
+    pub(crate) fn new(group: RunGroup<Dispatch, NoopTerminalHook>) -> Self {
+        Self {
+            group,
             _marker: PhantomData,
         }
     }
 
     /// The group id.
     pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn group(&self) -> RunGroup<'_, Dispatch, NoopTerminalHook> {
-        self.inner
-            .group(self.id.clone())
-            .expect("a job group id is a valid group id")
+        self.group.id()
     }
 
     /// Submit `jobs` as the group's members with the queue's default
@@ -85,13 +87,7 @@ impl<J: Job> JobGroup<J> {
                 input: job_payload(&job)?,
             });
         }
-        let spec = MemberSpec {
-            headers: opts.headers,
-            priority: opts.priority,
-            max_attempts_per_step: opts.max_attempts,
-            run_at: opts.run_at,
-        };
-        self.group().submit(members, &spec).await
+        self.group.submit(members, &opts.into()).await
     }
 
     /// Submit the members of the group's manifest that did not succeed,
@@ -106,13 +102,7 @@ impl<J: Job> JobGroup<J> {
     /// [`RunGroup::resume`]. `opts` applies as in
     /// [`submit_with`](Self::submit_with).
     pub async fn resume_with(&self, opts: SubmitOptions) -> Result<()> {
-        let spec = MemberSpec {
-            headers: opts.headers,
-            priority: opts.priority,
-            max_attempts_per_step: opts.max_attempts,
-            run_at: opts.run_at,
-        };
-        self.group().resume(&spec).await
+        self.group.resume(&opts.into()).await
     }
 
     /// The members' results as each one terminates, in completion
@@ -121,8 +111,8 @@ impl<J: Job> JobGroup<J> {
     /// dead-lettered outside its handler) is reported as a transient
     /// [`JobError`]. Returns [`Error::GroupNotFound`](crate::Error::GroupNotFound) for a group never
     /// submitted.
-    pub async fn results(&self) -> Result<impl Stream<Item = Result<GroupResult<J>>> + '_> {
-        let results = self.group().results().await?;
+    pub async fn results(&self) -> Result<impl Stream<Item = Result<GroupResult<J>>> + use<J>> {
+        let results = self.group.results().await?;
         Ok(results.map(|member| {
             let member = member?;
             Ok(GroupResult {
@@ -135,7 +125,7 @@ impl<J: Job> JobGroup<J> {
     /// Wait until every member has terminated and return their results
     /// in submission order; see [`results`](Self::results).
     pub async fn join(&self) -> Result<Vec<GroupResult<J>>> {
-        let manifest = self.group().manifest().await?;
+        let manifest = self.group.manifest().await?;
         let mut results: HashMap<String, std::result::Result<J::Output, JobError>> = HashMap::new();
         let mut stream = std::pin::pin!(self.results().await?);
         while let Some(result) = stream.try_next().await? {
@@ -155,18 +145,18 @@ impl<J: Job> JobGroup<J> {
 
     /// The group's durable state; see [`RunGroup::status`].
     pub async fn status(&self) -> Result<GroupStatus> {
-        self.group().status().await
+        self.group.status().await
     }
 
     /// Request cancellation of every active member; see
     /// [`RunGroup::cancel`].
     pub async fn cancel(&self) -> Result<usize> {
-        self.group().cancel().await
+        self.group.cancel().await
     }
 
     /// Remove the group's state; see [`RunGroup::forget`].
     pub async fn forget(&self) -> Result<()> {
-        self.group().forget().await
+        self.group.forget().await
     }
 }
 
