@@ -636,9 +636,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         H: 'static,
     {
         let runtime = self.clone();
-        WorkerHandle::spawn(shutdown, |stop| async move {
-            runtime.run(stop.cancelled_owned()).await
-        })
+        WorkerHandle::spawn(shutdown, |stop| async move { runtime.run_with(stop).await })
     }
 
     /// Drive the step worker loop until `shutdown` resolves. Spawns up
@@ -654,13 +652,25 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         R: 'static,
         H: 'static,
     {
-        // One cancellation token fans the "stop now" signal out to the
-        // worker (via `cancelled_owned`) and to the sweeper (which
-        // selects on its own clone). The signal is raised either when
-        // the caller's `shutdown` future fires or when the worker
-        // returns on its own (typically with an error).
         let stop = CancellationToken::new();
+        let mut worker = std::pin::pin!(self.run_with(stop.clone()));
+        tokio::select! {
+            res = &mut worker => res,
+            () = shutdown => {
+                stop.cancel();
+                worker.await
+            }
+        }
+    }
 
+    /// [`Self::run`] over a token: the worker and the background loops
+    /// stop when `stop` is cancelled, and `stop` is cancelled when the
+    /// worker returns on its own, so the background loops halt with it.
+    async fn run_with(&self, stop: CancellationToken) -> Result<()>
+    where
+        R: 'static,
+        H: 'static,
+    {
         let mut background: Vec<_> = (0..self.inner.core.sweeps.len())
             .map(|i| {
                 let core = self.inner.core.clone();
@@ -679,27 +689,16 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         let worker = Arc::new(StepWorker {
             inner: self.inner.clone(),
         });
-        let worker_fut = taquba::run_worker_concurrent(
+        let result = taquba::run_worker_concurrent(
             &self.inner.core.queue,
             &self.inner.core.queue_name,
             worker,
             self.inner.core.max_concurrent_steps,
             self.inner.core.poll_interval,
             stop.clone().cancelled_owned(),
-        );
-
-        let mut shutdown = std::pin::pin!(shutdown);
-        let mut worker_fut = std::pin::pin!(worker_fut);
-        let result = tokio::select! {
-            _ = shutdown.as_mut() => {
-                stop.cancel();
-                worker_fut.await
-            }
-            res = worker_fut.as_mut() => {
-                stop.cancel();
-                res
-            }
-        };
+        )
+        .await;
+        stop.cancel();
 
         for handle in background {
             let _ = handle.await;
