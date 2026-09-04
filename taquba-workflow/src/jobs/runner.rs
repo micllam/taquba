@@ -91,16 +91,16 @@ impl Inner {
         let key = job.idempotency_key();
         let run_id = key.as_deref().map(run_id_for_key);
 
-        // A completed job with this key answers from its result record,
-        // which outlives the run record the workflow deletes at
+        // A terminated job with this key answers from its terminal
+        // record, which outlives the run record the workflow deletes at
         // termination.
         if let Some(run_id) = &run_id
-            && let Some(result) = self.recorded_result(run_id).await?
+            && let Some(termination) = self.runtime.inner.core.terminal_record(run_id).await?
         {
-            if result.input_hash != hash_input(&payload) {
+            if termination.input_hash != hash_input(&payload) {
                 return Err(crate::Error::InputMismatch(run_id.clone()));
             }
-            tracing::debug!(job_id = %run_id, job_type = J::NAME, "submit matched a completed job");
+            tracing::debug!(job_id = %run_id, job_type = J::NAME, "submit matched a terminated job");
             return Ok(JobHandle::new(run_id.clone(), self.clone(), false));
         }
 
@@ -396,11 +396,11 @@ impl JobRunnerBuilder {
         self
     }
 
-    /// Remove a job's memo and run result record `retention` after it reaches
-    /// a terminal state. When unset (default), records are retained
-    /// indefinitely.
+    /// Remove a job's memo, run result record and terminal record
+    /// `retention` after it reaches a terminal state. When unset
+    /// (default), records are retained indefinitely.
     ///
-    /// Once a record is removed, [`JobHandle::fetch_result`] for that job
+    /// Once the records are removed, [`JobHandle::fetch_result`] for that job
     /// returns `Ok(None)` and an idempotent re-submission of the same
     /// payload runs the job again. Set the window to cover the longest gap
     /// callers need between the original submission and an idempotent
@@ -472,7 +472,7 @@ impl JobRunnerBuilder {
 mod tests {
     use super::*;
 
-    use crate::{Error, MemoStore};
+    use crate::Error;
 
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -595,6 +595,26 @@ mod tests {
 
         async fn run(&self, ctx: JobContext<'_>) -> std::result::Result<i64, TestError> {
             ctx.state::<Arc<AtomicU32>>().fetch_add(1, Ordering::SeqCst);
+            Ok(self.n)
+        }
+
+        fn idempotency_key(&self) -> Option<String> {
+            Some(format!("counted-keyed:{}", self.n))
+        }
+    }
+
+    /// The key of a [`CountedKeyed`] over a different payload.
+    #[derive(Serialize, Deserialize)]
+    struct CountedKeyedOther {
+        n: i64,
+    }
+
+    impl Job for CountedKeyedOther {
+        const NAME: &'static str = "test.counted-keyed-other";
+        type Output = i64;
+        type Error = TestError;
+
+        async fn run(&self, _: JobContext<'_>) -> std::result::Result<i64, TestError> {
             Ok(self.n)
         }
 
@@ -920,12 +940,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn idempotent_resubmit_after_result_swept_reruns() {
-        let queue_name = "test-resubmit-after-sweep";
-        let (queue, store) = open_queue().await;
+        let (queue, store, clock) = open_queue_at_with(10_000, fast_options()).await;
         let runs = Arc::new(AtomicU32::new(0));
-        let mut runner = JobRunner::builder(queue, store.clone())
-            .queue_name(queue_name)
+        let mut runner = JobRunner::builder(queue, store)
             .state(runs.clone())
+            .retention(Duration::from_secs(60))
             .register::<CountedKeyed>()
             .build();
         let handle = runner.spawn(std::future::pending::<()>());
@@ -936,13 +955,14 @@ mod tests {
         assert_eq!(first.await.unwrap(), 5);
         assert_eq!(runs.load(Ordering::SeqCst), 1);
 
-        // The retention sweep removing the run result record.
-        MemoStore::new(store, format!("{queue_name}-memo"))
-            .clear_memos_for_run(&first_id)
-            .await
-            .unwrap();
+        // The retention sweep removes the terminal record with the memos.
+        clock.advance(Duration::from_secs(61));
+        assert_eq!(
+            runner.inner.runtime.inner.core.sweep_once().await.unwrap(),
+            1
+        );
 
-        // The re-submission finds no run result record and runs the job
+        // The re-submission finds no terminal record and runs the job
         // again under the same id.
         let second = runner.submit(CountedKeyed { n: 5 }).await.unwrap();
         assert!(second.newly_submitted());
@@ -951,6 +971,36 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 2);
 
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resubmission_after_a_termination_without_a_result_joins_it() {
+        let (queue, store) = open_queue().await;
+        let runs = Arc::new(AtomicU32::new(0));
+        let runner = JobRunner::builder(queue, store)
+            .state(runs.clone())
+            .register::<CountedKeyed>()
+            .build();
+
+        // No worker: the cancellation of the pending step terminates
+        // the run without a run result record.
+        let first = runner.submit(CountedKeyed { n: 7 }).await.unwrap();
+        assert!(runner.inner.runtime.cancel(first.id()).await.unwrap());
+        assert!(first.fetch_result().await.unwrap().is_none());
+
+        let second = runner.submit(CountedKeyed { n: 7 }).await.unwrap();
+        assert!(!second.newly_submitted(), "the terminal record answers");
+        assert_eq!(second.id(), first.id());
+        let error = second.join().await.unwrap().unwrap_err();
+        assert_eq!(
+            (error.kind, error.message.as_str()),
+            (StepErrorKind::Transient, "job cancelled")
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            runner.submit(CountedKeyedOther { n: 7 }).await,
+            Err(crate::Error::InputMismatch(id)) if id == first.id()
+        ));
     }
 
     #[tokio::test(start_paused = true)]

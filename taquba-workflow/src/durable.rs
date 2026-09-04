@@ -211,11 +211,13 @@ impl From<DurableTerminalStatus> for TerminalStatus {
 }
 
 /// The stored form of a [`RunTermination`](crate::RunTermination) with
-/// the final step: the terminal record under `workflow/outcomes/{run_id}`,
-/// written in the settlement that terminates the run and read by
+/// the final step and the SHA-256 of the run's input: the terminal
+/// record under `workflow/outcomes/{run_id}`, written in the settlement
+/// that terminates the run and read by
 /// [`WorkflowRuntime::status`](crate::WorkflowRuntime::status) once the
-/// run record is gone, the termination half of a member record and
-/// the termination a run result record belongs to.
+/// run record is gone and by a typed re-submission after completion,
+/// the termination half of a member record and the termination a run
+/// result record belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DurableTermination {
     pub(crate) status: DurableTerminalStatus,
@@ -223,6 +225,7 @@ pub(crate) struct DurableTermination {
     pub(crate) error_kind: Option<DurableErrorKind>,
     pub(crate) final_step: u32,
     pub(crate) terminated_at_ms: u64,
+    pub(crate) input_hash: [u8; 32],
 }
 
 /// The durable member record of a grouped run, written under
@@ -275,13 +278,10 @@ impl From<DurableErrorKind> for StepErrorKind {
 /// The run result record, stored in the run memo under
 /// [`RUN_RESULT_MEMO_KEY`](crate::memo::RUN_RESULT_MEMO_KEY) by the
 /// worker before the settlement that terminates the run: the committed
-/// outcome, the SHA-256 of the run's input for an idempotent
-/// re-submission after completion, and the termination the record
-/// belongs to, equal to the terminal record written by the same
-/// settlement.
+/// outcome and the termination the record belongs to, equal to the
+/// terminal record written by the same settlement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DurableRunResult {
-    pub(crate) input_hash: [u8; 32],
     pub(crate) termination: DurableTermination,
     pub(crate) outcome: DurableRunOutcome,
 }

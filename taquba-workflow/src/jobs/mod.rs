@@ -111,16 +111,17 @@
 //!   survives process restarts: the
 //!   SHA-256 of the serialized payload is stored in the workflow's run
 //!   record, atomically with the enqueue.
-//! - **After the original completes**: the run result record holds the same
-//!   hash, so a re-submission with a matching payload returns a handle to
-//!   the recorded outcome (success or terminal failure) without running
-//!   the job again, and a differing payload fails with
-//!   [`Error::InputMismatch`](crate::Error::InputMismatch).
+//! - **After the original terminates**: the terminal record holds the
+//!   same hash, so a re-submission with a matching payload returns a
+//!   handle to the recorded termination (success, failure or
+//!   cancellation) without running the job again, and a differing
+//!   payload fails with [`Error::InputMismatch`](crate::Error::InputMismatch).
 //!
-//! If [`JobRunnerBuilder::retention`] is configured and the run result record
-//! has been removed, the re-submission runs the job again under the same
-//! id. Size the retention window to cover the longest gap callers need
-//! between the original submission and an idempotent re-submission.
+//! If [`JobRunnerBuilder::retention`] is configured and the terminal
+//! record has been removed, the re-submission runs the job again under
+//! the same id. Size the retention window to cover the longest gap
+//! callers need between the original submission and an idempotent
+//! re-submission.
 //!
 //! For jobs where "same input means same key" is the right semantics,
 //! [`payload_idempotency_key`] hashes the serialized payload directly.

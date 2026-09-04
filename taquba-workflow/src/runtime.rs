@@ -176,11 +176,10 @@ pub enum RunState {
     Terminated(RunTermination),
 }
 
-/// A run result record as read back: the committed outcome, the hash
-/// of the run's input and the termination the record belongs to.
+/// A run result record as read back: the committed outcome and the
+/// termination the record belongs to.
 #[derive(Debug, Clone)]
 pub(crate) struct RunResult {
-    pub(crate) input_hash: [u8; 32],
     pub(crate) termination: RunTermination,
     pub(crate) outcome: RunOutcome,
 }
@@ -906,9 +905,9 @@ impl RuntimeCore {
 
     /// [`WorkflowRuntime::cancel`].
     pub(crate) async fn cancel(&self, run_id: &str) -> Result<bool> {
-        if !self.request_cancel(run_id).await? {
+        let Some(input_hash) = self.request_cancel(run_id).await? else {
             return Ok(false);
-        }
+        };
         // Settle the current step now: remove it while it is queued, or
         // fire the claim's cancellation token, the parent of
         // `Delivery::cancel_token`, while it runs. A step that settles in
@@ -930,7 +929,7 @@ impl RuntimeCore {
             // at the API level. The effects are built before the outcome
             // is known; the queue applies them only on `Removed`.
             let outcome = claimed.cancelled(None);
-            let termination = self.termination(&outcome, None);
+            let termination = self.termination(&outcome, None, input_hash);
             let effects = self.terminate_collecting_effects(&outcome, &claimed, termination);
             match self.queue.cancel_with(&job.id, effects).await?.0 {
                 taquba::CancelOutcome::Removed | taquba::CancelOutcome::Requested => {
@@ -1023,12 +1022,19 @@ impl RuntimeCore {
             if current.is_none_or(|current| current.job_id != job.id) {
                 continue;
             }
+            // The record is written and deleted with the pointer; a
+            // pointer without one is a store the runtime did not write,
+            // left for the worker to report.
+            let Some(record) = self.run_record(run_id).await? else {
+                warn!(run_id = %run_id, job_id = %job.id, "dead step has a current-step pointer but no run record");
+                continue;
+            };
             let error = job
                 .last_error
                 .clone()
                 .unwrap_or_else(|| "step dead-lettered outside the worker".to_string());
             let outcome = claimed.failed(error);
-            let termination = self.termination(&outcome, None);
+            let termination = self.termination(&outcome, None, record.input_hash);
             let effects = self.terminate_collecting_effects(&outcome, &claimed, termination);
             self.queue.commit_effects(effects).await?;
             warn!(run_id = %run_id, step_number = claimed.step_number, job_id = %job.id, "terminated a run whose step was dead-lettered outside the worker");
@@ -1126,7 +1132,7 @@ impl RuntimeCore {
     }
 
     /// The terminal record of `run_id`; `None` when no record exists.
-    async fn terminal_record(&self, run_id: &str) -> Result<Option<DurableTermination>> {
+    pub(crate) async fn terminal_record(&self, run_id: &str) -> Result<Option<DurableTermination>> {
         match self.queue.kv_get(&outcome_kv_key(run_id)).await? {
             Some(bytes) => Ok(Some(rmp_serde::from_slice(&bytes)?)),
             None => Ok(None),
@@ -1232,7 +1238,6 @@ impl RuntimeCore {
         };
         match rmp_serde::from_slice::<DurableRunResult>(&bytes) {
             Ok(record) => Ok(Some(RunResult {
-                input_hash: record.input_hash,
                 termination: record.termination.into(),
                 outcome: record.outcome.into(),
             })),
@@ -1243,11 +1248,13 @@ impl RuntimeCore {
         }
     }
 
-    /// The termination of `outcome`'s run at the clock's current time.
+    /// The termination of `outcome`'s run at the clock's current time;
+    /// `input_hash` is the run record's.
     pub(crate) fn termination(
         &self,
         outcome: &RunOutcome,
         error_kind: Option<StepErrorKind>,
+        input_hash: [u8; 32],
     ) -> DurableTermination {
         DurableTermination {
             status: outcome.status.into(),
@@ -1255,6 +1262,7 @@ impl RuntimeCore {
             error_kind: error_kind.map(DurableErrorKind::from),
             final_step: outcome.final_step,
             terminated_at_ms: self.clock.now_ms(),
+            input_hash,
         }
     }
 
@@ -1263,11 +1271,9 @@ impl RuntimeCore {
     pub(crate) async fn store_run_result(
         &self,
         outcome: &RunOutcome,
-        input_hash: [u8; 32],
         termination: &DurableTermination,
     ) -> Result<()> {
         let record = DurableRunResult {
-            input_hash,
             termination: termination.clone(),
             outcome: DurableRunOutcome::from(outcome),
         };
@@ -1286,17 +1292,17 @@ impl RuntimeCore {
     }
 
     /// Record a cancellation request on the run record of `run_id`.
-    /// Returns whether the run is active; a request already recorded
-    /// counts as recorded again.
-    async fn request_cancel(&self, run_id: &str) -> Result<bool> {
+    /// Returns the record's input hash when the run is active, `None`
+    /// otherwise; a request already recorded counts as recorded again.
+    async fn request_cancel(&self, run_id: &str) -> Result<Option<[u8; 32]>> {
         let key = run_kv_key(run_id);
         loop {
             let Some(current) = self.queue.kv_get(&key).await? else {
-                return Ok(false);
+                return Ok(None);
             };
             let mut record: DurableRunRecord = rmp_serde::from_slice(&current)?;
             if record.cancel_requested {
-                return Ok(true);
+                return Ok(Some(record.input_hash));
             }
             record.cancel_requested = true;
             if self
@@ -1304,7 +1310,7 @@ impl RuntimeCore {
                 .kv_compare_put(&key, Some(&current), &durable::encode(&record))
                 .await?
             {
-                return Ok(true);
+                return Ok(Some(record.input_hash));
             }
         }
     }

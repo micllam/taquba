@@ -17,10 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RunState::Terminated(RunTermination)`: the status, error, error kind,
   final step and time of termination of a terminated run, reported by `WorkflowRuntime::status`
   and `jobs::JobHandle::status` from a terminal record under
-  `workflow/outcomes/{run_id}`. The record is written in every
-  terminating settlement and removed by the memo sweep with the run's
-  memo entries under `WorkflowRuntimeBuilder::memo_retention`.
-  `RunState` no longer implements `Copy`.
+  `workflow/outcomes/{run_id}`. The record, which also holds the run's
+  input hash, is written in every terminating settlement and removed by
+  the memo sweep with the run's memo entries under
+  `WorkflowRuntimeBuilder::memo_retention`. `RunState` no longer
+  implements `Copy`.
 - `StepError` implements `Clone`.
 - `jobs::JobGroup`: many jobs of one type submitted as one durable set
   (`JobRunner::group`, `JobRunner::new_group`, `JobGroup::submit`,
@@ -128,6 +129,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run result record, written by the worker for every run under the same
   run-memo key with a different layout; `jobs::JobHandle::fetch_result`,
   `jobs::JobHandle::join` and `jobs::JobGroup::results` read it.
+- **Breaking (behaviour):** a keyed `jobs::JobRunner::submit` after the
+  job terminated answers from the terminal record, for every
+  termination: a job cancelled while pending or dead-lettered outside
+  its handler is no longer run again, and joins as its recorded
+  termination until retention removes the record.
 - **Breaking (source):** `Step` is `#[non_exhaustive]` and holds its
   delivery fields (`run_id`, `headers`, `job_id`, `attempts`,
   `max_attempts`, `cancel_token`, `lease`, `memo`, `run_memo`, `effects`,
