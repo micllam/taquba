@@ -166,7 +166,9 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         {
             warn!(run_id = %claimed.run_id, "failed to write the run result record: {err}");
         }
-        let effects = self.terminate_collecting_effects(&outcome, claimed, termination);
+        let effects = self
+            .core
+            .terminate_collecting_effects(&outcome, claimed, termination);
         FailWith::new(error.into_worker_error(), effects).into()
     }
 
@@ -187,7 +189,9 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .store_run_result(&outcome, input_hash, &termination)
             .await
             .map_err(|err| StepError::from(err).into_worker_error())?;
-        Ok(self.terminate_collecting_effects(&outcome, claimed, termination))
+        Ok(self
+            .core
+            .terminate_collecting_effects(&outcome, claimed, termination))
     }
 
     /// Process a terminal-notification job: decode the committed

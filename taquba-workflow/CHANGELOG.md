@@ -104,6 +104,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (source):** `WorkflowRuntimeBuilder::build` requires a
+  `'static` terminal hook, as `spawn` and `run` already did.
 - **Breaking (source):** `RunSpec::{headers, priority,
   max_attempts_per_step, run_at}` moved into `RunSpec::options`, a
   `RunOptions`.

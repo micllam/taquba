@@ -22,10 +22,9 @@ use crate::keys::{
     group_terminal_kv_key, hex_sha256, outcome_kv_key,
 };
 use crate::memo::MemoStore;
-use crate::runner::StepRunner;
-use crate::runtime::{RunOptions, RunSpec, RunTermination, RuntimeCore, WorkflowRuntime};
+use crate::runtime::{RunOptions, RunSpec, RunTermination, RuntimeCore};
 use crate::sweep::Clearable;
-use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
+use crate::terminal::{RunOutcome, TerminalStatus};
 
 /// Member submissions and cancellations in flight at once. Each blocks
 /// on a durable commit, and concurrent commits share WAL flushes.
@@ -121,7 +120,7 @@ pub struct MemberResult {
     pub run_id: String,
     /// The member's last recorded termination.
     pub termination: RunTermination,
-    /// The member's committed outcome, read as [`WorkflowRuntime::outcome`]
+    /// The member's committed outcome, read as [`WorkflowRuntime::outcome`](crate::WorkflowRuntime::outcome)
     /// reads it; `None` for a member terminated without a worker.
     pub outcome: Option<RunOutcome>,
 }
@@ -266,7 +265,7 @@ impl Clearable for GroupStore {
 }
 
 /// A group of runs of one runtime, identified by a group id. Obtained
-/// from [`WorkflowRuntime::group`] or [`WorkflowRuntime::new_group`];
+/// from [`WorkflowRuntime::group`](crate::WorkflowRuntime::group) or [`WorkflowRuntime::new_group`](crate::WorkflowRuntime::new_group);
 /// cheap to clone.
 ///
 /// The group's members are identified by key. A member's run id is
@@ -277,22 +276,14 @@ impl Clearable for GroupStore {
 /// [`status`](Self::status), [`cancel`](Self::cancel) and
 /// [`forget`](Self::forget) answer after a restart and from any runtime
 /// over the same queue.
-pub struct RunGroup<R, H> {
-    runtime: WorkflowRuntime<R, H>,
+#[derive(Clone)]
+pub struct RunGroup {
+    runtime: Arc<RuntimeCore>,
     id: String,
 }
 
-impl<R, H> Clone for RunGroup<R, H> {
-    fn clone(&self) -> Self {
-        Self {
-            runtime: self.runtime.clone(),
-            id: self.id.clone(),
-        }
-    }
-}
-
-impl<R: StepRunner, H: TerminalHook> RunGroup<R, H> {
-    pub(crate) fn new(runtime: WorkflowRuntime<R, H>, id: String) -> Self {
+impl RunGroup {
+    pub(crate) fn new(runtime: Arc<RuntimeCore>, id: String) -> Self {
         Self { runtime, id }
     }
 
@@ -302,7 +293,7 @@ impl<R: StepRunner, H: TerminalHook> RunGroup<R, H> {
     }
 
     fn core(&self) -> &RuntimeCore {
-        &self.runtime.inner.core
+        &self.runtime
     }
 
     fn store(&self) -> &GroupStore {
@@ -403,7 +394,7 @@ impl<R: StepRunner, H: TerminalHook> RunGroup<R, H> {
     /// has been yielded, the group's terminal marker is written, from
     /// which the group retention sweep counts the window; a failed
     /// marker write is logged.
-    async fn terminations(&self) -> Result<impl Stream<Item = Result<MemberState>> + use<R, H>> {
+    async fn terminations(&self) -> Result<impl Stream<Item = Result<MemberState>> + use<>> {
         let manifest = self.manifest().await?;
         let waits: FuturesUnordered<_> = manifest
             .members
@@ -432,7 +423,7 @@ impl<R: StepRunner, H: TerminalHook> RunGroup<R, H> {
     /// The members' results as each one terminates, in completion
     /// order; a member already terminated is yielded at once. Returns
     /// [`Error::GroupNotFound`] for a group never submitted.
-    pub async fn results(&self) -> Result<impl Stream<Item = Result<MemberResult>> + use<R, H>> {
+    pub async fn results(&self) -> Result<impl Stream<Item = Result<MemberResult>> + use<>> {
         let terminations = self.terminations().await?;
         let group = self.clone();
         Ok(terminations.then(move |member| {
@@ -482,7 +473,7 @@ impl<R: StepRunner, H: TerminalHook> RunGroup<R, H> {
     }
 
     /// Request cancellation of every active member, as
-    /// [`WorkflowRuntime::cancel`] does for one run. Returns the number
+    /// [`WorkflowRuntime::cancel`](crate::WorkflowRuntime::cancel) does for one run. Returns the number
     /// of members whose request was recorded.
     pub async fn cancel(&self) -> Result<usize> {
         let mut cancellations = stream::iter(
@@ -566,8 +557,8 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::runner::{Step, StepError, StepOutcome};
-    use crate::runtime::RunSpec;
+    use crate::runner::{Step, StepError, StepOutcome, StepRunner};
+    use crate::runtime::{RunSpec, WorkflowRuntime};
     use crate::terminal::NoopTerminalHook;
     use crate::test_util::{open_queue, open_queue_at};
 
@@ -644,7 +635,7 @@ mod tests {
             .unwrap()
             .unwrap();
         queue.dead_letter(&claim, "hung").await.unwrap();
-        assert_eq!(runtime.inner.reconcile_dead_steps().await.unwrap(), 1);
+        assert_eq!(runtime.inner.core.reconcile_dead_steps().await.unwrap(), 1);
 
         let second: Vec<MemberResult> = group.results().await.unwrap().try_collect().await.unwrap();
         assert_eq!(second[0].termination.error.as_deref(), Some("hung"));

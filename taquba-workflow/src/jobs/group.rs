@@ -9,8 +9,7 @@ use futures_util::{Stream, StreamExt, TryStreamExt};
 use crate::group::{GroupMember, GroupStatus, RunGroup};
 use crate::jobs::handle::{JobError, decode_end};
 use crate::jobs::job::Job;
-use crate::jobs::runner::{Dispatch, job_payload};
-use crate::terminal::NoopTerminalHook;
+use crate::jobs::runner::job_payload;
 use crate::{Result, RunOptions};
 
 /// A [`RunGroup`] of jobs of one type, identified by a group id.
@@ -20,7 +19,7 @@ use crate::{Result, RunOptions};
 /// the positional `item-{i}`; see the [module
 /// documentation](crate::jobs#job-groups).
 pub struct JobGroup<J: Job> {
-    group: RunGroup<Dispatch, NoopTerminalHook>,
+    group: RunGroup,
     _marker: PhantomData<fn() -> J>,
 }
 
@@ -35,7 +34,7 @@ pub struct GroupResult<J: Job> {
 }
 
 impl<J: Job> JobGroup<J> {
-    pub(crate) fn new(group: RunGroup<Dispatch, NoopTerminalHook>) -> Self {
+    pub(crate) fn new(group: RunGroup) -> Self {
         Self {
             group,
             _marker: PhantomData,

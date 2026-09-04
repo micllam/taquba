@@ -351,7 +351,15 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     }
 
     /// Finalize the builder.
-    pub fn build(self) -> WorkflowRuntime<R, H> {
+    pub fn build(self) -> WorkflowRuntime<R, H>
+    where
+        H: 'static,
+    {
+        let terminal_hook = Arc::new(self.terminal_hook);
+        let observes: Arc<dyn Fn(&RunOutcome) -> bool + Send + Sync> = {
+            let hook = terminal_hook.clone();
+            Arc::new(move |outcome| hook.observes(outcome))
+        };
         let memo_store = MemoStore::new(self.object_store.clone(), self.memo_prefix.clone());
         let group_store = GroupStore::new(
             self.object_store,
@@ -388,11 +396,12 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
             sweeps,
             step_output_replay: self.step_output_replay,
             clock: self.clock,
+            observes,
         };
         let inner = RuntimeInner {
             runner: self.runner,
-            terminal_hook: self.terminal_hook,
-            core,
+            terminal_hook,
+            core: Arc::new(core),
         };
         WorkflowRuntime {
             inner: Arc::new(inner),
@@ -430,16 +439,15 @@ impl<R, H> Clone for WorkflowRuntime<R, H> {
 }
 
 /// A runtime's [`StepRunner`] and [`TerminalHook`], with the shared
-/// [`RuntimeCore`] they operate on.
+/// [`RuntimeCore`] they operate on: the executing half of a runtime,
+/// held by the worker.
 pub(crate) struct RuntimeInner<R, H> {
     pub(crate) runner: R,
-    pub(crate) terminal_hook: H,
-    pub(crate) core: RuntimeCore,
+    pub(crate) terminal_hook: Arc<H>,
+    pub(crate) core: Arc<RuntimeCore>,
 }
 
-/// The state every component of a runtime operates on: the queue
-/// handle, the memo store and the clock. Methods
-/// that invoke the runner or the hook are on [`RuntimeInner`].
+/// The control plane of a runtime,
 pub(crate) struct RuntimeCore {
     pub(crate) queue: Arc<Queue>,
     queue_name: String,
@@ -465,6 +473,9 @@ pub(crate) struct RuntimeCore {
     /// Time source. Defaults to the queue's clock; tests can substitute
     /// a [`MockClock`](taquba::MockClock) to virtualise time.
     pub(crate) clock: Arc<dyn Clock>,
+    /// [`TerminalHook::observes`] of the runtime's hook, which decides
+    /// whether a termination enqueues a notification job.
+    observes: Arc<dyn Fn(&RunOutcome) -> bool + Send + Sync>,
 }
 
 impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
@@ -515,8 +526,203 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// `newly_submitted = false`. A re-submission of an active `run_id`
     /// with a *different* input is rejected with [`Error::InputMismatch`];
     /// pick a fresh `run_id` for a new run.
-    #[instrument(skip(self, spec), fields(run_id))]
     pub async fn submit(&self, spec: RunSpec) -> Result<SubmitOutcome> {
+        self.inner.core.submit(spec).await
+    }
+
+    /// The status of a run, read from its durable state, so it answers
+    /// after a restart and from any runtime over the same queue. A
+    /// terminated run reports [`RunState::Terminated`] until the memo
+    /// sweep removes its terminal record; `None` for a run that is
+    /// unknown or swept.
+    ///
+    /// A run with a pending cancellation request reports
+    /// [`RunState::Cancelling`] whatever its step's lifecycle position,
+    /// until the run terminates.
+    pub async fn status(&self, run_id: &str) -> Result<Option<RunStatus>> {
+        self.inner.core.status(run_id).await
+    }
+
+    /// The committed outcome of a terminated run, read from its run
+    /// result record: the result the runner returned or the error that
+    /// ended the run, with the submitter's headers and the final step.
+    /// The record is written by the worker that terminates the run
+    /// before the terminating settlement and is removed with the run's
+    /// memo entries; `None` for a run that is unknown, still active or
+    /// was terminated without a worker (a cancellation of a pending
+    /// step, a dead-letter outside the worker), whose status
+    /// [`Self::status`] reports. A record belongs to the termination
+    /// its terminal record describes: a re-submission of a terminated
+    /// run id leaves the earlier run's record in place until its own
+    /// termination overwrites it, and such a record is not reported.
+    pub async fn outcome(&self, run_id: &str) -> Result<Option<RunOutcome>> {
+        self.inner.core.outcome(run_id).await
+    }
+
+    /// Wait until the run `run_id` terminates and report its end. The
+    /// wait follows the run's current step across its steps, so it
+    /// answers for a run of any length, after a restart and from any
+    /// runtime over the same queue; a run already terminated is
+    /// reported at once from its records. A step dead-lettered outside
+    /// the worker is terminated by the worker's dead-step
+    /// reconciliation, which the wait polls for at the poll interval.
+    ///
+    /// Returns [`Error::RunNotFound`] for a run the runtime has no
+    /// record of: never submitted, or terminated and swept.
+    pub async fn wait(&self, run_id: &str) -> Result<RunEnd> {
+        self.inner.core.wait(run_id).await
+    }
+
+    /// [`Self::wait`] bounded by `timeout`; `Ok(None)` when the timeout
+    /// elapses first.
+    pub async fn wait_timeout(&self, run_id: &str, timeout: Duration) -> Result<Option<RunEnd>> {
+        self.inner.core.wait_timeout(run_id, timeout).await
+    }
+
+    /// Request cancellation of an active run.
+    ///
+    /// Returns `Ok(true)` once the request is recorded on the run's
+    /// durable record, or `Ok(false)` if the run is unknown or already
+    /// terminal, including a run whose current step the queue
+    /// dead-lettered outside the worker, which the worker's dead-step
+    /// reconciliation terminates as failed. The request reaches a run
+    /// after a restart and from any runtime over the same queue.
+    ///
+    /// The run terminates as [`TerminalStatus::Cancelled`](crate::TerminalStatus::Cancelled) and its
+    /// notification job is enqueued for the terminal hook:
+    ///
+    /// - **Pending / scheduled step**: the queued step job is removed
+    ///   and the notification enqueued in one transaction before this
+    ///   call returns; the hook runs from a worker afterwards.
+    /// - **Running step**: cancellation is delivered to the runner via
+    ///   [`Delivery::cancel_token`](crate::Delivery::cancel_token); runners
+    ///   that watch the token short-circuit immediately. Runners that ignore
+    ///   the token are allowed to run to completion (futures cannot be safely
+    ///   aborted mid-step). In both cases the runner's [`StepOutcome`] /
+    ///   [`StepError`](crate::StepError) is discarded and the worker settles
+    ///   the run once the step returns, with any pending transient retry
+    ///   suppressed and the step acked rather than nacked.
+    /// - A step claimed after the request is settled as cancelled
+    ///   without running.
+    ///
+    /// Cancellation is best-effort: a run whose terminal step settles
+    /// while the request is being recorded keeps the outcome it
+    /// committed.
+    pub async fn cancel(&self, run_id: &str) -> Result<bool> {
+        self.inner.core.cancel(run_id).await
+    }
+
+    /// The group named `id`, which must be 1 to
+    /// [`MAX_RUN_ID_LEN`](crate::MAX_RUN_ID_LEN) bytes of `[A-Za-z0-9_-]`;
+    /// [`Error::InvalidGroupId`] otherwise.
+    pub fn group(&self, id: impl Into<String>) -> Result<RunGroup> {
+        let id = id.into();
+        validate_run_id(&id).map_err(|_| Error::InvalidGroupId(id.clone()))?;
+        Ok(RunGroup::new(self.inner.core.clone(), id))
+    }
+
+    /// A group with a generated id.
+    pub fn new_group(&self) -> RunGroup {
+        RunGroup::new(self.inner.core.clone(), ulid::Ulid::new().to_string())
+    }
+
+    /// Spawn [`Self::run`] as a Tokio task and return a handle for
+    /// graceful shutdown. The worker runs until `shutdown` resolves or
+    /// [`RunnerHandle::shutdown`] is called; in-flight steps finish
+    /// either way.
+    pub fn spawn<F>(&self, shutdown: F) -> RunnerHandle
+    where
+        F: Future<Output = ()> + Send + 'static,
+        R: 'static,
+        H: 'static,
+    {
+        let runtime = self.clone();
+        WorkerHandle::spawn(shutdown, |stop| async move {
+            runtime.run(stop.cancelled_owned()).await
+        })
+    }
+
+    /// Drive the step worker loop until `shutdown` resolves. Spawns up
+    /// to `max_concurrent_steps` step processors, the dead-step
+    /// reconciliation that terminates runs whose step the queue
+    /// dead-lettered outside the worker and, when
+    /// [`WorkflowRuntimeBuilder::memo_retention`] is set, a
+    /// memo-retention sweeper, all running in parallel. All halt cleanly
+    /// when `shutdown` resolves or the worker errors.
+    pub async fn run<F>(&self, shutdown: F) -> Result<()>
+    where
+        F: Future<Output = ()>,
+        R: 'static,
+        H: 'static,
+    {
+        // One cancellation token fans the "stop now" signal out to the
+        // worker (via `cancelled_owned`) and to the sweeper (which
+        // selects on its own clone). The signal is raised either when
+        // the caller's `shutdown` future fires or when the worker
+        // returns on its own (typically with an error).
+        let stop = CancellationToken::new();
+
+        let mut background: Vec<_> = (0..self.inner.core.sweeps.len())
+            .map(|i| {
+                let core = self.inner.core.clone();
+                let token = stop.clone();
+                tokio::spawn(async move {
+                    core.sweeps[i].run(&core.queue, &*core.clock, token).await;
+                })
+            })
+            .collect();
+        background.push({
+            let core = self.inner.core.clone();
+            let token = stop.clone();
+            tokio::spawn(async move { core.run_dead_step_reconciliation(token).await })
+        });
+
+        let worker = Arc::new(StepWorker {
+            inner: self.inner.clone(),
+        });
+        let worker_fut = taquba::run_worker_concurrent(
+            &self.inner.core.queue,
+            &self.inner.core.queue_name,
+            worker,
+            self.inner.core.max_concurrent_steps,
+            self.inner.core.poll_interval,
+            stop.clone().cancelled_owned(),
+        );
+
+        let mut shutdown = std::pin::pin!(shutdown);
+        let mut worker_fut = std::pin::pin!(worker_fut);
+        let result = tokio::select! {
+            _ = shutdown.as_mut() => {
+                stop.cancel();
+                worker_fut.await
+            }
+            res = worker_fut.as_mut() => {
+                stop.cancel();
+                res
+            }
+        };
+
+        for handle in background {
+            let _ = handle.await;
+        }
+
+        result?;
+        Ok(())
+    }
+}
+
+/// A handle to a worker task spawned by [`WorkflowRuntime::spawn`].
+///
+/// Dropping a `RunnerHandle` does not stop the worker: the task
+/// continues until the `shutdown` future passed to `spawn` resolves.
+/// Call [`shutdown`](WorkerHandle::shutdown) or
+/// [`wait`](WorkerHandle::wait) to stop or join the worker explicitly.
+pub type RunnerHandle = WorkerHandle<Result<()>>;
+
+impl RuntimeCore {
+    /// [`WorkflowRuntime::submit`].
+    #[instrument(skip(self, spec), fields(run_id))]
+    pub(crate) async fn submit(&self, spec: RunSpec) -> Result<SubmitOutcome> {
         let run_id = Self::validate_spec(&spec)?;
         tracing::Span::current().record("run_id", run_id.as_str());
         self.enqueue_run(&run_id, spec, None).await
@@ -532,20 +738,6 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     ) -> Result<SubmitOutcome> {
         let run_id = Self::validate_spec(&spec)?;
         self.enqueue_run(&run_id, spec, Some(membership)).await
-    }
-
-    /// The group named `id`, which must be 1 to
-    /// [`MAX_RUN_ID_LEN`](crate::MAX_RUN_ID_LEN) bytes of `[A-Za-z0-9_-]`;
-    /// [`Error::InvalidGroupId`] otherwise.
-    pub fn group(&self, id: impl Into<String>) -> Result<RunGroup<R, H>> {
-        let id = id.into();
-        validate_run_id(&id).map_err(|_| Error::InvalidGroupId(id.clone()))?;
-        Ok(RunGroup::new(self.clone(), id))
-    }
-
-    /// A group with a generated id.
-    pub fn new_group(&self) -> RunGroup<R, H> {
-        RunGroup::new(self.clone(), ulid::Ulid::new().to_string())
     }
 
     /// Check `spec`'s run id, headers and KV keys; the run id, generated
@@ -599,9 +791,9 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             }
         };
 
-        if let Some(existing) = self.inner.core.run_record(run_id).await? {
+        if let Some(existing) = self.run_record(run_id).await? {
             check_input(existing)?;
-            let current = self.inner.core.current_step(run_id).await?;
+            let current = self.current_step(run_id).await?;
             return Ok(duplicate(current.job_id));
         }
 
@@ -613,17 +805,12 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
                 .map(Membership::reserved_headers)
                 .unwrap_or_default(),
         };
-        let (request, job_id) = self.inner.core.step_enqueue_request(
-            run_id,
-            0,
-            spec.input,
-            &spec.options.headers,
-            opts,
-        );
+        let (request, job_id) =
+            self.step_enqueue_request(run_id, 0, spec.input, &spec.options.headers, opts);
 
         let record_bytes = durable::encode(&DurableRunRecord {
             run_id: run_id.to_string(),
-            submitted_at_ms: self.inner.core.clock.now_ms(),
+            submitted_at_ms: self.clock.now_ms(),
             input_hash,
             cancel_requested: false,
         });
@@ -638,8 +825,6 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         }
 
         let job_id = match self
-            .inner
-            .core
             .queue
             .enqueue_with_kv(&request.queue, request.payload, request.options, kv)
             .await?
@@ -650,7 +835,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             // is a store this runtime did not write, reported as a
             // duplicate.
             EnqueueResult::AlreadyEnqueued(existing) => {
-                if let Some(record) = self.inner.core.run_record(run_id).await? {
+                if let Some(record) = self.run_record(run_id).await? {
                     check_input(record)?;
                 }
                 return Ok(duplicate(existing));
@@ -665,29 +850,20 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         })
     }
 
-    /// The status of a run, read from its durable state, so it answers
-    /// after a restart and from any runtime over the same queue. A
-    /// terminated run reports [`RunState::Terminated`] until the memo
-    /// sweep removes its terminal record; `None` for a run that is
-    /// unknown or swept.
-    ///
-    /// A run with a pending cancellation request reports
-    /// [`RunState::Cancelling`] whatever its step's lifecycle position,
-    /// until the run terminates.
-    pub async fn status(&self, run_id: &str) -> Result<Option<RunStatus>> {
-        let core = &self.inner.core;
-        let Some(record) = core.run_record(run_id).await? else {
-            return core.terminated_status(run_id).await;
+    /// [`WorkflowRuntime::status`].
+    pub(crate) async fn status(&self, run_id: &str) -> Result<Option<RunStatus>> {
+        let Some(record) = self.run_record(run_id).await? else {
+            return self.terminated_status(run_id).await;
         };
         // The pointer is deleted with the record; its absence here means
         // the run terminated between the two reads.
-        let Some(current) = core.current_step_if_active(run_id).await? else {
-            return core.terminated_status(run_id).await;
+        let Some(current) = self.current_step_if_active(run_id).await? else {
+            return self.terminated_status(run_id).await;
         };
         let state = if record.cancel_requested {
             RunState::Cancelling
         } else {
-            match core.queue.get_job(&current.job_id).await? {
+            match self.queue.get_job(&current.job_id).await? {
                 Some(job) if job.status == JobStatus::Claimed => RunState::Running,
                 _ => RunState::Pending,
             }
@@ -699,88 +875,39 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         }))
     }
 
-    /// The committed outcome of a terminated run, read from its run
-    /// result record: the result the runner returned or the error that
-    /// ended the run, with the submitter's headers and the final step.
-    /// The record is written by the worker that terminates the run
-    /// before the terminating settlement and is removed with the run's
-    /// memo entries; `None` for a run that is unknown, still active or
-    /// was terminated without a worker (a cancellation of a pending
-    /// step, a dead-letter outside the worker), whose status
-    /// [`Self::status`] reports. A record belongs to the termination
-    /// its terminal record describes: a re-submission of a terminated
-    /// run id leaves the earlier run's record in place until its own
-    /// termination overwrites it, and such a record is not reported.
-    pub async fn outcome(&self, run_id: &str) -> Result<Option<RunOutcome>> {
-        let core = &self.inner.core;
-        if core.current_step_if_active(run_id).await?.is_some() {
+    /// [`WorkflowRuntime::outcome`].
+    pub(crate) async fn outcome(&self, run_id: &str) -> Result<Option<RunOutcome>> {
+        if self.current_step_if_active(run_id).await?.is_some() {
             return Ok(None);
         }
-        Ok(core
+        Ok(self
             .recorded_result(run_id)
             .await?
             .map(|result| result.outcome))
     }
 
-    /// Wait until the run `run_id` terminates and report its end. The
-    /// wait follows the run's current step across its steps, so it
-    /// answers for a run of any length, after a restart and from any
-    /// runtime over the same queue; a run already terminated is
-    /// reported at once from its records. A step dead-lettered outside
-    /// the worker is terminated by the worker's dead-step
-    /// reconciliation, which the wait polls for at the poll interval.
-    ///
-    /// Returns [`Error::RunNotFound`] for a run the runtime has no
-    /// record of: never submitted, or terminated and swept.
-    pub async fn wait(&self, run_id: &str) -> Result<RunEnd> {
-        self.inner
-            .core
-            .wait_run(run_id)
+    /// [`WorkflowRuntime::wait`].
+    pub(crate) async fn wait(&self, run_id: &str) -> Result<RunEnd> {
+        self.wait_run(run_id)
             .await?
             .ok_or_else(|| Error::RunNotFound(run_id.to_string()))
     }
 
-    /// [`Self::wait`] bounded by `timeout`; `Ok(None)` when the timeout
-    /// elapses first.
-    pub async fn wait_timeout(&self, run_id: &str, timeout: Duration) -> Result<Option<RunEnd>> {
+    /// [`WorkflowRuntime::wait_timeout`].
+    pub(crate) async fn wait_timeout(
+        &self,
+        run_id: &str,
+        timeout: Duration,
+    ) -> Result<Option<RunEnd>> {
         match tokio::time::timeout(timeout, self.wait(run_id)).await {
             Ok(end) => end.map(Some),
             Err(_) => Ok(None),
         }
     }
 
-    /// Request cancellation of an active run.
-    ///
-    /// Returns `Ok(true)` once the request is recorded on the run's
-    /// durable record, or `Ok(false)` if the run is unknown or already
-    /// terminal, including a run whose current step the queue
-    /// dead-lettered outside the worker, which the worker's dead-step
-    /// reconciliation terminates as failed. The request reaches a run
-    /// after a restart and from any runtime over the same queue.
-    ///
-    /// The run terminates as [`TerminalStatus::Cancelled`](crate::TerminalStatus::Cancelled) and its
-    /// notification job is enqueued for the terminal hook:
-    ///
-    /// - **Pending / scheduled step**: the queued step job is removed
-    ///   and the notification enqueued in one transaction before this
-    ///   call returns; the hook runs from a worker afterwards.
-    /// - **Running step**: cancellation is delivered to the runner via
-    ///   [`Delivery::cancel_token`](crate::Delivery::cancel_token); runners
-    ///   that watch the token short-circuit immediately. Runners that ignore
-    ///   the token are allowed to run to completion (futures cannot be safely
-    ///   aborted mid-step). In both cases the runner's [`StepOutcome`] /
-    ///   [`StepError`](crate::StepError) is discarded and the worker settles
-    ///   the run once the step returns, with any pending transient retry
-    ///   suppressed and the step acked rather than nacked.
-    /// - A step claimed after the request is settled as cancelled
-    ///   without running.
-    ///
-    /// Cancellation is best-effort: a run whose terminal step settles
-    /// while the request is being recorded keeps the outcome it
-    /// committed.
-    pub async fn cancel(&self, run_id: &str) -> Result<bool> {
-        let core = &self.inner.core;
-        if !core.request_cancel(run_id).await? {
+    /// [`WorkflowRuntime::cancel`].
+    pub(crate) async fn cancel(&self, run_id: &str) -> Result<bool> {
+        if !self.request_cancel(run_id).await? {
             return Ok(false);
         }
         // Settle the current step now: remove it while it is queued, or
@@ -790,11 +917,11 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         // request terminates the run on its own.
         let mut absent: Option<String> = None;
         loop {
-            let Some(current) = core.current_step_if_active(run_id).await? else {
+            let Some(current) = self.current_step_if_active(run_id).await? else {
                 // Terminated on its own after the request was recorded.
                 return Ok(false);
             };
-            let Some(job) = core.queue.get_job(&current.job_id).await? else {
+            let Some(job) = self.queue.get_job(&current.job_id).await? else {
                 if absent.as_deref() == Some(current.job_id.as_str()) {
                     return Err(Error::InconsistentRunState(run_id.to_string()));
                 }
@@ -812,11 +939,9 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             // at the API level. The effects are built before the outcome
             // is known; the queue applies them only on `Removed`.
             let outcome = claimed.cancelled(None);
-            let termination = core.termination(&outcome, None);
-            let effects = self
-                .inner
-                .terminate_collecting_effects(&outcome, &claimed, termination);
-            match core.queue.cancel_with(&job.id, effects).await?.0 {
+            let termination = self.termination(&outcome, None);
+            let effects = self.terminate_collecting_effects(&outcome, &claimed, termination);
+            match self.queue.cancel_with(&job.id, effects).await?.0 {
                 taquba::CancelOutcome::Removed | taquba::CancelOutcome::Requested => {
                     return Ok(true);
                 }
@@ -825,101 +950,133 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         }
     }
 
-    /// Spawn [`Self::run`] as a Tokio task and return a handle for
-    /// graceful shutdown. The worker runs until `shutdown` resolves or
-    /// [`RunnerHandle::shutdown`] is called; in-flight steps finish
-    /// either way.
-    pub fn spawn<F>(&self, shutdown: F) -> RunnerHandle
-    where
-        F: Future<Output = ()> + Send + 'static,
-        R: 'static,
-        H: 'static,
-    {
-        let runtime = self.clone();
-        WorkerHandle::spawn(shutdown, |stop| async move {
-            runtime.run(stop.cancelled_owned()).await
-        })
-    }
-
-    /// Drive the step worker loop until `shutdown` resolves. Spawns up
-    /// to `max_concurrent_steps` step processors, the dead-step
-    /// reconciliation that terminates runs whose step the queue
-    /// dead-lettered outside the worker and, when
-    /// [`WorkflowRuntimeBuilder::memo_retention`] is set, a
-    /// memo-retention sweeper, all running in parallel. All halt cleanly
-    /// when `shutdown` resolves or the worker errors.
-    pub async fn run<F>(&self, shutdown: F) -> Result<()>
-    where
-        F: Future<Output = ()>,
-        R: 'static,
-        H: 'static,
-    {
-        // One cancellation token fans the "stop now" signal out to the
-        // worker (via `cancelled_owned`) and to the sweeper (which
-        // selects on its own clone). The signal is raised either when
-        // the caller's `shutdown` future fires or when the worker
-        // returns on its own (typically with an error).
-        let stop = CancellationToken::new();
-
-        let mut background: Vec<_> = (0..self.inner.core.sweeps.len())
-            .map(|i| {
-                let inner = self.inner.clone();
-                let token = stop.clone();
-                tokio::spawn(async move {
-                    let core = &inner.core;
-                    core.sweeps[i].run(&core.queue, &*core.clock, token).await;
-                })
-            })
-            .collect();
-        background.push({
-            let inner = self.inner.clone();
-            let token = stop.clone();
-            tokio::spawn(async move { inner.run_dead_step_reconciliation(token).await })
-        });
-
-        let worker = Arc::new(StepWorker {
-            inner: self.inner.clone(),
-        });
-        let worker_fut = taquba::run_worker_concurrent(
-            &self.inner.core.queue,
-            &self.inner.core.queue_name,
-            worker,
-            self.inner.core.max_concurrent_steps,
-            self.inner.core.poll_interval,
-            stop.clone().cancelled_owned(),
+    /// Settle a run into its terminal state: return the deletes of the
+    /// durable run record and the current-step pointer, the writes of
+    /// the terminal record and the terminal marker (when memo retention
+    /// is enabled), the write of the member record (when the run is a
+    /// group member) and the terminal-notification enqueue
+    /// (when the hook observes this outcome) as [`SettlementEffects`]
+    /// for the settlement transaction. The notification job's payload
+    /// is the committed outcome and the configured [`TerminalHook`]
+    /// runs as its worker; `terminal_step` is the step that produced
+    /// the outcome, or the pending step a cancellation removes, and
+    /// `termination` the record of the outcome the settlement writes.
+    ///
+    /// The effects are pure: nothing is written and no state is
+    /// mutated here, so a caller that builds them and then commits a
+    /// non-terminal outcome leaves no trace. A settlement that fails
+    /// redelivers the step, which re-terminates and rebuilds the same
+    /// effects.
+    pub(crate) fn terminate_collecting_effects(
+        &self,
+        outcome: &RunOutcome,
+        terminal_step: &ClaimedStep<'_>,
+        termination: DurableTermination,
+    ) -> SettlementEffects {
+        let kv_deletes = vec![run_kv_key(&outcome.run_id), step_kv_key(&outcome.run_id)];
+        let mut kv_writes = HashMap::new();
+        kv_writes.insert(
+            outcome_kv_key(&outcome.run_id),
+            durable::encode(&termination),
         );
-
-        let mut shutdown = std::pin::pin!(shutdown);
-        let mut worker_fut = std::pin::pin!(worker_fut);
-        let result = tokio::select! {
-            _ = shutdown.as_mut() => {
-                stop.cancel();
-                worker_fut.await
-            }
-            res = worker_fut.as_mut() => {
-                stop.cancel();
-                res
-            }
-        };
-
-        for handle in background {
-            let _ = handle.await;
+        if self.memo_retention.is_some() {
+            kv_writes.insert(
+                terminal_kv_key(&outcome.run_id, termination.terminated_at_ms),
+                Vec::new(),
+            );
         }
-
-        result?;
-        Ok(())
+        if let Some(membership) = &terminal_step.membership {
+            kv_writes.insert(
+                membership.kv_key(),
+                durable::encode(&terminated_member(&outcome.run_id, termination)),
+            );
+        }
+        let enqueues = if (self.observes)(outcome) {
+            vec![self.notification_enqueue_request(outcome, Some(terminal_step.job))]
+        } else {
+            Vec::new()
+        };
+        SettlementEffects::default()
+            .enqueues(enqueues)
+            .kv_writes(kv_writes)
+            .kv_deletes(kv_deletes)
     }
-}
 
-/// A handle to a worker task spawned by [`WorkflowRuntime::spawn`].
-///
-/// Dropping a `RunnerHandle` does not stop the worker: the task
-/// continues until the `shutdown` future passed to `spawn` resolves.
-/// Call [`shutdown`](WorkerHandle::shutdown) or
-/// [`wait`](WorkerHandle::wait) to stop or join the worker explicitly.
-pub type RunnerHandle = WorkerHandle<Result<()>>;
+    /// Terminate every run whose step job the queue dead-lettered
+    /// outside the worker path: a lease that expired past the attempt
+    /// limit, or a claim dead-lettered by crash recovery when the queue
+    /// was opened. Such a settlement runs no workflow code, so the run
+    /// record and the current-step pointer survive it and no
+    /// notification is enqueued. A dead step job that the run's
+    /// current-step pointer names identifies the case exactly, because
+    /// every worker-path dead-letter deletes the pointer in its own
+    /// transaction and a re-submission of the run id names a new job.
+    /// The run terminates as [`TerminalStatus::Failed`] with the queue record's
+    /// last error, through the same effects as a worker-path
+    /// termination committed as one transaction with no transition of
+    /// their own; the runner's failure writes cannot apply, since no
+    /// runner returned. Returns the number of runs terminated.
+    pub(crate) async fn reconcile_dead_steps(&self) -> Result<usize> {
+        const PAGE: usize = 256;
+        let mut terminated = 0usize;
+        let mut dead = std::pin::pin!(self.queue.jobs(&self.queue_name, JobStatus::Dead, PAGE));
+        while let Some(job) = dead.try_next().await? {
+            if job.headers.contains_key(HEADER_TERMINAL) {
+                continue;
+            }
+            let Ok(claimed) = ClaimedStep::parse(&job) else {
+                continue;
+            };
+            let run_id = claimed.run_id.as_str();
+            let current = self.current_step_if_active(run_id).await?;
+            if current.is_none_or(|current| current.job_id != job.id) {
+                continue;
+            }
+            let error = job
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "step dead-lettered outside the worker".to_string());
+            let outcome = claimed.failed(error);
+            let termination = self.termination(&outcome, None);
+            let effects = self.terminate_collecting_effects(&outcome, &claimed, termination);
+            self.queue.commit_effects(effects).await?;
+            warn!(run_id = %run_id, step_number = claimed.step_number, job_id = %job.id, "terminated a run whose step was dead-lettered outside the worker");
+            terminated += 1;
+        }
+        Ok(terminated)
+    }
 
-impl RuntimeCore {
+    /// The reconciliation loop: a pass when the worker starts, then a
+    /// pass whenever the queue's dead count has changed since the last
+    /// successful pass, checked every poll interval, until `stop` is
+    /// cancelled.
+    async fn run_dead_step_reconciliation(&self, stop: CancellationToken) {
+        run_periodically(
+            self.poll_interval,
+            &stop,
+            None,
+            |reconciled_at: Option<i64>| async move {
+                match self.queue.stats(&self.queue_name).await {
+                    Ok(stats) if reconciled_at != Some(stats.dead) => {
+                        match self.reconcile_dead_steps().await {
+                            Ok(_) => Some(stats.dead),
+                            Err(err) => {
+                                warn!("dead-step reconciliation failed: {err}");
+                                reconciled_at
+                            }
+                        }
+                    }
+                    Ok(_) => reconciled_at,
+                    Err(err) => {
+                        warn!("dead-step reconciliation could not read queue stats: {err}");
+                        reconciled_at
+                    }
+                }
+            },
+        )
+        .await;
+    }
+
     /// One pass of every retention sweep; the number of entities cleared.
     #[cfg(test)]
     pub(crate) async fn sweep_once(&self) -> Result<usize> {
@@ -1307,140 +1464,6 @@ impl RuntimeCore {
         SettlementEffects::default()
             .enqueues(vec![request])
             .kv_writes(kv_writes)
-    }
-}
-
-impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
-    /// Settle a run into its terminal state: return the deletes of the
-    /// durable run record and the current-step pointer, the writes of
-    /// the terminal record and the terminal marker (when memo retention
-    /// is enabled), the write of the member record (when the run is a
-    /// group member) and the terminal-notification enqueue
-    /// (when the hook observes this outcome) as [`SettlementEffects`]
-    /// for the settlement transaction. The notification job's payload
-    /// is the committed outcome and the configured [`TerminalHook`]
-    /// runs as its worker; `terminal_step` is the step that produced
-    /// the outcome, or the pending step a cancellation removes, and
-    /// `termination` the record of the outcome the settlement writes.
-    ///
-    /// The effects are pure: nothing is written and no state is
-    /// mutated here, so a caller that builds them and then commits a
-    /// non-terminal outcome leaves no trace. A settlement that fails
-    /// redelivers the step, which re-terminates and rebuilds the same
-    /// effects.
-    pub(crate) fn terminate_collecting_effects(
-        &self,
-        outcome: &RunOutcome,
-        terminal_step: &ClaimedStep<'_>,
-        termination: DurableTermination,
-    ) -> SettlementEffects {
-        let kv_deletes = vec![run_kv_key(&outcome.run_id), step_kv_key(&outcome.run_id)];
-        let mut kv_writes = HashMap::new();
-        kv_writes.insert(
-            outcome_kv_key(&outcome.run_id),
-            durable::encode(&termination),
-        );
-        if self.core.memo_retention.is_some() {
-            kv_writes.insert(
-                terminal_kv_key(&outcome.run_id, termination.terminated_at_ms),
-                Vec::new(),
-            );
-        }
-        if let Some(membership) = &terminal_step.membership {
-            kv_writes.insert(
-                membership.kv_key(),
-                durable::encode(&terminated_member(&outcome.run_id, termination)),
-            );
-        }
-        let enqueues = if self.terminal_hook.observes(outcome) {
-            vec![
-                self.core
-                    .notification_enqueue_request(outcome, Some(terminal_step.job)),
-            ]
-        } else {
-            Vec::new()
-        };
-        SettlementEffects::default()
-            .enqueues(enqueues)
-            .kv_writes(kv_writes)
-            .kv_deletes(kv_deletes)
-    }
-
-    /// Terminate every run whose step job the queue dead-lettered
-    /// outside the worker path: a lease that expired past the attempt
-    /// limit, or a claim dead-lettered by crash recovery when the queue
-    /// was opened. Such a settlement runs no workflow code, so the run
-    /// record and the current-step pointer survive it and no
-    /// notification is enqueued. A dead step job that the run's
-    /// current-step pointer names identifies the case exactly, because
-    /// every worker-path dead-letter deletes the pointer in its own
-    /// transaction and a re-submission of the run id names a new job.
-    /// The run terminates as [`TerminalStatus::Failed`] with the queue record's
-    /// last error, through the same effects as a worker-path
-    /// termination committed as one transaction with no transition of
-    /// their own; the runner's failure writes cannot apply, since no
-    /// runner returned. Returns the number of runs terminated.
-    pub(crate) async fn reconcile_dead_steps(&self) -> Result<usize> {
-        const PAGE: usize = 256;
-        let core = &self.core;
-        let mut terminated = 0usize;
-        let mut dead = std::pin::pin!(core.queue.jobs(&core.queue_name, JobStatus::Dead, PAGE));
-        while let Some(job) = dead.try_next().await? {
-            if job.headers.contains_key(HEADER_TERMINAL) {
-                continue;
-            }
-            let Ok(claimed) = ClaimedStep::parse(&job) else {
-                continue;
-            };
-            let run_id = claimed.run_id.as_str();
-            let current = core.current_step_if_active(run_id).await?;
-            if current.is_none_or(|current| current.job_id != job.id) {
-                continue;
-            }
-            let error = job
-                .last_error
-                .clone()
-                .unwrap_or_else(|| "step dead-lettered outside the worker".to_string());
-            let outcome = claimed.failed(error);
-            let termination = core.termination(&outcome, None);
-            let effects = self.terminate_collecting_effects(&outcome, &claimed, termination);
-            core.queue.commit_effects(effects).await?;
-            warn!(run_id = %run_id, step_number = claimed.step_number, job_id = %job.id, "terminated a run whose step was dead-lettered outside the worker");
-            terminated += 1;
-        }
-        Ok(terminated)
-    }
-
-    /// The reconciliation loop: a pass when the worker starts, then a
-    /// pass whenever the queue's dead count has changed since the last
-    /// successful pass, checked every poll interval, until `stop` is
-    /// cancelled.
-    async fn run_dead_step_reconciliation(&self, stop: CancellationToken) {
-        let core = &self.core;
-        run_periodically(
-            core.poll_interval,
-            &stop,
-            None,
-            |reconciled_at: Option<i64>| async move {
-                match core.queue.stats(&core.queue_name).await {
-                    Ok(stats) if reconciled_at != Some(stats.dead) => {
-                        match self.reconcile_dead_steps().await {
-                            Ok(_) => Some(stats.dead),
-                            Err(err) => {
-                                warn!("dead-step reconciliation failed: {err}");
-                                reconciled_at
-                            }
-                        }
-                    }
-                    Ok(_) => reconciled_at,
-                    Err(err) => {
-                        warn!("dead-step reconciliation could not read queue stats: {err}");
-                        reconciled_at
-                    }
-                }
-            },
-        )
-        .await;
     }
 }
 
@@ -4423,7 +4446,7 @@ mod tests {
             .await
             .unwrap();
         assert!(again.newly_submitted);
-        assert_eq!(runtime.inner.reconcile_dead_steps().await.unwrap(), 0);
+        assert_eq!(runtime.inner.core.reconcile_dead_steps().await.unwrap(), 0);
         assert!(
             runtime.status("hung").await.unwrap().is_some(),
             "the re-submitted run is active"
@@ -4571,7 +4594,7 @@ mod tests {
                 .is_none(),
             "nothing terminates the run without a worker"
         );
-        assert_eq!(runtime.inner.reconcile_dead_steps().await.unwrap(), 1);
+        assert_eq!(runtime.inner.core.reconcile_dead_steps().await.unwrap(), 1);
         let end = tokio::time::timeout(Duration::from_secs(5), waiting)
             .await
             .expect("the wait resolved")
