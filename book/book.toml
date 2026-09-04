@@ -1,0 +1,12 @@
+[book]
+title = "Taquba: durable queues and workflows on object storage"
+authors = ["micllam"]
+language = "en"
+src = "src"
+description = "A guide to taquba and the crates built on it, covering usage, design and internals."
+
+[output.html]
+git-repository-url = "https://github.com/micllam/taquba"
+
+[output.html.playground]
+runnable = false
