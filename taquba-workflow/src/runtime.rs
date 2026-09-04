@@ -857,16 +857,15 @@ impl RuntimeCore {
         };
         // The pointer is deleted with the record; its absence here means
         // the run terminated between the two reads.
-        let Some(current) = self.current_step_if_active(run_id).await? else {
+        let Some((current, job)) = self.current_job(run_id).await? else {
             return self.terminated_status(run_id).await;
         };
         let state = if record.cancel_requested {
             RunState::Cancelling
+        } else if job.status == JobStatus::Claimed {
+            RunState::Running
         } else {
-            match self.queue.get_job(&current.job_id).await? {
-                Some(job) if job.status == JobStatus::Claimed => RunState::Running,
-                _ => RunState::Pending,
-            }
+            RunState::Pending
         };
         Ok(Some(RunStatus {
             run_id: run_id.to_string(),
@@ -915,18 +914,10 @@ impl RuntimeCore {
         // `Delivery::cancel_token`, while it runs. A step that settles in
         // between is followed to its successor; a step claimed after the
         // request terminates the run on its own.
-        let mut absent: Option<String> = None;
         loop {
-            let Some(current) = self.current_step_if_active(run_id).await? else {
+            let Some((_, job)) = self.current_job(run_id).await? else {
                 // Terminated on its own after the request was recorded.
                 return Ok(false);
-            };
-            let Some(job) = self.queue.get_job(&current.job_id).await? else {
-                if absent.as_deref() == Some(current.job_id.as_str()) {
-                    return Err(Error::InconsistentRunState(run_id.to_string()));
-                }
-                absent = Some(current.job_id);
-                continue;
             };
             if job.status == JobStatus::Dead {
                 // Dead-lettered by the queue outside the worker;
@@ -1109,6 +1100,31 @@ impl RuntimeCore {
         }
     }
 
+    /// The current step of `run_id` with its queue job; `None` when the
+    /// run is not active. The pointer and the job change in one
+    /// transaction, so a pointer that moved between the two reads is
+    /// followed, and a job missing under a pointer that a second read
+    /// still holds is a store the runtime did not write, reported as
+    /// [`Error::InconsistentRunState`].
+    pub(crate) async fn current_job(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<(DurableCurrentStep, JobRecord)>> {
+        let mut absent: Option<String> = None;
+        loop {
+            let Some(current) = self.current_step_if_active(run_id).await? else {
+                return Ok(None);
+            };
+            if let Some(job) = self.queue.get_job(&current.job_id).await? {
+                return Ok(Some((current, job)));
+            }
+            if absent.as_deref() == Some(current.job_id.as_str()) {
+                return Err(Error::InconsistentRunState(run_id.to_string()));
+            }
+            absent = Some(current.job_id);
+        }
+    }
+
     /// The terminal record of `run_id`; `None` when no record exists.
     async fn terminal_record(&self, run_id: &str) -> Result<Option<DurableTermination>> {
         match self.queue.kv_get(&outcome_kv_key(run_id)).await? {
@@ -1133,13 +1149,14 @@ impl RuntimeCore {
     /// dead-lettered outside the worker is polled at the poll interval
     /// until reconciliation terminates the run.
     pub(crate) async fn wait_run(&self, run_id: &str) -> Result<Option<RunEnd>> {
-        let mut absent_job: Option<String> = None;
         loop {
-            let Some(current) = self.current_step_if_active(run_id).await? else {
+            let Some((current, _)) = self.current_job(run_id).await? else {
                 return self.run_end(run_id).await;
             };
             match self.queue.wait_for_completion(&current.job_id).await? {
-                WaitOutcome::Done(_) | WaitOutcome::Cancelled => {}
+                // `NotFound`: the job settled between the two reads; the
+                // next read follows the pointer.
+                WaitOutcome::Done(_) | WaitOutcome::Cancelled | WaitOutcome::NotFound => {}
                 WaitOutcome::Dead(_) => {
                     // A worker-path dead-letter deletes the pointer with
                     // its settlement; a pointer that still names the dead
@@ -1152,15 +1169,6 @@ impl RuntimeCore {
                     if unreconciled {
                         tokio::time::sleep(self.poll_interval).await;
                     }
-                }
-                WaitOutcome::NotFound => {
-                    // The pointer and the job change in one transaction:
-                    // a second read of the same pointer over a missing
-                    // job is a store the runtime did not write.
-                    if absent_job.as_deref() == Some(current.job_id.as_str()) {
-                        return Err(Error::InconsistentRunState(run_id.to_string()));
-                    }
-                    absent_job = Some(current.job_id);
                 }
             }
         }
@@ -4617,6 +4625,37 @@ mod tests {
             end.termination,
             "the record is retained without memo retention",
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pointer_over_a_missing_job_is_an_inconsistent_run_state() {
+        let (queue, store) = open_queue().await;
+        let runtime =
+            WorkflowRuntime::builder(queue.clone(), store, UnreachableRunner, NoopTerminalHook)
+                .build();
+        let submitted = runtime
+            .submit(RunSpec {
+                run_id: Some("torn".into()),
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // The step job is removed without the runtime, so the pointer
+        // outlives it.
+        queue.cancel(&submitted.job_id).await.unwrap();
+        assert!(matches!(
+            runtime.status("torn").await,
+            Err(Error::InconsistentRunState(id)) if id == "torn"
+        ));
+        assert!(matches!(
+            runtime.wait("torn").await,
+            Err(Error::InconsistentRunState(id)) if id == "torn"
+        ));
+        assert!(matches!(
+            runtime.cancel("torn").await,
+            Err(Error::InconsistentRunState(id)) if id == "torn"
+        ));
     }
 
     #[tokio::test(start_paused = true)]

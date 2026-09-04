@@ -116,7 +116,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   durable. `WorkflowRuntime::status` and `jobs::JobHandle::status`
   return `Result<Option<RunStatus>>`, read from the run record, the
   current-step pointer and the step's queue job, so they answer after
-  a restart and from any runtime over the same queue.
+  a restart and from any runtime over the same queue; a pointer over a
+  missing job is `Error::InconsistentRunState`.
   `WorkflowRuntime::cancel` records the request on the run record
   (a new `cancel_requested` field, which changes the record's layout),
   reaches a run after a restart, and a step claimed after the request
