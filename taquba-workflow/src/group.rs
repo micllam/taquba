@@ -19,7 +19,7 @@ use crate::durable::{self, DurableMember, DurableTermination};
 use crate::error::{Error, Result};
 use crate::keys::{
     HEADER_GROUP, HEADER_GROUP_KEY, group_member_kv_key, group_members_kv_prefix,
-    group_terminal_kv_key, hex_sha256,
+    group_terminal_kv_key, hex_sha256, outcome_kv_key,
 };
 use crate::memo::MemoStore;
 use crate::runner::StepRunner;
@@ -217,36 +217,39 @@ impl GroupStore {
         Ok(members)
     }
 
-    /// Remove the state of `group_id`: the memo entries of every member
-    /// in its manifest, its member records and the manifest. A group
-    /// without a manifest has its member records removed and nothing
-    /// else.
+    /// Remove the state of `group_id`: the memo entries and the terminal
+    /// record of every member in its manifest, its member records and
+    /// the manifest. A group without a manifest has its member records
+    /// removed and nothing else.
     pub(crate) async fn forget(&self, group_id: &str) -> Result<()> {
+        let mut keys = Vec::new();
         if let Some(manifest) = self.read_manifest(group_id).await? {
             for member in &manifest.members {
-                self.memo_store
-                    .clear_memos_for_run(&member_run_id(group_id, &member.key))
-                    .await?;
+                let run_id = member_run_id(group_id, &member.key);
+                self.memo_store.clear_memos_for_run(&run_id).await?;
+                keys.push(outcome_kv_key(&run_id));
+                if keys.len() == MEMBER_PAGE_SIZE {
+                    self.delete_keys(std::mem::take(&mut keys)).await?;
+                }
             }
         }
         let prefix = group_members_kv_prefix(group_id);
         let mut entries = std::pin::pin!(self.queue.kv_entries(&prefix, MEMBER_PAGE_SIZE));
-        let mut keys = Vec::new();
         while let Some((key, _)) = entries.try_next().await? {
             keys.push(key);
             if keys.len() == MEMBER_PAGE_SIZE {
-                self.delete_members(std::mem::take(&mut keys)).await?;
+                self.delete_keys(std::mem::take(&mut keys)).await?;
             }
         }
         if !keys.is_empty() {
-            self.delete_members(keys).await?;
+            self.delete_keys(keys).await?;
         }
         self.objects.delete(&self.manifest_path(group_id)).await?;
         Ok(())
     }
 
-    /// Delete the member records under `keys` in one transaction.
-    async fn delete_members(&self, keys: Vec<Vec<u8>>) -> Result<()> {
+    /// Delete the KV entries under `keys` in one transaction.
+    async fn delete_keys(&self, keys: Vec<Vec<u8>>) -> Result<()> {
         self.queue
             .commit_effects(SettlementEffects::default().kv_deletes(keys))
             .await?;
@@ -534,8 +537,9 @@ impl<R: StepRunner, H: TerminalHook> RunGroup<R, H> {
     }
 
     /// Remove the group's state: its manifest, member records and the
-    /// memo entries and run result records of its members. A later
-    /// [`submit`](Self::submit) under the same id starts from nothing.
+    /// memo entries, run result records and terminal records of its
+    /// members. A later [`submit`](Self::submit) under the same id
+    /// starts from nothing.
     pub async fn forget(&self) -> Result<()> {
         self.store().forget(&self.id).await
     }
@@ -755,5 +759,64 @@ mod tests {
             group.manifest().await,
             Err(Error::GroupNotFound(_))
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_group_sweep_removes_the_members_records_with_the_group() {
+        let (queue, store, clock) = open_queue_at(10_000).await;
+        let runtime =
+            WorkflowRuntime::builder(queue.clone(), store.clone(), TwoSteps, NoopTerminalHook)
+                .group_retention(Duration::from_secs(1))
+                .build();
+        let group = runtime.group("g").unwrap();
+        group
+            .submit(vec![member("a")], &RunOptions::default())
+            .await
+            .unwrap();
+        let run_id = member_run_id("g", "a");
+        assert_eq!(group.cancel().await.unwrap(), 1);
+        let memos = crate::memo::MemoStore::new(store, "workflow-memo");
+        memos.new_run_memo(&run_id).put("k", b"v").await.unwrap();
+        let results: Vec<MemberResult> =
+            group.results().await.unwrap().try_collect().await.unwrap();
+        assert_eq!(results.len(), 1);
+        let marker = group_terminal_kv_key("g", 10_000);
+        assert!(
+            queue.kv_get(&marker).await.unwrap().is_some(),
+            "the marker is written when the last termination is observed"
+        );
+        let terminal_record = outcome_kv_key(&run_id);
+        assert!(queue.kv_get(&terminal_record).await.unwrap().is_some());
+
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(
+            runtime.inner.core.sweep_once().await.unwrap(),
+            0,
+            "the marker is not yet expired"
+        );
+        clock.advance(Duration::from_millis(1));
+        assert_eq!(runtime.inner.core.sweep_once().await.unwrap(), 1);
+        assert!(queue.kv_get(&marker).await.unwrap().is_none());
+        assert!(group.members().await.unwrap().is_empty());
+        assert!(matches!(
+            group.manifest().await,
+            Err(Error::GroupNotFound(_))
+        ));
+        assert!(
+            queue.kv_get(&terminal_record).await.unwrap().is_none(),
+            "the member's terminal record is removed with the group"
+        );
+        assert!(
+            memos
+                .new_run_memo(&run_id)
+                .get("k")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            runtime.status(&run_id).await.unwrap().is_none(),
+            "nothing of the member remains"
+        );
     }
 }

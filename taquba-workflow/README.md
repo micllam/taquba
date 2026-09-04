@@ -356,7 +356,8 @@ The group's durable state is the manifest in the object store and one
 member record per key under `workflow/groups/` in the queue's key-value
 namespace, written with the member's submission and rewritten with its
 status and error by the settlement that terminates it.
-`RunGroup::forget` removes it and `WorkflowRuntimeBuilder::group_retention`
+`RunGroup::forget` removes it with the members' memo entries and
+terminal records, and `WorkflowRuntimeBuilder::group_retention`
 removes it a window after a `RunGroup::results` consumer observed the
 last termination, through a sweep over `workflow/group-terminals/`; a
 group whose results are never consumed is retained until it is

@@ -333,7 +333,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     }
 
     /// Remove a [`RunGroup`]'s state (its manifest, member records and
-    /// the memo entries of its members) `retention` after a
+    /// the memo entries and terminal records of its members) `retention` after a
     /// [`RunGroup::results`] consumer observed the last member's
     /// termination, through a sweep when the worker starts and on every
     /// retention interval after that. When unset (default), no group
