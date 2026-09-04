@@ -106,7 +106,7 @@ impl<J: Job> JobGroup<J> {
             let member = member?;
             Ok(GroupResult {
                 key: member.key,
-                result: decode_end::<J>(Some(member.termination), member.outcome)?,
+                result: decode_end::<J>(member.termination, member.outcome)?,
             })
         }))
     }

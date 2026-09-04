@@ -52,9 +52,10 @@ pub(crate) struct Inner {
 }
 
 impl Inner {
-    /// The run result record of `run_id`, if one exists.
-    pub(crate) async fn run_result(&self, run_id: &str) -> Result<Option<RunResult>> {
-        self.runtime.inner.core.run_result(run_id).await
+    /// The run result record of the terminated run `run_id`, when the
+    /// worker that terminated it wrote one.
+    pub(crate) async fn recorded_result(&self, run_id: &str) -> Result<Option<RunResult>> {
+        self.runtime.inner.core.recorded_result(run_id).await
     }
 
     /// Spawn the worker. Panics on a second call: the runtime is
@@ -94,7 +95,7 @@ impl Inner {
         // which outlives the run record the workflow deletes at
         // termination.
         if let Some(run_id) = &run_id
-            && let Some(result) = self.run_result(run_id).await?
+            && let Some(result) = self.recorded_result(run_id).await?
         {
             if result.input_hash != hash_input(&payload) {
                 return Err(crate::Error::InputMismatch(run_id.clone()));

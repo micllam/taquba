@@ -23,9 +23,7 @@ use crate::keys::{
 };
 use crate::memo::MemoStore;
 use crate::runner::StepRunner;
-use crate::runtime::{
-    RunOptions, RunResult, RunSpec, RunTermination, RuntimeCore, WorkflowRuntime,
-};
+use crate::runtime::{RunOptions, RunSpec, RunTermination, RuntimeCore, WorkflowRuntime};
 use crate::sweep::Clearable;
 use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
 
@@ -438,32 +436,23 @@ impl<R: StepRunner, H: TerminalHook> RunGroup<R, H> {
             let group = group.clone();
             async move {
                 let member = member?;
-                let outcome = group.recorded_result(&member).await?;
-                let termination = member
+                let termination: RunTermination = member
                     .record
                     .terminated
-                    .ok_or_else(|| Error::InconsistentRunState(member.record.run_id.clone()))?;
+                    .ok_or_else(|| Error::InconsistentRunState(member.record.run_id.clone()))?
+                    .into();
+                let outcome = group
+                    .core()
+                    .run_result_of(&member.record.run_id, &termination)
+                    .await?;
                 Ok(MemberResult {
                     key: member.key,
                     run_id: member.record.run_id,
-                    termination: termination.into(),
+                    termination,
                     outcome: outcome.map(|result| result.outcome),
                 })
             }
         }))
-    }
-
-    /// The run result record of a terminated member, when the worker
-    /// that terminated it wrote one. The record must belong to the
-    /// member record's termination: a record outlives a re-submission
-    /// of the member until the next termination overwrites it.
-    async fn recorded_result(&self, member: &MemberState) -> Result<Option<RunResult>> {
-        let termination = member.record.terminated.clone().map(RunTermination::from);
-        Ok(self
-            .core()
-            .run_result(&member.record.run_id)
-            .await?
-            .filter(|result| Some(&result.termination) == termination.as_ref()))
     }
 
     /// The group's durable state. Returns [`Error::GroupNotFound`] for a
@@ -734,6 +723,7 @@ mod tests {
                 status: TerminalStatus::Cancelled,
                 error: None,
                 error_kind: None,
+                final_step: 0,
                 terminated_at_ms: 10_000,
             }
         );

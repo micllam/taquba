@@ -164,14 +164,15 @@ state.
 queue job into a `RunStatus` (`Pending`, `Running` or `Cancelling`,
 with the current step number), so it answers after a restart and from
 any runtime over the same queue. A terminated run reports
-`RunState::Terminated` with its status, error, error kind and time of
-termination, read from the terminal record written with the terminating
+`RunState::Terminated` with its status, error, error kind, final step
+and time of termination, read from the terminal record written with the terminating
 settlement, which [Memo retention](#memo-retention) removes with the
 run's memo entries.
 
 `WorkflowRuntime::wait` waits until a run terminates, following its
-current step across steps, and reports a `RunEnd`: the termination and
-the committed outcome, each when a record of it remains. A run already
+current step across steps, and reports a `RunEnd`: the termination from
+the run's terminal record and the committed outcome, when the worker
+that terminated the run recorded one. A run already
 terminated is reported at once, and `WorkflowRuntime::wait_timeout`
 bounds the wait. The wait relies on the queue's in-process completion
 notification, so it runs in the process that runs the worker.
@@ -182,8 +183,10 @@ final step) from the run result record the worker writes to the run's
 memo, under the reserved key `workflow.outcome`, before every
 terminating settlement it performs. A run terminated without a worker (a
 cancellation of a pending step, a step dead-lettered outside the worker)
-has no record. The record is removed with the run's memo entries by the
-memo sweep.
+has no record. A record belongs to the termination the run's terminal
+record describes, so a re-submission of a terminated run id does not
+report the earlier run's record. The record is removed with the run's
+memo entries by the memo sweep.
 
 ## Cancellation
 

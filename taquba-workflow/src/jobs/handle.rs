@@ -122,11 +122,9 @@ impl<J: Job> JobHandle<J> {
     ///
     /// Reads from object storage, so it works across process restarts.
     pub async fn fetch_result(&self) -> Result<Option<std::result::Result<J::Output, JobError>>> {
-        match self.inner.run_result(&self.id).await? {
+        match self.inner.recorded_result(&self.id).await? {
             None => Ok(None),
-            Some(result) => {
-                decode_end::<J>(Some(result.termination), Some(result.outcome)).map(Some)
-            }
+            Some(result) => decode_end::<J>(result.termination, Some(result.outcome)).map(Some),
         }
     }
 
@@ -165,7 +163,7 @@ impl<J: Job> JobHandle<J> {
 /// succeeded job, or the [`JobError`] of one that failed, was cancelled
 /// or terminated without recording an outcome.
 pub(crate) fn decode_end<J: Job>(
-    termination: Option<RunTermination>,
+    termination: RunTermination,
     outcome: Option<RunOutcome>,
 ) -> Result<std::result::Result<J::Output, JobError>> {
     if let Some(outcome) = outcome
@@ -174,23 +172,15 @@ pub(crate) fn decode_end<J: Job>(
         let output = outcome.result.unwrap_or_default();
         return Ok(Ok(rmp_serde::from_slice(&output)?));
     }
-    let (status, error, kind) = match termination {
-        Some(termination) => (
-            Some(termination.status),
-            termination.error,
-            termination.error_kind,
-        ),
-        None => (None, None, None),
-    };
-    let message = error.unwrap_or_else(|| {
-        match status {
-            Some(TerminalStatus::Cancelled) => "job cancelled",
+    let message = termination.error.unwrap_or_else(|| {
+        match termination.status {
+            TerminalStatus::Cancelled => "job cancelled",
             _ => "job terminated without recording an outcome",
         }
         .to_string()
     });
     Ok(Err(JobError {
-        kind: kind.unwrap_or(StepErrorKind::Transient),
+        kind: termination.error_kind.unwrap_or(StepErrorKind::Transient),
         message,
     }))
 }

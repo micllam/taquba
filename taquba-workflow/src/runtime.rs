@@ -178,6 +178,7 @@ pub enum RunState {
 
 /// A run result record as read back: the committed outcome, the hash
 /// of the run's input and the termination the record belongs to.
+#[derive(Debug, Clone)]
 pub(crate) struct RunResult {
     pub(crate) input_hash: [u8; 32],
     pub(crate) termination: RunTermination,
@@ -200,6 +201,8 @@ pub struct RunTermination {
     /// `None` for a success, a cancellation and a termination outside
     /// the worker.
     pub error_kind: Option<StepErrorKind>,
+    /// The number of the step whose settlement terminated the run.
+    pub final_step: u32,
     /// The runtime clock's time at the terminating settlement, in
     /// milliseconds since the Unix epoch.
     pub terminated_at_ms: u64,
@@ -211,6 +214,7 @@ impl From<DurableTermination> for RunTermination {
             status: record.status.into(),
             error: record.error,
             error_kind: record.error_kind.map(Into::into),
+            final_step: record.final_step,
             terminated_at_ms: record.terminated_at_ms,
         }
     }
@@ -220,9 +224,8 @@ impl From<DurableTermination> for RunTermination {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct RunEnd {
-    /// The run's termination, from its terminal record; `None` once the
-    /// memo sweep has removed it.
-    pub termination: Option<RunTermination>,
+    /// The run's termination, from its terminal record.
+    pub termination: RunTermination,
     /// The committed outcome, when the worker that terminated the run
     /// recorded one; see [`WorkflowRuntime::outcome`].
     pub outcome: Option<RunOutcome>,
@@ -704,12 +707,17 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// memo entries; `None` for a run that is unknown, still active or
     /// was terminated without a worker (a cancellation of a pending
     /// step, a dead-letter outside the worker), whose status
-    /// [`Self::status`] reports.
+    /// [`Self::status`] reports. A record belongs to the termination
+    /// its terminal record describes: a re-submission of a terminated
+    /// run id leaves the earlier run's record in place until its own
+    /// termination overwrites it, and such a record is not reported.
     pub async fn outcome(&self, run_id: &str) -> Result<Option<RunOutcome>> {
-        Ok(self
-            .inner
-            .core
-            .run_result(run_id)
+        let core = &self.inner.core;
+        if core.current_step_if_active(run_id).await?.is_some() {
+            return Ok(None);
+        }
+        Ok(core
+            .recorded_result(run_id)
             .await?
             .map(|result| result.outcome))
     }
@@ -1002,26 +1010,53 @@ impl RuntimeCore {
     }
 
     /// The end of the terminated run `run_id` from its terminal record
-    /// and its run result record; `None` when neither remains.
+    /// and the run result record of that termination; `None` when no
+    /// terminal record remains.
     async fn run_end(&self, run_id: &str) -> Result<Option<RunEnd>> {
-        let result = self.run_result(run_id).await?;
-        let termination = match self.terminal_record(run_id).await? {
-            Some(record) => Some(record.into()),
-            None => result.as_ref().map(|result| result.termination.clone()),
-        };
-        let outcome = result.map(|result| result.outcome);
-        if termination.is_none() && outcome.is_none() {
+        let Some(termination) = self.terminal_record(run_id).await? else {
             return Ok(None);
-        }
+        };
+        let termination = RunTermination::from(termination);
+        let outcome = self
+            .run_result_of(run_id, &termination)
+            .await?
+            .map(|result| result.outcome);
         Ok(Some(RunEnd {
             termination,
             outcome,
         }))
     }
 
-    /// The run result record of `run_id`; a record that fails to decode
-    /// is treated as absent.
-    pub(crate) async fn run_result(&self, run_id: &str) -> Result<Option<RunResult>> {
+    /// The run result record of the termination `run_id`'s terminal
+    /// record describes; `None` when no terminal record remains or the
+    /// worker that terminated the run wrote no record.
+    pub(crate) async fn recorded_result(&self, run_id: &str) -> Result<Option<RunResult>> {
+        match self.terminal_record(run_id).await? {
+            Some(termination) => self.run_result_of(run_id, &termination.into()).await,
+            None => Ok(None),
+        }
+    }
+
+    /// The run result record of `run_id` when it belongs to
+    /// `termination`. A record outlives a re-submission of the run id
+    /// until the next termination overwrites it, and a record written
+    /// before a settlement that did not commit outlives the termination
+    /// that followed, so a record of another termination is not
+    /// reported.
+    pub(crate) async fn run_result_of(
+        &self,
+        run_id: &str,
+        termination: &RunTermination,
+    ) -> Result<Option<RunResult>> {
+        Ok(self
+            .run_result(run_id)
+            .await?
+            .filter(|result| result.termination == *termination))
+    }
+
+    /// The run result record of `run_id`, whichever termination it
+    /// belongs to; a record that fails to decode is treated as absent.
+    async fn run_result(&self, run_id: &str) -> Result<Option<RunResult>> {
         let Some(bytes) = self
             .memo_store
             .new_run_memo(run_id)
@@ -1031,19 +1066,11 @@ impl RuntimeCore {
             return Ok(None);
         };
         match rmp_serde::from_slice::<DurableRunResult>(&bytes) {
-            Ok(record) => {
-                let outcome = RunOutcome::from(record.outcome);
-                Ok(Some(RunResult {
-                    input_hash: record.input_hash,
-                    termination: RunTermination {
-                        status: outcome.status,
-                        error: outcome.error.clone(),
-                        error_kind: record.error_kind.map(Into::into),
-                        terminated_at_ms: record.terminated_at_ms,
-                    },
-                    outcome,
-                }))
-            }
+            Ok(record) => Ok(Some(RunResult {
+                input_hash: record.input_hash,
+                termination: record.termination.into(),
+                outcome: record.outcome.into(),
+            })),
             Err(err) => {
                 warn!(run_id, error = %err, "run result record failed to decode; treated as absent");
                 Ok(None)
@@ -1076,8 +1103,7 @@ impl RuntimeCore {
     ) -> Result<()> {
         let record = DurableRunResult {
             input_hash,
-            terminated_at_ms: termination.terminated_at_ms,
-            error_kind: termination.error_kind,
+            termination: termination.clone(),
             outcome: DurableRunOutcome::from(outcome),
         };
         self.memo_store
@@ -3083,6 +3109,7 @@ mod tests {
                 status: TerminalStatus::Cancelled,
                 error: None,
                 error_kind: None,
+                final_step: 0,
                 terminated_at_ms: 10_000,
             }),
             "the terminal record commits with the removal",
@@ -4441,13 +4468,69 @@ mod tests {
             (outcome.final_step, outcome.result.as_deref()),
             (1, Some(b"done".as_slice()))
         );
-        let termination = end.termination.expect("from the run result record");
-        assert_eq!(termination.status, TerminalStatus::Succeeded);
+        assert_eq!(
+            (end.termination.status, end.termination.final_step),
+            (TerminalStatus::Succeeded, 1)
+        );
 
         // A run already terminated is reported at once.
         let again = runtime.wait("two").await.unwrap();
-        assert_eq!(again.termination, Some(termination));
+        assert_eq!(again.termination, end.termination);
         let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_result_record_of_an_earlier_run_is_not_reported_for_a_re_submitted_run_id() {
+        let (queue, store, clock) = open_queue_at(10_000).await;
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            FixedRunner::new(Ok(StepOutcome::Succeed {
+                result: b"done".to_vec(),
+            })),
+            NoopTerminalHook,
+        )
+        .build();
+        let spec = RunSpec {
+            run_id: Some("again".into()),
+            input: b"x".to_vec(),
+            ..Default::default()
+        };
+        runtime.submit(spec.clone()).await.unwrap();
+        let claim = queue
+            .claim("workflow-steps", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let effects = runtime
+            .inner
+            .process_step(&claim, &LeaseHandle::detached())
+            .await
+            .unwrap();
+        queue.ack_with(&claim, effects).await.unwrap();
+        let first = runtime.wait("again").await.unwrap();
+        assert_eq!(first.termination.status, TerminalStatus::Succeeded);
+        assert!(first.outcome.is_some());
+
+        // The run id is submitted again: the earlier run's records
+        // remain until the new run's termination overwrites them.
+        clock.advance(Duration::from_secs(1));
+        assert!(runtime.submit(spec).await.unwrap().newly_submitted);
+        assert!(
+            runtime.outcome("again").await.unwrap().is_none(),
+            "the run is active"
+        );
+        assert!(runtime.cancel("again").await.unwrap());
+        let end = runtime.wait("again").await.unwrap();
+        assert_eq!(
+            (end.termination.status, end.termination.terminated_at_ms),
+            (TerminalStatus::Cancelled, 11_000)
+        );
+        assert!(
+            end.outcome.is_none(),
+            "no worker terminated the new run, so the earlier run's record is not its outcome"
+        );
+        assert!(runtime.outcome("again").await.unwrap().is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -4496,12 +4579,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             end.termination,
-            Some(RunTermination {
+            RunTermination {
                 status: TerminalStatus::Failed,
                 error: Some("hung".into()),
                 error_kind: None,
+                final_step: 0,
                 terminated_at_ms: 10_000,
-            }),
+            },
             "the termination is read from the terminal record",
         );
         assert!(end.outcome.is_none());
