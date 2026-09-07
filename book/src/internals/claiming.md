@@ -181,8 +181,8 @@ job can be scheduled and claimed again before its flush completes. A crash in
 that window loses the settlement and the new claim together, and the job is
 delivered once more at the next open.
 
-After the commit the queue removes the lease registry entry if its token still
-matches the claim's. The condition covers the gap between the commit and the
+After the commit the queue removes the lease registry entry if its claim id
+still matches the claim's. The condition covers the gap between the commit and the
 removal, in which the job can be claimed again:
 
 ```text
@@ -190,7 +190,7 @@ settlement commits     the job is scheduled or pending again
   │
   │  a new claim of the job replaces the registry entry with its own
   │
-removal runs           the entry's token is the new claim's, so the
+removal runs           the entry's claim id is the new claim's, so the
                        removal leaves it in place
 ```
 
@@ -203,11 +203,11 @@ current one. Every settlement begins by ending the claim, in
 `txn::take_claim`, which performs three checks. Each check catches a different
 case.
 
-- **The registry token must match.** This check rejects a settlement that a
+- **The registry claim id must match.** This check rejects a settlement that a
   re-claim superseded. The presence of the key cannot do the same. A reap and a
   re-claim rewrite the same claimed key, and that key then looks untouched.
 - **The claimed record is read inside the transaction.** A settlement that
-  begins while the registry lags the store passes the token check. It began
+  begins while the registry lags the store passes the claim id check. It began
   after the commit that ended its claim, so it does not conflict with anything. The read
   catches it, because the record is gone.
 - **The claimed key is deleted in the transaction.** SlateDB's snapshot

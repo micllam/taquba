@@ -64,22 +64,22 @@ impl QueueCore {
         self.clock.now_ms()
     }
 
-    /// Complete a claim-ending transition after its commit: remove the
-    /// lease entry, fenced on `token`; record the pending insert; delete
-    /// the payload object of a done job whose record was not kept; and
-    /// deliver a terminal outcome to the job's completion waiters. The
-    /// delivered record carries its payload inline, taken from `claim`
-    /// when one is given and otherwise fetched from the payload store,
-    /// only when the job has waiters.
+    /// Complete a claim-ending transition after its commit. It removes
+    /// the lease entry, fenced on `claim_id`, records the pending insert,
+    /// deletes the payload object of a done job whose record was not kept
+    /// and delivers a terminal outcome to the job's completion waiters.
+    /// The delivered record includes its payload inline, taken from
+    /// `claim` when one is given and otherwise fetched from the payload
+    /// store, only when the job has waiters.
     pub(crate) async fn finish_claim_end(
         &self,
         job: &JobRecord,
         end: &ClaimEnd<'_>,
-        token: u64,
+        claim_id: u64,
         pending_key: Option<&[u8]>,
         claim: Option<&Claim>,
     ) {
-        self.lease_registry.remove(&job.queue, &job.id, token);
+        self.lease_registry.remove(&job.queue, &job.id, claim_id);
         if let Some(key) = pending_key {
             self.claim_cursor.note_pending_insert(&job.queue, key);
         }

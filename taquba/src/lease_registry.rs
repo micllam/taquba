@@ -1,5 +1,5 @@
 //! In-memory registry of claimed jobs' leases: the authoritative source
-//! of every claim's current expiry, claim token and cancellation token.
+//! of every claim's current expiry, claim id and cancellation token.
 //!
 //! Lease state is process state, not durable state. The queue is
 //! single-writer and single-process, so every path that consults or
@@ -16,7 +16,7 @@
 //! finds no claimed record under it), while a missing entry would leave
 //! its claim invisible to the reaper until the next open.
 //! And an entry is removed only after the transaction ending its claim
-//! has committed, fenced on the claim token, so a removal that runs
+//! has committed, fenced on the claim id, so a removal that runs
 //! after a re-claim of the same job cannot delete the new claim's
 //! entry.
 //!
@@ -58,12 +58,12 @@ pub(crate) struct DueLease {
     pub(crate) queue: String,
     pub(crate) id: String,
     pub(crate) expires_at: u64,
-    pub(crate) token: u64,
+    pub(crate) claim_id: u64,
 }
 
 struct Entry {
     expires_at: u64,
-    token: u64,
+    claim_id: u64,
     /// The claim's cooperative cancellation token, fired by
     /// [`LeaseRegistry::cancel`].
     cancel: CancellationToken,
@@ -104,7 +104,7 @@ impl LeaseRegistry {
         queue: &str,
         id: &str,
         expires_at: u64,
-        token: u64,
+        claim_id: u64,
         cancel: CancellationToken,
     ) {
         let mut inner = self.lock();
@@ -122,7 +122,7 @@ impl LeaseRegistry {
             key,
             Entry {
                 expires_at,
-                token,
+                claim_id,
                 cancel,
                 reaping: false,
             },
@@ -138,14 +138,14 @@ impl LeaseRegistry {
         &self,
         queue: &str,
         id: &str,
-        token: u64,
+        claim_id: u64,
         expires_at: u64,
         mode: Renewal,
     ) -> Result<bool> {
         let mut inner = self.lock();
         let key = (queue.to_string(), id.to_string());
         let old_expires = match inner.by_job.get(&key) {
-            Some(e) if e.token == token && !e.reaping => e.expires_at,
+            Some(e) if e.claim_id == claim_id && !e.reaping => e.expires_at,
             _ => return Err(Error::ClaimLost),
         };
         if old_expires == expires_at
@@ -167,13 +167,13 @@ impl LeaseRegistry {
         Ok(true)
     }
 
-    /// The job's current expiry and claim token, or `None` when it
+    /// The job's current expiry and claim id, or `None` when it
     /// holds no lease.
     pub(crate) fn current(&self, queue: &str, id: &str) -> Option<(u64, u64)> {
         self.lock()
             .by_job
             .get(&(queue.to_string(), id.to_string()))
-            .map(|e| (e.expires_at, e.token))
+            .map(|e| (e.expires_at, e.claim_id))
     }
 
     /// Fire the cancellation token of the claim currently holding the
@@ -220,24 +220,24 @@ impl LeaseRegistry {
                 queue: key.0,
                 id: key.1,
                 expires_at,
-                token: entry.token,
+                claim_id: entry.claim_id,
             });
         }
         due
     }
 
-    /// Remove the job's entry if it still belongs to the claim `token`
+    /// Remove the job's entry if it still belongs to the claim `claim_id`
     /// identifies. Called after the transaction ending the claim has
     /// committed; the fence makes a removal that runs after a re-claim
     /// of the same job a no-op, leaving the new claim's entry in
     /// place.
-    pub(crate) fn remove(&self, queue: &str, id: &str, token: u64) {
+    pub(crate) fn remove(&self, queue: &str, id: &str, claim_id: u64) {
         let mut inner = self.lock();
         let key = (queue.to_string(), id.to_string());
         let Some(entry) = inner.by_job.get(&key) else {
             return;
         };
-        if entry.token != token {
+        if entry.claim_id != claim_id {
             return;
         }
         let expires_at = entry.expires_at;
@@ -313,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn renewal_is_refused_for_a_stale_token_and_for_a_marked_entry() {
+    fn renewal_is_refused_for_a_stale_claim_id_and_for_a_marked_entry() {
         let registry = LeaseRegistry::new();
         registry.insert("q", "a", 10, 1, CancellationToken::new());
         assert!(registry.renew("q", "a", 2, 40, Renewal::Set).is_err());
@@ -324,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn removal_is_fenced_on_the_token() {
+    fn removal_is_fenced_on_the_claim_id() {
         let registry = LeaseRegistry::new();
         registry.insert("q", "a", 10, 1, CancellationToken::new());
         registry.remove("q", "a", 2);
@@ -475,7 +475,7 @@ mod tests {
         let renewed = q.renew_lease(&job, Duration::from_secs(60)).unwrap();
         assert_eq!(q.lease_expiry("work", &job.id), Some(renewed));
 
-        // The claim taken before the renewal keeps its token, so it
+        // The claim taken before the renewal keeps its claim id, so it
         // still settles the delivery.
         q.ack(&job).await.unwrap();
 
@@ -508,7 +508,7 @@ mod tests {
         q.reap_now().await.unwrap();
 
         // The re-claim writes the same claimed key the stale copy names,
-        // so only the claim token separates the two deliveries.
+        // so only the claim id separates the two deliveries.
         let fresh = q
             .claim("work", Duration::from_secs(30))
             .await
@@ -594,14 +594,14 @@ mod tests {
 
         // The registry lags the store: an entry is removed only after
         // the commit that ends its claim, so a settlement transaction
-        // begun inside that lag passes the token check and conflicts
+        // begun inside that lag passes the claim id check and conflicts
         // with nothing. Recreate the lagging entry and require the
         // in-transaction record read to reject the settlement.
         q.core.lease_registry.insert(
             "work",
             &claim.id,
             clock.now_ms() + 30_000,
-            claim.token(),
+            claim.claim_id(),
             claim.cancel_token().clone(),
         );
         assert!(matches!(

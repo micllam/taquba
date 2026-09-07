@@ -36,7 +36,7 @@ pub enum Error {
     /// job was settled already. Retrying with the same record cannot
     /// succeed; a redelivered attempt settles the job instead. A record
     /// taken before a lease renewal is not stale, because the renewal
-    /// leaves the claim token unchanged.
+    /// leaves the claim id unchanged.
     #[error("job claim is no longer held")]
     ClaimLost,
 

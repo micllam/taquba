@@ -120,8 +120,8 @@ pub struct JobRecord {
     pub cancel_requested: bool,
 }
 
-/// A held claim on a job: the record as it was delivered, the token
-/// identifying this delivery and the delivery's cancellation token.
+/// A held claim on a job: the record as it was delivered, the claim id
+/// that identifies this delivery and the delivery's cancellation token.
 ///
 /// Produced only by the `Queue::claim*` calls, and required by
 /// [`Queue::ack`](crate::Queue::ack),
@@ -133,11 +133,11 @@ pub struct JobRecord {
 /// [`Queue::list_jobs`](crate::Queue::list_jobs) therefore cannot settle
 /// a delivery the caller does not hold.
 ///
-/// The token is unique per claim but not ordered, so it identifies a
+/// The claim id is unique per claim but not ordered, so it identifies a
 /// delivery without ranking it. It fences settlement against the queue's
-/// own state and is deliberately not exposed: it would not serve as a
-/// fencing token against an external system, which needs monotonicity to
-/// reject a stale writer.
+/// own state and is deliberately not exposed: it is not a fencing token
+/// for an external system, which needs monotonicity to reject a stale
+/// writer.
 ///
 /// Dereferences to the claimed [`JobRecord`], so a caller reads
 /// `claim.payload` and `claim.id` directly.
@@ -163,17 +163,21 @@ pub struct JobRecord {
 #[derive(Debug)]
 pub struct Claim {
     job: JobRecord,
-    token: u64,
+    claim_id: u64,
     cancel: CancellationToken,
 }
 
 impl Claim {
-    pub(crate) fn new(job: JobRecord, token: u64, cancel: CancellationToken) -> Self {
-        Claim { job, token, cancel }
+    pub(crate) fn new(job: JobRecord, claim_id: u64, cancel: CancellationToken) -> Self {
+        Claim {
+            job,
+            claim_id,
+            cancel,
+        }
     }
 
-    pub(crate) fn token(&self) -> u64 {
-        self.token
+    pub(crate) fn claim_id(&self) -> u64 {
+        self.claim_id
     }
 
     /// The delivery's cooperative cancellation token, fired by
@@ -196,7 +200,7 @@ impl Claim {
         &self.job
     }
 
-    /// Consume the claim and return the record, discarding the token.
+    /// Consume the claim and return the record, discarding the claim id.
     /// The record can no longer settle the delivery.
     pub fn into_job(self) -> JobRecord {
         self.job

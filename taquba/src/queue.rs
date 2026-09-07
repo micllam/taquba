@@ -166,12 +166,12 @@ impl EnqueueResult {
     }
 }
 
-/// Generate a claim token. A ULID's low 64 bits fall inside its 80-bit
-/// random component, so tokens are distinct across claims of the same
+/// Generate a claim id. A ULID's low 64 bits fall inside its 80-bit
+/// random component, so claim ids are distinct across claims of the same
 /// job. The value identifies a claim and is not ordered, so it fences
 /// only against this queue's own state and is not a fencing token for
 /// anything outside it.
-fn new_claim_token() -> u64 {
+fn new_claim_id() -> u64 {
     Ulid::new().0 as u64
 }
 
@@ -404,7 +404,7 @@ impl Queue {
             self.core.clock.clone(),
             claim.queue.clone(),
             claim.id.clone(),
-            claim.token(),
+            claim.claim_id(),
             claim.cancel_token().clone(),
         )
     }
@@ -890,7 +890,7 @@ impl Queue {
                 // claim would try to delete a dedup index that may by now
                 // belong to a *different* job, corrupting the dedup invariant.
                 let dedup_key_to_release = job.dedup_key.take();
-                let token = new_claim_token();
+                let claim_id = new_claim_id();
                 let claimed = claimed_key(&job.queue, &job.id);
                 let value = job.stored_bytes()?;
 
@@ -912,13 +912,13 @@ impl Queue {
                     &job.queue,
                     &job.id,
                     lease_expires_at,
-                    token,
+                    claim_id,
                     cancel.clone(),
                 );
                 if let Some(dk) = dedup_key_to_release.as_deref() {
                     txn.delete(dedup_index_key(&job.queue, dk))?;
                 }
-                jobs.push(Claim::new(job, token, cancel));
+                jobs.push(Claim::new(job, claim_id, cancel));
             }
             let count = jobs.len() as i64;
             update_stats(
@@ -1117,7 +1117,7 @@ impl Queue {
         end_for: impl Fn(&JobRecord, u64) -> ClaimEnd<'e>,
     ) -> Result<(JobRecord, Option<Vec<EnqueueResult>>)> {
         let prepared = self.core.prepare_effects(effects).await?;
-        let token = claim.token();
+        let claim_id = claim.claim_id();
         let (queue, id) = (claim.queue.as_str(), claim.id.as_str());
 
         let settled: Result<SettledClaim<'e>> = async {
@@ -1126,7 +1126,8 @@ impl Queue {
                 // The returned record is the base for the written
                 // record; the claim's copy predates a cancel committed
                 // during the delivery.
-                let mut job = take_claim(&txn, &self.core.lease_registry, queue, id, token).await?;
+                let mut job =
+                    take_claim(&txn, &self.core.lease_registry, queue, id, claim_id).await?;
                 let now = self.now_ms();
                 let end = end_for(&job, now);
                 let pending_key = stage_claim_end(&txn, &mut job, &end, now)?;
@@ -1161,7 +1162,7 @@ impl Queue {
             .finish_claim_end(
                 &settled.job,
                 &settled.end,
-                token,
+                claim_id,
                 settled.pending_key.as_deref(),
                 Some(claim),
             )
@@ -1362,7 +1363,7 @@ impl Queue {
         if self.core.lease_registry.renew(
             &job.queue,
             &job.id,
-            claim.token(),
+            claim.claim_id(),
             new_expiry,
             Renewal::Set,
         )? {

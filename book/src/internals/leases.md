@@ -18,20 +18,20 @@ A `Claim` is the worker's side of the delivery. It contains three things:
 - The job record, as it was at the moment of the claim. The `Claim`
   dereferences to it, so a caller that only reads the payload and the headers
   treats it as a `JobRecord`.
-- The claim token, which identifies this one delivery.
+- The claim id, which identifies this one delivery.
 - The cancellation token, through which the queue cancels the processing of
   a claimed job.
 
-The two tokens are described in turn.
+The claim id and the cancellation token are described in turn.
 
-The claim token is 64 random bits that identify this one delivery. The queue
+The claim id is 64 random bits that identify this one delivery. The queue
 generates it at claim time and keeps a copy in memory, and at settlement it
 compares the two copies. A match proves that the caller's claim is still the
 live one. [The lease registry](#the-lease-registry) describes where the
 queue's copy is kept and how the comparison works.
 
 Every settlement takes a `&Claim`, and so does [`renew_lease`][renew_lease].
-Only `Queue::claim` and `claim_batch` create a `Claim`, and the token inside it
+Only `Queue::claim` and `claim_batch` create a `Claim`, and the claim id inside it
 is private. A worker can therefore settle only the claims it owns. A settlement
 that fails on a transient storage error keeps the `Claim` intact, so the caller
 retries with the same value.
@@ -116,13 +116,13 @@ the job is live now.
 
 The reaper and `Queue::cancel` reach a lease through the
 entry, because neither has the `Claim`. A settlement reaches it through the
-`Claim`, and the token is what joins the two parts.
+`Claim`, and the claim id is what joins the two parts.
 
 ```text
 worker task                          queue
 ┌─ Claim ─────────────────┐          ┌─ LeaseRegistry entry (queue, id) ─┐
 │ record                  │          │ expiry                            │
-│ token ──────────────────┼──────────┼ token                             │
+│ claim id ───────────────┼──────────┼ claim id                          │
 │ cancellation token ─────┼──────────┼ cancellation token                │
 └─────────────────────────┘          │ reaping mark                      │
                                      └───────────────────────────────────┘
@@ -131,17 +131,17 @@ reached through the Claim:           reached through the entry:
 ack, nack, dead_letter, renew_lease  the reaper, Queue::cancel
 ```
 
-The entry's copy of the claim token is the queue's record of which claim is
-live. A job that is claimed again after a failure gets a different token, so
-the copy inside an older `Claim` no longer matches. The token is never written
-to the store.
+The entry's copy of the claim id is the queue's record of which claim is
+live. A job that is claimed again after a failure gets a different claim id, so
+the copy inside an older `Claim` no longer matches. The claim id is never
+written to the store.
 
 Each field of the entry has its writer and its reader:
 
 | Field | Written by | Read by |
 | --- | --- | --- |
 | expiry | The claim sets it, and renewal extends it. | The reaper, which takes the entries that are due, soonest first, through a second index of the entries, ordered by expiry. |
-| token | The claim sets it. | Settlement, which compares it with the token in the `Claim` and refuses the settlement when the two differ. |
+| claim id | The claim sets it. | Settlement, which compares it with the claim id in the `Claim` and refuses the settlement when the two differ. |
 | cancellation token | The claim creates it. | `Queue::cancel`, which fires it, and the worker, which stops early when it fires. |
 | reaping mark | The reaper sets it when the entry is due. | Renewal, which refuses a marked entry. |
 
@@ -164,7 +164,7 @@ about that entry:
   again. A cancellation that arrives during the commit then does not find a
   token to fire.
 - The queue removes the entry only after the transaction that ends the claim
-  commits, and only if the entry's token matches the claim's. A removal that
+  commits, and only if the entry's claim id matches the claim's. A removal that
   runs after the job is claimed again does not remove anything, and the entry
   of the new claim stays in place.
 

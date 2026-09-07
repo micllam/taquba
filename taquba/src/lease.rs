@@ -38,7 +38,7 @@ struct Inner {
     clock: Arc<dyn Clock>,
     queue: String,
     id: String,
-    token: u64,
+    claim_id: u64,
 }
 
 impl LeaseHandle {
@@ -47,7 +47,7 @@ impl LeaseHandle {
         clock: Arc<dyn Clock>,
         queue: String,
         id: String,
-        token: u64,
+        claim_id: u64,
         cancel: CancellationToken,
     ) -> Self {
         Self {
@@ -56,7 +56,7 @@ impl LeaseHandle {
                 clock,
                 queue,
                 id,
-                token,
+                claim_id,
             }),
             cancel,
         }
@@ -110,7 +110,7 @@ impl LeaseHandle {
         if inner.registry.renew(
             &inner.queue,
             &inner.id,
-            inner.token,
+            inner.claim_id,
             needed,
             Renewal::Extend,
         )? {
@@ -190,7 +190,7 @@ mod tests {
             Err(Error::ClaimLost)
         ));
 
-        // A re-claim of the same job is a different token.
+        // A re-claim of the same job is a different claim id.
         registry.insert("q", "a", 1_030_000, 8, CancellationToken::new());
         assert!(matches!(
             handle.ensure_at_least(Duration::from_secs(10)),

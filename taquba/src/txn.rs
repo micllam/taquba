@@ -49,18 +49,18 @@ pub(crate) async fn get_indexed_job(
     Ok(Some((index_key, current_key, job)))
 }
 
-/// Verify that the job still holds the claim `token` identifies, stage
-/// the deletion of its record and return the stored record. Returns
-/// [`Error::ClaimLost`] when the claim has ended.
+/// Verify that the claim `claim_id` identifies is still the job's live
+/// claim, stage the deletion of its record and return the stored record.
+/// Returns [`Error::ClaimLost`] when the claim has ended.
 ///
 /// This is the fence every settlement passes through, in three parts.
-/// The registry token check rejects a settlement superseded by a
+/// The registry claim id check rejects a settlement superseded by a
 /// re-claim. The in-transaction record read rejects a settlement whose
 /// claim ended while its registry entry, removed only after the ending
 /// commit, was still present. The staged delete makes a settlement
 /// racing a concurrent requeue or re-claim a transaction conflict.
 /// Call it inside the retry loop so a retry re-runs both checks. A
-/// renewal changes neither the token nor the record, so a claim held
+/// renewal changes neither the claim id nor the record, so a claim held
 /// across one still settles.
 ///
 /// A settlement that writes a record must base it on the returned
@@ -72,10 +72,10 @@ pub(crate) async fn take_claim(
     registry: &LeaseRegistry,
     queue: &str,
     id: &str,
-    token: u64,
+    claim_id: u64,
 ) -> Result<JobRecord> {
     match registry.current(queue, id) {
-        Some((_, current)) if current == token => {}
+        Some((_, current)) if current == claim_id => {}
         _ => return Err(Error::ClaimLost),
     }
     let key = claimed_key(queue, id);

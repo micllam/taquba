@@ -107,7 +107,7 @@ record encodes only the fields that contain information.
 
 Four pieces of state describe a job and are not in its record:
 
-- **The live lease.** Its expiry and claim token are process state in the lease
+- **The live lease.** Its expiry and claim id are process state in the lease
   registry, so they do not appear on any record.
 - **The queue's configuration.** `lease_duration`, the retry backoff bounds,
   `keep_done_jobs` and `dead_retention` stay in [`QueueConfig`][QueueConfig].

@@ -129,9 +129,12 @@ impl QueueCore {
     async fn reap_job(&self, lease: &DueLease) -> Result<()> {
         let registry = &self.lease_registry;
         let DueLease {
-            queue, id, token, ..
+            queue,
+            id,
+            claim_id,
+            ..
         } = lease;
-        let (queue, id, token) = (queue.as_str(), id.as_str(), *token);
+        let (queue, id, claim_id) = (queue.as_str(), id.as_str(), *claim_id);
         let claimed_key_bytes = claimed_key(queue, id);
 
         loop {
@@ -147,7 +150,7 @@ impl QueueCore {
             // reading the new claim's record, indistinguishable in the
             // store from the old claim's.
             match registry.current(queue, id) {
-                Some((_, current)) if current == token => {}
+                Some((_, current)) if current == claim_id => {}
                 _ => {
                     txn.rollback();
                     return Ok(());
@@ -160,7 +163,7 @@ impl QueueCore {
             // leaves a claim to recover; drop the entry.
             let Some(raw) = txn.get(&claimed_key_bytes).await? else {
                 txn.rollback();
-                registry.remove(queue, id, token);
+                registry.remove(queue, id, claim_id);
                 debug!(queue = %queue, job_id = %id, "dropped lease entry with no claimed record");
                 return Ok(());
             };
@@ -177,7 +180,7 @@ impl QueueCore {
             // next open.
             match commit(txn, Durability::Deferred).await? {
                 Commit::Committed => {
-                    self.finish_claim_end(&job, &end, token, pending_key.as_deref(), None)
+                    self.finish_claim_end(&job, &end, claim_id, pending_key.as_deref(), None)
                         .await;
                     if end.is_terminal() {
                         crate::obs::dead_lettered(&job.queue);
@@ -544,7 +547,7 @@ mod tests {
 
     #[tokio::test]
     async fn ack_succeeds_on_expired_lease_before_reaper_runs() {
-        // Settlement is fenced on the claim token; the claim stays
+        // Settlement is fenced on the claim id. The claim stays
         // settleable past its lease expiry until the reaper requeues
         // the job.
         let clock = MockClock::new(1_700_000_000_000);
