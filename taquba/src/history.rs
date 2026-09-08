@@ -14,7 +14,8 @@
 //! [`Queue::get_job`](crate::Queue::get_job): the transaction that
 //! removes the job's last record (ack without retention, cancel of a
 //! pending or scheduled job, the done and dead retention sweeps) also
-//! deletes the history key. [`Queue::requeue_dead_job`](crate::Queue::requeue_dead_job)
+//! deletes the history key, because every such removal is staged by
+//! `txn::stage_remove`. [`Queue::requeue_dead_job`](crate::Queue::requeue_dead_job)
 //! keeps the history and appends a [`AttemptOutcome::Requeued`] marker,
 //! so entries recorded before the revival remain distinguishable after
 //! the attempt counter resets.

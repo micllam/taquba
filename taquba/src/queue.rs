@@ -20,8 +20,8 @@ use crate::error::{Error, Result};
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{Claim, JobRecord, JobStatus};
 use crate::keys::{
-    QueueName, attempt_history_key, claimed_key, dead_key, dedup_index_key, job_index_key,
-    pending_prefix, user_scoped_key,
+    QueueName, claimed_key, dead_key, dedup_index_key, job_index_key, pending_prefix,
+    user_scoped_key,
 };
 use crate::kv::validate_kv_value_size;
 use crate::lease_registry::{LeaseRegistry, Renewal};
@@ -33,8 +33,8 @@ use crate::scheduler::Scheduler;
 use crate::stats::{QueueMergeOperator, QueueStats, update_stats};
 use crate::txn::ClaimEnd;
 use crate::txn::{
-    Commit, Durability, commit, get_indexed_job, put_job_record, stage_claim_end, stage_to_pending,
-    take_claim,
+    Commit, Durability, commit, get_indexed_job, put_job_record, stage_claim_end, stage_remove,
+    stage_to_pending, take_claim,
 };
 
 /// Outcome of [`Queue::cancel`], reflecting which lifecycle branch the
@@ -1562,27 +1562,14 @@ impl Queue {
         loop {
             let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
 
-            let Some((index_key, current_key, mut job)) = get_indexed_job(&txn, id).await? else {
+            let Some((_, current_key, mut job)) = get_indexed_job(&txn, id).await? else {
                 txn.rollback();
                 return Ok((CancelOutcome::NotFound, Vec::new()));
             };
 
             let (msg, outcome, staged) = match job.status {
                 JobStatus::Pending | JobStatus::Scheduled => {
-                    let is_scheduled = matches!(job.status, JobStatus::Scheduled);
-                    txn.delete(&current_key)?;
-                    txn.delete(&index_key)?;
-                    // A nacked job waiting out its backoff has attempt
-                    // history; it is removed with the record.
-                    txn.delete(attempt_history_key(id))?;
-                    if let Some(ref dk) = job.dedup_key {
-                        txn.delete(dedup_index_key(&job.queue, dk))?;
-                    }
-                    if is_scheduled {
-                        update_stats(&txn, &job.queue, &[(JobStatus::Scheduled, -1)])?;
-                    } else {
-                        update_stats(&txn, &job.queue, &[(JobStatus::Pending, -1)])?;
-                    }
+                    stage_remove(&txn, &current_key, &job)?;
                     let staged = self.core.stage_effects(&txn, prepared).await?;
                     (
                         "pending/scheduled job cancelled",

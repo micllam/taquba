@@ -8,8 +8,8 @@ use crate::error::{Error, Result};
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{
-    QueueName, attempt_history_key, claimed_key, dead_key, done_key, job_index_key, pending_key,
-    scheduled_key,
+    QueueName, attempt_history_key, claimed_key, dead_key, dedup_index_key, done_key,
+    job_index_key, pending_key, scheduled_key,
 };
 use crate::lease_registry::LeaseRegistry;
 use crate::stats::update_stats;
@@ -215,6 +215,26 @@ impl ClaimEnd<'_> {
     }
 }
 
+/// Stage the removal of a job's last record, stored at `current_key`:
+/// the record, its job index entry, its attempt history and, when the
+/// job has a dedup key, the dedup index entry. The counter of the
+/// job's status is decremented, except the `Done` counter, which
+/// counts completions and is cumulative. Every path that removes a
+/// job's last record stages it here, so the history shares the
+/// record's lifetime by construction.
+pub(crate) fn stage_remove(txn: &DbTransaction, current_key: &[u8], job: &JobRecord) -> Result<()> {
+    txn.delete(current_key)?;
+    txn.delete(job_index_key(&job.id))?;
+    txn.delete(attempt_history_key(&job.id))?;
+    if let Some(dedup_key) = &job.dedup_key {
+        txn.delete(dedup_index_key(&job.queue, dedup_key))?;
+    }
+    if job.status != JobStatus::Done {
+        update_stats(txn, &job.queue, &[(job.status, -1)])?;
+    }
+    Ok(())
+}
+
 /// Stage the transition that ends a claim. The caller has read the
 /// stored record and staged the deletion of its claimed key; on return
 /// `job` is the record as written. Returns the pending key when the
@@ -227,9 +247,9 @@ pub(crate) fn stage_claim_end(
 ) -> Result<Option<Vec<u8>>> {
     match *end {
         ClaimEnd::Done { keep } => {
-            job.status = JobStatus::Done;
-            job.completed_at = Some(now);
             if keep {
+                job.status = JobStatus::Done;
+                job.completed_at = Some(now);
                 append_attempt(
                     txn,
                     &job.id,
@@ -248,16 +268,15 @@ pub(crate) fn stage_claim_end(
                     &job_index_key(&job.id),
                     &value,
                 )?;
+                update_stats(txn, &job.queue, &[(JobStatus::Claimed, -1)])?;
             } else {
-                // The attempt history shares the record's lifetime.
-                txn.delete(job_index_key(&job.id))?;
-                txn.delete(attempt_history_key(&job.id))?;
+                // The removal stages the claimed key's deletion a second
+                // time. The write set records the key once.
+                stage_remove(txn, &claimed_key(&job.queue, &job.id), job)?;
+                job.status = JobStatus::Done;
+                job.completed_at = Some(now);
             }
-            update_stats(
-                txn,
-                &job.queue,
-                &[(JobStatus::Claimed, -1), (JobStatus::Done, 1)],
-            )?;
+            update_stats(txn, &job.queue, &[(JobStatus::Done, 1)])?;
             Ok(None)
         }
         ClaimEnd::Retry {

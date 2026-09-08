@@ -9,14 +9,10 @@ use crate::background::Periodic;
 use crate::error::{Error, Result};
 use crate::history::AttemptOutcome;
 use crate::job::{JobRecord, JobStatus};
-use crate::keys::{
-    KeyTag, QueueName, attempt_history_key, claimed_key, job_index_key, parse_key_timestamp,
-    tag_prefix,
-};
+use crate::keys::{KeyTag, claimed_key, parse_key_timestamp, tag_prefix};
 use crate::lease_registry::DueLease;
 use crate::queue_core::QueueCore;
-use crate::stats::update_stats;
-use crate::txn::{ClaimEnd, Commit, Durability, commit, stage_claim_end};
+use crate::txn::{ClaimEnd, Commit, Durability, commit, stage_claim_end, stage_remove};
 
 /// Target bytes fetched per object-store request by the recovery and
 /// retention scans.
@@ -270,7 +266,7 @@ impl QueueCore {
         let now = self.now_ms();
         let min_cutoff = min_cutoff.map(|r| now.saturating_sub(r.as_millis() as u64));
 
-        let mut victims: Vec<(Vec<u8>, QueueName, String, Option<String>)> = Vec::new();
+        let mut victims: Vec<(Vec<u8>, JobRecord)> = Vec::new();
         let mut iter = self
             .db
             .scan_prefix_with_options(tag_prefix(tag), .., &sweep_scan_options())
@@ -300,26 +296,21 @@ impl QueueCore {
             };
             let cutoff = now.saturating_sub(retention.as_millis() as u64);
             if terminal_at < cutoff {
-                victims.push((kv.key.to_vec(), job.queue, job.id, job.payload_ref));
+                victims.push((kv.key.to_vec(), job));
             }
         }
         drop(iter);
 
-        for (key, queue, id, payload_ref) in victims {
-            // `QueueStats::dead` counts the live dead-letter records; the
-            // done counter counts completions and is not decremented.
-            let dead_stats_queue = matches!(status, JobStatus::Dead).then_some(&queue);
-            self.sweep_victim(&key, &id, payload_ref.as_deref(), dead_stats_queue)
-                .await?;
+        for (key, job) in victims {
+            self.sweep_victim(&key, &job).await?;
         }
         Ok(())
     }
 
     /// Delete one expired record in its own transaction: re-check that the
-    /// record still exists, then remove it together with its job index
-    /// entry and attempt history and, when `dead_stats_queue` is set,
-    /// decrement that queue's dead counter so `QueueStats::dead` reflects
-    /// the live size of the dead-letter inbox.
+    /// record still exists, then stage its removal, which decrements the
+    /// dead counter of a dead record so `QueueStats::dead` reflects the
+    /// live size of the dead-letter set.
     ///
     /// The commit does not await WAL durability: a commit lost in a crash
     /// leaves the record in place for the next sweep and the existence
@@ -328,29 +319,20 @@ impl QueueCore {
     /// sweep. The payload object is deleted only after the commit, so a
     /// crash in between leaves an orphaned object, never a live record
     /// whose payload is gone.
-    async fn sweep_victim(
-        &self,
-        key: &[u8],
-        id: &str,
-        payload_ref: Option<&str>,
-        dead_stats_queue: Option<&QueueName>,
-    ) -> Result<()> {
+    async fn sweep_victim(&self, key: &[u8], job: &JobRecord) -> Result<()> {
         let txn = self.db.begin(IsolationLevel::Snapshot).await?;
         let existed = txn.get(key).await?.is_some();
         if existed {
-            txn.delete(key)?;
-            txn.delete(job_index_key(id))?;
-            txn.delete(attempt_history_key(id))?;
-            if let Some(queue) = dead_stats_queue {
-                update_stats(&txn, queue, &[(JobStatus::Dead, -1)])?;
-            }
+            stage_remove(&txn, key, job)?;
         }
         match commit(txn, Durability::Deferred).await? {
             Commit::Committed => {}
             Commit::Conflict => return Ok(()),
         }
-        if existed && let Some(payload_ref) = payload_ref {
-            self.payload_store.delete_best_effort(payload_ref, id).await;
+        if existed && let Some(payload_ref) = &job.payload_ref {
+            self.payload_store
+                .delete_best_effort(payload_ref, &job.id)
+                .await;
         }
         Ok(())
     }
