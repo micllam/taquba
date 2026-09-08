@@ -107,6 +107,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (storage):** `WorkflowRuntimeBuilder::memo_prefix` defaults
+  to `"{queue_name}-memo"`, `"workflow-steps-memo"` for the default queue
+  name, so runtimes with distinct queue names on one object store do not
+  share memo entries by default. A store written with the old default
+  needs `memo_prefix("workflow-memo")`.
+- `jobs::JobRunnerBuilder::poll_interval` defaults to 250 ms, the
+  runtime's default, in place of 100 ms.
 - **Breaking (source):** `jobs::JobRunner::spawn` takes `&self` and no
   longer panics on a second call. Every call spawns one more worker over
   the same queue, as `WorkflowRuntime::spawn` does.

@@ -766,7 +766,7 @@ mod tests {
             .unwrap();
         let run_id = member_run_id("g", "a");
         assert_eq!(group.cancel().await.unwrap(), 1);
-        let memos = crate::memo::MemoStore::new(store, "workflow-memo");
+        let memos = crate::memo::MemoStore::new(store, "workflow-steps-memo");
         memos.new_run_memo(&run_id).put("k", b"v").await.unwrap();
         let results: Vec<MemberResult> =
             group.results().await.unwrap().try_collect().await.unwrap();

@@ -487,7 +487,7 @@ expires.
 
 Memo entries are stored in the object store passed to
 `WorkflowRuntime::builder` under the path prefix configured by
-`WorkflowRuntimeBuilder::memo_prefix` (default `"workflow-memo"`). A
+`WorkflowRuntimeBuilder::memo_prefix` (default `"{queue_name}-memo"`). A
 memo is a retry-safety cache whose readers tolerate absence by
 re-executing; the durable channel between steps is
 `StepOutcome::Continue`'s payload.

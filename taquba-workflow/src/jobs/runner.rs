@@ -32,8 +32,6 @@ struct JobPayload {
 }
 
 const DEFAULT_QUEUE_NAME: &str = "jobs";
-const DEFAULT_CONCURRENCY: usize = 16;
-const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The run id of a job with an idempotency key: the hex SHA-256 digest of
 /// the key, so any key maps onto the character set a run id accepts.
@@ -278,8 +276,8 @@ pub struct JobRunnerBuilder {
     memo_prefix: Option<String>,
     handlers: HashMap<&'static str, Box<dyn ErasedHandler>>,
     state: State,
-    concurrency: usize,
-    poll_interval: Duration,
+    concurrency: Option<usize>,
+    poll_interval: Option<Duration>,
     retention: Option<Duration>,
     group_retention: Option<Duration>,
     clock: Option<Arc<dyn Clock>>,
@@ -294,8 +292,8 @@ impl JobRunnerBuilder {
             memo_prefix: None,
             handlers: HashMap::new(),
             state: State::default(),
-            concurrency: DEFAULT_CONCURRENCY,
-            poll_interval: DEFAULT_POLL_INTERVAL,
+            concurrency: None,
+            poll_interval: None,
             retention: None,
             group_retention: None,
             clock: None,
@@ -351,15 +349,15 @@ impl JobRunnerBuilder {
     /// Panics if `max` is zero.
     pub fn max_concurrent_jobs(mut self, max: usize) -> Self {
         assert!(max > 0, "max_concurrent_jobs must be at least 1");
-        self.concurrency = max;
+        self.concurrency = Some(max);
         self
     }
 
     /// How long the worker waits on an idle queue before re-checking.
     /// In-process submissions wake it immediately regardless. Defaults to
-    /// 100 ms.
+    /// 250 ms.
     pub fn poll_interval(mut self, interval: Duration) -> Self {
-        self.poll_interval = interval;
+        self.poll_interval = Some(interval);
         self
     }
 
@@ -404,19 +402,22 @@ impl JobRunnerBuilder {
 
     /// Build the runner.
     pub fn build(self) -> JobRunner {
-        let memo_prefix = self
-            .memo_prefix
-            .unwrap_or_else(|| format!("{}-memo", self.queue_name));
         let dispatch = Dispatch {
             handlers: self.handlers,
             state: self.state,
         };
         let mut builder =
             WorkflowRuntime::builder(self.queue, self.object_store, dispatch, NoopTerminalHook)
-                .queue_name(self.queue_name)
-                .memo_prefix(memo_prefix)
-                .max_concurrent_steps(self.concurrency)
-                .poll_interval(self.poll_interval);
+                .queue_name(self.queue_name);
+        if let Some(prefix) = self.memo_prefix {
+            builder = builder.memo_prefix(prefix);
+        }
+        if let Some(max) = self.concurrency {
+            builder = builder.max_concurrent_steps(max);
+        }
+        if let Some(interval) = self.poll_interval {
+            builder = builder.poll_interval(interval);
+        }
         if let Some(clock) = self.clock {
             builder = builder.clock(clock);
         }

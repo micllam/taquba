@@ -237,7 +237,7 @@ pub struct WorkflowRuntimeBuilder<R, H> {
     queue: Arc<Queue>,
     object_store: Arc<dyn ObjectStore>,
     queue_name: String,
-    memo_prefix: String,
+    memo_prefix: Option<String>,
     runner: R,
     terminal_hook: H,
     max_concurrent_steps: usize,
@@ -257,12 +257,12 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
         self
     }
 
-    /// The object-store path prefix [`Delivery::memo`](crate::Delivery::memo)
-    /// entries live under. Defaults to `"workflow-memo"`. Pick a distinct value
-    /// when multiple runtimes share an object store, so their memo namespaces
-    /// don't collide.
+    /// The object-store path prefix of the [`Delivery::memo`](crate::Delivery::memo)
+    /// entries. Defaults to `"{queue_name}-memo"`, so runtimes with
+    /// distinct queue names on one object store have distinct memo
+    /// namespaces.
     pub fn memo_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.memo_prefix = prefix.into();
+        self.memo_prefix = Some(prefix.into());
         self
     }
 
@@ -359,10 +359,13 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
             let hook = terminal_hook.clone();
             Arc::new(move |outcome| hook.observes(outcome))
         };
-        let memo_store = MemoStore::new(self.object_store.clone(), self.memo_prefix.clone());
+        let memo_prefix = self
+            .memo_prefix
+            .unwrap_or_else(|| format!("{}-memo", self.queue_name));
+        let memo_store = MemoStore::new(self.object_store.clone(), memo_prefix.clone());
         let group_store = GroupStore::new(
             self.object_store,
-            self.memo_prefix,
+            memo_prefix,
             memo_store.clone(),
             self.queue.clone(),
         );
@@ -503,7 +506,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             queue,
             object_store,
             queue_name: "workflow-steps".to_string(),
-            memo_prefix: "workflow-memo".to_string(),
+            memo_prefix: None,
             runner,
             terminal_hook,
             max_concurrent_steps: 16,
@@ -3598,7 +3601,7 @@ mod tests {
         .memo_retention(Duration::from_secs(60))
         .build();
 
-        let memos = MemoStore::new(store, "workflow-memo");
+        let memos = MemoStore::new(store, "workflow-steps-memo");
         memos
             .new_memo("bystander", 0)
             .put("k", b"expensive")
@@ -3855,7 +3858,7 @@ mod tests {
         .memo_retention(Duration::from_secs(1))
         .build();
 
-        let memos = MemoStore::new(store, "workflow-memo");
+        let memos = MemoStore::new(store, "workflow-steps-memo");
         for (run_id, at_ms) in [("old", 1_000u64), ("young", 9_500u64)] {
             memos.new_memo(run_id, 0).put("k", b"v").await.unwrap();
             queue
@@ -3929,7 +3932,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let memos = MemoStore::new(store.clone(), "workflow-memo");
+        let memos = MemoStore::new(store.clone(), "workflow-steps-memo");
         memos
             .new_memo(&handle.run_id, 0)
             .put("k", b"cached")
@@ -3983,7 +3986,7 @@ mod tests {
         .build();
         let shutdown = spawn_runtime(runtime.clone());
 
-        let memos = MemoStore::new(store.clone(), "workflow-memo");
+        let memos = MemoStore::new(store.clone(), "workflow-steps-memo");
         memos
             .new_memo("in-flight-run", 0)
             .put("k", b"cached")
