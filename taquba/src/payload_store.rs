@@ -345,9 +345,7 @@ mod tests {
         assert_eq!(dead.len(), 1);
         assert_eq!(dead[0].payload, payload, "dead_jobs materializes payloads");
 
-        q.requeue_dead_job(dead.into_iter().next().unwrap())
-            .await
-            .unwrap();
+        q.requeue_dead_job(&dead[0].id).await.unwrap();
         let job = q
             .claim("work", Duration::from_secs(30))
             .await

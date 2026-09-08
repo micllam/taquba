@@ -83,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(dead.len(), 1);
     println!("dead-letter: {}: {:?}", dead[0].id, dead[0].last_error);
 
-    q.requeue_dead_job(dead.into_iter().next().unwrap()).await?;
+    q.requeue_dead_job(&dead[0].id).await?;
     println!("requeued dead job for a fresh attempt");
 
     let s = q.stats("tasks").await?;

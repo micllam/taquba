@@ -228,7 +228,7 @@ mod tests {
         q.dead_letter(&job, "unroutable").await.unwrap();
 
         let dead = q.get_job(&id).await.unwrap().unwrap();
-        q.requeue_dead_job(dead).await.unwrap();
+        q.requeue_dead_job(&dead.id).await.unwrap();
         let job = q.claim("work", lease).await.unwrap().unwrap();
         q.dead_letter(&job, "still unroutable").await.unwrap();
 

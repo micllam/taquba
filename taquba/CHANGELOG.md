@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (source):** `Queue::requeue_dead_job` takes the job's id
+  and reads the stored record inside its transaction, as `Queue::cancel`
+  and `Queue::wake_scheduled` do. A caller that passed a record passes
+  its id.
 - **Breaking (storage):** the claim-scan record that `Queue::close`
   writes has a new layout. The first claim after opening a store written
   by an earlier version scans from the front of the pending prefix.

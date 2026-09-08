@@ -362,7 +362,8 @@ interruption at open, operator requeue, completion on a queue with
 retention), so a job that failed three different ways reports all three
 errors rather than only the last.
 Interventions cover the common operator actions: `Queue::requeue_dead_job`
-revives a dead job with a fresh retry budget, `Queue::cancel` removes a
+revives a dead job for delivery up to its `max_attempts` again,
+`Queue::cancel` removes a
 pending or scheduled job (or requests cooperative cancellation of a claimed
 one) and `Queue::wake_scheduled` promotes a scheduled job before its
 `run_at`.

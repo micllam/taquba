@@ -3,17 +3,22 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use slatedb::Db;
+use std::future::Future;
+
+use bytes::Bytes;
+use slatedb::{Db, DbTransaction};
 
 use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
 use crate::completion::CompletionWaiters;
+use crate::error::Result;
 use crate::job::{Claim, JobRecord, JobStatus};
 use crate::lease_registry::LeaseRegistry;
 use crate::options::QueueConfig;
 use crate::payload_store::PayloadStore;
 use crate::queue::WaitOutcome;
 use crate::txn::ClaimEnd;
+use crate::txn::{Attempt, Durability, get_indexed_job, retry};
 
 /// The per-queue configurations of an open queue: a default and the
 /// overrides keyed by queue name.
@@ -110,5 +115,31 @@ impl QueueCore {
             _ => WaitOutcome::Done(Box::new(delivered)),
         };
         self.completion_waiters.settle(&job.id, || outcome);
+    }
+    /// One job transition addressed by id. The job's current record is
+    /// read inside a retried transaction and passed to `transition`
+    /// with the key it is stored at. The transition stages the next
+    /// state and returns the call's value, or aborts with a value. A job
+    /// without a record aborts with `missing()`.
+    pub(crate) async fn transition_by_id<T, F, Fut>(
+        &self,
+        id: &str,
+        durability: Durability,
+        missing: impl Fn() -> Result<T>,
+        transition: F,
+    ) -> Result<T>
+    where
+        F: Fn(DbTransaction, Bytes, JobRecord) -> Fut,
+        Fut: Future<Output = Result<Attempt<T>>>,
+    {
+        let (missing, transition) = (&missing, &transition);
+        retry(&self.db, durability, |txn| async move {
+            let Some((_, current_key, job)) = get_indexed_job(&txn, id).await? else {
+                txn.rollback();
+                return missing().map(Attempt::Abort);
+            };
+            transition(txn, current_key, job).await
+        })
+        .await
     }
 }

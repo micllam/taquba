@@ -12,7 +12,9 @@ use crate::job::{JobRecord, JobStatus};
 use crate::keys::{KeyTag, claimed_key, parse_key_timestamp, tag_prefix};
 use crate::lease_registry::DueLease;
 use crate::queue_core::QueueCore;
-use crate::txn::{ClaimEnd, Commit, Durability, commit, stage_claim_end, stage_remove};
+use crate::txn::{
+    Attempt, ClaimEnd, Commit, Durability, commit, retry, stage_claim_end, stage_remove,
+};
 
 /// Target bytes fetched per object-store request by the recovery and
 /// retention scans.
@@ -132,11 +134,14 @@ impl QueueCore {
             ..
         } = lease;
         let (id, claim_id) = (id.as_str(), *claim_id);
-        let claimed_key_bytes = claimed_key(queue, id);
+        let claimed_key_bytes = &claimed_key(queue, id);
 
-        loop {
-            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-
+        // The commit does not await WAL durability: each expired claim is
+        // its own transaction, so awaiting the flush would serialise the
+        // sweep at one job per flush interval, and a commit lost in a
+        // crash is redone by the requeue of claimed records at the next
+        // open.
+        let reaped = retry(&self.db, Durability::Deferred, |txn| async move {
             // A settlement removes the entry after its commit; an entry
             // that is gone or belongs to a new claim leaves nothing to
             // reap. The check runs after the transaction begins: a claim
@@ -150,7 +155,7 @@ impl QueueCore {
                 Some((_, current)) if current == claim_id => {}
                 _ => {
                     txn.rollback();
-                    return Ok(());
+                    return Ok(Attempt::Abort(None));
                 }
             }
 
@@ -158,38 +163,30 @@ impl QueueCore {
             // whose commit failed (the entry is registered first), or of a
             // settlement whose entry removal has not run yet. Neither case
             // leaves a claim to recover; drop the entry.
-            let Some(raw) = txn.get(&claimed_key_bytes).await? else {
+            let Some(raw) = txn.get(claimed_key_bytes).await? else {
                 txn.rollback();
                 registry.remove(queue, id, claim_id);
                 debug!(queue = %queue, job_id = %id, "dropped lease entry with no claimed record");
-                return Ok(());
+                return Ok(Attempt::Abort(None));
             };
 
-            let mut job = JobRecord::decode(&claimed_key_bytes, &raw)?;
-            txn.delete(&claimed_key_bytes)?;
+            let mut job = JobRecord::decode(claimed_key_bytes, &raw)?;
+            txn.delete(claimed_key_bytes)?;
             let end = unsettled_claim_end(&job, AttemptOutcome::LeaseExpired, "lease expired");
             let pending_key = stage_claim_end(&txn, &mut job, &end, self.now_ms())?;
-
-            // The commit does not await WAL durability: each expired claim
-            // is its own transaction, so awaiting the flush would serialise
-            // the sweep at one job per flush interval, and a commit lost in
-            // a crash is redone by the requeue of claimed records at the
-            // next open.
-            match commit(txn, Durability::Deferred).await? {
-                Commit::Committed => {
-                    self.finish_claim_end(&job, &end, claim_id, pending_key.as_deref(), None)
-                        .await;
-                    if end.is_terminal() {
-                        crate::obs::dead_lettered(&job.queue);
-                    } else {
-                        crate::obs::reaped(&job.queue, 1);
-                    }
-                    return Ok(());
-                }
-                // A settlement committed concurrently; retry against fresh state.
-                Commit::Conflict => continue,
+            Ok(Attempt::Commit(txn, Some((job, end, pending_key))))
+        })
+        .await?;
+        if let Some((job, end, pending_key)) = reaped {
+            self.finish_claim_end(&job, &end, claim_id, pending_key.as_deref(), None)
+                .await;
+            if end.is_terminal() {
+                crate::obs::dead_lettered(&job.queue);
+            } else {
+                crate::obs::reaped(&job.queue, 1);
             }
         }
+        Ok(())
     }
 
     /// Re-queue every claimed record found in the store. Called at open,
@@ -983,7 +980,7 @@ mod tests {
         tokio::time::sleep(reaper_interval * 2).await;
 
         assert!(q.dead_jobs("work", None, 100).await.unwrap().is_empty());
-        let err = q.requeue_dead_job(dead).await.unwrap_err();
+        let err = q.requeue_dead_job(&dead.id).await.unwrap_err();
         assert!(matches!(err, Error::JobNotFound(_)));
         assert_eq!(q.stats("work").await.unwrap().pending, 0);
         assert_eq!(q.stats("work").await.unwrap().dead, 0);

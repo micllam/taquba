@@ -1,6 +1,8 @@
 //! Transaction helpers shared by the queue, reaper and scheduler.
+use std::future::Future;
+
 use bytes::Bytes;
-use slatedb::DbTransaction;
+use slatedb::{Db, DbTransaction, IsolationLevel};
 
 use tracing::{debug, warn};
 
@@ -120,6 +122,42 @@ pub(crate) async fn commit(txn: DbTransaction, durability: Durability) -> Result
         }
         Err(e) if e.kind() == slatedb::ErrorKind::Transaction => Ok(Commit::Conflict),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// The result of one attempt of a body run by [`retry`].
+pub(crate) enum Attempt<T> {
+    /// Commit the transaction, then return the value.
+    Commit(DbTransaction, T),
+    /// Return the value without a commit. The body drops or rolls back
+    /// the transaction before it returns this.
+    Abort(T),
+}
+
+/// Run `body` against a fresh `Snapshot` transaction until its commit
+/// does not conflict. A [`Commit::Conflict`] begins a new transaction
+/// and runs `body` again, against fresh state, and an
+/// [`Attempt::Abort`] returns the value without a commit. `body`
+/// takes the transaction by value and returns it in
+/// [`Attempt::Commit`], so its future does not borrow from the call
+/// and is `Send` wherever its captures are.
+pub(crate) async fn retry<T, F, Fut>(db: &Db, durability: Durability, body: F) -> Result<T>
+where
+    F: Fn(DbTransaction) -> Fut,
+    Fut: Future<Output = Result<Attempt<T>>>,
+{
+    loop {
+        let txn = db.begin(IsolationLevel::Snapshot).await?;
+        match body(txn).await? {
+            Attempt::Abort(value) => return Ok(value),
+            Attempt::Commit(txn, value) => match commit(txn, durability).await? {
+                Commit::Committed => return Ok(value),
+                Commit::Conflict => {
+                    debug!("transaction conflict, retrying against fresh state");
+                    continue;
+                }
+            },
+        }
     }
 }
 

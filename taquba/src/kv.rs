@@ -7,12 +7,12 @@
 
 use bytes::Bytes;
 use futures_util::Stream;
-use slatedb::{DbTransaction, IsolationLevel};
+use slatedb::DbTransaction;
 
 use crate::error::{Error, Result};
 use crate::keys::user_scoped_key;
 use crate::queue::Queue;
-use crate::txn::{Commit, Durability, commit};
+use crate::txn::{Attempt, Durability, retry};
 
 /// Maximum size of a single value in the user KV namespace.
 ///
@@ -152,24 +152,21 @@ impl Queue {
         expected: Option<&[u8]>,
         write: impl Fn(&DbTransaction, &[u8]) -> std::result::Result<(), slatedb::Error>,
     ) -> Result<bool> {
-        let scoped = user_scoped_key(key);
-        loop {
-            let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
-            let matched = match (txn.get(&scoped).await?, expected) {
+        let (scoped, write) = (&user_scoped_key(key), &write);
+        retry(&self.core.db, Durability::Awaited, |txn| async move {
+            let matched = match (txn.get(scoped).await?, expected) {
                 (Some(current), Some(e)) => current.as_ref() == e,
                 (None, None) => true,
                 _ => false,
             };
             if !matched {
                 txn.rollback();
-                return Ok(false);
+                return Ok(Attempt::Abort(false));
             }
-            write(&txn, &scoped)?;
-            match commit(txn, Durability::Awaited).await? {
-                Commit::Committed => return Ok(true),
-                Commit::Conflict => continue,
-            }
-        }
+            write(&txn, scoped)?;
+            Ok(Attempt::Commit(txn, true))
+        })
+        .await
     }
 
     /// List entries of the user KV namespace under `prefix`, in

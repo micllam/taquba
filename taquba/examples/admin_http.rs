@@ -286,12 +286,9 @@ async fn requeue_job(
     State(q): State<Arc<Queue>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let job = q
-        .get_job(&id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("job not found: {id}")))?;
-    // A non-dead job maps to 409 via `Error::InvalidState`.
-    q.requeue_dead_job(job).await?;
+    // A missing job maps to 404 via `Error::JobNotFound`, and a job in
+    // another state to 409 via `Error::InvalidState`.
+    q.requeue_dead_job(&id).await?;
     Ok(Json(json!({ "outcome": "requeued" })))
 }
 

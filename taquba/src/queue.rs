@@ -20,8 +20,7 @@ use crate::error::{Error, Result};
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{Claim, JobRecord, JobStatus};
 use crate::keys::{
-    QueueName, claimed_key, dead_key, dedup_index_key, job_index_key, pending_prefix,
-    user_scoped_key,
+    QueueName, claimed_key, dedup_index_key, job_index_key, pending_prefix, user_scoped_key,
 };
 use crate::kv::validate_kv_value_size;
 use crate::lease_registry::{LeaseRegistry, Renewal};
@@ -33,8 +32,8 @@ use crate::scheduler::Scheduler;
 use crate::stats::{QueueMergeOperator, QueueStats, update_stats};
 use crate::txn::ClaimEnd;
 use crate::txn::{
-    Commit, Durability, commit, get_indexed_job, put_job_record, stage_claim_end, stage_remove,
-    stage_to_pending, take_claim,
+    Attempt, Commit, Durability, commit, get_indexed_job, put_job_record, retry, stage_claim_end,
+    stage_remove, stage_to_pending, take_claim,
 };
 
 /// Outcome of [`Queue::cancel`], reflecting which lifecycle branch the
@@ -537,17 +536,15 @@ impl Queue {
     /// of a job the reaper dead-lettered.
     pub async fn commit_effects(&self, effects: SettlementEffects) -> Result<Vec<EnqueueResult>> {
         let prepared = self.core.prepare_effects(effects).await?;
-        let committed: Result<Vec<EnqueueResult>> = async {
-            loop {
-                let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
-                let staged = self.core.stage_effects(&txn, &prepared).await?;
-                match commit(txn, Durability::Awaited).await? {
-                    Commit::Committed => return Ok(self.core.note_staged_effects(staged)),
-                    Commit::Conflict => continue,
-                }
-            }
+        let committed = {
+            let prepared = &prepared;
+            retry(&self.core.db, Durability::Awaited, |txn| async move {
+                let staged = self.core.stage_effects(&txn, prepared).await?;
+                Ok(Attempt::Commit(txn, staged))
+            })
+            .await
         }
-        .await;
+        .map(|staged| self.core.note_staged_effects(staged));
         self.core
             .finish_effects(prepared, committed.as_ref().ok().map(Vec::as_slice))
             .await;
@@ -602,29 +599,29 @@ impl Queue {
         kv_writes: &HashMap<Vec<u8>, Vec<u8>>,
     ) -> Result<EnqueueResult> {
         let timer = crate::obs::start();
-        loop {
-            let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
-
+        // `Err` is the id of the pending or scheduled job that a dedup
+        // key matched, as `stage_job_writes` reports it.
+        let written = retry(&self.core.db, Durability::Awaited, |txn| async move {
             let staged = match self.core.stage_job_writes(&txn, prepared).await? {
                 Ok(staged) => staged,
                 Err(already_enqueued) => {
                     txn.rollback();
-                    return Ok(EnqueueResult::AlreadyEnqueued(already_enqueued));
+                    return Ok(Attempt::Abort(Err(already_enqueued)));
                 }
             };
-
             for (k, v) in kv_writes {
                 txn.put(user_scoped_key(k), v)?;
             }
-
-            match commit(txn, Durability::Awaited).await? {
-                Commit::Committed => {
-                    crate::obs::enqueue_committed(&staged.queue, timer);
-                    self.core.note_staged_job(&staged);
-                    return Ok(EnqueueResult::New(staged.id));
-                }
-                Commit::Conflict => continue,
+            Ok(Attempt::Commit(txn, Ok(staged)))
+        })
+        .await?;
+        match written {
+            Ok(staged) => {
+                crate::obs::enqueue_committed(&staged.queue, timer);
+                self.core.note_staged_job(&staged);
+                Ok(EnqueueResult::New(staged.id))
             }
+            Err(already_enqueued) => Ok(EnqueueResult::AlreadyEnqueued(already_enqueued)),
         }
     }
 
@@ -1113,9 +1110,9 @@ impl Queue {
         let claim_id = claim.claim_id();
         let (queue, id) = (&claim.queue, claim.id.as_str());
 
-        let settled: Result<SettledClaim<'e>> = async {
-            loop {
-                let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
+        let settled: Result<SettledClaim<'e>> = {
+            let (prepared, end_for) = (&prepared, &end_for);
+            retry(&self.core.db, Durability::Awaited, |txn| async move {
                 // The returned record is the base for the written
                 // record; the claim's copy predates a cancel committed
                 // during the delivery.
@@ -1125,24 +1122,20 @@ impl Queue {
                 let end = end_for(&job, now);
                 let pending_key = stage_claim_end(&txn, &mut job, &end, now)?;
                 let staged = if end.is_terminal() {
-                    Some(self.core.stage_effects(&txn, &prepared).await?)
+                    Some(self.core.stage_effects(&txn, prepared).await?)
                 } else {
                     None
                 };
-                match commit(txn, Durability::Awaited).await? {
-                    Commit::Committed => {
-                        return Ok(SettledClaim {
-                            job,
-                            end,
-                            pending_key,
-                            results: staged.map(|s| self.core.note_staged_effects(s)),
-                        });
-                    }
-                    Commit::Conflict => continue,
-                }
-            }
+                Ok(Attempt::Commit(txn, (job, end, pending_key, staged)))
+            })
+            .await
         }
-        .await;
+        .map(|(job, end, pending_key, staged)| SettledClaim {
+            job,
+            end,
+            pending_key,
+            results: staged.map(|s| self.core.note_staged_effects(s)),
+        });
 
         self.core
             .finish_effects(
@@ -1279,59 +1272,61 @@ impl Queue {
         crate::read::attempt_history(self.core.db.as_ref(), id).await
     }
 
-    /// Move a dead-letter job back to the pending queue for a fresh attempt.
+    /// Move the dead-letter job `id` back to the pending queue for a
+    /// fresh attempt.
     ///
     /// Resets `attempts` to 0 and clears `last_error`, so the job is
-    /// delivered up to its `max_attempts` again. The commit is durable
-    /// before the call returns. A job whose dead record is gone, removed
-    /// by the retention sweep or by a concurrent revival, is reported as
-    /// [`Error::JobNotFound`].
-    #[instrument(skip(self, job), fields(queue = %job.queue, job_id = %job.id))]
-    pub async fn requeue_dead_job(&self, mut job: JobRecord) -> Result<()> {
-        if job.status != JobStatus::Dead {
-            return Err(Error::InvalidState);
-        }
-        let dead = dead_key(&job.queue, &job.id);
-        job.attempts = 0;
-        job.last_error = None;
-        job.claimed_at = None;
-        job.failed_at = None;
-        // Revival clears any prior cancel request: the operator chose to
-        // start this job afresh.
-        job.cancel_requested = false;
-
-        loop {
-            let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
-            if txn.get(&dead).await?.is_none() {
-                txn.rollback();
-                return Err(Error::JobNotFound(job.id.clone()));
-            }
-            txn.delete(&dead)?;
-            let pending = stage_to_pending(&txn, &mut job, JobStatus::Dead)?;
-            // The history is kept across the revival. The marker separates
-            // entries recorded before it from the reset attempt counter.
-            append_attempt(
-                &txn,
-                &job.id,
-                &JobAttempt {
-                    attempt: 0,
-                    claimed_at: None,
-                    recorded_at: self.now_ms(),
-                    outcome: AttemptOutcome::Requeued,
-                    error: None,
+    /// delivered up to its `max_attempts` again. The stored record is
+    /// read inside the transaction, and the commit is durable before
+    /// the call returns. A job without a record, removed by the
+    /// retention sweep or by a concurrent revival, is
+    /// [`Error::JobNotFound`], and a job in any state other than `Dead`
+    /// is [`Error::InvalidState`].
+    #[instrument(skip(self), fields(job_id = %id))]
+    pub async fn requeue_dead_job(&self, id: &str) -> Result<()> {
+        let (job, pending): (JobRecord, Vec<u8>) = self
+            .core
+            .transition_by_id(
+                id,
+                Durability::Awaited,
+                || Err(Error::JobNotFound(id.to_string())),
+                |txn, current_key, mut job| async move {
+                    if job.status != JobStatus::Dead {
+                        txn.rollback();
+                        return Err(Error::InvalidState);
+                    }
+                    txn.delete(&current_key)?;
+                    job.attempts = 0;
+                    job.last_error = None;
+                    job.claimed_at = None;
+                    job.failed_at = None;
+                    // Revival clears any prior cancel request: the operator
+                    // chose to start this job afresh.
+                    job.cancel_requested = false;
+                    let pending = stage_to_pending(&txn, &mut job, JobStatus::Dead)?;
+                    // The history is kept across the revival. The marker
+                    // separates entries recorded before it from the reset
+                    // attempt counter.
+                    append_attempt(
+                        &txn,
+                        &job.id,
+                        &JobAttempt {
+                            attempt: 0,
+                            claimed_at: None,
+                            recorded_at: self.now_ms(),
+                            outcome: AttemptOutcome::Requeued,
+                            error: None,
+                        },
+                    )?;
+                    Ok(Attempt::Commit(txn, (job, pending)))
                 },
-            )?;
-            match commit(txn, Durability::Awaited).await? {
-                Commit::Committed => {
-                    self.core
-                        .claim_cursor
-                        .note_pending_insert(&job.queue, &pending);
-                    debug!(queue = %job.queue, job_id = %job.id, "dead job re-queued");
-                    return Ok(());
-                }
-                Commit::Conflict => continue,
-            }
-        }
+            )
+            .await?;
+        self.core
+            .claim_cursor
+            .note_pending_insert(&job.queue, &pending);
+        debug!(queue = %job.queue, job_id = %job.id, "dead job re-queued");
+        Ok(())
     }
 
     /// Extend the lease on a claimed job, returning the new expiry as
@@ -1559,76 +1554,76 @@ impl Queue {
         id: &str,
         prepared: &PreparedEffects,
     ) -> Result<(CancelOutcome, Vec<EnqueueResult>)> {
-        loop {
-            let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
-
-            let Some((_, current_key, mut job)) = get_indexed_job(&txn, id).await? else {
-                txn.rollback();
-                return Ok((CancelOutcome::NotFound, Vec::new()));
-            };
-
-            let (msg, outcome, staged) = match job.status {
-                JobStatus::Pending | JobStatus::Scheduled => {
-                    stage_remove(&txn, &current_key, &job)?;
-                    let staged = self.core.stage_effects(&txn, prepared).await?;
-                    (
-                        "pending/scheduled job cancelled",
-                        CancelOutcome::Removed,
-                        Some(staged),
-                    )
-                }
-                JobStatus::Claimed => {
-                    if job.cancel_requested {
-                        // The flag is already persisted. The token
-                        // is fired again because a re-claim since
-                        // the first request holds a fresh one.
-                        txn.rollback();
-                        self.core.lease_registry.cancel(&job.queue, id);
-                        debug!(job_id = %id, "cancel re-requested on claimed job");
-                        return Ok((CancelOutcome::Requested, Vec::new()));
-                    }
-                    job.cancel_requested = true;
-                    let value = job.stored_bytes()?;
-                    txn.put(&current_key, &value)?;
-                    (
-                        "claimed job cancellation requested",
-                        CancelOutcome::Requested,
-                        None,
-                    )
-                }
-                JobStatus::Done | JobStatus::Dead => {
-                    txn.rollback();
-                    return Ok((CancelOutcome::NotFound, Vec::new()));
-                }
-            };
-
-            match commit(txn, Durability::Awaited).await? {
-                Commit::Committed => {
-                    // Fired on the Removed path as well: the
-                    // worker of a claim the reaper requeued just
-                    // before this call may still observe the token.
-                    // That claim's end removes the entry.
-                    self.core.lease_registry.cancel(&job.queue, id);
-                    let results = staged
-                        .map(|s| self.core.note_staged_effects(s))
-                        .unwrap_or_default();
-                    // Removed = terminal (job is gone). Requested = not yet
-                    // terminal; the worker's settlement delivers the
-                    // outcome when it acks / nacks / dead-letters.
-                    if matches!(outcome, CancelOutcome::Removed) {
-                        // The record is deleted, so its payload object
-                        // (if any) is removed here, after the commit.
-                        self.core.payload_store.delete_for(&job).await;
-                        self.core
-                            .completion_waiters
-                            .settle(id, || WaitOutcome::Cancelled);
-                    }
-                    debug!(job_id = %id, "{msg}");
-                    return Ok((outcome, results));
-                }
-                Commit::Conflict => continue,
-            }
+        // `Err` is an outcome reached without a commit.
+        let committed = self
+            .core
+            .transition_by_id(
+                id,
+                Durability::Awaited,
+                || Ok(Err(CancelOutcome::NotFound)),
+                |txn, current_key, mut job| async move {
+                    let (msg, outcome, staged) = match job.status {
+                        JobStatus::Pending | JobStatus::Scheduled => {
+                            stage_remove(&txn, &current_key, &job)?;
+                            let staged = self.core.stage_effects(&txn, prepared).await?;
+                            (
+                                "pending/scheduled job cancelled",
+                                CancelOutcome::Removed,
+                                Some(staged),
+                            )
+                        }
+                        JobStatus::Claimed => {
+                            if job.cancel_requested {
+                                // The flag is already persisted. The token
+                                // is fired again, because a re-claim after
+                                // the first request has a fresh token.
+                                txn.rollback();
+                                self.core.lease_registry.cancel(&job.queue, id);
+                                debug!(job_id = %id, "cancel re-requested on claimed job");
+                                return Ok(Attempt::Abort(Err(CancelOutcome::Requested)));
+                            }
+                            job.cancel_requested = true;
+                            let value = job.stored_bytes()?;
+                            txn.put(&current_key, &value)?;
+                            (
+                                "claimed job cancellation requested",
+                                CancelOutcome::Requested,
+                                None,
+                            )
+                        }
+                        JobStatus::Done | JobStatus::Dead => {
+                            txn.rollback();
+                            return Ok(Attempt::Abort(Err(CancelOutcome::NotFound)));
+                        }
+                    };
+                    Ok(Attempt::Commit(txn, Ok((job, msg, outcome, staged))))
+                },
+            )
+            .await?;
+        let (job, msg, outcome, staged) = match committed {
+            Ok(committed) => committed,
+            Err(outcome) => return Ok((outcome, Vec::new())),
+        };
+        // Fired on the Removed path as well: the worker of a claim the
+        // reaper requeued just before this call can still observe the
+        // token. That claim's end removes the entry.
+        self.core.lease_registry.cancel(&job.queue, id);
+        let results = staged
+            .map(|s| self.core.note_staged_effects(s))
+            .unwrap_or_default();
+        // Removed = terminal (job is gone). Requested = not yet
+        // terminal; the worker's settlement delivers the outcome when it
+        // acks / nacks / dead-letters.
+        if matches!(outcome, CancelOutcome::Removed) {
+            // The record is deleted, so its payload object (if any) is
+            // removed here, after the commit.
+            self.core.payload_store.delete_for(&job).await;
+            self.core
+                .completion_waiters
+                .settle(id, || WaitOutcome::Cancelled);
         }
+        debug!(job_id = %id, "{msg}");
+        Ok((outcome, results))
     }
 
     /// Move a `Scheduled` job to pending immediately, before its `run_at`,
@@ -1659,34 +1654,36 @@ impl Queue {
         id: &str,
         wake_payload: Option<Vec<u8>>,
     ) -> Result<WakeOutcome> {
-        loop {
-            let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
-
-            let Some((_, current_key, mut job)) = get_indexed_job(&txn, id).await? else {
-                txn.rollback();
-                return Ok(WakeOutcome::NotFound);
-            };
-
-            if job.status != JobStatus::Scheduled {
-                txn.rollback();
-                return Ok(WakeOutcome::NotScheduled);
+        // `Err` is an outcome reached without a commit.
+        let wake_payload = &wake_payload;
+        let woken: std::result::Result<(JobRecord, Vec<u8>), WakeOutcome> = self
+            .core
+            .transition_by_id(
+                id,
+                Durability::Awaited,
+                || Ok(Err(WakeOutcome::NotFound)),
+                |txn, current_key, mut job| async move {
+                    if job.status != JobStatus::Scheduled {
+                        txn.rollback();
+                        return Ok(Attempt::Abort(Err(WakeOutcome::NotScheduled)));
+                    }
+                    txn.delete(&current_key)?;
+                    job.woken_at = Some(self.now_ms());
+                    job.wake_payload = wake_payload.clone();
+                    let pending = stage_to_pending(&txn, &mut job, JobStatus::Scheduled)?;
+                    Ok(Attempt::Commit(txn, Ok((job, pending))))
+                },
+            )
+            .await?;
+        match woken {
+            Ok((job, pending)) => {
+                self.core
+                    .claim_cursor
+                    .note_pending_insert(&job.queue, &pending);
+                debug!(job_id = %id, queue = %job.queue, "scheduled job woken");
+                Ok(WakeOutcome::Woken)
             }
-
-            txn.delete(&current_key)?;
-            job.woken_at = Some(self.now_ms());
-            job.wake_payload = wake_payload.clone();
-            let pending = stage_to_pending(&txn, &mut job, JobStatus::Scheduled)?;
-
-            match commit(txn, Durability::Awaited).await? {
-                Commit::Committed => {
-                    self.core
-                        .claim_cursor
-                        .note_pending_insert(&job.queue, &pending);
-                    debug!(job_id = %id, queue = %job.queue, "scheduled job woken");
-                    return Ok(WakeOutcome::Woken);
-                }
-                Commit::Conflict => continue,
-            }
+            Err(outcome) => Ok(outcome),
         }
     }
 
@@ -2171,9 +2168,7 @@ mod tests {
         assert!(dead[0].failed_at.is_some());
 
         // Requeue and verify it's workable again
-        q.requeue_dead_job(dead.into_iter().next().unwrap())
-            .await
-            .unwrap();
+        q.requeue_dead_job(&dead[0].id).await.unwrap();
 
         let revived = q
             .claim("work", Duration::from_secs(30))
@@ -2221,7 +2216,7 @@ mod tests {
             .unwrap();
         q.nack(&claim, "fatal").await.unwrap();
         let dead = q.dead_jobs("work", None, 1).await.unwrap().pop().unwrap();
-        q.requeue_dead_job(dead).await.unwrap();
+        q.requeue_dead_job(&dead.id).await.unwrap();
 
         // A crash inside the flush window: closing without a flush
         // discards every write that is not durable.
