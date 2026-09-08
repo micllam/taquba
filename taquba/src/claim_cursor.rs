@@ -7,7 +7,7 @@ use tokio::sync::Notify;
 use tracing::warn;
 
 use crate::error::Result;
-use crate::keys::{KeyTag, QueueName, cursor_key, tag_prefix};
+use crate::keys::{KeyTag, QueueName, cursor_key, parse_cursor_key, tag_prefix};
 use crate::queue_core::QueueCore;
 
 /// Upper bound on wakeups issued for one batch of inserts. Beyond the
@@ -29,25 +29,23 @@ const MAX_INSERT_WAKEUPS: usize = 64;
 /// start or process restart).
 ///
 /// The epoch counts committed pending inserts. When a claim's full
-/// prefix scan finds nothing, it records the epoch it observed before
+/// prefix scan ends without a live key, it records the epoch it observed before
 /// its transaction began; until the next insert bumps the epoch,
 /// subsequent claims return `None` without scanning. Without this,
 /// every poll of an empty queue re-scans the tombstone band from the
 /// front, which grows with every job claimed since the last
 /// compaction.
 ///
-/// Shared across the queue, reaper, and scheduler via `Clone`; all
-/// clones reference the same in-memory map. The bound and emptiness
-/// marker survive a clean close ([`Self::export`] / [`Self::restore`]);
-/// after a crash the first claim falls back to a prefix scan and
-/// re-warms the state naturally.
-#[derive(Clone, Default)]
+/// The bound and emptiness marker survive a clean close
+/// ([`Self::export`] / [`Self::restore`]); after a crash the first
+/// claim falls back to a prefix scan and re-warms the state naturally.
+#[derive(Default)]
 pub(crate) struct ClaimCursor {
     inner: Arc<Mutex<HashMap<QueueName, QueueClaimState>>>,
 }
 
 /// Where the next claim scan starts.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ScanFrom {
     pub(crate) key: Bytes,
     /// `true` when `key` itself may be live (it was inserted at or
@@ -68,7 +66,7 @@ struct QueueClaimState {
     /// [`ClaimCursor::advance`] consumed it. Job ids are generated
     /// before their enqueue transaction commits, so a key can sort
     /// below keys an in-flight claim is about to advance past while
-    /// still being ahead of the bound when its insert is recorded.
+    /// still sorting after the bound when its insert is recorded.
     /// `advance` clamps to this key so the bound never jumps over an
     /// insert it could not have observed.
     min_insert_ahead: Option<Bytes>,
@@ -83,6 +81,14 @@ struct QueueClaimState {
     claim_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
+impl QueueClaimState {
+    /// Whether a full scan ended without a live key and no insert
+    /// followed.
+    fn known_empty(&self) -> bool {
+        self.empty_as_of == Some(self.epoch)
+    }
+}
+
 /// Snapshot of one queue's claim-scan state, taken at the start of a
 /// claim attempt.
 pub(crate) struct ClaimScanStart {
@@ -92,8 +98,10 @@ pub(crate) struct ClaimScanStart {
 }
 
 /// One queue's persistable claim-scan state: the scan bound and
-/// whether a full scan has proven the queue empty. Exported at clean
-/// close and restored at the next open.
+/// whether a full scan ended without a live key. Exported at clean
+/// close, stored as the record at the queue's [`cursor_key`] and
+/// restored at the next open.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct CursorState {
     pub(crate) scan_from: Option<ScanFrom>,
     pub(crate) known_empty: bool,
@@ -114,7 +122,7 @@ impl ClaimCursor {
             Some(s) => ClaimScanStart {
                 scan_from: s.scan_from.clone(),
                 epoch: s.epoch,
-                known_empty: s.empty_as_of == Some(s.epoch),
+                known_empty: s.known_empty(),
             },
             None => ClaimScanStart {
                 scan_from: None,
@@ -152,16 +160,26 @@ impl ClaimCursor {
         };
     }
 
-    /// Record that a full pending prefix scan found nothing, as
-    /// observed at `epoch` (the value returned by
-    /// [`Self::begin_claim`] for the same attempt). The scan-start
-    /// bound is kept: nothing is live behind it, and inserts landing
-    /// behind it move it themselves. Claims short-circuit to `None`
-    /// until the next insert bumps the epoch past `epoch`.
-    pub(crate) fn mark_empty(&self, queue: &QueueName, epoch: u64) {
+    /// Record that a full scan of the pending prefix ended without a
+    /// live key, as of the `observed` snapshot the attempt began with.
+    /// The scan-start bound is kept: nothing is live before it, and an
+    /// insert before it moves it. Claims short-circuit to `None` until
+    /// the next insert bumps the epoch past the snapshot's.
+    pub(crate) fn mark_empty(&self, queue: &QueueName, observed: &ClaimScanStart) {
         let mut map = self.inner.lock().unwrap();
         let s = map.entry(queue.clone()).or_default();
-        s.empty_as_of = Some(epoch);
+        s.empty_as_of = Some(observed.epoch);
+    }
+
+    /// Whether a full scan of `queue` ended without a live key and no
+    /// insert followed. Read without a claim attempt, before the claim
+    /// lock is taken.
+    pub(crate) fn known_empty(&self, queue: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(queue)
+            .is_some_and(QueueClaimState::known_empty)
     }
 
     /// Record one committed pending insert. See
@@ -179,7 +197,7 @@ impl ClaimCursor {
     ///
     /// The scan-start bound moves back to include `min_key` when a
     /// scan from it would otherwise skip the key. When no bound
-    /// exists, one is set only if a prior scan proved the queue empty
+    /// exists, one is set only if a prior scan ended without a live key
     /// (no insert recorded since); otherwise keys from before this
     /// process may be live and claims must keep falling back to the
     /// front scan. A key a scan would already yield is recorded for
@@ -196,7 +214,7 @@ impl ClaimCursor {
         let wakeup = {
             let mut map = self.inner.lock().unwrap();
             let s = map.entry(queue.clone()).or_default();
-            let was_known_empty = s.empty_as_of == Some(s.epoch);
+            let was_known_empty = s.known_empty();
             s.epoch += 1;
             let include_min_key = match &s.scan_from {
                 // Move the bound back when a scan from it would skip
@@ -204,10 +222,10 @@ impl ClaimCursor {
                 Some(sf) => {
                     min_key < sf.key.as_ref() || (min_key == sf.key.as_ref() && !sf.inclusive)
                 }
-                // Bound unknown (cold start or restart): a bound may be
-                // set only when a scan has proven the queue empty;
-                // otherwise keys from before this process may be live
-                // and claims must keep falling back to the front scan.
+                // Bound unknown (cold start or restart): a bound is set
+                // only when a scan ended without a live key. Otherwise
+                // keys from before this process can be live, and claims
+                // keep falling back to the front scan.
                 None => was_known_empty,
             };
             if include_min_key {
@@ -244,7 +262,7 @@ impl ClaimCursor {
         let map = self.inner.lock().unwrap();
         map.iter()
             .filter_map(|(queue, s)| {
-                let known_empty = s.empty_as_of == Some(s.epoch);
+                let known_empty = s.known_empty();
                 if s.scan_from.is_none() && !known_empty {
                     return None;
                 }
@@ -303,26 +321,11 @@ impl ClaimCursor {
     }
 }
 
-/// On-disk form of one queue's claim-scan state, stored under
-/// [`cursor_key`]. Written only by a clean
-/// [`Queue::close`](crate::Queue::close); the next open deletes the
-/// record before it accepts any call, so a record is never observed
-/// after the state it describes could have changed.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PersistedCursor {
-    /// Queue the state belongs to; stored in the record so the
-    /// reader does not parse it out of the key.
-    queue: QueueName,
-    /// Scan bound key, when one was established.
-    bound_key: Option<Vec<u8>>,
-    /// Whether the bound key itself may be live.
-    bound_inclusive: bool,
-    /// Whether a full scan had proven the queue empty at close.
-    known_empty: bool,
-}
-
-/// Write each queue's claim-scan state under its cursor key. Runs
-/// after the background tasks have stopped; `close` consumes the
+/// Write each queue's claim-scan state at its cursor key. Only a clean
+/// [`Queue::close`](crate::Queue::close) writes the records, and the
+/// next open deletes them before it accepts any call, so a record is
+/// never observed after the state it describes changes.
+/// Runs after the background tasks have stopped; `close` consumes the
 /// handle, so the exported state cannot change between the export and
 /// the database closing.
 pub(crate) async fn persist_cursor_state(core: &QueueCore) -> Result<()> {
@@ -332,13 +335,7 @@ pub(crate) async fn persist_cursor_state(core: &QueueCore) -> Result<()> {
     }
     let txn = core.db.begin(IsolationLevel::Snapshot).await?;
     for (queue, state) in states {
-        let record = PersistedCursor {
-            queue: queue.clone(),
-            bound_key: state.scan_from.as_ref().map(|sf| sf.key.to_vec()),
-            bound_inclusive: state.scan_from.is_some_and(|sf| sf.inclusive),
-            known_empty: state.known_empty,
-        };
-        txn.put(cursor_key(&queue), &rmp_serde::to_vec_named(&record)?)?;
+        txn.put(cursor_key(&queue), &rmp_serde::to_vec_named(&state)?)?;
     }
     txn.commit().await?;
     Ok(())
@@ -347,7 +344,7 @@ pub(crate) async fn persist_cursor_state(core: &QueueCore) -> Result<()> {
 /// Restore the claim cursor from cursor records persisted by the
 /// previous clean close, then delete them before the queue accepts any
 /// call. A record is valid only as of the close that wrote it: once
-/// inserts resume, the live bound can move behind the persisted one.
+/// inserts resume, the live bound can move before the persisted one.
 /// The delete does not await WAL durability. Every insert after it
 /// follows it in the WAL, so a flush that makes an insert durable makes
 /// the delete durable, and a flush lost in a crash loses the inserts
@@ -355,18 +352,26 @@ pub(crate) async fn persist_cursor_state(core: &QueueCore) -> Result<()> {
 /// a store without inserts after the close that wrote it, and the next
 /// open restores it again.
 ///
-/// A record that does not decode is deleted with a warning and does not
-/// restore any state. A scan from the front of the prefix is always
-/// correct, and the loss of the record adds exactly one such scan at
-/// the next open.
+/// A record that does not decode, or whose key does not name a queue,
+/// is deleted with a warning and does not restore any state. A scan
+/// from the front of the prefix is always correct, and the loss of the
+/// record adds exactly one such scan at the next open.
 pub(crate) async fn restore_cursor_state(core: &QueueCore) -> Result<()> {
     let txn = core.db.begin(IsolationLevel::Snapshot).await?;
     let mut records = Vec::new();
     {
         let mut iter = txn.scan_prefix(tag_prefix(KeyTag::Cursor), ..).await?;
         while let Some(kv) = iter.next().await? {
-            match rmp_serde::from_slice::<PersistedCursor>(&kv.value) {
-                Ok(record) => records.push((kv.key, Some(record))),
+            let Some(queue) = parse_cursor_key(&kv.key) else {
+                warn!(
+                    key = %String::from_utf8_lossy(&kv.key),
+                    "claim-scan key does not name a queue and is deleted"
+                );
+                records.push((kv.key, None));
+                continue;
+            };
+            match rmp_serde::from_slice::<CursorState>(&kv.value) {
+                Ok(state) => records.push((kv.key, Some((queue, state)))),
                 Err(err) => {
                     warn!(
                         key = %String::from_utf8_lossy(&kv.key),
@@ -381,17 +386,8 @@ pub(crate) async fn restore_cursor_state(core: &QueueCore) -> Result<()> {
         return Ok(());
     }
     for (key, record) in records {
-        if let Some(record) = record {
-            core.claim_cursor.restore(
-                &record.queue,
-                CursorState {
-                    scan_from: record.bound_key.map(|key| ScanFrom {
-                        key: Bytes::from(key),
-                        inclusive: record.bound_inclusive,
-                    }),
-                    known_empty: record.known_empty,
-                },
-            );
+        if let Some((queue, state)) = record {
+            core.claim_cursor.restore(&queue, state);
         }
         txn.delete(&key)?;
     }
@@ -426,7 +422,7 @@ mod tests {
     fn mark_empty_short_circuits_until_next_insert() {
         let state = ClaimCursor::new();
         let scan = state.begin_claim("q");
-        state.mark_empty(&qn("q"), scan.epoch);
+        state.mark_empty(&qn("q"), &scan);
 
         assert!(state.begin_claim("q").known_empty);
 
@@ -439,7 +435,7 @@ mod tests {
         let state = ClaimCursor::new();
         let scan = state.begin_claim("q");
         state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-1");
-        state.mark_empty(&qn("q"), scan.epoch);
+        state.mark_empty(&qn("q"), &scan);
 
         assert!(!state.begin_claim("q").known_empty);
     }
@@ -454,7 +450,7 @@ mod tests {
             &scan,
         );
         let scan = state.begin_claim("q");
-        state.mark_empty(&qn("q"), scan.epoch);
+        state.mark_empty(&qn("q"), &scan);
 
         assert_eq!(
             state.begin_claim("q").scan_from,
@@ -506,7 +502,7 @@ mod tests {
     fn insert_while_known_empty_sets_the_bound_without_a_prior_one() {
         let state = ClaimCursor::new();
         let scan = state.begin_claim("q");
-        state.mark_empty(&qn("q"), scan.epoch);
+        state.mark_empty(&qn("q"), &scan);
 
         state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-1");
         assert_eq!(
@@ -533,7 +529,7 @@ mod tests {
         );
 
         // While a claim that observed the bound at job-2 is in flight,
-        // job-3 commits. It is ahead of the bound, so it does not move
+        // job-3 commits. It sorts after the bound, so it does not move
         // it, but it sorts below the keys the claim is about to
         // advance past.
         let observed = state.begin_claim("q");

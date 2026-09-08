@@ -204,7 +204,7 @@ impl QueueCore {
     /// crash-looping job.
     ///
     /// Runs after the claim cursor is restored, and notes each re-queued
-    /// job's pending key, which sorts behind the restored clean-close
+    /// job's pending key, which sorts before the restored clean-close
     /// bound.
     pub(crate) async fn requeue_interrupted_claims(&self) -> Result<()> {
         let mut interrupted: Vec<JobRecord> = Vec::new();

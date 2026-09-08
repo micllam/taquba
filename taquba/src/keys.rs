@@ -376,6 +376,13 @@ pub(crate) fn parse_key_timestamp(key: &[u8], tag: KeyTag) -> Option<u64> {
     Some(u64::from_be_bytes(ts))
 }
 
+/// Parse the queue name from a cursor key. Returns `None` when the key
+/// is not a current-version cursor key or is malformed.
+pub(crate) fn parse_cursor_key(key: &[u8]) -> Option<QueueName> {
+    let rest = key.strip_prefix(header(KeyTag::Cursor).as_slice())?;
+    QueueName::new(std::str::from_utf8(rest).ok()?).ok()
+}
+
 /// Parse `(queue, metric)` from a stats key. Returns `None` when the
 /// key is not a current-version stats key or is malformed.
 pub(crate) fn parse_stats_key(key: &[u8]) -> Option<(String, String)> {
@@ -464,6 +471,15 @@ mod tests {
     #[test]
     fn claimed_keys_of_nested_queue_names_do_not_collide() {
         assert_ne!(claimed_key(&qn("ab"), "01A"), claimed_key(&qn("a"), "b01A"));
+    }
+
+    #[test]
+    fn cursor_key_round_trips_the_queue() {
+        assert_eq!(
+            parse_cursor_key(&cursor_key(&qn("email"))),
+            Some(qn("email"))
+        );
+        assert_eq!(parse_cursor_key(&stats_key(&qn("email"), "pending")), None);
     }
 
     #[test]

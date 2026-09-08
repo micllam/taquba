@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (storage):** the claim-scan record that `Queue::close`
+  writes has a new layout. The first claim after opening a store written
+  by an earlier version scans from the front of the pending prefix.
 - **Breaking (source):** `JobRecord::queue` is a `QueueName`. A caller
   that reads the field as a `str` is unchanged. One that moves it into
   a `String` converts it with `into_string` or `to_string`.

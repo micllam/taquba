@@ -717,11 +717,11 @@ impl Queue {
     /// claimed key and is used as the start bound on the next
     /// scan. This lets steady-state claims skip over the
     /// tombstones left by previously claimed (and deleted)
-    /// pending entries. When the cursor scan yields nothing
+    /// pending entries. When the cursor scan ends without a key
     /// inside the queue's prefix (cursor exhausted, or an older
-    /// job has been requeued by `nack` behind the cursor), the
+    /// job was requeued by `nack` before the cursor), the
     /// claim falls back to a front prefix scan and resets the
-    /// cursor. When the front scan also finds nothing, the queue is
+    /// cursor. When the front scan also ends without a key, the queue is
     /// marked empty in memory and subsequent claims return `None`
     /// without scanning until the next pending insert, so polling
     /// an empty queue does not re-walk the tombstone band left by
@@ -759,11 +759,11 @@ impl Queue {
             return Ok(Vec::new());
         }
         // Empty check before taking the claim lock: a queue known to be
-        // empty answers from in-process state without contending with
-        // claims that have work to do. A stale answer here is safe in
-        // both directions; emptiness is only ever revoked by an insert,
-        // and a stale "not empty" just falls through to the locked scan.
-        if self.core.claim_cursor.begin_claim(&queue).known_empty {
+        // empty is reported from in-process state, without contention
+        // with claims that have work to do. A stale value is safe in
+        // both directions. Emptiness is revoked only by an insert, and
+        // a stale "not empty" falls through to the locked scan.
+        if self.core.claim_cursor.known_empty(&queue) {
             return Ok(Vec::new());
         }
         let mut jobs = {
@@ -818,7 +818,7 @@ impl Queue {
             let scan_options = ScanOptions::default().with_cache_blocks(true);
             let mut iter = match scan.scan_from.clone() {
                 // Resume from the recorded bound (after the last claimed key,
-                // or a key inserted behind it). The subrange is relative to the
+                // or a key inserted before it). The subrange is relative to the
                 // prefix, so scan_prefix ends at the prefix upper bound natively
                 // and a drained queue is detected without scanning beyond the
                 // prefix.
@@ -855,10 +855,10 @@ impl Queue {
             }
             if candidates.is_empty() {
                 // Every live pending key sorts at or after a known bound
-                // (inserts landing behind it move it back), so an empty
-                // bound scan proves the queue is empty without re-walking
-                // the tombstone band from the front.
-                self.core.claim_cursor.mark_empty(queue, scan.epoch);
+                // (an insert before it moves it back), so a bound scan that
+                // ends without a key establishes that the queue is empty,
+                // without a read of the tombstone band from the front.
+                self.core.claim_cursor.mark_empty(queue, &scan);
                 return Ok(Vec::new());
             }
 
@@ -936,7 +936,7 @@ impl Queue {
                         // nothing is left after taking these jobs; record
                         // emptiness so the next poll short-circuits. Any
                         // insert since the epoch read revokes it.
-                        self.core.claim_cursor.mark_empty(queue, scan.epoch);
+                        self.core.claim_cursor.mark_empty(queue, &scan);
                     }
                     // The claim histogram measures the claim
                     // transaction; offloaded payload fetches happen

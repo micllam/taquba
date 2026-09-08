@@ -26,7 +26,7 @@ The claim id and the cancellation token are described in turn.
 
 The claim id is 64 random bits that identify this one delivery. The queue
 generates it at claim time and keeps a copy in memory, and at settlement it
-compares the two copies. A match proves that the caller's claim is still the
+compares the two copies. A match establishes that the caller's claim is still the
 live one. [The lease registry](#the-lease-registry) describes where the
 queue's copy is kept and how the comparison works.
 
@@ -148,7 +148,7 @@ Each field of the entry has its writer and its reader:
 The reaper marks each due entry and leaves it in place. Renewal and the reaper
 do not share a durable key, so the mark is what orders them. A reap that fails leaves
 its mark for the next tick, so one unreapable job does not block the entries
-behind it.
+due after it.
 
 Nothing in the registry is written to the store, because a lease matters only
 to the process that owns it. Recovery when the queue opens returns every claim

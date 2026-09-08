@@ -15,7 +15,7 @@ reaches a job it can claim.
 The queue avoids that band. It remembers where the previous scan stopped and
 resumes from that bound. `ClaimCursor` ([claim_cursor.rs][claim_cursor]) keeps
 that bound, one per queue. Each claim turns the keys it takes into tombstones
-and leaves the bound past them. The dead band grows behind the bound and is
+and leaves the bound past them. The dead band grows before the bound and is
 never read again.
 
 ```text
@@ -34,7 +34,7 @@ become tombstones and the bound moves past them
 ```
 
 Every live pending key must sort at or after the bound. Only then is a resume
-from the bound safe. An enqueue can put a key behind it, because keys sort by
+from the bound safe. An enqueue can put a key before it, because keys sort by
 priority first. A job enqueued at a higher priority than the jobs already
 claimed sorts before them. Its key is then inside the band of tombstones that
 the scan skips.
@@ -46,7 +46,7 @@ so its key sorts inside the band the scan skips
   ▨ ▨ ▨ ▨ ★ ▨ ▨ ▨ ▨ ▨ □ □ □ □ □ □
           ▲           ▲
           │           └ the bound: where the scan starts without the insert
-          └ the new key, behind the bound
+          └ the new key, before the bound
 
 the insert moves the bound back to the new key
 
@@ -70,7 +70,7 @@ of the prefix.
 A bound is valid only for the moment it was taken, because
 enqueues move it back. A scan from the start of the prefix cannot skip
 the jobs that arrived after a captured bound. The start is
-the one position that sits behind every live key. The first scan after a crash
+the one position that sorts before every live key. The first scan after a crash
 reads the tombstone band, and every scan after it resumes from the bound again.
 
 Claiming runs under a per-queue lock. `ClaimCursor` contains the lock and the

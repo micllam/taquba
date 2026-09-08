@@ -29,7 +29,7 @@ all-features = true
 slatedb = { version = "0.16.0", default-features = false, features = ["foyer"] }
 ulid = { workspace = true, features = ["serde"] }
 rmp-serde = "1"
-bytes = "1"
+bytes = { version = "1", features = ["serde"] }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
