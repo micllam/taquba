@@ -1,19 +1,39 @@
 //! Stored forms of the runtime's public types. Each `Durable*` type
 //! mirrors a public type and is what actually serializes, so the public
 //! type can evolve without changing the stored layout. Records are
-//! encoded as MessagePack maps (`rmp_serde::to_vec_named`) at the call
-//! sites.
+//! MessagePack maps with named fields, written through [`encode`] and
+//! read through [`decode`] or, for a record at one key of the queue's
+//! KV namespace, [`kv_record`].
 
 use std::collections::HashMap;
 use std::time::Duration;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use taquba::Queue;
+
+use crate::error::Result;
 
 /// Encode one of the crate's own records as MessagePack with named
 /// fields. The record types here hold strings, bytes, integers and
 /// enumerations, whose encoding cannot fail.
 pub(crate) fn encode<T: Serialize>(record: &T) -> Vec<u8> {
     rmp_serde::to_vec_named(record).expect("a durable record encodes")
+}
+
+/// Decode one of the crate's own records. A record that does not decode
+/// is [`Error::Deserialization`](crate::Error::Deserialization).
+pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    Ok(rmp_serde::from_slice(bytes)?)
+}
+
+/// The record at `key` of the queue's KV namespace, `None` when no
+/// value is stored there.
+pub(crate) async fn kv_record<T: DeserializeOwned>(queue: &Queue, key: &[u8]) -> Result<Option<T>> {
+    match queue.kv_get(key).await? {
+        Some(bytes) => decode(&bytes).map(Some),
+        None => Ok(None),
+    }
 }
 
 use crate::effects::StagedEffects;

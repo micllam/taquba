@@ -172,7 +172,7 @@ impl GroupStore {
 
     pub(crate) async fn read_manifest(&self, group_id: &str) -> Result<Option<Manifest>> {
         match self.objects.get(&self.manifest_path(group_id)).await? {
-            Some(bytes) => Ok(Some(rmp_serde::from_slice(&bytes)?)),
+            Some(bytes) => durable::decode(&bytes).map(Some),
             None => Ok(None),
         }
     }
@@ -188,14 +188,7 @@ impl GroupStore {
 
     /// The member record of `key` in `group_id`, when one exists.
     pub(crate) async fn member(&self, group_id: &str, key: &str) -> Result<Option<DurableMember>> {
-        match self
-            .queue
-            .kv_get(&group_member_kv_key(group_id, key))
-            .await?
-        {
-            Some(bytes) => Ok(Some(rmp_serde::from_slice(&bytes)?)),
-            None => Ok(None),
-        }
+        durable::kv_record(&self.queue, &group_member_kv_key(group_id, key)).await
     }
 
     /// Every member record of `group_id`, in key order. A record that

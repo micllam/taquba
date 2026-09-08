@@ -1088,12 +1088,9 @@ impl RuntimeCore {
 
     /// The current-step pointer of a run whose durable record exists.
     pub(crate) async fn current_step(&self, run_id: &str) -> Result<DurableCurrentStep> {
-        let bytes = self
-            .queue
-            .kv_get(&step_kv_key(run_id))
+        self.current_step_if_active(run_id)
             .await?
-            .ok_or_else(|| Error::InconsistentRunState(run_id.to_string()))?;
-        Ok(rmp_serde::from_slice(&bytes)?)
+            .ok_or_else(|| Error::InconsistentRunState(run_id.to_string()))
     }
 
     /// The current-step pointer of `run_id`, `None` when the run is not
@@ -1102,10 +1099,7 @@ impl RuntimeCore {
         &self,
         run_id: &str,
     ) -> Result<Option<DurableCurrentStep>> {
-        match self.queue.kv_get(&step_kv_key(run_id)).await? {
-            Some(bytes) => Ok(Some(rmp_serde::from_slice(&bytes)?)),
-            None => Ok(None),
-        }
+        durable::kv_record(&self.queue, &step_kv_key(run_id)).await
     }
 
     /// The current step of `run_id` with its queue job; `None` when the
@@ -1135,10 +1129,7 @@ impl RuntimeCore {
 
     /// The terminal record of `run_id`; `None` when no record exists.
     pub(crate) async fn terminal_record(&self, run_id: &str) -> Result<Option<DurableTermination>> {
-        match self.queue.kv_get(&outcome_kv_key(run_id)).await? {
-            Some(bytes) => Ok(Some(rmp_serde::from_slice(&bytes)?)),
-            None => Ok(None),
-        }
+        durable::kv_record(&self.queue, &outcome_kv_key(run_id)).await
     }
 
     /// The status of a terminated run from its terminal record; `None`
@@ -1287,10 +1278,7 @@ impl RuntimeCore {
 
     /// The durable record of `run_id`, when the run is active.
     pub(crate) async fn run_record(&self, run_id: &str) -> Result<Option<DurableRunRecord>> {
-        match self.queue.kv_get(&run_kv_key(run_id)).await? {
-            Some(bytes) => Ok(Some(rmp_serde::from_slice(&bytes)?)),
-            None => Ok(None),
-        }
+        durable::kv_record(&self.queue, &run_kv_key(run_id)).await
     }
 
     /// Record a cancellation request on the run record of `run_id`.
@@ -1302,7 +1290,7 @@ impl RuntimeCore {
             let Some(current) = self.queue.kv_get(&key).await? else {
                 return Ok(None);
             };
-            let mut record: DurableRunRecord = rmp_serde::from_slice(&current)?;
+            let mut record: DurableRunRecord = durable::decode(&current)?;
             if record.cancel_requested {
                 return Ok(Some(record.input_hash));
             }
