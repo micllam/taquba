@@ -340,12 +340,15 @@ pub(crate) async fn persist_cursor_state(core: &QueueCore) -> Result<()> {
 }
 
 /// Restore the claim cursor from cursor records persisted by the
-/// previous clean close, then durably delete them before the queue
-/// accepts any call. A record is valid only as of the close that wrote
-/// it: once inserts resume the live bound can move behind the
-/// persisted one, so a crash before the delete is durable would leave
-/// a record whose stale bound makes a later open skip the jobs behind
-/// it.
+/// previous clean close, then delete them before the queue accepts any
+/// call. A record is valid only as of the close that wrote it: once
+/// inserts resume, the live bound can move behind the persisted one.
+/// The delete does not await WAL durability. Every insert after it
+/// follows it in the WAL, so a flush that makes an insert durable makes
+/// the delete durable, and a flush lost in a crash loses the inserts
+/// with the delete. A record that survives a crash therefore describes
+/// a store without inserts after the close that wrote it, and the next
+/// open restores it again.
 pub(crate) async fn restore_cursor_state(core: &QueueCore) -> Result<()> {
     let txn = core.db.begin(IsolationLevel::Snapshot).await?;
     let mut records = Vec::new();
@@ -982,6 +985,62 @@ mod tests {
 
         let job = q.claim("work", lease).await.unwrap().unwrap();
         assert_eq!(job.payload, b"urgent");
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cursor_record_surviving_a_lost_flush_is_restored_at_the_next_open() {
+        let store = make_store();
+        let lease = Duration::from_secs(5);
+        let q = Queue::open(store.clone(), "test").await.unwrap();
+        q.enqueue("work", b"normal-1".to_vec()).await.unwrap();
+        q.enqueue("work", b"normal-2".to_vec()).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+
+        // A flush interval longer than the test, so the open's delete of
+        // the record is durable only with a later awaited write. Closing
+        // without a flush discards it, the effect of a crash.
+        let opts = OpenOptions {
+            flush_interval: Some(Duration::from_secs(3600)),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(store.clone(), "test", opts)
+            .await
+            .unwrap();
+        q.core
+            .db
+            .close_with_options(slatedb::config::CloseOptions::default().with_flush_type(None))
+            .await
+            .unwrap();
+        drop(q);
+
+        let q = Queue::open(store, "test").await.unwrap();
+        assert!(
+            q.core.claim_cursor.begin_claim("work").scan_from.is_some(),
+            "the surviving record is restored",
+        );
+        assert!(
+            q.core.db.get(cursor_key("work")).await.unwrap().is_none(),
+            "the cursor record is consumed at open",
+        );
+        q.enqueue_with(
+            "work",
+            b"urgent".to_vec(),
+            EnqueueOptions {
+                priority: Some(PRIORITY_HIGH),
+                ..EnqueueOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        assert_eq!(job.payload, b"urgent");
+        q.ack(&job).await.unwrap();
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        assert_eq!(job.payload, b"normal-2");
         q.ack(&job).await.unwrap();
         q.close().await.unwrap();
     }
