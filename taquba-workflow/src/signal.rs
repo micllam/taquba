@@ -15,7 +15,7 @@ use std::time::Duration;
 use taquba::{JobRecord, JobStatus, Queue, SettlementEffects, WorkerError};
 use tracing::{debug, warn};
 
-use crate::error::{Error, Result};
+use crate::error::{Result, worker_error};
 use crate::keys::{
     HEADER_SIGNAL_DELIVERED, HEADER_SIGNAL_WAIT, signal_buf_kv_key, signal_delivered_kv_key,
     signal_wait_kv_key,
@@ -143,31 +143,37 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     ) -> std::result::Result<SettlementEffects, WorkerError> {
         let wait_key = signal_wait_kv_key(correlation_key);
 
-        // One waiter per correlation key: reject a registration while a
-        // live waiter holds the key. The check reads current state; a
-        // stale index entry (its job no longer scheduled) is overwritten.
-        // The rejection terminates the run like any permanent step error.
-        match self.core.queue.kv_get(&wait_key).await {
-            Ok(Some(existing)) => {
-                if let Ok(existing_id) = std::str::from_utf8(&existing)
-                    && let Ok(Some(job)) = self.core.queue.get_job(existing_id).await
-                    && job.status == JobStatus::Scheduled
-                {
-                    let message = format!(
-                        "a waiter is already registered for correlation key `{correlation_key}`"
-                    );
-                    return Err(self
-                        .terminating_failure(claimed, StepError::permanent(message), input_hash)
-                        .await);
-                }
-            }
-            Ok(None) => {}
-            Err(e) => return Err(StepError::from(Error::Queue(e)).into_worker_error()),
+        // One waiter per correlation key: a registration while a live
+        // waiter is at the key is rejected. The check reads current
+        // state, and a stale index entry (its job no longer scheduled) is
+        // overwritten. The rejection terminates the run as a permanent
+        // step error does.
+        if let Some(existing) = self
+            .core
+            .queue
+            .kv_get(&wait_key)
+            .await
+            .map_err(worker_error)?
+            && let Ok(existing_id) = std::str::from_utf8(&existing)
+            && let Ok(Some(job)) = self.core.queue.get_job(existing_id).await
+            && job.status == JobStatus::Scheduled
+        {
+            let message =
+                format!("a waiter is already registered for correlation key `{correlation_key}`");
+            return Err(self
+                .terminating_failure(claimed, StepError::permanent(message), input_hash)
+                .await);
         }
 
         let buf_key = signal_buf_kv_key(correlation_key);
-        match self.core.queue.kv_get(&buf_key).await {
-            Ok(Some(buffered)) => {
+        match self
+            .core
+            .queue
+            .kv_get(&buf_key)
+            .await
+            .map_err(worker_error)?
+        {
+            Some(buffered) => {
                 let opts = StepEnqueueOpts {
                     reserved_headers: claimed
                         .reserved_headers_with((HEADER_SIGNAL_DELIVERED, "1".to_string())),
@@ -185,7 +191,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 effects.kv_deletes.push(buf_key);
                 Ok(effects)
             }
-            Ok(None) => {
+            None => {
                 let opts = StepEnqueueOpts {
                     run_at: Some(self.core.run_at_after(timeout)),
                     reserved_headers: claimed
@@ -200,7 +206,6 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     .await;
                 Ok(effects)
             }
-            Err(e) => Err(StepError::from(Error::Queue(e)).into_worker_error()),
         }
     }
 }

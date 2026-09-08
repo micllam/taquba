@@ -156,6 +156,13 @@ impl Error {
     }
 }
 
+/// The worker error reporting `err` from a step's delivery: a
+/// [`taquba::PermanentFailure`] for a permanent error, which
+/// dead-letters the step, and a retrying error otherwise.
+pub(crate) fn worker_error(err: impl Into<Error>) -> taquba::WorkerError {
+    crate::runner::StepError::from(err.into()).into_worker_error()
+}
+
 /// Result alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, Error>;
 

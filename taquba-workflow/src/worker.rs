@@ -14,7 +14,7 @@ use tracing::{debug, warn};
 
 use crate::durable::DurableRunOutcome;
 use crate::effects::{EffectsHandle, TerminalEffects};
-use crate::error::Error;
+use crate::error::{Error, worker_error};
 use crate::group::Membership;
 use crate::keys::{HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RESERVED_HEADER_PREFIX};
 use crate::kv::KvReadHandle;
@@ -186,7 +186,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         self.core
             .store_run_result(&outcome, &termination)
             .await
-            .map_err(|err| StepError::from(err).into_worker_error())?;
+            .map_err(worker_error)?;
         Ok(self
             .core
             .terminate_collecting_effects(&outcome, claimed, termination))
@@ -237,7 +237,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             Ok(claimed) => claimed,
             Err(err) => {
                 warn!(job_id = %job.id, error = %err, "workflow step has malformed headers");
-                return Err(StepError::from(err).into_worker_error());
+                return Err(worker_error(err));
             }
         };
         let run_id = claimed.run_id.as_str();
@@ -247,7 +247,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .core
             .resolve_step_signal(job, run_id, step_number)
             .await
-            .map_err(|err| StepError::from(err).into_worker_error())?;
+            .map_err(worker_error)?;
 
         // A cancellation requested before this claim is recorded on the
         // run record; the step is settled as cancelled without running.
@@ -255,10 +255,8 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .core
             .run_record(run_id)
             .await
-            .map_err(|err| StepError::from(err).into_worker_error())?
-            .ok_or_else(|| {
-                StepError::from(Error::InconsistentRunState(run_id.to_string())).into_worker_error()
-            })?;
+            .map_err(worker_error)?
+            .ok_or_else(|| worker_error(Error::InconsistentRunState(run_id.to_string())))?;
         if record.cancel_requested {
             let mut effects = self
                 .terminate_recorded(&claimed, claimed.cancelled(None), record.input_hash, None)
@@ -298,7 +296,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             self.core
                 .load_step_output(run_id, step_number, &job.payload)
                 .await
-                .map_err(|err| StepError::from(err).into_worker_error())?
+                .map_err(worker_error)?
         } else {
             None
         };
@@ -329,7 +327,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             self.core
                 .store_step_output(run_id, step_number, &job.payload, outcome, &caller_effects)
                 .await
-                .map_err(|err| StepError::from(err).into_worker_error())?;
+                .map_err(worker_error)?;
         }
 
         let runner_cancelled = matches!(outcome, Ok(StepOutcome::Cancel { .. }));
