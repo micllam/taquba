@@ -20,7 +20,7 @@ use crate::keys::{HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RESERVED_HEADER_P
 use crate::kv::KvReadHandle;
 use crate::runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 use crate::runtime::{RuntimeInner, StepEnqueueOpts};
-use crate::terminal::{RunOutcome, TerminalHook};
+use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
 
 /// The [`Worker`] of a runtime: every claimed job of the runtime's
 /// queue is processed by [`RuntimeInner::process_step`].
@@ -114,35 +114,37 @@ impl<'a> ClaimedStep<'a> {
             .unwrap_or_default()
     }
 
+    /// The outcome of the run terminating at this step with `status`.
+    fn outcome(
+        &self,
+        status: TerminalStatus,
+        result: Option<Vec<u8>>,
+        error: Option<String>,
+    ) -> RunOutcome {
+        RunOutcome {
+            run_id: self.run_id.clone(),
+            status,
+            result,
+            error,
+            headers: self.headers.clone(),
+            final_step: self.step_number,
+        }
+    }
+
     /// A `Succeeded` outcome of the run at this step.
     pub(crate) fn succeeded(&self, result: Vec<u8>) -> RunOutcome {
-        RunOutcome::succeeded(
-            self.run_id.clone(),
-            result,
-            self.headers.clone(),
-            self.step_number,
-        )
+        self.outcome(TerminalStatus::Succeeded, Some(result), None)
     }
 
     /// A `Failed` outcome of the run at this step.
     pub(crate) fn failed(&self, error: String) -> RunOutcome {
-        RunOutcome::failed(
-            self.run_id.clone(),
-            error,
-            self.headers.clone(),
-            self.step_number,
-        )
+        self.outcome(TerminalStatus::Failed, None, Some(error))
     }
 
     /// A `Cancelled` outcome of the run at this step; `reason` is
     /// `None` for an external cancellation.
     pub(crate) fn cancelled(&self, reason: Option<String>) -> RunOutcome {
-        RunOutcome::cancelled(
-            self.run_id.clone(),
-            reason,
-            self.headers.clone(),
-            self.step_number,
-        )
+        self.outcome(TerminalStatus::Cancelled, None, reason)
     }
 }
 
