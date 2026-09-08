@@ -29,7 +29,8 @@ pub struct JobRecord {
     /// When [`Self::payload_ref`] is `Some`, the payload was offloaded
     /// to the payload object store at enqueue and is fetched from there
     /// on each claim or read; the persisted record itself stores no
-    /// payload bytes.
+    /// payload bytes. Stored as a MessagePack binary string.
+    #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
     /// Name of this job's payload object in the payload object store.
     /// `Some` only when the payload exceeded
@@ -81,7 +82,7 @@ pub struct JobRecord {
     /// [`Self::woken_at`] for the early-wake marker itself. Once attached,
     /// the value persists across later transitions, so a worker observes it
     /// on every delivery of the job.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
     pub wake_payload: Option<Vec<u8>>,
     /// Priority bucket; lower numbers are claimed first. See
     /// [`PRIORITY_HIGH`](crate::PRIORITY_HIGH),
@@ -350,6 +351,27 @@ mod tests {
     use super::*;
     use crate::keys::{dead_key, job_index_key, pending_key};
     use crate::test_util::qn;
+
+    #[test]
+    fn payload_bytes_are_stored_as_a_binary_string() {
+        // A binary string stores the bytes as they are, so the stored
+        // record contains the payload as one contiguous window. An
+        // integer array prefixes every byte at or above `0x80`.
+        let payload: Vec<u8> = (0..=255).collect();
+        let mut job = JobRecord::new_pending("j".into(), qn("q"), payload.clone(), 3, 0, 1);
+        job.wake_payload = Some(payload.iter().rev().copied().collect());
+        let stored = job.stored_bytes().unwrap();
+        assert!(
+            stored
+                .windows(payload.len())
+                .any(|w| w == payload.as_slice())
+        );
+        let woken: Vec<u8> = payload.iter().rev().copied().collect();
+        assert!(stored.windows(woken.len()).any(|w| w == woken.as_slice()));
+        let decoded = JobRecord::decode(&pending_key(&qn("q"), 0, "j"), &stored).unwrap();
+        assert_eq!(decoded.payload, payload);
+        assert_eq!(decoded.wake_payload.as_deref(), Some(woken.as_slice()));
+    }
 
     fn record() -> JobRecord {
         JobRecord::new_pending("j".into(), qn("q"), b"p".to_vec(), 3, 0, 1)

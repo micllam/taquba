@@ -141,10 +141,12 @@ impl From<DurableTrigger> for Trigger {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum DurableStepOutcome {
     Continue {
+        #[serde(with = "serde_bytes")]
         payload: Vec<u8>,
         when: DurableTrigger,
     },
     Succeed {
+        #[serde(with = "serde_bytes")]
         result: Vec<u8>,
     },
     Fail {
@@ -265,6 +267,7 @@ pub(crate) struct DurableMember {
 pub(crate) struct DurableRunOutcome {
     run_id: String,
     status: DurableTerminalStatus,
+    #[serde(with = "serde_bytes")]
     result: Option<Vec<u8>>,
     error: Option<String>,
     headers: HashMap<String, String>,
@@ -329,5 +332,38 @@ impl From<DurableRunOutcome> for RunOutcome {
             headers: outcome.headers,
             final_step: outcome.final_step,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payload_bytes_are_stored_as_binary_strings() {
+        // A binary string stores the bytes as they are, so the encoded
+        // record contains the payload as one contiguous window. An
+        // integer array prefixes every byte at or above `0x80`.
+        let payload: Vec<u8> = (0..=255).collect();
+        let is_contiguous = |bytes: &[u8]| bytes.windows(payload.len()).any(|w| w == payload);
+        assert!(is_contiguous(&encode(&DurableStepOutcome::Continue {
+            payload: payload.clone(),
+            when: DurableTrigger::Immediate,
+        })));
+        assert!(is_contiguous(&encode(&DurableStepOutcome::Succeed {
+            result: payload.clone(),
+        })));
+        let outcome = DurableRunOutcome {
+            run_id: "run".into(),
+            status: DurableTerminalStatus::Succeeded,
+            result: Some(payload.clone()),
+            error: None,
+            headers: HashMap::new(),
+            final_step: 0,
+        };
+        let stored = encode(&outcome);
+        assert!(is_contiguous(&stored));
+        let decoded: DurableRunOutcome = decode(&stored).unwrap();
+        assert_eq!(decoded.result, Some(payload));
     }
 }

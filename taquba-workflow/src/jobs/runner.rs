@@ -28,6 +28,7 @@ use crate::terminal::NoopTerminalHook;
 #[derive(Serialize, Deserialize)]
 struct JobPayload {
     name: String,
+    #[serde(with = "serde_bytes")]
     input: Vec<u8>,
 }
 

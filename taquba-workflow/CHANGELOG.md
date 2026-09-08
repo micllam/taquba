@@ -107,6 +107,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (storage):** the step payload and result in a step-output
+  replay record, the result in a run result record and a
+  terminal-notification payload, and the serialized job in a typed job's
+  run payload are stored as MessagePack binary strings. Stored as
+  integer arrays before, a byte at or above `0x80` took two bytes.
 - **Breaking (storage):** `WorkflowRuntimeBuilder::memo_prefix` defaults
   to `"{queue_name}-memo"`, `"workflow-steps-memo"` for the default queue
   name, so runtimes with distinct queue names on one object store do not

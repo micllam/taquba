@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (storage):** `JobRecord::payload` and `wake_payload` are
+  stored as MessagePack binary strings. Stored as integer arrays before,
+  a byte at or above `0x80` took two bytes.
 - **Breaking (source):** `Queue::requeue_dead_job` takes the job's id
   and reads the stored record inside its transaction, as `Queue::cancel`
   and `Queue::wake_scheduled` do. A caller that passed a record passes

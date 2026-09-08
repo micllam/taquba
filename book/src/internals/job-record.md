@@ -82,7 +82,9 @@ Three properties of the lifecycle:
 
 A job is stored as a single `JobRecord`, encoded as a MessagePack map with
 field names. MessagePack is compact, and the named fields keep a stored record
-readable when the set of fields changes.
+readable when the set of fields changes. The two byte fields, `payload` and
+`wake_payload`, are binary strings, so the record stores their bytes as they
+are.
 
 The record contains:
 
