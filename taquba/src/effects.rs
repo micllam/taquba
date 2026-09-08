@@ -375,14 +375,16 @@ impl QueueCore {
     }
 
     /// Post-commit bookkeeping for one staged job: a Pending job is
-    /// recorded on the claim cursor, which wakes a waiting worker; a
-    /// Scheduled job becomes claimable later via the scheduler loop,
-    /// which records its own insert.
+    /// recorded on the claim cursor, which wakes a waiting worker, and
+    /// a Scheduled job becomes claimable later through the scheduler
+    /// loop, which records its own insert. Every staged job is counted
+    /// as enqueued here, whichever transaction committed it.
     pub(crate) fn note_staged_job(&self, staged: &StagedJob) {
         if let Some(ref pending_key) = staged.pending_key {
             self.claim_cursor
                 .note_pending_insert(&staged.queue, pending_key);
         }
+        crate::obs::enqueued(&staged.queue, 1);
         debug!(queue = %staged.queue, job_id = %staged.id, "job enqueued");
     }
 }

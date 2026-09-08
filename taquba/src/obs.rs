@@ -98,8 +98,11 @@ mod imp {
         );
     }
 
-    pub(crate) fn enqueued(queue: &str, n: u64, t: Timer) {
+    pub(crate) fn enqueued(queue: &str, n: u64) {
         metrics::counter!("taquba_jobs_enqueued_total", "queue" => queue.to_owned()).increment(n);
+    }
+
+    pub(crate) fn enqueue_committed(queue: &str, t: Timer) {
         record(t, "taquba_enqueue_duration_seconds", queue);
     }
 
@@ -266,7 +269,9 @@ mod imp {
     #[inline]
     pub(crate) fn describe() {}
     #[inline]
-    pub(crate) fn enqueued(_queue: &str, _n: u64, _t: Timer) {}
+    pub(crate) fn enqueued(_queue: &str, _n: u64) {}
+    #[inline]
+    pub(crate) fn enqueue_committed(_queue: &str, _t: Timer) {}
     #[inline]
     pub(crate) fn claimed(_queue: &str, _n: u64, _t: Timer) {}
     #[inline]
@@ -295,7 +300,8 @@ mod tests {
         let snapshotter = recorder.snapshotter();
         metrics::with_local_recorder(&recorder, || {
             super::describe();
-            super::enqueued("q", 2, super::start());
+            super::enqueued("q", 2);
+            super::enqueue_committed("q", super::start());
             super::claimed("q", 2, super::start());
             super::completed("q", super::start());
             super::nacked("q");
@@ -330,6 +336,67 @@ mod tests {
                 "expected metric {expected} was not emitted; got {emitted:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_effect_enqueue_counts_toward_the_enqueued_total() {
+        use crate::EnqueueRequest;
+        use crate::test_util::*;
+        use metrics_util::debugging::DebugValue;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // A current-thread runtime, so every emission runs on the thread
+        // that installed the recorder.
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let q = Queue::open(make_store(), "test").await.unwrap();
+                    q.enqueue("work", b"first".to_vec()).await.unwrap();
+                    let claim = q
+                        .claim("work", Duration::from_secs(30))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let follow_up = EnqueueRequest {
+                        queue: "follow-ups".to_string(),
+                        payload: b"second".to_vec(),
+                        options: EnqueueOptions::default(),
+                    };
+                    q.ack_with(
+                        &claim,
+                        SettlementEffects::default().enqueues(vec![follow_up]),
+                    )
+                    .await
+                    .unwrap();
+                    q.close().await.unwrap();
+                });
+        });
+
+        let counts: HashMap<String, u64> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == "taquba_jobs_enqueued_total")
+            .map(|(composite, _, _, value)| {
+                let queue = composite
+                    .key()
+                    .labels()
+                    .find(|label| label.key() == "queue")
+                    .expect("the counter is labelled by queue")
+                    .value()
+                    .to_string();
+                let DebugValue::Counter(n) = value else {
+                    panic!("{queue}: not a counter");
+                };
+                (queue, n)
+            })
+            .collect();
+        assert_eq!(counts.get("work"), Some(&1));
+        assert_eq!(counts.get("follow-ups"), Some(&1));
     }
 
     #[test]

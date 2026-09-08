@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `taquba_jobs_enqueued_total` counts a job enqueued through
+  `SettlementEffects` (`ack_with`, `nack_with`, `dead_letter_with`,
+  `cancel_with` and `commit_effects`), which the counter missed. The
+  enqueue-latency histogram is unchanged and still measures the enqueue
+  calls only.
 - `Queue::requeue_dead_job` awaits the durability of its commit and
   retries a transaction conflict. A crash after the call returned left
   the job dead, and a conflict with the dead-retention sweep was

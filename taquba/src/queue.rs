@@ -626,7 +626,7 @@ impl Queue {
 
             match commit(txn, Durability::Awaited).await? {
                 Commit::Committed => {
-                    crate::obs::enqueued(&staged.queue, 1, timer);
+                    crate::obs::enqueue_committed(&staged.queue, timer);
                     self.core.note_staged_job(&staged);
                     return Ok(EnqueueResult::New(staged.id));
                 }
@@ -1752,7 +1752,8 @@ impl Queue {
                 return Err(err);
             }
         };
-        crate::obs::enqueued(queue, staged.len() as u64, timer);
+        crate::obs::enqueued(queue, staged.len() as u64);
+        crate::obs::enqueue_committed(queue, timer);
         // Batch ids are monotonic ULIDs at one priority, so the first
         // staged job holds the batch's smallest pending key.
         if let Some(key) = staged.first().and_then(|s| s.pending_key.as_ref()) {
