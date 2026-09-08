@@ -2,7 +2,7 @@
 //! records: validation, payload offload before the transaction, staging
 //! inside it and the work that follows its commit.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use slatedb::DbTransaction;
@@ -128,8 +128,21 @@ pub(crate) struct StagedEffects {
     pub(crate) jobs: Vec<StagedJob>,
 }
 
+/// One queue's share of a staged set: what
+/// [`QueueCore::note_staged_effects`] records for the queue after the
+/// commit.
+#[derive(Default)]
+struct QueueInserts<'a> {
+    /// Staged jobs on the queue, pending and scheduled.
+    enqueued: u64,
+    /// Staged jobs in the pending key space.
+    pending: usize,
+    /// The smallest pending key among them.
+    min_pending_key: Option<&'a [u8]>,
+}
+
 /// Identity of a job staged by [`Queue::stage_job_writes`], retained
-/// for post-commit bookkeeping.
+/// for the cursor note and the counter that follow the commit.
 pub(crate) struct StagedJob {
     pub(crate) id: String,
     pub(crate) queue: QueueName,
@@ -315,10 +328,31 @@ impl QueueCore {
     }
 
     /// Record the staged jobs after the commit and return their enqueue
-    /// results.
+    /// results. The jobs are grouped by queue: each queue's pending
+    /// inserts are recorded once, with the smallest pending key and
+    /// their count, and counted as enqueued once.
     pub(crate) fn note_staged_effects(&self, staged: StagedEffects) -> Vec<EnqueueResult> {
+        let mut by_queue: BTreeMap<&QueueName, QueueInserts<'_>> = BTreeMap::new();
         for staged_job in &staged.jobs {
-            self.note_staged_job(staged_job);
+            let inserts = by_queue.entry(&staged_job.queue).or_default();
+            inserts.enqueued += 1;
+            if let Some(pending_key) = &staged_job.pending_key {
+                inserts.pending += 1;
+                if inserts
+                    .min_pending_key
+                    .is_none_or(|min| pending_key.as_slice() < min)
+                {
+                    inserts.min_pending_key = Some(pending_key);
+                }
+            }
+            debug!(queue = %staged_job.queue, job_id = %staged_job.id, "job enqueued");
+        }
+        for (queue, inserts) in by_queue {
+            if let Some(min_key) = inserts.min_pending_key {
+                self.claim_cursor
+                    .note_pending_inserts(queue, min_key, inserts.pending);
+            }
+            crate::obs::enqueued(queue, inserts.enqueued);
         }
         staged.results
     }
@@ -370,8 +404,8 @@ impl QueueCore {
         }))
     }
 
-    /// Post-commit bookkeeping for one staged job: a Pending job is
-    /// recorded on the claim cursor, which wakes a waiting worker, and
+    /// The work that follows the commit of one staged job: a Pending job
+    /// is recorded on the claim cursor, which wakes a waiting worker, and
     /// a Scheduled job becomes claimable later through the scheduler
     /// loop, which records its own insert. Every staged job is counted
     /// as enqueued here, whichever transaction committed it.

@@ -15,7 +15,7 @@ use crate::background::BackgroundTask;
 use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
 use crate::completion::{CompletionWaiters, Registration};
-use crate::effects::{PreparedEffects, PreparedJob, SettlementEffects};
+use crate::effects::{EnqueueRequest, PreparedEffects, PreparedJob, SettlementEffects};
 use crate::error::{Error, Result};
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{Claim, JobRecord, JobStatus};
@@ -1693,60 +1693,33 @@ impl Queue {
     /// Enqueue multiple jobs atomically in a single transaction.
     ///
     /// All jobs use the queue's configured `max_attempts` and `default_priority`.
-    /// Returns the IDs in the same order as `payloads`.
+    /// Returns the IDs in the same order as `payloads`. The enqueues are
+    /// committed as the effects of [`Self::commit_effects`].
     pub async fn enqueue_batch(&self, queue: &str, payloads: Vec<Vec<u8>>) -> Result<Vec<String>> {
         if payloads.is_empty() {
             return Ok(Vec::new());
         }
         let timer = crate::obs::start();
-
-        let mut prepared = payloads
+        let enqueues = payloads
             .into_iter()
-            .map(|payload| {
-                self.core
-                    .prepare_job_record(queue, payload, EnqueueOptions::default())
+            .map(|payload| EnqueueRequest {
+                queue: queue.to_string(),
+                payload,
+                options: EnqueueOptions::default(),
             })
-            .collect::<Result<Vec<_>>>()?;
-        self.core.offload_prepared(&mut prepared).await?;
-
-        let write = async {
-            loop {
-                let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
-                let mut staged = Vec::with_capacity(prepared.len());
-                for prepared_job in &prepared {
-                    match self.core.stage_job_writes(&txn, prepared_job).await? {
-                        Ok(staged_job) => staged.push(staged_job),
-                        // Batch jobs have no dedup key.
-                        Err(_) => return Err(Error::InvalidState),
-                    }
-                }
-                match commit(txn, Durability::Awaited).await? {
-                    Commit::Committed => return Ok(staged),
-                    Commit::Conflict => continue,
-                }
-            }
-        };
-        let staged = match write.await {
-            Ok(staged) => staged,
-            Err(err) => {
-                self.core.discard_prepared(&prepared).await;
-                return Err(err);
-            }
-        };
-        crate::obs::enqueued(queue, staged.len() as u64);
+            .collect();
+        let results = self
+            .commit_effects(SettlementEffects::default().enqueues(enqueues))
+            .await?;
         crate::obs::enqueue_committed(queue, timer);
-        // Batch ids are monotonic ULIDs at one priority, so the first
-        // staged job holds the batch's smallest pending key.
-        if let Some(first) = staged.first()
-            && let Some(key) = &first.pending_key
-        {
-            self.core
-                .claim_cursor
-                .note_pending_inserts(&first.queue, key, staged.len());
-        }
-
-        debug!(queue = queue, count = staged.len(), "batch enqueued");
-        Ok(staged.into_iter().map(|s| s.id).collect())
+        debug!(queue = queue, count = results.len(), "batch enqueued");
+        // A batch job does not have a dedup key, so every result is `New`.
+        Ok(results
+            .into_iter()
+            .map(|result| match result {
+                EnqueueResult::New(id) | EnqueueResult::AlreadyEnqueued(id) => id,
+            })
+            .collect())
     }
 
     /// Trigger an immediate reap sweep (primarily useful in tests and tooling).

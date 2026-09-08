@@ -372,6 +372,9 @@ mod tests {
                     )
                     .await
                     .unwrap();
+                    q.enqueue_batch("work", vec![b"third".to_vec(), b"fourth".to_vec()])
+                        .await
+                        .unwrap();
                     q.close().await.unwrap();
                 });
         });
@@ -395,7 +398,7 @@ mod tests {
                 (queue, n)
             })
             .collect();
-        assert_eq!(counts.get("work"), Some(&1));
+        assert_eq!(counts.get("work"), Some(&3));
         assert_eq!(counts.get("follow-ups"), Some(&1));
     }
 
