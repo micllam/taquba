@@ -1780,12 +1780,13 @@ impl Queue {
     /// queue's claim-scan state, then close the underlying database.
     ///
     /// The persisted state lets the next open resume claims at the
-    /// recorded bound instead of re-scanning the tombstone band left
-    /// by previously claimed jobs, so the first claim after a clean
-    /// restart costs the same as a warm one. With
+    /// recorded bound without a scan of the tombstone band left by
+    /// previously claimed jobs. It is written best-effort: a failed
+    /// write is logged, the database still closes, and the next open
+    /// scans from the front of the prefix. With
     /// [`OpenOptions::liveness_heartbeat`] set, a final beat marked
-    /// closed is committed best-effort, so readers can distinguish
-    /// this close from a writer that stopped beating.
+    /// closed is committed best-effort as well, so readers can
+    /// distinguish this close from a writer that stopped committing beats.
     pub async fn close(self) -> Result<()> {
         tokio::join!(self.reaper_task.stop(), self.scheduler_task.stop(), async {
             if let Some(sampler) = self.metrics_sampler {
@@ -1797,7 +1798,9 @@ impl Queue {
         {
             task.write_closing_beat().await;
         }
-        crate::claim_cursor::persist_cursor_state(&self.core).await?;
+        if let Err(e) = crate::claim_cursor::persist_cursor_state(&self.core).await {
+            warn!("persisting the claim-scan state failed: {e}");
+        }
         self.core.db.close().await?;
         Ok(())
     }

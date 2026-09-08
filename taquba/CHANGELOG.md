@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `Queue::close` closes the database when the write of the claim-scan
+  state fails, and logs the failure. The next open then scans from the
+  front of the pending prefix.
+- `Queue::open` deletes a claim-scan record that does not decode, with a
+  warning, where it failed the open before.
 - `taquba_jobs_enqueued_total` counts a job enqueued through
   `SettlementEffects` (`ack_with`, `nack_with`, `dead_letter_with`,
   `cancel_with` and `commit_effects`), which the counter missed. The

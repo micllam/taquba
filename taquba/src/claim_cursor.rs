@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use slatedb::IsolationLevel;
 use tokio::sync::Notify;
+use tracing::warn;
 
 use crate::error::Result;
 use crate::keys::{KeyTag, cursor_key, tag_prefix};
@@ -349,30 +350,45 @@ pub(crate) async fn persist_cursor_state(core: &QueueCore) -> Result<()> {
 /// with the delete. A record that survives a crash therefore describes
 /// a store without inserts after the close that wrote it, and the next
 /// open restores it again.
+///
+/// A record that does not decode is deleted with a warning and does not
+/// restore any state. A scan from the front of the prefix is always
+/// correct, and the loss of the record adds exactly one such scan at
+/// the next open.
 pub(crate) async fn restore_cursor_state(core: &QueueCore) -> Result<()> {
     let txn = core.db.begin(IsolationLevel::Snapshot).await?;
     let mut records = Vec::new();
     {
         let mut iter = txn.scan_prefix(tag_prefix(KeyTag::Cursor), ..).await?;
         while let Some(kv) = iter.next().await? {
-            let record: PersistedCursor = rmp_serde::from_slice(&kv.value)?;
-            records.push((kv.key, record));
+            match rmp_serde::from_slice::<PersistedCursor>(&kv.value) {
+                Ok(record) => records.push((kv.key, Some(record))),
+                Err(err) => {
+                    warn!(
+                        key = %String::from_utf8_lossy(&kv.key),
+                        "claim-scan record failed to decode and is deleted: {err}"
+                    );
+                    records.push((kv.key, None));
+                }
+            }
         }
     }
     if records.is_empty() {
         return Ok(());
     }
     for (key, record) in records {
-        core.claim_cursor.restore(
-            &record.queue,
-            CursorState {
-                scan_from: record.bound_key.map(|key| ScanFrom {
-                    key: Bytes::from(key),
-                    inclusive: record.bound_inclusive,
-                }),
-                known_empty: record.known_empty,
-            },
-        );
+        if let Some(record) = record {
+            core.claim_cursor.restore(
+                &record.queue,
+                CursorState {
+                    scan_from: record.bound_key.map(|key| ScanFrom {
+                        key: Bytes::from(key),
+                        inclusive: record.bound_inclusive,
+                    }),
+                    known_empty: record.known_empty,
+                },
+            );
+        }
         txn.delete(&key)?;
     }
     txn.commit().await?;
@@ -985,6 +1001,35 @@ mod tests {
 
         let job = q.claim("work", lease).await.unwrap().unwrap();
         assert_eq!(job.payload, b"urgent");
+        q.ack(&job).await.unwrap();
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_cursor_record_is_deleted_at_open() {
+        let store = make_store();
+        let lease = Duration::from_secs(5);
+        let q = Queue::open(store.clone(), "test").await.unwrap();
+        q.enqueue("work", b"only".to_vec()).await.unwrap();
+        // There is no exportable state for the queue, so the close does
+        // not overwrite the record.
+        q.core
+            .db
+            .put(cursor_key("work"), b"not a cursor record")
+            .await
+            .unwrap();
+        q.close().await.unwrap();
+
+        let q = Queue::open(store, "test").await.unwrap();
+        let scan = q.core.claim_cursor.begin_claim("work");
+        assert!(scan.scan_from.is_none());
+        assert!(!scan.known_empty);
+        assert!(
+            q.core.db.get(cursor_key("work")).await.unwrap().is_none(),
+            "the undecodable record is deleted",
+        );
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        assert_eq!(job.payload, b"only");
         q.ack(&job).await.unwrap();
         q.close().await.unwrap();
     }
