@@ -102,7 +102,7 @@ impl JobView {
         let lease_expires_at = q.lease_expiry(&job.queue, &job.id);
         Self {
             id: job.id,
-            queue: job.queue,
+            queue: job.queue.into_string(),
             status: job.status,
             attempts: job.attempts,
             max_attempts: job.max_attempts,

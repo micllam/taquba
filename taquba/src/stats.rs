@@ -4,7 +4,7 @@ use slatedb::{DbTransaction, MergeOperator, MergeOperatorError};
 
 use crate::error::Result;
 use crate::job::JobStatus;
-use crate::keys::{KeyTag, stats_key};
+use crate::keys::{KeyTag, QueueName, stats_key};
 
 /// Map a [`JobStatus`] to the on-disk metric name used for its counter.
 pub(crate) fn metric_name(status: JobStatus) -> &'static str {
@@ -89,7 +89,7 @@ fn read_i64_le(bytes: &[u8]) -> std::result::Result<i64, ()> {
 /// Apply stat deltas for a single operation within an existing transaction.
 pub(crate) fn update_stats(
     txn: &DbTransaction,
-    queue: &str,
+    queue: &QueueName,
     deltas: &[(JobStatus, i64)],
 ) -> Result<()> {
     for (status, delta) in deltas {

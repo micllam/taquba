@@ -7,7 +7,7 @@ use tokio::sync::Notify;
 use tracing::warn;
 
 use crate::error::Result;
-use crate::keys::{KeyTag, cursor_key, tag_prefix};
+use crate::keys::{KeyTag, QueueName, cursor_key, tag_prefix};
 use crate::queue_core::QueueCore;
 
 /// Upper bound on wakeups issued for one batch of inserts. Beyond the
@@ -43,7 +43,7 @@ const MAX_INSERT_WAKEUPS: usize = 64;
 /// re-warms the state naturally.
 #[derive(Clone, Default)]
 pub(crate) struct ClaimCursor {
-    inner: Arc<Mutex<HashMap<String, QueueClaimState>>>,
+    inner: Arc<Mutex<HashMap<QueueName, QueueClaimState>>>,
 }
 
 /// Where the next claim scan starts.
@@ -134,9 +134,9 @@ impl ClaimCursor {
     /// `claimed` (a key equal to `claimed` is a reinsert of the job
     /// the claim took, requeued after its lease expired within the
     /// claim).
-    pub(crate) fn advance(&self, queue: &str, claimed: Bytes, observed: &ClaimScanStart) {
+    pub(crate) fn advance(&self, queue: &QueueName, claimed: Bytes, observed: &ClaimScanStart) {
         let mut map = self.inner.lock().unwrap();
-        let s = map.entry(queue.to_string()).or_default();
+        let s = map.entry(queue.clone()).or_default();
         if s.scan_from != observed.scan_from {
             return;
         }
@@ -158,16 +158,16 @@ impl ClaimCursor {
     /// bound is kept: nothing is live behind it, and inserts landing
     /// behind it move it themselves. Claims short-circuit to `None`
     /// until the next insert bumps the epoch past `epoch`.
-    pub(crate) fn mark_empty(&self, queue: &str, epoch: u64) {
+    pub(crate) fn mark_empty(&self, queue: &QueueName, epoch: u64) {
         let mut map = self.inner.lock().unwrap();
-        let s = map.entry(queue.to_string()).or_default();
+        let s = map.entry(queue.clone()).or_default();
         s.empty_as_of = Some(epoch);
     }
 
     /// Record one committed pending insert. See
     /// [`Self::note_pending_inserts`] for the semantics, including why
     /// this must be called after the insert's transaction commits.
-    pub(crate) fn note_pending_insert(&self, queue: &str, new_key: &[u8]) {
+    pub(crate) fn note_pending_insert(&self, queue: &QueueName, new_key: &[u8]) {
         self.note_pending_inserts(queue, new_key, 1);
     }
 
@@ -192,10 +192,10 @@ impl ClaimCursor {
     /// commits. Calling it before the commit would let a concurrent
     /// claim scan miss the job, record emptiness at the already-bumped
     /// epoch, and strand the job until the next insert.
-    pub(crate) fn note_pending_inserts(&self, queue: &str, min_key: &[u8], count: usize) {
+    pub(crate) fn note_pending_inserts(&self, queue: &QueueName, min_key: &[u8], count: usize) {
         let wakeup = {
             let mut map = self.inner.lock().unwrap();
-            let s = map.entry(queue.to_string()).or_default();
+            let s = map.entry(queue.clone()).or_default();
             let was_known_empty = s.empty_as_of == Some(s.epoch);
             s.epoch += 1;
             let include_min_key = match &s.scan_from {
@@ -240,7 +240,7 @@ impl ClaimCursor {
     /// Export every queue's persistable state. Queues with neither a
     /// bound nor recorded emptiness are omitted; their next claim
     /// falls back to the front prefix scan regardless.
-    pub(crate) fn export(&self) -> Vec<(String, CursorState)> {
+    pub(crate) fn export(&self) -> Vec<(QueueName, CursorState)> {
         let map = self.inner.lock().unwrap();
         map.iter()
             .filter_map(|(queue, s)| {
@@ -264,9 +264,9 @@ impl ClaimCursor {
     /// traffic: the persisted state is valid because nothing mutates
     /// the store while it is closed, and any insert after this call
     /// updates the restored state through the normal paths.
-    pub(crate) fn restore(&self, queue: &str, state: CursorState) {
+    pub(crate) fn restore(&self, queue: &QueueName, state: CursorState) {
         let mut map = self.inner.lock().unwrap();
-        let s = map.entry(queue.to_string()).or_default();
+        let s = map.entry(queue.clone()).or_default();
         s.scan_from = state.scan_from;
         if state.known_empty {
             s.empty_as_of = Some(s.epoch);
@@ -277,22 +277,26 @@ impl ClaimCursor {
     /// notifies, one `notify_one` per recorded insert. `notify_one`
     /// leaves a permit when no task is waiting, so a waiter that
     /// subscribes after an insert still wakes immediately.
+    ///
+    /// A name over the key encoding's bound cannot receive an insert, so
+    /// the returned wakeup for such a name is never notified.
     pub(crate) fn wakeup_for(&self, queue: &str) -> Arc<Notify> {
-        self.inner
-            .lock()
-            .unwrap()
-            .entry(queue.to_string())
-            .or_default()
-            .wakeup
-            .clone()
+        let mut map = self.inner.lock().unwrap();
+        if let Some(s) = map.get(queue) {
+            return s.wakeup.clone();
+        }
+        match QueueName::new(queue) {
+            Ok(queue) => map.entry(queue).or_default().wakeup.clone(),
+            Err(_) => Arc::new(Notify::new()),
+        }
     }
 
     /// The mutex a claim on `queue` holds across its scan and commit.
-    pub(crate) fn claim_lock_for(&self, queue: &str) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn claim_lock_for(&self, queue: &QueueName) -> Arc<tokio::sync::Mutex<()>> {
         self.inner
             .lock()
             .unwrap()
-            .entry(queue.to_string())
+            .entry(queue.clone())
             .or_default()
             .claim_lock
             .clone()
@@ -308,7 +312,7 @@ impl ClaimCursor {
 struct PersistedCursor {
     /// Queue the state belongs to; stored in the record so the
     /// reader does not parse it out of the key.
-    queue: String,
+    queue: QueueName,
     /// Scan bound key, when one was established.
     bound_key: Option<Vec<u8>>,
     /// Whether the bound key itself may be live.
@@ -399,6 +403,10 @@ pub(crate) async fn restore_cursor_state(core: &QueueCore) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn qn(name: &str) -> QueueName {
+        name.parse().unwrap()
+    }
+
     fn scan_from(key: &'static [u8], inclusive: bool) -> Option<ScanFrom> {
         Some(ScanFrom {
             key: Bytes::from_static(key),
@@ -418,11 +426,11 @@ mod tests {
     fn mark_empty_short_circuits_until_next_insert() {
         let state = ClaimCursor::new();
         let scan = state.begin_claim("q");
-        state.mark_empty("q", scan.epoch);
+        state.mark_empty(&qn("q"), scan.epoch);
 
         assert!(state.begin_claim("q").known_empty);
 
-        state.note_pending_insert("q", b"pending:q:00000000:job-1");
+        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-1");
         assert!(!state.begin_claim("q").known_empty);
     }
 
@@ -430,8 +438,8 @@ mod tests {
     fn insert_between_begin_and_mark_revokes_emptiness() {
         let state = ClaimCursor::new();
         let scan = state.begin_claim("q");
-        state.note_pending_insert("q", b"pending:q:00000000:job-1");
-        state.mark_empty("q", scan.epoch);
+        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-1");
+        state.mark_empty(&qn("q"), scan.epoch);
 
         assert!(!state.begin_claim("q").known_empty);
     }
@@ -440,9 +448,13 @@ mod tests {
     fn mark_empty_keeps_the_scan_bound() {
         let state = ClaimCursor::new();
         let scan = state.begin_claim("q");
-        state.advance("q", Bytes::from_static(b"pending:q:00000000:job-5"), &scan);
+        state.advance(
+            &qn("q"),
+            Bytes::from_static(b"pending:q:00000000:job-5"),
+            &scan,
+        );
         let scan = state.begin_claim("q");
-        state.mark_empty("q", scan.epoch);
+        state.mark_empty(&qn("q"), scan.epoch);
 
         assert_eq!(
             state.begin_claim("q").scan_from,
@@ -454,15 +466,19 @@ mod tests {
     fn insert_behind_the_bound_moves_it_back_inclusively() {
         let state = ClaimCursor::new();
         let scan = state.begin_claim("q");
-        state.advance("q", Bytes::from_static(b"pending:q:00000000:job-5"), &scan);
+        state.advance(
+            &qn("q"),
+            Bytes::from_static(b"pending:q:00000000:job-5"),
+            &scan,
+        );
 
-        state.note_pending_insert("q", b"pending:q:00000000:job-9");
+        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-9");
         assert_eq!(
             state.begin_claim("q").scan_from,
             scan_from(b"pending:q:00000000:job-5", false),
         );
 
-        state.note_pending_insert("q", b"pending:q:00000000:job-3");
+        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-3");
         assert_eq!(
             state.begin_claim("q").scan_from,
             scan_from(b"pending:q:00000000:job-3", true),
@@ -473,9 +489,13 @@ mod tests {
     fn reinsert_of_the_claimed_key_becomes_inclusive() {
         let state = ClaimCursor::new();
         let scan = state.begin_claim("q");
-        state.advance("q", Bytes::from_static(b"pending:q:00000000:job-5"), &scan);
+        state.advance(
+            &qn("q"),
+            Bytes::from_static(b"pending:q:00000000:job-5"),
+            &scan,
+        );
 
-        state.note_pending_insert("q", b"pending:q:00000000:job-5");
+        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-5");
         assert_eq!(
             state.begin_claim("q").scan_from,
             scan_from(b"pending:q:00000000:job-5", true),
@@ -486,9 +506,9 @@ mod tests {
     fn insert_while_known_empty_sets_the_bound_without_a_prior_one() {
         let state = ClaimCursor::new();
         let scan = state.begin_claim("q");
-        state.mark_empty("q", scan.epoch);
+        state.mark_empty(&qn("q"), scan.epoch);
 
-        state.note_pending_insert("q", b"pending:q:00000000:job-1");
+        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-1");
         assert_eq!(
             state.begin_claim("q").scan_from,
             scan_from(b"pending:q:00000000:job-1", true),
@@ -498,7 +518,7 @@ mod tests {
     #[test]
     fn insert_with_unknown_bound_keeps_the_front_scan_fallback() {
         let state = ClaimCursor::new();
-        state.note_pending_insert("q", b"pending:q:00000000:job-1");
+        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-1");
         assert!(state.begin_claim("q").scan_from.is_none());
     }
 
@@ -506,16 +526,20 @@ mod tests {
     fn advance_clamps_to_key_inserted_ahead_during_the_claim() {
         let state = ClaimCursor::new();
         let scan = state.begin_claim("q");
-        state.advance("q", Bytes::from_static(b"pending:q:00000000:job-2"), &scan);
+        state.advance(
+            &qn("q"),
+            Bytes::from_static(b"pending:q:00000000:job-2"),
+            &scan,
+        );
 
         // While a claim that observed the bound at job-2 is in flight,
         // job-3 commits. It is ahead of the bound, so it does not move
         // it, but it sorts below the keys the claim is about to
         // advance past.
         let observed = state.begin_claim("q");
-        state.note_pending_insert("q", b"pending:q:00000000:job-3");
+        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-3");
         state.advance(
-            "q",
+            &qn("q"),
             Bytes::from_static(b"pending:q:00000000:job-5"),
             &observed,
         );
@@ -530,19 +554,23 @@ mod tests {
     fn advance_clamp_is_consumed_by_one_advance() {
         let state = ClaimCursor::new();
         let scan = state.begin_claim("q");
-        state.advance("q", Bytes::from_static(b"pending:q:00000000:job-2"), &scan);
+        state.advance(
+            &qn("q"),
+            Bytes::from_static(b"pending:q:00000000:job-2"),
+            &scan,
+        );
 
         let observed = state.begin_claim("q");
-        state.note_pending_insert("q", b"pending:q:00000000:job-3");
+        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-3");
         state.advance(
-            "q",
+            &qn("q"),
             Bytes::from_static(b"pending:q:00000000:job-5"),
             &observed,
         );
 
         let observed = state.begin_claim("q");
         state.advance(
-            "q",
+            &qn("q"),
             Bytes::from_static(b"pending:q:00000000:job-5"),
             &observed,
         );
@@ -556,15 +584,19 @@ mod tests {
     fn advance_clamps_to_a_reinsert_of_the_claimed_key() {
         let state = ClaimCursor::new();
         let scan = state.begin_claim("q");
-        state.advance("q", Bytes::from_static(b"pending:q:00000000:job-2"), &scan);
+        state.advance(
+            &qn("q"),
+            Bytes::from_static(b"pending:q:00000000:job-2"),
+            &scan,
+        );
 
         // The claim takes job-5, whose lease expires within the claim,
         // and the reaper requeues it at its original key before the
         // claim's bound update runs.
         let observed = state.begin_claim("q");
-        state.note_pending_insert("q", b"pending:q:00000000:job-5");
+        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-5");
         state.advance(
-            "q",
+            &qn("q"),
             Bytes::from_static(b"pending:q:00000000:job-5"),
             &observed,
         );
@@ -579,12 +611,16 @@ mod tests {
     fn advance_ignores_clamp_keys_past_the_claimed_key() {
         let state = ClaimCursor::new();
         let scan = state.begin_claim("q");
-        state.advance("q", Bytes::from_static(b"pending:q:00000000:job-2"), &scan);
+        state.advance(
+            &qn("q"),
+            Bytes::from_static(b"pending:q:00000000:job-2"),
+            &scan,
+        );
 
         let observed = state.begin_claim("q");
-        state.note_pending_insert("q", b"pending:q:00000000:job-9");
+        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-9");
         state.advance(
-            "q",
+            &qn("q"),
             Bytes::from_static(b"pending:q:00000000:job-5"),
             &observed,
         );
@@ -603,9 +639,9 @@ mod tests {
         // it runs, a reaper requeue inserts a key that sorts below the
         // keys the claim will advance past.
         let observed = state.begin_claim("q");
-        state.note_pending_insert("q", b"pending:q:00000000:job-1");
+        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-1");
         state.advance(
-            "q",
+            &qn("q"),
             Bytes::from_static(b"pending:q:00000000:job-5"),
             &observed,
         );
@@ -620,7 +656,7 @@ mod tests {
     fn restore_sets_bound_and_emptiness() {
         let state = ClaimCursor::new();
         state.restore(
-            "q",
+            &qn("q"),
             CursorState {
                 scan_from: scan_from(b"pending:q:00000000:job-5", false),
                 known_empty: true,
@@ -639,14 +675,14 @@ mod tests {
     fn restored_emptiness_is_revoked_by_an_insert() {
         let state = ClaimCursor::new();
         state.restore(
-            "q",
+            &qn("q"),
             CursorState {
                 scan_from: None,
                 known_empty: true,
             },
         );
 
-        state.note_pending_insert("q", b"pending:q:00000000:job-1");
+        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-1");
         let scan = state.begin_claim("q");
         assert!(!scan.known_empty);
         assert_eq!(scan.scan_from, scan_from(b"pending:q:00000000:job-1", true));
@@ -657,7 +693,7 @@ mod tests {
         let state = ClaimCursor::new();
         let scan = state.begin_claim("q1");
         state.advance(
-            "q1",
+            &qn("q1"),
             Bytes::from_static(b"pending:q1:00000000:job-1"),
             &scan,
         );
@@ -678,12 +714,16 @@ mod tests {
     fn advance_is_dropped_when_the_bound_moved_during_the_claim() {
         let state = ClaimCursor::new();
         let scan = state.begin_claim("q");
-        state.advance("q", Bytes::from_static(b"pending:q:00000000:job-5"), &scan);
+        state.advance(
+            &qn("q"),
+            Bytes::from_static(b"pending:q:00000000:job-5"),
+            &scan,
+        );
 
         let observed = state.begin_claim("q");
-        state.note_pending_insert("q", b"pending:q:00000000:job-3");
+        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-3");
         state.advance(
-            "q",
+            &qn("q"),
             Bytes::from_static(b"pending:q:00000000:job-7"),
             &observed,
         );
@@ -943,7 +983,12 @@ mod tests {
         assert!(scan.scan_from.is_some());
         assert!(!scan.known_empty);
         assert!(
-            q.core.db.get(cursor_key("work")).await.unwrap().is_none(),
+            q.core
+                .db
+                .get(cursor_key(&qn("work")))
+                .await
+                .unwrap()
+                .is_none(),
             "the cursor record is consumed at open",
         );
 
@@ -1015,7 +1060,7 @@ mod tests {
         // not overwrite the record.
         q.core
             .db
-            .put(cursor_key("work"), b"not a cursor record")
+            .put(cursor_key(&qn("work")), b"not a cursor record")
             .await
             .unwrap();
         q.close().await.unwrap();
@@ -1025,7 +1070,12 @@ mod tests {
         assert!(scan.scan_from.is_none());
         assert!(!scan.known_empty);
         assert!(
-            q.core.db.get(cursor_key("work")).await.unwrap().is_none(),
+            q.core
+                .db
+                .get(cursor_key(&qn("work")))
+                .await
+                .unwrap()
+                .is_none(),
             "the undecodable record is deleted",
         );
         let job = q.claim("work", lease).await.unwrap().unwrap();
@@ -1068,7 +1118,12 @@ mod tests {
             "the surviving record is restored",
         );
         assert!(
-            q.core.db.get(cursor_key("work")).await.unwrap().is_none(),
+            q.core
+                .db
+                .get(cursor_key(&qn("work")))
+                .await
+                .unwrap()
+                .is_none(),
             "the cursor record is consumed at open",
         );
         q.enqueue_with(

@@ -481,7 +481,7 @@ mod tests {
             "other",
             b"sentinel".to_vec(),
             EnqueueOptions::default(),
-            HashMap::from([(pending_key("work", 1, "fake-id"), b"trickery".to_vec())]),
+            HashMap::from([(pending_key(&qn("work"), 1, "fake-id"), b"trickery".to_vec())]),
         )
         .await
         .unwrap();
@@ -497,7 +497,10 @@ mod tests {
         assert_eq!(claimed.payload, b"payload");
 
         // The user-visible key still reads back fine.
-        let v = q.kv_get(&pending_key("work", 1, "fake-id")).await.unwrap();
+        let v = q
+            .kv_get(&pending_key(&qn("work"), 1, "fake-id"))
+            .await
+            .unwrap();
         assert_eq!(v.as_deref(), Some(b"trickery".as_slice()));
 
         q.close().await.unwrap();

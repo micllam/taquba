@@ -8,7 +8,8 @@ use crate::error::{Error, Result};
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{
-    attempt_history_key, claimed_key, dead_key, done_key, job_index_key, pending_key, scheduled_key,
+    QueueName, attempt_history_key, claimed_key, dead_key, done_key, job_index_key, pending_key,
+    scheduled_key,
 };
 use crate::lease_registry::LeaseRegistry;
 use crate::stats::update_stats;
@@ -70,7 +71,7 @@ pub(crate) async fn get_indexed_job(
 pub(crate) async fn take_claim(
     txn: &DbTransaction,
     registry: &LeaseRegistry,
-    queue: &str,
+    queue: &QueueName,
     id: &str,
     claim_id: u64,
 ) -> Result<JobRecord> {

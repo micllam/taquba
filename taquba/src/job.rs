@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::keys::KeyTag;
+use crate::keys::{KeyTag, QueueName};
 
 /// A single job stored in a Taquba queue.
 ///
@@ -22,7 +22,7 @@ pub struct JobRecord {
     /// Lexicographically sorted by enqueue time within the same millisecond.
     pub id: String,
     /// Logical queue this job belongs to.
-    pub queue: String,
+    pub queue: QueueName,
     /// Application-defined payload.
     ///
     /// Always populated on records returned by the claim and read APIs.
@@ -226,7 +226,7 @@ impl JobRecord {
     /// field at its initial value.
     pub(crate) fn new_pending(
         id: String,
-        queue: String,
+        queue: QueueName,
         payload: Vec<u8>,
         max_attempts: u32,
         priority: u32,
@@ -349,9 +349,10 @@ pub enum JobStatus {
 mod tests {
     use super::*;
     use crate::keys::{dead_key, job_index_key, pending_key};
+    use crate::test_util::qn;
 
     fn record() -> JobRecord {
-        JobRecord::new_pending("j".into(), "q".into(), b"p".to_vec(), 3, 0, 1)
+        JobRecord::new_pending("j".into(), qn("q"), b"p".to_vec(), 3, 0, 1)
     }
 
     #[test]
@@ -363,9 +364,9 @@ mod tests {
     #[test]
     fn decode_takes_the_status_from_the_key() {
         let bytes = record().stored_bytes().unwrap();
-        let dead = JobRecord::decode(&dead_key("q", "j"), &bytes).unwrap();
+        let dead = JobRecord::decode(&dead_key(&qn("q"), "j"), &bytes).unwrap();
         assert_eq!(dead.status, JobStatus::Dead);
-        let pending = JobRecord::decode(&pending_key("q", 0, "j"), &bytes).unwrap();
+        let pending = JobRecord::decode(&pending_key(&qn("q"), 0, "j"), &bytes).unwrap();
         assert_eq!(pending.status, JobStatus::Pending);
         assert!(JobRecord::decode(&job_index_key("j"), &bytes).is_err());
     }

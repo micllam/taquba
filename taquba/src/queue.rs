@@ -20,7 +20,7 @@ use crate::error::{Error, Result};
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{Claim, JobRecord, JobStatus};
 use crate::keys::{
-    MAX_QUEUE_NAME_LEN, attempt_history_key, claimed_key, dead_key, dedup_index_key, job_index_key,
+    QueueName, attempt_history_key, claimed_key, dead_key, dedup_index_key, job_index_key,
     pending_prefix, user_scoped_key,
 };
 use crate::kv::validate_kv_value_size;
@@ -91,18 +91,6 @@ pub struct JobPage {
     /// [`Queue::list_jobs`] call to continue the listing. `None` when no
     /// further entries existed at scan time.
     pub next_cursor: Option<Vec<u8>>,
-}
-
-/// Validate a queue name against the key encoding's one-byte length
-/// field. Called at every public entry point that accepts a queue name.
-pub(crate) fn validate_queue_name(queue: &str) -> Result<()> {
-    if queue.len() > MAX_QUEUE_NAME_LEN {
-        return Err(Error::InvalidQueueName {
-            queue: queue.to_string(),
-            reason: "queue name exceeds the maximum length of 255 bytes",
-        });
-    }
-    Ok(())
 }
 
 /// Maximum byte length of a caller-supplied
@@ -318,6 +306,11 @@ impl Queue {
         #[cfg(feature = "metrics")]
         {
             builder = builder.with_metrics_recorder(crate::obs::slatedb_recorder());
+        }
+        // A configuration for a name the key encoding cannot store
+        // does not apply to any job, so the names are validated here.
+        for queue in opts.queue_configs.keys() {
+            QueueName::new(queue.as_str())?;
         }
         let db = Arc::new(builder.build().await?);
         let core = Arc::new(QueueCore {
@@ -761,7 +754,7 @@ impl Queue {
         max_jobs: usize,
         lease_duration: Duration,
     ) -> Result<Vec<Claim>> {
-        validate_queue_name(queue)?;
+        let queue = QueueName::new(queue)?;
         if max_jobs == 0 {
             return Ok(Vec::new());
         }
@@ -770,13 +763,13 @@ impl Queue {
         // claims that have work to do. A stale answer here is safe in
         // both directions; emptiness is only ever revoked by an insert,
         // and a stale "not empty" just falls through to the locked scan.
-        if self.core.claim_cursor.begin_claim(queue).known_empty {
+        if self.core.claim_cursor.begin_claim(&queue).known_empty {
             return Ok(Vec::new());
         }
         let mut jobs = {
-            let lock = self.core.claim_cursor.claim_lock_for(queue);
+            let lock = self.core.claim_cursor.claim_lock_for(&queue);
             let _guard = lock.lock().await;
-            self.claim_batch_locked(queue, max_jobs, lease_duration)
+            self.claim_batch_locked(&queue, max_jobs, lease_duration)
                 .await?
         };
         // Offloaded payloads are fetched after the claim lock is
@@ -796,7 +789,7 @@ impl Queue {
     /// never held across a payload read.
     async fn claim_batch_locked(
         &self,
-        queue: &str,
+        queue: &QueueName,
         max_jobs: usize,
         lease_duration: Duration,
     ) -> Result<Vec<Claim>> {
@@ -950,11 +943,11 @@ impl Queue {
                     // after the claim lock is released and are not
                     // included.
                     crate::obs::claimed(queue, jobs.len() as u64, timer);
-                    debug!(queue = queue, count = jobs.len(), "jobs claimed");
+                    debug!(queue = %queue, count = jobs.len(), "jobs claimed");
                     return Ok(jobs);
                 }
                 Commit::Conflict => {
-                    warn!(queue = queue, "claim transaction conflict, retrying");
+                    warn!(queue = %queue, "claim transaction conflict, retrying");
                     continue;
                 }
             }
@@ -1118,7 +1111,7 @@ impl Queue {
     ) -> Result<(JobRecord, Option<Vec<EnqueueResult>>)> {
         let prepared = self.core.prepare_effects(effects).await?;
         let claim_id = claim.claim_id();
-        let (queue, id) = (claim.queue.as_str(), claim.id.as_str());
+        let (queue, id) = (&claim.queue, claim.id.as_str());
 
         let settled: Result<SettledClaim<'e>> = async {
             loop {
@@ -1389,9 +1382,10 @@ impl Queue {
     /// when no live lease for the job exists in this process, including
     /// when the job is in any state other than `Claimed`.
     pub fn lease_expiry(&self, queue: &str, id: &str) -> Option<u64> {
+        let queue = QueueName::new(queue).ok()?;
         self.core
             .lease_registry
-            .current(queue, id)
+            .current(&queue, id)
             .map(|(expires_at, _)| expires_at)
     }
 
@@ -1756,10 +1750,12 @@ impl Queue {
         crate::obs::enqueue_committed(queue, timer);
         // Batch ids are monotonic ULIDs at one priority, so the first
         // staged job holds the batch's smallest pending key.
-        if let Some(key) = staged.first().and_then(|s| s.pending_key.as_ref()) {
+        if let Some(first) = staged.first()
+            && let Some(key) = &first.pending_key
+        {
             self.core
                 .claim_cursor
-                .note_pending_inserts(queue, key, staged.len());
+                .note_pending_inserts(&first.queue, key, staged.len());
         }
 
         debug!(queue = queue, count = staged.len(), "batch enqueued");
@@ -1810,6 +1806,7 @@ impl Queue {
 mod tests {
     use super::*;
     use crate::EnqueueRequest;
+    use crate::keys::MAX_QUEUE_NAME_LEN;
     use crate::kv::MAX_KV_VALUE_SIZE;
     use crate::options::{PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_NORMAL};
     use crate::test_util::*;
@@ -2281,6 +2278,32 @@ mod tests {
         let job = q.get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Pending);
         q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_over_length_queue_name_is_rejected_at_enqueue_and_claim() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let over = "q".repeat(MAX_QUEUE_NAME_LEN + 1);
+        assert!(matches!(
+            q.enqueue(&over, b"payload".to_vec()).await,
+            Err(Error::InvalidQueueName { .. })
+        ));
+        assert!(matches!(
+            q.claim(&over, Duration::from_secs(30)).await,
+            Err(Error::InvalidQueueName { .. })
+        ));
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_rejects_a_queue_config_for_an_unencodable_name() {
+        let mut opts = OpenOptions::default();
+        opts.queue_configs
+            .insert("q".repeat(MAX_QUEUE_NAME_LEN + 1), QueueConfig::default());
+        assert!(matches!(
+            Queue::open_with_options(make_store(), "test", opts).await,
+            Err(Error::InvalidQueueName { .. })
+        ));
     }
 
     #[tokio::test]

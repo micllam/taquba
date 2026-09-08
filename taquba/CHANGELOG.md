@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `QueueName`: a queue name validated against the key encoding's bound
+  of `MAX_QUEUE_NAME_LEN` bytes, built by `QueueName::new` or
+  `str::parse`. It dereferences to `str` and implements `PartialEq<str>`.
 - `JobRecord::is_last_attempt`: whether a transient failure of the
   current attempt dead-letters the job.
 - `Queue::kv_entries` and `Queue::jobs`, with the same methods on
@@ -21,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (source):** `JobRecord::queue` is a `QueueName`. A caller
+  that reads the field as a `str` is unchanged. One that moves it into
+  a `String` converts it with `into_string` or `to_string`.
+- `Queue::open` rejects a `queue_configs` key over `MAX_QUEUE_NAME_LEN`
+  bytes with `Error::InvalidQueueName`. Such a configuration did not
+  apply to any job before.
 - **Breaking (source):** `Queue::wait_for_completion(id)` waits without
   a bound. The bounded wait is `Queue::wait_for_completion_timeout(id,
   timeout)`, which returns `None` when the timeout elapses first, and

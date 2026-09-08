@@ -440,7 +440,7 @@ pub use effects::{EnqueueRequest, SettlementEffects};
 pub use error::{Error, Result};
 pub use history::{AttemptOutcome, JobAttempt};
 pub use job::{Claim, JobRecord, JobStatus};
-pub use keys::MAX_QUEUE_NAME_LEN;
+pub use keys::{MAX_QUEUE_NAME_LEN, QueueName};
 pub use kv::{KvPage, MAX_KV_VALUE_SIZE};
 pub use lease::LeaseHandle;
 pub use liveness::{StoreActivity, WriterHeartbeat};

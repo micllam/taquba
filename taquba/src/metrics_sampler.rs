@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::background::Periodic;
 use crate::error::Result;
 use crate::job::JobRecord;
-use crate::keys::pending_prefix;
+use crate::keys::{QueueName, pending_prefix};
 use crate::queue_core::QueueCore;
 use crate::read::{list_queues, stats};
 pub(crate) struct MetricsSampler {
@@ -39,6 +39,8 @@ async fn sample(core: &QueueCore) -> Result<()> {
     let db = core.db.as_ref();
     let now = core.now_ms();
     for queue in list_queues(db).await? {
+        // A name parsed from a stored key is within the bound.
+        let queue = QueueName::new(queue)?;
         let stats = stats(db, &queue).await?;
         crate::obs::set_depth(&queue, stats.pending, stats.claimed);
 

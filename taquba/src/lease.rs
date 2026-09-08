@@ -8,6 +8,7 @@ use tracing::debug;
 
 use crate::clock::Clock;
 use crate::error::{Error, Result};
+use crate::keys::QueueName;
 use crate::lease_registry::{LeaseRegistry, Renewal};
 
 /// Margin added on top of a requested remaining duration, so a delivery
@@ -36,7 +37,7 @@ pub struct LeaseHandle {
 struct Inner {
     registry: LeaseRegistry,
     clock: Arc<dyn Clock>,
-    queue: String,
+    queue: QueueName,
     id: String,
     claim_id: u64,
 }
@@ -45,7 +46,7 @@ impl LeaseHandle {
     pub(crate) fn new(
         registry: LeaseRegistry,
         clock: Arc<dyn Clock>,
-        queue: String,
+        queue: QueueName,
         id: String,
         claim_id: u64,
         cancel: CancellationToken,
@@ -138,6 +139,7 @@ impl std::fmt::Debug for LeaseHandle {
 mod tests {
     use super::*;
     use crate::clock::MockClock;
+    use crate::test_util::qn;
 
     #[test]
     fn a_detached_handle_succeeds_without_effect() {
@@ -150,11 +152,11 @@ mod tests {
     fn ensure_at_least_extends_only_when_short() {
         let registry = LeaseRegistry::new();
         let clock = MockClock::new(1_000_000);
-        registry.insert("q", "a", 1_030_000, 7, CancellationToken::new());
+        registry.insert(&qn("q"), "a", 1_030_000, 7, CancellationToken::new());
         let handle = LeaseHandle::new(
             registry.clone(),
             Arc::new(clock.clone()),
-            "q".into(),
+            qn("q"),
             "a".into(),
             7,
             CancellationToken::new(),
@@ -162,36 +164,36 @@ mod tests {
 
         // Covered: 10s + margin fits inside the 30s lease.
         handle.ensure_at_least(Duration::from_secs(10)).unwrap();
-        assert!(registry.contains("q", "a", 1_030_000));
+        assert!(registry.contains(&qn("q"), "a", 1_030_000));
 
         // Short: extended to now + remaining + margin.
         handle.ensure_at_least(Duration::from_secs(60)).unwrap();
         let expected = 1_000_000 + 60_000 + SETTLEMENT_MARGIN.as_millis() as u64;
-        assert!(registry.contains("q", "a", expected));
+        assert!(registry.contains(&qn("q"), "a", expected));
     }
 
     #[test]
     fn ensure_at_least_fails_once_the_claim_ended() {
         let registry = LeaseRegistry::new();
         let clock = MockClock::new(1_000_000);
-        registry.insert("q", "a", 1_030_000, 7, CancellationToken::new());
+        registry.insert(&qn("q"), "a", 1_030_000, 7, CancellationToken::new());
         let handle = LeaseHandle::new(
             registry.clone(),
             Arc::new(clock.clone()),
-            "q".into(),
+            qn("q"),
             "a".into(),
             7,
             CancellationToken::new(),
         );
 
-        registry.remove("q", "a", 7);
+        registry.remove(&qn("q"), "a", 7);
         assert!(matches!(
             handle.ensure_at_least(Duration::from_secs(10)),
             Err(Error::ClaimLost)
         ));
 
         // A re-claim of the same job is a different claim id.
-        registry.insert("q", "a", 1_030_000, 8, CancellationToken::new());
+        registry.insert(&qn("q"), "a", 1_030_000, 8, CancellationToken::new());
         assert!(matches!(
             handle.ensure_at_least(Duration::from_secs(10)),
             Err(Error::ClaimLost)
@@ -202,12 +204,12 @@ mod tests {
     fn ensure_at_least_is_refused_once_cancellation_is_requested() {
         let registry = LeaseRegistry::new();
         let clock = MockClock::new(1_000_000);
-        registry.insert("q", "a", 1_030_000, 7, CancellationToken::new());
+        registry.insert(&qn("q"), "a", 1_030_000, 7, CancellationToken::new());
         let cancel = CancellationToken::new();
         let handle = LeaseHandle::new(
             registry.clone(),
             Arc::new(clock.clone()),
-            "q".into(),
+            qn("q"),
             "a".into(),
             7,
             cancel.clone(),
@@ -216,11 +218,11 @@ mod tests {
         handle.ensure_at_least(Duration::from_secs(60)).unwrap();
 
         cancel.cancel();
-        let before = registry.current("q", "a");
+        let before = registry.current(&qn("q"), "a");
         assert!(matches!(
             handle.ensure_at_least(Duration::from_secs(600)),
             Err(Error::CancelRequested)
         ));
-        assert_eq!(registry.current("q", "a"), before);
+        assert_eq!(registry.current(&qn("q"), "a"), before);
     }
 }

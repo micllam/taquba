@@ -10,7 +10,8 @@ use crate::error::{Error, Result};
 use crate::history::AttemptOutcome;
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{
-    KeyTag, attempt_history_key, claimed_key, job_index_key, parse_key_timestamp, tag_prefix,
+    KeyTag, QueueName, attempt_history_key, claimed_key, job_index_key, parse_key_timestamp,
+    tag_prefix,
 };
 use crate::lease_registry::DueLease;
 use crate::queue_core::QueueCore;
@@ -134,7 +135,7 @@ impl QueueCore {
             claim_id,
             ..
         } = lease;
-        let (queue, id, claim_id) = (queue.as_str(), id.as_str(), *claim_id);
+        let (id, claim_id) = (id.as_str(), *claim_id);
         let claimed_key_bytes = claimed_key(queue, id);
 
         loop {
@@ -269,7 +270,7 @@ impl QueueCore {
         let now = self.now_ms();
         let min_cutoff = min_cutoff.map(|r| now.saturating_sub(r.as_millis() as u64));
 
-        let mut victims: Vec<(Vec<u8>, String, String, Option<String>)> = Vec::new();
+        let mut victims: Vec<(Vec<u8>, QueueName, String, Option<String>)> = Vec::new();
         let mut iter = self
             .db
             .scan_prefix_with_options(tag_prefix(tag), .., &sweep_scan_options())
@@ -307,7 +308,7 @@ impl QueueCore {
         for (key, queue, id, payload_ref) in victims {
             // `QueueStats::dead` counts the live dead-letter records; the
             // done counter counts completions and is not decremented.
-            let dead_stats_queue = matches!(status, JobStatus::Dead).then_some(queue.as_str());
+            let dead_stats_queue = matches!(status, JobStatus::Dead).then_some(&queue);
             self.sweep_victim(&key, &id, payload_ref.as_deref(), dead_stats_queue)
                 .await?;
         }
@@ -332,7 +333,7 @@ impl QueueCore {
         key: &[u8],
         id: &str,
         payload_ref: Option<&str>,
-        dead_stats_queue: Option<&str>,
+        dead_stats_queue: Option<&QueueName>,
     ) -> Result<()> {
         let txn = self.db.begin(IsolationLevel::Snapshot).await?;
         let existed = txn.get(key).await?.is_some();
@@ -395,11 +396,11 @@ mod tests {
         q.reap_now().await.unwrap();
 
         for id in [&retried, &doomed] {
-            assert!(q.core.lease_registry.current("work", id).is_none());
+            assert!(q.core.lease_registry.current(&qn("work"), id).is_none());
             assert!(
                 q.core
                     .db
-                    .get(&claimed_key("work", id))
+                    .get(&claimed_key(&qn("work"), id))
                     .await
                     .unwrap()
                     .is_none()
@@ -658,8 +659,8 @@ mod tests {
 
         clock.advance(Duration::from_secs(31));
         q.reap_now().await.unwrap();
-        assert!(q.core.lease_registry.current("work", &id).is_none());
-        assert!(!q.core.lease_registry.cancel("work", &id));
+        assert!(q.core.lease_registry.current(&qn("work"), &id).is_none());
+        assert!(!q.core.lease_registry.cancel(&qn("work"), &id));
         assert!(!token.is_cancelled());
 
         // The requeued job holds no entry to fire.
@@ -1260,7 +1261,7 @@ mod tests {
         // The poisoned record sorts first, both jobs sharing an expiry.
         q.core
             .db
-            .put(claimed_key("work", &poison), b"not messagepack")
+            .put(claimed_key(&qn("work"), &poison), b"not messagepack")
             .await
             .unwrap();
 

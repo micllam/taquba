@@ -503,7 +503,7 @@ mod tests {
             if job.payload == b"first" {
                 Ok(SettlementEffects {
                     enqueues: vec![crate::effects::EnqueueRequest {
-                        queue: job.queue.clone(),
+                        queue: job.queue.to_string(),
                         payload: b"second".to_vec(),
                         options: crate::options::EnqueueOptions::default(),
                     }],

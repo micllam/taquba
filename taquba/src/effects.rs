@@ -11,10 +11,12 @@ use ulid::Ulid;
 
 use crate::error::{Error, Result};
 use crate::job::{JobRecord, JobStatus};
-use crate::keys::{dedup_index_key, job_index_key, pending_key, scheduled_key, user_scoped_key};
+use crate::keys::{
+    QueueName, dedup_index_key, job_index_key, pending_key, scheduled_key, user_scoped_key,
+};
 use crate::kv::validate_kv_value_size;
 use crate::options::EnqueueOptions;
-use crate::queue::{EnqueueResult, validate_id_override, validate_queue_name};
+use crate::queue::{EnqueueResult, validate_id_override};
 use crate::queue_core::QueueCore;
 use crate::stats::update_stats;
 use crate::txn::put_job_record;
@@ -130,7 +132,7 @@ pub(crate) struct StagedEffects {
 /// for post-commit bookkeeping.
 pub(crate) struct StagedJob {
     pub(crate) id: String,
-    pub(crate) queue: String,
+    pub(crate) queue: QueueName,
     /// `Some` when the job landed in the pending key space, in which
     /// case the commit must be followed by a cursor insert note, which
     /// also wakes a waiting worker.
@@ -160,8 +162,8 @@ impl QueueCore {
         payload: Vec<u8>,
         opts: EnqueueOptions,
     ) -> Result<PreparedJob> {
-        validate_queue_name(queue)?;
-        let cfg = self.configs.get(queue);
+        let queue = QueueName::new(queue)?;
+        let cfg = self.configs.get(&queue);
         let max_attempts = opts.max_attempts.unwrap_or(cfg.max_attempts);
         let priority = opts.priority.unwrap_or(cfg.default_priority);
 
@@ -183,18 +185,12 @@ impl QueueCore {
         };
 
         let (status, key) = match run_at {
-            Some(ms) => (JobStatus::Scheduled, scheduled_key(queue, ms, &id)),
-            None => (JobStatus::Pending, pending_key(queue, priority, &id)),
+            Some(ms) => (JobStatus::Scheduled, scheduled_key(&queue, ms, &id)),
+            None => (JobStatus::Pending, pending_key(&queue, priority, &id)),
         };
 
-        let mut job = JobRecord::new_pending(
-            id,
-            queue.to_string(),
-            payload,
-            max_attempts,
-            priority,
-            self.now_ms(),
-        );
+        let mut job =
+            JobRecord::new_pending(id, queue, payload, max_attempts, priority, self.now_ms());
         job.headers = opts.headers;
         job.status = status;
         job.run_at = run_at;

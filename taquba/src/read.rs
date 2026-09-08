@@ -17,13 +17,13 @@ use crate::error::{Error, Result};
 use crate::history::{JobAttempt, decode_history};
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{
-    KeyTag, attempt_history_key, claimed_prefix, dead_key, dead_prefix, heartbeat_key,
+    KeyTag, QueueName, attempt_history_key, claimed_prefix, dead_key, dead_prefix, heartbeat_key,
     job_index_key, parse_stats_key, pending_prefix, stats_key, tag_prefix, user_scoped_key,
 };
 use crate::kv::KvPage;
 use crate::liveness::{HeartbeatRecord, WriterHeartbeat};
 use crate::payload_store::PayloadStore;
-use crate::queue::{JobPage, validate_queue_name};
+use crate::queue::JobPage;
 use crate::stats::{QueueStats, metric_name};
 
 /// Uniform point-read and prefix-scan access to a store, implemented by
@@ -75,18 +75,18 @@ impl ReadHandle for DbReader {
 /// Body of `stats`: assemble a [`QueueStats`] snapshot from the queue's
 /// per-state counters.
 pub(crate) async fn stats<H: ReadHandle>(handle: &H, queue: &str) -> Result<QueueStats> {
-    validate_queue_name(queue)?;
+    let queue = QueueName::new(queue)?;
     Ok(QueueStats {
-        queue: queue.to_string(),
-        pending: count_for(handle, queue, JobStatus::Pending).await?,
-        claimed: count_for(handle, queue, JobStatus::Claimed).await?,
-        done: count_for(handle, queue, JobStatus::Done).await?,
-        dead: count_for(handle, queue, JobStatus::Dead).await?,
-        scheduled: count_for(handle, queue, JobStatus::Scheduled).await?,
+        pending: count_for(handle, &queue, JobStatus::Pending).await?,
+        claimed: count_for(handle, &queue, JobStatus::Claimed).await?,
+        done: count_for(handle, &queue, JobStatus::Done).await?,
+        dead: count_for(handle, &queue, JobStatus::Dead).await?,
+        scheduled: count_for(handle, &queue, JobStatus::Scheduled).await?,
+        queue: queue.into_string(),
     })
 }
 
-async fn count_for<H: ReadHandle>(handle: &H, queue: &str, status: JobStatus) -> Result<i64> {
+async fn count_for<H: ReadHandle>(handle: &H, queue: &QueueName, status: JobStatus) -> Result<i64> {
     let key = stats_key(queue, metric_name(status));
     match handle.get(&key).await? {
         None => Ok(0),
@@ -127,7 +127,7 @@ pub(crate) async fn list_jobs<H: ReadHandle>(
     cursor: Option<&[u8]>,
     limit: usize,
 ) -> Result<JobPage> {
-    validate_queue_name(queue)?;
+    let queue = QueueName::new(queue)?;
     let empty = JobPage {
         jobs: Vec::new(),
         next_cursor: None,
@@ -139,9 +139,9 @@ pub(crate) async fn list_jobs<H: ReadHandle>(
     // record and is set only for the key spaces that cover every
     // queue.
     let (prefix, filter_queue) = match status {
-        JobStatus::Pending => (pending_prefix(queue), false),
-        JobStatus::Dead => (dead_prefix(queue), false),
-        JobStatus::Claimed => (claimed_prefix(queue), false),
+        JobStatus::Pending => (pending_prefix(&queue), false),
+        JobStatus::Dead => (dead_prefix(&queue), false),
+        JobStatus::Claimed => (claimed_prefix(&queue), false),
         JobStatus::Scheduled => (tag_prefix(KeyTag::Scheduled).to_vec(), true),
         JobStatus::Done => (tag_prefix(KeyTag::Done).to_vec(), true),
     };
@@ -204,11 +204,12 @@ pub(crate) async fn dead_jobs<H: ReadHandle>(
     // Dead keys are the queue's dead prefix followed by the job id,
     // so an id cursor converts to the key cursor of the equivalent
     // `list_jobs` call.
-    let cursor = after.map(|id| dead_key(queue, id));
+    let queue = QueueName::new(queue)?;
+    let cursor = after.map(|id| dead_key(&queue, id));
     Ok(list_jobs(
         handle,
         payloads,
-        queue,
+        &queue,
         JobStatus::Dead,
         cursor.as_deref(),
         limit,

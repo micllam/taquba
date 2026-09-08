@@ -28,11 +28,120 @@
 //! User KV keys are `[KeyTag::User, caller bytes]` with no version
 //! byte: caller bytes are opaque data, not a schema this module owns.
 
+use std::borrow::Borrow;
+use std::fmt;
+use std::ops::Deref;
+use std::str::FromStr;
+
+use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::error::{Error, Result};
 use crate::job::JobStatus;
 
 /// Maximum byte length of a queue name, imposed by the one-byte length
 /// field in key encodings.
 pub const MAX_QUEUE_NAME_LEN: usize = 255;
+
+/// A queue name within the bound of the key encoding: at most
+/// [`MAX_QUEUE_NAME_LEN`] bytes, the range of the one-byte length
+/// field. `QueueName` is the parameter type of every key builder, so a
+/// key over an unvalidated name does not compile, and the type of
+/// [`JobRecord::queue`](crate::JobRecord::queue). A name is validated
+/// by [`QueueName::new`], by [`str::parse`] and by deserialization. The
+/// type dereferences to `str` and implements `PartialEq<str>`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct QueueName(String);
+
+impl QueueName {
+    /// Validate `name`. A name over [`MAX_QUEUE_NAME_LEN`] bytes is
+    /// [`Error::InvalidQueueName`].
+    pub fn new(name: impl Into<String>) -> Result<Self> {
+        let name = name.into();
+        if name.len() > MAX_QUEUE_NAME_LEN {
+            return Err(Error::InvalidQueueName {
+                queue: name,
+                reason: "queue name exceeds the maximum length of 255 bytes",
+            });
+        }
+        Ok(Self(name))
+    }
+
+    /// The name as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The name as an owned string.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl Deref for QueueName {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for QueueName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Borrow<str> for QueueName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for QueueName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for QueueName {
+    type Err = Error;
+
+    fn from_str(name: &str) -> Result<Self> {
+        Self::new(name)
+    }
+}
+
+impl PartialEq<str> for QueueName {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for QueueName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<String> for QueueName {
+    fn eq(&self, other: &String) -> bool {
+        &self.0 == other
+    }
+}
+
+impl From<QueueName> for String {
+    fn from(name: QueueName) -> Self {
+        name.0
+    }
+}
+
+impl<'de> Deserialize<'de> for QueueName {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Self::new(name).map_err(serde::de::Error::custom)
+    }
+}
 
 /// Version byte written into every internal key after the tag.
 /// `0x00` is reserved as invalid.
@@ -130,15 +239,13 @@ fn header(tag: KeyTag) -> [u8; 2] {
     [tag.id(), KEY_VERSION]
 }
 
-/// Length-prefixed queue name field. Callers validate the length via
-/// [`MAX_QUEUE_NAME_LEN`] at the API boundary.
-fn push_queue(out: &mut Vec<u8>, queue: &str) {
-    debug_assert!(queue.len() <= MAX_QUEUE_NAME_LEN);
+/// Length-prefixed queue name field.
+fn push_queue(out: &mut Vec<u8>, queue: &QueueName) {
     out.push(queue.len() as u8);
     out.extend_from_slice(queue.as_bytes());
 }
 
-pub(crate) fn pending_key(queue: &str, priority: u32, id: &str) -> Vec<u8> {
+pub(crate) fn pending_key(queue: &QueueName, priority: u32, id: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(2 + 1 + queue.len() + 4 + id.len());
     k.extend_from_slice(&header(KeyTag::Pending));
     push_queue(&mut k, queue);
@@ -147,14 +254,14 @@ pub(crate) fn pending_key(queue: &str, priority: u32, id: &str) -> Vec<u8> {
     k
 }
 
-pub(crate) fn pending_prefix(queue: &str) -> Vec<u8> {
+pub(crate) fn pending_prefix(queue: &QueueName) -> Vec<u8> {
     let mut k = Vec::with_capacity(2 + 1 + queue.len());
     k.extend_from_slice(&header(KeyTag::Pending));
     push_queue(&mut k, queue);
     k
 }
 
-fn time_first_key(tag: KeyTag, ts: u64, queue: &str, id: &str) -> Vec<u8> {
+fn time_first_key(tag: KeyTag, ts: u64, queue: &QueueName, id: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(2 + 8 + 1 + queue.len() + id.len());
     k.extend_from_slice(&header(tag));
     k.extend_from_slice(&ts.to_be_bytes());
@@ -163,7 +270,7 @@ fn time_first_key(tag: KeyTag, ts: u64, queue: &str, id: &str) -> Vec<u8> {
     k
 }
 
-fn queue_first_key(tag: KeyTag, queue: &str, id: &str) -> Vec<u8> {
+fn queue_first_key(tag: KeyTag, queue: &QueueName, id: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(2 + 1 + queue.len() + id.len());
     k.extend_from_slice(&header(tag));
     push_queue(&mut k, queue);
@@ -171,34 +278,34 @@ fn queue_first_key(tag: KeyTag, queue: &str, id: &str) -> Vec<u8> {
     k
 }
 
-fn queue_prefix(tag: KeyTag, queue: &str) -> Vec<u8> {
+fn queue_prefix(tag: KeyTag, queue: &QueueName) -> Vec<u8> {
     let mut k = Vec::with_capacity(2 + 1 + queue.len());
     k.extend_from_slice(&header(tag));
     push_queue(&mut k, queue);
     k
 }
 
-pub(crate) fn claimed_key(queue: &str, id: &str) -> Vec<u8> {
+pub(crate) fn claimed_key(queue: &QueueName, id: &str) -> Vec<u8> {
     queue_first_key(KeyTag::Claimed, queue, id)
 }
 
-pub(crate) fn claimed_prefix(queue: &str) -> Vec<u8> {
+pub(crate) fn claimed_prefix(queue: &QueueName) -> Vec<u8> {
     queue_prefix(KeyTag::Claimed, queue)
 }
 
-pub(crate) fn scheduled_key(queue: &str, run_at: u64, id: &str) -> Vec<u8> {
+pub(crate) fn scheduled_key(queue: &QueueName, run_at: u64, id: &str) -> Vec<u8> {
     time_first_key(KeyTag::Scheduled, run_at, queue, id)
 }
 
-pub(crate) fn done_key(completed_at: u64, queue: &str, id: &str) -> Vec<u8> {
+pub(crate) fn done_key(completed_at: u64, queue: &QueueName, id: &str) -> Vec<u8> {
     time_first_key(KeyTag::Done, completed_at, queue, id)
 }
 
-pub(crate) fn dead_key(queue: &str, id: &str) -> Vec<u8> {
+pub(crate) fn dead_key(queue: &QueueName, id: &str) -> Vec<u8> {
     queue_first_key(KeyTag::Dead, queue, id)
 }
 
-pub(crate) fn dead_prefix(queue: &str) -> Vec<u8> {
+pub(crate) fn dead_prefix(queue: &QueueName) -> Vec<u8> {
     queue_prefix(KeyTag::Dead, queue)
 }
 
@@ -216,7 +323,7 @@ pub(crate) fn attempt_history_key(id: &str) -> Vec<u8> {
     k
 }
 
-pub(crate) fn dedup_index_key(queue: &str, key: &str) -> Vec<u8> {
+pub(crate) fn dedup_index_key(queue: &QueueName, key: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(2 + 1 + queue.len() + key.len());
     k.extend_from_slice(&header(KeyTag::Dedup));
     push_queue(&mut k, queue);
@@ -224,7 +331,7 @@ pub(crate) fn dedup_index_key(queue: &str, key: &str) -> Vec<u8> {
     k
 }
 
-pub(crate) fn cursor_key(queue: &str) -> Vec<u8> {
+pub(crate) fn cursor_key(queue: &QueueName) -> Vec<u8> {
     let mut k = Vec::with_capacity(2 + queue.len());
     k.extend_from_slice(&header(KeyTag::Cursor));
     k.extend_from_slice(queue.as_bytes());
@@ -235,7 +342,7 @@ pub(crate) fn heartbeat_key() -> Vec<u8> {
     header(KeyTag::Heartbeat).to_vec()
 }
 
-pub(crate) fn stats_key(queue: &str, metric: &str) -> Vec<u8> {
+pub(crate) fn stats_key(queue: &QueueName, metric: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(2 + 1 + queue.len() + metric.len());
     k.extend_from_slice(&header(KeyTag::Stats));
     push_queue(&mut k, queue);
@@ -289,12 +396,35 @@ mod tests {
 
     use super::*;
 
+    fn qn(name: &str) -> QueueName {
+        name.parse().unwrap()
+    }
+
+    #[test]
+    fn queue_name_is_bounded_by_the_length_field() {
+        let longest = "q".repeat(MAX_QUEUE_NAME_LEN);
+        assert_eq!(QueueName::new(&longest).unwrap(), longest.as_str());
+        let over = "q".repeat(MAX_QUEUE_NAME_LEN + 1);
+        assert!(matches!(
+            QueueName::new(&over),
+            Err(Error::InvalidQueueName { .. })
+        ));
+        assert!(over.parse::<QueueName>().is_err());
+        let stored = rmp_serde::to_vec_named(&over).unwrap();
+        assert!(rmp_serde::from_slice::<QueueName>(&stored).is_err());
+        let stored = rmp_serde::to_vec_named(&qn("email")).unwrap();
+        assert_eq!(
+            rmp_serde::from_slice::<QueueName>(&stored).unwrap(),
+            "email"
+        );
+    }
+
     #[test]
     fn pending_keys_order_by_priority_then_id_within_a_queue() {
-        let prefix = pending_prefix("q");
-        let high = pending_key("q", 100, "01A");
-        let normal_a = pending_key("q", 1_000, "01A");
-        let normal_b = pending_key("q", 1_000, "01B");
+        let prefix = pending_prefix(&qn("q"));
+        let high = pending_key(&qn("q"), 100, "01A");
+        let normal_a = pending_key(&qn("q"), 1_000, "01A");
+        let normal_b = pending_key(&qn("q"), 1_000, "01B");
         assert!(high.starts_with(&prefix));
         assert!(high < normal_a);
         assert!(normal_a < normal_b);
@@ -302,22 +432,22 @@ mod tests {
 
     #[test]
     fn pending_prefixes_of_nested_queue_names_do_not_collide() {
-        let key = pending_key("ab", 1_000, "01A");
-        assert!(!key.starts_with(&pending_prefix("a")));
-        assert!(key.starts_with(&pending_prefix("ab")));
+        let key = pending_key(&qn("ab"), 1_000, "01A");
+        assert!(!key.starts_with(&pending_prefix(&qn("a"))));
+        assert!(key.starts_with(&pending_prefix(&qn("ab"))));
     }
 
     #[test]
     fn time_first_keys_order_globally_by_timestamp() {
-        let earlier = scheduled_key("zzz", 100, "01A");
-        let later = scheduled_key("aaa", 200, "01A");
+        let earlier = scheduled_key(&qn("zzz"), 100, "01A");
+        let later = scheduled_key(&qn("aaa"), 200, "01A");
         assert!(earlier < later);
         assert!(earlier.starts_with(&tag_prefix(KeyTag::Scheduled)));
     }
 
     #[test]
     fn parse_key_timestamp_round_trips() {
-        let key = scheduled_key("work", 1_700_000_000_123, "abc");
+        let key = scheduled_key(&qn("work"), 1_700_000_000_123, "abc");
         assert_eq!(
             parse_key_timestamp(&key, KeyTag::Scheduled),
             Some(1_700_000_000_123)
@@ -326,19 +456,19 @@ mod tests {
 
     #[test]
     fn parse_key_timestamp_rejects_other_tags_and_short_keys() {
-        let key = scheduled_key("work", 42, "abc");
+        let key = scheduled_key(&qn("work"), 42, "abc");
         assert_eq!(parse_key_timestamp(&key, KeyTag::Done), None);
         assert_eq!(parse_key_timestamp(&key[..6], KeyTag::Scheduled), None);
     }
 
     #[test]
     fn claimed_keys_of_nested_queue_names_do_not_collide() {
-        assert_ne!(claimed_key("ab", "01A"), claimed_key("a", "b01A"));
+        assert_ne!(claimed_key(&qn("ab"), "01A"), claimed_key(&qn("a"), "b01A"));
     }
 
     #[test]
     fn stats_key_round_trips_queue_and_metric() {
-        let key = stats_key("email", "pending");
+        let key = stats_key(&qn("email"), "pending");
         assert_eq!(
             parse_stats_key(&key),
             Some(("email".to_string(), "pending".to_string()))
@@ -357,16 +487,16 @@ mod tests {
     #[test]
     fn key_spaces_do_not_overlap() {
         let keys = [
-            pending_key("q", 1, "id"),
-            claimed_key("q", "id"),
-            scheduled_key("q", 1, "id"),
-            done_key(1, "q", "id"),
-            dead_key("q", "id"),
+            pending_key(&qn("q"), 1, "id"),
+            claimed_key(&qn("q"), "id"),
+            scheduled_key(&qn("q"), 1, "id"),
+            done_key(1, &qn("q"), "id"),
+            dead_key(&qn("q"), "id"),
             job_index_key("id"),
             attempt_history_key("id"),
-            dedup_index_key("q", "id"),
-            cursor_key("q"),
-            stats_key("q", "m"),
+            dedup_index_key(&qn("q"), "id"),
+            cursor_key(&qn("q")),
+            stats_key(&qn("q"), "m"),
             heartbeat_key(),
             user_scoped_key(b"id"),
         ];
