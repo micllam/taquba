@@ -1288,8 +1288,11 @@ impl Queue {
 
     /// Move a dead-letter job back to the pending queue for a fresh attempt.
     ///
-    /// Resets `attempts` to 0 and clears `last_error` so the job gets a full
-    /// retry budget.
+    /// Resets `attempts` to 0 and clears `last_error`, so the job is
+    /// delivered up to its `max_attempts` again. The commit is durable
+    /// before the call returns. A job whose dead record is gone, removed
+    /// by the retention sweep or by a concurrent revival, is reported as
+    /// [`Error::JobNotFound`].
     #[instrument(skip(self, job), fields(queue = %job.queue, job_id = %job.id))]
     pub async fn requeue_dead_job(&self, mut job: JobRecord) -> Result<()> {
         if job.status != JobStatus::Dead {
@@ -1304,32 +1307,38 @@ impl Queue {
         // start this job afresh.
         job.cancel_requested = false;
 
-        let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
-        txn.get(&dead)
-            .await?
-            .ok_or_else(|| Error::JobNotFound(job.id.clone()))?;
-        txn.delete(&dead)?;
-        let pending = stage_to_pending(&txn, &mut job, JobStatus::Dead)?;
-        // The history is kept across the revival; the marker separates
-        // entries recorded before it from the reset attempt counter.
-        append_attempt(
-            &txn,
-            &job.id,
-            &JobAttempt {
-                attempt: 0,
-                claimed_at: None,
-                recorded_at: self.now_ms(),
-                outcome: AttemptOutcome::Requeued,
-                error: None,
-            },
-        )?;
-        txn.commit().await?;
-        self.core
-            .claim_cursor
-            .note_pending_insert(&job.queue, &pending);
-
-        debug!(queue = %job.queue, job_id = %job.id, "dead job re-queued");
-        Ok(())
+        loop {
+            let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
+            if txn.get(&dead).await?.is_none() {
+                txn.rollback();
+                return Err(Error::JobNotFound(job.id.clone()));
+            }
+            txn.delete(&dead)?;
+            let pending = stage_to_pending(&txn, &mut job, JobStatus::Dead)?;
+            // The history is kept across the revival. The marker separates
+            // entries recorded before it from the reset attempt counter.
+            append_attempt(
+                &txn,
+                &job.id,
+                &JobAttempt {
+                    attempt: 0,
+                    claimed_at: None,
+                    recorded_at: self.now_ms(),
+                    outcome: AttemptOutcome::Requeued,
+                    error: None,
+                },
+            )?;
+            match commit(txn, Durability::Awaited).await? {
+                Commit::Committed => {
+                    self.core
+                        .claim_cursor
+                        .note_pending_insert(&job.queue, &pending);
+                    debug!(queue = %job.queue, job_id = %job.id, "dead job re-queued");
+                    return Ok(());
+                }
+                Commit::Conflict => continue,
+            }
+        }
     }
 
     /// Extend the lease on a claimed job, returning the new expiry as
@@ -2218,6 +2227,55 @@ mod tests {
             "requeue must clear failed_at so a re-fail starts a fresh retention window"
         );
 
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_revival_is_durable_before_the_call_returns() {
+        // A flush interval longer than the test, so a write is durable
+        // only when its commit awaits the flush.
+        let opts = || OpenOptions {
+            flush_interval: Some(Duration::from_secs(3600)),
+            ..OpenOptions::default()
+        };
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", opts())
+            .await
+            .unwrap();
+        let id = q
+            .enqueue_with(
+                "work",
+                b"payload".to_vec(),
+                EnqueueOptions {
+                    max_attempts: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let claim = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.nack(&claim, "fatal").await.unwrap();
+        let dead = q.dead_jobs("work", None, 1).await.unwrap().pop().unwrap();
+        q.requeue_dead_job(dead).await.unwrap();
+
+        // A crash inside the flush window: closing without a flush
+        // discards every write that is not durable.
+        q.core
+            .db
+            .close_with_options(slatedb::config::CloseOptions::default().with_flush_type(None))
+            .await
+            .unwrap();
+        drop(q);
+
+        let q = Queue::open_with_options(store, "test", opts())
+            .await
+            .unwrap();
+        let job = q.get_job(&id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Pending);
         q.close().await.unwrap();
     }
 

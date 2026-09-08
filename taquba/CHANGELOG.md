@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timeout)`, which returns `None` when the timeout elapses first, and
   `WaitOutcome::TimedOut` is removed.
 
+### Fixed
+
+- `Queue::requeue_dead_job` awaits the durability of its commit and
+  retries a transaction conflict. A crash after the call returned left
+  the job dead, and a conflict with the dead-retention sweep was
+  reported as `Error::Storage` in place of `Error::JobNotFound`.
+
 ## [0.12.0] - 2026-09-02
 
 ### Added
