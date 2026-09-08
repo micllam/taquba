@@ -65,7 +65,7 @@ const STEP_FETCH: u32 = 0;
 const STEP_REPORT: u32 = 1;
 
 struct FanoutRunner {
-    jobs: Arc<JobRunner>,
+    jobs: JobRunner,
 }
 
 impl StepRunner for FanoutRunner {
@@ -156,11 +156,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Typed-jobs layer, sharing the queue with the workflow runtime
     // below. The runner's dispatch worker runs until shutdown.
-    let mut jobs = JobRunner::builder(queue.clone(), store.clone())
+    let jobs = JobRunner::builder(queue.clone(), store.clone())
         .register::<FetchPage>()
         .build();
     let jobs_handle = jobs.spawn(std::future::pending::<()>());
-    let jobs = Arc::new(jobs);
 
     let (tx, rx) = oneshot::channel::<()>();
     let runtime = WorkflowRuntime::builder(

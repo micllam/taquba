@@ -183,7 +183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         executions: AtomicUsize::new(0),
         failed_once: Mutex::new(HashSet::new()),
     });
-    let mut runner = JobRunner::builder(queue.clone(), store)
+    let runner = JobRunner::builder(queue.clone(), store)
         .register::<Item>()
         .state(resume.clone())
         .max_concurrent_jobs(max_concurrent)

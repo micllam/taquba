@@ -119,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?,
     );
 
-    let mut runner = JobRunner::builder(queue.clone(), store)
+    let runner = JobRunner::builder(queue.clone(), store)
         .max_concurrent_jobs(max_concurrent)
         .register::<BenchJob>()
         .build();

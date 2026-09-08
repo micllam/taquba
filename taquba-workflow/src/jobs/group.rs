@@ -195,7 +195,7 @@ mod tests {
     async fn a_group_joins_its_results_in_submission_order_and_reruns_failures() {
         let (queue, store) = open_queue().await;
         let runs = Arc::new(AtomicU32::new(0));
-        let mut runner = JobRunner::builder(queue, store)
+        let runner = JobRunner::builder(queue, store)
             .register::<Square>()
             .state(runs.clone())
             .build();

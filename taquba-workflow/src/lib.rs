@@ -363,7 +363,7 @@
 //!     }
 //! }
 //!
-//! let mut runner = JobRunner::builder(queue, store)
+//! let runner = JobRunner::builder(queue, store)
 //!     .register::<SendEmail>()
 //!     .build();
 //! let worker = runner.spawn(std::future::pending::<()>());

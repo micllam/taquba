@@ -243,7 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let queue = Arc::new(Queue::open_with_options(store.clone(), "db", opts).await?);
 
     let stages = Arc::new(Stages::default());
-    let mut runner = JobRunner::builder(queue, store)
+    let runner = JobRunner::builder(queue, store)
         .queue_name("docs")
         .register::<ProcessDocument>()
         .state(stages.clone())

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `jobs::JobRunner` implements `Clone`, so a handler that submits jobs
+  keeps a clone in its state.
 - `Delivery`: the run identity, attempt count and handles a handler runs
   under. `Step` and `jobs::JobContext` dereference to it. `Delivery::detached()` builds one bound to no queue and
   `Step::detached(payload)` step 0 over it, for tests.
@@ -105,6 +107,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (source):** `jobs::JobRunner::spawn` takes `&self` and no
+  longer panics on a second call. Every call spawns one more worker over
+  the same queue, as `WorkflowRuntime::spawn` does.
 - **Breaking (source):** `WorkflowRuntimeBuilder::build` requires a
   `'static` terminal hook, as `spawn` and `run` already did.
 - **Breaking (source):** `RunSpec::{headers, priority,

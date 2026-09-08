@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use crate::{
     RunOptions, RunSpec, RunnerHandle, Step, StepError, StepOutcome, StepRunner, WorkflowRuntime,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
 use taquba::object_store::ObjectStore;
 use taquba::{Clock, Queue};
 
@@ -21,7 +20,6 @@ use crate::jobs::group::JobGroup;
 use crate::jobs::handle::JobHandle;
 use crate::jobs::job::Job;
 use crate::keys::{hash_input, hex_sha256};
-use crate::runtime::RunResult;
 use crate::terminal::NoopTerminalHook;
 
 /// The payload of a job's run: the job's [`Job::NAME`], by which the step
@@ -43,34 +41,10 @@ fn run_id_for_key(key: &str) -> String {
     hex_sha256(&[key.as_bytes()])
 }
 
-/// The state shared by the runner and every [`JobHandle`]: the runtime
-/// a job runs as one step of, whose terminal hook is
-/// [`NoopTerminalHook`], so a job enqueues no notification.
-pub(crate) struct Inner {
-    pub(crate) runtime: WorkflowRuntime<Dispatch, NoopTerminalHook>,
-    spawned: AtomicBool,
-}
-
-impl Inner {
-    /// The run result record of the terminated run `run_id`, when the
-    /// worker that terminated it wrote one.
-    pub(crate) async fn recorded_result(&self, run_id: &str) -> Result<Option<RunResult>> {
-        self.runtime.inner.core.recorded_result(run_id).await
-    }
-
-    /// Spawn the worker. Panics on a second call: the runtime is
-    /// single-writer and its runner spawns one worker.
-    pub(crate) fn spawn_once<F>(&self, shutdown: F) -> RunnerHandle
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        assert!(
-            !self.spawned.swap(true, Ordering::SeqCst),
-            "spawn may only be called once"
-        );
-        self.runtime.spawn(shutdown)
-    }
-}
+/// The runtime a job runs as one step of, shared by the runner and
+/// every [`JobHandle`]. Its terminal hook is [`NoopTerminalHook`], so a
+/// job does not enqueue a notification.
+pub(crate) type JobRuntime = WorkflowRuntime<Dispatch, NoopTerminalHook>;
 
 /// The run payload of `job`: its [`Job::NAME`] and its serialized
 /// fields.
@@ -79,57 +53,6 @@ pub(crate) fn job_payload<J: Job>(job: &J) -> Result<Vec<u8>> {
         name: J::NAME.to_string(),
         input: rmp_serde::to_vec_named(job)?,
     })?)
-}
-
-impl Inner {
-    pub(crate) async fn submit<J: Job>(
-        self: &Arc<Self>,
-        job: J,
-        options: RunOptions,
-    ) -> Result<JobHandle<J>> {
-        let payload = job_payload(&job)?;
-        let key = job.idempotency_key();
-        let run_id = key.as_deref().map(run_id_for_key);
-
-        // A terminated job with this key answers from its terminal
-        // record, which outlives the run record the workflow deletes at
-        // termination.
-        if let Some(run_id) = &run_id
-            && let Some(termination) = self.runtime.inner.core.terminal_record(run_id).await?
-        {
-            if termination.input_hash != hash_input(&payload) {
-                return Err(crate::Error::InputMismatch(run_id.clone()));
-            }
-            tracing::debug!(job_id = %run_id, job_type = J::NAME, "submit matched a terminated job");
-            return Ok(JobHandle::new(run_id.clone(), self.clone(), false));
-        }
-
-        let outcome = self
-            .runtime
-            .submit(RunSpec {
-                run_id,
-                input: payload,
-                options: RunOptions {
-                    max_attempts_per_step: options
-                        .max_attempts_per_step
-                        .or_else(|| job.max_attempts()),
-                    ..options
-                },
-                kv_writes: HashMap::new(),
-            })
-            .await?;
-        tracing::debug!(
-            job_id = %outcome.run_id,
-            job_type = J::NAME,
-            newly_submitted = outcome.newly_submitted,
-            "job submitted"
-        );
-        Ok(JobHandle::new(
-            outcome.run_id,
-            self.clone(),
-            outcome.newly_submitted,
-        ))
-    }
 }
 
 type DispatchFuture<'a> =
@@ -232,14 +155,21 @@ impl StepRunner for Dispatch {
 }
 
 /// The orchestration service: submits jobs and spawns the worker that runs
-/// them.
+/// them. A clone shares the runtime (internally `Arc`).
 ///
-/// One runner per process: taquba is single-writer. Build it with
-/// [`JobRunner::builder`], registering every job type on the builder, then
-/// [`spawn`](Self::spawn) the worker. Jobs can be submitted before or after
-/// spawning.
+/// Build it with [`JobRunner::builder`], registering every job type on
+/// the builder, then [`spawn`](Self::spawn) the worker. Jobs can be
+/// submitted before or after spawning.
 pub struct JobRunner {
-    inner: Arc<Inner>,
+    runtime: JobRuntime,
+}
+
+impl Clone for JobRunner {
+    fn clone(&self) -> Self {
+        Self {
+            runtime: self.runtime.clone(),
+        }
+    }
 }
 
 impl JobRunner {
@@ -262,7 +192,7 @@ impl JobRunner {
     ///
     /// Returns a [`JobHandle`] that can be awaited for the typed result.
     pub async fn submit<J: Job>(&self, job: J) -> Result<JobHandle<J>> {
-        self.inner.submit(job, RunOptions::default()).await
+        self.submit_with(job, RunOptions::default()).await
     }
 
     /// Submit a job with `options`: its headers, priority, attempt limit
@@ -270,19 +200,60 @@ impl JobRunner {
     /// precedence over [`Job::max_attempts`]; the queue's limit applies
     /// when neither is set.
     pub async fn submit_with<J: Job>(&self, job: J, options: RunOptions) -> Result<JobHandle<J>> {
-        self.inner.submit(job, options).await
+        let payload = job_payload(&job)?;
+        let key = job.idempotency_key();
+        let run_id = key.as_deref().map(run_id_for_key);
+
+        // A terminated job with this key is reported from its terminal
+        // record, which outlives the run record the workflow deletes at
+        // termination.
+        if let Some(run_id) = &run_id
+            && let Some(termination) = self.runtime.inner.core.terminal_record(run_id).await?
+        {
+            if termination.input_hash != hash_input(&payload) {
+                return Err(crate::Error::InputMismatch(run_id.clone()));
+            }
+            tracing::debug!(job_id = %run_id, job_type = J::NAME, "submit matched a terminated job");
+            return Ok(JobHandle::new(run_id.clone(), self.runtime.clone(), false));
+        }
+
+        let outcome = self
+            .runtime
+            .submit(RunSpec {
+                run_id,
+                input: payload,
+                options: RunOptions {
+                    max_attempts_per_step: options
+                        .max_attempts_per_step
+                        .or_else(|| job.max_attempts()),
+                    ..options
+                },
+                kv_writes: HashMap::new(),
+            })
+            .await?;
+        tracing::debug!(
+            job_id = %outcome.run_id,
+            job_type = J::NAME,
+            newly_submitted = outcome.newly_submitted,
+            "job submitted"
+        );
+        Ok(JobHandle::new(
+            outcome.run_id,
+            self.runtime.clone(),
+            outcome.newly_submitted,
+        ))
     }
 
     /// The group of `J` jobs named `id`, which must be 1 to 128 bytes of
     /// `[A-Za-z0-9_-]`; [`Error::InvalidGroupId`](crate::Error::InvalidGroupId)
     /// otherwise.
     pub fn group<J: Job>(&self, id: impl Into<String>) -> Result<JobGroup<J>> {
-        Ok(JobGroup::new(self.inner.runtime.group(id)?))
+        Ok(JobGroup::new(self.runtime.group(id)?))
     }
 
     /// A group of `J` jobs with a generated id.
     pub fn new_group<J: Job>(&self) -> JobGroup<J> {
-        JobGroup::new(self.inner.runtime.new_group())
+        JobGroup::new(self.runtime.new_group())
     }
 
     /// Spawn the worker task and return a handle for graceful shutdown.
@@ -290,16 +261,12 @@ impl JobRunner {
     /// The worker claims and runs jobs concurrently (up to the configured
     /// limit) until either `shutdown` resolves or
     /// [`RunnerHandle::shutdown`] is called. In-flight jobs are allowed to
-    /// finish.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called more than once.
-    pub fn spawn<F>(&mut self, shutdown: F) -> RunnerHandle
+    /// finish. Every call spawns one more worker over the same queue.
+    pub fn spawn<F>(&self, shutdown: F) -> RunnerHandle
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.inner.spawn_once(shutdown)
+        self.runtime.spawn(shutdown)
     }
 }
 
@@ -460,10 +427,7 @@ impl JobRunnerBuilder {
             builder = builder.group_retention(retention);
         }
         JobRunner {
-            inner: Arc::new(Inner {
-                runtime: builder.build(),
-                spawned: AtomicBool::new(false),
-            }),
+            runtime: builder.build(),
         }
     }
 }
@@ -741,7 +705,7 @@ mod tests {
         let (queue, store) =
             open_queue_with(OpenOptions::default().default_queue_config(cfg)).await;
         let calls = Arc::new(AtomicU32::new(0));
-        let mut runner = JobRunner::builder(queue.clone(), store)
+        let runner = JobRunner::builder(queue.clone(), store)
             .state(calls.clone())
             .register::<Memoizing>()
             .build();
@@ -764,7 +728,7 @@ mod tests {
         let base = 1_700_000_000_000;
         let (queue, store, _clock) = open_queue_at_with(base, fast_options()).await;
         let gate = Arc::new(RenewGate::default());
-        let mut runner = JobRunner::builder(queue.clone(), store)
+        let runner = JobRunner::builder(queue.clone(), store)
             .state(gate.clone())
             .register::<Renewing>()
             .build();
@@ -794,7 +758,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn permanent_failure_is_dead_lettered_with_recorded_outcome() {
         let (queue, store) = open_queue().await;
-        let mut runner = JobRunner::builder(queue.clone(), store)
+        let runner = JobRunner::builder(queue.clone(), store)
             .register::<AlwaysFails>()
             .build();
         let handle = runner.spawn(std::future::pending::<()>());
@@ -820,7 +784,7 @@ mod tests {
     async fn a_duplicate_submission_joins_the_in_flight_job() {
         let (queue, store) = open_queue().await;
         let runs = Arc::new(AtomicU32::new(0));
-        let mut runner = JobRunner::builder(queue, store)
+        let runner = JobRunner::builder(queue, store)
             .state(runs.clone())
             .register::<CountedKeyed>()
             .build();
@@ -880,7 +844,7 @@ mod tests {
             OpenOptions::default().default_queue_config(QueueConfig::default().max_attempts(1)),
         )
         .await;
-        let mut runner = JobRunner::builder(queue, store)
+        let runner = JobRunner::builder(queue, store)
             .register::<KeyedFailure>()
             .build();
         let handle = runner.spawn(std::future::pending::<()>());
@@ -911,7 +875,7 @@ mod tests {
 
         let first_id = {
             let queue = Arc::new(Queue::open(store.clone(), queue_name).await.unwrap());
-            let mut runner = JobRunner::builder(queue.clone(), store.clone())
+            let runner = JobRunner::builder(queue.clone(), store.clone())
                 .register::<Keyed>()
                 .build();
             let handle = runner.spawn(std::future::pending::<()>());
@@ -942,7 +906,7 @@ mod tests {
     async fn idempotent_resubmit_after_result_swept_reruns() {
         let (queue, store, clock) = open_queue_at_with(10_000, fast_options()).await;
         let runs = Arc::new(AtomicU32::new(0));
-        let mut runner = JobRunner::builder(queue, store)
+        let runner = JobRunner::builder(queue, store)
             .state(runs.clone())
             .retention(Duration::from_secs(60))
             .register::<CountedKeyed>()
@@ -957,10 +921,7 @@ mod tests {
 
         // The retention sweep removes the terminal record with the memos.
         clock.advance(Duration::from_secs(61));
-        assert_eq!(
-            runner.inner.runtime.inner.core.sweep_once().await.unwrap(),
-            1
-        );
+        assert_eq!(runner.runtime.inner.core.sweep_once().await.unwrap(), 1);
 
         // The re-submission finds no terminal record and runs the job
         // again under the same id.
@@ -985,7 +946,7 @@ mod tests {
         // No worker: the cancellation of the pending step terminates
         // the run without a run result record.
         let first = runner.submit(CountedKeyed { n: 7 }).await.unwrap();
-        assert!(runner.inner.runtime.cancel(first.id()).await.unwrap());
+        assert!(runner.runtime.cancel(first.id()).await.unwrap());
         assert!(first.fetch_result().await.unwrap().is_none());
 
         let second = runner.submit(CountedKeyed { n: 7 }).await.unwrap();
@@ -1007,7 +968,7 @@ mod tests {
     async fn retention_removes_the_outcome_record() {
         let t0 = 1_700_000_000_000;
         let (queue, store, clock) = open_queue_at_with(t0, fast_options()).await;
-        let mut runner = JobRunner::builder(queue, store)
+        let runner = JobRunner::builder(queue, store)
             .state("ok")
             .retention(Duration::from_secs(60))
             .register::<Adder>()
@@ -1034,7 +995,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn unknown_job_type_is_dead_lettered() {
         let (queue, store) = open_queue().await;
-        let mut runner = JobRunner::builder(queue.clone(), store).build();
+        let runner = JobRunner::builder(queue.clone(), store).build();
         let handle = runner.spawn(std::future::pending::<()>());
 
         let job = runner.submit(Keyed { n: 9 }).await.unwrap();
@@ -1053,7 +1014,7 @@ mod tests {
             .retry_backoff_base(Duration::ZERO);
         let (queue, store) =
             open_queue_with(OpenOptions::default().default_queue_config(cfg)).await;
-        let mut runner = JobRunner::builder(queue.clone(), store)
+        let runner = JobRunner::builder(queue.clone(), store)
             .register::<AlwaysFailsTransient>()
             .build();
         let handle = runner.spawn(std::future::pending::<()>());
@@ -1071,7 +1032,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn await_after_the_run_terminated_reads_the_outcome_record() {
         let (queue, store) = open_queue().await;
-        let mut runner = JobRunner::builder(queue, store)
+        let runner = JobRunner::builder(queue, store)
             .state("ok")
             .register::<Adder>()
             .build();
@@ -1110,7 +1071,7 @@ mod tests {
     async fn scheduled_job_runs_when_clock_passes_run_at() {
         let t0_ms = 1_700_000_000_000_u64;
         let (queue, store, clock) = open_queue_at_with(t0_ms, fast_options()).await;
-        let mut runner = JobRunner::builder(queue.clone(), store)
+        let runner = JobRunner::builder(queue.clone(), store)
             .state("ok")
             .register::<Adder>()
             .build();
@@ -1146,7 +1107,7 @@ mod tests {
         let (queue, store, clock) =
             open_queue_at_with(t0_ms, fast_options().default_queue_config(cfg)).await;
         let attempts = Arc::new(AtomicU32::new(0));
-        let mut runner = JobRunner::builder(queue, store)
+        let runner = JobRunner::builder(queue, store)
             .state(attempts.clone())
             .register::<Reclaimable>()
             .build();

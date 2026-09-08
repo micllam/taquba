@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let store = Arc::new(InMemory::new());
     let queue = Arc::new(Queue::open(store.clone(), "db").await?);
-    let mut runner = JobRunner::builder(queue, store)
+    let runner = JobRunner::builder(queue, store)
         .register::<CountWords>()
         .build();
     let worker = runner.spawn(std::future::pending::<()>());

@@ -52,7 +52,7 @@
 //! let store = Arc::new(InMemory::new());
 //! let queue = Arc::new(Queue::open(store.clone(), "background-jobs").await?);
 //!
-//! let mut runner = JobRunner::builder(queue, store)
+//! let runner = JobRunner::builder(queue, store)
 //!     .max_concurrent_jobs(50)
 //!     .register::<SendEmail>()
 //!     .build();

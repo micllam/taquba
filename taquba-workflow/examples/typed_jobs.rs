@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(InMemory::new());
     let queue = Arc::new(Queue::open(store.clone(), "jobs-demo").await?);
 
-    let mut runner = JobRunner::builder(queue, store)
+    let runner = JobRunner::builder(queue, store)
         .max_concurrent_jobs(4)
         .register::<Greet>()
         .build();
