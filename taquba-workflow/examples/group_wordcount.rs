@@ -10,6 +10,7 @@ use std::sync::Arc;
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use taquba::{Queue, object_store::memory::InMemory};
+use taquba_workflow::RunId;
 use taquba_workflow::jobs::{Job, JobContext, JobRunner};
 
 #[derive(Serialize, Deserialize)]
@@ -60,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
     let worker = runner.spawn(std::future::pending::<()>());
 
-    let group = runner.group::<CountWords>("wordcount")?;
+    let group = runner.group::<CountWords>(RunId::new("wordcount")?);
     group
         .submit(documents.iter().map(|(id, text)| CountWords {
             id: (*id).to_string(),

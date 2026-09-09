@@ -1,7 +1,14 @@
 //! The runtime's reserved namespaces: the `workflow.` header keys, the
-//! `workflow/` prefix in the caller KV namespace with the builders for
-//! the durable keys under it, the step dedup-key prefix and run-id
-//! validation.
+//! `workflow/` prefix in the caller KV namespace and the builders of the
+//! durable keys within it, the step dedup-key prefix and the validated
+//! [`RunId`].
+
+use std::borrow::Borrow;
+use std::fmt;
+use std::ops::Deref;
+use std::str::FromStr;
+
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{Error, Result};
 
@@ -42,8 +49,8 @@ pub const HEADER_GROUP_KEY: &str = "workflow.group_key";
 
 pub(crate) const DEDUP_PREFIX: &str = "run:";
 
-/// Maximum length of a caller-supplied [`RunSpec::run_id`](crate::RunSpec::run_id), matching the
-/// limit Taquba applies to a caller-supplied job id.
+/// Maximum byte length of a [`RunId`], the limit Taquba applies to a
+/// caller-supplied job id.
 pub const MAX_RUN_ID_LEN: usize = 128;
 
 /// Prefix for the durable per-run record in Taquba's user KV namespace.
@@ -87,12 +94,12 @@ pub(crate) const OUTCOME_KV_PREFIX: &[u8] = b"workflow/outcomes/";
 pub(crate) const GROUP_KV_PREFIX: &[u8] = b"workflow/groups/";
 
 /// Prefix under which the member records of one group are stored.
-pub(crate) fn group_members_kv_prefix(group_id: &str) -> Vec<u8> {
+pub(crate) fn group_members_kv_prefix(group_id: &RunId) -> Vec<u8> {
     prefixed(GROUP_KV_PREFIX, &format!("{group_id}/"))
 }
 
 /// Key of the member record of `key` in group `group_id`.
-pub(crate) fn group_member_kv_key(group_id: &str, key: &str) -> Vec<u8> {
+pub(crate) fn group_member_kv_key(group_id: &RunId, key: &str) -> Vec<u8> {
     prefixed(&group_members_kv_prefix(group_id), key)
 }
 
@@ -101,7 +108,7 @@ pub(crate) fn group_member_kv_key(group_id: &str, key: &str) -> Vec<u8> {
 /// prefix scan returns markers oldest first and the sweep's expired set
 /// is the front of the range. The value is empty: both fields are in
 /// the key.
-pub(crate) fn terminal_kv_key(run_id: &str, terminal_at_ms: u64) -> Vec<u8> {
+pub(crate) fn terminal_kv_key(run_id: &RunId, terminal_at_ms: u64) -> Vec<u8> {
     timestamped_kv_key(TERMINAL_KV_PREFIX, run_id, terminal_at_ms)
 }
 
@@ -111,22 +118,24 @@ pub(crate) const GROUP_TERMINAL_KV_PREFIX: &[u8] = b"workflow/group-terminals/";
 
 /// Key of the terminal marker of group `group_id`, whose members all
 /// terminated by `terminal_at_ms`.
-pub(crate) fn group_terminal_kv_key(group_id: &str, terminal_at_ms: u64) -> Vec<u8> {
+pub(crate) fn group_terminal_kv_key(group_id: &RunId, terminal_at_ms: u64) -> Vec<u8> {
     timestamped_kv_key(GROUP_TERMINAL_KV_PREFIX, group_id, terminal_at_ms)
 }
 
 /// `{prefix}{ts:020}/{id}`: a marker whose zero-padded timestamp leads the
 /// suffix, so a prefix scan returns markers oldest first.
-pub(crate) fn timestamped_kv_key(prefix: &[u8], id: &str, ts_ms: u64) -> Vec<u8> {
+pub(crate) fn timestamped_kv_key(prefix: &[u8], id: &RunId, ts_ms: u64) -> Vec<u8> {
     prefixed(prefix, &format!("{ts_ms:020}/{id}"))
 }
 
-/// The `(id, ts_ms)` of a key built by [`timestamped_kv_key`].
-pub(crate) fn parse_timestamped_kv_key(prefix: &[u8], key: &[u8]) -> Option<(String, u64)> {
+/// The `(id, ts_ms)` of a key built by [`timestamped_kv_key`], `None`
+/// for a key outside `prefix`, with a malformed timestamp or with an
+/// id that is not a valid run id.
+pub(crate) fn parse_timestamped_kv_key(prefix: &[u8], key: &[u8]) -> Option<(RunId, u64)> {
     let suffix = key.strip_prefix(prefix)?;
     let text = std::str::from_utf8(suffix).ok()?;
     let (ts, id) = text.split_once('/')?;
-    Some((id.to_string(), ts.parse().ok()?))
+    Some((RunId::new(id).ok()?, ts.parse().ok()?))
 }
 
 /// The SHA-256 digest of `input`.
@@ -150,30 +159,127 @@ pub(crate) fn hex_sha256(parts: &[&[u8]]) -> String {
     hex
 }
 
-/// Validate a caller-supplied run id. The run id becomes an object-store
-/// path segment under the memo prefix and a key segment in the queue's
-/// key-value namespace, so it is restricted to the same 1 to
-/// [`MAX_RUN_ID_LEN`] bytes of `[A-Za-z0-9_-]` that Taquba requires of a
-/// caller-supplied job id. An empty run id would resolve to the memo
-/// prefix itself, whose entries the retention sweep would then remove
-/// for every run.
-pub(crate) fn validate_run_id(run_id: &str) -> Result<()> {
-    let reason = if run_id.is_empty() {
-        "run id must not be empty"
-    } else if run_id.len() > MAX_RUN_ID_LEN {
-        "run id exceeds maximum length of 128 bytes"
-    } else if !run_id
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
-        "run id must contain only `[A-Za-z0-9_-]`"
-    } else {
-        return Ok(());
-    };
-    Err(Error::InvalidRunId {
-        run_id: run_id.to_string(),
-        reason,
-    })
+/// A run id: 1 to [`MAX_RUN_ID_LEN`] bytes of `[A-Za-z0-9_-]`. A run id
+/// is a path segment in the memo store and a key segment in the queue's
+/// KV namespace, so it is restricted to the characters Taquba accepts
+/// in a caller-supplied job id. `RunId` is the parameter type of every
+/// key and path builder, so a key over an unvalidated id does not
+/// compile. An id is validated by [`RunId::new`], by [`str::parse`] and
+/// by deserialization. A group id is a `RunId` as well, because it is
+/// stored at the same key positions. The type dereferences to `str`
+/// and implements `PartialEq<str>`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct RunId(String);
+
+impl RunId {
+    /// Validate `id`. An empty id, an id over [`MAX_RUN_ID_LEN`] bytes
+    /// or one with a character outside `[A-Za-z0-9_-]` is
+    /// [`Error::InvalidRunId`].
+    pub fn new(id: impl Into<String>) -> Result<Self> {
+        let id = id.into();
+        // An empty id is the memo prefix itself, and the sweep then
+        // clears every run's entries.
+        let reason = if id.is_empty() {
+            "run id must not be empty"
+        } else if id.len() > MAX_RUN_ID_LEN {
+            "run id exceeds maximum length of 128 bytes"
+        } else if !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            "run id must contain only `[A-Za-z0-9_-]`"
+        } else {
+            return Ok(Self(id));
+        };
+        Err(Error::InvalidRunId { run_id: id, reason })
+    }
+
+    /// A generated id: a ULID.
+    pub(crate) fn generate() -> Self {
+        Self(ulid::Ulid::new().to_string())
+    }
+
+    /// The id that is the lowercase hex SHA-256 digest of `parts`
+    /// concatenated, valid by construction.
+    pub(crate) fn digest(parts: &[&[u8]]) -> Self {
+        Self(hex_sha256(parts))
+    }
+
+    /// The id as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The id as an owned string.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl Deref for RunId {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for RunId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Borrow<str> for RunId {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RunId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for RunId {
+    type Err = Error;
+
+    fn from_str(id: &str) -> Result<Self> {
+        Self::new(id)
+    }
+}
+
+impl PartialEq<str> for RunId {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for RunId {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<String> for RunId {
+    fn eq(&self, other: &String) -> bool {
+        &self.0 == other
+    }
+}
+
+impl From<RunId> for String {
+    fn from(id: RunId) -> Self {
+        id.0
+    }
+}
+
+impl<'de> Deserialize<'de> for RunId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let id = String::deserialize(deserializer)?;
+        Self::new(id).map_err(serde::de::Error::custom)
+    }
 }
 
 /// `{prefix}{suffix}`.
@@ -184,15 +290,15 @@ fn prefixed(prefix: &[u8], suffix: &str) -> Vec<u8> {
     k
 }
 
-pub(crate) fn run_kv_key(run_id: &str) -> Vec<u8> {
+pub(crate) fn run_kv_key(run_id: &RunId) -> Vec<u8> {
     prefixed(RUN_KV_PREFIX, run_id)
 }
 
-pub(crate) fn step_kv_key(run_id: &str) -> Vec<u8> {
+pub(crate) fn step_kv_key(run_id: &RunId) -> Vec<u8> {
     prefixed(STEP_KV_PREFIX, run_id)
 }
 
-pub(crate) fn outcome_kv_key(run_id: &str) -> Vec<u8> {
+pub(crate) fn outcome_kv_key(run_id: &RunId) -> Vec<u8> {
     prefixed(OUTCOME_KV_PREFIX, run_id)
 }
 
@@ -204,7 +310,7 @@ pub(crate) fn signal_buf_kv_key(correlation_key: &str) -> Vec<u8> {
     prefixed(SIGNAL_BUF_KV_PREFIX, correlation_key)
 }
 
-pub(crate) fn signal_delivered_kv_key(run_id: &str, step_number: u32) -> Vec<u8> {
+pub(crate) fn signal_delivered_kv_key(run_id: &RunId, step_number: u32) -> Vec<u8> {
     prefixed(
         SIGNAL_DELIVERED_KV_PREFIX,
         &format!("{run_id}/{step_number}"),
@@ -237,16 +343,46 @@ mod tests {
     }
 
     #[test]
+    fn run_id_rejects_empty_long_and_unsafe_ids() {
+        for bad in [
+            "",
+            "run/1",
+            "run 1",
+            "run:1",
+            &"a".repeat(MAX_RUN_ID_LEN + 1),
+        ] {
+            assert!(
+                matches!(RunId::new(bad), Err(Error::InvalidRunId { .. })),
+                "`{bad}` must be rejected",
+            );
+        }
+        assert!(RunId::new("a".repeat(MAX_RUN_ID_LEN)).is_ok());
+        assert!(rmp_serde::from_slice::<RunId>(&rmp_serde::to_vec("").unwrap()).is_err());
+        assert_eq!(
+            rmp_serde::from_slice::<RunId>(&rmp_serde::to_vec("run-1").unwrap()).unwrap(),
+            "run-1"
+        );
+    }
+
+    #[test]
     fn terminal_marker_keys_sort_oldest_first_and_round_trip() {
-        let old = terminal_kv_key("run-b", 1_000);
-        let young = terminal_kv_key("run-a", 2_000);
+        let old = terminal_kv_key(&RunId::new("run-b").unwrap(), 1_000);
+        let young = terminal_kv_key(&RunId::new("run-a").unwrap(), 2_000);
         assert!(
             old < young,
             "ordering must follow the timestamp ahead of the id"
         );
         assert_eq!(
             parse_timestamped_kv_key(TERMINAL_KV_PREFIX, &young),
-            Some(("run-a".to_string(), 2_000)),
+            Some((RunId::new("run-a").unwrap(), 2_000)),
+        );
+        assert_eq!(
+            parse_timestamped_kv_key(
+                TERMINAL_KV_PREFIX,
+                b"workflow/terminals/00000000000000002000/"
+            ),
+            None,
+            "a marker with an empty id is malformed"
         );
         assert_eq!(
             parse_timestamped_kv_key(TERMINAL_KV_PREFIX, b"workflow/runs/run-a"),

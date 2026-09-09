@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 
 use crate::effects::TerminalEffects;
+use crate::keys::RunId;
 use crate::runner::StepError;
 
 /// Terminal state of a workflow run, passed to a [`TerminalHook`].
@@ -54,7 +55,7 @@ impl std::fmt::Display for TerminalStatus {
 #[derive(Debug, Clone)]
 pub struct RunOutcome {
     /// The run's identifier.
-    pub run_id: String,
+    pub run_id: RunId,
     /// Whether the run completed successfully or failed.
     pub status: TerminalStatus,
     /// Set when `status == Succeeded`: the bytes the runner returned via
@@ -214,7 +215,7 @@ mod webhook {
                 return Ok(());
             };
             let mut req = WebhookRequest::new(url)
-                .header("Workflow-Run-Id", &outcome.run_id)
+                .header("Workflow-Run-Id", outcome.run_id.as_str())
                 .header("Workflow-Run-Status", outcome.status.as_str());
             if let Some(t) = self.timeout {
                 req = req.timeout(t);

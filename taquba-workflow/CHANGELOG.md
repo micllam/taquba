@@ -33,8 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `JobRunnerBuilder::group_retention` removes a group's state a window
   after a consumer observed its last termination. Members are keyed by the job's
   idempotency key or `item-{i}`, and a member's job id is derived from
-  the group id and its key. `Error::DuplicateMemberKey`,
-  `GroupMismatch`, `GroupNotFound` and `InvalidGroupId` are its errors.
+  the group id and its key. It fails with `Error::DuplicateMemberKey`,
+  `GroupMismatch` or `GroupNotFound`.
 - `HEADER_GROUP` and `HEADER_GROUP_KEY`: the reserved headers naming a
   grouped run's group and member key on its step jobs.
 - `RunGroup`: many runs of one runtime submitted as one durable set
@@ -107,6 +107,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (source):** `RunId`, a validated run id of 1 to
+  `MAX_RUN_ID_LEN` bytes of `[A-Za-z0-9_-]`, is the type of every run id
+  and group id on the crate's surface: the `run_id` and `group_id`
+  fields, the id parameters of the run and group methods, the ids the
+  accessors return and the ids the `Error` variants name.
+  `RunSpec::run_id` is an `Option<RunId>`. Construct one with
+  `RunId::new` or `str::parse`, which raise `Error::InvalidRunId`. The
+  type dereferences to `str`. `WorkflowRuntime::group` and
+  `jobs::JobRunner::group` no longer return a `Result`.
 - **Breaking (storage):** the step payload and result in a step-output
   replay record, the result in a run result record and a
   terminal-notification payload, and the serialized job in a typed job's

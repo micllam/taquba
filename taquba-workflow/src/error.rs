@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::keys::RunId;
+
 /// Errors returned by the runtime's submission and worker paths.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -25,11 +27,9 @@ pub enum Error {
     #[error("submission header `{0}` uses the reserved `workflow.*` prefix")]
     ReservedHeaderInSubmit(String),
 
-    /// A caller-supplied [`crate::RunSpec::run_id`] is empty, longer than
+    /// A run id or group id is empty, longer than
     /// [`crate::MAX_RUN_ID_LEN`] bytes or contains a character outside
-    /// `[A-Za-z0-9_-]`. The run id becomes an object-store path segment
-    /// and a key segment in the queue's key-value namespace, so it is
-    /// restricted to the same character set as a Taquba job id.
+    /// `[A-Za-z0-9_-]`. See [`crate::RunId`].
     #[error("invalid run id `{run_id}`: {reason}")]
     InvalidRunId {
         /// The rejected run id.
@@ -44,13 +44,13 @@ pub enum Error {
     /// with new input is treated as a programmer error: pick a fresh
     /// `run_id` for a new run.
     #[error("run `{0}` exists with a different input; pick a fresh run_id")]
-    InputMismatch(String),
+    InputMismatch(RunId),
 
     /// A run's durable record exists without the current-step pointer
     /// written beside it. The two are written and deleted in one
     /// transaction, so this reports a store the runtime did not write.
     #[error("run `{0}` has a run record but no current-step pointer")]
-    InconsistentRunState(String),
+    InconsistentRunState(RunId),
 
     /// A caller KV key passed via [`crate::RunSpec::kv_writes`] or staged
     /// through an [`crate::EffectsHandle`] starts with the reserved
@@ -93,7 +93,7 @@ pub enum Error {
     /// A wait named a run the runtime has no record of: never
     /// submitted, or terminated with no record retained.
     #[error("run `{0}` not found")]
-    RunNotFound(String),
+    RunNotFound(RunId),
 
     /// A group operation waited on a member of the manifest that was
     /// not submitted; [`RunGroup::resume`](crate::RunGroup::resume)
@@ -101,7 +101,7 @@ pub enum Error {
     #[error("member `{key}` of group `{group_id}` was not submitted")]
     MemberNotSubmitted {
         /// The group id.
-        group_id: String,
+        group_id: RunId,
         /// The member's key.
         key: String,
     },
@@ -113,16 +113,11 @@ pub enum Error {
     /// A submission to an existing group supplied a different member
     /// set than the group's manifest.
     #[error("group `{0}` exists with a different member set")]
-    GroupMismatch(String),
+    GroupMismatch(RunId),
 
     /// A group operation named a group with no manifest.
     #[error("group `{0}` not found")]
-    GroupNotFound(String),
-
-    /// A group id was not 1 to [`crate::MAX_RUN_ID_LEN`] bytes of
-    /// `[A-Za-z0-9_-]`.
-    #[error("invalid group id `{0}`: must be 1 to 128 bytes of `[A-Za-z0-9_-]`")]
-    InvalidGroupId(String),
+    GroupNotFound(RunId),
 }
 
 impl Error {
@@ -148,8 +143,7 @@ impl Error {
             | Self::MemberNotSubmitted { .. }
             | Self::DuplicateMemberKey(_)
             | Self::GroupMismatch(_)
-            | Self::GroupNotFound(_)
-            | Self::InvalidGroupId(_) => true,
+            | Self::GroupNotFound(_) => true,
             Self::Queue(e) => e.is_permanent(),
             Self::Store(_) => false,
         }
@@ -169,6 +163,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::rid;
 
     struct BadSerialize;
 
@@ -204,8 +199,8 @@ mod tests {
                 },
                 true,
             ),
-            (Error::InputMismatch("run-1".into()), true),
-            (Error::InconsistentRunState("run-1".into()), true),
+            (Error::InputMismatch(rid("run-1")), true),
+            (Error::InconsistentRunState(rid("run-1")), true),
             (Error::ReservedKvKey("workflow/x".into()), true),
             (Error::ConflictingKvEffect("k".into()), true),
             (Error::EffectsSealed, true),
@@ -232,17 +227,16 @@ mod tests {
                 true,
             ),
             (Error::DuplicateMemberKey("k".into()), true),
-            (Error::GroupMismatch("b".into()), true),
-            (Error::GroupNotFound("b".into()), true),
-            (Error::RunNotFound("run-1".into()), true),
+            (Error::GroupMismatch(rid("b")), true),
+            (Error::GroupNotFound(rid("b")), true),
+            (Error::RunNotFound(rid("run-1")), true),
             (
                 Error::MemberNotSubmitted {
-                    group_id: "b".into(),
+                    group_id: rid("b"),
                     key: "k".into(),
                 },
                 true,
             ),
-            (Error::InvalidGroupId("a/b".into()), true),
         ] {
             assert_eq!(error.is_permanent(), permanent, "{error}");
         }

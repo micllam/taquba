@@ -43,8 +43,8 @@ use serde::{Deserialize, Serialize};
 use taquba::Queue;
 use taquba::object_store::local::LocalFileSystem;
 use taquba_workflow::{
-    RunOutcome, RunSpec, SignalOutcome, Step, StepError, StepOutcome, StepRunner, TerminalEffects,
-    TerminalHook, TerminalStatus, WorkflowRuntime,
+    RunId, RunOutcome, RunSpec, SignalOutcome, Step, StepError, StepOutcome, StepRunner,
+    TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
 };
 use tokio::sync::oneshot;
 
@@ -275,7 +275,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Mode::Run => {
             let outcome = runtime
                 .submit(RunSpec {
-                    run_id: Some(RUN_ID.to_string()),
+                    run_id: Some(RunId::new(RUN_ID)?),
                     input: Vec::new(),
                     ..Default::default()
                 })

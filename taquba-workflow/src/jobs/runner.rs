@@ -19,7 +19,7 @@ use crate::jobs::context::{JobContext, State};
 use crate::jobs::group::JobGroup;
 use crate::jobs::handle::JobHandle;
 use crate::jobs::job::Job;
-use crate::keys::{hash_input, hex_sha256};
+use crate::keys::{RunId, hash_input};
 use crate::terminal::NoopTerminalHook;
 
 /// The payload of a job's run: the job's [`Job::NAME`], by which the step
@@ -36,8 +36,8 @@ const DEFAULT_QUEUE_NAME: &str = "jobs";
 
 /// The run id of a job with an idempotency key: the hex SHA-256 digest of
 /// the key, so any key maps onto the character set a run id accepts.
-fn run_id_for_key(key: &str) -> String {
-    hex_sha256(&[key.as_bytes()])
+fn run_id_for_key(key: &str) -> RunId {
+    RunId::digest(&[key.as_bytes()])
 }
 
 /// The runtime a job runs as one step of, shared by the runner and
@@ -243,11 +243,9 @@ impl JobRunner {
         ))
     }
 
-    /// The group of `J` jobs named `id`, which must be 1 to 128 bytes of
-    /// `[A-Za-z0-9_-]`; [`Error::InvalidGroupId`](crate::Error::InvalidGroupId)
-    /// otherwise.
-    pub fn group<J: Job>(&self, id: impl Into<String>) -> Result<JobGroup<J>> {
-        Ok(JobGroup::new(self.runtime.group(id)?))
+    /// The group of `J` jobs named `id`.
+    pub fn group<J: Job>(&self, id: RunId) -> JobGroup<J> {
+        JobGroup::new(self.runtime.group(id))
     }
 
     /// A group of `J` jobs with a generated id.
@@ -853,7 +851,7 @@ mod tests {
 
         let first = runner.submit(KeyedFailure { n: 7 }).await.unwrap();
         assert!(first.newly_submitted());
-        let first_id = first.id().to_string();
+        let first_id = first.id().clone();
         match first.await {
             Err(JoinError::Job(job_err)) => assert_eq!(job_err.kind, StepErrorKind::Permanent),
             other => panic!("expected Permanent JobError, got {other:?}"),
@@ -861,7 +859,7 @@ mod tests {
 
         let second = runner.submit(KeyedFailure { n: 7 }).await.unwrap();
         assert!(!second.newly_submitted());
-        assert_eq!(second.id(), first_id);
+        assert_eq!(*second.id(), first_id);
         match second.await {
             Err(JoinError::Job(job_err)) => assert_eq!(job_err.kind, StepErrorKind::Permanent),
             other => panic!("expected cached Permanent JobError, got {other:?}"),
@@ -883,7 +881,7 @@ mod tests {
             let handle = runner.spawn(std::future::pending::<()>());
 
             let job = runner.submit(Keyed { n: 99 }).await.unwrap();
-            let id = job.id().to_string();
+            let id = job.id().clone();
             assert_eq!(job.await.unwrap(), 99);
 
             handle.shutdown().await.unwrap();
@@ -894,7 +892,7 @@ mod tests {
         let runner = JobRunner::builder(queue, store).build();
         let second = runner.submit(Keyed { n: 99 }).await.unwrap();
         assert!(!second.newly_submitted());
-        assert_eq!(second.id(), first_id);
+        assert_eq!(*second.id(), first_id);
         let outcome = second
             .fetch_result()
             .await
@@ -929,7 +927,7 @@ mod tests {
         // again under the same id.
         let second = runner.submit(CountedKeyed { n: 5 }).await.unwrap();
         assert!(second.newly_submitted());
-        assert_eq!(second.id(), first_id);
+        assert_eq!(*second.id(), first_id);
         assert_eq!(second.await.unwrap(), 5);
         assert_eq!(runs.load(Ordering::SeqCst), 2);
 
@@ -962,7 +960,7 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 0);
         assert!(matches!(
             runner.submit(CountedKeyedOther { n: 7 }).await,
-            Err(crate::Error::InputMismatch(id)) if id == first.id()
+            Err(crate::Error::InputMismatch(id)) if &id == first.id()
         ));
     }
 

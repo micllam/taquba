@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::error::Result;
-use crate::keys::{parse_timestamped_kv_key, validate_run_id};
+use crate::keys::{RunId, parse_timestamped_kv_key};
 
 /// Terminal markers read per page by a sweep pass.
 const SWEEP_PAGE_SIZE: usize = 256;
@@ -40,18 +40,18 @@ pub(crate) trait Clearable: Send + Sync + 'static {
     /// entity's marker in one transaction.
     fn clear(
         &self,
-        id: &str,
+        id: &RunId,
     ) -> impl Future<Output = std::result::Result<Vec<Vec<u8>>, Self::Error>> + Send;
 }
 
 /// [`Clearable`] behind a boxed future, so sweeps over different stores
 /// share one type.
 trait DynClearable: Send + Sync {
-    fn clear_dyn<'a>(&'a self, id: &'a str) -> ClearFuture<'a>;
+    fn clear_dyn<'a>(&'a self, id: &'a RunId) -> ClearFuture<'a>;
 }
 
 impl<C: Clearable> DynClearable for C {
-    fn clear_dyn<'a>(&'a self, id: &'a str) -> ClearFuture<'a> {
+    fn clear_dyn<'a>(&'a self, id: &'a RunId) -> ClearFuture<'a> {
         Box::pin(async move { self.clear(id).await.map_err(Into::into) })
     }
 }
@@ -109,9 +109,7 @@ impl Sweep {
         let mut cleared = 0usize;
         let mut markers = std::pin::pin!(queue.kv_entries(self.prefix, SWEEP_PAGE_SIZE));
         while let Some((key, _)) = markers.try_next().await? {
-            let parsed = parse_timestamped_kv_key(self.prefix, &key)
-                .filter(|(id, _)| validate_run_id(id).is_ok());
-            let Some((id, ts_ms)) = parsed else {
+            let Some((id, ts_ms)) = parse_timestamped_kv_key(self.prefix, &key) else {
                 warn!(
                     key = %String::from_utf8_lossy(&key),
                     "malformed marker; deleting without clearing",

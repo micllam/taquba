@@ -21,8 +21,8 @@ use crate::error::{Error, Result};
 use crate::group::{GroupStore, Membership, RunGroup, pending_member, terminated_member};
 use crate::keys::{
     DEDUP_PREFIX, GROUP_TERMINAL_KV_PREFIX, HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL,
-    RESERVED_HEADER_PREFIX, RESERVED_KV_PREFIX, TERMINAL_KV_PREFIX, hash_input, outcome_kv_key,
-    run_kv_key, step_kv_key, terminal_kv_key, validate_run_id,
+    RESERVED_HEADER_PREFIX, RESERVED_KV_PREFIX, RunId, TERMINAL_KV_PREFIX, hash_input,
+    outcome_kv_key, run_kv_key, step_kv_key, terminal_kv_key,
 };
 use crate::memo::{MemoStore, RUN_RESULT_MEMO_KEY};
 use crate::runner::{StepErrorKind, StepOutcome, StepRunner, Trigger};
@@ -87,10 +87,8 @@ pub struct RunOptions {
 /// Spec passed to [`WorkflowRuntime::submit`].
 #[derive(Debug, Clone, Default)]
 pub struct RunSpec {
-    /// Caller-supplied run identifier of 1 to [`MAX_RUN_ID_LEN`](crate::MAX_RUN_ID_LEN) bytes of
-    /// `[A-Za-z0-9_-]`; anything else is rejected with
-    /// [`Error::InvalidRunId`]. If `None`, the runtime generates a ULID.
-    /// The dedup key for the first step job is `run:{run_id}:0`, so
+    /// Caller-supplied run identifier. If `None`, the runtime generates
+    /// a ULID. The dedup key for the first step job is `run:{run_id}:0`, so
     /// re-submitting the same `run_id` while the run is active returns the
     /// existing job rather than creating a duplicate.
     ///
@@ -100,7 +98,7 @@ pub struct RunSpec {
     /// [`WorkflowRuntimeBuilder::memo_retention`] the first run's marker
     /// expires against those shared entries even while the second run is
     /// executing. The second run then re-executes the affected steps.
-    pub run_id: Option<String>,
+    pub run_id: Option<RunId>,
     /// Bytes handed to the runner as the first step's payload.
     pub input: Vec<u8>,
     /// The settings of the run's steps.
@@ -123,7 +121,7 @@ pub struct RunSpec {
 #[non_exhaustive]
 pub struct SubmitOutcome {
     /// The run's identifier (generated if the spec didn't carry one).
-    pub run_id: String,
+    pub run_id: RunId,
     /// `true` if this call enqueued a new run; `false` if a run with this
     /// id was already active (its durable run record exists) and this
     /// call was a no-op. Call
@@ -141,7 +139,7 @@ pub struct SubmitOutcome {
 #[derive(Debug, Clone)]
 pub struct RunStatus {
     /// The run's identifier.
-    pub run_id: String,
+    pub run_id: RunId,
     /// Lifecycle state of the run's current step, or its termination.
     pub state: RunState,
     /// Step number of the run's current step; the final step of a
@@ -421,7 +419,7 @@ struct RunStore {
 impl Clearable for RunStore {
     type Error = Error;
 
-    async fn clear(&self, run_id: &str) -> Result<Vec<Vec<u8>>> {
+    async fn clear(&self, run_id: &RunId) -> Result<Vec<Vec<u8>>> {
         self.memo_store.clear_memos_for_run(run_id).await?;
         Ok(vec![outcome_kv_key(run_id)])
     }
@@ -541,7 +539,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// A run with a pending cancellation request reports
     /// [`RunState::Cancelling`] whatever its step's lifecycle position,
     /// until the run terminates.
-    pub async fn status(&self, run_id: &str) -> Result<Option<RunStatus>> {
+    pub async fn status(&self, run_id: &RunId) -> Result<Option<RunStatus>> {
         self.inner.core.status(run_id).await
     }
 
@@ -557,7 +555,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// its terminal record describes: a re-submission of a terminated
     /// run id leaves the earlier run's record in place until its own
     /// termination overwrites it, and such a record is not reported.
-    pub async fn outcome(&self, run_id: &str) -> Result<Option<RunOutcome>> {
+    pub async fn outcome(&self, run_id: &RunId) -> Result<Option<RunOutcome>> {
         self.inner.core.outcome(run_id).await
     }
 
@@ -571,13 +569,13 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     ///
     /// Returns [`Error::RunNotFound`] for a run the runtime has no
     /// record of: never submitted, or terminated and swept.
-    pub async fn wait(&self, run_id: &str) -> Result<RunEnd> {
+    pub async fn wait(&self, run_id: &RunId) -> Result<RunEnd> {
         self.inner.core.wait(run_id).await
     }
 
     /// [`Self::wait`] bounded by `timeout`; `Ok(None)` when the timeout
     /// elapses first.
-    pub async fn wait_timeout(&self, run_id: &str, timeout: Duration) -> Result<Option<RunEnd>> {
+    pub async fn wait_timeout(&self, run_id: &RunId, timeout: Duration) -> Result<Option<RunEnd>> {
         self.inner.core.wait_timeout(run_id, timeout).await
     }
 
@@ -610,22 +608,18 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// Cancellation is best-effort: a run whose terminal step settles
     /// while the request is being recorded keeps the outcome it
     /// committed.
-    pub async fn cancel(&self, run_id: &str) -> Result<bool> {
+    pub async fn cancel(&self, run_id: &RunId) -> Result<bool> {
         self.inner.core.cancel(run_id).await
     }
 
-    /// The group named `id`, which must be 1 to
-    /// [`MAX_RUN_ID_LEN`](crate::MAX_RUN_ID_LEN) bytes of `[A-Za-z0-9_-]`;
-    /// [`Error::InvalidGroupId`] otherwise.
-    pub fn group(&self, id: impl Into<String>) -> Result<RunGroup> {
-        let id = id.into();
-        validate_run_id(&id).map_err(|_| Error::InvalidGroupId(id.clone()))?;
-        Ok(RunGroup::new(self.inner.core.clone(), id))
+    /// The group named `id`.
+    pub fn group(&self, id: RunId) -> RunGroup {
+        RunGroup::new(self.inner.core.clone(), id)
     }
 
     /// A group with a generated id.
     pub fn new_group(&self) -> RunGroup {
-        RunGroup::new(self.inner.core.clone(), ulid::Ulid::new().to_string())
+        RunGroup::new(self.inner.core.clone(), RunId::generate())
     }
 
     /// Spawn [`Self::run`] as a Tokio task and return a handle for
@@ -741,12 +735,9 @@ impl RuntimeCore {
         self.enqueue_run(&run_id, spec, Some(membership)).await
     }
 
-    /// Check `spec`'s run id, headers and KV keys; the run id, generated
-    /// when the spec names none.
-    fn validate_spec(spec: &RunSpec) -> Result<String> {
-        if let Some(supplied) = spec.run_id.as_deref() {
-            validate_run_id(supplied)?;
-        }
+    /// Check `spec`'s headers and KV keys, and return the run id,
+    /// generated when the spec names none.
+    fn validate_spec(spec: &RunSpec) -> Result<RunId> {
         for k in spec.options.headers.keys() {
             if k.starts_with(RESERVED_HEADER_PREFIX) {
                 return Err(Error::ReservedHeaderInSubmit(k.clone()));
@@ -759,10 +750,7 @@ impl RuntimeCore {
                 ));
             }
         }
-        Ok(spec
-            .run_id
-            .clone()
-            .unwrap_or_else(|| ulid::Ulid::new().to_string()))
+        Ok(spec.run_id.clone().unwrap_or_else(RunId::generate))
     }
 
     /// Enqueue step 0 of `run_id` unless the run is active. The run
@@ -774,13 +762,13 @@ impl RuntimeCore {
     /// enqueue.
     async fn enqueue_run(
         &self,
-        run_id: &str,
+        run_id: &RunId,
         spec: RunSpec,
         membership: Option<&Membership>,
     ) -> Result<SubmitOutcome> {
         let input_hash = hash_input(&spec.input);
         let duplicate = |job_id: String| SubmitOutcome {
-            run_id: run_id.to_string(),
+            run_id: run_id.clone(),
             newly_submitted: false,
             job_id,
         };
@@ -788,7 +776,7 @@ impl RuntimeCore {
             if existing.input_hash == input_hash {
                 Ok(())
             } else {
-                Err(Error::InputMismatch(run_id.to_string()))
+                Err(Error::InputMismatch(run_id.clone()))
             }
         };
 
@@ -810,7 +798,7 @@ impl RuntimeCore {
             self.step_enqueue_request(run_id, 0, spec.input, &spec.options.headers, opts);
 
         let record_bytes = durable::encode(&DurableRunRecord {
-            run_id: run_id.to_string(),
+            run_id: run_id.clone(),
             submitted_at_ms: self.clock.now_ms(),
             input_hash,
             cancel_requested: false,
@@ -845,14 +833,14 @@ impl RuntimeCore {
 
         debug!(run_id = %run_id, job_id = %job_id, "run submitted");
         Ok(SubmitOutcome {
-            run_id: run_id.to_string(),
+            run_id: run_id.clone(),
             newly_submitted: true,
             job_id,
         })
     }
 
     /// [`WorkflowRuntime::status`].
-    pub(crate) async fn status(&self, run_id: &str) -> Result<Option<RunStatus>> {
+    pub(crate) async fn status(&self, run_id: &RunId) -> Result<Option<RunStatus>> {
         let Some(record) = self.run_record(run_id).await? else {
             return self.terminated_status(run_id).await;
         };
@@ -869,14 +857,14 @@ impl RuntimeCore {
             RunState::Pending
         };
         Ok(Some(RunStatus {
-            run_id: run_id.to_string(),
+            run_id: run_id.clone(),
             state,
             current_step: current.step_number,
         }))
     }
 
     /// [`WorkflowRuntime::outcome`].
-    pub(crate) async fn outcome(&self, run_id: &str) -> Result<Option<RunOutcome>> {
+    pub(crate) async fn outcome(&self, run_id: &RunId) -> Result<Option<RunOutcome>> {
         if self.current_step_if_active(run_id).await?.is_some() {
             return Ok(None);
         }
@@ -887,16 +875,16 @@ impl RuntimeCore {
     }
 
     /// [`WorkflowRuntime::wait`].
-    pub(crate) async fn wait(&self, run_id: &str) -> Result<RunEnd> {
+    pub(crate) async fn wait(&self, run_id: &RunId) -> Result<RunEnd> {
         self.wait_run(run_id)
             .await?
-            .ok_or_else(|| Error::RunNotFound(run_id.to_string()))
+            .ok_or_else(|| Error::RunNotFound(run_id.clone()))
     }
 
     /// [`WorkflowRuntime::wait_timeout`].
     pub(crate) async fn wait_timeout(
         &self,
-        run_id: &str,
+        run_id: &RunId,
         timeout: Duration,
     ) -> Result<Option<RunEnd>> {
         match tokio::time::timeout(timeout, self.wait(run_id)).await {
@@ -906,7 +894,7 @@ impl RuntimeCore {
     }
 
     /// [`WorkflowRuntime::cancel`].
-    pub(crate) async fn cancel(&self, run_id: &str) -> Result<bool> {
+    pub(crate) async fn cancel(&self, run_id: &RunId) -> Result<bool> {
         let Some(input_hash) = self.request_cancel(run_id).await? else {
             return Ok(false);
         };
@@ -1019,7 +1007,7 @@ impl RuntimeCore {
             let Ok(claimed) = ClaimedStep::parse(&job) else {
                 continue;
             };
-            let run_id = claimed.run_id.as_str();
+            let run_id = &claimed.run_id;
             let current = self.current_step_if_active(run_id).await?;
             if current.is_none_or(|current| current.job_id != job.id) {
                 continue;
@@ -1087,17 +1075,17 @@ impl RuntimeCore {
     }
 
     /// The current-step pointer of a run whose durable record exists.
-    pub(crate) async fn current_step(&self, run_id: &str) -> Result<DurableCurrentStep> {
+    pub(crate) async fn current_step(&self, run_id: &RunId) -> Result<DurableCurrentStep> {
         self.current_step_if_active(run_id)
             .await?
-            .ok_or_else(|| Error::InconsistentRunState(run_id.to_string()))
+            .ok_or_else(|| Error::InconsistentRunState(run_id.clone()))
     }
 
     /// The current-step pointer of `run_id`, `None` when the run is not
     /// active.
     pub(crate) async fn current_step_if_active(
         &self,
-        run_id: &str,
+        run_id: &RunId,
     ) -> Result<Option<DurableCurrentStep>> {
         durable::kv_record(&self.queue, &step_kv_key(run_id)).await
     }
@@ -1110,7 +1098,7 @@ impl RuntimeCore {
     /// [`Error::InconsistentRunState`].
     pub(crate) async fn current_job(
         &self,
-        run_id: &str,
+        run_id: &RunId,
     ) -> Result<Option<(DurableCurrentStep, JobRecord)>> {
         let mut absent: Option<String> = None;
         loop {
@@ -1121,22 +1109,25 @@ impl RuntimeCore {
                 return Ok(Some((current, job)));
             }
             if absent.as_deref() == Some(current.job_id.as_str()) {
-                return Err(Error::InconsistentRunState(run_id.to_string()));
+                return Err(Error::InconsistentRunState(run_id.clone()));
             }
             absent = Some(current.job_id);
         }
     }
 
     /// The terminal record of `run_id`; `None` when no record exists.
-    pub(crate) async fn terminal_record(&self, run_id: &str) -> Result<Option<DurableTermination>> {
+    pub(crate) async fn terminal_record(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<DurableTermination>> {
         durable::kv_record(&self.queue, &outcome_kv_key(run_id)).await
     }
 
     /// The status of a terminated run from its terminal record; `None`
     /// when no record exists.
-    async fn terminated_status(&self, run_id: &str) -> Result<Option<RunStatus>> {
+    async fn terminated_status(&self, run_id: &RunId) -> Result<Option<RunStatus>> {
         Ok(self.terminal_record(run_id).await?.map(|record| RunStatus {
-            run_id: run_id.to_string(),
+            run_id: run_id.clone(),
             current_step: record.final_step,
             state: RunState::Terminated(record.into()),
         }))
@@ -1147,7 +1138,7 @@ impl RuntimeCore {
     /// current step and no record. A current step the queue
     /// dead-lettered outside the worker is polled at the poll interval
     /// until reconciliation terminates the run.
-    pub(crate) async fn wait_run(&self, run_id: &str) -> Result<Option<RunEnd>> {
+    pub(crate) async fn wait_run(&self, run_id: &RunId) -> Result<Option<RunEnd>> {
         loop {
             let Some((current, _)) = self.current_job(run_id).await? else {
                 return self.run_end(run_id).await;
@@ -1176,7 +1167,7 @@ impl RuntimeCore {
     /// The end of the terminated run `run_id` from its terminal record
     /// and the run result record of that termination; `None` when no
     /// terminal record remains.
-    async fn run_end(&self, run_id: &str) -> Result<Option<RunEnd>> {
+    async fn run_end(&self, run_id: &RunId) -> Result<Option<RunEnd>> {
         let Some(termination) = self.terminal_record(run_id).await? else {
             return Ok(None);
         };
@@ -1194,7 +1185,7 @@ impl RuntimeCore {
     /// The run result record of the termination `run_id`'s terminal
     /// record describes; `None` when no terminal record remains or the
     /// worker that terminated the run wrote no record.
-    pub(crate) async fn recorded_result(&self, run_id: &str) -> Result<Option<RunResult>> {
+    pub(crate) async fn recorded_result(&self, run_id: &RunId) -> Result<Option<RunResult>> {
         match self.terminal_record(run_id).await? {
             Some(termination) => self.run_result_of(run_id, &termination.into()).await,
             None => Ok(None),
@@ -1209,7 +1200,7 @@ impl RuntimeCore {
     /// reported.
     pub(crate) async fn run_result_of(
         &self,
-        run_id: &str,
+        run_id: &RunId,
         termination: &RunTermination,
     ) -> Result<Option<RunResult>> {
         Ok(self
@@ -1220,7 +1211,7 @@ impl RuntimeCore {
 
     /// The run result record of `run_id`, whichever termination it
     /// belongs to; a record that fails to decode is treated as absent.
-    async fn run_result(&self, run_id: &str) -> Result<Option<RunResult>> {
+    async fn run_result(&self, run_id: &RunId) -> Result<Option<RunResult>> {
         let Some(bytes) = self
             .memo_store
             .new_run_memo(run_id)
@@ -1235,7 +1226,7 @@ impl RuntimeCore {
                 outcome: record.outcome.into(),
             })),
             Err(err) => {
-                warn!(run_id, error = %err, "run result record failed to decode; treated as absent");
+                warn!(%run_id, error = %err, "run result record failed to decode; treated as absent");
                 Ok(None)
             }
         }
@@ -1277,14 +1268,14 @@ impl RuntimeCore {
     }
 
     /// The durable record of `run_id`, when the run is active.
-    pub(crate) async fn run_record(&self, run_id: &str) -> Result<Option<DurableRunRecord>> {
+    pub(crate) async fn run_record(&self, run_id: &RunId) -> Result<Option<DurableRunRecord>> {
         durable::kv_record(&self.queue, &run_kv_key(run_id)).await
     }
 
     /// Record a cancellation request on the run record of `run_id`.
     /// Returns the record's input hash when the run is active, `None`
     /// otherwise; a request already recorded counts as recorded again.
-    async fn request_cancel(&self, run_id: &str) -> Result<Option<[u8; 32]>> {
+    async fn request_cancel(&self, run_id: &RunId) -> Result<Option<[u8; 32]>> {
         let key = run_kv_key(run_id);
         loop {
             let Some(current) = self.queue.kv_get(&key).await? else {
@@ -1311,7 +1302,7 @@ impl RuntimeCore {
     /// id.
     fn step_enqueue_request(
         &self,
-        run_id: &str,
+        run_id: &RunId,
         step_number: u32,
         payload: Vec<u8>,
         user_headers: &HashMap<String, String>,
@@ -1349,7 +1340,7 @@ impl RuntimeCore {
     ) -> EnqueueRequest {
         let payload = durable::encode(&DurableRunOutcome::from(outcome));
         let mut headers = HashMap::new();
-        headers.insert(HEADER_RUN_ID.to_string(), outcome.run_id.clone());
+        headers.insert(HEADER_RUN_ID.to_string(), outcome.run_id.to_string());
         headers.insert(HEADER_TERMINAL.to_string(), "1".to_string());
         EnqueueRequest {
             queue: self.queue_name.clone(),
@@ -1370,7 +1361,7 @@ impl RuntimeCore {
 
     pub(crate) async fn load_step_output(
         &self,
-        run_id: &str,
+        run_id: &RunId,
         step_number: u32,
         step_payload: &[u8],
     ) -> Result<Option<(StepOutcome, StagedEffects)>> {
@@ -1416,7 +1407,7 @@ impl RuntimeCore {
 
     pub(crate) async fn store_step_output(
         &self,
-        run_id: &str,
+        run_id: &RunId,
         step_number: u32,
         step_payload: &[u8],
         outcome: &StepOutcome,
@@ -1456,7 +1447,7 @@ impl RuntimeCore {
         opts: StepEnqueueOpts,
         kv_writes: impl FnOnce(&str) -> HashMap<Vec<u8>, Vec<u8>>,
     ) -> SettlementEffects {
-        let run_id = claimed.run_id.as_str();
+        let run_id = &claimed.run_id;
         let next_step = claimed.step_number + 1;
         let (request, next_job_id) =
             self.step_enqueue_request(run_id, next_step, payload, &claimed.headers, opts);
@@ -1477,7 +1468,7 @@ mod tests {
     use crate::durable::DurableMember;
     use crate::effects::{EffectsHandle, TerminalEffects};
     use crate::group::GroupMember;
-    use crate::keys::{MAX_RUN_ID_LEN, group_member_kv_key};
+    use crate::keys::group_member_kv_key;
     use crate::keys::{
         TERMINAL_KV_PREFIX, parse_timestamped_kv_key, signal_buf_kv_key, signal_wait_kv_key,
     };
@@ -1486,7 +1477,7 @@ mod tests {
     use crate::terminal::NoopTerminalHook;
     use crate::terminal::TerminalStatus;
     use crate::test_util::{
-        advance, fast_options, open_queue, open_queue_at, open_queue_at_with, open_queue_with,
+        advance, fast_options, open_queue, open_queue_at, open_queue_at_with, open_queue_with, rid,
     };
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1639,7 +1630,7 @@ mod tests {
 
     /// Every terminal marker in the queue's KV namespace, as
     /// `(run_id, terminal_at_ms)` pairs in key order (oldest first).
-    async fn terminal_markers(queue: &Queue) -> Vec<(String, u64)> {
+    async fn terminal_markers(queue: &Queue) -> Vec<(RunId, u64)> {
         let page = queue
             .kv_scan(TERMINAL_KV_PREFIX, None, 1_000)
             .await
@@ -1656,7 +1647,7 @@ mod tests {
     /// the run is active or unknown.
     async fn terminal_status_of<R: StepRunner, H: TerminalHook>(
         runtime: &WorkflowRuntime<R, H>,
-        run_id: &str,
+        run_id: &RunId,
     ) -> Option<TerminalStatus> {
         match runtime.status(run_id).await.unwrap().map(|s| s.state) {
             Some(RunState::Terminated(termination)) => Some(termination.status),
@@ -2190,7 +2181,7 @@ mod tests {
 
         runtime
             .submit(RunSpec {
-                run_id: Some("run-a".to_string()),
+                run_id: Some(rid("run-a")),
                 input: Vec::new(),
                 ..Default::default()
             })
@@ -2200,7 +2191,7 @@ mod tests {
 
         runtime
             .submit(RunSpec {
-                run_id: Some("run-b".to_string()),
+                run_id: Some(rid("run-b")),
                 input: Vec::new(),
                 ..Default::default()
             })
@@ -2225,11 +2216,19 @@ mod tests {
             "the rejected registration dead-letters run-b's step",
         );
         assert!(
-            queue.kv_get(&run_kv_key("run-b")).await.unwrap().is_none(),
+            queue
+                .kv_get(&run_kv_key(&rid("run-b")))
+                .await
+                .unwrap()
+                .is_none(),
             "the run record delete rides the dead-letter",
         );
         assert!(
-            queue.kv_get(&run_kv_key("run-a")).await.unwrap().is_some(),
+            queue
+                .kv_get(&run_kv_key(&rid("run-a")))
+                .await
+                .unwrap()
+                .is_some(),
             "the waiting run keeps its record",
         );
 
@@ -2369,7 +2368,7 @@ mod tests {
         // No worker loop runs, so the step stays queued and the run is
         // active for every later submit.
         let spec = |input: &[u8], key: &[u8]| RunSpec {
-            run_id: Some("fixed-id".to_string()),
+            run_id: Some(rid("fixed-id")),
             input: input.to_vec(),
             kv_writes: HashMap::from([(key.to_vec(), b"1".to_vec())]),
             ..Default::default()
@@ -2377,7 +2376,7 @@ mod tests {
 
         let first = runtime.submit(spec(b"x", b"app/first")).await.unwrap();
         assert!(first.newly_submitted);
-        assert!(runtime.status("fixed-id").await.unwrap().is_some());
+        assert!(runtime.status(&rid("fixed-id")).await.unwrap().is_some());
         assert_eq!(
             queue.kv_get(b"app/first").await.unwrap().as_deref(),
             Some(b"1".as_slice())
@@ -2414,7 +2413,7 @@ mod tests {
         let shutdown = spawn_runtime(first.clone());
         let submitted = first
             .submit(RunSpec {
-                run_id: Some("durable".into()),
+                run_id: Some(rid("durable")),
                 input: b"x".to_vec(),
                 ..Default::default()
             })
@@ -2438,7 +2437,7 @@ mod tests {
         .build();
         let duplicate = second
             .submit(RunSpec {
-                run_id: Some("durable".into()),
+                run_id: Some(rid("durable")),
                 input: b"x".to_vec(),
                 ..Default::default()
             })
@@ -2551,7 +2550,7 @@ mod tests {
         let runtime =
             WorkflowRuntime::builder(queue, store.clone(), PauseRunner, NoopTerminalHook).build();
         let spec = |input: &[u8]| RunSpec {
-            run_id: Some("raced".to_string()),
+            run_id: Some(rid("raced")),
             input: input.to_vec(),
             ..Default::default()
         };
@@ -2684,7 +2683,7 @@ mod tests {
 
         runtime
             .submit(RunSpec {
-                run_id: Some("replay-run".to_string()),
+                run_id: Some(rid("replay-run")),
                 input: b"input".to_vec(),
                 ..Default::default()
             })
@@ -2753,7 +2752,7 @@ mod tests {
 
         runtime
             .submit(RunSpec {
-                run_id: Some("corrupt-run".to_string()),
+                run_id: Some(rid("corrupt-run")),
                 input: b"input".to_vec(),
                 ..Default::default()
             })
@@ -2769,7 +2768,7 @@ mod tests {
             .inner
             .core
             .memo_store
-            .put_step_output("corrupt-run", 0, &job.payload, b"not msgpack")
+            .put_step_output(&rid("corrupt-run"), 0, &job.payload, b"not msgpack")
             .await
             .unwrap();
 
@@ -2815,7 +2814,7 @@ mod tests {
 
         runtime
             .submit(RunSpec {
-                run_id: Some("terminal-replay".to_string()),
+                run_id: Some(rid("terminal-replay")),
                 input: b"input".to_vec(),
                 ..Default::default()
             })
@@ -3395,7 +3394,7 @@ mod tests {
             "no Cancelled hook may fire after the run already terminated as Succeeded",
         );
 
-        assert!(!runtime.cancel("never-submitted").await.unwrap());
+        assert!(!runtime.cancel(&rid("never-submitted")).await.unwrap());
 
         let _ = shutdown.send(());
     }
@@ -3508,7 +3507,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn submit_rejects_reserved_headers_reserved_kv_keys_and_unusable_run_ids() {
+    async fn submit_rejects_reserved_headers_and_reserved_kv_keys() {
         let (queue, store, _clock) = open_queue_at(10_000).await;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
@@ -3518,36 +3517,6 @@ mod tests {
             ChannelHook { tx },
         )
         .build();
-
-        for bad in [
-            "",
-            "run/1",
-            "run 1",
-            "run:1",
-            &"a".repeat(MAX_RUN_ID_LEN + 1),
-        ] {
-            let err = runtime
-                .submit(RunSpec {
-                    run_id: Some(bad.to_string()),
-                    input: b"x".to_vec(),
-                    ..Default::default()
-                })
-                .await
-                .expect_err("run id must be rejected");
-            assert!(
-                matches!(err, Error::InvalidRunId { .. }),
-                "unexpected error for `{bad}`: {err}",
-            );
-        }
-
-        let ok = runtime
-            .submit(RunSpec {
-                run_id: Some("a".repeat(MAX_RUN_ID_LEN)),
-                input: b"x".to_vec(),
-                ..Default::default()
-            })
-            .await;
-        assert!(ok.is_ok(), "a run id at the limit must be accepted");
 
         let err = runtime
             .submit(RunSpec {
@@ -3591,11 +3560,12 @@ mod tests {
 
         let memos = MemoStore::new(store, "workflow-steps-memo");
         memos
-            .new_memo("bystander", 0)
+            .new_memo(&rid("bystander"), 0)
             .put("k", b"expensive")
             .await
             .unwrap();
-        let marker = terminal_kv_key("", 0);
+        // A marker whose id is empty, which no key builder can produce.
+        let marker = [TERMINAL_KV_PREFIX, b"00000000000000000000/"].concat();
         queue.kv_put(&marker, b"").await.unwrap();
         let mut unparseable = Vec::from(TERMINAL_KV_PREFIX);
         unparseable.extend_from_slice(b"not-a-timestamp");
@@ -3604,7 +3574,7 @@ mod tests {
         advance(&clock, Duration::from_secs(3_600)).await;
         runtime.inner.core.sweep_once().await.unwrap();
         assert_eq!(
-            memos.new_memo("bystander", 0).get("k").await.unwrap(),
+            memos.new_memo(&rid("bystander"), 0).get("k").await.unwrap(),
             Some(b"expensive".to_vec()),
             "an unrelated run's memo entries must survive",
         );
@@ -3848,9 +3818,10 @@ mod tests {
 
         let memos = MemoStore::new(store, "workflow-steps-memo");
         for (run_id, at_ms) in [("old", 1_000u64), ("young", 9_500u64)] {
-            memos.new_memo(run_id, 0).put("k", b"v").await.unwrap();
+            let run_id = rid(run_id);
+            memos.new_memo(&run_id, 0).put("k", b"v").await.unwrap();
             queue
-                .kv_put(&terminal_kv_key(run_id, at_ms), b"")
+                .kv_put(&terminal_kv_key(&run_id, at_ms), b"")
                 .await
                 .unwrap();
         }
@@ -3862,9 +3833,9 @@ mod tests {
         let remaining = terminal_markers(&queue).await;
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].0, "young");
-        assert_eq!(memos.new_memo("old", 0).get("k").await.unwrap(), None);
+        assert_eq!(memos.new_memo(&rid("old"), 0).get("k").await.unwrap(), None);
         assert_eq!(
-            memos.new_memo("young", 0).get("k").await.unwrap(),
+            memos.new_memo(&rid("young"), 0).get("k").await.unwrap(),
             Some(b"v".to_vec()),
         );
     }
@@ -3976,7 +3947,7 @@ mod tests {
 
         let memos = MemoStore::new(store.clone(), "workflow-steps-memo");
         memos
-            .new_memo("in-flight-run", 0)
+            .new_memo(&rid("in-flight-run"), 0)
             .put("k", b"cached")
             .await
             .unwrap();
@@ -3988,7 +3959,11 @@ mod tests {
         }
 
         assert_eq!(
-            memos.new_memo("in-flight-run", 0).get("k").await.unwrap(),
+            memos
+                .new_memo(&rid("in-flight-run"), 0)
+                .get("k")
+                .await
+                .unwrap(),
             Some(b"cached".to_vec()),
             "sweep must not remove memos of a run with no terminal marker",
         );
@@ -4390,7 +4365,7 @@ mod tests {
 
         let submitted = runtime
             .submit(RunSpec {
-                run_id: Some("hung".into()),
+                run_id: Some(rid("hung")),
                 input: Vec::new(),
                 options: RunOptions {
                     max_attempts_per_step: Some(1),
@@ -4407,7 +4382,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(
-            runtime.status("hung").await.unwrap().map(|s| s.state),
+            runtime.status(&rid("hung")).await.unwrap().map(|s| s.state),
             Some(RunState::Running)
         );
 
@@ -4430,10 +4405,22 @@ mod tests {
                 .status,
             JobStatus::Dead
         );
-        assert!(queue.kv_get(&run_kv_key("hung")).await.unwrap().is_none());
-        assert!(queue.kv_get(&step_kv_key("hung")).await.unwrap().is_none());
+        assert!(
+            queue
+                .kv_get(&run_kv_key(&rid("hung")))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            queue
+                .kv_get(&step_kv_key(&rid("hung")))
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
-            terminal_status_of(&runtime, "hung").await,
+            terminal_status_of(&runtime, &rid("hung")).await,
             Some(TerminalStatus::Failed)
         );
         let _ = shutdown.send(());
@@ -4443,7 +4430,7 @@ mod tests {
         // current step's job, so the new run is left alone.
         let again = runtime
             .submit(RunSpec {
-                run_id: Some("hung".into()),
+                run_id: Some(rid("hung")),
                 input: Vec::new(),
                 ..Default::default()
             })
@@ -4452,7 +4439,7 @@ mod tests {
         assert!(again.newly_submitted);
         assert_eq!(runtime.inner.core.reconcile_dead_steps().await.unwrap(), 0);
         assert!(
-            runtime.status("hung").await.unwrap().is_some(),
+            runtime.status(&rid("hung")).await.unwrap().is_some(),
             "the re-submitted run is active"
         );
     }
@@ -4473,20 +4460,20 @@ mod tests {
         )
         .build();
         assert!(matches!(
-            runtime.wait("absent").await,
+            runtime.wait(&rid("absent")).await,
             Err(Error::RunNotFound(id)) if id == "absent"
         ));
         let shutdown = spawn_runtime(runtime.clone());
 
         runtime
             .submit(RunSpec {
-                run_id: Some("two".into()),
+                run_id: Some(rid("two")),
                 input: b"x".to_vec(),
                 ..Default::default()
             })
             .await
             .unwrap();
-        let end = tokio::time::timeout(Duration::from_secs(5), runtime.wait("two"))
+        let end = tokio::time::timeout(Duration::from_secs(5), runtime.wait(&rid("two")))
             .await
             .expect("the wait resolved")
             .unwrap();
@@ -4501,7 +4488,7 @@ mod tests {
         );
 
         // A run already terminated is reported at once.
-        let again = runtime.wait("two").await.unwrap();
+        let again = runtime.wait(&rid("two")).await.unwrap();
         assert_eq!(again.termination, end.termination);
         let _ = shutdown.send(());
     }
@@ -4519,7 +4506,7 @@ mod tests {
         )
         .build();
         let spec = RunSpec {
-            run_id: Some("again".into()),
+            run_id: Some(rid("again")),
             input: b"x".to_vec(),
             ..Default::default()
         };
@@ -4535,7 +4522,7 @@ mod tests {
             .await
             .unwrap();
         queue.ack_with(&claim, effects).await.unwrap();
-        let first = runtime.wait("again").await.unwrap();
+        let first = runtime.wait(&rid("again")).await.unwrap();
         assert_eq!(first.termination.status, TerminalStatus::Succeeded);
         assert!(first.outcome.is_some());
 
@@ -4544,11 +4531,11 @@ mod tests {
         clock.advance(Duration::from_secs(1));
         assert!(runtime.submit(spec).await.unwrap().newly_submitted);
         assert!(
-            runtime.outcome("again").await.unwrap().is_none(),
+            runtime.outcome(&rid("again")).await.unwrap().is_none(),
             "the run is active"
         );
-        assert!(runtime.cancel("again").await.unwrap());
-        let end = runtime.wait("again").await.unwrap();
+        assert!(runtime.cancel(&rid("again")).await.unwrap());
+        let end = runtime.wait(&rid("again")).await.unwrap();
         assert_eq!(
             (end.termination.status, end.termination.terminated_at_ms),
             (TerminalStatus::Cancelled, 11_000)
@@ -4557,7 +4544,7 @@ mod tests {
             end.outcome.is_none(),
             "no worker terminated the new run, so the earlier run's record is not its outcome"
         );
-        assert!(runtime.outcome("again").await.unwrap().is_none());
+        assert!(runtime.outcome(&rid("again")).await.unwrap().is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -4569,7 +4556,7 @@ mod tests {
                 .build();
         runtime
             .submit(RunSpec {
-                run_id: Some("hung".into()),
+                run_id: Some(rid("hung")),
                 input: Vec::new(),
                 ..Default::default()
             })
@@ -4584,15 +4571,15 @@ mod tests {
 
         let waiting = tokio::spawn({
             let runtime = runtime.clone();
-            async move { runtime.wait("hung").await }
+            async move { runtime.wait(&rid("hung")).await }
         });
         assert!(
-            !runtime.cancel("hung").await.unwrap(),
+            !runtime.cancel(&rid("hung")).await.unwrap(),
             "the request is not honoured"
         );
         assert!(
             runtime
-                .wait_timeout("hung", Duration::from_secs(1))
+                .wait_timeout(&rid("hung"), Duration::from_secs(1))
                 .await
                 .unwrap()
                 .is_none(),
@@ -4617,7 +4604,7 @@ mod tests {
         );
         assert!(end.outcome.is_none());
         assert_eq!(
-            runtime.wait("hung").await.unwrap().termination,
+            runtime.wait(&rid("hung")).await.unwrap().termination,
             end.termination,
             "the record is retained without memo retention",
         );
@@ -4631,7 +4618,7 @@ mod tests {
                 .build();
         let submitted = runtime
             .submit(RunSpec {
-                run_id: Some("torn".into()),
+                run_id: Some(rid("torn")),
                 input: Vec::new(),
                 ..Default::default()
             })
@@ -4641,15 +4628,15 @@ mod tests {
         // outlives it.
         queue.cancel(&submitted.job_id).await.unwrap();
         assert!(matches!(
-            runtime.status("torn").await,
+            runtime.status(&rid("torn")).await,
             Err(Error::InconsistentRunState(id)) if id == "torn"
         ));
         assert!(matches!(
-            runtime.wait("torn").await,
+            runtime.wait(&rid("torn")).await,
             Err(Error::InconsistentRunState(id)) if id == "torn"
         ));
         assert!(matches!(
-            runtime.cancel("torn").await,
+            runtime.cancel(&rid("torn")).await,
             Err(Error::InconsistentRunState(id)) if id == "torn"
         ));
     }
@@ -4664,7 +4651,7 @@ mod tests {
             async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
                 let record = step
                     .kv
-                    .get(&group_member_kv_key("g", "m"))
+                    .get(&group_member_kv_key(&rid("g"), "m"))
                     .await?
                     .expect("the member record is written with the submission");
                 let member: DurableMember = rmp_serde::from_slice(&record).unwrap();
@@ -4690,7 +4677,7 @@ mod tests {
         .build();
         let shutdown = spawn_runtime(runtime.clone());
 
-        let group = runtime.group("g").unwrap();
+        let group = runtime.group(rid("g"));
         group
             .submit(
                 vec![GroupMember {
@@ -4774,7 +4761,7 @@ mod tests {
         queue.kv_put(b"app/stale", b"old").await.unwrap();
         runtime
             .submit(RunSpec {
-                run_id: Some("replay-effects".to_string()),
+                run_id: Some(rid("replay-effects")),
                 input: b"input".to_vec(),
                 ..Default::default()
             })
@@ -4856,7 +4843,7 @@ mod tests {
 
         runtime
             .submit(RunSpec {
-                run_id: Some("phantom".to_string()),
+                run_id: Some(rid("phantom")),
                 input: Vec::new(),
                 ..Default::default()
             })
@@ -4891,7 +4878,7 @@ mod tests {
             })
         };
         running_rx.recv().await.unwrap();
-        assert!(runtime.cancel("phantom").await.unwrap());
+        assert!(runtime.cancel(&rid("phantom")).await.unwrap());
         worker.await.unwrap();
 
         let notification = queue
@@ -4937,7 +4924,7 @@ mod tests {
                 effects
                     .enqueue(EnqueueRequest {
                         queue: "side-effects".to_string(),
-                        payload: outcome.run_id.clone().into_bytes(),
+                        payload: outcome.run_id.to_string().into_bytes(),
                         options: EnqueueOptions::default(),
                     })
                     .map_err(|e| StepError::permanent(e.to_string()))?;
@@ -4957,7 +4944,7 @@ mod tests {
 
         runtime
             .submit(RunSpec {
-                run_id: Some("hooked".to_string()),
+                run_id: Some(rid("hooked")),
                 input: Vec::new(),
                 ..Default::default()
             })
@@ -5015,7 +5002,7 @@ mod tests {
 
         runtime
             .submit(RunSpec {
-                run_id: Some("flaky".to_string()),
+                run_id: Some(rid("flaky")),
                 input: Vec::new(),
                 ..Default::default()
             })
@@ -5088,7 +5075,7 @@ mod tests {
 
         runtime
             .submit(RunSpec {
-                run_id: Some("with-callback".to_string()),
+                run_id: Some(rid("with-callback")),
                 input: Vec::new(),
                 options: RunOptions {
                     headers: HashMap::from([(
@@ -5125,7 +5112,7 @@ mod tests {
         // A run without a callback header enqueues no notification.
         runtime
             .submit(RunSpec {
-                run_id: Some("without-callback".to_string()),
+                run_id: Some(rid("without-callback")),
                 input: Vec::new(),
                 ..Default::default()
             })

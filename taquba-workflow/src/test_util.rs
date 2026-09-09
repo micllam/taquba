@@ -7,6 +7,13 @@ use taquba::object_store::ObjectStore;
 use taquba::object_store::memory::InMemory;
 use taquba::{MockClock, OpenOptions, Queue, QueueConfig};
 
+use crate::keys::RunId;
+
+/// The run id `id`, which must be valid.
+pub(crate) fn rid(id: &str) -> RunId {
+    RunId::new(id).unwrap()
+}
+
 /// A queue named `test` over an in-memory object store of its own,
 /// opened with `opts`.
 pub(crate) async fn open_queue_with(opts: OpenOptions) -> (Arc<Queue>, Arc<dyn ObjectStore>) {

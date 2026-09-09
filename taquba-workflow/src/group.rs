@@ -18,8 +18,8 @@ use crate::blob::ObjectPrefix;
 use crate::durable::{self, DurableMember, DurableTermination};
 use crate::error::{Error, Result};
 use crate::keys::{
-    HEADER_GROUP, HEADER_GROUP_KEY, group_member_kv_key, group_members_kv_prefix,
-    group_terminal_kv_key, hex_sha256, outcome_kv_key,
+    HEADER_GROUP, HEADER_GROUP_KEY, RunId, group_member_kv_key, group_members_kv_prefix,
+    group_terminal_kv_key, outcome_kv_key,
 };
 use crate::memo::MemoStore;
 use crate::runtime::{RunOptions, RunSpec, RunTermination, RuntimeCore};
@@ -34,33 +34,38 @@ const SUBMIT_CONCURRENCY: usize = 32;
 const MEMBER_PAGE_SIZE: usize = 1000;
 
 /// The run id of the member `key` of group `group_id`: the hex SHA-256
-/// digest of `{group_id}/{key}`, so a key may hold characters a run id
-/// rejects and groups never share run state.
-pub(crate) fn member_run_id(group_id: &str, key: &str) -> String {
-    hex_sha256(&[group_id.as_bytes(), b"/", key.as_bytes()])
+/// digest of `{group_id}/{key}`, so a key can contain characters a run
+/// id rejects and groups never share run state.
+pub(crate) fn member_run_id(group_id: &RunId, key: &str) -> RunId {
+    RunId::digest(&[group_id.as_bytes(), b"/", key.as_bytes()])
 }
 
 /// The group membership of a run, set on every step job of the run in
 /// the [`HEADER_GROUP`] and [`HEADER_GROUP_KEY`] headers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Membership {
-    pub(crate) group_id: String,
+    pub(crate) group_id: RunId,
     pub(crate) key: String,
 }
 
 impl Membership {
     /// The membership named by `headers`, when both headers are present.
-    pub(crate) fn from_headers(headers: &HashMap<String, String>) -> Option<Self> {
-        Some(Self {
-            group_id: headers.get(HEADER_GROUP)?.clone(),
-            key: headers.get(HEADER_GROUP_KEY)?.clone(),
-        })
+    pub(crate) fn from_headers(headers: &HashMap<String, String>) -> Result<Option<Self>> {
+        let (Some(group_id), Some(key)) =
+            (headers.get(HEADER_GROUP), headers.get(HEADER_GROUP_KEY))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            group_id: RunId::new(group_id.as_str())?,
+            key: key.clone(),
+        }))
     }
 
     /// The reserved headers that hold this membership on a step job.
     pub(crate) fn reserved_headers(&self) -> Vec<(&'static str, String)> {
         vec![
-            (HEADER_GROUP, self.group_id.clone()),
+            (HEADER_GROUP, self.group_id.to_string()),
             (HEADER_GROUP_KEY, self.key.clone()),
         ]
     }
@@ -71,7 +76,7 @@ impl Membership {
     }
 
     /// The run id of this member.
-    pub(crate) fn run_id(&self) -> String {
+    pub(crate) fn run_id(&self) -> RunId {
         member_run_id(&self.group_id, &self.key)
     }
 }
@@ -89,7 +94,7 @@ pub struct GroupMember {
 /// The members of one group, in submission order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Manifest {
-    pub(crate) group_id: String,
+    pub(crate) group_id: RunId,
     pub(crate) members: Vec<GroupMember>,
 }
 
@@ -98,7 +103,7 @@ pub(crate) struct Manifest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupStatus {
     /// The group id.
-    pub group_id: String,
+    pub group_id: RunId,
     /// Number of members in the group's manifest.
     pub total: usize,
     /// Members submitted and not yet terminated.
@@ -117,7 +122,7 @@ pub struct MemberResult {
     /// The member's key.
     pub key: String,
     /// The run id of the member's run.
-    pub run_id: String,
+    pub run_id: RunId,
     /// The member's last recorded termination.
     pub termination: RunTermination,
     /// The member's committed outcome, read as [`WorkflowRuntime::outcome`](crate::WorkflowRuntime::outcome)
@@ -166,11 +171,11 @@ impl GroupStore {
         }
     }
 
-    fn manifest_path(&self, group_id: &str) -> Path {
+    fn manifest_path(&self, group_id: &RunId) -> Path {
         self.objects.path(&format!("groups/{group_id}/manifest"))
     }
 
-    pub(crate) async fn read_manifest(&self, group_id: &str) -> Result<Option<Manifest>> {
+    pub(crate) async fn read_manifest(&self, group_id: &RunId) -> Result<Option<Manifest>> {
         match self.objects.get(&self.manifest_path(group_id)).await? {
             Some(bytes) => durable::decode(&bytes).map(Some),
             None => Ok(None),
@@ -187,13 +192,17 @@ impl GroupStore {
     }
 
     /// The member record of `key` in `group_id`, when one exists.
-    pub(crate) async fn member(&self, group_id: &str, key: &str) -> Result<Option<DurableMember>> {
+    pub(crate) async fn member(
+        &self,
+        group_id: &RunId,
+        key: &str,
+    ) -> Result<Option<DurableMember>> {
         durable::kv_record(&self.queue, &group_member_kv_key(group_id, key)).await
     }
 
     /// Every member record of `group_id`, in key order. A record that
     /// fails to decode is skipped.
-    pub(crate) async fn members(&self, group_id: &str) -> Result<Vec<MemberState>> {
+    pub(crate) async fn members(&self, group_id: &RunId) -> Result<Vec<MemberState>> {
         let prefix = group_members_kv_prefix(group_id);
         let mut members = Vec::new();
         let mut entries = std::pin::pin!(self.queue.kv_entries(&prefix, MEMBER_PAGE_SIZE));
@@ -202,7 +211,7 @@ impl GroupStore {
             match rmp_serde::from_slice(&value) {
                 Ok(record) => members.push(MemberState { key, record }),
                 Err(err) => {
-                    warn!(group_id, key, error = %err, "group member record failed to decode");
+                    warn!(%group_id, key, error = %err, "group member record failed to decode");
                 }
             }
         }
@@ -213,7 +222,7 @@ impl GroupStore {
     /// record of every member in its manifest, its member records and
     /// the manifest. A group without a manifest has its member records
     /// removed and nothing else.
-    pub(crate) async fn forget(&self, group_id: &str) -> Result<()> {
+    pub(crate) async fn forget(&self, group_id: &RunId) -> Result<()> {
         let mut keys = Vec::new();
         if let Some(manifest) = self.read_manifest(group_id).await? {
             for member in &manifest.members {
@@ -252,7 +261,7 @@ impl GroupStore {
 impl Clearable for GroupStore {
     type Error = Error;
 
-    async fn clear(&self, group_id: &str) -> Result<Vec<Vec<u8>>> {
+    async fn clear(&self, group_id: &RunId) -> Result<Vec<Vec<u8>>> {
         self.forget(group_id).await.map(|()| Vec::new())
     }
 }
@@ -272,16 +281,16 @@ impl Clearable for GroupStore {
 #[derive(Clone)]
 pub struct RunGroup {
     runtime: Arc<RuntimeCore>,
-    id: String,
+    id: RunId,
 }
 
 impl RunGroup {
-    pub(crate) fn new(runtime: Arc<RuntimeCore>, id: String) -> Self {
+    pub(crate) fn new(runtime: Arc<RuntimeCore>, id: RunId) -> Self {
         Self { runtime, id }
     }
 
     /// The group id.
-    pub fn id(&self) -> &str {
+    pub fn id(&self) -> &RunId {
         &self.id
     }
 
@@ -530,17 +539,17 @@ impl RunGroup {
 }
 
 /// The member record written with a member's submission.
-pub(crate) fn pending_member(run_id: &str) -> DurableMember {
+pub(crate) fn pending_member(run_id: &RunId) -> DurableMember {
     DurableMember {
-        run_id: run_id.to_string(),
+        run_id: run_id.clone(),
         terminated: None,
     }
 }
 
 /// The member record written by the settlement that terminates a member.
-pub(crate) fn terminated_member(run_id: &str, termination: DurableTermination) -> DurableMember {
+pub(crate) fn terminated_member(run_id: &RunId, termination: DurableTermination) -> DurableMember {
     DurableMember {
-        run_id: run_id.to_string(),
+        run_id: run_id.clone(),
         terminated: Some(termination),
     }
 }
@@ -553,7 +562,7 @@ mod tests {
     use crate::runner::{Step, StepError, StepOutcome, StepRunner};
     use crate::runtime::{RunSpec, WorkflowRuntime};
     use crate::terminal::NoopTerminalHook;
-    use crate::test_util::{open_queue, open_queue_at};
+    use crate::test_util::{open_queue, open_queue_at, rid};
 
     /// Continues once, then succeeds with the step number.
     struct TwoSteps;
@@ -591,7 +600,7 @@ mod tests {
         let (queue, store, clock) = open_queue_at(10_000).await;
         let runtime =
             WorkflowRuntime::builder(queue.clone(), store, Rejecting, NoopTerminalHook).build();
-        let group = runtime.group("g").unwrap();
+        let group = runtime.group(rid("g"));
         group
             .submit(vec![member("a")], &RunOptions::default())
             .await
@@ -646,7 +655,7 @@ mod tests {
         let runtime = WorkflowRuntime::builder(queue.clone(), store, TwoSteps, NoopTerminalHook)
             .poll_interval(Duration::from_millis(10))
             .build();
-        let group = runtime.group("g").unwrap();
+        let group = runtime.group(rid("g"));
         group
             .submit(vec![member("a"), member("b")], &RunOptions::default())
             .await
@@ -654,7 +663,7 @@ mod tests {
         let pending = group.members().await.unwrap();
         assert_eq!(pending.len(), 2);
         assert!(pending.iter().all(|m| m.status().is_none()));
-        assert_eq!(pending[0].record.run_id, member_run_id("g", "a"));
+        assert_eq!(pending[0].record.run_id, member_run_id(&rid("g"), "a"));
 
         assert!(matches!(
             group.submit(vec![member("a"), member("a")], &RunOptions::default()).await,
@@ -693,12 +702,12 @@ mod tests {
         let (queue, store, _clock) = open_queue_at(10_000).await;
         let runtime =
             WorkflowRuntime::builder(queue.clone(), store, TwoSteps, NoopTerminalHook).build();
-        let group = runtime.group("g").unwrap();
+        let group = runtime.group(rid("g"));
         group
             .submit(vec![member("a")], &RunOptions::default())
             .await
             .unwrap();
-        let run_id = member_run_id("g", "a");
+        let run_id = member_run_id(&rid("g"), "a");
         assert_eq!(group.cancel().await.unwrap(), 1);
         assert_eq!(group.cancel().await.unwrap(), 0, "no member is active");
 
@@ -752,19 +761,19 @@ mod tests {
             WorkflowRuntime::builder(queue.clone(), store.clone(), TwoSteps, NoopTerminalHook)
                 .group_retention(Duration::from_secs(1))
                 .build();
-        let group = runtime.group("g").unwrap();
+        let group = runtime.group(rid("g"));
         group
             .submit(vec![member("a")], &RunOptions::default())
             .await
             .unwrap();
-        let run_id = member_run_id("g", "a");
+        let run_id = member_run_id(&rid("g"), "a");
         assert_eq!(group.cancel().await.unwrap(), 1);
         let memos = crate::memo::MemoStore::new(store, "workflow-steps-memo");
         memos.new_run_memo(&run_id).put("k", b"v").await.unwrap();
         let results: Vec<MemberResult> =
             group.results().await.unwrap().try_collect().await.unwrap();
         assert_eq!(results.len(), 1);
-        let marker = group_terminal_kv_key("g", 10_000);
+        let marker = group_terminal_kv_key(&rid("g"), 10_000);
         assert!(
             queue.kv_get(&marker).await.unwrap().is_some(),
             "the marker is written when the last termination is observed"

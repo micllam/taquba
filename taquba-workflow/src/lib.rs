@@ -103,8 +103,9 @@
 //! # Submissions
 //!
 //! [`WorkflowRuntime::submit`] takes a [`RunSpec`]: the first step's
-//! `input`, an optional `run_id` (1 to [`MAX_RUN_ID_LEN`] bytes of
-//! `[A-Za-z0-9_-]`; a ULID is generated when absent), the [`RunOptions`]
+//! `input`, an optional `run_id` (a [`RunId`], validated at construction
+//! to 1 to [`MAX_RUN_ID_LEN`] bytes of `[A-Za-z0-9_-]`, and a ULID is
+//! generated when absent), the [`RunOptions`]
 //! of its steps (`headers`, a `priority` and `max_attempts_per_step`
 //! overriding the queue's defaults for every step and a `run_at` before
 //! which the first step is not claimable) and `kv_writes` applied with
@@ -632,7 +633,7 @@ pub use error::{Error, Result};
 pub use group::{GroupMember, GroupStatus, MemberResult, RunGroup};
 pub use keys::{
     HEADER_RUN_ID, HEADER_SIGNAL_DELIVERED, HEADER_SIGNAL_WAIT, HEADER_STEP, HEADER_TERMINAL,
-    MAX_RUN_ID_LEN, RESERVED_HEADER_PREFIX, RESERVED_KV_PREFIX,
+    MAX_RUN_ID_LEN, RESERVED_HEADER_PREFIX, RESERVED_KV_PREFIX, RunId,
 };
 pub use kv::KvReadHandle;
 pub use memo::{Memo, MemoStore};

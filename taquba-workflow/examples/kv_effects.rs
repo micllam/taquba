@@ -30,8 +30,8 @@ use std::time::Duration;
 use taquba::Queue;
 use taquba::object_store::memory::InMemory;
 use taquba_workflow::{
-    RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects, TerminalHook,
-    WorkflowRuntime,
+    RunId, RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects,
+    TerminalHook, WorkflowRuntime,
 };
 
 fn status_key(run_id: &str) -> Vec<u8> {
@@ -93,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let run_id = "order-1001";
     runtime
         .submit(RunSpec {
-            run_id: Some(run_id.into()),
+            run_id: Some(RunId::new(run_id)?),
             input: b"2 units of item 7".to_vec(),
             kv_writes: HashMap::from([
                 (status_key(run_id), b"received".to_vec()),

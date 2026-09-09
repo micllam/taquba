@@ -16,7 +16,7 @@ use crate::durable::DurableRunOutcome;
 use crate::effects::{EffectsHandle, TerminalEffects};
 use crate::error::{Error, worker_error};
 use crate::group::Membership;
-use crate::keys::{HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RESERVED_HEADER_PREFIX};
+use crate::keys::{HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RESERVED_HEADER_PREFIX, RunId};
 use crate::kv::KvReadHandle;
 use crate::runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 use crate::runtime::{RuntimeInner, StepEnqueueOpts};
@@ -43,7 +43,7 @@ impl<R: StepRunner + 'static, H: TerminalHook + 'static> Worker for StepWorker<R
 /// when it has one, the submitter's headers with the reserved ones
 /// removed and the queue record itself.
 pub(crate) struct ClaimedStep<'a> {
-    pub(crate) run_id: String,
+    pub(crate) run_id: RunId,
     pub(crate) step_number: u32,
     pub(crate) membership: Option<Membership>,
     /// Submitter-supplied headers, without the reserved `workflow.` keys.
@@ -53,14 +53,15 @@ pub(crate) struct ClaimedStep<'a> {
 
 impl<'a> ClaimedStep<'a> {
     /// Identify the claimed step from `job`'s headers. Fails, permanently,
-    /// for a job without the run id header or with a step header that
-    /// is not a `u32`.
+    /// for a job without the run id header, with a run id or group id
+    /// that is not valid or with a step header that is not a `u32`.
     pub(crate) fn parse(job: &'a JobRecord) -> std::result::Result<Self, Error> {
-        let run_id = job
-            .headers
-            .get(HEADER_RUN_ID)
-            .ok_or(Error::MissingHeader(HEADER_RUN_ID))?
-            .to_string();
+        let run_id = RunId::new(
+            job.headers
+                .get(HEADER_RUN_ID)
+                .ok_or(Error::MissingHeader(HEADER_RUN_ID))?
+                .as_str(),
+        )?;
         let step_str = job
             .headers
             .get(HEADER_STEP)
@@ -78,7 +79,7 @@ impl<'a> ClaimedStep<'a> {
         Ok(Self {
             run_id,
             step_number,
-            membership: Membership::from_headers(&job.headers),
+            membership: Membership::from_headers(&job.headers)?,
             headers,
             job,
         })
@@ -242,7 +243,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 return Err(worker_error(err));
             }
         };
-        let run_id = claimed.run_id.as_str();
+        let run_id = &claimed.run_id;
         let step_number = claimed.step_number;
 
         let (step_signal, signal_kv_deletes) = self
@@ -258,7 +259,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .run_record(run_id)
             .await
             .map_err(worker_error)?
-            .ok_or_else(|| worker_error(Error::InconsistentRunState(run_id.to_string())))?;
+            .ok_or_else(|| worker_error(Error::InconsistentRunState(run_id.clone())))?;
         if record.cancel_requested {
             let mut effects = self
                 .terminate_recorded(&claimed, claimed.cancelled(None), record.input_hash, None)
@@ -277,7 +278,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         let effects_handle = EffectsHandle::for_delivery();
         let step = Step {
             delivery: Delivery {
-                run_id: run_id.to_string(),
+                run_id: run_id.clone(),
                 headers: claimed.headers.clone(),
                 job_id: job.id.clone(),
                 attempts: job.attempts,

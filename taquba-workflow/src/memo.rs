@@ -56,7 +56,7 @@ use taquba::object_store::{ObjectStore, path::Path};
 
 use crate::blob::ObjectPrefix;
 use crate::error::{Error, Result};
-use crate::keys::hex_sha256;
+use crate::keys::{RunId, hex_sha256};
 
 /// Run-memo key of the run result record. Handlers receive the run
 /// memo as well, so the key is reserved and documented.
@@ -96,13 +96,13 @@ impl MemoStore {
     }
 
     /// Build a [`Memo`] bound to `(run_id, step_number)`.
-    pub fn new_memo(&self, run_id: impl Into<String>, step_number: u32) -> Memo {
+    pub fn new_memo(&self, run_id: &RunId, step_number: u32) -> Memo {
         Memo::new(self.clone(), run_id, MemoScope::Step(step_number))
     }
 
     /// Build a [`Memo`] scoped to `run_id` as a whole, shared by every
     /// step of the run.
-    pub fn new_run_memo(&self, run_id: impl Into<String>) -> Memo {
+    pub fn new_run_memo(&self, run_id: &RunId) -> Memo {
         Memo::new(self.clone(), run_id, MemoScope::Run)
     }
 
@@ -110,10 +110,8 @@ impl MemoStore {
     /// `run_id`. Returns the number of entries removed. Errors during
     /// individual deletes are logged (best-effort cleanup) but do not
     /// stop the sweep; an aggregated error is returned only if a list
-    /// operation fails. Fails with [`Error::InvalidRunId`] for an invalid
-    /// run id; an empty one would resolve to the memo prefix itself.
-    pub async fn clear_memos_for_run(&self, run_id: &str) -> Result<usize> {
-        crate::keys::validate_run_id(run_id)?;
+    /// operation fails.
+    pub async fn clear_memos_for_run(&self, run_id: &RunId) -> Result<usize> {
         let memo_deleted = self
             .clear_prefix(run_id, self.memos_run_prefix(run_id), "memo")
             .await?;
@@ -123,7 +121,12 @@ impl MemoStore {
         Ok(memo_deleted + step_output_deleted)
     }
 
-    async fn clear_prefix(&self, run_id: &str, prefix: Path, kind: &'static str) -> Result<usize> {
+    async fn clear_prefix(
+        &self,
+        run_id: &RunId,
+        prefix: Path,
+        kind: &'static str,
+    ) -> Result<usize> {
         let mut stream = self.objects.list(&prefix);
         let mut deleted = 0usize;
         while let Some(item) = stream.next().await {
@@ -146,7 +149,7 @@ impl MemoStore {
 
     pub(crate) async fn get_step_output(
         &self,
-        run_id: &str,
+        run_id: &RunId,
         step_number: u32,
         step_payload: &[u8],
     ) -> Result<Option<Vec<u8>>> {
@@ -157,7 +160,7 @@ impl MemoStore {
 
     pub(crate) async fn put_step_output(
         &self,
-        run_id: &str,
+        run_id: &RunId,
         step_number: u32,
         step_payload: &[u8],
         value: &[u8],
@@ -170,7 +173,7 @@ impl MemoStore {
             .await
     }
 
-    fn memo_path(&self, run_id: &str, scope: MemoScope, key: &str) -> Path {
+    fn memo_path(&self, run_id: &RunId, scope: MemoScope, key: &str) -> Path {
         let segment = match scope {
             MemoScope::Step(step_number) => step_number.to_string(),
             MemoScope::Run => "run".to_string(),
@@ -180,15 +183,15 @@ impl MemoStore {
             .join(hex_sha256(&[key.as_bytes()]))
     }
 
-    fn memos_run_prefix(&self, run_id: &str) -> Path {
+    fn memos_run_prefix(&self, run_id: &RunId) -> Path {
         self.objects.path(&format!("memos/{run_id}"))
     }
 
-    fn step_outputs_run_prefix(&self, run_id: &str) -> Path {
+    fn step_outputs_run_prefix(&self, run_id: &RunId) -> Path {
         self.objects.path(&format!("step-outputs/{run_id}"))
     }
 
-    fn step_output_path(&self, run_id: &str, step_number: u32, step_payload: &[u8]) -> Path {
+    fn step_output_path(&self, run_id: &RunId, step_number: u32, step_payload: &[u8]) -> Path {
         self.step_outputs_run_prefix(run_id)
             .join(step_number.to_string())
             .join(hex_sha256(&[step_payload]))
@@ -208,21 +211,21 @@ enum MemoScope {
 #[derive(Clone)]
 pub struct Memo {
     store: MemoStore,
-    run_id: String,
+    run_id: RunId,
     scope: MemoScope,
 }
 
 impl Memo {
-    fn new(store: MemoStore, run_id: impl Into<String>, scope: MemoScope) -> Self {
+    fn new(store: MemoStore, run_id: &RunId, scope: MemoScope) -> Self {
         Self {
             store,
-            run_id: run_id.into(),
+            run_id: run_id.clone(),
             scope,
         }
     }
 
     /// The run identifier this memo is bound to.
-    pub fn run_id(&self) -> &str {
+    pub fn run_id(&self) -> &RunId {
         &self.run_id
     }
 
@@ -356,6 +359,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
+    use crate::test_util::rid;
     use serde::Serialize;
     use taquba::object_store::memory::InMemory;
 
@@ -366,7 +370,7 @@ mod tests {
     }
 
     fn make_memo() -> Memo {
-        MemoStore::new(Arc::new(InMemory::new()), "memo").new_memo("run-1", 0)
+        MemoStore::new(Arc::new(InMemory::new()), "memo").new_memo(&rid("run-1"), 0)
     }
 
     #[tokio::test]
@@ -385,9 +389,9 @@ mod tests {
     #[tokio::test]
     async fn run_and_step_namespaces_are_isolated() {
         let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        let in_run_a = store.new_memo("run-a", 0);
-        let in_run_a_step_1 = store.new_memo("run-a", 1);
-        let in_run_b = store.new_memo("run-b", 0);
+        let in_run_a = store.new_memo(&rid("run-a"), 0);
+        let in_run_a_step_1 = store.new_memo(&rid("run-a"), 1);
+        let in_run_b = store.new_memo(&rid("run-b"), 0);
         in_run_a.put("k", b"a-0").await.unwrap();
         in_run_a_step_1.put("k", b"a-1").await.unwrap();
         in_run_b.put("k", b"b-0").await.unwrap();
@@ -402,17 +406,20 @@ mod tests {
     #[tokio::test]
     async fn a_run_memo_is_scoped_beside_the_step_memos() {
         let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        let at_step_0 = store.new_memo("run-1", 0);
-        let for_run = store.new_run_memo("run-1");
+        let at_step_0 = store.new_memo(&rid("run-1"), 0);
+        let for_run = store.new_run_memo(&rid("run-1"));
         at_step_0.put("k", b"step-0").await.unwrap();
         for_run.put("k", b"run").await.unwrap();
         assert_eq!(at_step_0.get("k").await.unwrap(), Some(b"step-0".to_vec()));
         assert_eq!(for_run.get("k").await.unwrap(), Some(b"run".to_vec()));
         assert_eq!(
-            store.new_run_memo("run-1").get("k").await.unwrap(),
+            store.new_run_memo(&rid("run-1")).get("k").await.unwrap(),
             Some(b"run".to_vec()),
         );
-        assert_eq!(store.new_run_memo("run-2").get("k").await.unwrap(), None);
+        assert_eq!(
+            store.new_run_memo(&rid("run-2")).get("k").await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -540,20 +547,20 @@ mod tests {
         let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
 
         store
-            .put_step_output("run-1", 0, b"payload-a", b"out-a")
+            .put_step_output(&rid("run-1"), 0, b"payload-a", b"out-a")
             .await
             .unwrap();
 
         assert_eq!(
             store
-                .get_step_output("run-1", 0, b"payload-a")
+                .get_step_output(&rid("run-1"), 0, b"payload-a")
                 .await
                 .unwrap(),
             Some(b"out-a".to_vec()),
         );
         assert!(
             store
-                .get_step_output("run-1", 0, b"payload-b")
+                .get_step_output(&rid("run-1"), 0, b"payload-b")
                 .await
                 .unwrap()
                 .is_none(),
@@ -564,15 +571,23 @@ mod tests {
     async fn entries_are_stored_at_the_documented_paths() {
         let backing = Arc::new(InMemory::new());
         let store = MemoStore::new(backing.clone(), "memo");
-        store.new_memo("run-1", 0).put("k", b"step").await.unwrap();
-        store.new_run_memo("run-1").put("k", b"run").await.unwrap();
         store
-            .new_memo("run-1", 0)
+            .new_memo(&rid("run-1"), 0)
+            .put("k", b"step")
+            .await
+            .unwrap();
+        store
+            .new_run_memo(&rid("run-1"))
+            .put("k", b"run")
+            .await
+            .unwrap();
+        store
+            .new_memo(&rid("run-1"), 0)
             .content_put("hello", b"content")
             .await
             .unwrap();
         store
-            .put_step_output("run-1", 0, b"payload", b"out")
+            .put_step_output(&rid("run-1"), 0, b"payload", b"out")
             .await
             .unwrap();
 
@@ -600,20 +615,27 @@ mod tests {
     #[tokio::test]
     async fn clear_memos_for_run_removes_step_output_and_run_memo_entries() {
         let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        store.new_memo("run-1", 0).put("k", b"memo").await.unwrap();
-        store.new_run_memo("run-1").put("k", b"run").await.unwrap();
         store
-            .put_step_output("run-1", 0, b"payload", b"out")
+            .new_memo(&rid("run-1"), 0)
+            .put("k", b"memo")
+            .await
+            .unwrap();
+        store
+            .new_run_memo(&rid("run-1"))
+            .put("k", b"run")
+            .await
+            .unwrap();
+        store
+            .put_step_output(&rid("run-1"), 0, b"payload", b"out")
             .await
             .unwrap();
 
-        let deleted = store.clear_memos_for_run("run-1").await.unwrap();
+        let deleted = store.clear_memos_for_run(&rid("run-1")).await.unwrap();
 
         assert_eq!(deleted, 3);
-        assert!(store.new_memo("run-1", 0).get("k").await.unwrap().is_none());
         assert!(
             store
-                .new_run_memo("run-1")
+                .new_memo(&rid("run-1"), 0)
                 .get("k")
                 .await
                 .unwrap()
@@ -621,7 +643,15 @@ mod tests {
         );
         assert!(
             store
-                .get_step_output("run-1", 0, b"payload")
+                .new_run_memo(&rid("run-1"))
+                .get("k")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_step_output(&rid("run-1"), 0, b"payload")
                 .await
                 .unwrap()
                 .is_none(),
@@ -654,8 +684,8 @@ mod tests {
         // memos that observe each other's writes -- the storage is
         // the source of truth, not any in-memory state.
         let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let writer = MemoStore::new(backing.clone(), "memo").new_memo("run-1", 0);
-        let reader = MemoStore::new(backing, "memo").new_memo("run-1", 0);
+        let writer = MemoStore::new(backing.clone(), "memo").new_memo(&rid("run-1"), 0);
+        let reader = MemoStore::new(backing, "memo").new_memo(&rid("run-1"), 0);
         writer.put("k", b"shared").await.unwrap();
         assert_eq!(reader.get("k").await.unwrap(), Some(b"shared".to_vec()));
     }
@@ -664,55 +694,45 @@ mod tests {
     async fn clear_memos_for_run_removes_only_that_runs_entries() {
         let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let store = MemoStore::new(backing, "memo");
-        let in_run_a = store.new_memo("run-a", 0);
-        let in_run_a_step1 = store.new_memo("run-a", 1);
-        let in_run_b = store.new_memo("run-b", 0);
+        let in_run_a = store.new_memo(&rid("run-a"), 0);
+        let in_run_a_step1 = store.new_memo(&rid("run-a"), 1);
+        let in_run_b = store.new_memo(&rid("run-b"), 0);
         in_run_a.put("k", b"a-0").await.unwrap();
         in_run_a_step1.put("k", b"a-1").await.unwrap();
         in_run_b.put("k", b"b-0").await.unwrap();
 
-        let deleted = store.clear_memos_for_run("run-a").await.unwrap();
+        let deleted = store.clear_memos_for_run(&rid("run-a")).await.unwrap();
         assert_eq!(deleted, 2);
 
         assert_eq!(in_run_a.get("k").await.unwrap(), None);
         assert_eq!(in_run_a_step1.get("k").await.unwrap(), None);
         assert_eq!(in_run_b.get("k").await.unwrap(), Some(b"b-0".to_vec()));
-        assert_eq!(store.clear_memos_for_run("run-a").await.unwrap(), 0);
+        assert_eq!(store.clear_memos_for_run(&rid("run-a")).await.unwrap(), 0);
     }
 
     #[tokio::test]
     async fn clear_memos_for_run_does_not_match_run_id_as_prefix() {
         let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        store.new_memo("run", 0).put("k", b"short").await.unwrap();
         store
-            .new_memo("run-suffix", 0)
+            .new_memo(&rid("run"), 0)
+            .put("k", b"short")
+            .await
+            .unwrap();
+        store
+            .new_memo(&rid("run-suffix"), 0)
             .put("k", b"long")
             .await
             .unwrap();
 
-        let deleted = store.clear_memos_for_run("run").await.unwrap();
+        let deleted = store.clear_memos_for_run(&rid("run")).await.unwrap();
         assert_eq!(deleted, 1);
         assert_eq!(
-            store.new_memo("run-suffix", 0).get("k").await.unwrap(),
+            store
+                .new_memo(&rid("run-suffix"), 0)
+                .get("k")
+                .await
+                .unwrap(),
             Some(b"long".to_vec()),
-        );
-    }
-
-    #[tokio::test]
-    async fn clear_memos_for_run_rejects_an_empty_run_id() {
-        let memos = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        memos
-            .new_memo("bystander", 0)
-            .put("k", b"expensive")
-            .await
-            .unwrap();
-        assert!(matches!(
-            memos.clear_memos_for_run("").await,
-            Err(crate::Error::InvalidRunId { .. })
-        ));
-        assert_eq!(
-            memos.new_memo("bystander", 0).get("k").await.unwrap(),
-            Some(b"expensive".to_vec()),
         );
     }
 }

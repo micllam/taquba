@@ -10,7 +10,7 @@ use crate::group::{GroupMember, GroupStatus, RunGroup};
 use crate::jobs::handle::{JobError, decode_end};
 use crate::jobs::job::Job;
 use crate::jobs::runner::job_payload;
-use crate::{Result, RunOptions};
+use crate::{Result, RunId, RunOptions};
 
 /// A [`RunGroup`] of jobs of one type, identified by a group id.
 /// Obtained from [`JobRunner::group`](crate::jobs::JobRunner::group) or
@@ -42,7 +42,7 @@ impl<J: Job> JobGroup<J> {
     }
 
     /// The group id.
-    pub fn id(&self) -> &str {
+    pub fn id(&self) -> &RunId {
         self.group.id()
     }
 
@@ -157,7 +157,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use crate::jobs::{Job, JobContext, JobRunner};
-    use crate::test_util::open_queue;
+    use crate::test_util::{open_queue, rid};
     use crate::{Error, StepErrorKind};
 
     #[derive(Debug, thiserror::Error)]
@@ -202,7 +202,7 @@ mod tests {
         let worker = runner.spawn(std::future::pending::<()>());
 
         let jobs = || vec![Square { n: 3 }, Square { n: 13 }, Square { n: 2 }];
-        let group = runner.group::<Square>("squares").unwrap();
+        let group = runner.group::<Square>(rid("squares"));
         group.submit(jobs()).await.unwrap();
         let results = tokio::time::timeout(std::time::Duration::from_secs(10), group.join())
             .await
@@ -238,10 +238,6 @@ mod tests {
 
         let err = group.submit(vec![Square { n: 3 }]).await.unwrap_err();
         assert!(matches!(err, Error::GroupMismatch(id) if id == "squares"));
-        assert!(matches!(
-            runner.group::<Square>("a/b").map(|g| g.id().to_string()),
-            Err(Error::InvalidGroupId(_))
-        ));
 
         // A resume from the manifest runs the failed member once more,
         // and the results stream yields the succeeded ones at once.

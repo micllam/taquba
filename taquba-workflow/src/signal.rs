@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 
 use crate::error::{Result, worker_error};
 use crate::keys::{
-    HEADER_SIGNAL_DELIVERED, HEADER_SIGNAL_WAIT, signal_buf_kv_key, signal_delivered_kv_key,
+    HEADER_SIGNAL_DELIVERED, HEADER_SIGNAL_WAIT, RunId, signal_buf_kv_key, signal_delivered_kv_key,
     signal_wait_kv_key,
 };
 use crate::runner::{StepError, StepRunner};
@@ -217,7 +217,7 @@ impl RuntimeCore {
     pub(crate) async fn resolve_step_signal(
         &self,
         job: &JobRecord,
-        run_id: &str,
+        run_id: &RunId,
         step_number: u32,
     ) -> Result<(Option<Vec<u8>>, Vec<Vec<u8>>)> {
         if job.headers.contains_key(HEADER_SIGNAL_DELIVERED) {

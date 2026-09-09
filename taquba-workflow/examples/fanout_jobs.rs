@@ -30,8 +30,8 @@ use taquba::Queue;
 use taquba::object_store::memory::InMemory;
 use taquba_workflow::jobs::{Job, JobContext, JobRunner};
 use taquba_workflow::{
-    RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects, TerminalHook,
-    TerminalStatus, WorkflowRuntime,
+    RunId, RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects,
+    TerminalHook, TerminalStatus, WorkflowRuntime,
 };
 use tokio::sync::oneshot;
 
@@ -79,7 +79,7 @@ impl StepRunner for FanoutRunner {
                 // Fan out: one typed job per URL, as one group per step.
                 let group = self
                     .jobs
-                    .group::<FetchPage>(format!("fetch-{}", step.run_id))?;
+                    .group::<FetchPage>(RunId::new(format!("fetch-{}", step.run_id))?);
                 group
                     .submit(urls.iter().map(|url| FetchPage {
                         url: (*url).to_string(),

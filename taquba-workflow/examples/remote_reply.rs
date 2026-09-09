@@ -44,8 +44,8 @@ use futures_util::TryStreamExt;
 use taquba::Queue;
 use taquba::object_store::{ObjectStore, ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
 use taquba_workflow::{
-    RunOutcome, RunSpec, SignalOutcome, Step, StepError, StepOutcome, StepRunner, TerminalEffects,
-    TerminalHook, TerminalStatus, WorkflowRuntime,
+    RunId, RunOutcome, RunSpec, SignalOutcome, Step, StepError, StepOutcome, StepRunner,
+    TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -254,7 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let outcome = runtime
         .submit(RunSpec {
-            run_id: Some(RUN_ID.to_string()),
+            run_id: Some(RunId::new(RUN_ID)?),
             input: b"invoice 118: three chairs, one table".to_vec(),
             ..Default::default()
         })

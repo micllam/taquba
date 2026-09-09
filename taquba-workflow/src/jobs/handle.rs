@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::time::Duration;
 
-use crate::{RunOutcome, RunStatus, RunTermination, StepErrorKind, TerminalStatus};
+use crate::{RunId, RunOutcome, RunStatus, RunTermination, StepErrorKind, TerminalStatus};
 use thiserror::Error;
 
 use crate::jobs::job::Job;
@@ -57,7 +57,7 @@ pub enum JoinError {
 /// [`fetch_result`](Self::fetch_result) reads it back from object
 /// storage after a restart.
 pub struct JobHandle<J: Job> {
-    id: String,
+    id: RunId,
     runtime: JobRuntime,
     newly_submitted: bool,
     _marker: PhantomData<fn() -> J>,
@@ -75,7 +75,7 @@ impl<J: Job> Clone for JobHandle<J> {
 }
 
 impl<J: Job> JobHandle<J> {
-    pub(crate) fn new(id: String, runtime: JobRuntime, newly_submitted: bool) -> Self {
+    pub(crate) fn new(id: RunId, runtime: JobRuntime, newly_submitted: bool) -> Self {
         Self {
             id,
             runtime,
@@ -87,7 +87,7 @@ impl<J: Job> JobHandle<J> {
     /// The job's identifier: a ULID, or the digest of the job's
     /// [`idempotency_key`](Job::idempotency_key) when it has one, so a
     /// submission that matched an earlier job returns that job's id.
-    pub fn id(&self) -> &str {
+    pub fn id(&self) -> &RunId {
         &self.id
     }
 

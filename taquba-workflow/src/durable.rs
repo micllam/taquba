@@ -37,6 +37,7 @@ pub(crate) async fn kv_record<T: DeserializeOwned>(queue: &Queue, key: &[u8]) ->
 }
 
 use crate::effects::StagedEffects;
+use crate::keys::RunId;
 use crate::runner::{StepErrorKind, StepOutcome, Trigger};
 use crate::terminal::{RunOutcome, TerminalStatus};
 
@@ -57,7 +58,7 @@ use crate::terminal::{RunOutcome, TerminalStatus};
 /// record and a request can never outlive the run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DurableRunRecord {
-    pub(crate) run_id: String,
+    pub(crate) run_id: RunId,
     pub(crate) submitted_at_ms: u64,
     pub(crate) input_hash: [u8; 32],
     pub(crate) cancel_requested: bool,
@@ -255,7 +256,7 @@ pub(crate) struct DurableTermination {
 /// rewritten in the settlement that terminates it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DurableMember {
-    pub(crate) run_id: String,
+    pub(crate) run_id: RunId,
     /// The member's termination; `None` while it is active.
     pub(crate) terminated: Option<DurableTermination>,
 }
@@ -265,7 +266,7 @@ pub(crate) struct DurableMember {
 /// both survive restarts and redeliveries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DurableRunOutcome {
-    run_id: String,
+    run_id: RunId,
     status: DurableTerminalStatus,
     #[serde(with = "serde_bytes")]
     result: Option<Vec<u8>>,
@@ -338,6 +339,7 @@ impl From<DurableRunOutcome> for RunOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::rid;
 
     #[test]
     fn payload_bytes_are_stored_as_binary_strings() {
@@ -354,7 +356,7 @@ mod tests {
             result: payload.clone(),
         })));
         let outcome = DurableRunOutcome {
-            run_id: "run".into(),
+            run_id: rid("run"),
             status: DurableTerminalStatus::Succeeded,
             result: Some(payload.clone()),
             error: None,

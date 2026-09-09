@@ -26,8 +26,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use taquba::{OpenOptions, Queue, QueueConfig, object_store::memory::InMemory};
-use taquba_workflow::StepErrorKind;
 use taquba_workflow::jobs::{Job, JobContext, JobRunner};
+use taquba_workflow::{RunId, StepErrorKind};
 
 #[derive(Serialize, Deserialize)]
 struct ProcessDocument {
@@ -250,7 +250,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
     let worker = runner.spawn(std::future::pending::<()>());
 
-    let group = runner.group::<ProcessDocument>("documents")?;
+    let group = runner.group::<ProcessDocument>(RunId::new("documents")?);
     group.submit(sample_documents()).await?;
     let results = group.join().await?;
     worker.shutdown().await?;
