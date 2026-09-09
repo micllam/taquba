@@ -149,7 +149,6 @@ pub struct RunStatus {
 
 /// Lifecycle state tracked in [`RunStatus::state`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum RunState {
     /// A step job exists in the queue but has not yet been claimed.
     Pending,

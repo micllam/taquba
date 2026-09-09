@@ -7,7 +7,6 @@ use crate::runner::StepError;
 
 /// Terminal state of a workflow run, passed to a [`TerminalHook`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum TerminalStatus {
     /// The runner returned [`crate::StepOutcome::Succeed`].
     Succeeded,

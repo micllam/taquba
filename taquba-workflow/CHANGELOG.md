@@ -107,6 +107,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `Trigger`, `StepOutcome`, `StepErrorKind`, `Error`, `TerminalStatus` and
+  `RunState` are exhaustive enums.
 - **Breaking (source):** `RunId`, a validated run id of 1 to
   `MAX_RUN_ID_LEN` bytes of `[A-Za-z0-9_-]`, is the type of every run id
   and group id on the crate's surface: the `run_id` and `group_id`

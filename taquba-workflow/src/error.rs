@@ -4,7 +4,6 @@ use crate::keys::RunId;
 
 /// Errors returned by the runtime's submission and worker paths.
 #[derive(Debug, Error)]
-#[non_exhaustive]
 pub enum Error {
     /// A step job is missing the [`crate::HEADER_RUN_ID`] header.
     /// Permanent: a misconfigured job will not become valid on retry.

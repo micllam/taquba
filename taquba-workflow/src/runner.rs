@@ -227,7 +227,6 @@ impl Step {
 /// When the next step of a run becomes claimable. Set on the `when`
 /// field of [`StepOutcome::Continue`].
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub enum Trigger {
     /// The next step is claimable immediately.
     Immediate,
@@ -255,7 +254,6 @@ pub enum Trigger {
 
 /// What the runner wants the runtime to do after this step.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub enum StepOutcome {
     /// Run is not finished. Enqueue the next step with `payload` as its
     /// bytes; `when` decides when it becomes claimable. The runtime
@@ -403,7 +401,6 @@ impl From<crate::Error> for StepError {
 
 /// Whether a [`StepError`] should retry or fail the run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum StepErrorKind {
     /// Retry per the queue's backoff policy until `max_attempts` is reached.
     Transient,
