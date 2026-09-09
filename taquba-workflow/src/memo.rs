@@ -55,6 +55,7 @@ use serde::de::DeserializeOwned;
 use taquba::object_store::{ObjectStore, path::Path};
 
 use crate::blob::ObjectPrefix;
+use crate::durable::decode_or_absent;
 use crate::error::{Error, Result};
 use crate::keys::{RunId, hex_sha256};
 
@@ -274,16 +275,11 @@ impl Memo {
         F: Future<Output = std::result::Result<R, E>>,
         E: From<Error>,
     {
-        if let Some(bytes) = self.get(key).await? {
-            match rmp_serde::from_slice::<R>(&bytes) {
-                Ok(value) => return Ok(value),
-                Err(err) => tracing::warn!(
-                    run_id = %self.run_id,
-                    key = %key,
-                    error = %err,
-                    "memo entry failed to decode; recomputing",
-                ),
-            }
+        if let Some(bytes) = self.get(key).await?
+            && let Some(value) =
+                decode_or_absent::<R>(&bytes, "memo entry", &format_args!("{}/{key}", self.run_id))
+        {
+            return Ok(value);
         }
         let value = compute.await?;
         let bytes = rmp_serde::to_vec_named(&value).map_err(Error::Serialization)?;

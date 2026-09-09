@@ -208,11 +208,12 @@ impl GroupStore {
         let mut entries = std::pin::pin!(self.queue.kv_entries(&prefix, MEMBER_PAGE_SIZE));
         while let Some((kv_key, value)) = entries.try_next().await? {
             let key = String::from_utf8_lossy(&kv_key[prefix.len()..]).into_owned();
-            match rmp_serde::from_slice(&value) {
-                Ok(record) => members.push(MemberState { key, record }),
-                Err(err) => {
-                    warn!(%group_id, key, error = %err, "group member record failed to decode");
-                }
+            if let Some(record) = durable::decode_or_absent(
+                &value,
+                "group member record",
+                &format_args!("{group_id}/{key}"),
+            ) {
+                members.push(MemberState { key, record });
             }
         }
         Ok(members)

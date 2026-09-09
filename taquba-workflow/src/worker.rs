@@ -12,7 +12,7 @@ use taquba::{
 };
 use tracing::{debug, warn};
 
-use crate::durable::DurableRunOutcome;
+use crate::durable::{self, DurableRunOutcome};
 use crate::effects::{EffectsHandle, TerminalEffects};
 use crate::error::{Error, worker_error};
 use crate::group::Membership;
@@ -204,13 +204,12 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         &self,
         job: &JobRecord,
     ) -> std::result::Result<SettlementEffects, WorkerError> {
-        let outcome: RunOutcome = match rmp_serde::from_slice::<DurableRunOutcome>(&job.payload) {
-            Ok(durable) => durable.into(),
-            Err(err) => {
+        let outcome: RunOutcome = durable::decode::<DurableRunOutcome>(&job.payload)
+            .map_err(|err| {
                 warn!(job_id = %job.id, error = %err, "terminal notification has a malformed payload");
-                return Err(PermanentFailure::new(err.to_string()).into());
-            }
-        };
+                PermanentFailure::new(err.to_string())
+            })?
+            .into();
         let effects = TerminalEffects::for_delivery();
         let result = self.terminal_hook.on_termination(&outcome, &effects).await;
         let (staged, enqueues) = effects.seal_and_take();

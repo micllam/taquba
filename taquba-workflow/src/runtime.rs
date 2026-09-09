@@ -1220,16 +1220,14 @@ impl RuntimeCore {
         else {
             return Ok(None);
         };
-        match rmp_serde::from_slice::<DurableRunResult>(&bytes) {
-            Ok(record) => Ok(Some(RunResult {
-                termination: record.termination.into(),
-                outcome: record.outcome.into(),
-            })),
-            Err(err) => {
-                warn!(%run_id, error = %err, "run result record failed to decode; treated as absent");
-                Ok(None)
-            }
-        }
+        Ok(
+            durable::decode_or_absent::<DurableRunResult>(&bytes, "run result record", run_id).map(
+                |record| RunResult {
+                    termination: record.termination.into(),
+                    outcome: record.outcome.into(),
+                },
+            ),
+        )
     }
 
     /// The termination of `outcome`'s run at the clock's current time;
@@ -1372,37 +1370,30 @@ impl RuntimeCore {
         else {
             return Ok(None);
         };
-        match rmp_serde::from_slice::<DurableStepOutcomeRecord>(&bytes) {
-            Ok(record) => {
-                let mut outcome = StepOutcome::from(record.outcome);
-                match &mut outcome {
-                    StepOutcome::Continue {
-                        when: Trigger::After(delay),
-                        ..
-                    } => {
-                        *delay = remaining_delay(record.stored_at_ms, self.clock.now_ms(), *delay);
-                    }
-                    StepOutcome::Continue {
-                        when: Trigger::OnSignal { timeout, .. },
-                        ..
-                    } => {
-                        *timeout =
-                            remaining_delay(record.stored_at_ms, self.clock.now_ms(), *timeout);
-                    }
-                    _ => {}
-                }
-                Ok(Some((outcome, record.effects)))
+        let Some(record) = durable::decode_or_absent::<DurableStepOutcomeRecord>(
+            &bytes,
+            "step-output replay record",
+            &format_args!("{run_id}/{step_number}"),
+        ) else {
+            return Ok(None);
+        };
+        let mut outcome = StepOutcome::from(record.outcome);
+        match &mut outcome {
+            StepOutcome::Continue {
+                when: Trigger::After(delay),
+                ..
+            } => {
+                *delay = remaining_delay(record.stored_at_ms, self.clock.now_ms(), *delay);
             }
-            Err(err) => {
-                warn!(
-                    run_id = %run_id,
-                    step_number,
-                    error = %err,
-                    "step-output replay entry failed to deserialize; recomputing",
-                );
-                Ok(None)
+            StepOutcome::Continue {
+                when: Trigger::OnSignal { timeout, .. },
+                ..
+            } => {
+                *timeout = remaining_delay(record.stored_at_ms, self.clock.now_ms(), *timeout);
             }
+            _ => {}
         }
+        Ok(Some((outcome, record.effects)))
     }
 
     pub(crate) async fn store_step_output(

@@ -4,13 +4,30 @@
 //! MessagePack maps with named fields, written through [`encode`] and
 //! read through [`decode`] or, for a record at one key of the queue's
 //! KV namespace, [`kv_record`].
+//!
+//! A record that fails to decode is treated in one of two ways, chosen
+//! by what its absence means to the reader, and each treatment has a
+//! function of its own. Where absence means that the work runs again, the reader
+//! calls [`decode_or_absent`], which logs the failure and reports the
+//! record as absent: a memo entry is recomputed, a step-output replay
+//! record re-executes the step, a run result record is reported as
+//! missing, and a member record skipped by the group listing is
+//! submitted again. Where absence is read as a fresh entity, the reader
+//! calls [`decode`] or [`kv_record`], and the failure propagates as
+//! [`Error::Deserialization`](crate::Error::Deserialization): the run
+//! record, the current-step pointer, the terminal record, a member
+//! record read on its own and the group manifest, whose absence starts
+//! a new run or group. A new reader calls one of these and does not
+//! deserialize a record directly.
 
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use taquba::Queue;
+use tracing::warn;
 
 use crate::error::Result;
 
@@ -25,6 +42,23 @@ pub(crate) fn encode<T: Serialize>(record: &T) -> Vec<u8> {
 /// is [`Error::Deserialization`](crate::Error::Deserialization).
 pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     Ok(rmp_serde::from_slice(bytes)?)
+}
+
+/// Decode a record whose absence means that the work runs again. A
+/// record that fails to decode is logged, as the `record` kind of the
+/// entity `id`, and reported as absent.
+pub(crate) fn decode_or_absent<T: DeserializeOwned>(
+    bytes: &[u8],
+    record: &'static str,
+    id: &dyn Display,
+) -> Option<T> {
+    match rmp_serde::from_slice(bytes) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            warn!(record, %id, error = %err, "{record} failed to decode; treated as absent");
+            None
+        }
+    }
 }
 
 /// The record at `key` of the queue's KV namespace, `None` when no
