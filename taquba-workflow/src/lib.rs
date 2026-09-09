@@ -251,6 +251,16 @@
 //! covering all three delivery paths (signal, timeout and buffered)
 //! across process restarts.
 //!
+//! A signal is also how work on another machine reports back without
+//! an inbound endpoint on this process. The requesting step chooses a
+//! reply key in the bucket, sends it with the request and continues on
+//! a signal. The remote worker writes its reply at that key, and a
+//! watcher task in this process delivers the key as the signal when the
+//! object appears. No lease is held during the wait, because the
+//! requesting step settles before the remote work starts. See `examples/remote_reply.rs`
+//! for a runnable version with the pending-marker layout the watcher
+//! reads.
+//!
 //! # Application KV effects
 //!
 //! Application state that describes a run (a status row, a progress
