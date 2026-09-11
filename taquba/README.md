@@ -365,8 +365,9 @@ Interventions cover the common operator actions: `Queue::requeue_dead_job`
 revives a dead job for delivery up to its `max_attempts` again,
 `Queue::cancel` removes a
 pending or scheduled job (or requests cooperative cancellation of a claimed
-one) and `Queue::wake_scheduled` promotes a scheduled job before its
-`run_at`.
+one), `Queue::wake_scheduled` promotes a scheduled job before its
+`run_at` and `Queue::claim_by_id` claims one pending or scheduled job
+without the scan, for a producer that performs the job it created.
 
 Because a store is single-writer, an admin surface that mutates state must
 live inside the process that owns the queue.

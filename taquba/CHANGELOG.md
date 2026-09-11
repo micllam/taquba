@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `WorkerHandle`: a loop spawned as a Tokio task, stopped through
   `shutdown` or the shutdown future given to `spawn` and joined with
   `wait`.
+- `Queue::claim_by_id` and `ClaimOutcome`: claim one pending or scheduled
+  job by ID without the scan, with the attempt, the dedup release and the
+  lease of a scan claim.
 
 ### Changed
 

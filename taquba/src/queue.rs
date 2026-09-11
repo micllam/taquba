@@ -80,6 +80,19 @@ pub enum WakeOutcome {
     NotFound,
 }
 
+/// Outcome of [`Queue::claim_by_id`].
+#[derive(Debug)]
+pub enum ClaimOutcome {
+    /// The job was `Pending` or `Scheduled` and is now claimed by the
+    /// caller.
+    Claimed(Box<Claim>),
+    /// A job with this ID exists but is claimed, done or dead. Nothing
+    /// was changed.
+    NotClaimable,
+    /// No job with this ID was found.
+    NotFound,
+}
+
 /// One page of a job listing. Returned by [`Queue::list_jobs`].
 #[derive(Debug, Clone)]
 pub struct JobPage {
@@ -948,6 +961,93 @@ impl Queue {
                     continue;
                 }
             }
+        }
+    }
+
+    /// Claim one pending or scheduled job by ID with an explicit lease
+    /// duration.
+    ///
+    /// This is the targeted counterpart of [`Self::claim`]: the same
+    /// transition (to claimed), applied to a single job by ID at the
+    /// caller's initiative and without the scan, for a producer that
+    /// performs the job it created or an operator that runs one job
+    /// now. A scheduled job is claimed before its `run_at`. The claim
+    /// consumes an attempt, releases the job's dedup key and registers
+    /// its lease exactly as a scan claim does, so the reaper requeues it
+    /// when the lease expires and the next open requeues it after a
+    /// crash. The claim commits without awaiting WAL durability, as
+    /// [`Self::claim`] does.
+    ///
+    /// Exactly one caller wins the transition: a concurrent scan claim,
+    /// scheduler promotion, [`Self::cancel`] and this call conflict on
+    /// the record, and the loser observes [`ClaimOutcome::NotClaimable`]
+    /// or [`ClaimOutcome::NotFound`].
+    #[instrument(skip(self), fields(job_id = %id))]
+    pub async fn claim_by_id(&self, id: &str, lease_duration: Duration) -> Result<ClaimOutcome> {
+        let timer = crate::obs::start();
+        // `Err` is an outcome reached without a commit.
+        let claimed: std::result::Result<Claim, ClaimOutcome> = self
+            .core
+            .transition_by_id(
+                id,
+                Durability::Deferred,
+                || Ok(Err(ClaimOutcome::NotFound)),
+                |txn, current_key, mut job| async move {
+                    let from = job.status;
+                    if !matches!(from, JobStatus::Pending | JobStatus::Scheduled) {
+                        txn.rollback();
+                        return Ok(Attempt::Abort(Err(ClaimOutcome::NotClaimable)));
+                    }
+                    let now = self.now_ms();
+                    job.status = JobStatus::Claimed;
+                    job.claimed_at = Some(now);
+                    job.attempts += 1;
+                    // The dedup key leaves the record before the claimed
+                    // copy is written, as in the scan claim, so a later
+                    // requeue cannot release another job's index entry.
+                    let dedup_key_to_release = job.dedup_key.take();
+                    let claim_id = new_claim_id();
+                    let value = job.stored_bytes()?;
+                    txn.delete(&current_key)?;
+                    put_job_record(
+                        &txn,
+                        &claimed_key(&job.queue, &job.id),
+                        &job_index_key(&job.id),
+                        &value,
+                    )?;
+                    let cancel = tokio_util::sync::CancellationToken::new();
+                    if job.cancel_requested {
+                        cancel.cancel();
+                    }
+                    // Registered before the commit, as in the scan claim:
+                    // a failed commit leaves a stale entry, discarded when
+                    // due, where a missing entry would hide the claim from
+                    // the reaper.
+                    self.core.lease_registry.insert(
+                        &job.queue,
+                        &job.id,
+                        now + lease_duration.as_millis() as u64,
+                        claim_id,
+                        cancel.clone(),
+                    );
+                    if let Some(dk) = dedup_key_to_release.as_deref() {
+                        txn.delete(dedup_index_key(&job.queue, dk))?;
+                    }
+                    update_stats(&txn, &job.queue, &[(from, -1), (JobStatus::Claimed, 1)])?;
+                    Ok(Attempt::Commit(txn, Ok(Claim::new(job, claim_id, cancel))))
+                },
+            )
+            .await?;
+        match claimed {
+            Ok(claim) => {
+                let mut jobs = vec![claim];
+                self.materialize_payloads(&mut jobs).await?;
+                let claim = jobs.pop().expect("one claim was materialized");
+                crate::obs::claimed(&claim.queue, 1, timer);
+                debug!(queue = %claim.queue, job_id = %id, "job claimed by id");
+                Ok(ClaimOutcome::Claimed(Box::new(claim)))
+            }
+            Err(outcome) => Ok(outcome),
         }
     }
 
@@ -3120,4 +3220,123 @@ mod tests {
 
     // Every claimed record must hold a registry entry; a record
     // without one is invisible to the reaper until the next open.
+
+    #[tokio::test]
+    async fn claim_by_id_claims_the_named_pending_job_and_consumes_an_attempt() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let first = q.enqueue("q", b"first".to_vec()).await.unwrap();
+        let second = q
+            .enqueue_with(
+                "q",
+                b"second".to_vec(),
+                EnqueueOptions::default().dedup_key("once".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let ClaimOutcome::Claimed(claim) = q
+            .claim_by_id(&second, Duration::from_secs(30))
+            .await
+            .unwrap()
+        else {
+            panic!("the pending job is claimed");
+        };
+        assert_eq!(claim.id, second);
+        assert_eq!(claim.status, JobStatus::Claimed);
+        assert_eq!(claim.attempts, 1);
+        assert_eq!(claim.payload, b"second");
+        let stats = q.stats("q").await.unwrap();
+        assert_eq!((stats.pending, stats.claimed), (1, 1));
+        // The dedup key is released by the claim.
+        let again = q
+            .enqueue_with(
+                "q",
+                b"third".to_vec(),
+                EnqueueOptions::default().dedup_key("once".to_string()),
+            )
+            .await
+            .unwrap();
+        assert_ne!(again, second);
+        // The scan claim skips the claimed job and the claim settles.
+        let scanned = q
+            .claim("q", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(scanned.id, first);
+        q.ack(&claim).await.unwrap();
+        assert!(q.get_job(&second).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_by_id_claims_a_scheduled_job_and_reports_the_rest() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        assert!(matches!(
+            q.claim_by_id("absent", Duration::from_secs(1))
+                .await
+                .unwrap(),
+            ClaimOutcome::NotFound
+        ));
+        let scheduled = q
+            .enqueue_with(
+                "q",
+                b"later".to_vec(),
+                EnqueueOptions::default()
+                    .run_at(std::time::SystemTime::now() + Duration::from_secs(3600)),
+            )
+            .await
+            .unwrap();
+        // A scheduled job is claimed before its `run_at`.
+        let ClaimOutcome::Claimed(early) = q
+            .claim_by_id(&scheduled, Duration::from_secs(30))
+            .await
+            .unwrap()
+        else {
+            panic!("the scheduled job is claimed");
+        };
+        assert_eq!(early.status, JobStatus::Claimed);
+        let stats = q.stats("q").await.unwrap();
+        assert_eq!((stats.scheduled, stats.claimed), (0, 1));
+        q.ack(&early).await.unwrap();
+        let id = q.enqueue("q", b"now".to_vec()).await.unwrap();
+        let claim = q
+            .claim("q", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            q.claim_by_id(&id, Duration::from_secs(1)).await.unwrap(),
+            ClaimOutcome::NotClaimable
+        ));
+        q.ack(&claim).await.unwrap();
+        assert!(matches!(
+            q.claim_by_id(&id, Duration::from_secs(1)).await.unwrap(),
+            ClaimOutcome::NotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_claim_by_id_is_reaped_when_its_lease_expires() {
+        let clock = MockClock::new(1_000_000);
+        let q = Queue::open_with_options(
+            make_store(),
+            "test",
+            OpenOptions::default().clock(Arc::new(clock.clone())),
+        )
+        .await
+        .unwrap();
+        let id = q.enqueue("q", b"work".to_vec()).await.unwrap();
+        let ClaimOutcome::Claimed(claim) =
+            q.claim_by_id(&id, Duration::from_secs(10)).await.unwrap()
+        else {
+            panic!("the pending job is claimed");
+        };
+        assert_eq!(q.lease_expiry("q", &id), Some(1_010_000));
+
+        clock.advance(Duration::from_secs(11));
+        q.reap_now().await.unwrap();
+        let job = q.get_job(&id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Pending);
+        assert!(matches!(q.ack(&claim).await, Err(Error::ClaimLost)));
+    }
 }
