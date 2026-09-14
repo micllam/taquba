@@ -187,6 +187,8 @@ impl Default for ReaderOptions {
 /// stored. Opening a reader against a path no writer has ever created
 /// fails with [`Error::StoreNotInitialized`](crate::Error::StoreNotInitialized);
 /// a health check racing the first deployment must expect that error.
+/// A path with an unreadable manifest fails with
+/// [`Error::Storage`](crate::Error::Storage).
 ///
 /// # Observable outcomes
 ///

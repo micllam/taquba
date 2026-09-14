@@ -81,7 +81,9 @@ impl Periodic for Reaper {
 /// The transition for a claim that ends without a settlement: the
 /// job is dead-lettered once its attempts are exhausted and otherwise
 /// returns to pending without a backoff. Shared by the reaper and the
-/// open-time recovery of interrupted claims.
+/// open-time recovery of interrupted claims. Metrics stay at the call
+/// sites, because the same `Retry` counts as a nack on the worker path
+/// and as a reap here.
 fn unsettled_claim_end<'a>(
     job: &JobRecord,
     outcome: AttemptOutcome,

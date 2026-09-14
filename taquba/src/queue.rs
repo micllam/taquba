@@ -985,7 +985,10 @@ impl Queue {
     #[instrument(skip(self), fields(job_id = %id))]
     pub async fn claim_by_id(&self, id: &str, lease_duration: Duration) -> Result<ClaimOutcome> {
         let timer = crate::obs::start();
-        // `Err` is an outcome reached without a commit.
+        // `Err` is an outcome reached without a commit. The claim lock and
+        // the claim cursor are not touched, as in `cancel`: removing a
+        // pending key keeps every live key at or after the scan bound, and
+        // a concurrent scan claim conflicts on the key.
         let claimed: std::result::Result<Claim, ClaimOutcome> = self
             .core
             .transition_by_id(
@@ -1300,6 +1303,10 @@ impl Queue {
     /// - `Done`: completion-time order, oldest first. Done records exist
     ///   only on queues with [`QueueConfig::keep_done_jobs`] set.
     /// - `Dead`: enqueue order, as in [`Queue::dead_jobs`].
+    ///
+    /// The claimed listing is not ordered by lease expiry: a renewal
+    /// changes an expiry without changing a key, so an expiry-ordered
+    /// page boundary would move under a listing.
     ///
     /// `cursor` is an opaque resume token: pass `None` to start from the
     /// beginning, or [`JobPage::next_cursor`] from the previous page to
