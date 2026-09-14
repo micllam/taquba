@@ -8,6 +8,7 @@ description = "POSIX cron-style scheduling on top of the Taquba durable task que
 homepage = "https://github.com/micllam/taquba"
 readme = "README.md"
 keywords = ["queue", "cron", "scheduler", "taquba"]
+exclude = ["AGENTS.md", "CLAUDE.md"]
 
 [dependencies]
 taquba = { workspace = true }

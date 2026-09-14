@@ -8,6 +8,7 @@ description = "HTTP webhook delivery on top of the Taquba durable task queue."
 homepage = "https://github.com/micllam/taquba"
 readme = "README.md"
 keywords = ["queue", "webhook", "http", "taquba"]
+exclude = ["AGENTS.md", "CLAUDE.md"]
 
 [dependencies]
 taquba = { workspace = true }

@@ -8,6 +8,7 @@ description = "A durable, single-process task queue for Rust backed by object st
 homepage = "https://github.com/micllam/taquba"
 readme = "README.md"
 keywords = ["queue", "task", "worker", "slatedb"]
+exclude = ["AGENTS.md", "CLAUDE.md"]
 
 [features]
 # No backend is enabled by default; the in-memory and local-disk stores work

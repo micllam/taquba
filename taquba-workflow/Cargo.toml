@@ -8,6 +8,7 @@ description = "Durable, at-least-once workflow runtime on top of the Taquba task
 homepage = "https://github.com/micllam/taquba"
 readme = "README.md"
 keywords = ["queue", "workflow", "agent", "durable", "taquba"]
+exclude = ["AGENTS.md", "CLAUDE.md"]
 
 [features]
 default = []
