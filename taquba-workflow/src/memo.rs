@@ -269,6 +269,9 @@ impl Memo {
     /// and its value overwrites the entry. An error from `compute` is
     /// returned without storing anything, so a later call runs `compute`
     /// again.
+    ///
+    /// A side effect inside `compute` runs again when the process terminates
+    /// after `compute` returns and before the value is stored.
     pub async fn memoized<R, F, E>(&self, key: &str, compute: F) -> std::result::Result<R, E>
     where
         R: Serialize + DeserializeOwned,
