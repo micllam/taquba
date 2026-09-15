@@ -126,12 +126,11 @@ opened with (`Queue::clock`).
   retries or duplicate attempts at the same firing instant cannot produce
   more than one job.
 - **No backfill by default.** If the scheduler is offline when a firing
-  should have happened, the missed firing is dropped; the next firing is
-  the next future occurrence rather than a replay of the missed ones. A
-  schedule with `ScheduleOptions::backfill` set replays the missed firings
-  within its lookback exactly once, on the strength of the persisted
-  watermark rather than the dedup key, which is released when the job
-  completes.
+  should have happened, the missed firing is dropped, and the next firing is
+  the next future occurrence. A schedule with `ScheduleOptions::backfill` set
+  replays the missed firings within its lookback exactly once. Only the
+  persisted watermark stops a firing from being enqueued twice, because claiming
+  a job releases its dedup key.
 - **Single-instance schedules.** A given schedule (identified by `name`)
   must be owned by at most one `CronScheduler` at a time.
 - **No schedule persistence.** Schedules live only in memory; rebuild
