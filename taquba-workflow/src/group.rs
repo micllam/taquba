@@ -699,6 +699,35 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn the_run_options_apply_to_every_member() {
+        let (queue, store) = open_queue().await;
+        let runtime =
+            WorkflowRuntime::builder(queue.clone(), store, TwoSteps, NoopTerminalHook).build();
+        let group = runtime.group(rid("g"));
+        let options = RunOptions {
+            priority: Some(3),
+            max_attempts_per_step: Some(5),
+            headers: HashMap::from([("tenant".to_string(), "acme".to_string())]),
+            ..Default::default()
+        };
+        group
+            .submit(vec![member("a"), member("b")], &options)
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            let job = queue
+                .claim("workflow-steps", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .expect("a member's step job");
+            assert_eq!(job.priority, 3);
+            assert_eq!(job.max_attempts, 5);
+            assert_eq!(job.headers.get("tenant").map(String::as_str), Some("acme"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_group_cancellation_records_the_member_cancelled() {
         let (queue, store, _clock) = open_queue_at(10_000).await;
         let runtime =
