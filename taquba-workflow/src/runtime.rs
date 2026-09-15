@@ -118,7 +118,6 @@ pub struct RunSpec {
 /// `submit` is idempotent on `run_id`: re-submitting an active run is a
 /// no-op and the returned `SubmitOutcome` carries `newly_submitted = false`.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct SubmitOutcome {
     /// The run's identifier (generated if the spec didn't carry one).
     pub run_id: RunId,
@@ -218,7 +217,6 @@ impl From<DurableTermination> for RunTermination {
 
 /// The end of a run, as [`WorkflowRuntime::wait`] reports it.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct RunEnd {
     /// The run's termination, from its terminal record.
     pub termination: RunTermination,
