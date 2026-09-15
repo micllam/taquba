@@ -444,7 +444,10 @@ pub(crate) struct RuntimeInner<R, H> {
     pub(crate) core: Arc<RuntimeCore>,
 }
 
-/// The control plane of a runtime,
+/// The control half of a runtime: the queue, the stores and the settings,
+/// with every operation that reads or settles run state without invoking the
+/// runner or the hook. It is not generic over the runner and hook types, so the
+/// worker, [`WorkflowRuntime`] and [`RunGroup`](crate::RunGroup) share it.
 pub(crate) struct RuntimeCore {
     pub(crate) queue: Arc<Queue>,
     queue_name: String,
