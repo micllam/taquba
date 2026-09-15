@@ -964,7 +964,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cursor_bound_persists_across_a_clean_close() {
+    async fn only_a_clean_close_persists_the_cursor_bound() {
         let store = make_store();
         let lease = Duration::from_secs(5);
         let q = Queue::open(store.clone(), "test").await.unwrap();
@@ -972,6 +972,15 @@ mod tests {
         q.enqueue("work", b"second".to_vec()).await.unwrap();
         let first = q.claim("work", lease).await.unwrap().unwrap();
         q.ack(&first).await.unwrap();
+        assert!(
+            q.core
+                .db
+                .get(cursor_key(&qn("work")))
+                .await
+                .unwrap()
+                .is_none(),
+            "the run does not write a cursor record before the close",
+        );
         q.close().await.unwrap();
 
         let q = Queue::open(store, "test").await.unwrap();
