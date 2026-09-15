@@ -186,11 +186,12 @@ pub struct OpenOptions {
     /// successor stops producing observable beats at its next flush,
     /// and each failed beat is logged at error level and counted as
     /// `taquba_heartbeat_failures_total` (`metrics` feature). The first
-    /// beat is committed during open, and a clean [`Queue::close`](crate::Queue::close)
-    /// commits a final beat marked closed, so a stale closed beat
-    /// indicates a deliberate shutdown rather than a vanished writer.
-    /// The steady-state cost is one durable commit per interval, whose
-    /// WAL, L0 and compaction churn is negligible.
+    /// beat is committed during open, and a clean
+    /// [`Queue::close`](crate::Queue::close) commits a final beat marked
+    /// closed, so a stale closed beat distinguishes a deliberate shutdown
+    /// from a writer whose process terminated. The heartbeat adds one
+    /// durable commit per interval, with negligible WAL, L0 and
+    /// compaction churn.
     ///
     /// A beat awaits durability, so successive beats land the interval
     /// plus one commit latency apart. Choose an interval well above

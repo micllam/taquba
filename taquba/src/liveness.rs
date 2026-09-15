@@ -68,10 +68,10 @@ pub struct StoreActivity {
 /// avoid clock comparison entirely.
 ///
 /// A clean [`Queue::close`](crate::Queue::close) commits a final beat
-/// marked [`Self::closed`], so a stale closed beat indicates a
-/// deliberate shutdown rather than a vanished writer. The marker is
-/// best-effort: a writer that could not commit it leaves its last
-/// periodic beat in place.
+/// marked [`Self::closed`], so a stale closed beat distinguishes a
+/// deliberate shutdown from a writer whose process terminated. The
+/// marker is best-effort: a writer that fails to commit the marker
+/// leaves its last periodic beat in place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriterHeartbeat {
     /// Beat counter, increasing across beats and across writer

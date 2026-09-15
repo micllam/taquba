@@ -346,8 +346,8 @@
 //! fresh beat proves the process that owns the store is alive, and
 //! proves nothing about that process's workers. A clean
 //! [`Queue::close`] commits a final beat marked closed, so a stale
-//! closed beat indicates a deliberate shutdown rather than a vanished
-//! writer.
+//! closed beat distinguishes a deliberate shutdown from a writer whose
+//! process terminated.
 //!
 //! To make job outcomes observable across processes, settle them into
 //! the KV namespace: [`Queue::ack_with`] writes outcome entries
