@@ -400,6 +400,10 @@
 //! sampler that emits per-queue depth and oldest-pending-age gauges, and
 //! SlateDB's own storage metrics are forwarded into the same recorder.
 //!
+//! Spans and log events go through [`tracing`](https://docs.rs/tracing), with
+//! or without the `metrics` feature. Both are no-ops until the host process
+//! installs a subscriber.
+//!
 //! [SlateDB]: https://github.com/slatedb/slatedb
 
 #![warn(missing_docs)]
