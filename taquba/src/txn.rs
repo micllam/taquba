@@ -56,15 +56,15 @@ pub(crate) async fn get_indexed_job(
 /// claim, stage the deletion of its record and return the stored record.
 /// Returns [`Error::ClaimLost`] when the claim has ended.
 ///
-/// This is the fence every settlement passes through, in three parts.
-/// The registry claim id check rejects a settlement superseded by a
-/// re-claim. The in-transaction record read rejects a settlement whose
-/// claim ended while its registry entry, removed only after the ending
-/// commit, was still present. The staged delete makes a settlement
-/// racing a concurrent requeue or re-claim a transaction conflict.
-/// Call it inside the retry loop so a retry re-runs both checks. A
-/// renewal changes neither the claim id nor the record, so a claim held
-/// across one still settles.
+/// This is the fence every settlement passes through, in three parts. The
+/// registry claim id check rejects a settlement superseded by a re-claim. The
+/// in-transaction record read rejects a settlement whose claim ended while its
+/// registry entry, removed only after the ending commit, was still present. The
+/// staged delete makes a settlement racing a concurrent requeue or re-claim a
+/// transaction conflict. The claimed key does not identify a claim, because a
+/// reap and a re-claim rewrite the same key. Call it inside the retry loop so a
+/// retry re-runs both checks. A renewal changes neither the claim id nor the
+/// record, so a claim held across a renewal still settles.
 ///
 /// A settlement that writes a record must base it on the returned
 /// record, which includes changes committed during the claim (a
