@@ -460,7 +460,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_settlement_after_reaper_dead_letter_is_rejected() {
+    async fn a_settlement_after_a_reaper_dead_letter_is_rejected_without_its_effects() {
         let clock = MockClock::new(1_700_000_000_000);
         let opts = OpenOptions {
             clock: Arc::new(clock.clone()),
@@ -497,15 +497,18 @@ mod tests {
         assert_eq!(stats.claimed, 0);
         assert_eq!(stats.dead, 1);
 
+        let effects = || crate::SettlementEffects::default().kv_put(b"k".to_vec(), b"v".to_vec());
         assert!(matches!(q.ack(&stale).await, Err(Error::ClaimLost)));
         assert!(matches!(
-            q.nack(&stale, "late failure").await,
+            q.nack_with(&stale, "late failure", effects()).await,
             Err(Error::ClaimLost)
         ));
         assert!(matches!(
-            q.dead_letter(&stale, "late permanent failure").await,
+            q.dead_letter_with(&stale, "late permanent failure", effects())
+                .await,
             Err(Error::ClaimLost)
         ));
+        assert!(q.kv_get(b"k").await.unwrap().is_none());
 
         assert!(matches!(
             q.renew_lease(&stale, Duration::from_secs(30)),

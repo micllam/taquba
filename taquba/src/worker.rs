@@ -58,14 +58,15 @@ impl std::error::Error for PermanentFailure {}
 /// Wrapper error attaching [`SettlementEffects`] to a failure returned from
 /// [`Worker::process`] or [`Worker::process_with_effects`].
 ///
-/// The worker loop settles the wrapped error exactly as it would settle
-/// the error unwrapped, and applies `effects` atomically with the
-/// settlement when that settlement dead-letters the job: a wrapped
-/// [`PermanentFailure`] dead-letters through
-/// [`crate::Queue::dead_letter_with`], and any other wrapped error is
-/// reported through [`crate::Queue::nack_with`], whose effects apply
-/// only once the job's attempts are exhausted. Effects on a retried
-/// failure are discarded; attach them on every attempt.
+/// The worker loop settles the wrapped error exactly as the unwrapped error,
+/// and applies `effects` atomically with a settlement that dead-letters the
+/// job. A wrapped [`PermanentFailure`] dead-letters through
+/// [`crate::Queue::dead_letter_with`]. Any other wrapped error is reported
+/// through [`crate::Queue::nack_with`], whose effects apply only once the job's
+/// attempts are exhausted. Effects on a retried failure are discarded, so a
+/// handler attaches them on every attempt. A dead-letter by the reaper or by
+/// crash recovery at open runs without a worker, and the effects do not apply.
+/// A layer that needs them reconciles through [`crate::Queue::commit_effects`].
 ///
 /// ```rust,ignore
 /// Err(FailWith::new(PermanentFailure::new("bad input"), effects).into())
