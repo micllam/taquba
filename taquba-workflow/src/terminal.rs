@@ -88,10 +88,10 @@ pub struct RunOutcome {
 /// - Delivery is at-least-once: a crash after the hook ran but before
 ///   the notification job was acknowledged re-delivers it, so
 ///   implementations must be idempotent.
-/// - A transient error ([`StepError::transient`]) retries the
-///   notification job per the queue's backoff up to the terminal step's
-///   `max_attempts`; a permanent error dead-letters it, where
-///   [`taquba::Queue::dead_jobs`] finds it.
+/// - The notification job takes the terminal step's priority and
+///   `max_attempts`. A transient error ([`StepError::transient`]) retries the
+///   notification job per the queue's backoff up to `max_attempts`. A permanent
+///   error dead-letters it, where [`taquba::Queue::dead_jobs`] finds it.
 /// - Effects staged on the [`TerminalEffects`] handle are applied in
 ///   the same transaction as the notification's acknowledgement when
 ///   the hook returns `Ok`.
