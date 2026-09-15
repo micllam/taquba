@@ -32,7 +32,6 @@ pub const DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD: usize = 256 * 1024;
 /// ```ignore
 /// QueueConfig::default().max_attempts(10)
 /// ```
-#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct QueueConfig {
     /// Maximum delivery attempts before a job is dead-lettered. Attempts
@@ -133,7 +132,6 @@ impl Default for QueueConfig {
 }
 
 /// Configuration for opening a [`Queue`](crate::Queue) instance.
-#[non_exhaustive]
 pub struct OpenOptions {
     /// How often the background reaper scans for expired leases. Defaults to 5s.
     /// The same loop also performs done- and dead-job retention sweeps.
@@ -357,9 +355,8 @@ impl Default for OpenOptions {
 
 /// Per-call overrides for [`Queue::enqueue_with`](crate::Queue::enqueue_with).
 ///
-/// Every field is `Option`; leave a field as `None` (the default) to inherit
-/// the queue's configured value. Construct via [`EnqueueOptions::default`] +
-/// struct-update syntax so adding new fields in future versions is non-breaking:
+/// Every field defaults to `None`, and `headers` to an empty map. Construct
+/// via [`EnqueueOptions::default`] and the setters:
 ///
 /// ```
 /// use std::time::{Duration, SystemTime};
@@ -367,7 +364,6 @@ impl Default for OpenOptions {
 ///
 /// let opts = EnqueueOptions::default().run_at(SystemTime::now() + Duration::from_secs(60));
 /// ```
-#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct EnqueueOptions {
     /// Override the queue's default `max_attempts` for just this job.

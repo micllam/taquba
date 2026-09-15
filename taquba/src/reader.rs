@@ -47,7 +47,6 @@ pub enum ReaderMode {
 }
 
 /// Options for [`QueueReader::open_with_options`].
-#[non_exhaustive]
 #[derive(Clone)]
 pub struct ReaderOptions {
     /// How the reader follows the writer's state. Defaults to

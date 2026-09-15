@@ -44,7 +44,6 @@ pub struct EnqueueRequest {
 /// [`CancelOutcome::Removed`](crate::CancelOutcome::Removed)) commits without them. A key named in
 /// both `kv_writes` and `kv_deletes` is rejected with
 /// [`Error::ConflictingKvEffect`].
-#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct SettlementEffects {
     /// Jobs enqueued atomically with the settlement.

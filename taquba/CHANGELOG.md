@@ -47,6 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a bound. The bounded wait is `Queue::wait_for_completion_timeout(id,
   timeout)`, which returns `None` when the timeout elapses first, and
   `WaitOutcome::TimedOut` is removed.
+- A struct literal builds `OpenOptions`, `QueueConfig`, `EnqueueOptions`,
+  `ReaderOptions` and `SettlementEffects` outside the crate, and a new field
+  breaks a literal that lists every field. A literal that ends in
+  `..Default::default()` compiles after a field is added, and the setters
+  are unchanged.
 
 ### Fixed
 
