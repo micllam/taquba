@@ -167,11 +167,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attempt_history_removed_when_ack_expunges_the_record() {
+    async fn attempt_history_is_removed_with_the_record_and_not_inherited_by_a_reused_id() {
         let q = Queue::open_with_options(make_store(), "test", no_backoff_opts())
             .await
             .unwrap();
-        let id = q.enqueue("work", b"x".to_vec()).await.unwrap();
+        let opts = || crate::EnqueueOptions::default().id_override("job-1".to_string());
+        let id = q.enqueue_with("work", b"x".to_vec(), opts()).await.unwrap();
         let lease = Duration::from_secs(30);
 
         let job = q.claim("work", lease).await.unwrap().unwrap();
@@ -181,6 +182,14 @@ mod tests {
         let job = q.claim("work", lease).await.unwrap().unwrap();
         q.ack(&job).await.unwrap();
         assert!(q.attempt_history(&id).await.unwrap().is_empty());
+
+        let reused = q.enqueue_with("work", b"y".to_vec(), opts()).await.unwrap();
+        assert_eq!(reused, id);
+        let job = q.claim("work", lease).await.unwrap().unwrap();
+        q.nack(&job, "failed again").await.unwrap();
+        let history = q.attempt_history(&id).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].error.as_deref(), Some("failed again"));
         q.close().await.unwrap();
     }
 

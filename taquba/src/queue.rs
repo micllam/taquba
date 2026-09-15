@@ -1370,11 +1370,12 @@ impl Queue {
     /// lease. [`Self::requeue_dead_job`] appends an
     /// [`AttemptOutcome::Requeued`] marker and keeps the prior entries.
     ///
-    /// The history shares the job's lifetime: it is removed in the same
-    /// transaction that removes the job's last record, so a job for which
-    /// [`Self::get_job`] returns `None` has an empty history. An ack on a
-    /// queue without retention therefore removes the history rather than
-    /// recording the completed attempt.
+    /// The transaction that removes the job's last record also removes its
+    /// history, so a job for which [`Self::get_job`] returns `None` has an
+    /// empty history. An ack on a queue without retention removes the history
+    /// and does not record the completed attempt. A later job enqueued with the
+    /// same id through [`EnqueueOptions::id_override`] starts with an empty
+    /// history.
     pub async fn attempt_history(&self, id: &str) -> Result<Vec<JobAttempt>> {
         crate::read::attempt_history(self.core.db.as_ref(), id).await
     }
