@@ -162,12 +162,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   termination: a job cancelled while pending or dead-lettered outside
   its handler is no longer run again, and joins as its recorded
   termination until retention removes the record.
-- **Breaking (source):** `Step` is `#[non_exhaustive]` and holds its
-  delivery fields (`run_id`, `headers`, `job_id`, `attempts`,
-  `max_attempts`, `cancel_token`, `lease`, `memo`, `run_memo`, `effects`,
-  `kv`) on `Step::delivery`, reachable through the dereference. A
-  struct literal outside the crate moves to `Step::detached` and
-  assigns its fields.
+- **Breaking (source):** the delivery fields of `Step` (`run_id`, `headers`,
+  `job_id`, `attempts`, `max_attempts`, `cancel_token`, `lease`, `memo`,
+  `run_memo`, `effects`, `kv`) move to `Step::delivery`, reachable through the
+  dereference. A struct literal nests these fields in a `Delivery`, or starts
+  from `Step::detached` and assigns them.
 - The terminal-notification job of a run terminated by a dead-lettered
   step (a permanent step error, a transient one on the last attempt, a
   second waiter on a correlation key, or a step the queue dead-lettered
