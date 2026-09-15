@@ -45,10 +45,10 @@ pub enum Error {
     #[error("run `{0}` exists with a different input; pick a fresh run_id")]
     InputMismatch(RunId),
 
-    /// A run's durable record exists without the current-step pointer
-    /// written beside it. The two are written and deleted in one
-    /// transaction, so this reports a store the runtime did not write.
-    #[error("run `{0}` has a run record but no current-step pointer")]
+    /// The durable records of a run disagree with one another. The runtime
+    /// writes and deletes them together, so the error reports a store the
+    /// runtime did not write.
+    #[error("run `{0}` has inconsistent durable state")]
     InconsistentRunState(RunId),
 
     /// A caller KV key passed via [`crate::RunSpec::kv_writes`] or staged

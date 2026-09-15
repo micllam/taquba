@@ -602,9 +602,10 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// - A step claimed after the request is settled as cancelled
     ///   without running.
     ///
-    /// Cancellation is best-effort: a run whose terminal step settles
-    /// while the request is being recorded keeps the outcome it
-    /// committed.
+    /// Cancellation is best-effort: a run whose terminal step settles while the
+    /// request is recorded keeps the outcome it committed. A request applies
+    /// only to the run it is recorded on, and a later submission of the same
+    /// run id starts without it.
     pub async fn cancel(&self, run_id: &RunId) -> Result<bool> {
         self.inner.core.cancel(run_id).await
     }
@@ -4533,6 +4534,35 @@ mod tests {
             "no worker terminated the new run, so the earlier run's record is not its outcome"
         );
         assert!(runtime.outcome(&rid("again")).await.unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_request_does_not_reach_a_re_submission_of_the_run_id() {
+        let (queue, store, _clock) = open_queue_at(10_000).await;
+        let runtime =
+            WorkflowRuntime::builder(queue.clone(), store, UnreachableRunner, NoopTerminalHook)
+                .build();
+        let spec = RunSpec {
+            run_id: Some(rid("again")),
+            input: b"x".to_vec(),
+            ..Default::default()
+        };
+        runtime.submit(spec.clone()).await.unwrap();
+        assert!(runtime.cancel(&rid("again")).await.unwrap());
+        let end = runtime.wait(&rid("again")).await.unwrap();
+        assert_eq!(end.termination.status, TerminalStatus::Cancelled);
+
+        assert!(runtime.submit(spec).await.unwrap().newly_submitted);
+        let record = runtime
+            .inner
+            .core
+            .run_record(&rid("again"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!record.cancel_requested);
+        let status = runtime.status(&rid("again")).await.unwrap().unwrap();
+        assert_eq!(status.state, RunState::Pending);
     }
 
     #[tokio::test(start_paused = true)]
