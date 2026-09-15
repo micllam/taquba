@@ -1601,23 +1601,23 @@ impl Queue {
 
     /// Cancel a job, handling every lifecycle state.
     ///
-    /// - **`Pending` or `Scheduled`**: removes the job from the queue
-    ///   immediately. Returns [`CancelOutcome::Removed`].
+    /// - **`Pending` or `Scheduled`**: removes the job, its attempt history and
+    ///   its dedup key in one transaction. Returns [`CancelOutcome::Removed`].
     /// - **`Claimed` (a worker is processing it)**: persists a
     ///   `cancel_requested` flag on the job record and fires the
     ///   in-process [`tokio_util::sync::CancellationToken`] exposed on
     ///   [`Claim::cancel_token`] and
     ///   [`LeaseHandle::cancel_token`](crate::LeaseHandle::cancel_token).
-    ///   Returns [`CancelOutcome::Requested`]. Workers that `select!`
-    ///   on the token can short-circuit cooperatively; workers that
-    ///   ignore it run to completion. The persisted flag ensures that
-    ///   if the worker's lease expires and the reaper requeues the job,
-    ///   the next claim's token starts pre-cancelled.
+    ///   Returns [`CancelOutcome::Requested`].
     /// - **`Done` / `Dead` / unknown**: returns [`CancelOutcome::NotFound`].
     ///
-    /// Cooperative cancellation does not abort a running worker; futures
-    /// cannot be safely cancelled mid-await. A worker observes the token
-    /// to exit early.
+    /// Cancellation does not abort a running worker. A worker that uses
+    /// `select!` on the token stops at a point where its own state is
+    /// consistent. A worker that ignores the token runs to completion. A
+    /// renewal of a cancelled claim fails with [`Error::CancelRequested`], so
+    /// the worker keeps the claim at most until its lease expires. The flag is
+    /// stored, so every later claim of the job starts with its token already
+    /// fired until [`Self::requeue_dead_job`] clears the flag.
     pub async fn cancel(&self, id: &str) -> Result<CancelOutcome> {
         self.cancel_with(id, SettlementEffects::default())
             .await
@@ -2704,10 +2704,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cancel_pending_job() {
+    async fn cancelling_a_pending_job_removes_it_and_releases_its_dedup_key() {
         let q = Queue::open(make_store(), "test").await.unwrap();
+        let opts = || EnqueueOptions {
+            dedup_key: Some("user-42".to_string()),
+            ..Default::default()
+        };
 
-        let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let id = q
+            .enqueue_with("work", b"payload".to_vec(), opts())
+            .await
+            .unwrap();
 
         assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Removed);
 
@@ -2724,6 +2731,13 @@ mod tests {
 
         // Stats reflect the removal.
         assert_eq!(q.stats("work").await.unwrap().pending, 0);
+
+        // The dedup key is free for a new job.
+        let again = q
+            .enqueue_with("work", b"payload".to_vec(), opts())
+            .await
+            .unwrap();
+        assert_ne!(again, id);
 
         q.close().await.unwrap();
     }
@@ -2872,7 +2886,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cancel_requested_during_the_delivery_survives_a_dead_letter() {
+    async fn a_cancel_request_stays_on_a_dead_record_until_revival() {
         let q = Queue::open_with_options(make_store(), "test", no_backoff_opts())
             .await
             .unwrap();
@@ -2890,6 +2904,17 @@ mod tests {
         let dead = q.get_job(&id).await.unwrap().unwrap();
         assert_eq!(dead.status, JobStatus::Dead);
         assert!(dead.cancel_requested);
+
+        q.requeue_dead_job(&id).await.unwrap();
+        let revived = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!revived.cancel_requested);
+        assert!(!revived.cancel_token().is_cancelled());
+
+        q.ack(&revived).await.unwrap();
         q.close().await.unwrap();
     }
 
