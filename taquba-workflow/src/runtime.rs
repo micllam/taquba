@@ -3829,6 +3829,68 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_re_submitted_run_shares_its_entries_until_the_first_run_expires() {
+        let (queue, store, clock) = open_queue_at(10_000).await;
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store.clone(),
+            FixedRunner::new(Ok(StepOutcome::Succeed {
+                result: b"done".to_vec(),
+            })),
+            NoopTerminalHook,
+        )
+        .memo_retention(Duration::from_secs(1))
+        .build();
+        let spec = RunSpec {
+            run_id: Some(rid("shared")),
+            input: b"x".to_vec(),
+            ..Default::default()
+        };
+        runtime.submit(spec.clone()).await.unwrap();
+        let claim = queue
+            .claim("workflow-steps", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let effects = runtime
+            .inner
+            .process_step(&claim, &LeaseHandle::detached())
+            .await
+            .unwrap();
+        queue.ack_with(&claim, effects).await.unwrap();
+        let memos = MemoStore::new(store, "workflow-steps-memo");
+        memos
+            .new_memo(&rid("shared"), 0)
+            .put("k", b"v")
+            .await
+            .unwrap();
+
+        assert!(runtime.submit(spec).await.unwrap().newly_submitted);
+        assert_eq!(
+            memos.new_memo(&rid("shared"), 0).get("k").await.unwrap(),
+            Some(b"v".to_vec()),
+            "the second run reads the first run's entry",
+        );
+
+        // The first run's marker expires while the second run is active.
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(runtime.inner.core.sweep_once().await.unwrap(), 1);
+        assert_eq!(
+            memos.new_memo(&rid("shared"), 0).get("k").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            runtime
+                .status(&rid("shared"))
+                .await
+                .unwrap()
+                .map(|s| s.state),
+            Some(RunState::Pending),
+            "the second run is still active",
+        );
+    }
+
     /// Yield up to `iters` times waiting for `cond` to become true.
     /// Used in sweeper tests to let the spawned sweep task make
     /// progress between `tokio::time::advance` and the assertion;
