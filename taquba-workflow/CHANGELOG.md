@@ -7,21 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-16
+
 ### Added
 
 - `jobs::JobRunner` implements `Clone`, so a handler that submits jobs
   keeps a clone in its state.
 - `Delivery`: the run identity, attempt count and handles a handler runs
-  under. `Step` and `jobs::JobContext` dereference to it. `Delivery::detached()` builds one bound to no queue and
+  under. `Step` and `jobs::JobContext` dereference to it.
+  `Delivery::detached()` builds one bound to no queue and
   `Step::detached(payload)` step 0 over it, for tests.
 - `Delivery::is_last_attempt`: whether a transient `StepError` from this
   attempt dead-letters the step.
 - `RunState::Terminated(RunTermination)`: the status, error, error kind,
-  final step and time of termination of a terminated run, reported by `WorkflowRuntime::status`
-  and `jobs::JobHandle::status` from a terminal record under
-  `workflow/outcomes/{run_id}`. The record, which also holds the run's
-  input hash, is written in every terminating settlement and removed by
-  the memo sweep with the run's memo entries under
+  final step and time of termination of a terminated run, reported by
+  `WorkflowRuntime::status` and `jobs::JobHandle::status` from a terminal
+  record under `workflow/outcomes/{run_id}`. The record, which also holds
+  the run's input hash, is written in every terminating settlement and
+  removed by the memo sweep with the run's memo entries under
   `WorkflowRuntimeBuilder::memo_retention`. `RunState` no longer
   implements `Copy`.
 - `StepError` implements `Clone`.
@@ -107,6 +110,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Raised the minimum `taquba` requirement to 0.13 and, for the
+  `webhooks` feature, the `taquba-webhooks` requirement to 0.9.
 - `Trigger`, `StepOutcome`, `StepErrorKind`, `Error`, `TerminalStatus` and
   `RunState` are exhaustive enums.
 - A struct literal builds `SubmitOutcome` outside the crate, and a new field
