@@ -62,10 +62,14 @@ let opts = ScheduleOptions {
 };
 ```
 
-Every enqueued job carries the header `cron.fire_ms` (`FIRE_MS_HEADER`),
-which stores the firing time as milliseconds since the Unix epoch, so a
-worker can identify the window a job covers. Header names with the `cron.`
-prefix are reserved; a schedule that supplies one is rejected.
+Every enqueued job has the header `cron.fire_ms` (`FIRE_MS_HEADER`), the
+firing time as milliseconds since the Unix epoch. The header
+`cron.previous_fire_ms` (`PREVIOUS_FIRE_MS_HEADER`) is the occurrence of the
+expression before the firing time, in the same form, so the two headers
+bound the interval that the job covers. The scheduler computes the previous
+occurrence from the expression, whether or not that occurrence was enqueued.
+Header names with the `cron.` prefix are reserved, and a schedule with such
+a header is rejected.
 
 ## Backfill
 

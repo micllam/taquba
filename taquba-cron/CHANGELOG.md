@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schedules while the scheduler runs, so a change of the schedule set does
   not need a restart of the scheduler. A registration after the scheduler
   stops fails with the new `Error::Stopped`.
+- `PREVIOUS_FIRE_MS_HEADER` (`cron.previous_fire_ms`): every job has the
+  occurrence of the expression before its firing time, so a worker reads
+  the interval of the firing from two headers without a cron parser.
 
 ### Changed
 

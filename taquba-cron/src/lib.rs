@@ -43,10 +43,14 @@
 //! };
 //! ```
 //!
-//! Every enqueued job carries the header [`FIRE_MS_HEADER`] (`cron.fire_ms`),
-//! which stores the firing time as milliseconds since the Unix epoch, so a
-//! worker can identify the window a job covers. Header names with the
-//! `cron.` prefix are reserved; a schedule that supplies one is rejected.
+//! Every enqueued job has the header [`FIRE_MS_HEADER`] (`cron.fire_ms`),
+//! the firing time as milliseconds since the Unix epoch. The header
+//! [`PREVIOUS_FIRE_MS_HEADER`] (`cron.previous_fire_ms`) is the occurrence
+//! of the expression before the firing time, in the same form, so the two
+//! headers bound the interval that the job covers. The scheduler computes
+//! the previous occurrence from the expression, whether or not that
+//! occurrence was enqueued. Header names with the `cron.` prefix are
+//! reserved, and a schedule with such a header is rejected.
 //!
 //! # Backfill
 //!
@@ -173,6 +177,11 @@ use tracing::{debug, error, warn};
 /// milliseconds since the Unix epoch in decimal.
 pub const FIRE_MS_HEADER: &str = "cron.fire_ms";
 
+/// Header attached to every enqueued job, storing the occurrence of the
+/// expression before the firing time as milliseconds since the Unix epoch
+/// in decimal. It is absent for a firing without an earlier occurrence.
+pub const PREVIOUS_FIRE_MS_HEADER: &str = "cron.previous_fire_ms";
+
 /// Prefix of the header names reserved for this crate. A schedule whose
 /// [`ScheduleOptions::headers`] contains a name with this prefix is
 /// rejected with [`Error::ReservedHeader`].
@@ -224,6 +233,12 @@ impl Expression {
     /// without one.
     fn next_after(&self, anchor: DateTime<Utc>) -> Option<DateTime<Utc>> {
         self.0.find_next_occurrence(&anchor, false).ok()
+    }
+
+    /// The last occurrence before `at`, or `None` for an expression
+    /// without one.
+    fn previous_before(&self, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.0.find_previous_occurrence(&at, false).ok()
     }
 }
 
@@ -723,6 +738,12 @@ impl CronScheduler {
         let fire_ms = fire_at.timestamp_millis();
         let mut headers = entry.headers.clone();
         headers.insert(FIRE_MS_HEADER.to_string(), fire_ms.to_string());
+        if let Some(previous) = entry.expression.previous_before(fire_at) {
+            headers.insert(
+                PREVIOUS_FIRE_MS_HEADER.to_string(),
+                previous.timestamp_millis().to_string(),
+            );
+        }
         let opts = EnqueueOptions::default()
             .dedup_key(Some(format!("cron:{}:{}", entry.name, fire_ms)))
             .headers(headers)
@@ -801,6 +822,17 @@ mod tests {
             .collect();
         times.sort_unstable();
         times
+    }
+
+    async fn previous_fire_ms(q: &Queue, queue: &str) -> Vec<i64> {
+        let page = q
+            .list_jobs(queue, taquba::JobStatus::Pending, None, 100)
+            .await
+            .unwrap();
+        page.jobs
+            .iter()
+            .map(|j| j.headers[PREVIOUS_FIRE_MS_HEADER].parse().unwrap())
+            .collect()
     }
 
     async fn watermark(q: &Queue, name: &str) -> Option<i64> {
@@ -1024,7 +1056,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_job_carries_the_firing_time_header() {
+    async fn every_job_has_the_firing_time_and_the_previous_occurrence() {
         let q = test_queue().await;
         let mut s = CronScheduler::new(q.clone());
         s.schedule(
@@ -1041,6 +1073,25 @@ mod tests {
             vec![ms(t0() + minutes(1))]
         );
         assert_eq!(watermark(&q, "minutely").await, None);
+        assert_eq!(previous_fire_ms(&q, "out").await, vec![ms(t0())]);
+
+        // The previous occurrence comes from the expression: this scheduler
+        // first ticks one hour before the firing of a weekly schedule.
+        let monday: DateTime<Utc> = "2026-09-14T02:00:00Z".parse().unwrap();
+        s.schedule(
+            "weekly",
+            "0 2 * * 1".parse().unwrap(),
+            "weekly",
+            b"x".to_vec(),
+        )
+        .unwrap();
+        s.step(monday - minutes(60)).await;
+        s.step(monday).await;
+        assert_eq!(pending_fire_ms(&q, "weekly").await, vec![ms(monday)]);
+        assert_eq!(
+            previous_fire_ms(&q, "weekly").await,
+            vec![ms(monday - minutes(7 * 24 * 60))]
+        );
     }
 
     #[tokio::test]
