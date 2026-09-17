@@ -16,7 +16,7 @@
 //! let queue = Arc::new(Queue::open(Arc::new(InMemory::new()), "demo").await?);
 //!
 //! let mut scheduler = CronScheduler::new(queue);
-//! scheduler.schedule("daily-report", "0 9 * * *", "reports", b"daily".to_vec())?;
+//! scheduler.schedule("daily-report", "0 9 * * *".parse()?, "reports", b"daily".to_vec())?;
 //!
 //! scheduler.run(std::future::pending::<()>()).await?;
 //! # Ok(()) }
@@ -99,7 +99,8 @@
 //!
 //! A step follows a range or `*`, as in `5-59/5 * * * *`, and the form
 //! `5/5 * * * *` is rejected. An expression with a seconds field or a year
-//! field is rejected.
+//! field is rejected. An [`Expression`] is parsed from a string, and the
+//! parse fails with [`Error::InvalidExpression`].
 //!
 //! All firing times are evaluated in UTC, against the clock the queue was
 //! opened with ([`taquba::Queue::clock`]).
@@ -175,19 +176,46 @@ fn lookback_floor(now: DateTime<Utc>, lookback: Duration) -> Option<DateTime<Utc
         .and_then(|d| now.checked_sub_signed(d))
 }
 
-/// Parse a 5-field expression. A seconds field or a year field is rejected.
-fn parse(expression: &str) -> Result<Cron> {
-    CronParser::builder()
-        .seconds(Seconds::Disallowed)
-        .build()
-        .parse(expression)
-        .map_err(|e| Error::InvalidExpression {
-            expression: expression.to_string(),
-            message: e.to_string(),
-        })
+/// A parsed 5-field cron expression, the parameter type of
+/// [`CronScheduler::schedule`].
+///
+/// ```
+/// use taquba_cron::Expression;
+///
+/// let expression: Expression = "0 9 * * 1-5".parse()?;
+/// # Ok::<(), taquba_cron::Error>(())
+/// ```
+#[derive(Debug, Clone)]
+pub struct Expression(Cron);
+
+impl Expression {
+    /// The first occurrence after `anchor`, or `None` for an expression
+    /// without one.
+    fn next_after(&self, anchor: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.0.find_next_occurrence(&anchor, false).ok()
+    }
 }
 
-/// Errors returned by [`CronScheduler`].
+impl std::str::FromStr for Expression {
+    type Err = Error;
+
+    /// Fails with [`Error::InvalidExpression`]. A seconds field or a year
+    /// field is rejected.
+    fn from_str(expression: &str) -> Result<Self> {
+        CronParser::builder()
+            .seconds(Seconds::Disallowed)
+            .build()
+            .parse(expression)
+            .map(Expression)
+            .map_err(|e| Error::InvalidExpression {
+                expression: expression.to_string(),
+                message: e.to_string(),
+            })
+    }
+}
+
+/// Errors returned by [`CronScheduler`] and by the parse of an
+/// [`Expression`].
 ///
 /// Every variant is a permanent configuration error: retrying an
 /// identical call cannot succeed.
@@ -257,7 +285,7 @@ pub struct ScheduleOptions {
 
 struct ScheduleEntry {
     name: String,
-    expression: Cron,
+    expression: Expression,
     target_queue: String,
     payload: Vec<u8>,
     headers: HashMap<String, String>,
@@ -298,7 +326,7 @@ impl CronScheduler {
     pub fn schedule(
         &mut self,
         name: impl Into<String>,
-        expression: &str,
+        expression: Expression,
         target_queue: impl Into<String>,
         payload: Vec<u8>,
     ) -> Result<&mut Self> {
@@ -316,7 +344,7 @@ impl CronScheduler {
     pub fn schedule_with(
         &mut self,
         name: impl Into<String>,
-        expression: &str,
+        expression: Expression,
         target_queue: impl Into<String>,
         payload: Vec<u8>,
         opts: ScheduleOptions,
@@ -332,10 +360,9 @@ impl CronScheduler {
         {
             return Err(Error::ReservedHeader(header.clone()));
         }
-        let parsed = parse(expression)?;
         self.entries.push(ScheduleEntry {
             name,
-            expression: parsed,
+            expression,
             target_queue: target_queue.into(),
             payload,
             headers: opts.headers,
@@ -449,7 +476,7 @@ impl CronScheduler {
                 }
             };
             let entry = &mut self.entries[i];
-            entry.next_fire = entry.expression.find_next_occurrence(&anchor, false).ok();
+            entry.next_fire = entry.expression.next_after(anchor);
         }
 
         while let Some(fire_at) = self.entries[i].next_fire
@@ -463,7 +490,7 @@ impl CronScheduler {
                     } else {
                         now
                     };
-                    entry.next_fire = entry.expression.find_next_occurrence(&anchor, false).ok();
+                    entry.next_fire = entry.expression.next_after(anchor);
                 }
                 Err(e) => {
                     let entry = &mut self.entries[i];
@@ -471,7 +498,7 @@ impl CronScheduler {
                     if entry.backfill.is_some() {
                         return Some(now + ENQUEUE_RETRY_DELAY);
                     }
-                    entry.next_fire = entry.expression.find_next_occurrence(&now, false).ok();
+                    entry.next_fire = entry.expression.next_after(now);
                     break;
                 }
             }
@@ -608,10 +635,11 @@ mod tests {
         t.timestamp_millis()
     }
 
-    #[tokio::test]
-    async fn rejects_invalid_expression() {
-        let q = test_queue().await;
-        let mut s = CronScheduler::new(q);
+    #[test]
+    fn an_expression_parses_the_five_field_syntax() {
+        for expression in ["0 9 * * *", "0 * * * *", "0 9 * * 1-5", "5-59/5 * * * *"] {
+            expression.parse::<Expression>().unwrap();
+        }
         // A seconds field, a year field and a step without a range are
         // outside the 5-field syntax.
         for expression in [
@@ -620,7 +648,7 @@ mod tests {
             "0 0 9 * * * 2030",
             "5/5 * * * *",
         ] {
-            match s.schedule("bad", expression, "out", b"x".to_vec()) {
+            match expression.parse::<Expression>() {
                 Err(Error::InvalidExpression { .. }) => {}
                 Ok(_) => panic!("expected InvalidExpression for `{expression}`"),
                 Err(other) => panic!("expected InvalidExpression, got {other:?}"),
@@ -629,26 +657,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_valid_posix_expression() {
-        let q = test_queue().await;
-        let mut s = CronScheduler::new(q);
-        s.schedule("daily", "0 9 * * *", "reports", b"x".to_vec())
-            .unwrap();
-        s.schedule("hourly", "0 * * * *", "reports", b"y".to_vec())
-            .unwrap();
-        s.schedule("weekday-am", "0 9 * * 1-5", "reports", b"z".to_vec())
-            .unwrap();
-        s.schedule("stepped", "5-59/5 * * * *", "reports", b"w".to_vec())
-            .unwrap();
-    }
-
-    #[tokio::test]
     async fn rejects_duplicate_name() {
         let q = test_queue().await;
         let mut s = CronScheduler::new(q);
-        s.schedule("once", "0 9 * * *", "reports1", b"x".to_vec())
-            .unwrap();
-        match s.schedule("once", "0 10 * * *", "reports2", b"y".to_vec()) {
+        s.schedule(
+            "once",
+            "0 9 * * *".parse().unwrap(),
+            "reports1",
+            b"x".to_vec(),
+        )
+        .unwrap();
+        match s.schedule(
+            "once",
+            "0 10 * * *".parse().unwrap(),
+            "reports2",
+            b"y".to_vec(),
+        ) {
             Err(Error::DuplicateName(name)) => assert_eq!(name, "once"),
             Err(other) => panic!("expected DuplicateName, got {other:?}"),
             Ok(_) => panic!("expected DuplicateName"),
@@ -661,7 +685,7 @@ mod tests {
         let mut s = CronScheduler::new(q);
         let result = s.schedule_with(
             "tagged",
-            "0 9 * * *",
+            "0 9 * * *".parse().unwrap(),
             "reports",
             b"x".to_vec(),
             ScheduleOptions {
@@ -682,7 +706,7 @@ mod tests {
         let mut s = CronScheduler::new(q);
         s.schedule_with(
             "boosted",
-            "0 9 * * *",
+            "0 9 * * *".parse().unwrap(),
             "reports",
             b"x".to_vec(),
             ScheduleOptions {
@@ -701,8 +725,13 @@ mod tests {
     async fn shuts_down_immediately_when_signal_fires() {
         let q = mock_clock_queue(t0()).await.0;
         let mut s = CronScheduler::new(q);
-        s.schedule("daily", "0 9 * * *", "reports", b"x".to_vec())
-            .unwrap();
+        s.schedule(
+            "daily",
+            "0 9 * * *".parse().unwrap(),
+            "reports",
+            b"x".to_vec(),
+        )
+        .unwrap();
         let start = tokio::time::Instant::now();
         s.run(async {}).await.unwrap();
         assert_eq!(start.elapsed(), Duration::ZERO);
@@ -712,8 +741,13 @@ mod tests {
     async fn every_job_carries_the_firing_time_header() {
         let q = test_queue().await;
         let mut s = CronScheduler::new(q.clone());
-        s.schedule("minutely", "* * * * *", "out", b"x".to_vec())
-            .unwrap();
+        s.schedule(
+            "minutely",
+            "* * * * *".parse().unwrap(),
+            "out",
+            b"x".to_vec(),
+        )
+        .unwrap();
         s.step(t0()).await;
         s.step(t0() + minutes(1)).await;
         assert_eq!(
@@ -729,7 +763,7 @@ mod tests {
         let mut s = CronScheduler::new(q.clone());
         s.schedule_with(
             "minutely",
-            "* * * * *",
+            "* * * * *".parse().unwrap(),
             "out",
             b"x".to_vec(),
             backfill(Duration::MAX),
@@ -755,7 +789,7 @@ mod tests {
         first
             .schedule_with(
                 "minutely",
-                "* * * * *",
+                "* * * * *".parse().unwrap(),
                 "out",
                 b"x".to_vec(),
                 backfill(Duration::MAX),
@@ -773,7 +807,7 @@ mod tests {
         second
             .schedule_with(
                 "minutely",
-                "* * * * *",
+                "* * * * *".parse().unwrap(),
                 "out",
                 b"x".to_vec(),
                 backfill(Duration::MAX),
@@ -800,7 +834,7 @@ mod tests {
         let mut s = CronScheduler::new(q.clone());
         s.schedule_with(
             "minutely",
-            "* * * * *",
+            "* * * * *".parse().unwrap(),
             "out",
             b"x".to_vec(),
             backfill(minutes(5)),
@@ -831,7 +865,7 @@ mod tests {
         let mut s = CronScheduler::new(q.clone());
         s.schedule_with(
             "minutely",
-            "* * * * *",
+            "* * * * *".parse().unwrap(),
             "out",
             b"x".to_vec(),
             backfill(Duration::MAX),
@@ -848,7 +882,7 @@ mod tests {
         let mut s = CronScheduler::new(q.clone());
         s.schedule_with(
             "minutely",
-            "* * * * *",
+            "* * * * *".parse().unwrap(),
             "q".repeat(300),
             b"x".to_vec(),
             backfill(Duration::MAX),
@@ -871,7 +905,7 @@ mod tests {
         let mut s = CronScheduler::new(q.clone());
         s.schedule_with(
             "minutely",
-            "* * * * *",
+            "* * * * *".parse().unwrap(),
             "out",
             b"x".to_vec(),
             backfill(Duration::MAX),
@@ -898,8 +932,13 @@ mod tests {
     async fn run_fires_on_the_queue_clock() {
         let (q, clock) = mock_clock_queue(t0() + Duration::from_secs(30)).await;
         let mut s = CronScheduler::new(q.clone());
-        s.schedule("minutely", "* * * * *", "out", b"x".to_vec())
-            .unwrap();
+        s.schedule(
+            "minutely",
+            "* * * * *".parse().unwrap(),
+            "out",
+            b"x".to_vec(),
+        )
+        .unwrap();
         let (stop, shutdown) = tokio::sync::oneshot::channel::<()>();
         let run = tokio::spawn(s.run(async {
             let _ = shutdown.await;
@@ -933,8 +972,13 @@ mod tests {
     async fn step_fires_one_missed_firing_after_clock_jump() {
         let q = test_queue().await;
         let mut s = CronScheduler::new(q.clone());
-        s.schedule("minutely", "* * * * *", "out", b"x".to_vec())
-            .unwrap();
+        s.schedule(
+            "minutely",
+            "* * * * *".parse().unwrap(),
+            "out",
+            b"x".to_vec(),
+        )
+        .unwrap();
 
         // T0 is a whole number of minutes past epoch, so it lands
         // on a `* * * * *` occurrence.

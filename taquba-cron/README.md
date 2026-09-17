@@ -34,8 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let queue = Arc::new(Queue::open(Arc::new(InMemory::new()), "demo").await?);
 
     let mut scheduler = CronScheduler::new(queue);
-    scheduler.schedule("daily-report", "0 9 * * *", "reports", b"daily".to_vec())?;
-    scheduler.schedule("hourly-sweep", "0 * * * *", "sweeps",  b"sweep".to_vec())?;
+    scheduler.schedule("daily-report", "0 9 * * *".parse()?, "reports", b"daily".to_vec())?;
+    scheduler.schedule("hourly-sweep", "0 * * * *".parse()?, "sweeps", b"sweep".to_vec())?;
 
     scheduler.run(std::future::pending::<()>()).await?;
     Ok(())
@@ -118,7 +118,8 @@ Expressions are 5-field POSIX cron, parsed by [`croner`](https://crates.io/crate
 
 A step follows a range or `*`, as in `5-59/5 * * * *`, and the form
 `5/5 * * * *` is rejected. An expression with a seconds field or a year
-field is rejected.
+field is rejected. An `Expression` is parsed from a string, and the parse
+fails with `Error::InvalidExpression`.
 
 All firing times are evaluated in UTC, against the clock the queue was
 opened with (`Queue::clock`).

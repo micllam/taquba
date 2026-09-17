@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut scheduler = CronScheduler::new(queue.clone());
     scheduler.schedule(
         "minutely-task",
-        "* * * * *",
+        "* * * * *".parse()?,
         "tasks",
         b"hello from cron".to_vec(),
     )?;
