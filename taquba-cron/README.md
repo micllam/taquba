@@ -94,17 +94,23 @@ let opts = ScheduleOptions {
 };
 ```
 
-The watermark is written in the same transaction as the enqueue, so a
-crash between the two cannot occur, and it advances only when a firing is
-enqueued: an enqueue error under backfill holds the schedule at the failed
-firing and retries it. A schedule without a watermark (the first run after
-opting in) starts at the current time and replays nothing. The watermark
-records a position in the occurrence sequence rather than the schedule itself;
-after an expression change the missed occurrences of the new expression
-since the watermark are replayed. The watermark of a schedule that is no
-longer registered is left in place; remove it with
-`CronScheduler::clear_watermark`. Keys under the `cron/` prefix of the KV
-namespace are reserved for this crate.
+The scheduler writes the watermark in the transaction of the enqueue, so the
+two commit together. The watermark advances only when a firing is enqueued:
+an enqueue error under backfill keeps the schedule at the failed firing, and
+the scheduler retries it.
+
+A schedule without a watermark starts at the current time and does not
+replay a firing. To start a new schedule at an earlier time, write that time
+to `watermark_key(name)` before the registration. The value is the time as
+milliseconds since the Unix epoch in decimal. The first run then replays the
+occurrences after that time, within the lookback.
+
+The watermark records a position in the occurrence sequence and is
+independent of the expression. After an expression change, the scheduler
+replays the missed occurrences of the new expression after the watermark.
+The watermark stays in the KV namespace after its schedule is removed, and
+`CronScheduler::clear_watermark` deletes it. Keys with the `cron/` prefix of
+the KV namespace are reserved for this crate.
 
 ## Changes while the scheduler runs
 

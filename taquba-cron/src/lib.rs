@@ -75,17 +75,23 @@
 //! };
 //! ```
 //!
-//! The watermark is written in the same transaction as the enqueue, so a
-//! crash between the two cannot occur, and it advances only when a firing
-//! is enqueued: an enqueue error under backfill holds the schedule at the
-//! failed firing and retries it. A schedule without a watermark (the first
-//! run after opting in) starts at the current time and replays nothing.
-//! The watermark records a position in the occurrence sequence rather than
-//! the schedule itself; after an expression change the missed occurrences
-//! of the new expression since the watermark are replayed. The watermark
-//! of a schedule that is no longer registered is left in place; remove it
-//! with [`CronScheduler::clear_watermark`]. Keys under the `cron/` prefix
-//! of the KV namespace are reserved for this crate.
+//! The scheduler writes the watermark in the transaction of the enqueue, so
+//! the two commit together. The watermark advances only when a firing is
+//! enqueued: an enqueue error under backfill keeps the schedule at the
+//! failed firing, and the scheduler retries it.
+//!
+//! A schedule without a watermark starts at the current time and does not
+//! replay a firing. To start a new schedule at an earlier time, write that
+//! time to [`watermark_key`] before the registration. The value is the time
+//! as milliseconds since the Unix epoch in decimal. The first run then
+//! replays the occurrences after that time, within the lookback.
+//!
+//! The watermark records a position in the occurrence sequence and is
+//! independent of the expression. After an expression change, the scheduler
+//! replays the missed occurrences of the new expression after the
+//! watermark. The watermark stays in the KV namespace after its schedule is
+//! removed, and [`CronScheduler::clear_watermark`] deletes it. Keys with the
+//! `cron/` prefix of the KV namespace are reserved for this crate.
 //!
 //! # Changes while the scheduler runs
 //!
@@ -1163,26 +1169,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_lookback_bounds_the_replay() {
+    async fn a_written_watermark_starts_the_replay_within_the_lookback() {
         let q = test_queue().await;
+        let now = t0() + minutes(60);
         q.kv_put(&watermark_key("minutely"), ms(t0()).to_string().as_bytes())
             .await
             .unwrap();
+        let recent = now - minutes(3);
+        q.kv_put(&watermark_key("recent"), ms(recent).to_string().as_bytes())
+            .await
+            .unwrap();
         let mut s = CronScheduler::new(q.clone());
-        s.schedule_with(
-            "minutely",
-            "* * * * *".parse().unwrap(),
-            "out",
-            b"x".to_vec(),
-            backfill(minutes(5)),
-        )
-        .unwrap();
-        let now = t0() + minutes(60);
+        for (name, queue) in [("minutely", "out"), ("recent", "recent")] {
+            s.schedule_with(
+                name,
+                "* * * * *".parse().unwrap(),
+                queue,
+                b"x".to_vec(),
+                backfill(minutes(5)),
+            )
+            .unwrap();
+        }
         let soonest = s.step(now).await.expect("satisfiable");
         assert_eq!(soonest, now + minutes(1));
+
+        // A watermark older than the lookback is raised to the lookback.
         let expected: Vec<i64> = (56..=60).map(|m| ms(t0() + minutes(m))).collect();
         assert_eq!(pending_fire_ms(&q, "out").await, expected);
         assert_eq!(watermark(&q, "minutely").await, Some(ms(now)));
+
+        // A watermark within the lookback is the start of the replay.
+        let expected: Vec<i64> = (1..=3).map(|m| ms(recent + minutes(m))).collect();
+        assert_eq!(pending_fire_ms(&q, "recent").await, expected);
+        assert_eq!(watermark(&q, "recent").await, Some(ms(now)));
     }
 
     #[tokio::test]
