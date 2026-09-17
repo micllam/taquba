@@ -81,6 +81,11 @@
 //! enqueued: an enqueue error under backfill keeps the schedule at the
 //! failed firing, and the scheduler retries it.
 //!
+//! A replay enqueues one firing of a schedule at a time, and the other
+//! schedules fire between two firings of the replay. A shutdown or a removal
+//! of the schedule also takes effect there. A replay that a shutdown ends
+//! resumes at the watermark on the next start.
+//!
 //! [`Backfill::start`] determines the start of a schedule without a
 //! watermark. With [`BackfillStart::CurrentTime`] the schedule starts at the
 //! current time and does not replay a firing. With
@@ -600,7 +605,10 @@ impl CronScheduler {
     /// Run the scheduler until `shutdown` resolves.
     ///
     /// Sleeps until the soonest next firing across all entries, enqueues
-    /// everything that's now due, then recomputes. No fixed-quantum polling.
+    /// one due firing per entry, then recomputes. No fixed-quantum polling.
+    /// A replay under backfill continues at the next tick, so `shutdown` and
+    /// a change through a [`ScheduleHandle`] take effect between two firings
+    /// of the replay.
     pub async fn run<F>(mut self, shutdown: F) -> Result<()>
     where
         F: std::future::Future<Output = ()>,
@@ -666,11 +674,12 @@ impl CronScheduler {
         DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::<Utc>::MAX_UTC)
     }
 
-    /// One scheduling tick: enqueue every entry whose next firing is at
-    /// or before `now`, then return the soonest instant at which any
-    /// entry needs attention (its next firing, or a retry of a failed
-    /// enqueue under backfill), or `None` if every expression is
-    /// unsatisfiable.
+    /// One scheduling tick: enqueue one firing of every entry whose next
+    /// firing is at or before `now`, then return the soonest instant at
+    /// which any entry needs attention (its next firing, or a retry of a
+    /// failed enqueue under backfill), or `None` if every expression is
+    /// unsatisfiable. An entry with a further due firing returns an instant
+    /// at or before `now`.
     async fn step(&mut self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         self.sync();
         let mut soonest: Option<DateTime<Utc>> = None;
@@ -684,16 +693,16 @@ impl CronScheduler {
         soonest
     }
 
-    /// Advance one entry to `now`, enqueueing every firing at or before
-    /// it, and return the instant the entry next needs attention.
+    /// Enqueue the entry's next firing when it is at or before `now`, and
+    /// return the instant the entry next needs attention.
     ///
-    /// Without backfill an entry fires at most once per tick and the
-    /// next occurrence is searched strictly after `now`, so occurrences
-    /// between the fired one and `now` are skipped, and a failed enqueue
-    /// is dropped the same way. With backfill the search is anchored at
-    /// the fired occurrence, so every missed occurrence is enqueued in
-    /// order, and a failed enqueue leaves `next_fire` in place for a
-    /// retry after [`ENQUEUE_RETRY_DELAY`].
+    /// Without backfill the next occurrence is searched strictly after
+    /// `now`, so occurrences between the fired one and `now` are skipped,
+    /// and a failed enqueue is dropped the same way. With backfill the
+    /// search is anchored at the fired occurrence, so the following ticks
+    /// enqueue every missed occurrence in order, and a failed enqueue
+    /// leaves `next_fire` in place for a retry after
+    /// [`ENQUEUE_RETRY_DELAY`].
     async fn tick_entry(&mut self, i: usize, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         let entry = self.active[i].entry.clone();
         if self.active[i].next_fire.is_none() {
@@ -707,7 +716,7 @@ impl CronScheduler {
             self.active[i].next_fire = entry.expression.next_after(anchor);
         }
 
-        while let Some(fire_at) = self.active[i].next_fire
+        if let Some(fire_at) = self.active[i].next_fire
             && fire_at <= now
         {
             match self.fire(&entry, fire_at).await {
@@ -725,7 +734,6 @@ impl CronScheduler {
                         return Some(now + ENQUEUE_RETRY_DELAY);
                     }
                     self.active[i].next_fire = entry.expression.next_after(now);
-                    break;
                 }
             }
         }
@@ -858,6 +866,16 @@ mod tests {
                 start: BackfillStart::Lookback,
             }),
             ..Default::default()
+        }
+    }
+
+    /// Calls `step` until no entry has a due firing, as the run loop does.
+    async fn step_to(s: &mut CronScheduler, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        loop {
+            match s.step(now).await {
+                Some(wake) if wake <= now => {}
+                soonest => return soonest,
+            }
         }
     }
 
@@ -1163,7 +1181,7 @@ mod tests {
         assert_eq!(pending_fire_ms(&q, "out").await, Vec::<i64>::new());
 
         let now = t0() + minutes(5) + Duration::from_secs(30);
-        let soonest1 = s.step(now).await.expect("satisfiable");
+        let soonest1 = step_to(&mut s, now).await.expect("satisfiable");
         assert_eq!(soonest1, t0() + minutes(6));
         let expected: Vec<i64> = (1..=5).map(|m| ms(t0() + minutes(m))).collect();
         assert_eq!(pending_fire_ms(&q, "out").await, expected);
@@ -1235,7 +1253,7 @@ mod tests {
             )
             .unwrap();
         }
-        let soonest = s.step(now).await.expect("satisfiable");
+        let soonest = step_to(&mut s, now).await.expect("satisfiable");
         assert_eq!(soonest, now + minutes(1));
 
         // A watermark older than the lookback is raised to the lookback.
@@ -1262,7 +1280,7 @@ mod tests {
         )
         .unwrap();
         let now = t0() + minutes(60);
-        let soonest = s.step(now).await.expect("satisfiable");
+        let soonest = step_to(&mut s, now).await.expect("satisfiable");
         assert_eq!(soonest, now + minutes(1));
 
         let expected: Vec<i64> = (56..=60).map(|m| ms(t0() + minutes(m))).collect();
@@ -1285,6 +1303,73 @@ mod tests {
             Err(other) => panic!("expected UnboundedStart, got {other:?}"),
             Ok(_) => panic!("expected UnboundedStart"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_replay_enqueues_one_firing_per_entry_per_tick() {
+        let q = test_queue().await;
+        q.kv_put(&watermark_key("replayed"), ms(t0()).to_string().as_bytes())
+            .await
+            .unwrap();
+        let mut s = CronScheduler::new(q.clone());
+        let handle = s.handle();
+        s.schedule_with(
+            "replayed",
+            "* * * * *".parse().unwrap(),
+            "out",
+            b"x".to_vec(),
+            backfill(Duration::MAX),
+        )
+        .unwrap();
+        s.schedule("live", "* * * * *".parse().unwrap(), "live", b"x".to_vec())
+            .unwrap();
+        s.step(t0()).await;
+
+        // The replay returns a due instant, and the live entry fires in the
+        // same tick.
+        let now = t0() + minutes(5);
+        let soonest = s.step(now).await.expect("satisfiable");
+        assert_eq!(soonest, t0() + minutes(2));
+        assert_eq!(
+            pending_fire_ms(&q, "out").await,
+            vec![ms(t0() + minutes(1))]
+        );
+        assert_eq!(
+            pending_fire_ms(&q, "live").await,
+            vec![ms(t0() + minutes(1))]
+        );
+
+        // A removal between two ticks ends the replay.
+        assert!(handle.unschedule("replayed"));
+        step_to(&mut s, now).await;
+        assert_eq!(
+            pending_fire_ms(&q, "out").await,
+            vec![ms(t0() + minutes(1))]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_observes_shutdown_between_the_firings_of_a_replay() {
+        let (q, _clock) = mock_clock_queue(t0() + minutes(5)).await;
+        q.kv_put(&watermark_key("minutely"), ms(t0()).to_string().as_bytes())
+            .await
+            .unwrap();
+        let mut s = CronScheduler::new(q.clone());
+        s.schedule_with(
+            "minutely",
+            "* * * * *".parse().unwrap(),
+            "out",
+            b"x".to_vec(),
+            backfill(Duration::MAX),
+        )
+        .unwrap();
+
+        s.run(std::future::ready(())).await.unwrap();
+        assert_eq!(
+            pending_fire_ms(&q, "out").await,
+            vec![ms(t0() + minutes(1))]
+        );
+        assert_eq!(watermark(&q, "minutely").await, Some(ms(t0() + minutes(1))));
     }
 
     #[tokio::test]

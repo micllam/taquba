@@ -100,6 +100,11 @@ two commit together. The watermark advances only when a firing is enqueued:
 an enqueue error under backfill keeps the schedule at the failed firing, and
 the scheduler retries it.
 
+A replay enqueues one firing of a schedule at a time, and the other
+schedules fire between two firings of the replay. A shutdown or a removal of
+the schedule also takes effect there. A replay that a shutdown ends resumes
+at the watermark on the next start.
+
 `Backfill::start` determines the start of a schedule without a watermark.
 With `BackfillStart::CurrentTime` the schedule starts at the current time and
 does not replay a firing. With `BackfillStart::Lookback` the first run
