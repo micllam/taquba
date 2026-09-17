@@ -97,6 +97,10 @@
 //! * * * * *
 //! ```
 //!
+//! A step follows a range or `*`, as in `5-59/5 * * * *`, and the form
+//! `5/5 * * * *` is rejected. An expression with a seconds field or a year
+//! field is rejected.
+//!
 //! All firing times are evaluated in UTC, against the clock the queue was
 //! opened with ([`taquba::Queue::clock`]).
 //!
@@ -128,6 +132,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use croner::Cron;
+use croner::parser::{CronParser, Seconds};
 use taquba::{EnqueueOptions, EnqueueResult, Queue, WorkerHandle};
 use tokio::time::sleep;
 use tracing::{debug, error, warn};
@@ -168,6 +173,18 @@ fn lookback_floor(now: DateTime<Utc>, lookback: Duration) -> Option<DateTime<Utc
     chrono::Duration::from_std(lookback)
         .ok()
         .and_then(|d| now.checked_sub_signed(d))
+}
+
+/// Parse a 5-field expression. A seconds field or a year field is rejected.
+fn parse(expression: &str) -> Result<Cron> {
+    CronParser::builder()
+        .seconds(Seconds::Disallowed)
+        .build()
+        .parse(expression)
+        .map_err(|e| Error::InvalidExpression {
+            expression: expression.to_string(),
+            message: e.to_string(),
+        })
 }
 
 /// Errors returned by [`CronScheduler`].
@@ -315,12 +332,7 @@ impl CronScheduler {
         {
             return Err(Error::ReservedHeader(header.clone()));
         }
-        let parsed = Cron::new(expression)
-            .parse()
-            .map_err(|e| Error::InvalidExpression {
-                expression: expression.to_string(),
-                message: e.to_string(),
-            })?;
+        let parsed = parse(expression)?;
         self.entries.push(ScheduleEntry {
             name,
             expression: parsed,
@@ -600,10 +612,19 @@ mod tests {
     async fn rejects_invalid_expression() {
         let q = test_queue().await;
         let mut s = CronScheduler::new(q);
-        match s.schedule("bad", "this is not a cron", "out", b"x".to_vec()) {
-            Err(Error::InvalidExpression { .. }) => {}
-            Ok(_) => panic!("expected InvalidExpression"),
-            Err(other) => panic!("expected InvalidExpression, got {other:?}"),
+        // A seconds field, a year field and a step without a range are
+        // outside the 5-field syntax.
+        for expression in [
+            "this is not a cron",
+            "0 0 9 * * *",
+            "0 0 9 * * * 2030",
+            "5/5 * * * *",
+        ] {
+            match s.schedule("bad", expression, "out", b"x".to_vec()) {
+                Err(Error::InvalidExpression { .. }) => {}
+                Ok(_) => panic!("expected InvalidExpression for `{expression}`"),
+                Err(other) => panic!("expected InvalidExpression, got {other:?}"),
+            }
         }
     }
 
@@ -616,6 +637,8 @@ mod tests {
         s.schedule("hourly", "0 * * * *", "reports", b"y".to_vec())
             .unwrap();
         s.schedule("weekday-am", "0 9 * * 1-5", "reports", b"z".to_vec())
+            .unwrap();
+        s.schedule("stepped", "5-59/5 * * * *", "reports", b"w".to_vec())
             .unwrap();
     }
 

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Raised `croner` from 2 to 4: the parser rejects a step without a range,
+  so `5/5 * * * *` fails with `Error::InvalidExpression`. Write the range,
+  as in `5-59/5 * * * *`.
+- A `+` prefix on the day-of-week field now requires both day fields to
+  match, where croner 2 ignored the prefix. Remove the prefix to keep the
+  earlier firing times.
+
 ## [0.9.0] - 2026-09-16
 
 ### Added
