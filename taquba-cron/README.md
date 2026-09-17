@@ -84,11 +84,12 @@ than the lookback are skipped.
 
 ```rust
 use std::time::Duration;
-use taquba_cron::{Backfill, ScheduleOptions};
+use taquba_cron::{Backfill, BackfillStart, ScheduleOptions};
 
 let opts = ScheduleOptions {
     backfill: Some(Backfill {
         lookback: Duration::from_secs(6 * 60 * 60),
+        start: BackfillStart::CurrentTime,
     }),
     ..Default::default()
 };
@@ -99,11 +100,12 @@ two commit together. The watermark advances only when a firing is enqueued:
 an enqueue error under backfill keeps the schedule at the failed firing, and
 the scheduler retries it.
 
-A schedule without a watermark starts at the current time and does not
-replay a firing. To start a new schedule at an earlier time, write that time
-to `watermark_key(name)` before the registration. The value is the time as
-milliseconds since the Unix epoch in decimal. The first run then replays the
-occurrences after that time, within the lookback.
+`Backfill::start` determines the start of a schedule without a watermark.
+With `BackfillStart::CurrentTime` the schedule starts at the current time and
+does not replay a firing. With `BackfillStart::Lookback` the first run
+replays the occurrences within the lookback. That start requires a bounded
+lookback, and a registration with `Duration::MAX` fails with
+`Error::UnboundedStart`.
 
 The watermark records a position in the occurrence sequence and is
 independent of the expression. After an expression change, the scheduler

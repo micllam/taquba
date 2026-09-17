@@ -65,11 +65,12 @@
 //!
 //! ```
 //! use std::time::Duration;
-//! use taquba_cron::{Backfill, ScheduleOptions};
+//! use taquba_cron::{Backfill, BackfillStart, ScheduleOptions};
 //!
 //! let opts = ScheduleOptions {
 //!     backfill: Some(Backfill {
 //!         lookback: Duration::from_secs(6 * 60 * 60),
+//!         start: BackfillStart::CurrentTime,
 //!     }),
 //!     ..Default::default()
 //! };
@@ -80,11 +81,12 @@
 //! enqueued: an enqueue error under backfill keeps the schedule at the
 //! failed firing, and the scheduler retries it.
 //!
-//! A schedule without a watermark starts at the current time and does not
-//! replay a firing. To start a new schedule at an earlier time, write that
-//! time to [`watermark_key`] before the registration. The value is the time
-//! as milliseconds since the Unix epoch in decimal. The first run then
-//! replays the occurrences after that time, within the lookback.
+//! [`Backfill::start`] determines the start of a schedule without a
+//! watermark. With [`BackfillStart::CurrentTime`] the schedule starts at the
+//! current time and does not replay a firing. With
+//! [`BackfillStart::Lookback`] the first run replays the occurrences within
+//! the lookback. That start requires a bounded lookback, and a registration
+//! with `Duration::MAX` fails with [`Error::UnboundedStart`].
 //!
 //! The watermark records a position in the occurrence sequence and is
 //! independent of the expression. After an expression change, the scheduler
@@ -286,6 +288,10 @@ pub enum Error {
     /// A schedule header uses the reserved [`RESERVED_HEADER_PREFIX`].
     #[error("schedule header `{0}` uses the reserved `cron.` prefix")]
     ReservedHeader(String),
+    /// The schedule has [`BackfillStart::Lookback`] and a lookback that does
+    /// not bound the replay.
+    #[error("schedule `{0}` starts at the lookback, and the lookback is unbounded")]
+    UnboundedStart(String),
     /// The scheduler of this [`ScheduleHandle`] is stopped or dropped.
     #[error("the scheduler is stopped")]
     Stopped,
@@ -302,6 +308,22 @@ pub struct Backfill {
     /// replayed. `Duration::MAX` replays every occurrence since the
     /// watermark.
     pub lookback: Duration,
+    /// The start of a schedule without a watermark.
+    pub start: BackfillStart,
+}
+
+/// The start of a schedule under backfill that does not have a watermark: a
+/// new schedule, or a schedule after [`CronScheduler::clear_watermark`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackfillStart {
+    /// The schedule starts at the current time and does not replay a
+    /// firing.
+    CurrentTime,
+    /// The schedule replays the occurrences within [`Backfill::lookback`].
+    /// A lookback too large to subtract from the Unix epoch does not bound
+    /// that replay, and the registration fails with
+    /// [`Error::UnboundedStart`].
+    Lookback,
 }
 
 /// Per-schedule overrides for [`CronScheduler::schedule_with`]. Construct via
@@ -388,6 +410,12 @@ impl Registry {
             .find(|k| k.starts_with(RESERVED_HEADER_PREFIX))
         {
             return Err(Error::ReservedHeader(header.clone()));
+        }
+        if let Some(backfill) = &opts.backfill
+            && backfill.start == BackfillStart::Lookback
+            && lookback_floor(DateTime::UNIX_EPOCH, backfill.lookback).is_none()
+        {
+            return Err(Error::UnboundedStart(name));
         }
         let mut state = self.state.lock().unwrap();
         if state.stopped {
@@ -706,8 +734,8 @@ impl CronScheduler {
     }
 
     /// The instant after which the entry's first occurrence is searched:
-    /// `now` without backfill or without a watermark, otherwise the
-    /// persisted watermark, raised to the lookback floor.
+    /// `now` without backfill, the [`BackfillStart`] without a watermark,
+    /// otherwise the persisted watermark, raised to the lookback floor.
     async fn initial_anchor(
         &self,
         entry: &ScheduleEntry,
@@ -717,7 +745,11 @@ impl CronScheduler {
             return Ok(now);
         };
         let Some(raw) = self.queue.kv_get(&watermark_key(&entry.name)).await? else {
-            return Ok(now);
+            // The registration rejects a lookback without a floor.
+            return Ok(match backfill.start {
+                BackfillStart::CurrentTime => now,
+                BackfillStart::Lookback => lookback_floor(now, backfill.lookback).unwrap_or(now),
+            });
         };
         let Some(watermark) = parse_watermark(&raw) else {
             warn!(name = %entry.name, "malformed cron watermark; starting at the current time");
@@ -811,7 +843,20 @@ mod tests {
 
     fn backfill(lookback: Duration) -> ScheduleOptions {
         ScheduleOptions {
-            backfill: Some(Backfill { lookback }),
+            backfill: Some(Backfill {
+                lookback,
+                start: BackfillStart::CurrentTime,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn backfill_from_lookback(lookback: Duration) -> ScheduleOptions {
+        ScheduleOptions {
+            backfill: Some(Backfill {
+                lookback,
+                start: BackfillStart::Lookback,
+            }),
             ..Default::default()
         }
     }
@@ -1169,7 +1214,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_written_watermark_starts_the_replay_within_the_lookback() {
+    async fn the_lookback_bounds_the_replay() {
         let q = test_queue().await;
         let now = t0() + minutes(60);
         q.kv_put(&watermark_key("minutely"), ms(t0()).to_string().as_bytes())
@@ -1202,6 +1247,44 @@ mod tests {
         let expected: Vec<i64> = (1..=3).map(|m| ms(recent + minutes(m))).collect();
         assert_eq!(pending_fire_ms(&q, "recent").await, expected);
         assert_eq!(watermark(&q, "recent").await, Some(ms(now)));
+    }
+
+    #[tokio::test]
+    async fn a_schedule_without_a_watermark_starts_at_the_lookback() {
+        let q = test_queue().await;
+        let mut s = CronScheduler::new(q.clone());
+        s.schedule_with(
+            "minutely",
+            "* * * * *".parse().unwrap(),
+            "out",
+            b"x".to_vec(),
+            backfill_from_lookback(minutes(5)),
+        )
+        .unwrap();
+        let now = t0() + minutes(60);
+        let soonest = s.step(now).await.expect("satisfiable");
+        assert_eq!(soonest, now + minutes(1));
+
+        let expected: Vec<i64> = (56..=60).map(|m| ms(t0() + minutes(m))).collect();
+        assert_eq!(pending_fire_ms(&q, "out").await, expected);
+        assert_eq!(watermark(&q, "minutely").await, Some(ms(now)));
+    }
+
+    #[tokio::test]
+    async fn a_start_at_an_unbounded_lookback_is_rejected() {
+        let mut s = CronScheduler::new(test_queue().await);
+        let result = s.schedule_with(
+            "minutely",
+            "* * * * *".parse().unwrap(),
+            "out",
+            b"x".to_vec(),
+            backfill_from_lookback(Duration::MAX),
+        );
+        match result {
+            Err(Error::UnboundedStart(name)) => assert_eq!(name, "minutely"),
+            Err(other) => panic!("expected UnboundedStart, got {other:?}"),
+            Ok(_) => panic!("expected UnboundedStart"),
+        }
     }
 
     #[tokio::test]

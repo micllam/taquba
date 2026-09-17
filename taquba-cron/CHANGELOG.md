@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `PREVIOUS_FIRE_MS_HEADER` (`cron.previous_fire_ms`): every job has the
   occurrence of the expression before its firing time, so a worker reads
   the interval of the firing from two headers without a cron parser.
+- `Backfill::start` and `BackfillStart`: with `BackfillStart::Lookback` a
+  schedule without a watermark replays the occurrences within the lookback
+  at its first run, and an unbounded lookback fails with the new
+  `Error::UnboundedStart`. Add `start: BackfillStart::CurrentTime` to a
+  `Backfill` literal to keep the earlier start at the current time.
 
 ### Changed
 
