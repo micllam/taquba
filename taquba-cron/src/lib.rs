@@ -135,6 +135,13 @@
 //! the schedule resumes at the watermark. After the scheduler stops, a
 //! registration through the handle fails with [`Error::Stopped`].
 //!
+//! [`ScheduleHandle::replace_all`] takes the whole schedule set, for a
+//! consumer that builds the set from configuration. A schedule equal to a
+//! registered schedule is untouched and keeps its next firing. Every other
+//! schedule is a new registration, and a registered schedule that is absent
+//! from the set is removed. The call applies the whole set or, on an error,
+//! no part of it.
+//!
 //! # Cron syntax
 //!
 //! Expressions are 5-field POSIX cron, parsed by [`croner`]:
@@ -476,21 +483,27 @@ struct RegistryState {
     stopped: bool,
 }
 
+/// The checks of one schedule that do not depend on the registry.
+fn validate(schedule: &Schedule) -> Result<()> {
+    if let Some(header) = schedule
+        .headers
+        .keys()
+        .find(|k| k.starts_with(RESERVED_HEADER_PREFIX))
+    {
+        return Err(Error::ReservedHeader(header.clone()));
+    }
+    if let Some(backfill) = &schedule.backfill
+        && backfill.start == BackfillStart::Lookback
+        && lookback_floor(DateTime::UNIX_EPOCH, backfill.lookback).is_none()
+    {
+        return Err(Error::UnboundedStart(schedule.name.clone()));
+    }
+    Ok(())
+}
+
 impl Registry {
     fn register(&self, schedule: Schedule) -> Result<()> {
-        if let Some(header) = schedule
-            .headers
-            .keys()
-            .find(|k| k.starts_with(RESERVED_HEADER_PREFIX))
-        {
-            return Err(Error::ReservedHeader(header.clone()));
-        }
-        if let Some(backfill) = &schedule.backfill
-            && backfill.start == BackfillStart::Lookback
-            && lookback_floor(DateTime::UNIX_EPOCH, backfill.lookback).is_none()
-        {
-            return Err(Error::UnboundedStart(schedule.name));
-        }
+        validate(&schedule)?;
         let mut state = self.state.lock().unwrap();
         if state.stopped {
             return Err(Error::Stopped);
@@ -501,6 +514,42 @@ impl Registry {
         state.version += 1;
         state.entries.push(Arc::new(schedule));
         Ok(())
+    }
+
+    /// Replace the entries with `schedules` and return whether the set
+    /// changed. An entry equal to a schedule keeps its `Arc`, which
+    /// [`CronScheduler::sync`] uses to keep the position of the entry.
+    fn replace_all(&self, schedules: Vec<Schedule>) -> Result<bool> {
+        for (i, schedule) in schedules.iter().enumerate() {
+            validate(schedule)?;
+            if schedules[..i].iter().any(|s| s.name == schedule.name) {
+                return Err(Error::DuplicateName(schedule.name.clone()));
+            }
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.stopped {
+            return Err(Error::Stopped);
+        }
+        let mut kept = 0;
+        let entries: Vec<Arc<Schedule>> = schedules
+            .into_iter()
+            .map(
+                |schedule| match state.entries.iter().find(|e| ***e == schedule) {
+                    Some(entry) => {
+                        kept += 1;
+                        entry.clone()
+                    }
+                    None => Arc::new(schedule),
+                },
+            )
+            .collect();
+        // Names are unique on both sides, so equal counts mean equal sets.
+        if kept == entries.len() && kept == state.entries.len() {
+            return Ok(false);
+        }
+        state.version += 1;
+        state.entries = entries;
+        Ok(true)
     }
 }
 
@@ -539,6 +588,21 @@ impl ScheduleHandle {
     pub fn schedule(&self, schedule: Schedule) -> Result<()> {
         self.registry.register(schedule)?;
         self.registry.changed.notify_one();
+        Ok(())
+    }
+
+    /// Replace the registered schedules with `schedules`. A schedule equal
+    /// to a registered schedule is untouched and keeps its next firing. Every
+    /// other schedule is a new registration, and a registered schedule that
+    /// is absent from `schedules` is removed, as by [`Self::unschedule`].
+    ///
+    /// The call applies the whole set or, on an error, no part of it. It
+    /// fails with the errors of [`Self::schedule`], and with
+    /// [`Error::DuplicateName`] for a name that `schedules` contains twice.
+    pub fn replace_all(&self, schedules: Vec<Schedule>) -> Result<()> {
+        if self.registry.replace_all(schedules)? {
+            self.registry.changed.notify_one();
+        }
         Ok(())
     }
 
@@ -1084,6 +1148,90 @@ mod tests {
             b"x".to_vec(),
         ));
         assert!(matches!(result, Err(Error::Stopped)));
+        let result = handle.replace_all(Vec::new());
+        assert!(matches!(result, Err(Error::Stopped)));
+    }
+
+    #[tokio::test]
+    async fn replace_all_keeps_an_equal_schedule_and_registers_the_rest() {
+        let q = test_queue().await;
+        let mut s = CronScheduler::new(q.clone());
+        let handle = s.handle();
+        let minutely = |name: &str, queue: &str| {
+            Schedule::new(name, "* * * * *".parse().unwrap(), queue, b"x".to_vec())
+        };
+        handle
+            .replace_all(vec![
+                minutely("kept", "kept"),
+                minutely("changed", "before"),
+                minutely("removed", "removed"),
+            ])
+            .unwrap();
+        s.step(t0()).await;
+
+        handle
+            .replace_all(vec![
+                minutely("kept", "kept"),
+                minutely("changed", "after"),
+                minutely("added", "added"),
+            ])
+            .unwrap();
+
+        // The equal schedule keeps its next firing. A changed schedule and
+        // an added schedule start at the current time.
+        let now = t0() + minutes(1);
+        s.step(now).await;
+        assert_eq!(pending_fire_ms(&q, "kept").await, vec![ms(now)]);
+        for queue in ["before", "after", "removed", "added"] {
+            assert_eq!(pending_fire_ms(&q, queue).await, Vec::<i64>::new());
+        }
+
+        let now = t0() + minutes(2);
+        s.step(now).await;
+        for queue in ["after", "added"] {
+            assert_eq!(pending_fire_ms(&q, queue).await, vec![ms(now)]);
+        }
+        for queue in ["before", "removed"] {
+            assert_eq!(pending_fire_ms(&q, queue).await, Vec::<i64>::new());
+        }
+
+        // An equal set is not a change of the registry.
+        let version = s.registry.state.lock().unwrap().version;
+        handle
+            .replace_all(vec![
+                minutely("added", "added"),
+                minutely("kept", "kept"),
+                minutely("changed", "after"),
+            ])
+            .unwrap();
+        assert_eq!(s.registry.state.lock().unwrap().version, version);
+    }
+
+    #[tokio::test]
+    async fn replace_all_applies_nothing_when_a_schedule_is_rejected() {
+        let q = test_queue().await;
+        let s = CronScheduler::new(q);
+        let handle = s.handle();
+        let minutely =
+            |name: &str| Schedule::new(name, "* * * * *".parse().unwrap(), "out", b"x".to_vec());
+        handle.schedule(minutely("registered")).unwrap();
+
+        let reserved = minutely("reserved").headers(HashMap::from([(
+            FIRE_MS_HEADER.to_string(),
+            "0".to_string(),
+        )]));
+        let result = handle.replace_all(vec![minutely("first"), reserved]);
+        assert!(matches!(result, Err(Error::ReservedHeader(_))));
+
+        let result = handle.replace_all(vec![minutely("twice"), minutely("twice")]);
+        match result {
+            Err(Error::DuplicateName(name)) => assert_eq!(name, "twice"),
+            other => panic!("expected DuplicateName, got {other:?}"),
+        }
+
+        let state = s.registry.state.lock().unwrap();
+        let names: Vec<&str> = state.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["registered"]);
     }
 
     #[tokio::test]

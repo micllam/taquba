@@ -165,6 +165,12 @@ expression is an `unschedule` and a `schedule` with the same name, and the
 schedule resumes at the watermark. After the scheduler stops, a registration
 through the handle fails with `Error::Stopped`.
 
+`ScheduleHandle::replace_all` takes the whole schedule set, for a consumer
+that builds the set from configuration. A schedule equal to a registered
+schedule is untouched and keeps its next firing. Every other schedule is a
+new registration, and a registered schedule that is absent from the set is
+removed. The call applies the whole set or, on an error, no part of it.
+
 ## Cron syntax
 
 Expressions are 5-field POSIX cron, parsed by [`croner`](https://crates.io/crates/croner):
