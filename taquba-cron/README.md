@@ -102,6 +102,41 @@ longer registered is left in place; remove it with
 `CronScheduler::clear_watermark`. Keys under the `cron/` prefix of the KV
 namespace are reserved for this crate.
 
+## Changes while the scheduler runs
+
+`CronScheduler::handle` returns a `ScheduleHandle`, which registers and
+removes schedules before and during `CronScheduler::run`. The running
+scheduler applies a change before its next firing. A schedule registered
+through the handle starts at the time the scheduler applies it, or at its
+watermark under backfill.
+
+```rust
+use std::sync::Arc;
+use taquba::{Queue, object_store::memory::InMemory};
+use taquba_cron::CronScheduler;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = Arc::new(Queue::open(Arc::new(InMemory::new()), "demo").await?);
+
+    let scheduler = CronScheduler::new(queue);
+    let handle = scheduler.handle();
+    let worker = scheduler.spawn(std::future::pending::<()>());
+
+    let hourly = "0 * * * *".parse()?;
+    handle.schedule("hourly-sweep", hourly, "sweeps", b"sweep".to_vec())?;
+    assert!(handle.unschedule("hourly-sweep"));
+
+    worker.shutdown().await?;
+    Ok(())
+}
+```
+
+`ScheduleHandle::unschedule` keeps the backfill watermark. A change of an
+expression is an `unschedule` and a `schedule` with the same name, and the
+schedule resumes at the watermark. After the scheduler stops, a registration
+through the handle fails with `Error::Stopped`.
+
 ## Cron syntax
 
 Expressions are 5-field POSIX cron, parsed by [`croner`](https://crates.io/crates/croner):

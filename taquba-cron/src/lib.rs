@@ -83,6 +83,36 @@
 //! with [`CronScheduler::clear_watermark`]. Keys under the `cron/` prefix
 //! of the KV namespace are reserved for this crate.
 //!
+//! # Changes while the scheduler runs
+//!
+//! [`CronScheduler::handle`] returns a [`ScheduleHandle`], which registers
+//! and removes schedules before and during [`CronScheduler::run`]. The
+//! running scheduler applies a change before its next firing. A schedule
+//! registered through the handle starts at the time the scheduler applies
+//! it, or at its watermark under backfill.
+//!
+//! ```no_run
+//! # use std::sync::Arc;
+//! # use taquba::{Queue, object_store::memory::InMemory};
+//! # use taquba_cron::CronScheduler;
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! # let queue = Arc::new(Queue::open(Arc::new(InMemory::new()), "demo").await?);
+//! let scheduler = CronScheduler::new(queue);
+//! let handle = scheduler.handle();
+//! let worker = scheduler.spawn(std::future::pending::<()>());
+//!
+//! let hourly = "0 * * * *".parse()?;
+//! handle.schedule("hourly-sweep", hourly, "sweeps", b"sweep".to_vec())?;
+//! assert!(handle.unschedule("hourly-sweep"));
+//! # worker.shutdown().await?;
+//! # Ok(()) }
+//! ```
+//!
+//! [`ScheduleHandle::unschedule`] keeps the backfill watermark. A change of
+//! an expression is an `unschedule` and a `schedule` with the same name, and
+//! the schedule resumes at the watermark. After the scheduler stops, a
+//! registration through the handle fails with [`Error::Stopped`].
+//!
 //! # Cron syntax
 //!
 //! Expressions are 5-field POSIX cron, parsed by [`croner`]:
@@ -128,13 +158,14 @@
 #![warn(missing_docs)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use croner::Cron;
 use croner::parser::{CronParser, Seconds};
 use taquba::{EnqueueOptions, EnqueueResult, Queue, WorkerHandle};
+use tokio::sync::Notify;
 use tokio::time::sleep;
 use tracing::{debug, error, warn};
 
@@ -217,8 +248,7 @@ impl std::str::FromStr for Expression {
 /// Errors returned by [`CronScheduler`] and by the parse of an
 /// [`Expression`].
 ///
-/// Every variant is a permanent configuration error: retrying an
-/// identical call cannot succeed.
+/// Every variant is permanent: retrying an identical call cannot succeed.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The cron expression failed to parse.
@@ -235,6 +265,9 @@ pub enum Error {
     /// A schedule header uses the reserved [`RESERVED_HEADER_PREFIX`].
     #[error("schedule header `{0}` uses the reserved `cron.` prefix")]
     ReservedHeader(String),
+    /// The scheduler of this [`ScheduleHandle`] is stopped or dropped.
+    #[error("the scheduler is stopped")]
+    Stopped,
 }
 
 /// Result alias used throughout the crate.
@@ -292,20 +325,150 @@ struct ScheduleEntry {
     priority: Option<u32>,
     max_attempts: Option<u32>,
     backfill: Option<Backfill>,
-    /// The next firing to enqueue. `None` until the first tick
-    /// establishes it; under backfill it is held across a failed
-    /// enqueue so the firing is retried.
+}
+
+/// A registered entry and its position in the occurrence sequence.
+struct ActiveEntry {
+    entry: Arc<ScheduleEntry>,
+    /// The next firing to enqueue, `None` until the first tick sets it.
+    /// Under backfill it is kept across a failed enqueue, and the firing
+    /// is retried.
     next_fire: Option<DateTime<Utc>>,
+}
+
+/// The registered schedules, shared by a scheduler and its handles.
+struct Registry {
+    state: Mutex<RegistryState>,
+    changed: Notify,
+}
+
+#[derive(Default)]
+struct RegistryState {
+    entries: Vec<Arc<ScheduleEntry>>,
+    /// Incremented by every change of `entries`.
+    version: u64,
+    /// Set when the scheduler is dropped, which includes the return of
+    /// [`CronScheduler::run`].
+    stopped: bool,
+}
+
+impl Registry {
+    fn register(
+        &self,
+        name: String,
+        expression: Expression,
+        target_queue: String,
+        payload: Vec<u8>,
+        opts: ScheduleOptions,
+    ) -> Result<()> {
+        if let Some(header) = opts
+            .headers
+            .keys()
+            .find(|k| k.starts_with(RESERVED_HEADER_PREFIX))
+        {
+            return Err(Error::ReservedHeader(header.clone()));
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.stopped {
+            return Err(Error::Stopped);
+        }
+        if state.entries.iter().any(|e| e.name == name) {
+            return Err(Error::DuplicateName(name));
+        }
+        state.version += 1;
+        state.entries.push(Arc::new(ScheduleEntry {
+            name,
+            expression,
+            target_queue,
+            payload,
+            headers: opts.headers,
+            priority: opts.priority,
+            max_attempts: opts.max_attempts,
+            backfill: opts.backfill,
+        }));
+        Ok(())
+    }
 }
 
 /// A single-process cron scheduler that enqueues jobs onto a [`Queue`] when
 /// each of its registered expressions fires.
 ///
 /// Build with [`Self::new`], register entries with [`Self::schedule`] /
-/// [`Self::schedule_with`], then call [`Self::run`].
+/// [`Self::schedule_with`], then call [`Self::run`]. [`Self::handle`]
+/// registers and removes entries while the scheduler runs.
 pub struct CronScheduler {
     queue: Arc<Queue>,
-    entries: Vec<ScheduleEntry>,
+    registry: Arc<Registry>,
+    active: Vec<ActiveEntry>,
+    /// The registry version that `active` reflects.
+    synced: u64,
+}
+
+impl Drop for CronScheduler {
+    fn drop(&mut self) {
+        self.registry.state.lock().unwrap().stopped = true;
+    }
+}
+
+/// Registers and removes schedules on a [`CronScheduler`], before and
+/// during [`CronScheduler::run`]. The running scheduler applies a change
+/// before its next firing.
+#[derive(Clone)]
+pub struct ScheduleHandle {
+    registry: Arc<Registry>,
+}
+
+impl ScheduleHandle {
+    /// Register a schedule, as [`CronScheduler::schedule`] does. It fails
+    /// with [`Error::Stopped`] after the scheduler is dropped.
+    pub fn schedule(
+        &self,
+        name: impl Into<String>,
+        expression: Expression,
+        target_queue: impl Into<String>,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        self.schedule_with(
+            name,
+            expression,
+            target_queue,
+            payload,
+            ScheduleOptions::default(),
+        )
+    }
+
+    /// [`Self::schedule`] with per-schedule [`ScheduleOptions`].
+    pub fn schedule_with(
+        &self,
+        name: impl Into<String>,
+        expression: Expression,
+        target_queue: impl Into<String>,
+        payload: Vec<u8>,
+        opts: ScheduleOptions,
+    ) -> Result<()> {
+        self.registry
+            .register(name.into(), expression, target_queue.into(), payload, opts)?;
+        self.registry.changed.notify_one();
+        Ok(())
+    }
+
+    /// Remove the schedule `name` and return whether it was registered.
+    /// The backfill watermark of the schedule stays in place. A firing that
+    /// the scheduler enqueues during the call is still enqueued.
+    pub fn unschedule(&self, name: &str) -> bool {
+        let mut state = self.registry.state.lock().unwrap();
+        let before = state.entries.len();
+        state.entries.retain(|e| e.name != name);
+        let removed = state.entries.len() < before;
+        if removed {
+            state.version += 1;
+        }
+        drop(state);
+        if removed {
+            self.registry.changed.notify_one();
+        }
+        removed
+    }
 }
 
 impl CronScheduler {
@@ -313,7 +476,20 @@ impl CronScheduler {
     pub fn new(queue: Arc<Queue>) -> Self {
         Self {
             queue,
-            entries: Vec::new(),
+            registry: Arc::new(Registry {
+                state: Mutex::default(),
+                changed: Notify::new(),
+            }),
+            active: Vec::new(),
+            synced: 0,
+        }
+    }
+
+    /// A handle that registers and removes schedules while the scheduler
+    /// runs.
+    pub fn handle(&self) -> ScheduleHandle {
+        ScheduleHandle {
+            registry: self.registry.clone(),
         }
     }
 
@@ -349,28 +525,8 @@ impl CronScheduler {
         payload: Vec<u8>,
         opts: ScheduleOptions,
     ) -> Result<&mut Self> {
-        let name = name.into();
-        if self.entries.iter().any(|e| e.name == name) {
-            return Err(Error::DuplicateName(name));
-        }
-        if let Some(header) = opts
-            .headers
-            .keys()
-            .find(|k| k.starts_with(RESERVED_HEADER_PREFIX))
-        {
-            return Err(Error::ReservedHeader(header.clone()));
-        }
-        self.entries.push(ScheduleEntry {
-            name,
-            expression,
-            target_queue: target_queue.into(),
-            payload,
-            headers: opts.headers,
-            priority: opts.priority,
-            max_attempts: opts.max_attempts,
-            backfill: opts.backfill,
-            next_fire: None,
-        });
+        self.registry
+            .register(name.into(), expression, target_queue.into(), payload, opts)?;
         Ok(self)
     }
 
@@ -401,34 +557,56 @@ impl CronScheduler {
         F: std::future::Future<Output = ()>,
     {
         tokio::pin!(shutdown);
-
-        // Nothing to fire: just wait for shutdown rather than spin a no-op
-        // loop with a fallback sleep.
-        if self.entries.is_empty() {
-            shutdown.await;
-            return Ok(());
-        }
+        let registry = self.registry.clone();
 
         loop {
-            let Some(soonest) = self.step(self.now()).await else {
-                // All registered expressions are unsatisfiable (e.g.
-                // `0 0 30 2 *`); cron expressions are static, so this
-                // state can't change. Wait for shutdown rather than spin
-                // a no-op loop.
-                let names: Vec<&str> = self.entries.iter().map(|e| e.name.as_str()).collect();
+            let soonest = self.step(self.now()).await;
+            if soonest.is_none() && !self.active.is_empty() {
+                // Every registered expression is unsatisfiable (for
+                // example `0 0 30 2 *`), so the loop waits for a change
+                // of the registry or for shutdown.
+                let names: Vec<&str> = self.active.iter().map(|a| a.entry.name.as_str()).collect();
                 warn!(
                     schedules = ?names,
                     "all registered cron expressions are unsatisfiable; scheduler will not fire any jobs"
                 );
-                shutdown.await;
-                return Ok(());
+            }
+            let sleep_for = soonest.map(|at| (at - self.now()).to_std().unwrap_or(Duration::ZERO));
+            let timer = async {
+                match sleep_for {
+                    Some(duration) => sleep(duration).await,
+                    None => std::future::pending().await,
+                }
             };
 
-            let sleep_for = (soonest - self.now()).to_std().unwrap_or(Duration::ZERO);
-
             tokio::select! {
-                _ = sleep(sleep_for) => {}
+                biased;
                 _ = &mut shutdown => return Ok(()),
+                _ = registry.changed.notified() => {}
+                _ = timer => {}
+            }
+        }
+    }
+
+    /// Bring `active` in line with the registry: a removed entry leaves,
+    /// and a new entry starts without a next firing.
+    fn sync(&mut self) {
+        let entries = {
+            let state = self.registry.state.lock().unwrap();
+            if state.version == self.synced {
+                return;
+            }
+            self.synced = state.version;
+            state.entries.clone()
+        };
+        self.active
+            .retain(|a| entries.iter().any(|e| Arc::ptr_eq(e, &a.entry)));
+        for entry in entries {
+            if !self.active.iter().any(|a| Arc::ptr_eq(&a.entry, &entry)) {
+                self.active.push(ActiveEntry {
+                    entry,
+                    next_fire: None,
+                });
             }
         }
     }
@@ -445,9 +623,10 @@ impl CronScheduler {
     /// enqueue under backfill), or `None` if every expression is
     /// unsatisfiable.
     async fn step(&mut self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.sync();
         let mut soonest: Option<DateTime<Utc>> = None;
 
-        for i in 0..self.entries.len() {
+        for i in 0..self.active.len() {
             if let Some(wake) = self.tick_entry(i, now).await {
                 soonest = Some(soonest.map_or(wake, |s| s.min(wake)));
             }
@@ -467,51 +646,52 @@ impl CronScheduler {
     /// order, and a failed enqueue leaves `next_fire` in place for a
     /// retry after [`ENQUEUE_RETRY_DELAY`].
     async fn tick_entry(&mut self, i: usize, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        if self.entries[i].next_fire.is_none() {
-            let anchor = match self.initial_anchor(i, now).await {
+        let entry = self.active[i].entry.clone();
+        if self.active[i].next_fire.is_none() {
+            let anchor = match self.initial_anchor(&entry, now).await {
                 Ok(anchor) => anchor,
                 Err(e) => {
-                    error!(name = %self.entries[i].name, error = %e, "failed to read cron watermark");
+                    error!(name = %entry.name, error = %e, "failed to read cron watermark");
                     return Some(now + ENQUEUE_RETRY_DELAY);
                 }
             };
-            let entry = &mut self.entries[i];
-            entry.next_fire = entry.expression.next_after(anchor);
+            self.active[i].next_fire = entry.expression.next_after(anchor);
         }
 
-        while let Some(fire_at) = self.entries[i].next_fire
+        while let Some(fire_at) = self.active[i].next_fire
             && fire_at <= now
         {
-            match self.fire(i, fire_at).await {
+            match self.fire(&entry, fire_at).await {
                 Ok(()) => {
-                    let entry = &mut self.entries[i];
                     let anchor = if entry.backfill.is_some() {
                         fire_at
                     } else {
                         now
                     };
-                    entry.next_fire = entry.expression.next_after(anchor);
+                    self.active[i].next_fire = entry.expression.next_after(anchor);
                 }
                 Err(e) => {
-                    let entry = &mut self.entries[i];
                     error!(name = %entry.name, error = %e, "failed to enqueue cron job");
                     if entry.backfill.is_some() {
                         return Some(now + ENQUEUE_RETRY_DELAY);
                     }
-                    entry.next_fire = entry.expression.next_after(now);
+                    self.active[i].next_fire = entry.expression.next_after(now);
                     break;
                 }
             }
         }
 
-        self.entries[i].next_fire
+        self.active[i].next_fire
     }
 
     /// The instant after which the entry's first occurrence is searched:
     /// `now` without backfill or without a watermark, otherwise the
     /// persisted watermark, raised to the lookback floor.
-    async fn initial_anchor(&self, i: usize, now: DateTime<Utc>) -> taquba::Result<DateTime<Utc>> {
-        let entry = &self.entries[i];
+    async fn initial_anchor(
+        &self,
+        entry: &ScheduleEntry,
+        now: DateTime<Utc>,
+    ) -> taquba::Result<DateTime<Utc>> {
         let Some(backfill) = &entry.backfill else {
             return Ok(now);
         };
@@ -536,11 +716,10 @@ impl CronScheduler {
         }
     }
 
-    /// Enqueue the firing of entry `i` at `fire_at`. Under backfill the
+    /// Enqueue the firing of `entry` at `fire_at`. Under backfill the
     /// watermark is written in the enqueue transaction; a dedup hit
     /// applies no KV write, so the watermark is then advanced separately.
-    async fn fire(&self, i: usize, fire_at: DateTime<Utc>) -> taquba::Result<()> {
-        let entry = &self.entries[i];
+    async fn fire(&self, entry: &ScheduleEntry, fire_at: DateTime<Utc>) -> taquba::Result<()> {
         let fire_ms = fire_at.timestamp_millis();
         let mut headers = entry.headers.clone();
         headers.insert(FIRE_MS_HEADER.to_string(), fire_ms.to_string());
@@ -677,6 +856,113 @@ mod tests {
             Err(other) => panic!("expected DuplicateName, got {other:?}"),
             Ok(_) => panic!("expected DuplicateName"),
         }
+        // A handle registers into the name set of its scheduler.
+        let result = s.handle().schedule(
+            "once",
+            "0 11 * * *".parse().unwrap(),
+            "reports3",
+            b"z".to_vec(),
+        );
+        assert!(matches!(result, Err(Error::DuplicateName(name)) if name == "once"));
+    }
+
+    #[tokio::test]
+    async fn a_schedule_registered_through_the_handle_fires() {
+        let q = test_queue().await;
+        let mut s = CronScheduler::new(q.clone());
+        let handle = s.handle();
+        assert_eq!(s.step(t0()).await, None);
+
+        handle
+            .schedule(
+                "minutely",
+                "* * * * *".parse().unwrap(),
+                "out",
+                b"x".to_vec(),
+            )
+            .unwrap();
+        assert_eq!(s.step(t0()).await, Some(t0() + minutes(1)));
+        s.step(t0() + minutes(1)).await;
+        assert_eq!(
+            pending_fire_ms(&q, "out").await,
+            vec![ms(t0() + minutes(1))]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unscheduled_entry_stops_firing_and_releases_its_name() {
+        let q = test_queue().await;
+        let mut s = CronScheduler::new(q.clone());
+        s.schedule(
+            "minutely",
+            "* * * * *".parse().unwrap(),
+            "out",
+            b"x".to_vec(),
+        )
+        .unwrap();
+        let handle = s.handle();
+        s.step(t0()).await;
+
+        assert!(handle.unschedule("minutely"));
+        assert!(!handle.unschedule("minutely"));
+        assert_eq!(s.step(t0() + minutes(1)).await, None);
+        assert_eq!(q.stats("out").await.unwrap().pending, 0);
+
+        // The entry registered again starts at the current time.
+        handle
+            .schedule(
+                "minutely",
+                "* * * * *".parse().unwrap(),
+                "out",
+                b"x".to_vec(),
+            )
+            .unwrap();
+        assert_eq!(s.step(t0() + minutes(5)).await, Some(t0() + minutes(6)));
+        assert_eq!(q.stats("out").await.unwrap().pending, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_applies_a_handle_change_while_it_waits() {
+        let (q, clock) = mock_clock_queue(t0() + Duration::from_secs(30)).await;
+        let s = CronScheduler::new(q.clone());
+        let handle = s.handle();
+        let (stop, shutdown) = tokio::sync::oneshot::channel::<()>();
+        let run = tokio::spawn(s.run(async {
+            let _ = shutdown.await;
+        }));
+        // The scheduler waits without an entry and without a timer.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        handle
+            .schedule(
+                "minutely",
+                "* * * * *".parse().unwrap(),
+                "out",
+                b"x".to_vec(),
+            )
+            .unwrap();
+        // The entry starts at the time the loop applies it. The loop runs
+        // before the clock advances.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        clock.advance(Duration::from_secs(30));
+        let mut fired = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if q.stats("out").await.unwrap().pending == 1 {
+                fired = true;
+                break;
+            }
+        }
+        assert!(fired, "the run loop must apply the registration");
+        assert_eq!(
+            pending_fire_ms(&q, "out").await,
+            vec![ms(t0() + minutes(1))]
+        );
+
+        stop.send(()).unwrap();
+        run.await.unwrap().unwrap();
+        let result = handle.schedule("late", "* * * * *".parse().unwrap(), "out", b"x".to_vec());
+        assert!(matches!(result, Err(Error::Stopped)));
     }
 
     #[tokio::test]
@@ -716,7 +1002,7 @@ mod tests {
             },
         )
         .unwrap();
-        let entry = &s.entries[0];
+        let entry = s.registry.state.lock().unwrap().entries[0].clone();
         assert_eq!(entry.priority, Some(taquba::PRIORITY_HIGH));
         assert_eq!(entry.max_attempts, Some(7));
     }
@@ -892,7 +1178,7 @@ mod tests {
         let now = t0() + minutes(2);
         let soonest = s.step(now).await.expect("retry scheduled");
         assert_eq!(soonest, now + ENQUEUE_RETRY_DELAY);
-        assert_eq!(s.entries[0].next_fire, Some(t0() + minutes(1)));
+        assert_eq!(s.active[0].next_fire, Some(t0() + minutes(1)));
         assert_eq!(watermark(&q, "minutely").await, None);
     }
 

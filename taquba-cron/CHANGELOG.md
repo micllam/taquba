@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `CronScheduler::handle` and `ScheduleHandle`: register and remove
+  schedules while the scheduler runs, so a change of the schedule set does
+  not need a restart of the scheduler. A registration after the scheduler
+  stops fails with the new `Error::Stopped`.
+
 ### Changed
 
 - `CronScheduler::schedule` and `CronScheduler::schedule_with` take the new
