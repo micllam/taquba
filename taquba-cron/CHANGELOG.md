@@ -26,7 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `CronScheduler::schedule` and `CronScheduler::schedule_with` take the new
   `Expression` type, so a parse failure is reported before a scheduler
-  exists. Parse the string at the call, as in `"0 9 * * *".parse()?`.
+  exists. `Expression` implements `PartialEq`, `Eq` and `Display` over its
+  normalised text. Parse the string at the call, as in
+  `"0 9 * * *".parse()?`.
 - Raised `croner` from 2 to 4: the parser rejects a step without a range,
   so `5/5 * * * *` fails with `Error::InvalidExpression`. Write the range,
   as in `5-59/5 * * * *`.

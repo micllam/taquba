@@ -238,8 +238,29 @@ fn lookback_floor(now: DateTime<Utc>, lookback: Duration) -> Option<DateTime<Utc
 /// let expression: Expression = "0 9 * * 1-5".parse()?;
 /// # Ok::<(), taquba_cron::Error>(())
 /// ```
+///
+/// The `Display` form is the text as the parser normalises it: trimmed, in
+/// upper case, and with a month name, a day name or a nickname such as
+/// `@daily` written as numbers. It parses to an equal expression. Two
+/// expressions are equal when their `Display` forms are equal, so
+/// `0 9 * * mon-fri` equals `0 9 * * 1-5`, and `*/5 * * * *` does not equal
+/// `0-59/5 * * * *`.
 #[derive(Debug, Clone)]
 pub struct Expression(Cron);
+
+impl PartialEq for Expression {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_str() == other.0.as_str()
+    }
+}
+
+impl Eq for Expression {}
+
+impl std::fmt::Display for Expression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 impl Expression {
     /// The first occurrence after `anchor`, or `None` for an expression
@@ -934,6 +955,26 @@ mod tests {
                 Err(other) => panic!("expected InvalidExpression, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn an_expression_displays_and_compares_its_normalised_text() {
+        for (text, display) in [
+            ("*/5 * * * *", "*/5 * * * *"),
+            (" 0 9 * * mon-fri ", "0 9 * * 1-5"),
+            ("0  9 * * *", "0  9 * * *"),
+            ("0 0 l * *", "0 0 L * *"),
+            ("@daily", "0 0 * * *"),
+        ] {
+            let expression: Expression = text.parse().unwrap();
+            assert_eq!(expression.to_string(), display);
+            assert_eq!(expression, display.parse().unwrap());
+        }
+
+        // The comparison is of the text, so an equivalent expression in
+        // another form is unequal.
+        let every_five: Expression = "*/5 * * * *".parse().unwrap();
+        assert_ne!(every_five, "0-59/5 * * * *".parse().unwrap());
     }
 
     #[tokio::test]
