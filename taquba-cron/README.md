@@ -27,15 +27,26 @@ cargo add tokio --features full
 ```rust
 use std::sync::Arc;
 use taquba::{Queue, object_store::memory::InMemory};
-use taquba_cron::CronScheduler;
+use taquba_cron::{CronScheduler, Schedule};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let queue = Arc::new(Queue::open(Arc::new(InMemory::new()), "demo").await?);
 
-    let mut scheduler = CronScheduler::new(queue);
-    scheduler.schedule("daily-report", "0 9 * * *".parse()?, "reports", b"daily".to_vec())?;
-    scheduler.schedule("hourly-sweep", "0 * * * *".parse()?, "sweeps", b"sweep".to_vec())?;
+    let scheduler = CronScheduler::new(queue);
+    let handle = scheduler.handle();
+    handle.schedule(Schedule::new(
+        "daily-report",
+        "0 9 * * *".parse()?,
+        "reports",
+        b"daily".to_vec(),
+    ))?;
+    handle.schedule(Schedule::new(
+        "hourly-sweep",
+        "0 * * * *".parse()?,
+        "sweeps",
+        b"sweep".to_vec(),
+    ))?;
 
     scheduler.run(std::future::pending::<()>()).await?;
     Ok(())
@@ -47,19 +58,17 @@ returns a `taquba::WorkerHandle` that stops it.
 
 ## Per-schedule options
 
-`schedule_with` accepts a `ScheduleOptions` for per-schedule overrides
-(HTTP-style headers, priority, max attempts, backfill):
+A `Schedule` has a setter for each optional field: HTTP-style headers, a
+priority, a maximum attempt count and backfill.
 
 ```rust
 use std::collections::HashMap;
-use taquba_cron::ScheduleOptions;
+use taquba_cron::Schedule;
 
-let opts = ScheduleOptions {
-    headers: HashMap::from([("target_url".into(), "https://example.com/hook".into())]),
-    priority: Some(taquba::PRIORITY_HIGH),
-    max_attempts: Some(10),
-    ..Default::default()
-};
+let schedule = Schedule::new("hook", "0 9 * * *".parse()?, "hooks", b"ping".to_vec())
+    .headers(HashMap::from([("target_url".into(), "https://example.com/hook".into())]))
+    .priority(Some(taquba::PRIORITY_HIGH))
+    .max_attempts(Some(10));
 ```
 
 Every enqueued job has the header `cron.fire_ms` (`FIRE_MS_HEADER`), the
@@ -73,26 +82,24 @@ a header is rejected.
 
 ## Backfill
 
-By default a firing missed while the scheduler is not running is dropped.
-A schedule that opts in with `ScheduleOptions::backfill` replays missed
-firings instead: the scheduler persists the time of the last enqueued
-firing in the queue's KV namespace under `watermark_key(name)`
-(`cron/watermark/{name}`), and on start enqueues one job per occurrence
-between that watermark and the current time, oldest first, before resuming
-live firings. `Backfill::lookback` bounds the replay: occurrences older
-than the lookback are skipped.
+By default the scheduler drops a firing that it misses while it is not
+running. A schedule with `Schedule::backfill` replays missed firings. The
+scheduler stores the time of the last enqueued firing in the queue's KV
+namespace, at the key `watermark_key(name)` (`cron/watermark/{name}`). On
+start it enqueues one job per occurrence between that watermark and the
+current time, oldest first, and then resumes live firings.
+`Backfill::lookback` bounds the replay, and the scheduler skips an occurrence
+older than the lookback.
 
 ```rust
 use std::time::Duration;
-use taquba_cron::{Backfill, BackfillStart, ScheduleOptions};
+use taquba_cron::{Backfill, BackfillStart, Schedule};
 
-let opts = ScheduleOptions {
-    backfill: Some(Backfill {
+let schedule = Schedule::new("sweep", "0 * * * *".parse()?, "sweeps", b"sweep".to_vec())
+    .backfill(Some(Backfill {
         lookback: Duration::from_secs(6 * 60 * 60),
         start: BackfillStart::CurrentTime,
-    }),
-    ..Default::default()
-};
+    }));
 ```
 
 The scheduler writes the watermark in the transaction of the enqueue, so the
@@ -130,7 +137,7 @@ watermark under backfill.
 ```rust
 use std::sync::Arc;
 use taquba::{Queue, object_store::memory::InMemory};
-use taquba_cron::CronScheduler;
+use taquba_cron::{CronScheduler, Schedule};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -140,8 +147,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handle = scheduler.handle();
     let worker = scheduler.spawn(std::future::pending::<()>());
 
-    let hourly = "0 * * * *".parse()?;
-    handle.schedule("hourly-sweep", hourly, "sweeps", b"sweep".to_vec())?;
+    handle.schedule(Schedule::new(
+        "hourly-sweep",
+        "0 * * * *".parse()?,
+        "sweeps",
+        b"sweep".to_vec(),
+    ))?;
     assert!(handle.unschedule("hourly-sweep"));
 
     worker.shutdown().await?;
@@ -184,7 +195,7 @@ opened with (`Queue::clock`).
   more than one job.
 - **No backfill by default.** If the scheduler is offline when a firing
   should have happened, the missed firing is dropped, and the next firing is
-  the next future occurrence. A schedule with `ScheduleOptions::backfill` set
+  the next future occurrence. A schedule with `Schedule::backfill` set
   replays the missed firings within its lookback exactly once. Only the
   persisted watermark stops a firing from being enqueued twice, because claiming
   a job releases its dedup key.

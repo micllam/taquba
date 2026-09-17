@@ -10,13 +10,18 @@
 //! ```no_run
 //! use std::sync::Arc;
 //! use taquba::{Queue, object_store::memory::InMemory};
-//! use taquba_cron::CronScheduler;
+//! use taquba_cron::{CronScheduler, Schedule};
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let queue = Arc::new(Queue::open(Arc::new(InMemory::new()), "demo").await?);
 //!
-//! let mut scheduler = CronScheduler::new(queue);
-//! scheduler.schedule("daily-report", "0 9 * * *".parse()?, "reports", b"daily".to_vec())?;
+//! let scheduler = CronScheduler::new(queue);
+//! scheduler.handle().schedule(Schedule::new(
+//!     "daily-report",
+//!     "0 9 * * *".parse()?,
+//!     "reports",
+//!     b"daily".to_vec(),
+//! ))?;
 //!
 //! scheduler.run(std::future::pending::<()>()).await?;
 //! # Ok(()) }
@@ -27,20 +32,18 @@
 //!
 //! # Per-schedule options
 //!
-//! [`CronScheduler::schedule_with`] accepts a [`ScheduleOptions`] for
-//! per-schedule overrides (HTTP-style headers, priority, max attempts,
-//! backfill):
+//! A [`Schedule`] has a setter for each optional field: HTTP-style headers,
+//! a priority, a maximum attempt count and backfill.
 //!
 //! ```
 //! use std::collections::HashMap;
-//! use taquba_cron::ScheduleOptions;
+//! use taquba_cron::Schedule;
 //!
-//! let opts = ScheduleOptions {
-//!     headers: HashMap::from([("target_url".into(), "https://example.com/hook".into())]),
-//!     priority: Some(taquba::PRIORITY_HIGH),
-//!     max_attempts: Some(10),
-//!     ..Default::default()
-//! };
+//! let schedule = Schedule::new("hook", "0 9 * * *".parse()?, "hooks", b"ping".to_vec())
+//!     .headers(HashMap::from([("target_url".into(), "https://example.com/hook".into())]))
+//!     .priority(Some(taquba::PRIORITY_HIGH))
+//!     .max_attempts(Some(10));
+//! # Ok::<(), taquba_cron::Error>(())
 //! ```
 //!
 //! Every enqueued job has the header [`FIRE_MS_HEADER`] (`cron.fire_ms`),
@@ -54,26 +57,24 @@
 //!
 //! # Backfill
 //!
-//! By default a firing missed while the scheduler is not running is
-//! dropped. A schedule that opts in with [`ScheduleOptions::backfill`]
-//! replays missed firings instead: the scheduler persists the time of the
-//! last enqueued firing in the queue's KV namespace under
-//! [`watermark_key`], and on start enqueues one job per occurrence between
-//! that watermark and the current time, oldest first, before resuming
-//! live firings. [`Backfill::lookback`] bounds the replay: occurrences
-//! older than the lookback are skipped.
+//! By default the scheduler drops a firing that it misses while it is not
+//! running. A schedule with [`Schedule::backfill`] replays missed firings.
+//! The scheduler stores the time of the last enqueued firing in the queue's
+//! KV namespace, at the key [`watermark_key`]. On start it enqueues one job
+//! per occurrence between that watermark and the current time, oldest first,
+//! and then resumes live firings. [`Backfill::lookback`] bounds the replay,
+//! and the scheduler skips an occurrence older than the lookback.
 //!
 //! ```
 //! use std::time::Duration;
-//! use taquba_cron::{Backfill, BackfillStart, ScheduleOptions};
+//! use taquba_cron::{Backfill, BackfillStart, Schedule};
 //!
-//! let opts = ScheduleOptions {
-//!     backfill: Some(Backfill {
+//! let schedule = Schedule::new("sweep", "0 * * * *".parse()?, "sweeps", b"sweep".to_vec())
+//!     .backfill(Some(Backfill {
 //!         lookback: Duration::from_secs(6 * 60 * 60),
 //!         start: BackfillStart::CurrentTime,
-//!     }),
-//!     ..Default::default()
-//! };
+//!     }));
+//! # Ok::<(), taquba_cron::Error>(())
 //! ```
 //!
 //! The scheduler writes the watermark in the transaction of the enqueue, so
@@ -111,15 +112,19 @@
 //! ```no_run
 //! # use std::sync::Arc;
 //! # use taquba::{Queue, object_store::memory::InMemory};
-//! # use taquba_cron::CronScheduler;
+//! # use taquba_cron::{CronScheduler, Schedule};
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! # let queue = Arc::new(Queue::open(Arc::new(InMemory::new()), "demo").await?);
 //! let scheduler = CronScheduler::new(queue);
 //! let handle = scheduler.handle();
 //! let worker = scheduler.spawn(std::future::pending::<()>());
 //!
-//! let hourly = "0 * * * *".parse()?;
-//! handle.schedule("hourly-sweep", hourly, "sweeps", b"sweep".to_vec())?;
+//! handle.schedule(Schedule::new(
+//!     "hourly-sweep",
+//!     "0 * * * *".parse()?,
+//!     "sweeps",
+//!     b"sweep".to_vec(),
+//! ))?;
 //! assert!(handle.unschedule("hourly-sweep"));
 //! # worker.shutdown().await?;
 //! # Ok(()) }
@@ -161,7 +166,7 @@
 //! - **No backfill by default.** If the scheduler is offline when a firing
 //!   should have happened, the missed firing is dropped, and the next firing
 //!   is the next *future* occurrence. A schedule with
-//!   [`ScheduleOptions::backfill`] set replays the missed firings within its
+//!   [`Schedule::backfill`] set replays the missed firings within its
 //!   lookback exactly once. Only the persisted watermark stops a firing from
 //!   being enqueued twice, because claiming a job releases its dedup key.
 //! - **Single-instance schedules.** A given schedule (identified by `name`)
@@ -196,8 +201,8 @@ pub const FIRE_MS_HEADER: &str = "cron.fire_ms";
 pub const PREVIOUS_FIRE_MS_HEADER: &str = "cron.previous_fire_ms";
 
 /// Prefix of the header names reserved for this crate. A schedule whose
-/// [`ScheduleOptions::headers`] contains a name with this prefix is
-/// rejected with [`Error::ReservedHeader`].
+/// [`Schedule::headers`] contains a name with this prefix is rejected with
+/// [`Error::ReservedHeader`].
 pub const RESERVED_HEADER_PREFIX: &str = "cron.";
 
 /// Prefix of every watermark key in the queue's KV namespace.
@@ -229,8 +234,7 @@ fn lookback_floor(now: DateTime<Utc>, lookback: Duration) -> Option<DateTime<Utc
         .and_then(|d| now.checked_sub_signed(d))
 }
 
-/// A parsed 5-field cron expression, the parameter type of
-/// [`CronScheduler::schedule`].
+/// A parsed 5-field cron expression, the type of [`Schedule::expression`].
 ///
 /// ```
 /// use taquba_cron::Expression;
@@ -328,7 +332,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Replay policy for firings missed while the scheduler was not running.
 /// See the crate documentation, section "Backfill".
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Backfill {
     /// Occurrences at or before this far before the current time are not
     /// replayed. `Duration::MAX` replays every occurrence since the
@@ -352,53 +356,104 @@ pub enum BackfillStart {
     Lookback,
 }
 
-/// Per-schedule overrides for [`CronScheduler::schedule_with`]. Construct via
-/// [`ScheduleOptions::default`] + struct-update syntax:
+/// A named cron expression with the job that each firing enqueues, the
+/// parameter type of [`ScheduleHandle::schedule`].
 ///
 /// ```
 /// use std::collections::HashMap;
-/// use taquba_cron::ScheduleOptions;
+/// use taquba_cron::Schedule;
 ///
-/// let opts = ScheduleOptions {
-///     headers: HashMap::from([("target_url".into(), "https://example.com/hook".into())]),
-///     priority: Some(taquba::PRIORITY_HIGH),
-///     ..ScheduleOptions::default()
-/// };
+/// let schedule = Schedule::new("hook", "0 9 * * *".parse()?, "hooks", b"ping".to_vec())
+///     .headers(HashMap::from([("target_url".into(), "https://example.com/hook".into())]))
+///     .priority(Some(taquba::PRIORITY_HIGH));
+/// # Ok::<(), taquba_cron::Error>(())
 /// ```
-#[derive(Debug, Clone, Default)]
-pub struct ScheduleOptions {
-    /// Headers attached to every [`taquba::JobRecord`] produced by this
-    /// schedule. Useful for cron-driven webhooks (target URL, signing key
-    /// id) or alert routing metadata. Names with the
-    /// [`RESERVED_HEADER_PREFIX`] are rejected.
+///
+/// Two schedules are equal when every field is equal. The expression
+/// compares by its normalised text, so an equivalent expression in another
+/// form makes two schedules unequal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Schedule {
+    /// The name of the schedule, unique within a scheduler. It is part of
+    /// the [`taquba::EnqueueOptions::dedup_key`] of every enqueued job
+    /// (`"cron:{name}:{fire_time_ms}"`) and of the backfill watermark key,
+    /// so it must be stable across restarts.
+    pub name: String,
+    /// The expression whose occurrences are the firing times.
+    pub expression: Expression,
+    /// The queue on which each firing enqueues a job.
+    pub queue: String,
+    /// The payload of every enqueued job.
+    pub payload: Vec<u8>,
+    /// The headers of every enqueued job, for example the target URL of a
+    /// webhook. The registration rejects a name with the
+    /// [`RESERVED_HEADER_PREFIX`].
     pub headers: HashMap<String, String>,
-    /// Override the queue's `default_priority` for jobs produced by this
-    /// schedule. `None` (default) inherits the queue config. Lower numbers
-    /// are claimed first; see [`taquba::PRIORITY_HIGH`], [`taquba::PRIORITY_NORMAL`],
+    /// The priority of the enqueued jobs. `None` inherits the
+    /// `default_priority` of the queue. A lower number is claimed first, as
+    /// in [`taquba::PRIORITY_HIGH`], [`taquba::PRIORITY_NORMAL`] and
     /// [`taquba::PRIORITY_LOW`].
     pub priority: Option<u32>,
-    /// Override the queue's `max_attempts` for jobs produced by this
-    /// schedule. `None` (default) inherits the queue config.
+    /// The maximum attempt count of the enqueued jobs. `None` inherits the
+    /// `max_attempts` of the queue.
     pub max_attempts: Option<u32>,
-    /// Replay firings missed while the scheduler was not running. `None`
-    /// (default) drops them.
+    /// The replay policy for firings missed while the scheduler is not
+    /// running. With `None` the scheduler drops them.
     pub backfill: Option<Backfill>,
 }
 
-struct ScheduleEntry {
-    name: String,
-    expression: Expression,
-    target_queue: String,
-    payload: Vec<u8>,
-    headers: HashMap<String, String>,
-    priority: Option<u32>,
-    max_attempts: Option<u32>,
-    backfill: Option<Backfill>,
+impl Schedule {
+    /// A schedule without headers, overrides or backfill.
+    pub fn new(
+        name: impl Into<String>,
+        expression: Expression,
+        queue: impl Into<String>,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            expression,
+            queue: queue.into(),
+            payload,
+            headers: HashMap::new(),
+            priority: None,
+            max_attempts: None,
+            backfill: None,
+        }
+    }
+
+    /// Set [`Self::headers`].
+    #[must_use]
+    pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// Set [`Self::priority`].
+    #[must_use]
+    pub fn priority(mut self, priority: Option<u32>) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Set [`Self::max_attempts`].
+    #[must_use]
+    pub fn max_attempts(mut self, max_attempts: Option<u32>) -> Self {
+        self.max_attempts = max_attempts;
+        self
+    }
+
+    /// Set [`Self::backfill`].
+    #[must_use]
+    pub fn backfill(mut self, backfill: Option<Backfill>) -> Self {
+        self.backfill = backfill;
+        self
+    }
 }
 
 /// A registered entry and its position in the occurrence sequence.
 struct ActiveEntry {
-    entry: Arc<ScheduleEntry>,
+    entry: Arc<Schedule>,
     /// The next firing to enqueue, `None` until the first tick sets it.
     /// Under backfill it is kept across a failed enqueue, and the firing
     /// is retried.
@@ -413,7 +468,7 @@ struct Registry {
 
 #[derive(Default)]
 struct RegistryState {
-    entries: Vec<Arc<ScheduleEntry>>,
+    entries: Vec<Arc<Schedule>>,
     /// Incremented by every change of `entries`.
     version: u64,
     /// Set when the scheduler is dropped, which includes the return of
@@ -422,45 +477,29 @@ struct RegistryState {
 }
 
 impl Registry {
-    fn register(
-        &self,
-        name: String,
-        expression: Expression,
-        target_queue: String,
-        payload: Vec<u8>,
-        opts: ScheduleOptions,
-    ) -> Result<()> {
-        if let Some(header) = opts
+    fn register(&self, schedule: Schedule) -> Result<()> {
+        if let Some(header) = schedule
             .headers
             .keys()
             .find(|k| k.starts_with(RESERVED_HEADER_PREFIX))
         {
             return Err(Error::ReservedHeader(header.clone()));
         }
-        if let Some(backfill) = &opts.backfill
+        if let Some(backfill) = &schedule.backfill
             && backfill.start == BackfillStart::Lookback
             && lookback_floor(DateTime::UNIX_EPOCH, backfill.lookback).is_none()
         {
-            return Err(Error::UnboundedStart(name));
+            return Err(Error::UnboundedStart(schedule.name));
         }
         let mut state = self.state.lock().unwrap();
         if state.stopped {
             return Err(Error::Stopped);
         }
-        if state.entries.iter().any(|e| e.name == name) {
-            return Err(Error::DuplicateName(name));
+        if state.entries.iter().any(|e| e.name == schedule.name) {
+            return Err(Error::DuplicateName(schedule.name));
         }
         state.version += 1;
-        state.entries.push(Arc::new(ScheduleEntry {
-            name,
-            expression,
-            target_queue,
-            payload,
-            headers: opts.headers,
-            priority: opts.priority,
-            max_attempts: opts.max_attempts,
-            backfill: opts.backfill,
-        }));
+        state.entries.push(Arc::new(schedule));
         Ok(())
     }
 }
@@ -468,9 +507,9 @@ impl Registry {
 /// A single-process cron scheduler that enqueues jobs onto a [`Queue`] when
 /// each of its registered expressions fires.
 ///
-/// Build with [`Self::new`], register entries with [`Self::schedule`] /
-/// [`Self::schedule_with`], then call [`Self::run`]. [`Self::handle`]
-/// registers and removes entries while the scheduler runs.
+/// Build with [`Self::new`], register schedules through [`Self::handle`],
+/// then call [`Self::run`]. The handle also registers and removes schedules
+/// while the scheduler runs.
 pub struct CronScheduler {
     queue: Arc<Queue>,
     registry: Arc<Registry>,
@@ -494,35 +533,11 @@ pub struct ScheduleHandle {
 }
 
 impl ScheduleHandle {
-    /// Register a schedule, as [`CronScheduler::schedule`] does. It fails
-    /// with [`Error::Stopped`] after the scheduler is dropped.
-    pub fn schedule(
-        &self,
-        name: impl Into<String>,
-        expression: Expression,
-        target_queue: impl Into<String>,
-        payload: Vec<u8>,
-    ) -> Result<()> {
-        self.schedule_with(
-            name,
-            expression,
-            target_queue,
-            payload,
-            ScheduleOptions::default(),
-        )
-    }
-
-    /// [`Self::schedule`] with per-schedule [`ScheduleOptions`].
-    pub fn schedule_with(
-        &self,
-        name: impl Into<String>,
-        expression: Expression,
-        target_queue: impl Into<String>,
-        payload: Vec<u8>,
-        opts: ScheduleOptions,
-    ) -> Result<()> {
-        self.registry
-            .register(name.into(), expression, target_queue.into(), payload, opts)?;
+    /// Register a schedule. It fails with [`Error::DuplicateName`],
+    /// [`Error::ReservedHeader`] or [`Error::UnboundedStart`], and with
+    /// [`Error::Stopped`] after the scheduler is dropped.
+    pub fn schedule(&self, schedule: Schedule) -> Result<()> {
+        self.registry.register(schedule)?;
         self.registry.changed.notify_one();
         Ok(())
     }
@@ -568,47 +583,10 @@ impl CronScheduler {
         }
     }
 
-    /// Register a schedule. When `expression` fires, `payload` is enqueued on
-    /// `target_queue`.
-    ///
-    /// `name` is used in the [`taquba::EnqueueOptions::dedup_key`] of every
-    /// enqueued job (`"cron:{name}:{fire_time_ms}"`); it must be stable
-    /// across restarts so a re-fire after a crash deduplicates correctly.
-    pub fn schedule(
-        &mut self,
-        name: impl Into<String>,
-        expression: Expression,
-        target_queue: impl Into<String>,
-        payload: Vec<u8>,
-    ) -> Result<&mut Self> {
-        self.schedule_with(
-            name,
-            expression,
-            target_queue,
-            payload,
-            ScheduleOptions::default(),
-        )
-    }
-
-    /// Like [`Self::schedule`], but with one or more [`ScheduleOptions`]
-    /// fields overridden.
-    pub fn schedule_with(
-        &mut self,
-        name: impl Into<String>,
-        expression: Expression,
-        target_queue: impl Into<String>,
-        payload: Vec<u8>,
-        opts: ScheduleOptions,
-    ) -> Result<&mut Self> {
-        self.registry
-            .register(name.into(), expression, target_queue.into(), payload, opts)?;
-        Ok(self)
-    }
-
     /// Delete the backfill watermark of the schedule `name` from `queue`.
     ///
     /// A watermark outlives its schedule; call this after removing a
-    /// schedule that used [`ScheduleOptions::backfill`], or to make the
+    /// schedule that used [`Schedule::backfill`], or to make the
     /// schedule start over at the current time on its next run.
     pub async fn clear_watermark(queue: &Queue, name: &str) -> taquba::Result<()> {
         queue.kv_delete(&watermark_key(name)).await
@@ -767,7 +745,7 @@ impl CronScheduler {
     /// otherwise the persisted watermark, raised to the lookback floor.
     async fn initial_anchor(
         &self,
-        entry: &ScheduleEntry,
+        entry: &Schedule,
         now: DateTime<Utc>,
     ) -> taquba::Result<DateTime<Utc>> {
         let Some(backfill) = &entry.backfill else {
@@ -801,7 +779,7 @@ impl CronScheduler {
     /// Enqueue the firing of `entry` at `fire_at`. Under backfill the
     /// watermark is written in the enqueue transaction; a dedup hit
     /// applies no KV write, so the watermark is then advanced separately.
-    async fn fire(&self, entry: &ScheduleEntry, fire_at: DateTime<Utc>) -> taquba::Result<()> {
+    async fn fire(&self, entry: &Schedule, fire_at: DateTime<Utc>) -> taquba::Result<()> {
         let fire_ms = fire_at.timestamp_millis();
         let mut headers = entry.headers.clone();
         headers.insert(FIRE_MS_HEADER.to_string(), fire_ms.to_string());
@@ -822,14 +800,14 @@ impl CronScheduler {
             let writes = HashMap::from([(key.clone(), value.clone())]);
             let result = self
                 .queue
-                .enqueue_with_kv(&entry.target_queue, entry.payload.clone(), opts, writes)
+                .enqueue_with_kv(&entry.queue, entry.payload.clone(), opts, writes)
                 .await?;
             if matches!(result, EnqueueResult::AlreadyEnqueued(_)) {
                 self.queue.kv_put(&key, &value).await?;
             }
         } else {
             self.queue
-                .enqueue_with(&entry.target_queue, entry.payload.clone(), opts)
+                .enqueue_with(&entry.queue, entry.payload.clone(), opts)
                 .await?;
         }
         debug!(name = %entry.name, fire_ms, "enqueued cron job");
@@ -870,24 +848,18 @@ mod tests {
         DateTime::from_timestamp_millis(10 * 60_000).unwrap()
     }
 
-    fn backfill(lookback: Duration) -> ScheduleOptions {
-        ScheduleOptions {
-            backfill: Some(Backfill {
-                lookback,
-                start: BackfillStart::CurrentTime,
-            }),
-            ..Default::default()
-        }
+    fn backfill(lookback: Duration) -> Option<Backfill> {
+        Some(Backfill {
+            lookback,
+            start: BackfillStart::CurrentTime,
+        })
     }
 
-    fn backfill_from_lookback(lookback: Duration) -> ScheduleOptions {
-        ScheduleOptions {
-            backfill: Some(Backfill {
-                lookback,
-                start: BackfillStart::Lookback,
-            }),
-            ..Default::default()
-        }
+    fn backfill_from_lookback(lookback: Duration) -> Option<Backfill> {
+        Some(Backfill {
+            lookback,
+            start: BackfillStart::Lookback,
+        })
     }
 
     /// Calls `step` until no entry has a due firing, as the run loop does.
@@ -980,31 +952,32 @@ mod tests {
     #[tokio::test]
     async fn rejects_duplicate_name() {
         let q = test_queue().await;
-        let mut s = CronScheduler::new(q);
-        s.schedule(
-            "once",
-            "0 9 * * *".parse().unwrap(),
-            "reports1",
-            b"x".to_vec(),
-        )
-        .unwrap();
-        match s.schedule(
+        let s = CronScheduler::new(q);
+        s.handle()
+            .schedule(Schedule::new(
+                "once",
+                "0 9 * * *".parse().unwrap(),
+                "reports1",
+                b"x".to_vec(),
+            ))
+            .unwrap();
+        match s.handle().schedule(Schedule::new(
             "once",
             "0 10 * * *".parse().unwrap(),
             "reports2",
             b"y".to_vec(),
-        ) {
+        )) {
             Err(Error::DuplicateName(name)) => assert_eq!(name, "once"),
             Err(other) => panic!("expected DuplicateName, got {other:?}"),
             Ok(_) => panic!("expected DuplicateName"),
         }
         // A handle registers into the name set of its scheduler.
-        let result = s.handle().schedule(
+        let result = s.handle().schedule(Schedule::new(
             "once",
             "0 11 * * *".parse().unwrap(),
             "reports3",
             b"z".to_vec(),
-        );
+        ));
         assert!(matches!(result, Err(Error::DuplicateName(name)) if name == "once"));
     }
 
@@ -1016,12 +989,12 @@ mod tests {
         assert_eq!(s.step(t0()).await, None);
 
         handle
-            .schedule(
+            .schedule(Schedule::new(
                 "minutely",
                 "* * * * *".parse().unwrap(),
                 "out",
                 b"x".to_vec(),
-            )
+            ))
             .unwrap();
         assert_eq!(s.step(t0()).await, Some(t0() + minutes(1)));
         s.step(t0() + minutes(1)).await;
@@ -1035,13 +1008,14 @@ mod tests {
     async fn an_unscheduled_entry_stops_firing_and_releases_its_name() {
         let q = test_queue().await;
         let mut s = CronScheduler::new(q.clone());
-        s.schedule(
-            "minutely",
-            "* * * * *".parse().unwrap(),
-            "out",
-            b"x".to_vec(),
-        )
-        .unwrap();
+        s.handle()
+            .schedule(Schedule::new(
+                "minutely",
+                "* * * * *".parse().unwrap(),
+                "out",
+                b"x".to_vec(),
+            ))
+            .unwrap();
         let handle = s.handle();
         s.step(t0()).await;
 
@@ -1052,12 +1026,12 @@ mod tests {
 
         // The entry registered again starts at the current time.
         handle
-            .schedule(
+            .schedule(Schedule::new(
                 "minutely",
                 "* * * * *".parse().unwrap(),
                 "out",
                 b"x".to_vec(),
-            )
+            ))
             .unwrap();
         assert_eq!(s.step(t0() + minutes(5)).await, Some(t0() + minutes(6)));
         assert_eq!(q.stats("out").await.unwrap().pending, 0);
@@ -1076,12 +1050,12 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         handle
-            .schedule(
+            .schedule(Schedule::new(
                 "minutely",
                 "* * * * *".parse().unwrap(),
                 "out",
                 b"x".to_vec(),
-            )
+            ))
             .unwrap();
         // The entry starts at the time the loop applies it. The loop runs
         // before the clock advances.
@@ -1103,23 +1077,30 @@ mod tests {
 
         stop.send(()).unwrap();
         run.await.unwrap().unwrap();
-        let result = handle.schedule("late", "* * * * *".parse().unwrap(), "out", b"x".to_vec());
+        let result = handle.schedule(Schedule::new(
+            "late",
+            "* * * * *".parse().unwrap(),
+            "out",
+            b"x".to_vec(),
+        ));
         assert!(matches!(result, Err(Error::Stopped)));
     }
 
     #[tokio::test]
     async fn rejects_a_reserved_header() {
         let q = test_queue().await;
-        let mut s = CronScheduler::new(q);
-        let result = s.schedule_with(
-            "tagged",
-            "0 9 * * *".parse().unwrap(),
-            "reports",
-            b"x".to_vec(),
-            ScheduleOptions {
-                headers: HashMap::from([(FIRE_MS_HEADER.to_string(), "0".to_string())]),
-                ..Default::default()
-            },
+        let s = CronScheduler::new(q);
+        let result = s.handle().schedule(
+            Schedule::new(
+                "tagged",
+                "0 9 * * *".parse().unwrap(),
+                "reports",
+                b"x".to_vec(),
+            )
+            .headers(HashMap::from([(
+                FIRE_MS_HEADER.to_string(),
+                "0".to_string(),
+            )])),
         );
         match result {
             Err(Error::ReservedHeader(name)) => assert_eq!(name, FIRE_MS_HEADER),
@@ -1129,37 +1110,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schedule_options_carries_priority_and_max_attempts() {
+    async fn a_firing_has_the_priority_and_max_attempts_of_its_schedule() {
         let q = test_queue().await;
-        let mut s = CronScheduler::new(q);
-        s.schedule_with(
-            "boosted",
-            "0 9 * * *".parse().unwrap(),
-            "reports",
-            b"x".to_vec(),
-            ScheduleOptions {
-                priority: Some(taquba::PRIORITY_HIGH),
-                max_attempts: Some(7),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let entry = s.registry.state.lock().unwrap().entries[0].clone();
-        assert_eq!(entry.priority, Some(taquba::PRIORITY_HIGH));
-        assert_eq!(entry.max_attempts, Some(7));
+        let mut s = CronScheduler::new(q.clone());
+        s.handle()
+            .schedule(
+                Schedule::new(
+                    "boosted",
+                    "* * * * *".parse().unwrap(),
+                    "reports",
+                    b"x".to_vec(),
+                )
+                .priority(Some(taquba::PRIORITY_HIGH))
+                .max_attempts(Some(7)),
+            )
+            .unwrap();
+        s.step(t0()).await;
+        s.step(t0() + minutes(1)).await;
+
+        let page = q
+            .list_jobs("reports", taquba::JobStatus::Pending, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].priority, taquba::PRIORITY_HIGH);
+        assert_eq!(page.jobs[0].max_attempts, 7);
     }
 
     #[tokio::test(start_paused = true)]
     async fn shuts_down_immediately_when_signal_fires() {
         let q = mock_clock_queue(t0()).await.0;
-        let mut s = CronScheduler::new(q);
-        s.schedule(
-            "daily",
-            "0 9 * * *".parse().unwrap(),
-            "reports",
-            b"x".to_vec(),
-        )
-        .unwrap();
+        let s = CronScheduler::new(q);
+        s.handle()
+            .schedule(Schedule::new(
+                "daily",
+                "0 9 * * *".parse().unwrap(),
+                "reports",
+                b"x".to_vec(),
+            ))
+            .unwrap();
         let start = tokio::time::Instant::now();
         s.run(async {}).await.unwrap();
         assert_eq!(start.elapsed(), Duration::ZERO);
@@ -1169,13 +1158,14 @@ mod tests {
     async fn every_job_has_the_firing_time_and_the_previous_occurrence() {
         let q = test_queue().await;
         let mut s = CronScheduler::new(q.clone());
-        s.schedule(
-            "minutely",
-            "* * * * *".parse().unwrap(),
-            "out",
-            b"x".to_vec(),
-        )
-        .unwrap();
+        s.handle()
+            .schedule(Schedule::new(
+                "minutely",
+                "* * * * *".parse().unwrap(),
+                "out",
+                b"x".to_vec(),
+            ))
+            .unwrap();
         s.step(t0()).await;
         s.step(t0() + minutes(1)).await;
         assert_eq!(
@@ -1188,13 +1178,14 @@ mod tests {
         // The previous occurrence comes from the expression: this scheduler
         // first ticks one hour before the firing of a weekly schedule.
         let monday: DateTime<Utc> = "2026-09-14T02:00:00Z".parse().unwrap();
-        s.schedule(
-            "weekly",
-            "0 2 * * 1".parse().unwrap(),
-            "weekly",
-            b"x".to_vec(),
-        )
-        .unwrap();
+        s.handle()
+            .schedule(Schedule::new(
+                "weekly",
+                "0 2 * * 1".parse().unwrap(),
+                "weekly",
+                b"x".to_vec(),
+            ))
+            .unwrap();
         s.step(monday - minutes(60)).await;
         s.step(monday).await;
         assert_eq!(pending_fire_ms(&q, "weekly").await, vec![ms(monday)]);
@@ -1208,14 +1199,17 @@ mod tests {
     async fn backfill_replays_every_missed_firing_in_order() {
         let q = test_queue().await;
         let mut s = CronScheduler::new(q.clone());
-        s.schedule_with(
-            "minutely",
-            "* * * * *".parse().unwrap(),
-            "out",
-            b"x".to_vec(),
-            backfill(Duration::MAX),
-        )
-        .unwrap();
+        s.handle()
+            .schedule(
+                Schedule::new(
+                    "minutely",
+                    "* * * * *".parse().unwrap(),
+                    "out",
+                    b"x".to_vec(),
+                )
+                .backfill(backfill(Duration::MAX)),
+            )
+            .unwrap();
 
         let soonest0 = s.step(t0()).await.expect("satisfiable");
         assert_eq!(soonest0, t0() + minutes(1));
@@ -1234,12 +1228,15 @@ mod tests {
         let q = test_queue().await;
         let mut first = CronScheduler::new(q.clone());
         first
-            .schedule_with(
-                "minutely",
-                "* * * * *".parse().unwrap(),
-                "out",
-                b"x".to_vec(),
-                backfill(Duration::MAX),
+            .handle()
+            .schedule(
+                Schedule::new(
+                    "minutely",
+                    "* * * * *".parse().unwrap(),
+                    "out",
+                    b"x".to_vec(),
+                )
+                .backfill(backfill(Duration::MAX)),
             )
             .unwrap();
         first.step(t0()).await;
@@ -1252,12 +1249,15 @@ mod tests {
 
         let mut second = CronScheduler::new(q.clone());
         second
-            .schedule_with(
-                "minutely",
-                "* * * * *".parse().unwrap(),
-                "out",
-                b"x".to_vec(),
-                backfill(Duration::MAX),
+            .handle()
+            .schedule(
+                Schedule::new(
+                    "minutely",
+                    "* * * * *".parse().unwrap(),
+                    "out",
+                    b"x".to_vec(),
+                )
+                .backfill(backfill(Duration::MAX)),
             )
             .unwrap();
         let soonest = second
@@ -1285,14 +1285,12 @@ mod tests {
             .unwrap();
         let mut s = CronScheduler::new(q.clone());
         for (name, queue) in [("minutely", "out"), ("recent", "recent")] {
-            s.schedule_with(
-                name,
-                "* * * * *".parse().unwrap(),
-                queue,
-                b"x".to_vec(),
-                backfill(minutes(5)),
-            )
-            .unwrap();
+            s.handle()
+                .schedule(
+                    Schedule::new(name, "* * * * *".parse().unwrap(), queue, b"x".to_vec())
+                        .backfill(backfill(minutes(5))),
+                )
+                .unwrap();
         }
         let soonest = step_to(&mut s, now).await.expect("satisfiable");
         assert_eq!(soonest, now + minutes(1));
@@ -1312,14 +1310,17 @@ mod tests {
     async fn a_schedule_without_a_watermark_starts_at_the_lookback() {
         let q = test_queue().await;
         let mut s = CronScheduler::new(q.clone());
-        s.schedule_with(
-            "minutely",
-            "* * * * *".parse().unwrap(),
-            "out",
-            b"x".to_vec(),
-            backfill_from_lookback(minutes(5)),
-        )
-        .unwrap();
+        s.handle()
+            .schedule(
+                Schedule::new(
+                    "minutely",
+                    "* * * * *".parse().unwrap(),
+                    "out",
+                    b"x".to_vec(),
+                )
+                .backfill(backfill_from_lookback(minutes(5))),
+            )
+            .unwrap();
         let now = t0() + minutes(60);
         let soonest = step_to(&mut s, now).await.expect("satisfiable");
         assert_eq!(soonest, now + minutes(1));
@@ -1331,13 +1332,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_start_at_an_unbounded_lookback_is_rejected() {
-        let mut s = CronScheduler::new(test_queue().await);
-        let result = s.schedule_with(
-            "minutely",
-            "* * * * *".parse().unwrap(),
-            "out",
-            b"x".to_vec(),
-            backfill_from_lookback(Duration::MAX),
+        let s = CronScheduler::new(test_queue().await);
+        let result = s.handle().schedule(
+            Schedule::new(
+                "minutely",
+                "* * * * *".parse().unwrap(),
+                "out",
+                b"x".to_vec(),
+            )
+            .backfill(backfill_from_lookback(Duration::MAX)),
         );
         match result {
             Err(Error::UnboundedStart(name)) => assert_eq!(name, "minutely"),
@@ -1354,15 +1357,24 @@ mod tests {
             .unwrap();
         let mut s = CronScheduler::new(q.clone());
         let handle = s.handle();
-        s.schedule_with(
-            "replayed",
-            "* * * * *".parse().unwrap(),
-            "out",
-            b"x".to_vec(),
-            backfill(Duration::MAX),
-        )
-        .unwrap();
-        s.schedule("live", "* * * * *".parse().unwrap(), "live", b"x".to_vec())
+        s.handle()
+            .schedule(
+                Schedule::new(
+                    "replayed",
+                    "* * * * *".parse().unwrap(),
+                    "out",
+                    b"x".to_vec(),
+                )
+                .backfill(backfill(Duration::MAX)),
+            )
+            .unwrap();
+        s.handle()
+            .schedule(Schedule::new(
+                "live",
+                "* * * * *".parse().unwrap(),
+                "live",
+                b"x".to_vec(),
+            ))
             .unwrap();
         s.step(t0()).await;
 
@@ -1395,15 +1407,18 @@ mod tests {
         q.kv_put(&watermark_key("minutely"), ms(t0()).to_string().as_bytes())
             .await
             .unwrap();
-        let mut s = CronScheduler::new(q.clone());
-        s.schedule_with(
-            "minutely",
-            "* * * * *".parse().unwrap(),
-            "out",
-            b"x".to_vec(),
-            backfill(Duration::MAX),
-        )
-        .unwrap();
+        let s = CronScheduler::new(q.clone());
+        s.handle()
+            .schedule(
+                Schedule::new(
+                    "minutely",
+                    "* * * * *".parse().unwrap(),
+                    "out",
+                    b"x".to_vec(),
+                )
+                .backfill(backfill(Duration::MAX)),
+            )
+            .unwrap();
 
         s.run(std::future::ready(())).await.unwrap();
         assert_eq!(
@@ -1428,14 +1443,17 @@ mod tests {
             .await
             .unwrap();
         let mut s = CronScheduler::new(q.clone());
-        s.schedule_with(
-            "minutely",
-            "* * * * *".parse().unwrap(),
-            "out",
-            b"x".to_vec(),
-            backfill(Duration::MAX),
-        )
-        .unwrap();
+        s.handle()
+            .schedule(
+                Schedule::new(
+                    "minutely",
+                    "* * * * *".parse().unwrap(),
+                    "out",
+                    b"x".to_vec(),
+                )
+                .backfill(backfill(Duration::MAX)),
+            )
+            .unwrap();
         s.step(fire_at + Duration::from_secs(30)).await;
         assert_eq!(q.stats("out").await.unwrap().pending, 1);
         assert_eq!(watermark(&q, "minutely").await, Some(ms(fire_at)));
@@ -1445,14 +1463,17 @@ mod tests {
     async fn an_enqueue_error_under_backfill_holds_the_firing_for_retry() {
         let q = test_queue().await;
         let mut s = CronScheduler::new(q.clone());
-        s.schedule_with(
-            "minutely",
-            "* * * * *".parse().unwrap(),
-            "q".repeat(300),
-            b"x".to_vec(),
-            backfill(Duration::MAX),
-        )
-        .unwrap();
+        s.handle()
+            .schedule(
+                Schedule::new(
+                    "minutely",
+                    "* * * * *".parse().unwrap(),
+                    "q".repeat(300),
+                    b"x".to_vec(),
+                )
+                .backfill(backfill(Duration::MAX)),
+            )
+            .unwrap();
         s.step(t0()).await;
         let now = t0() + minutes(2);
         let soonest = s.step(now).await.expect("retry scheduled");
@@ -1468,14 +1489,17 @@ mod tests {
             .await
             .unwrap();
         let mut s = CronScheduler::new(q.clone());
-        s.schedule_with(
-            "minutely",
-            "* * * * *".parse().unwrap(),
-            "out",
-            b"x".to_vec(),
-            backfill(Duration::MAX),
-        )
-        .unwrap();
+        s.handle()
+            .schedule(
+                Schedule::new(
+                    "minutely",
+                    "* * * * *".parse().unwrap(),
+                    "out",
+                    b"x".to_vec(),
+                )
+                .backfill(backfill(Duration::MAX)),
+            )
+            .unwrap();
         let soonest = s.step(t0()).await.expect("satisfiable");
         assert_eq!(soonest, t0() + minutes(1));
         assert_eq!(q.stats("out").await.unwrap().pending, 0);
@@ -1496,14 +1520,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn run_fires_on_the_queue_clock() {
         let (q, clock) = mock_clock_queue(t0() + Duration::from_secs(30)).await;
-        let mut s = CronScheduler::new(q.clone());
-        s.schedule(
-            "minutely",
-            "* * * * *".parse().unwrap(),
-            "out",
-            b"x".to_vec(),
-        )
-        .unwrap();
+        let s = CronScheduler::new(q.clone());
+        s.handle()
+            .schedule(Schedule::new(
+                "minutely",
+                "* * * * *".parse().unwrap(),
+                "out",
+                b"x".to_vec(),
+            ))
+            .unwrap();
         let (stop, shutdown) = tokio::sync::oneshot::channel::<()>();
         let run = tokio::spawn(s.run(async {
             let _ = shutdown.await;
@@ -1537,13 +1562,14 @@ mod tests {
     async fn step_fires_one_missed_firing_after_clock_jump() {
         let q = test_queue().await;
         let mut s = CronScheduler::new(q.clone());
-        s.schedule(
-            "minutely",
-            "* * * * *".parse().unwrap(),
-            "out",
-            b"x".to_vec(),
-        )
-        .unwrap();
+        s.handle()
+            .schedule(Schedule::new(
+                "minutely",
+                "* * * * *".parse().unwrap(),
+                "out",
+                b"x".to_vec(),
+            ))
+            .unwrap();
 
         // T0 is a whole number of minutes past epoch, so it lands
         // on a `* * * * *` occurrence.

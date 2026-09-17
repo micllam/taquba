@@ -24,11 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `CronScheduler::schedule` and `CronScheduler::schedule_with` take the new
-  `Expression` type, so a parse failure is reported before a scheduler
-  exists. `Expression` implements `PartialEq`, `Eq` and `Display` over its
-  normalised text. Parse the string at the call, as in
-  `"0 9 * * *".parse()?`.
+- `CronScheduler::schedule`, `schedule_with` and `ScheduleOptions` are
+  removed: `ScheduleHandle::schedule` is the one registration method and
+  takes the new `Schedule` value, which a consumer can store and compare.
+  Call `scheduler.handle().schedule(...)` with a value from `Schedule::new`
+  and the setters `headers`, `priority`, `max_attempts` and `backfill`.
+- A schedule has a parsed `Expression` in place of a string, so a parse
+  failure is reported before a scheduler exists. `Expression` implements
+  `PartialEq`, `Eq` and `Display` over its normalised text. Parse the string
+  at the call, as in `"0 9 * * *".parse()?`.
 - Raised `croner` from 2 to 4: the parser rejects a step without a range,
   so `5/5 * * * *` fails with `Error::InvalidExpression`. Write the range,
   as in `5-59/5 * * * *`.

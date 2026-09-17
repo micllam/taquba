@@ -11,7 +11,7 @@ use std::time::Duration;
 use taquba::{
     JobRecord, LeaseHandle, Queue, Worker, WorkerError, object_store::memory::InMemory, run_worker,
 };
-use taquba_cron::CronScheduler;
+use taquba_cron::{CronScheduler, Schedule};
 use tokio::sync::oneshot;
 
 struct PrintWorker;
@@ -33,13 +33,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // In production you'd swap InMemory for an S3 / GCS / Azure / local-disk store.
     let queue = Arc::new(Queue::open(Arc::new(InMemory::new()), "cron-demo").await?);
 
-    let mut scheduler = CronScheduler::new(queue.clone());
-    scheduler.schedule(
+    let scheduler = CronScheduler::new(queue.clone());
+    scheduler.handle().schedule(Schedule::new(
         "minutely-task",
         "* * * * *".parse()?,
         "tasks",
         b"hello from cron".to_vec(),
-    )?;
+    ))?;
 
     // Worker drains the `tasks` queue. Wrapping in `Arc` lets us share it
     // between this `main` future and the spawned worker task.
