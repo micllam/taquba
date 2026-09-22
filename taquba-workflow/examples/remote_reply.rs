@@ -177,7 +177,7 @@ async fn watch_once(
     store: &Arc<dyn ObjectStore>,
     runtime: &WorkflowRuntime<Dispatcher, ShutdownOnTermination>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut markers = std::pin::pin!(queue.kv_entries(PENDING_PREFIX, 64));
+    let mut markers = std::pin::pin!(queue.kv_entries(PENDING_PREFIX, .., 64));
     while let Some((marker, reply_key)) = markers.try_next().await? {
         let path = Path::from(String::from_utf8_lossy(&reply_key).into_owned());
         match store.head(&path).await {

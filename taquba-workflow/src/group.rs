@@ -205,7 +205,7 @@ impl GroupStore {
     pub(crate) async fn members(&self, group_id: &RunId) -> Result<Vec<MemberState>> {
         let prefix = group_members_kv_prefix(group_id);
         let mut members = Vec::new();
-        let mut entries = std::pin::pin!(self.queue.kv_entries(&prefix, MEMBER_PAGE_SIZE));
+        let mut entries = std::pin::pin!(self.queue.kv_entries(&prefix, .., MEMBER_PAGE_SIZE));
         while let Some((kv_key, value)) = entries.try_next().await? {
             let key = String::from_utf8_lossy(&kv_key[prefix.len()..]).into_owned();
             if let Some(record) = durable::decode_or_absent(
@@ -236,7 +236,7 @@ impl GroupStore {
             }
         }
         let prefix = group_members_kv_prefix(group_id);
-        let mut entries = std::pin::pin!(self.queue.kv_entries(&prefix, MEMBER_PAGE_SIZE));
+        let mut entries = std::pin::pin!(self.queue.kv_entries(&prefix, .., MEMBER_PAGE_SIZE));
         while let Some((key, _)) = entries.try_next().await? {
             keys.push(key);
             if keys.len() == MEMBER_PAGE_SIZE {

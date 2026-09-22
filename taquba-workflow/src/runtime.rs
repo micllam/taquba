@@ -1623,10 +1623,7 @@ mod tests {
     /// Every terminal marker in the queue's KV namespace, as
     /// `(run_id, terminal_at_ms)` pairs in key order (oldest first).
     async fn terminal_markers(queue: &Queue) -> Vec<(RunId, u64)> {
-        let page = queue
-            .kv_scan(TERMINAL_KV_PREFIX, None, 1_000)
-            .await
-            .unwrap();
+        let page = queue.kv_scan(TERMINAL_KV_PREFIX, .., 1_000).await.unwrap();
         page.entries
             .iter()
             .map(|(key, _)| {

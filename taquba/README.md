@@ -307,12 +307,13 @@ consumes an entry only if it still holds the value the caller read, so a
 concurrent replacement is never deleted by mistake, and
 `Queue::kv_compare_put` writes only if the key still holds an expected value
 (or is still absent), the read-modify-write primitive that makes concurrent
-updates of one entry lose no writes. `Queue::kv_scan` lists entries under a
-key prefix in pages, for enumerating live state and for exporting the
-namespace, and `Queue::kv_entries` reads the same listing as one stream.
+updates of one entry lose no writes. `Queue::kv_scan` lists the entries
+with a key prefix within a key range, in pages, for enumerating live state
+and for exporting the namespace, and `Queue::kv_entries` reads the same
+listing as one stream.
 `Queue::commit_effects` applies a `SettlementEffects` (enqueues, KV writes
-and deletes) as one transaction with no job transition, for state that must
-move in one step when no transition of its own carries it.
+and deletes) as one transaction without a job transition, for state that
+must move in one step when no transition of its own includes it.
 
 `Queue::ack_with` extends the same atomicity to settlement: it acknowledges a
 claimed job and, in the same transaction, enqueues follow-up jobs and applies

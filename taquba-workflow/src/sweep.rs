@@ -107,7 +107,7 @@ impl Sweep {
             .now_ms()
             .saturating_sub(self.retention.as_millis() as u64);
         let mut cleared = 0usize;
-        let mut markers = std::pin::pin!(queue.kv_entries(self.prefix, SWEEP_PAGE_SIZE));
+        let mut markers = std::pin::pin!(queue.kv_entries(self.prefix, .., SWEEP_PAGE_SIZE));
         while let Some((key, _)) = markers.try_next().await? {
             let Some((id, ts_ms)) = parse_timestamped_kv_key(self.prefix, &key) else {
                 warn!(

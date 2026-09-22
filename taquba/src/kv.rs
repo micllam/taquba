@@ -5,6 +5,8 @@
 //! to a queue transition are [`Queue::enqueue_with_kv`] and the KV
 //! fields of [`SettlementEffects`](crate::SettlementEffects).
 
+use std::ops::{Bound, Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive};
+
 use bytes::Bytes;
 use futures_util::Stream;
 use slatedb::DbTransaction;
@@ -35,6 +37,80 @@ pub(crate) fn validate_kv_value_size(value: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// A range of keys within a prefix, as [`Queue::kv_scan`] takes it. The
+/// standard range forms over any byte string implement it: `..`,
+/// `key..`, `..key`, `..=key`, `a..b` and `a..=b`. A pair of [`Bound`]s
+/// implements it, which is the form of an exclusive start.
+pub trait KvRange {
+    /// The lower bound of the range.
+    fn start_bound(&self) -> Bound<&[u8]>;
+    /// The upper bound of the range.
+    fn end_bound(&self) -> Bound<&[u8]>;
+}
+
+impl<K: AsRef<[u8]>> KvRange for Range<K> {
+    fn start_bound(&self) -> Bound<&[u8]> {
+        Bound::Included(self.start.as_ref())
+    }
+    fn end_bound(&self) -> Bound<&[u8]> {
+        Bound::Excluded(self.end.as_ref())
+    }
+}
+
+impl<K: AsRef<[u8]>> KvRange for RangeInclusive<K> {
+    fn start_bound(&self) -> Bound<&[u8]> {
+        Bound::Included(self.start().as_ref())
+    }
+    fn end_bound(&self) -> Bound<&[u8]> {
+        Bound::Included(self.end().as_ref())
+    }
+}
+
+impl<K: AsRef<[u8]>> KvRange for RangeFrom<K> {
+    fn start_bound(&self) -> Bound<&[u8]> {
+        Bound::Included(self.start.as_ref())
+    }
+    fn end_bound(&self) -> Bound<&[u8]> {
+        Bound::Unbounded
+    }
+}
+
+impl<K: AsRef<[u8]>> KvRange for RangeTo<K> {
+    fn start_bound(&self) -> Bound<&[u8]> {
+        Bound::Unbounded
+    }
+    fn end_bound(&self) -> Bound<&[u8]> {
+        Bound::Excluded(self.end.as_ref())
+    }
+}
+
+impl<K: AsRef<[u8]>> KvRange for RangeToInclusive<K> {
+    fn start_bound(&self) -> Bound<&[u8]> {
+        Bound::Unbounded
+    }
+    fn end_bound(&self) -> Bound<&[u8]> {
+        Bound::Included(self.end.as_ref())
+    }
+}
+
+impl KvRange for RangeFull {
+    fn start_bound(&self) -> Bound<&[u8]> {
+        Bound::Unbounded
+    }
+    fn end_bound(&self) -> Bound<&[u8]> {
+        Bound::Unbounded
+    }
+}
+
+impl<K: AsRef<[u8]>> KvRange for (Bound<K>, Bound<K>) {
+    fn start_bound(&self) -> Bound<&[u8]> {
+        self.0.as_ref().map(AsRef::as_ref)
+    }
+    fn end_bound(&self) -> Bound<&[u8]> {
+        self.1.as_ref().map(AsRef::as_ref)
+    }
+}
+
 /// One page of a user KV listing. Returned by [`Queue::kv_scan`].
 #[derive(Debug, Clone)]
 pub struct KvPage {
@@ -42,10 +118,10 @@ pub struct KvPage {
     /// order of the keys. Keys are in the caller namespace, without the
     /// internal user key tag.
     pub entries: Vec<(Vec<u8>, Bytes)>,
-    /// Opaque resume token: pass it as the `cursor` of the next
-    /// [`Queue::kv_scan`] call to continue the listing. `None` when no
-    /// further entries existed at scan time.
-    pub next_cursor: Option<Vec<u8>>,
+    /// Whether an entry within the range followed the last entry of this
+    /// page at scan time. The listing continues with the range from
+    /// `Bound::Excluded` of that entry's key to the same end.
+    pub more: bool,
 }
 
 impl Queue {
@@ -169,43 +245,46 @@ impl Queue {
         .await
     }
 
-    /// List entries of the user KV namespace under `prefix`, in
-    /// ascending byte order of the keys.
+    /// List entries of the user KV namespace under `prefix` within
+    /// `range`, in ascending byte order of the keys.
     ///
-    /// An empty `prefix` lists the whole namespace. `cursor` is an
-    /// opaque resume token: pass `None` to start from the beginning, or
-    /// [`KvPage::next_cursor`] from the previous page to continue. A
-    /// cursor identifies a scan position, not an entry, so it remains
-    /// valid when the entry it was taken at is deleted. The listing is
-    /// not a snapshot: an entry written or deleted between page reads
-    /// may be missed or observed depending on its key's position
-    /// relative to the cursor.
+    /// An empty `prefix` lists the whole namespace, and `..` lists every
+    /// key within the prefix. The bounds of `range`, a [`KvRange`], are
+    /// keys in the caller namespace: `key..` begins at `key`, and
+    /// `(Bound::Excluded(key), Bound::Unbounded)` begins after it, which
+    /// continues a listing from the last key of a page. The page contains
+    /// the keys within the prefix that the range contains. A bound
+    /// outside the prefix is correct as given, and a range without such
+    /// a key returns an empty page. The listing is not a snapshot, so an
+    /// entry written or deleted between page reads is missed or observed
+    /// depending on the position of its key.
     ///
-    /// Only caller-namespace entries are returned; Taquba's internal
+    /// Only caller-namespace entries are returned, and Taquba's internal
     /// key spaces are never visible here. This is the enumeration and
-    /// export primitive for the namespace: a full sweep
-    /// (`prefix = b""`, follow `next_cursor` to exhaustion) observes
-    /// every entry that existed for the whole sweep.
+    /// export primitive for the namespace: a full sweep (`prefix = b""`,
+    /// `..`, continued while [`KvPage::more`]) observes every entry that
+    /// existed for the whole sweep.
     pub async fn kv_scan(
         &self,
         prefix: &[u8],
-        cursor: Option<&[u8]>,
+        range: impl KvRange,
         limit: usize,
     ) -> Result<KvPage> {
-        crate::read::kv_scan(self.core.db.as_ref(), prefix, cursor, limit).await
+        crate::read::kv_scan(self.core.db.as_ref(), prefix, range, limit).await
     }
 
-    /// Every entry of the user KV namespace under `prefix`, in ascending
-    /// byte order of the keys, as one stream that reads through
-    /// [`Self::kv_scan`] `page_size` entries at a time. A consumer that
-    /// stops reading fetches no further page; the listing semantics are
-    /// those of `kv_scan`.
+    /// Every entry of the user KV namespace under `prefix` within
+    /// `range`, in ascending byte order of the keys, as one stream that
+    /// reads through [`Self::kv_scan`] `page_size` entries at a time. A
+    /// consumer that stops reading does not fetch a further page. The
+    /// listing semantics are those of `kv_scan`.
     pub fn kv_entries<'a>(
         &'a self,
         prefix: &'a [u8],
+        range: impl KvRange,
         page_size: usize,
     ) -> impl Stream<Item = Result<(Vec<u8>, Bytes)>> + 'a {
-        crate::read::kv_entries(self.core.db.as_ref(), prefix, page_size)
+        crate::read::kv_entries(self.core.db.as_ref(), prefix, range, page_size)
     }
 }
 
@@ -380,31 +459,98 @@ mod tests {
         }
         q.kv_put(b"config", b"c").await.unwrap();
 
-        let page = q.kv_scan(b"runs/", None, 3).await.unwrap();
+        let page = q.kv_scan(b"runs/", .., 3).await.unwrap();
         assert_eq!(page.entries.len(), 3);
         assert_eq!(page.entries[0].0, b"runs/0");
-        assert!(page.next_cursor.is_some());
+        assert!(page.more);
 
+        let last = page.entries[2].0.as_slice();
         let rest = q
-            .kv_scan(b"runs/", page.next_cursor.as_deref(), 10)
+            .kv_scan(b"runs/", (Bound::Excluded(last), Bound::Unbounded), 10)
             .await
             .unwrap();
         assert_eq!(rest.entries.len(), 2);
         assert_eq!(rest.entries[1].0, b"runs/4");
-        assert!(rest.next_cursor.is_none());
+        assert!(!rest.more);
 
-        let all = q.kv_scan(b"", None, 100).await.unwrap();
+        let all = q.kv_scan(b"", .., 100).await.unwrap();
         assert_eq!(all.entries.len(), 6);
         assert_eq!(all.entries[0].0, b"config");
 
-        let empty = q.kv_scan(b"", None, 0).await.unwrap();
-        assert!(empty.entries.is_empty() && empty.next_cursor.is_none());
+        let empty = q.kv_scan(b"", .., 0).await.unwrap();
+        assert!(empty.entries.is_empty() && !empty.more);
 
-        let foreign = q
-            .kv_scan(b"other/", page.next_cursor.as_deref(), 10)
-            .await
-            .unwrap();
-        assert!(foreign.entries.is_empty() && foreign.next_cursor.is_none());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn kv_scan_reads_the_keys_within_the_range() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        for i in 0..5u8 {
+            q.kv_put(&[b"runs/".as_slice(), &[b'0' + i]].concat(), &[i])
+                .await
+                .unwrap();
+        }
+        let keys = |page: KvPage| page.entries.into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+        let key = |i: u8| [b"runs/".as_slice(), &[b'0' + i]].concat();
+
+        // Each bound form, with a bound that is not a stored key.
+        assert_eq!(
+            keys(q.kv_scan(b"runs/", b"runs/2".., 10).await.unwrap()),
+            [key(2), key(3), key(4)]
+        );
+        assert_eq!(
+            keys(q.kv_scan(b"runs/", b"runs/25".., 10).await.unwrap()),
+            [key(3), key(4)]
+        );
+        assert_eq!(
+            keys(q.kv_scan(b"runs/", ..b"runs/2", 10).await.unwrap()),
+            [key(0), key(1)]
+        );
+        assert_eq!(
+            keys(q.kv_scan(b"runs/", ..=b"runs/2", 10).await.unwrap()),
+            [key(0), key(1), key(2)]
+        );
+        assert_eq!(
+            keys(q.kv_scan(b"runs/", b"runs/1"..b"runs/3", 10).await.unwrap()),
+            [key(1), key(2)]
+        );
+
+        // A bound outside the prefix is before every key or after every key.
+        assert_eq!(
+            q.kv_scan(b"runs/", b"a".., 10).await.unwrap().entries.len(),
+            5
+        );
+        assert_eq!(
+            q.kv_scan(b"runs/", ..b"z", 10).await.unwrap().entries.len(),
+            5
+        );
+        assert!(
+            q.kv_scan(b"runs/", b"z".., 10)
+                .await
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        assert!(
+            q.kv_scan(b"runs/", ..b"a", 10)
+                .await
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+
+        // A range without a key within it, including an inverted one.
+        let inverted = q.kv_scan(b"runs/", b"runs/3"..b"runs/1", 10).await.unwrap();
+        assert!(inverted.entries.is_empty() && !inverted.more);
+        let point = (Bound::Excluded(b"runs/2"), Bound::Excluded(b"runs/2"));
+        assert!(
+            q.kv_scan(b"runs/", point, 10)
+                .await
+                .unwrap()
+                .entries
+                .is_empty()
+        );
 
         q.close().await.unwrap();
     }
@@ -433,7 +579,7 @@ mod tests {
         .unwrap();
         q.kv_put(b"only", b"entry").await.unwrap();
 
-        let page = q.kv_scan(b"", None, 100).await.unwrap();
+        let page = q.kv_scan(b"", .., 100).await.unwrap();
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].0, b"only");
 

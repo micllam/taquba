@@ -219,13 +219,14 @@
 //! is never deleted by mistake, and [`Queue::kv_compare_put`] writes
 //! only if the key still holds an expected value (or is still absent),
 //! the read-modify-write primitive that makes concurrent updates of
-//! one entry lose no writes. [`Queue::kv_scan`] lists entries under a
-//! key prefix in pages, for enumerating live state and for exporting
-//! the namespace, and [`Queue::kv_entries`] reads the same listing as
-//! one stream. [`Queue::commit_effects`] applies a
-//! [`SettlementEffects`] (enqueues, KV writes and deletes) as one
-//! transaction with no job transition, for state that must move in one
-//! step when no transition of its own carries it.
+//! one entry lose no writes. [`Queue::kv_scan`] lists the entries with
+//! a key prefix within a key range, in pages, for enumerating live state
+//! and for exporting the namespace, and [`Queue::kv_entries`] reads the
+//! same listing as one stream.
+//! [`Queue::commit_effects`] applies a [`SettlementEffects`] (enqueues,
+//! KV writes and deletes) as one transaction without a job transition,
+//! for state that must move in one step when no transition of its own
+//! includes it.
 //!
 //! [`Queue::ack_with`] extends the same atomicity to settlement: it
 //! acknowledges a claimed job and, in the same transaction, enqueues
@@ -448,7 +449,7 @@ pub use error::{Error, Result};
 pub use history::{AttemptOutcome, JobAttempt};
 pub use job::{Claim, JobRecord, JobStatus};
 pub use keys::{MAX_QUEUE_NAME_LEN, QueueName};
-pub use kv::{KvPage, MAX_KV_VALUE_SIZE};
+pub use kv::{KvPage, KvRange, MAX_KV_VALUE_SIZE};
 pub use lease::LeaseHandle;
 pub use liveness::{StoreActivity, WriterHeartbeat};
 pub use options::{

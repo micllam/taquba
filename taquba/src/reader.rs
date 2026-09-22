@@ -21,7 +21,7 @@ use slatedb::{DbReader, DbReaderMode};
 use crate::error::{Error, Result};
 use crate::history::JobAttempt;
 use crate::job::{JobRecord, JobStatus};
-use crate::kv::KvPage;
+use crate::kv::{KvPage, KvRange};
 use crate::liveness::{StoreActivity, WriterHeartbeat};
 use crate::payload_store::PayloadStore;
 use crate::queue::JobPage;
@@ -375,29 +375,31 @@ impl QueueReader {
         crate::read::kv_get(&self.reader, key).await
     }
 
-    /// List entries of the user KV namespace under `prefix`, in
-    /// ascending byte order of the keys.
+    /// List entries of the user KV namespace under `prefix` within
+    /// `range`, in ascending byte order of the keys.
     ///
-    /// Cursor and paging semantics are those of
+    /// Range and paging semantics are those of
     /// [`Queue::kv_scan`](crate::Queue::kv_scan).
     pub async fn kv_scan(
         &self,
         prefix: &[u8],
-        cursor: Option<&[u8]>,
+        range: impl KvRange,
         limit: usize,
     ) -> Result<KvPage> {
-        crate::read::kv_scan(&self.reader, prefix, cursor, limit).await
+        crate::read::kv_scan(&self.reader, prefix, range, limit).await
     }
 
-    /// Every entry of the user KV namespace under `prefix` as one
-    /// stream, read `page_size` entries at a time; see
+    /// Every entry of the user KV namespace under `prefix` within
+    /// `range` as one stream, read `page_size` entries at a time. The
+    /// semantics are those of
     /// [`Queue::kv_entries`](crate::Queue::kv_entries).
     pub fn kv_entries<'a>(
         &'a self,
         prefix: &'a [u8],
+        range: impl KvRange,
         page_size: usize,
     ) -> impl Stream<Item = Result<(Vec<u8>, Bytes)>> + 'a {
-        crate::read::kv_entries(&self.reader, prefix, page_size)
+        crate::read::kv_entries(&self.reader, prefix, range, page_size)
     }
 
     /// Close the reader, stopping its manifest polling and releasing
@@ -453,7 +455,7 @@ mod tests {
             reader.kv_get(b"outcome/1").await.unwrap().unwrap().as_ref(),
             b"ok"
         );
-        let kv_page = reader.kv_scan(b"outcome/", None, 10).await.unwrap();
+        let kv_page = reader.kv_scan(b"outcome/", .., 10).await.unwrap();
         assert_eq!(kv_page.entries.len(), 1);
 
         reader.close().await.unwrap();

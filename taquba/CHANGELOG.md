@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `kv_scan` and `kv_entries` on `Queue` and `QueueReader` take a
+  `KvRange` over the keys within the prefix, so a listing of time-ordered
+  keys begins and ends at a bound. `KvPage::next_cursor` becomes
+  `KvPage::more`: pass `..` for the whole prefix, and continue a page
+  from `Bound::Excluded` of its last key.
+
 ## [0.13.0] - 2026-09-16
 
 ### Added

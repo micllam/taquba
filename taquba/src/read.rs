@@ -20,7 +20,7 @@ use crate::keys::{
     KeyTag, QueueName, attempt_history_key, claimed_prefix, dead_key, dead_prefix, heartbeat_key,
     job_index_key, parse_stats_key, pending_prefix, stats_key, tag_prefix, user_scoped_key,
 };
-use crate::kv::KvPage;
+use crate::kv::{KvPage, KvRange};
 use crate::liveness::{HeartbeatRecord, WriterHeartbeat};
 use crate::payload_store::PayloadStore;
 use crate::queue::JobPage;
@@ -31,7 +31,11 @@ use crate::stats::{QueueStats, metric_name};
 pub(crate) trait ReadHandle: Sync {
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>>;
 
-    async fn scan_prefix(&self, prefix: Vec<u8>, start: Bound<Bytes>) -> Result<DbIterator>;
+    async fn scan_prefix(
+        &self,
+        prefix: Vec<u8>,
+        range: (Bound<Bytes>, Bound<Bytes>),
+    ) -> Result<DbIterator>;
 
     /// Whether the record listed at `key` has been removed from the
     /// store. Consulted by [`list_jobs`] when a listed record's payload
@@ -49,8 +53,12 @@ impl ReadHandle for Db {
         Ok(Db::get(self, key).await?)
     }
 
-    async fn scan_prefix(&self, prefix: Vec<u8>, start: Bound<Bytes>) -> Result<DbIterator> {
-        Ok(Db::scan_prefix(self, prefix, (start, Bound::Unbounded)).await?)
+    async fn scan_prefix(
+        &self,
+        prefix: Vec<u8>,
+        range: (Bound<Bytes>, Bound<Bytes>),
+    ) -> Result<DbIterator> {
+        Ok(Db::scan_prefix(self, prefix, range).await?)
     }
 
     async fn job_removed_since_scan(&self, key: &[u8]) -> Result<bool> {
@@ -63,8 +71,12 @@ impl ReadHandle for DbReader {
         Ok(DbReader::get(self, key).await?)
     }
 
-    async fn scan_prefix(&self, prefix: Vec<u8>, start: Bound<Bytes>) -> Result<DbIterator> {
-        Ok(DbReader::scan_prefix(self, prefix, (start, Bound::Unbounded)).await?)
+    async fn scan_prefix(
+        &self,
+        prefix: Vec<u8>,
+        range: (Bound<Bytes>, Bound<Bytes>),
+    ) -> Result<DbIterator> {
+        Ok(DbReader::scan_prefix(self, prefix, range).await?)
     }
 
     async fn job_removed_since_scan(&self, _key: &[u8]) -> Result<bool> {
@@ -104,7 +116,10 @@ pub(crate) async fn list_queues<H: ReadHandle>(handle: &H) -> Result<Vec<String>
     let mut seen = std::collections::HashSet::new();
     let mut queues = Vec::new();
     let mut iter = handle
-        .scan_prefix(tag_prefix(KeyTag::Stats).to_vec(), Bound::Unbounded)
+        .scan_prefix(
+            tag_prefix(KeyTag::Stats).to_vec(),
+            (Bound::Unbounded, Bound::Unbounded),
+        )
         .await?;
     while let Some(kv) = iter.next().await? {
         let Some((queue, _metric)) = parse_stats_key(&kv.key) else {
@@ -158,7 +173,9 @@ pub(crate) async fn list_jobs<H: ReadHandle>(
     // resumes from.
     let mut page: Vec<(Bytes, JobRecord)> = Vec::with_capacity(limit);
     let mut more = false;
-    let mut iter = handle.scan_prefix(prefix, start).await?;
+    let mut iter = handle
+        .scan_prefix(prefix, (start, Bound::Unbounded))
+        .await?;
     while let Some(kv) = iter.next().await? {
         let job = JobRecord::decode(&kv.key, &kv.value)?;
         if filter_queue && job.queue != queue {
@@ -267,51 +284,84 @@ pub(crate) async fn kv_get<H: ReadHandle>(handle: &H, key: &[u8]) -> Result<Opti
     handle.get(&user_scoped_key(key)).await
 }
 
-/// Body of `kv_scan`: one page of the user KV namespace under `prefix`,
-/// in ascending byte order of the keys.
+/// Body of `kv_scan`: one page of the user KV namespace under `prefix`
+/// within `range`, in ascending byte order of the keys.
 pub(crate) async fn kv_scan<H: ReadHandle>(
     handle: &H,
     prefix: &[u8],
-    cursor: Option<&[u8]>,
+    range: impl KvRange,
     limit: usize,
 ) -> Result<KvPage> {
     let empty = KvPage {
         entries: Vec::new(),
-        next_cursor: None,
+        more: false,
+    };
+    let Some(range) = subrange(prefix, range) else {
+        return Ok(empty);
     };
     if limit == 0 {
         return Ok(empty);
     }
-    let scoped_prefix = user_scoped_key(prefix);
-    let start = match cursor {
-        None => Bound::Unbounded,
-        // A cursor from a different prefix does not identify a
-        // position under this one; nothing follows it here.
-        Some(c) if !c.starts_with(&scoped_prefix) => return Ok(empty),
-        Some(c) => Bound::Excluded(Bytes::copy_from_slice(&c[scoped_prefix.len()..])),
-    };
-
-    let mut page: Vec<(Bytes, Bytes)> = Vec::with_capacity(limit);
+    let mut entries = Vec::with_capacity(limit);
     let mut more = false;
-    let mut iter = handle.scan_prefix(scoped_prefix, start).await?;
+    let mut iter = handle.scan_prefix(user_scoped_key(prefix), range).await?;
     while let Some(kv) = iter.next().await? {
-        if page.len() == limit {
+        if entries.len() == limit {
             more = true;
             break;
         }
-        page.push((kv.key, kv.value));
+        // A stored key includes the one-byte user tag, and a caller sees
+        // the caller namespace, so the tag is stripped here.
+        entries.push((kv.key[1..].to_vec(), kv.value));
     }
-    let next_cursor = more.then(|| page[page.len() - 1].0.to_vec());
-    // Stored keys carry the one-byte user tag; callers see their own
-    // namespace, so it is stripped here. Cursors keep the stored form.
-    let entries = page
-        .into_iter()
-        .map(|(k, v)| (k[1..].to_vec(), v))
-        .collect();
-    Ok(KvPage {
-        entries,
-        next_cursor,
-    })
+    Ok(KvPage { entries, more })
+}
+
+/// The position of a bound relative to the keys within a prefix.
+enum Side {
+    /// Before every key within the prefix.
+    Before,
+    /// A bound on the part of the key after the prefix.
+    Within(Bound<Bytes>),
+    /// After every key within the prefix.
+    After,
+}
+
+fn side(prefix: &[u8], bound: Bound<&[u8]>) -> Side {
+    let key = match bound {
+        Bound::Unbounded => return Side::Within(Bound::Unbounded),
+        Bound::Included(key) | Bound::Excluded(key) => key,
+    };
+    if key.starts_with(prefix) {
+        Side::Within(bound.map(|key| Bytes::copy_from_slice(&key[prefix.len()..])))
+    } else if key < prefix {
+        Side::Before
+    } else {
+        Side::After
+    }
+}
+
+/// The bounds of `range` on the part of the key after `prefix`, as the
+/// scan takes them, or `None` for a range without a key within the
+/// prefix. The store rejects an empty range, and the test of the bounds
+/// here is the store's test.
+fn subrange(prefix: &[u8], range: impl KvRange) -> Option<(Bound<Bytes>, Bound<Bytes>)> {
+    let start = match side(prefix, range.start_bound()) {
+        Side::Before => Bound::Unbounded,
+        Side::Within(bound) => bound,
+        Side::After => return None,
+    };
+    let end = match side(prefix, range.end_bound()) {
+        Side::Before => return None,
+        Side::Within(bound) => bound,
+        Side::After => Bound::Unbounded,
+    };
+    let non_empty = match (&start, &end) {
+        (Bound::Included(a), Bound::Included(b)) => a <= b,
+        (Bound::Included(a) | Bound::Excluded(a), Bound::Included(b) | Bound::Excluded(b)) => a < b,
+        (Bound::Unbounded, _) | (_, Bound::Unbounded) => true,
+    };
+    non_empty.then_some((start, end))
 }
 
 /// The items of a paged read as one stream, fetched one page at a
@@ -339,16 +389,32 @@ where
     .try_flatten()
 }
 
-/// Body of `kv_entries`: every entry under `prefix`, in ascending key
-/// order, read through [`kv_scan`] `page_size` entries at a time.
+/// Body of `kv_entries`: every entry under `prefix` within `range`, in
+/// ascending key order, read through [`kv_scan`] `page_size` entries
+/// at a time.
 pub(crate) fn kv_entries<'a, H: ReadHandle>(
     handle: &'a H,
     prefix: &'a [u8],
+    range: impl KvRange,
     page_size: usize,
 ) -> impl Stream<Item = Result<(Vec<u8>, Bytes)>> + 'a {
-    pages(move |cursor| async move {
-        let page = kv_scan(handle, prefix, cursor.as_deref(), page_size).await?;
-        Ok((page.entries, page.next_cursor))
+    let start = range.start_bound().map(Vec::from);
+    let end = range.end_bound().map(Vec::from);
+    pages(move |cursor| {
+        let (start, end) = (start.clone(), end.clone());
+        async move {
+            // A page follows the last key of the page before it.
+            let start = match &cursor {
+                Some(last) => Bound::Excluded(last.as_slice()),
+                None => start.as_ref().map(Vec::as_slice),
+            };
+            let range = (start, end.as_ref().map(Vec::as_slice));
+            let page = kv_scan(handle, prefix, range, page_size).await?;
+            let next = page
+                .more
+                .then(|| page.entries[page.entries.len() - 1].0.clone());
+            Ok((page.entries, next))
+        }
     })
 }
 
@@ -389,13 +455,21 @@ mod tests {
         q.kv_put(b"q/0", b"v").await.unwrap();
 
         let keys: Vec<Vec<u8>> = q
-            .kv_entries(b"p/", 2)
+            .kv_entries(b"p/", .., 2)
             .map_ok(|(key, _)| key)
             .try_collect()
             .await
             .unwrap();
         let expected: Vec<Vec<u8>> = (0..5u8).map(|i| vec![b'p', b'/', b'0' + i]).collect();
         assert_eq!(keys, expected);
+
+        let from_third: Vec<Vec<u8>> = q
+            .kv_entries(b"p/", b"p/2".., 2)
+            .map_ok(|(key, _)| key)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(from_third, expected[2..]);
     }
 
     #[tokio::test]
