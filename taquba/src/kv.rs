@@ -37,6 +37,20 @@ pub(crate) fn validate_kv_value_size(value: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Whether the state of the stored key `scoped` within `txn` matches
+/// `expected`: the value it must hold, or `None` for absence.
+pub(crate) async fn kv_state_matches(
+    txn: &DbTransaction,
+    scoped: &[u8],
+    expected: Option<&[u8]>,
+) -> Result<bool> {
+    Ok(match (txn.get(scoped).await?, expected) {
+        (Some(current), Some(expected)) => current.as_ref() == expected,
+        (None, None) => true,
+        _ => false,
+    })
+}
+
 /// A range of keys within a prefix, as [`Queue::kv_scan`] takes it. The
 /// standard range forms over any byte string implement it: `..`,
 /// `key..`, `..key`, `..=key`, `a..b` and `a..=b`. A pair of [`Bound`]s
@@ -230,12 +244,7 @@ impl Queue {
     ) -> Result<bool> {
         let (scoped, write) = (&user_scoped_key(key), &write);
         retry(&self.core.db, Durability::Awaited, |txn| async move {
-            let matched = match (txn.get(scoped).await?, expected) {
-                (Some(current), Some(e)) => current.as_ref() == e,
-                (None, None) => true,
-                _ => false,
-            };
-            if !matched {
+            if !kv_state_matches(&txn, scoped, expected).await? {
                 txn.rollback();
                 return Ok(Attempt::Abort(false));
             }

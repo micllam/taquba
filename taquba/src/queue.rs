@@ -22,7 +22,7 @@ use crate::job::{Claim, JobRecord, JobStatus};
 use crate::keys::{
     QueueName, claimed_key, dedup_index_key, job_index_key, pending_prefix, user_scoped_key,
 };
-use crate::kv::validate_kv_value_size;
+use crate::kv::{kv_state_matches, validate_kv_value_size};
 use crate::lease_registry::{LeaseRegistry, Renewal};
 use crate::options::{EnqueueOptions, OpenOptions, QueueConfig};
 use crate::payload_store::PayloadStore;
@@ -548,18 +548,66 @@ impl Queue {
     /// transition of its own to carry it, such as reconciling the state
     /// of a job the reaper dead-lettered.
     pub async fn commit_effects(&self, effects: SettlementEffects) -> Result<Vec<EnqueueResult>> {
+        let committed = self.commit_effects_where(effects, None).await?;
+        Ok(committed.expect("a commit without a compare arm is unconditional"))
+    }
+
+    /// Apply `effects` as [`Self::commit_effects`] does, only if the
+    /// current state of the user KV key `key` matches `expected`:
+    /// `Some(v)` requires the key to hold exactly `v`, and `None`
+    /// requires the key to be absent.
+    ///
+    /// Returns the enqueue results when the state matched and the
+    /// effects were applied, and `None` when it did not (nothing is
+    /// changed in that case). The compare and the effects execute in
+    /// one transaction, so no concurrent write can be interleaved
+    /// between the compare and the commit: either this call applies the
+    /// effects to the state it compared against, or it reports `None`.
+    /// The effects are durable before the call returns `Some`, and they
+    /// can write or delete `key` itself.
+    pub async fn kv_compare_commit(
+        &self,
+        key: &[u8],
+        expected: Option<&[u8]>,
+        effects: SettlementEffects,
+    ) -> Result<Option<Vec<EnqueueResult>>> {
+        self.commit_effects_where(effects, Some((key, expected)))
+            .await
+    }
+
+    /// Body of `commit_effects` and `kv_compare_commit`: the transaction
+    /// loop over the prepared effects, with the compare arm `guard`
+    /// (the key and its expected state) tested first when one is given.
+    async fn commit_effects_where(
+        &self,
+        effects: SettlementEffects,
+        guard: Option<(&[u8], Option<&[u8]>)>,
+    ) -> Result<Option<Vec<EnqueueResult>>> {
         let prepared = self.core.prepare_effects(effects).await?;
+        let guard = guard.map(|(key, expected)| (user_scoped_key(key), expected));
         let committed = {
-            let prepared = &prepared;
+            let (prepared, guard) = (&prepared, &guard);
             retry(&self.core.db, Durability::Awaited, |txn| async move {
+                if let Some((scoped, expected)) = guard
+                    && !kv_state_matches(&txn, scoped, *expected).await?
+                {
+                    txn.rollback();
+                    return Ok(Attempt::Abort(None));
+                }
                 let staged = self.core.stage_effects(&txn, prepared).await?;
-                Ok(Attempt::Commit(txn, staged))
+                Ok(Attempt::Commit(txn, Some(staged)))
             })
             .await
         }
-        .map(|staged| self.core.note_staged_effects(staged));
+        .map(|staged| staged.map(|staged| self.core.note_staged_effects(staged)));
         self.core
-            .finish_effects(prepared, committed.as_ref().ok().map(Vec::as_slice))
+            .finish_effects(
+                prepared,
+                committed
+                    .as_ref()
+                    .ok()
+                    .and_then(|results| results.as_deref()),
+            )
             .await;
         committed
     }
@@ -3144,6 +3192,79 @@ mod tests {
             Some(b"again".as_slice()),
         );
         assert_eq!(q.stats("work").await.unwrap().pending, 1);
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn kv_compare_commit_applies_the_effects_only_when_the_key_matches() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        q.kv_put(b"runs/1", b"active").await.unwrap();
+        q.kv_put(b"runs/1/step", b"3").await.unwrap();
+        let effects = || {
+            SettlementEffects::default()
+                .enqueue(EnqueueRequest {
+                    queue: "work".to_string(),
+                    payload: b"follow-up".to_vec(),
+                    options: EnqueueOptions::default(),
+                })
+                .kv_put(b"runs/1".to_vec(), b"done".to_vec())
+                .kv_delete(b"runs/1/step".to_vec())
+        };
+        async fn pending(q: &Queue) -> usize {
+            q.list_jobs("work", JobStatus::Pending, None, 10)
+                .await
+                .unwrap()
+                .jobs
+                .len()
+        }
+
+        // A different value and a wrong absence expectation do not apply
+        // the effects.
+        assert!(
+            q.kv_compare_commit(b"runs/1", Some(b"stale"), effects())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            q.kv_compare_commit(b"runs/1", None, effects())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            q.kv_get(b"runs/1").await.unwrap().as_deref(),
+            Some(b"active".as_slice())
+        );
+        assert_eq!(
+            q.kv_get(b"runs/1/step").await.unwrap().as_deref(),
+            Some(b"3".as_slice())
+        );
+        assert_eq!(pending(&q).await, 0);
+
+        // The expected value applies the effects, the compared key included.
+        let results = q
+            .kv_compare_commit(b"runs/1", Some(b"active"), effects())
+            .await
+            .unwrap()
+            .expect("the value matched");
+        assert!(matches!(results.as_slice(), [EnqueueResult::New(_)]));
+        assert_eq!(
+            q.kv_get(b"runs/1").await.unwrap().as_deref(),
+            Some(b"done".as_slice())
+        );
+        assert!(q.kv_get(b"runs/1/step").await.unwrap().is_none());
+        assert_eq!(pending(&q).await, 1);
+
+        // Absence is a state to compare against.
+        let claim = SettlementEffects::default().kv_put(b"runs/2".to_vec(), b"active".to_vec());
+        let results = q.kv_compare_commit(b"runs/2", None, claim).await.unwrap();
+        assert!(matches!(results.as_deref(), Some([])));
+        assert_eq!(
+            q.kv_get(b"runs/2").await.unwrap().as_deref(),
+            Some(b"active".as_slice())
+        );
 
         q.close().await.unwrap();
     }

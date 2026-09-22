@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Queue::kv_compare_commit`: `commit_effects` conditional on the value
+  or the absence of one user KV key, so a record and the state written
+  with it commit against the value a caller read. A failed compare does
+  not apply the effects and returns `None`.
+
 ### Changed
 
 - `kv_scan` and `kv_entries` on `Queue` and `QueueReader` take a
