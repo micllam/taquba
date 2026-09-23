@@ -139,10 +139,10 @@ impl QueueView {
     /// job that changes state between page reads is absent from every page or
     /// appears on two pages.
     ///
-    /// A page can hold fewer than `limit` jobs while more remain,
-    /// because a job removed between the key scan and its payload
-    /// fetch is omitted from the page. The listing is exhausted only
-    /// when [`JobPage::next_cursor`] is `None`.
+    /// A listed record is in its stored form: an inline payload is included,
+    /// and an offloaded payload is not, with [`JobRecord::payload_ref`] set.
+    /// [`QueueView::get_job`] returns the record with its payload. The listing
+    /// is exhausted when [`JobPage::next_cursor`] is `None`.
     ///
     /// The pending, claimed and dead key spaces group by queue, so those
     /// scans cover only the requested queue. The scheduled and done
@@ -182,10 +182,9 @@ impl QueueView {
             Some(c) => Bound::Excluded(Bytes::copy_from_slice(&c[prefix.len()..])),
         };
 
-        // Each row includes the key it was scanned at, which is both the
-        // key its record lives under and the position the cursor
-        // resumes from.
-        let mut page: Vec<(Bytes, JobRecord)> = Vec::with_capacity(limit);
+        // The scanned key of the last row is the cursor of the next page.
+        let mut jobs = Vec::with_capacity(limit);
+        let mut last_key = None;
         let mut more = false;
         let mut iter = self
             .handle
@@ -196,38 +195,14 @@ impl QueueView {
             if filter_queue && job.queue != queue {
                 continue;
             }
-            if page.len() == limit {
+            if jobs.len() == limit {
                 more = true;
                 break;
             }
-            page.push((kv.key, job));
+            jobs.push(job);
+            last_key = Some(kv.key);
         }
-        let next_cursor = more.then(|| page[page.len() - 1].0.to_vec());
-
-        let mut jobs = Vec::with_capacity(page.len());
-        for (record_key, mut job) in page {
-            match self.payloads.materialize(&mut job).await {
-                Ok(()) => jobs.push(job),
-                Err(Error::PayloadMissing { id }) => {
-                    // The scan can list a record just before a record-removing
-                    // transaction commits, with the object fetch running just
-                    // after that commit's payload-object deletion. The writer
-                    // re-reads the record key and omits the row of a record
-                    // confirmed removed. A reader re-reads the same lagging
-                    // view its scan used and so cannot confirm a removal, so it
-                    // reports the missing payload, which resolves once its view
-                    // advances past the removal.
-                    let removed = match &self.handle {
-                        Handle::Writer(db) => db.get(&record_key).await?.is_none(),
-                        Handle::Reader(_) => false,
-                    };
-                    if !removed {
-                        return Err(Error::PayloadMissing { id });
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        let next_cursor = more.then(|| last_key.expect("a full page has a last row").to_vec());
         Ok(JobPage { jobs, next_cursor })
     }
 
@@ -256,7 +231,8 @@ impl QueueView {
     /// the number of jobs returned.
     ///
     /// Jobs are returned in ULID order, which corresponds to the order in
-    /// which they were originally enqueued.
+    /// which they were originally enqueued, in the stored form of
+    /// [`QueueView::list_jobs`].
     pub async fn dead_jobs(
         &self,
         queue: &str,
@@ -912,7 +888,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_jobs_materializes_offloaded_payloads() {
+    async fn list_jobs_returns_an_offloaded_record_without_its_payload() {
         let q = Queue::open_with_options(make_store(), "test", offload_opts())
             .await
             .unwrap();
@@ -927,7 +903,9 @@ mod tests {
         assert_eq!(page.jobs.len(), 1);
         assert_eq!(page.jobs[0].id, id);
         assert!(page.jobs[0].payload_ref.is_some());
-        assert_eq!(page.jobs[0].payload, payload);
+        assert!(page.jobs[0].payload.is_empty());
+        let job = q.view().get_job(&id).await.unwrap().unwrap();
+        assert_eq!(job.payload, payload);
         q.close().await.unwrap();
     }
 

@@ -632,15 +632,14 @@ mod tests {
             reader.view().get_job(&id).await,
             Err(Error::PayloadMissing { .. })
         ));
-        // A reader cannot confirm a removal from its lagging view, so
-        // the listing reports the missing payload.
-        assert!(matches!(
-            reader
-                .view()
-                .list_jobs("work", JobStatus::Pending, None, 10)
-                .await,
-            Err(Error::PayloadMissing { .. })
-        ));
+        // A listing does not fetch the object.
+        let page = reader
+            .view()
+            .list_jobs("work", JobStatus::Pending, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert!(page.jobs[0].payload.is_empty());
 
         reader.close().await.unwrap();
         q.close().await.unwrap();

@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   methods of `QueueView`, returned by `Queue::view` and
   `QueueReader::view`, so one function reads through the writer or
   through a reader in another process. Call the reads on `view()`.
+- `QueueView::list_jobs`, `jobs` and `dead_jobs` return an offloaded
+  record without its payload bytes and with `payload_ref` set, so a page
+  does not read an object and does not fail on a payload object removed
+  after the scan. Fetch one job with its payload through
+  `QueueView::get_job`.
 
 ## [0.13.0] - 2026-09-16
 

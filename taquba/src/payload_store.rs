@@ -343,7 +343,9 @@ mod tests {
 
         let dead = q.view().dead_jobs("work", None, 10).await.unwrap();
         assert_eq!(dead.len(), 1);
-        assert_eq!(dead[0].payload, payload, "dead_jobs materializes payloads");
+        assert!(dead[0].payload.is_empty());
+        let read = q.view().get_job(&dead[0].id).await.unwrap().unwrap();
+        assert_eq!(read.payload, payload, "the object survives dead-lettering");
 
         q.requeue_dead_job(&dead[0].id).await.unwrap();
         let job = q

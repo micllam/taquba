@@ -25,11 +25,13 @@ pub struct JobRecord {
     pub queue: QueueName,
     /// Application-defined payload.
     ///
-    /// Always populated on records returned by the claim and read APIs.
-    /// When [`Self::payload_ref`] is `Some`, the payload was offloaded
-    /// to the payload object store at enqueue and is fetched from there
-    /// on each claim or read; the persisted record itself stores no
-    /// payload bytes. Stored as a MessagePack binary string.
+    /// Populated on a record returned by a claim or by
+    /// [`QueueView::get_job`](crate::QueueView::get_job). When
+    /// [`Self::payload_ref`] is `Some`, the payload was offloaded to the
+    /// payload object store at enqueue and is fetched from there on each claim
+    /// or `get_job`. The persisted record does not store payload bytes, and a
+    /// listing returns the record in that form. Stored as a MessagePack binary
+    /// string.
     #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
     /// Name of this job's payload object in the payload object store.
