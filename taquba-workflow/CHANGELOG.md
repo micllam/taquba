@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `WorkflowView`: the status and the outcome of a run, read through a
+  `taquba::QueueView` and a `MemoStore`, so a process without a runtime reads
+  them through a `taquba::QueueReader`. `WorkflowRuntime::view` returns the
+  runtime's view, and `WorkflowRuntime::status` and `WorkflowRuntime::outcome`
+  read through it.
+
 ## [0.12.0] - 2026-09-16
 
 ### Added

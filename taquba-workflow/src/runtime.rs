@@ -28,6 +28,7 @@ use crate::memo::{MemoStore, RUN_RESULT_MEMO_KEY};
 use crate::runner::{StepErrorKind, StepOutcome, StepRunner, Trigger};
 use crate::sweep::{Clearable, Sweep, run_periodically};
 use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
+use crate::view::WorkflowView;
 use crate::worker::{ClaimedStep, StepWorker};
 
 /// The encoded current-step pointer for `job_id` at `step_number`.
@@ -134,7 +135,7 @@ pub struct SubmitOutcome {
 }
 
 /// Status snapshot of a run, read from its durable state by
-/// [`WorkflowRuntime::status`].
+/// [`WorkflowView::status`].
 #[derive(Debug, Clone)]
 pub struct RunStatus {
     /// The run's identifier.
@@ -381,8 +382,10 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
                 group_store.clone(),
             ));
         }
+        let view = WorkflowView::new(self.queue.view().clone(), memo_store.clone());
         let core = RuntimeCore {
             queue: self.queue,
+            view,
             queue_name: self.queue_name,
             max_concurrent_steps: self.max_concurrent_steps,
             poll_interval: self.poll_interval,
@@ -450,6 +453,7 @@ pub(crate) struct RuntimeInner<R, H> {
 /// worker, [`WorkflowRuntime`] and [`RunGroup`](crate::RunGroup) share it.
 pub(crate) struct RuntimeCore {
     pub(crate) queue: Arc<Queue>,
+    pub(crate) view: WorkflowView,
     queue_name: String,
     max_concurrent_steps: usize,
     poll_interval: Duration,
@@ -530,33 +534,21 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         self.inner.core.submit(spec).await
     }
 
-    /// The status of a run, read from its durable state, so it answers
-    /// after a restart and from any runtime over the same queue. A
-    /// terminated run reports [`RunState::Terminated`] until the memo
-    /// sweep removes its terminal record; `None` for a run that is
-    /// unknown or swept.
-    ///
-    /// A run with a pending cancellation request reports
-    /// [`RunState::Cancelling`] whatever its step's lifecycle position,
-    /// until the run terminates.
-    pub async fn status(&self, run_id: &RunId) -> Result<Option<RunStatus>> {
-        self.inner.core.status(run_id).await
+    /// The runtime's view of its store: the read-only queries over the queue
+    /// and the memo store the runtime writes to.
+    pub fn view(&self) -> &WorkflowView {
+        &self.inner.core.view
     }
 
-    /// The committed outcome of a terminated run, read from its run
-    /// result record: the result the runner returned or the error that
-    /// ended the run, with the submitter's headers and the final step.
-    /// The record is written by the worker that terminates the run
-    /// before the terminating settlement and is removed with the run's
-    /// memo entries; `None` for a run that is unknown, still active or
-    /// was terminated without a worker (a cancellation of a pending
-    /// step, a dead-letter outside the worker), whose status
-    /// [`Self::status`] reports. A record belongs to the termination
-    /// its terminal record describes: a re-submission of a terminated
-    /// run id leaves the earlier run's record in place until its own
-    /// termination overwrites it, and such a record is not reported.
+    /// [`WorkflowView::status`] through the runtime's view, so the status is
+    /// available after a restart and from any runtime over the same queue.
+    pub async fn status(&self, run_id: &RunId) -> Result<Option<RunStatus>> {
+        self.inner.core.view.status(run_id).await
+    }
+
+    /// [`WorkflowView::outcome`] through the runtime's view.
     pub async fn outcome(&self, run_id: &RunId) -> Result<Option<RunOutcome>> {
-        self.inner.core.outcome(run_id).await
+        self.inner.core.view.outcome(run_id).await
     }
 
     /// Wait until the run `run_id` terminates and report its end. The
@@ -781,7 +773,7 @@ impl RuntimeCore {
             }
         };
 
-        if let Some(existing) = self.run_record(run_id).await? {
+        if let Some(existing) = self.view.run_record(run_id).await? {
             check_input(existing)?;
             let current = self.current_step(run_id).await?;
             return Ok(duplicate(current.job_id));
@@ -825,7 +817,7 @@ impl RuntimeCore {
             // is a store this runtime did not write, reported as a
             // duplicate.
             EnqueueResult::AlreadyEnqueued(existing) => {
-                if let Some(record) = self.run_record(run_id).await? {
+                if let Some(record) = self.view.run_record(run_id).await? {
                     check_input(record)?;
                 }
                 return Ok(duplicate(existing));
@@ -838,41 +830,6 @@ impl RuntimeCore {
             newly_submitted: true,
             job_id,
         })
-    }
-
-    /// [`WorkflowRuntime::status`].
-    pub(crate) async fn status(&self, run_id: &RunId) -> Result<Option<RunStatus>> {
-        let Some(record) = self.run_record(run_id).await? else {
-            return self.terminated_status(run_id).await;
-        };
-        // The pointer is deleted with the record; its absence here means
-        // the run terminated between the two reads.
-        let Some((current, job)) = self.current_job(run_id).await? else {
-            return self.terminated_status(run_id).await;
-        };
-        let state = if record.cancel_requested {
-            RunState::Cancelling
-        } else if job.status == JobStatus::Claimed {
-            RunState::Running
-        } else {
-            RunState::Pending
-        };
-        Ok(Some(RunStatus {
-            run_id: run_id.clone(),
-            state,
-            current_step: current.step_number,
-        }))
-    }
-
-    /// [`WorkflowRuntime::outcome`].
-    pub(crate) async fn outcome(&self, run_id: &RunId) -> Result<Option<RunOutcome>> {
-        if self.current_step_if_active(run_id).await?.is_some() {
-            return Ok(None);
-        }
-        Ok(self
-            .recorded_result(run_id)
-            .await?
-            .map(|result| result.outcome))
     }
 
     /// [`WorkflowRuntime::wait`].
@@ -905,7 +862,7 @@ impl RuntimeCore {
         // between is followed to its successor; a step claimed after the
         // request terminates the run on its own.
         loop {
-            let Some((_, job)) = self.current_job(run_id).await? else {
+            let Some((_, job)) = self.view.current_job(run_id).await? else {
                 // Terminated on its own after the request was recorded.
                 return Ok(false);
             };
@@ -1013,14 +970,14 @@ impl RuntimeCore {
                 continue;
             };
             let run_id = &claimed.run_id;
-            let current = self.current_step_if_active(run_id).await?;
+            let current = self.view.current_step_if_active(run_id).await?;
             if current.is_none_or(|current| current.job_id != job.id) {
                 continue;
             }
             // The record is written and deleted with the pointer; a
             // pointer without one is a store the runtime did not write,
             // left for the worker to report.
-            let Some(record) = self.run_record(run_id).await? else {
+            let Some(record) = self.view.run_record(run_id).await? else {
                 warn!(run_id = %run_id, job_id = %job.id, "dead step has a current-step pointer but no run record");
                 continue;
             };
@@ -1081,61 +1038,10 @@ impl RuntimeCore {
 
     /// The current-step pointer of a run whose durable record exists.
     pub(crate) async fn current_step(&self, run_id: &RunId) -> Result<DurableCurrentStep> {
-        self.current_step_if_active(run_id)
+        self.view
+            .current_step_if_active(run_id)
             .await?
             .ok_or_else(|| Error::InconsistentRunState(run_id.clone()))
-    }
-
-    /// The current-step pointer of `run_id`, `None` when the run is not
-    /// active.
-    pub(crate) async fn current_step_if_active(
-        &self,
-        run_id: &RunId,
-    ) -> Result<Option<DurableCurrentStep>> {
-        durable::kv_record(&self.queue, &step_kv_key(run_id)).await
-    }
-
-    /// The current step of `run_id` with its queue job; `None` when the
-    /// run is not active. The pointer and the job change in one
-    /// transaction, so a pointer that moved between the two reads is
-    /// followed, and a job missing under a pointer that a second read
-    /// still holds is a store the runtime did not write, reported as
-    /// [`Error::InconsistentRunState`].
-    pub(crate) async fn current_job(
-        &self,
-        run_id: &RunId,
-    ) -> Result<Option<(DurableCurrentStep, JobRecord)>> {
-        let mut absent: Option<String> = None;
-        loop {
-            let Some(current) = self.current_step_if_active(run_id).await? else {
-                return Ok(None);
-            };
-            if let Some(job) = self.queue.view().get_job(&current.job_id).await? {
-                return Ok(Some((current, job)));
-            }
-            if absent.as_deref() == Some(current.job_id.as_str()) {
-                return Err(Error::InconsistentRunState(run_id.clone()));
-            }
-            absent = Some(current.job_id);
-        }
-    }
-
-    /// The terminal record of `run_id`; `None` when no record exists.
-    pub(crate) async fn terminal_record(
-        &self,
-        run_id: &RunId,
-    ) -> Result<Option<DurableTermination>> {
-        durable::kv_record(&self.queue, &outcome_kv_key(run_id)).await
-    }
-
-    /// The status of a terminated run from its terminal record; `None`
-    /// when no record exists.
-    async fn terminated_status(&self, run_id: &RunId) -> Result<Option<RunStatus>> {
-        Ok(self.terminal_record(run_id).await?.map(|record| RunStatus {
-            run_id: run_id.clone(),
-            current_step: record.final_step,
-            state: RunState::Terminated(record.into()),
-        }))
     }
 
     /// Wait until `run_id` terminates, following its current step
@@ -1145,7 +1051,7 @@ impl RuntimeCore {
     /// until reconciliation terminates the run.
     pub(crate) async fn wait_run(&self, run_id: &RunId) -> Result<Option<RunEnd>> {
         loop {
-            let Some((current, _)) = self.current_job(run_id).await? else {
+            let Some((current, _)) = self.view.current_job(run_id).await? else {
                 return self.run_end(run_id).await;
             };
             match self.queue.wait_for_completion(&current.job_id).await? {
@@ -1158,6 +1064,7 @@ impl RuntimeCore {
                     // job identifies a dead-letter outside the worker,
                     // which reconciliation terminates.
                     let unreconciled = self
+                        .view
                         .current_step_if_active(run_id)
                         .await?
                         .is_some_and(|step| step.job_id == current.job_id);
@@ -1173,11 +1080,12 @@ impl RuntimeCore {
     /// and the run result record of that termination; `None` when no
     /// terminal record remains.
     async fn run_end(&self, run_id: &RunId) -> Result<Option<RunEnd>> {
-        let Some(termination) = self.terminal_record(run_id).await? else {
+        let Some(termination) = self.view.terminal_record(run_id).await? else {
             return Ok(None);
         };
         let termination = RunTermination::from(termination);
         let outcome = self
+            .view
             .run_result_of(run_id, &termination)
             .await?
             .map(|result| result.outcome);
@@ -1185,54 +1093,6 @@ impl RuntimeCore {
             termination,
             outcome,
         }))
-    }
-
-    /// The run result record of the termination `run_id`'s terminal
-    /// record describes; `None` when no terminal record remains or the
-    /// worker that terminated the run wrote no record.
-    pub(crate) async fn recorded_result(&self, run_id: &RunId) -> Result<Option<RunResult>> {
-        match self.terminal_record(run_id).await? {
-            Some(termination) => self.run_result_of(run_id, &termination.into()).await,
-            None => Ok(None),
-        }
-    }
-
-    /// The run result record of `run_id` when it belongs to
-    /// `termination`. A record outlives a re-submission of the run id
-    /// until the next termination overwrites it, and a record written
-    /// before a settlement that did not commit outlives the termination
-    /// that followed, so a record of another termination is not
-    /// reported.
-    pub(crate) async fn run_result_of(
-        &self,
-        run_id: &RunId,
-        termination: &RunTermination,
-    ) -> Result<Option<RunResult>> {
-        Ok(self
-            .run_result(run_id)
-            .await?
-            .filter(|result| result.termination == *termination))
-    }
-
-    /// The run result record of `run_id`, whichever termination it
-    /// belongs to; a record that fails to decode is treated as absent.
-    async fn run_result(&self, run_id: &RunId) -> Result<Option<RunResult>> {
-        let Some(bytes) = self
-            .memo_store
-            .new_run_memo(run_id)
-            .get(RUN_RESULT_MEMO_KEY)
-            .await?
-        else {
-            return Ok(None);
-        };
-        Ok(
-            durable::decode_or_absent::<DurableRunResult>(&bytes, "run result record", run_id).map(
-                |record| RunResult {
-                    termination: record.termination.into(),
-                    outcome: record.outcome.into(),
-                },
-            ),
-        )
     }
 
     /// The termination of `outcome`'s run at the clock's current time;
@@ -1268,11 +1128,6 @@ impl RuntimeCore {
             .new_run_memo(&outcome.run_id)
             .put(RUN_RESULT_MEMO_KEY, &durable::encode(&record))
             .await
-    }
-
-    /// The durable record of `run_id`, when the run is active.
-    pub(crate) async fn run_record(&self, run_id: &RunId) -> Result<Option<DurableRunRecord>> {
-        durable::kv_record(&self.queue, &run_kv_key(run_id)).await
     }
 
     /// Record a cancellation request on the run record of `run_id`.
@@ -1475,10 +1330,11 @@ mod tests {
     use crate::test_util::{
         advance, fast_options, open_queue, open_queue_at, open_queue_at_with, open_queue_with, rid,
     };
+    use crate::view::WorkflowView;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicU32, Ordering};
     use taquba::object_store::memory::InMemory;
-    use taquba::{LeaseHandle, MockClock, OpenOptions, QueueConfig};
+    use taquba::{LeaseHandle, MockClock, OpenOptions, QueueConfig, QueueReader};
     use tokio::sync::oneshot;
 
     /// Recording terminal hook backed by an mpsc channel.
@@ -3230,6 +3086,51 @@ mod tests {
         assert_eq!(stats.pending, 0, "cancelled job must be removed");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_view_reads_the_same_state_through_the_runtime_and_a_reader() {
+        let (queue, store, _clock) = open_queue_at(10_000).await;
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store.clone(),
+            UnreachableRunner,
+            NoopTerminalHook,
+        )
+        .memo_prefix("memo")
+        .build();
+        // The worker loop is not spawned, so the step stays pending.
+        let handle = runtime.submit(RunSpec::default()).await.unwrap();
+
+        let reader = QueueReader::open(store.clone(), "test").await.unwrap();
+        let view = WorkflowView::new(reader.view().clone(), MemoStore::new(store.clone(), "memo"));
+        let through_reader = view.status(&handle.run_id).await.unwrap().expect("active");
+        let through_runtime = runtime.status(&handle.run_id).await.unwrap().unwrap();
+        assert_eq!(through_reader.run_id, handle.run_id);
+        assert_eq!(through_reader.state, RunState::Pending);
+        assert_eq!(through_reader.state, through_runtime.state);
+        assert_eq!(through_reader.current_step, through_runtime.current_step);
+        assert!(view.outcome(&handle.run_id).await.unwrap().is_none());
+        assert!(view.status(&rid("unknown")).await.unwrap().is_none());
+
+        assert!(runtime.cancel(&handle.run_id).await.unwrap());
+        let reader = QueueReader::open(store.clone(), "test").await.unwrap();
+        let view = WorkflowView::new(reader.view().clone(), MemoStore::new(store, "memo"));
+        let status = view
+            .status(&handle.run_id)
+            .await
+            .unwrap()
+            .expect("terminal record");
+        assert_eq!(
+            status.state,
+            RunState::Terminated(RunTermination {
+                status: TerminalStatus::Cancelled,
+                error: None,
+                error_kind: None,
+                final_step: 0,
+                terminated_at_ms: 10_000,
+            }),
+        );
+    }
+
     /// Drive a single step that blocks on a gate, calls `cancel(run_id)`
     /// while the step is in-flight, and then has the runner return the
     /// supplied error. Asserts that external cancellation suppresses the
@@ -4676,8 +4577,7 @@ mod tests {
 
         assert!(runtime.submit(spec).await.unwrap().newly_submitted);
         let record = runtime
-            .inner
-            .core
+            .view()
             .run_record(&rid("again"))
             .await
             .unwrap()

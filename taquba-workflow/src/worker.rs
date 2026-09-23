@@ -255,6 +255,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         // run record; the step is settled as cancelled without running.
         let record = self
             .core
+            .view
             .run_record(run_id)
             .await
             .map_err(worker_error)?

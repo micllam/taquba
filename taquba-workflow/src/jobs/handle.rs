@@ -121,7 +121,14 @@ impl<J: Job> JobHandle<J> {
     ///
     /// Reads from object storage, so it works across process restarts.
     pub async fn fetch_result(&self) -> Result<Option<std::result::Result<J::Output, JobError>>> {
-        match self.runtime.inner.core.recorded_result(&self.id).await? {
+        match self
+            .runtime
+            .inner
+            .core
+            .view
+            .recorded_result(&self.id)
+            .await?
+        {
             None => Ok(None),
             Some(result) => decode_end::<J>(result.termination, Some(result.outcome)).map(Some),
         }

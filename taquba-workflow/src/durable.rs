@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use taquba::Queue;
+use taquba::QueueView;
 use tracing::warn;
 
 use crate::error::Result;
@@ -63,8 +63,11 @@ pub(crate) fn decode_or_absent<T: DeserializeOwned>(
 
 /// The record at `key` of the queue's KV namespace, `None` when no
 /// value is stored there.
-pub(crate) async fn kv_record<T: DeserializeOwned>(queue: &Queue, key: &[u8]) -> Result<Option<T>> {
-    match queue.view().kv_get(key).await? {
+pub(crate) async fn kv_record<T: DeserializeOwned>(
+    view: &QueueView,
+    key: &[u8],
+) -> Result<Option<T>> {
+    match view.kv_get(key).await? {
         Some(bytes) => decode(&bytes).map(Some),
         None => Ok(None),
     }
@@ -267,14 +270,13 @@ impl From<DurableTerminalStatus> for TerminalStatus {
     }
 }
 
-/// The stored form of a [`RunTermination`](crate::RunTermination) with
-/// the final step and the SHA-256 of the run's input: the terminal
-/// record under `workflow/outcomes/{run_id}`, written in the settlement
-/// that terminates the run and read by
-/// [`WorkflowRuntime::status`](crate::WorkflowRuntime::status) once the
-/// run record is gone and by a typed re-submission after completion,
-/// the termination half of a member record and the termination a run
-/// result record belongs to.
+/// The stored form of a [`RunTermination`](crate::RunTermination) with the
+/// final step and the SHA-256 of the run's input: the terminal record under
+/// `workflow/outcomes/{run_id}`, written in the settlement that terminates the
+/// run and read by [`WorkflowView::status`](crate::WorkflowView::status) once
+/// the run record is gone and by a typed re-submission after completion, the
+/// termination half of a member record and the termination a run result record
+/// belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DurableTermination {
     pub(crate) status: DurableTerminalStatus,

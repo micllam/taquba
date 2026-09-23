@@ -124,20 +124,19 @@
 //! for the mismatch check. A current-step pointer under `workflow/steps/`
 //! is written beside it, rewritten in the settlement that enqueues each
 //! next step and names the queue job [`SubmitOutcome::job_id`] reports
-//! for a duplicate; a `taquba::QueueReader` can read it to resolve a
-//! run's live job from outside the process. Both are removed when the run
-//! reaches a terminal state.
+//! for a duplicate. Both are removed when the run reaches a terminal state.
 //!
-//! [`WorkflowRuntime::status`] reads the record, the pointer and the
-//! step's queue job into a [`RunStatus`] ([`RunState::Pending`],
-//! [`RunState::Running`] or [`RunState::Cancelling`], with the current
-//! step number), so it answers after a restart and from any runtime over
-//! the same queue. A terminated run reports [`RunState::Terminated`]
-//! with its status, error, error kind, final step and time of
-//! termination, read from the terminal record written with the
-//! terminating settlement,
-//! which [Memo retention](#memo-retention) removes with the run's memo
-//! entries.
+//! [`WorkflowView::status`] reads the record, the pointer and the step's queue
+//! job into a [`RunStatus`] ([`RunState::Pending`], [`RunState::Running`] or
+//! [`RunState::Cancelling`], with the current step number).
+//! [`WorkflowRuntime::status`] reads through the runtime's view, so the status
+//! is available after a restart and from any runtime over the same queue. A
+//! process without a runtime builds a [`WorkflowView`] from a
+//! `taquba::QueueReader` view and a [`MemoStore`] at the runtime's memo prefix.
+//! A terminated run reports [`RunState::Terminated`] with its status, error,
+//! error kind, final step and time of termination, read from the terminal
+//! record written with the terminating settlement, which
+//! [Memo retention](#memo-retention) removes with the run's memo entries.
 //!
 //! [`WorkflowRuntime::wait`] waits until a run terminates, following its
 //! current step across steps, and reports a [`RunEnd`]: the termination
@@ -626,6 +625,7 @@ mod sweep;
 mod terminal;
 #[cfg(test)]
 mod test_util;
+mod view;
 mod worker;
 
 pub use effects::{EffectsHandle, TerminalEffects};
@@ -646,3 +646,4 @@ pub use signal::SignalOutcome;
 #[cfg(feature = "webhooks")]
 pub use terminal::WebhookTerminalHook;
 pub use terminal::{NoopTerminalHook, RunOutcome, TerminalHook, TerminalStatus};
+pub use view::WorkflowView;

@@ -13,7 +13,7 @@ Each rule identifies the code it applies to, whose docs describe the mechanism.
 - **Terminal record.** Every termination arm passes the input hash to
   `RuntimeCore::termination`. Do not add a result payload or a cost to the
   record.
-- **Run result record.** `RuntimeCore::run_result_of` is the one site that
+- **Run result record.** `WorkflowView::run_result_of` is the one site that
   matches a record to a termination.
 - **Cancellation.** Do not add per-run in-process state.
 - **Decode failures.** The decode policy in the `durable.rs` module docs does
@@ -26,8 +26,8 @@ Each rule identifies the code it applies to, whose docs describe the mechanism.
   `process_step` is the one construction site, and `Delivery::detached` the one
   detached constructor.
 - **Control plane** (`runtime.rs`). Do not put `R` or `H` back on a control
-  type. Read the current step's job through `RuntimeCore::current_job`, never
-  by pairing `current_step_if_active` with `get_job`.
+  type. Read the current step's job through `WorkflowView::current_job`, never
+  by pairing `current_step_if_active` with a job read.
 - **Run wait** (`RuntimeCore::wait_run`). Do not reconcile dead steps inline in
   the wait.
 - **Retention sweeps** (`sweep.rs`). A new retention need implements

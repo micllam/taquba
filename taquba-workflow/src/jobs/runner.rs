@@ -207,7 +207,7 @@ impl JobRunner {
         // record, which outlives the run record the workflow deletes at
         // termination.
         if let Some(run_id) = &run_id
-            && let Some(termination) = self.runtime.inner.core.terminal_record(run_id).await?
+            && let Some(termination) = self.runtime.inner.core.view.terminal_record(run_id).await?
         {
             if termination.input_hash != hash_input(&payload) {
                 return Err(crate::Error::InputMismatch(run_id.clone()));

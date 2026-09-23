@@ -197,7 +197,7 @@ impl GroupStore {
         group_id: &RunId,
         key: &str,
     ) -> Result<Option<DurableMember>> {
-        durable::kv_record(&self.queue, &group_member_kv_key(group_id, key)).await
+        durable::kv_record(self.queue.view(), &group_member_kv_key(group_id, key)).await
     }
 
     /// Every member record of `group_id`, in key order. A record that
@@ -442,6 +442,7 @@ impl RunGroup {
                     .into();
                 let outcome = group
                     .core()
+                    .view
                     .run_result_of(&member.record.run_id, &termination)
                     .await?;
                 Ok(MemberResult {
