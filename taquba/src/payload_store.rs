@@ -177,7 +177,7 @@ mod tests {
         let id = q.enqueue("work", payload.clone()).await.unwrap();
         assert_eq!(object_count(&store, "test-payloads").await, 1);
 
-        let read = q.get_job(&id).await.unwrap().unwrap();
+        let read = q.view().get_job(&id).await.unwrap().unwrap();
         assert!(read.payload_ref.is_some());
         assert_eq!(read.payload, payload);
 
@@ -251,7 +251,7 @@ mod tests {
             "unexpected error: {err:?}"
         );
         assert_eq!(
-            q.stats("work").await.unwrap().pending,
+            q.view().stats("work").await.unwrap().pending,
             0,
             "a record must not be written when its payload object was not"
         );
@@ -287,7 +287,7 @@ mod tests {
             0,
             "objects written before the failure must be removed, since no record points at them"
         );
-        assert_eq!(q.stats("work").await.unwrap().pending, 0);
+        assert_eq!(q.view().stats("work").await.unwrap().pending, 0);
         q.close().await.unwrap();
     }
 
@@ -314,7 +314,7 @@ mod tests {
         q.ack(&job).await.unwrap();
 
         assert!(
-            q.get_job(&id).await.unwrap().is_none(),
+            q.view().get_job(&id).await.unwrap().is_none(),
             "the payload delete is best-effort and must not prevent settlement"
         );
         assert_eq!(
@@ -341,7 +341,7 @@ mod tests {
             .unwrap();
         q.dead_letter(&job, "permanent").await.unwrap();
 
-        let dead = q.dead_jobs("work", None, 10).await.unwrap();
+        let dead = q.view().dead_jobs("work", None, 10).await.unwrap();
         assert_eq!(dead.len(), 1);
         assert_eq!(dead[0].payload, payload, "dead_jobs materializes payloads");
 
@@ -424,7 +424,7 @@ mod tests {
 
         let id = q.enqueue("work", vec![0u8; 64]).await.unwrap();
         assert_eq!(object_count(&store, "test-payloads").await, 0);
-        let job = q.get_job(&id).await.unwrap().unwrap();
+        let job = q.view().get_job(&id).await.unwrap().unwrap();
         assert!(job.payload_ref.is_none());
         assert_eq!(job.payload.len(), 64);
         q.close().await.unwrap();
@@ -443,7 +443,7 @@ mod tests {
 
         let id = q.enqueue("work", vec![0u8; 1024 * 1024]).await.unwrap();
         assert_eq!(object_count(&store, "test-payloads").await, 0);
-        let job = q.get_job(&id).await.unwrap().unwrap();
+        let job = q.view().get_job(&id).await.unwrap().unwrap();
         assert!(job.payload_ref.is_none());
         q.close().await.unwrap();
     }
@@ -541,7 +541,7 @@ mod tests {
         store.delete(&objects[0].location).await.unwrap();
 
         // The record is live, so the missing object is a real loss.
-        let err = q.get_job(&id).await.unwrap_err();
+        let err = q.view().get_job(&id).await.unwrap_err();
         assert!(matches!(err, Error::PayloadMissing { id: ref e } if *e == id));
 
         q.close().await.unwrap();

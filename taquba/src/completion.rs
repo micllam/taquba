@@ -206,7 +206,7 @@ mod tests {
             }
             other => panic!("expected Done(record), got {other:?}"),
         }
-        assert!(q.get_job(&id).await.unwrap().is_none());
+        assert!(q.view().get_job(&id).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -256,7 +256,7 @@ mod tests {
         assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Removed);
 
         assert!(matches!(waiter.await.unwrap(), WaitOutcome::Cancelled));
-        assert!(q.get_job(&id).await.unwrap().is_none());
+        assert!(q.view().get_job(&id).await.unwrap().is_none());
     }
 
     #[tokio::test]

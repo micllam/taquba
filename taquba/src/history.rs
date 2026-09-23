@@ -11,7 +11,7 @@
 //! buffer entry by entry.
 //!
 //! The history is retained exactly as long as the job is findable via
-//! [`Queue::get_job`](crate::Queue::get_job): the transaction that
+//! [`QueueView::get_job`](crate::QueueView::get_job): the transaction that
 //! removes the job's last record (ack without retention, cancel of a
 //! pending or scheduled job, the done and dead retention sweeps) also
 //! deletes the history key, because every such removal is staged by
@@ -28,7 +28,7 @@ use crate::keys::attempt_history_key;
 
 /// One recorded event in a job's delivery history.
 ///
-/// Returned by [`Queue::attempt_history`](crate::Queue::attempt_history)
+/// Returned by [`QueueView::attempt_history`](crate::QueueView::attempt_history)
 /// in write order. All timestamps are wall-clock milliseconds since the
 /// UNIX epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,7 +152,7 @@ mod tests {
         let job = q.claim("work", lease).await.unwrap().unwrap();
         q.ack(&job).await.unwrap();
 
-        let history = q.attempt_history(&id).await.unwrap();
+        let history = q.view().attempt_history(&id).await.unwrap();
         assert_eq!(history.len(), 3);
         assert_eq!(history[0].attempt, 1);
         assert_eq!(history[0].outcome, AttemptOutcome::Retried);
@@ -177,17 +177,17 @@ mod tests {
 
         let job = q.claim("work", lease).await.unwrap().unwrap();
         q.nack(&job, "failed").await.unwrap();
-        assert_eq!(q.attempt_history(&id).await.unwrap().len(), 1);
+        assert_eq!(q.view().attempt_history(&id).await.unwrap().len(), 1);
 
         let job = q.claim("work", lease).await.unwrap().unwrap();
         q.ack(&job).await.unwrap();
-        assert!(q.attempt_history(&id).await.unwrap().is_empty());
+        assert!(q.view().attempt_history(&id).await.unwrap().is_empty());
 
         let reused = q.enqueue_with("work", b"y".to_vec(), opts()).await.unwrap();
         assert_eq!(reused, id);
         let job = q.claim("work", lease).await.unwrap().unwrap();
         q.nack(&job, "failed again").await.unwrap();
-        let history = q.attempt_history(&id).await.unwrap();
+        let history = q.view().attempt_history(&id).await.unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].error.as_deref(), Some("failed again"));
         q.close().await.unwrap();
@@ -214,11 +214,11 @@ mod tests {
             .unwrap();
         q.nack(&job, "failed").await.unwrap();
         assert_eq!(
-            q.get_job(&id).await.unwrap().unwrap().status,
+            q.view().get_job(&id).await.unwrap().unwrap().status,
             JobStatus::Dead
         );
 
-        let history = q.attempt_history(&id).await.unwrap();
+        let history = q.view().attempt_history(&id).await.unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].attempt, 1);
         assert_eq!(history[0].outcome, AttemptOutcome::DeadLettered);
@@ -236,12 +236,12 @@ mod tests {
         let job = q.claim("work", lease).await.unwrap().unwrap();
         q.dead_letter(&job, "unroutable").await.unwrap();
 
-        let dead = q.get_job(&id).await.unwrap().unwrap();
+        let dead = q.view().get_job(&id).await.unwrap().unwrap();
         q.requeue_dead_job(&dead.id).await.unwrap();
         let job = q.claim("work", lease).await.unwrap().unwrap();
         q.dead_letter(&job, "still unroutable").await.unwrap();
 
-        let history = q.attempt_history(&id).await.unwrap();
+        let history = q.view().attempt_history(&id).await.unwrap();
         let outcomes: Vec<_> = history.iter().map(|a| a.outcome).collect();
         assert_eq!(
             outcomes,
@@ -277,10 +277,10 @@ mod tests {
         // Default backoff is non-zero, so the nacked job waits in
         // `Scheduled` with one history entry.
         q.nack(&job, "failed").await.unwrap();
-        assert_eq!(q.attempt_history(&id).await.unwrap().len(), 1);
+        assert_eq!(q.view().attempt_history(&id).await.unwrap().len(), 1);
 
         assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Removed);
-        assert!(q.attempt_history(&id).await.unwrap().is_empty());
+        assert!(q.view().attempt_history(&id).await.unwrap().is_empty());
         q.close().await.unwrap();
     }
 }

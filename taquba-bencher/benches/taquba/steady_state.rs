@@ -381,7 +381,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tick.tick().await;
                 let (mut pending, mut claimed, mut done) = (0i64, 0i64, 0i64);
                 for queue_name in queue_names.iter() {
-                    match queue.stats(queue_name).await {
+                    match queue.view().stats(queue_name).await {
                         Ok(s) => {
                             pending += s.pending;
                             claimed += s.claimed;

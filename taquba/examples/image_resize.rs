@@ -124,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let s = q.stats("resize").await?;
+    let s = q.view().stats("resize").await?;
     println!();
     println!(
         "before promotion: pending:{} scheduled:{}",
@@ -135,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_millis(5)).await;
     q.promote_scheduled_now().await?;
 
-    let s = q.stats("resize").await?;
+    let s = q.view().stats("resize").await?;
     println!(
         "after promotion: pending:{} scheduled:{}",
         s.pending, s.scheduled
@@ -160,7 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     loop {
-        let s = q.stats("resize").await?;
+        let s = q.view().stats("resize").await?;
         if s.pending == 0 && s.claimed == 0 && s.scheduled == 0 {
             break;
         }
@@ -169,7 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = shutdown_tx.send(());
     let _ = handle.await;
 
-    let s = q.stats("resize").await?;
+    let s = q.view().stats("resize").await?;
     println!();
     println!(
         "done: pending:{} done:{} dead:{}",

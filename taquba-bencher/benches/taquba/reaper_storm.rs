@@ -242,8 +242,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 tick.tick().await;
                 let (storm, live) = match (
-                    queue.stats(STORM_QUEUE).await,
-                    queue.stats(LIVE_QUEUE).await,
+                    queue.view().stats(STORM_QUEUE).await,
+                    queue.view().stats(LIVE_QUEUE).await,
                 ) {
                     (Ok(s), Ok(l)) => (s, l),
                     _ => continue,

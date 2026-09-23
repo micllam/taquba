@@ -678,6 +678,7 @@ mod tests {
 
     async fn count_jobs(queue: &Queue, status: JobStatus) -> usize {
         queue
+            .view()
             .list_jobs(DEFAULT_QUEUE_NAME, status, None, 100)
             .await
             .unwrap()
@@ -716,7 +717,12 @@ mod tests {
         assert_eq!(value, 7);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
-            queue.kv_get(b"jobs-test/marker").await.unwrap().as_deref(),
+            queue
+                .view()
+                .kv_get(b"jobs-test/marker")
+                .await
+                .unwrap()
+                .as_deref(),
             Some(&b"done"[..]),
         );
 
@@ -737,6 +743,7 @@ mod tests {
         let job = runner.submit(Renewing).await.unwrap();
         gate.renewed.notified().await;
         let claimed = queue
+            .view()
             .list_jobs(DEFAULT_QUEUE_NAME, JobStatus::Claimed, None, 10)
             .await
             .unwrap()

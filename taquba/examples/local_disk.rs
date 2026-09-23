@@ -19,7 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(LocalFileSystem::new_with_prefix(QUEUE_DIR)?);
     let q = Queue::open(store, "data").await?;
 
-    let pending_before = q.stats(QUEUE_NAME).await?.pending;
+    let pending_before = q.view().stats(QUEUE_NAME).await?.pending;
 
     if pending_before == 0 {
         // First run: enqueue some work.
@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         println!();
-        let s = q.stats(QUEUE_NAME).await?;
+        let s = q.view().stats(QUEUE_NAME).await?;
         println!("stats: pending:{} done:{}", s.pending, s.done);
         println!();
         println!("Queue is now empty.  Run again to enqueue fresh jobs.");

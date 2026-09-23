@@ -8,7 +8,6 @@
 use std::ops::{Bound, Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive};
 
 use bytes::Bytes;
-use futures_util::Stream;
 use slatedb::DbTransaction;
 
 use crate::error::{Error, Result};
@@ -51,7 +50,7 @@ pub(crate) async fn kv_state_matches(
     })
 }
 
-/// A range of keys within a prefix, as [`Queue::kv_scan`] takes it. The
+/// A range of keys within a prefix, as [`QueueView::kv_scan`](crate::QueueView::kv_scan) takes it. The
 /// standard range forms over any byte string implement it: `..`,
 /// `key..`, `..key`, `..=key`, `a..b` and `a..=b`. A pair of [`Bound`]s
 /// implements it, which is the form of an exclusive start.
@@ -125,7 +124,7 @@ impl<K: AsRef<[u8]>> KvRange for (Bound<K>, Bound<K>) {
     }
 }
 
-/// One page of a user KV listing. Returned by [`Queue::kv_scan`].
+/// One page of a user KV listing. Returned by [`QueueView::kv_scan`](crate::QueueView::kv_scan).
 #[derive(Debug, Clone)]
 pub struct KvPage {
     /// Entries on this page as `(key, value)` pairs, in ascending byte
@@ -139,14 +138,6 @@ pub struct KvPage {
 }
 
 impl Queue {
-    /// Read a value from the user KV namespace.
-    ///
-    /// Caller-supplied keys are internally scoped under a reserved
-    /// user key tag and cannot collide with Taquba's internal layout.
-    pub async fn kv_get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        crate::read::kv_get(self.core.db.as_ref(), key).await
-    }
-
     /// Write a value to the user KV namespace.
     ///
     /// Caller-supplied keys are internally scoped under a reserved
@@ -253,48 +244,6 @@ impl Queue {
         })
         .await
     }
-
-    /// List entries of the user KV namespace under `prefix` within
-    /// `range`, in ascending byte order of the keys.
-    ///
-    /// An empty `prefix` lists the whole namespace, and `..` lists every
-    /// key within the prefix. The bounds of `range`, a [`KvRange`], are
-    /// keys in the caller namespace: `key..` begins at `key`, and
-    /// `(Bound::Excluded(key), Bound::Unbounded)` begins after it, which
-    /// continues a listing from the last key of a page. The page contains
-    /// the keys within the prefix that the range contains. A bound
-    /// outside the prefix is correct as given, and a range without such
-    /// a key returns an empty page. The listing is not a snapshot, so an
-    /// entry written or deleted between page reads is missed or observed
-    /// depending on the position of its key.
-    ///
-    /// Only caller-namespace entries are returned, and Taquba's internal
-    /// key spaces are never visible here. This is the enumeration and
-    /// export primitive for the namespace: a full sweep (`prefix = b""`,
-    /// `..`, continued while [`KvPage::more`]) observes every entry that
-    /// existed for the whole sweep.
-    pub async fn kv_scan(
-        &self,
-        prefix: &[u8],
-        range: impl KvRange,
-        limit: usize,
-    ) -> Result<KvPage> {
-        crate::read::kv_scan(self.core.db.as_ref(), prefix, range, limit).await
-    }
-
-    /// Every entry of the user KV namespace under `prefix` within
-    /// `range`, in ascending byte order of the keys, as one stream that
-    /// reads through [`Self::kv_scan`] `page_size` entries at a time. A
-    /// consumer that stops reading does not fetch a further page. The
-    /// listing semantics are those of `kv_scan`.
-    pub fn kv_entries<'a>(
-        &'a self,
-        prefix: &'a [u8],
-        range: impl KvRange,
-        page_size: usize,
-    ) -> impl Stream<Item = Result<(Vec<u8>, Bytes)>> + 'a {
-        crate::read::kv_entries(self.core.db.as_ref(), prefix, range, page_size)
-    }
 }
 
 #[cfg(test)]
@@ -329,12 +278,12 @@ mod tests {
         store.fail_puts(false);
         let q = Queue::open(store, "test").await.unwrap();
         assert_eq!(
-            q.kv_get(b"slot").await.unwrap().as_deref(),
+            q.view().kv_get(b"slot").await.unwrap().as_deref(),
             Some(b"v1".as_slice())
         );
         assert!(q.kv_compare_put(b"slot", Some(b"v1"), b"v2").await.unwrap());
         assert_eq!(
-            q.kv_get(b"slot").await.unwrap().as_deref(),
+            q.view().kv_get(b"slot").await.unwrap().as_deref(),
             Some(b"v2".as_slice())
         );
         q.close().await.unwrap();
@@ -346,7 +295,7 @@ mod tests {
 
         q.kv_put(b"config", b"v1").await.unwrap();
         assert_eq!(
-            q.kv_get(b"config").await.unwrap().as_deref(),
+            q.view().kv_get(b"config").await.unwrap().as_deref(),
             Some(b"v1".as_slice())
         );
 
@@ -357,7 +306,7 @@ mod tests {
         ));
 
         q.kv_delete(b"config").await.unwrap();
-        assert!(q.kv_get(b"config").await.unwrap().is_none());
+        assert!(q.view().kv_get(b"config").await.unwrap().is_none());
 
         q.close().await.unwrap();
     }
@@ -370,12 +319,12 @@ mod tests {
 
         assert!(!q.kv_compare_delete(b"latch", b"v2").await.unwrap());
         assert_eq!(
-            q.kv_get(b"latch").await.unwrap().as_deref(),
+            q.view().kv_get(b"latch").await.unwrap().as_deref(),
             Some(b"v1".as_slice())
         );
 
         assert!(q.kv_compare_delete(b"latch", b"v1").await.unwrap());
-        assert!(q.kv_get(b"latch").await.unwrap().is_none());
+        assert!(q.view().kv_get(b"latch").await.unwrap().is_none());
 
         assert!(!q.kv_compare_delete(b"latch", b"v1").await.unwrap());
 
@@ -387,29 +336,29 @@ mod tests {
         let q = Queue::open(make_store(), "test").await.unwrap();
 
         assert!(!q.kv_compare_put(b"slot", Some(b"v1"), b"v2").await.unwrap());
-        assert!(q.kv_get(b"slot").await.unwrap().is_none());
+        assert!(q.view().kv_get(b"slot").await.unwrap().is_none());
 
         assert!(q.kv_compare_put(b"slot", None, b"v1").await.unwrap());
         assert_eq!(
-            q.kv_get(b"slot").await.unwrap().as_deref(),
+            q.view().kv_get(b"slot").await.unwrap().as_deref(),
             Some(b"v1".as_slice())
         );
 
         assert!(!q.kv_compare_put(b"slot", None, b"v2").await.unwrap());
         assert_eq!(
-            q.kv_get(b"slot").await.unwrap().as_deref(),
+            q.view().kv_get(b"slot").await.unwrap().as_deref(),
             Some(b"v1".as_slice())
         );
 
         assert!(!q.kv_compare_put(b"slot", Some(b"v0"), b"v2").await.unwrap());
         assert_eq!(
-            q.kv_get(b"slot").await.unwrap().as_deref(),
+            q.view().kv_get(b"slot").await.unwrap().as_deref(),
             Some(b"v1".as_slice())
         );
 
         assert!(q.kv_compare_put(b"slot", Some(b"v1"), b"v2").await.unwrap());
         assert_eq!(
-            q.kv_get(b"slot").await.unwrap().as_deref(),
+            q.view().kv_get(b"slot").await.unwrap().as_deref(),
             Some(b"v2".as_slice())
         );
 
@@ -433,7 +382,7 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 for _ in 0..25 {
                     loop {
-                        let current = q.kv_get(b"counter").await.unwrap().unwrap();
+                        let current = q.view().kv_get(b"counter").await.unwrap().unwrap();
                         let n = u64::from_be_bytes(current.as_ref().try_into().unwrap());
                         let next = (n + 1).to_be_bytes();
                         if q.kv_compare_put(b"counter", Some(current.as_ref()), &next)
@@ -450,7 +399,7 @@ mod tests {
             h.await.unwrap();
         }
 
-        let total = q.kv_get(b"counter").await.unwrap().unwrap();
+        let total = q.view().kv_get(b"counter").await.unwrap().unwrap();
         assert_eq!(u64::from_be_bytes(total.as_ref().try_into().unwrap()), 100);
 
         let q = Arc::try_unwrap(q).unwrap_or_else(|_| panic!("queue still shared"));
@@ -468,13 +417,14 @@ mod tests {
         }
         q.kv_put(b"config", b"c").await.unwrap();
 
-        let page = q.kv_scan(b"runs/", .., 3).await.unwrap();
+        let page = q.view().kv_scan(b"runs/", .., 3).await.unwrap();
         assert_eq!(page.entries.len(), 3);
         assert_eq!(page.entries[0].0, b"runs/0");
         assert!(page.more);
 
         let last = page.entries[2].0.as_slice();
         let rest = q
+            .view()
             .kv_scan(b"runs/", (Bound::Excluded(last), Bound::Unbounded), 10)
             .await
             .unwrap();
@@ -482,11 +432,11 @@ mod tests {
         assert_eq!(rest.entries[1].0, b"runs/4");
         assert!(!rest.more);
 
-        let all = q.kv_scan(b"", .., 100).await.unwrap();
+        let all = q.view().kv_scan(b"", .., 100).await.unwrap();
         assert_eq!(all.entries.len(), 6);
         assert_eq!(all.entries[0].0, b"config");
 
-        let empty = q.kv_scan(b"", .., 0).await.unwrap();
+        let empty = q.view().kv_scan(b"", .., 0).await.unwrap();
         assert!(empty.entries.is_empty() && !empty.more);
 
         q.close().await.unwrap();
@@ -505,44 +455,61 @@ mod tests {
 
         // Each bound form, with a bound that is not a stored key.
         assert_eq!(
-            keys(q.kv_scan(b"runs/", b"runs/2".., 10).await.unwrap()),
+            keys(q.view().kv_scan(b"runs/", b"runs/2".., 10).await.unwrap()),
             [key(2), key(3), key(4)]
         );
         assert_eq!(
-            keys(q.kv_scan(b"runs/", b"runs/25".., 10).await.unwrap()),
+            keys(q.view().kv_scan(b"runs/", b"runs/25".., 10).await.unwrap()),
             [key(3), key(4)]
         );
         assert_eq!(
-            keys(q.kv_scan(b"runs/", ..b"runs/2", 10).await.unwrap()),
+            keys(q.view().kv_scan(b"runs/", ..b"runs/2", 10).await.unwrap()),
             [key(0), key(1)]
         );
         assert_eq!(
-            keys(q.kv_scan(b"runs/", ..=b"runs/2", 10).await.unwrap()),
+            keys(q.view().kv_scan(b"runs/", ..=b"runs/2", 10).await.unwrap()),
             [key(0), key(1), key(2)]
         );
         assert_eq!(
-            keys(q.kv_scan(b"runs/", b"runs/1"..b"runs/3", 10).await.unwrap()),
+            keys(
+                q.view()
+                    .kv_scan(b"runs/", b"runs/1"..b"runs/3", 10)
+                    .await
+                    .unwrap()
+            ),
             [key(1), key(2)]
         );
 
         // A bound outside the prefix is before every key or after every key.
         assert_eq!(
-            q.kv_scan(b"runs/", b"a".., 10).await.unwrap().entries.len(),
+            q.view()
+                .kv_scan(b"runs/", b"a".., 10)
+                .await
+                .unwrap()
+                .entries
+                .len(),
             5
         );
         assert_eq!(
-            q.kv_scan(b"runs/", ..b"z", 10).await.unwrap().entries.len(),
+            q.view()
+                .kv_scan(b"runs/", ..b"z", 10)
+                .await
+                .unwrap()
+                .entries
+                .len(),
             5
         );
         assert!(
-            q.kv_scan(b"runs/", b"z".., 10)
+            q.view()
+                .kv_scan(b"runs/", b"z".., 10)
                 .await
                 .unwrap()
                 .entries
                 .is_empty()
         );
         assert!(
-            q.kv_scan(b"runs/", ..b"a", 10)
+            q.view()
+                .kv_scan(b"runs/", ..b"a", 10)
                 .await
                 .unwrap()
                 .entries
@@ -550,11 +517,16 @@ mod tests {
         );
 
         // A range without a key within it, including an inverted one.
-        let inverted = q.kv_scan(b"runs/", b"runs/3"..b"runs/1", 10).await.unwrap();
+        let inverted = q
+            .view()
+            .kv_scan(b"runs/", b"runs/3"..b"runs/1", 10)
+            .await
+            .unwrap();
         assert!(inverted.entries.is_empty() && !inverted.more);
         let point = (Bound::Excluded(b"runs/2"), Bound::Excluded(b"runs/2"));
         assert!(
-            q.kv_scan(b"runs/", point, 10)
+            q.view()
+                .kv_scan(b"runs/", point, 10)
                 .await
                 .unwrap()
                 .entries
@@ -588,7 +560,7 @@ mod tests {
         .unwrap();
         q.kv_put(b"only", b"entry").await.unwrap();
 
-        let page = q.kv_scan(b"", .., 100).await.unwrap();
+        let page = q.view().kv_scan(b"", .., 100).await.unwrap();
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].0, b"only");
 
@@ -609,14 +581,14 @@ mod tests {
 
         let q = Queue::open(store, "test").await.unwrap();
         assert_eq!(
-            q.kv_get(b"standalone").await.unwrap().as_deref(),
+            q.view().kv_get(b"standalone").await.unwrap().as_deref(),
             Some(b"v1".as_slice())
         );
         assert_eq!(
-            q.kv_get(b"coupled").await.unwrap().as_deref(),
+            q.view().kv_get(b"coupled").await.unwrap().as_deref(),
             Some(b"v2".as_slice())
         );
-        assert_eq!(q.stats("jobs").await.unwrap().pending, 1);
+        assert_eq!(q.view().stats("jobs").await.unwrap().pending, 1);
         q.close().await.unwrap();
     }
 
@@ -639,7 +611,7 @@ mod tests {
         .unwrap();
 
         // The original job is still claimable from the original queue.
-        let s = q.stats("work").await.unwrap();
+        let s = q.view().stats("work").await.unwrap();
         assert_eq!(s.pending, 1);
         let claimed = q
             .claim("work", Duration::from_secs(30))
@@ -650,6 +622,7 @@ mod tests {
 
         // The user-visible key still reads back fine.
         let v = q
+            .view()
             .kv_get(&pending_key(&qn("work"), 1, "fake-id"))
             .await
             .unwrap();

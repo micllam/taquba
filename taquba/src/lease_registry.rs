@@ -411,7 +411,7 @@ mod tests {
                 .is_none()
         );
 
-        let fetched = q.get_job(&job.id).await.unwrap().unwrap();
+        let fetched = q.view().get_job(&job.id).await.unwrap().unwrap();
         assert_eq!(fetched.status, JobStatus::Claimed);
         // The claim still holds, so the original handle settles it.
         q.ack(&job).await.unwrap();
@@ -484,7 +484,7 @@ mod tests {
         // still settles the delivery.
         q.ack(&job).await.unwrap();
 
-        let stats = q.stats("work").await.unwrap();
+        let stats = q.view().stats("work").await.unwrap();
         assert_eq!(stats.done, 1);
         assert_eq!(stats.claimed, 0);
 
@@ -532,7 +532,7 @@ mod tests {
         ));
 
         // The live claim is untouched by the rejected settlements.
-        let stats = q.stats("work").await.unwrap();
+        let stats = q.view().stats("work").await.unwrap();
         assert_eq!(stats.claimed, 1);
         assert_eq!(stats.done, 0);
         assert_eq!(stats.dead, 0);
@@ -575,7 +575,7 @@ mod tests {
         assert!(renewed > clock.now_ms());
         clock.advance(Duration::from_secs(61));
         q.reap_now().await.unwrap();
-        let stats = q.stats("work").await.unwrap();
+        let stats = q.view().stats("work").await.unwrap();
         assert_eq!(stats.done, 1);
         assert_eq!(stats.pending, 0);
         assert_eq!(stats.dead, 0);
@@ -620,7 +620,7 @@ mod tests {
         ));
         assert!(matches!(q.ack(&claim).await, Err(Error::ClaimLost)));
 
-        let stats = q.stats("work").await.unwrap();
+        let stats = q.view().stats("work").await.unwrap();
         assert_eq!(stats.done, 1);
         assert_eq!(stats.pending, 0);
         assert_eq!(stats.dead, 0);

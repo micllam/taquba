@@ -87,7 +87,7 @@
 //! [`StepOutcome::Fail`] and [`StepOutcome::Cancel`] are runner verdicts
 //! and acknowledge normally; an `Err(`[`StepError::permanent`]`)` is an
 //! infrastructure error and dead-letters, so operators find it through
-//! [`taquba::Queue::dead_jobs`].
+//! [`taquba::QueueView::dead_jobs`].
 //!
 //! # The delivery
 //!
@@ -304,7 +304,7 @@
 //! The written values are readable inside a step through [`Delivery::kv`]
 //! (a [`KvReadHandle`] exposing `get` only, answering from committed
 //! state, so effects staged by the running step are excluded), through
-//! [`taquba::Queue::kv_get`] and, from another process, through a
+//! [`taquba::QueueView::kv_get`] and, from another process, through a
 //! `taquba::QueueReader`.
 //!
 //! See `examples/kv_effects.rs` for a runnable order flow maintaining a
@@ -535,7 +535,7 @@
 //! anyway.
 //!
 //! Other cleanup policies (selective retention, externally-driven
-//! sweeps) can be built on [`taquba::Queue::kv_scan`] over that prefix
+//! sweeps) can be built on [`taquba::QueueView::kv_scan`] over that prefix
 //! and [`MemoStore::clear_memos_for_run`], without configuring
 //! [`WorkflowRuntimeBuilder::memo_retention`].
 //!

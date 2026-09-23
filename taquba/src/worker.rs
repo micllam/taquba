@@ -546,7 +546,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(processed.load(Ordering::SeqCst), 2);
-        let stats = queue.stats("work").await.unwrap();
+        let stats = queue.view().stats("work").await.unwrap();
         assert_eq!(stats.pending, 0);
         assert_eq!(stats.done, 2);
         queue.close().await.unwrap();
@@ -623,7 +623,7 @@ mod tests {
         // The first attempt's settlement lost the claim; the loop kept
         // running and the redelivered attempt settled the job.
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        let stats = queue.stats("work").await.unwrap();
+        let stats = queue.view().stats("work").await.unwrap();
         assert_eq!(stats.pending, 0);
         assert_eq!(stats.claimed, 0);
         assert_eq!(stats.done, 1);
@@ -738,8 +738,8 @@ mod tests {
         };
         run_one_failing_attempt(&queue, &worker).await;
 
-        assert_eq!(queue.stats("work").await.unwrap().dead, 1);
-        assert_eq!(queue.stats("notify").await.unwrap().pending, 1);
+        assert_eq!(queue.view().stats("work").await.unwrap().dead, 1);
+        assert_eq!(queue.view().stats("notify").await.unwrap().pending, 1);
         queue.close().await.unwrap();
     }
 
@@ -756,7 +756,7 @@ mod tests {
         };
         run_one_failing_attempt(&queue, &worker).await;
 
-        let dead = queue.get_job(&id).await.unwrap().unwrap();
+        let dead = queue.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(dead.attempts, 1, "a wrapped failure consumes one attempt");
         assert_eq!(dead.last_error.as_deref(), Some("permanent failure"));
         queue.close().await.unwrap();
@@ -775,10 +775,10 @@ mod tests {
         };
         run_one_failing_attempt(&queue, &worker).await;
 
-        let stats = queue.stats("work").await.unwrap();
+        let stats = queue.view().stats("work").await.unwrap();
         assert_eq!(stats.dead, 0);
         assert_eq!(stats.scheduled + stats.pending, 1);
-        assert_eq!(queue.stats("notify").await.unwrap().pending, 0);
+        assert_eq!(queue.view().stats("notify").await.unwrap().pending, 0);
         queue.close().await.unwrap();
     }
 
@@ -805,8 +805,8 @@ mod tests {
         };
         run_one_failing_attempt(&queue, &worker).await;
 
-        assert_eq!(queue.stats("work").await.unwrap().dead, 1);
-        assert_eq!(queue.stats("notify").await.unwrap().pending, 1);
+        assert_eq!(queue.view().stats("work").await.unwrap().dead, 1);
+        assert_eq!(queue.view().stats("notify").await.unwrap().pending, 1);
         queue.close().await.unwrap();
     }
 
@@ -849,7 +849,7 @@ mod tests {
 
         // Wait for the dead counter to tick, then shut down.
         loop {
-            let s = q.stats("work").await.unwrap();
+            let s = q.view().stats("work").await.unwrap();
             if s.dead > 0 {
                 break;
             }
@@ -858,7 +858,7 @@ mod tests {
         let _ = shutdown_tx.send(());
         let _ = handle.await;
 
-        let job = q.get_job(&id).await.unwrap().unwrap();
+        let job = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Dead);
         assert_eq!(
             job.attempts, 1,
@@ -913,7 +913,7 @@ mod tests {
 
         // Wait for the worker to claim the job, then immediately request shutdown.
         loop {
-            if q.stats("work").await.unwrap().claimed == 1 {
+            if q.view().stats("work").await.unwrap().claimed == 1 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -926,8 +926,8 @@ mod tests {
             "in-flight job must finish before shutdown returns"
         );
         // And the job was acked, not left in claimed: for the reaper.
-        assert_eq!(q.stats("work").await.unwrap().claimed, 0);
-        assert_eq!(q.stats("work").await.unwrap().done, 1);
+        assert_eq!(q.view().stats("work").await.unwrap().claimed, 0);
+        assert_eq!(q.view().stats("work").await.unwrap().done, 1);
     }
 
     #[tokio::test]
@@ -981,7 +981,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stats = q.stats("work").await.unwrap();
+        let stats = q.view().stats("work").await.unwrap();
         assert_eq!(stats.done, 1, "the ack after a renewal must succeed");
         assert_eq!(stats.pending, 0, "the renewed job must not be requeued");
         assert_eq!(stats.claimed, 0);
@@ -1036,7 +1036,7 @@ mod tests {
         });
 
         loop {
-            let s = q.stats("work").await.unwrap();
+            let s = q.view().stats("work").await.unwrap();
             if s.pending == 0 && s.claimed == 0 {
                 break;
             }
@@ -1045,7 +1045,7 @@ mod tests {
         let _ = shutdown_tx.send(());
         let _ = handle.await;
 
-        assert_eq!(q.stats("work").await.unwrap().done, 5);
+        assert_eq!(q.view().stats("work").await.unwrap().done, 5);
     }
 
     #[tokio::test]

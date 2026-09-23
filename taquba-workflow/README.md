@@ -120,7 +120,7 @@ demonstrates.
 `StepOutcome::Fail` and `StepOutcome::Cancel` are runner verdicts and
 acknowledge normally; an `Err(StepError::permanent)` is an infrastructure
 error and dead-letters, so operators find it through
-`Queue::dead_jobs`.
+`QueueView::dead_jobs`.
 
 ## The delivery
 
@@ -331,7 +331,7 @@ Semantics:
 The written values are readable inside a step through `Delivery::kv` (a
 `KvReadHandle` exposing `get` only, answering from committed state, so
 effects staged by the running step are excluded), through
-`Queue::kv_get` and, from another process, through a `QueueReader`.
+`QueueView::kv_get` and, from another process, through a `QueueReader`.
 
 See [`examples/kv_effects.rs`](examples/kv_effects.rs) for a runnable
 order flow maintaining a status row through both surfaces.
@@ -559,7 +559,7 @@ absence: a step that finds an entry absent re-executes the work, as it
 would under at-least-once delivery anyway.
 
 Other cleanup policies (selective retention, externally-driven sweeps)
-can be built on `Queue::kv_scan` over that prefix and
+can be built on `QueueView::kv_scan` over that prefix and
 `MemoStore::clear_memos_for_run`, without configuring
 `WorkflowRuntimeBuilder::memo_retention`.
 

@@ -469,7 +469,7 @@ mod tests {
             .await
             .unwrap();
         // None of the settlement's effects survived the crash.
-        assert!(q.kv_get(b"runs/1").await.unwrap().is_none());
+        assert!(q.view().kv_get(b"runs/1").await.unwrap().is_none());
         assert!(
             q.claim("next", Duration::from_secs(5))
                 .await
@@ -489,7 +489,7 @@ mod tests {
         let results = q.ack_with(&job, effects()).await.unwrap();
         assert!(matches!(results[0], EnqueueResult::New(_)));
         assert_eq!(
-            q.kv_get(b"runs/1").await.unwrap().as_deref(),
+            q.view().kv_get(b"runs/1").await.unwrap().as_deref(),
             Some(b"done".as_slice())
         );
         let follow = q
@@ -542,12 +542,12 @@ mod tests {
         let follow_up = q.claim("next", lease).await.unwrap().unwrap();
         assert_eq!(follow_up.payload, b"second");
         q.ack(&follow_up).await.unwrap();
-        assert!(q.kv_get(b"runs/1").await.unwrap().is_none());
+        assert!(q.view().kv_get(b"runs/1").await.unwrap().is_none());
         assert_eq!(
-            q.kv_get(b"runs/2").await.unwrap().as_deref(),
+            q.view().kv_get(b"runs/2").await.unwrap().as_deref(),
             Some(b"done".as_slice()),
         );
-        assert_eq!(q.stats("work").await.unwrap().done, 1);
+        assert_eq!(q.view().stats("work").await.unwrap().done, 1);
         q.close().await.unwrap();
     }
 
@@ -580,8 +580,8 @@ mod tests {
             q.dead_letter_with(&job, "late", effects()).await,
             Err(Error::ClaimLost)
         ));
-        assert_eq!(q.stats("next").await.unwrap().pending, 0);
-        assert!(q.kv_get(b"k").await.unwrap().is_none());
+        assert_eq!(q.view().stats("next").await.unwrap().pending, 0);
+        assert!(q.view().kv_get(b"k").await.unwrap().is_none());
         q.close().await.unwrap();
     }
 
@@ -629,8 +629,8 @@ mod tests {
             .unwrap();
         assert!(matches!(&results[0], EnqueueResult::AlreadyEnqueued(id) if *id == existing_id));
         assert!(matches!(&results[1], EnqueueResult::New(_)));
-        assert_eq!(q.stats("next").await.unwrap().pending, 2);
-        assert_eq!(q.stats("work").await.unwrap().done, 1);
+        assert_eq!(q.view().stats("next").await.unwrap().pending, 2);
+        assert_eq!(q.view().stats("work").await.unwrap().done, 1);
         q.close().await.unwrap();
     }
 
@@ -661,10 +661,10 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0], EnqueueResult::New(_)));
 
-        assert_eq!(q.stats("work").await.unwrap().dead, 1);
-        assert_eq!(q.stats("notify").await.unwrap().pending, 1);
+        assert_eq!(q.view().stats("work").await.unwrap().dead, 1);
+        assert_eq!(q.view().stats("notify").await.unwrap().pending, 1);
         assert_eq!(
-            q.kv_get(b"runs/1").await.unwrap().as_deref(),
+            q.view().kv_get(b"runs/1").await.unwrap().as_deref(),
             Some(b"failed".as_slice()),
         );
         let follow_up = q.claim("notify", lease).await.unwrap().unwrap();
@@ -698,11 +698,11 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, NackOutcome::Retried);
 
-        let stats = q.stats("work").await.unwrap();
+        let stats = q.view().stats("work").await.unwrap();
         assert_eq!(stats.scheduled, 1);
         assert_eq!(stats.dead, 0);
-        assert_eq!(q.stats("notify").await.unwrap().pending, 0);
-        assert!(q.kv_get(b"k").await.unwrap().is_none());
+        assert_eq!(q.view().stats("notify").await.unwrap().pending, 0);
+        assert!(q.view().kv_get(b"k").await.unwrap().is_none());
         q.close().await.unwrap();
     }
 
@@ -744,10 +744,10 @@ mod tests {
         };
         assert!(matches!(results[0], EnqueueResult::New(_)));
 
-        assert_eq!(q.stats("work").await.unwrap().dead, 1);
-        assert_eq!(q.stats("notify").await.unwrap().pending, 1);
+        assert_eq!(q.view().stats("work").await.unwrap().dead, 1);
+        assert_eq!(q.view().stats("notify").await.unwrap().pending, 1);
         assert_eq!(
-            q.kv_get(b"runs/1").await.unwrap().as_deref(),
+            q.view().kv_get(b"runs/1").await.unwrap().as_deref(),
             Some(b"failed".as_slice()),
         );
         let follow_up = q.claim("notify", lease).await.unwrap().unwrap();
@@ -781,9 +781,9 @@ mod tests {
         assert_eq!(outcome, CancelOutcome::Removed);
         assert!(matches!(results[0], EnqueueResult::New(_)));
 
-        assert_eq!(q.stats("work").await.unwrap().pending, 0);
-        assert_eq!(q.stats("notify").await.unwrap().pending, 1);
-        assert!(q.get_job(&id).await.unwrap().is_none());
+        assert_eq!(q.view().stats("work").await.unwrap().pending, 0);
+        assert_eq!(q.view().stats("notify").await.unwrap().pending, 1);
+        assert!(q.view().get_job(&id).await.unwrap().is_none());
         let follow_up = q.claim("notify", lease).await.unwrap().unwrap();
         assert_eq!(follow_up.payload, b"cancelled");
         q.ack(&follow_up).await.unwrap();
@@ -814,8 +814,8 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, CancelOutcome::Requested);
         assert!(results.is_empty());
-        assert_eq!(q.stats("notify").await.unwrap().pending, 0);
-        assert!(q.kv_get(b"k").await.unwrap().is_none());
+        assert_eq!(q.view().stats("notify").await.unwrap().pending, 0);
+        assert!(q.view().kv_get(b"k").await.unwrap().is_none());
 
         q.ack(&job).await.unwrap();
         q.close().await.unwrap();
@@ -837,7 +837,7 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, CancelOutcome::NotFound);
         assert!(results.is_empty());
-        assert!(q.kv_get(b"k").await.unwrap().is_none());
+        assert!(q.view().kv_get(b"k").await.unwrap().is_none());
         q.close().await.unwrap();
     }
 
@@ -896,9 +896,9 @@ mod tests {
         };
         let err = q.ack_with(&job, effects.clone()).await.unwrap_err();
         assert!(matches!(err, Error::ConflictingKvEffect { ref key } if key == b"k"));
-        assert!(q.kv_get(b"k").await.unwrap().is_none());
+        assert!(q.view().kv_get(b"k").await.unwrap().is_none());
         assert_eq!(
-            q.stats("work").await.unwrap().claimed,
+            q.view().stats("work").await.unwrap().claimed,
             1,
             "the claim is untouched"
         );
@@ -1024,7 +1024,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(q.stats("next").await.unwrap().scheduled, 1);
+        assert_eq!(q.view().stats("next").await.unwrap().scheduled, 1);
         assert!(q.claim("next", lease).await.unwrap().is_none());
         q.close().await.unwrap();
     }
@@ -1089,7 +1089,7 @@ mod tests {
             EnqueueResult::New(id) => id.clone(),
             _ => unreachable!(),
         };
-        let follow_up = q.get_job(&follow_up_ids).await.unwrap().unwrap();
+        let follow_up = q.view().get_job(&follow_up_ids).await.unwrap().unwrap();
         assert_eq!(follow_up.payload, vec![4u8; 256]);
         q.close().await.unwrap();
     }

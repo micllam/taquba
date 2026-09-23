@@ -57,7 +57,7 @@ impl KvReadHandle {
     /// fails.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         match &self.queue {
-            Some(queue) => Ok(queue.kv_get(key).await?),
+            Some(queue) => Ok(queue.view().kv_get(key).await?),
             None => Ok(None),
         }
     }

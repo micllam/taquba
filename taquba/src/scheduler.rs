@@ -153,7 +153,7 @@ mod tests {
             .unwrap();
 
         // Not yet promoted.
-        let s = q.stats("jobs").await.unwrap();
+        let s = q.view().stats("jobs").await.unwrap();
         assert_eq!(s.scheduled, 1);
         assert_eq!(s.pending, 0);
         assert!(
@@ -167,7 +167,7 @@ mod tests {
         clock.advance(Duration::from_millis(200));
         q.promote_scheduled_now().await.unwrap();
 
-        let s = q.stats("jobs").await.unwrap();
+        let s = q.view().stats("jobs").await.unwrap();
         assert_eq!(s.scheduled, 0);
         assert_eq!(s.pending, 1);
 
@@ -219,7 +219,7 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, WakeOutcome::Woken);
 
-        let s = q.stats("jobs").await.unwrap();
+        let s = q.view().stats("jobs").await.unwrap();
         assert_eq!(s.scheduled, 0);
         assert_eq!(s.pending, 1);
 
@@ -518,7 +518,7 @@ mod tests {
 
         // The job waits in the scheduled key space until the backoff
         // elapses.
-        let s = q.stats("work").await.unwrap();
+        let s = q.view().stats("work").await.unwrap();
         assert_eq!(s.pending, 0);
         assert_eq!(s.claimed, 0);
         assert_eq!(s.scheduled, 1);
@@ -576,7 +576,7 @@ mod tests {
         // The payload offloads at enqueue even though the record lands
         // in the scheduled key space.
         assert_eq!(object_count(&store, "test-payloads").await, 1);
-        let scheduled = q.get_job(&id).await.unwrap().unwrap();
+        let scheduled = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(scheduled.status, JobStatus::Scheduled);
         assert_eq!(scheduled.payload, payload);
 

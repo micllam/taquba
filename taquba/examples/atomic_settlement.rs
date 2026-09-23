@@ -160,7 +160,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let mut confirmed = 0;
         for order_id in orders {
-            if q.kv_get(&status_key(order_id)).await?.as_deref() == Some(b"confirmed".as_slice()) {
+            if q.view().kv_get(&status_key(order_id)).await?.as_deref()
+                == Some(b"confirmed".as_slice())
+            {
                 confirmed += 1;
             }
         }
@@ -176,7 +178,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     for order_id in orders {
-        let status = q.kv_get(&status_key(order_id)).await?;
+        let status = q.view().kv_get(&status_key(order_id)).await?;
         println!(
             "order {order_id}: {}",
             String::from_utf8_lossy(status.as_deref().unwrap_or(b"<missing>"))

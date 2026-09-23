@@ -98,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wait until the queue is drained, including jobs parked in `scheduled`
     // for retry backoff.
     loop {
-        let s = q.stats("jobs").await?;
+        let s = q.view().stats("jobs").await?;
         if s.pending == 0 && s.claimed == 0 && s.scheduled == 0 {
             break;
         }
@@ -108,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = handle.await;
 
     println!();
-    let s = q.stats("jobs").await?;
+    let s = q.view().stats("jobs").await?;
     println!(
         "done - pending:{} claimed:{} done:{} dead:{}",
         s.pending, s.claimed, s.done, s.dead
@@ -117,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if s.dead > 0 {
         println!();
         println!("dead-letter jobs:");
-        for job in q.dead_jobs("jobs", None, 100).await? {
+        for job in q.view().dead_jobs("jobs", None, 100).await? {
             println!("  {} - {:?}", job.id, job.last_error);
         }
     }

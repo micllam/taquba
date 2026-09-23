@@ -11,21 +11,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
 use slatedb::config::DbReaderOptions;
 use slatedb::manifest::SsTableId;
 use slatedb::object_store::ObjectStore;
 use slatedb::{DbReader, DbReaderMode};
 
 use crate::error::{Error, Result};
-use crate::history::JobAttempt;
-use crate::job::{JobRecord, JobStatus};
-use crate::kv::{KvPage, KvRange};
 use crate::liveness::{StoreActivity, WriterHeartbeat};
 use crate::payload_store::PayloadStore;
-use crate::queue::JobPage;
-use crate::stats::{QueueMergeOperator, QueueStats};
+use crate::read::{Handle, QueueView};
+use crate::stats::QueueMergeOperator;
 
 /// How a [`QueueReader`] follows the writer's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -191,17 +187,17 @@ impl Default for ReaderOptions {
 ///
 /// # Observable outcomes
 ///
-/// The queue's own records are swept by retention, so a consumer keeps
-/// its outcomes readable across processes by settling them into the
-/// user KV namespace:
-/// [`Queue::ack_with`](crate::Queue::ack_with) writes outcome entries
-/// atomically with the settlement (and
-/// [`Queue::enqueue_with_kv`](crate::Queue::enqueue_with_kv) maps
-/// caller identifiers to job ids at submit), and [`Self::kv_get`] /
-/// [`Self::kv_scan`] serve them here.
+/// The queue's own records are swept by retention, so a consumer keeps its
+/// outcomes readable across processes by settling them into the user KV
+/// namespace: [`Queue::ack_with`](crate::Queue::ack_with) writes outcome
+/// entries atomically with the settlement (and
+/// [`Queue::enqueue_with_kv`](crate::Queue::enqueue_with_kv) maps caller
+/// identifiers to job ids at submit), and
+/// [`QueueView::kv_get`](crate::QueueView::kv_get) /
+/// [`QueueView::kv_scan`](crate::QueueView::kv_scan) read them here.
 pub struct QueueReader {
-    reader: DbReader,
-    payload_store: Arc<PayloadStore>,
+    reader: Arc<DbReader>,
+    view: QueueView,
 }
 
 impl QueueReader {
@@ -255,9 +251,10 @@ impl QueueReader {
             }
             Err(e) => return Err(e.into()),
         };
+        let reader = Arc::new(reader);
         Ok(Self {
+            view: QueueView::new(Handle::Reader(reader.clone()), payload_store),
             reader,
-            payload_store,
         })
     }
 
@@ -294,112 +291,13 @@ impl QueueReader {
     /// See [`WriterHeartbeat`] for what a beat proves and how to judge
     /// its staleness.
     pub async fn writer_heartbeat(&self) -> Result<Option<WriterHeartbeat>> {
-        crate::read::writer_heartbeat(&self.reader).await
+        self.view.writer_heartbeat().await
     }
 
-    /// Return a snapshot of job counts for the given queue.
-    pub async fn stats(&self, queue: &str) -> Result<QueueStats> {
-        crate::read::stats(&self.reader, queue).await
-    }
-
-    /// Return the names of all queues that have ever had at least one job.
-    pub async fn list_queues(&self) -> Result<Vec<String>> {
-        crate::read::list_queues(&self.reader).await
-    }
-
-    /// Return a page of the given queue's jobs in one lifecycle state.
-    ///
-    /// Ordering, cursor and paging semantics are those of
-    /// [`Queue::list_jobs`](crate::Queue::list_jobs).
-    pub async fn list_jobs(
-        &self,
-        queue: &str,
-        status: JobStatus,
-        cursor: Option<&[u8]>,
-        limit: usize,
-    ) -> Result<JobPage> {
-        crate::read::list_jobs(
-            &self.reader,
-            &self.payload_store,
-            queue,
-            status,
-            cursor,
-            limit,
-        )
-        .await
-    }
-
-    /// Every job of `queue` in `status` as one stream, read `page_size`
-    /// jobs at a time; see [`Queue::jobs`](crate::Queue::jobs).
-    pub fn jobs<'a>(
-        &'a self,
-        queue: &'a str,
-        status: JobStatus,
-        page_size: usize,
-    ) -> impl Stream<Item = Result<JobRecord>> + 'a {
-        crate::read::jobs(&self.reader, &self.payload_store, queue, status, page_size)
-    }
-
-    /// Return a page of dead-letter jobs for the given queue.
-    ///
-    /// Cursor and ordering semantics are those of
-    /// [`Queue::dead_jobs`](crate::Queue::dead_jobs).
-    pub async fn dead_jobs(
-        &self,
-        queue: &str,
-        after: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<JobRecord>> {
-        crate::read::dead_jobs(&self.reader, &self.payload_store, queue, after, limit).await
-    }
-
-    /// Look up a job by ID regardless of its current state.
-    ///
-    /// Returns `None` if the ID was never enqueued or has since been
-    /// expunged. The index and the record are two plain reads of the
-    /// reader's view.
-    pub async fn get_job(&self, id: &str) -> Result<Option<JobRecord>> {
-        crate::read::get_job(&self.reader, &self.payload_store, id).await
-    }
-
-    /// Return a job's recorded delivery history, in write order.
-    ///
-    /// Entry and lifetime semantics are those of
-    /// [`Queue::attempt_history`](crate::Queue::attempt_history).
-    pub async fn attempt_history(&self, id: &str) -> Result<Vec<JobAttempt>> {
-        crate::read::attempt_history(&self.reader, id).await
-    }
-
-    /// Read a value from the user KV namespace.
-    pub async fn kv_get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        crate::read::kv_get(&self.reader, key).await
-    }
-
-    /// List entries of the user KV namespace under `prefix` within
-    /// `range`, in ascending byte order of the keys.
-    ///
-    /// Range and paging semantics are those of
-    /// [`Queue::kv_scan`](crate::Queue::kv_scan).
-    pub async fn kv_scan(
-        &self,
-        prefix: &[u8],
-        range: impl KvRange,
-        limit: usize,
-    ) -> Result<KvPage> {
-        crate::read::kv_scan(&self.reader, prefix, range, limit).await
-    }
-
-    /// Every entry of the user KV namespace under `prefix` within
-    /// `range` as one stream, read `page_size` entries at a time. The
-    /// semantics are those of
-    /// [`Queue::kv_entries`](crate::Queue::kv_entries).
-    pub fn kv_entries<'a>(
-        &'a self,
-        prefix: &'a [u8],
-        range: impl KvRange,
-        page_size: usize,
-    ) -> impl Stream<Item = Result<(Vec<u8>, Bytes)>> + 'a {
-        crate::read::kv_entries(&self.reader, prefix, range, page_size)
+    /// The reader's lagging view of the store: the read-only queries over
+    /// the flushed state the reader's manifest poll last observed.
+    pub fn view(&self) -> &QueueView {
+        &self.view
     }
 
     /// Close the reader, stopping its manifest polling and releasing
@@ -423,6 +321,7 @@ async fn store_path_is_empty(store: &Arc<dyn ObjectStore>, path: &str) -> bool {
 mod tests {
     use super::*;
     use crate::error::Error;
+    use crate::job::JobStatus;
     use crate::options::OpenOptions;
     use crate::queue::Queue;
     use slatedb::object_store::ObjectStoreExt;
@@ -438,24 +337,31 @@ mod tests {
         q.kv_put(b"outcome/1", b"ok").await.unwrap();
 
         let reader = QueueReader::open(store, "test").await.unwrap();
-        let job = reader.get_job(&id).await.unwrap().unwrap();
+        let job = reader.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.id, id);
         assert_eq!(job.payload, b"payload");
         assert_eq!(job.status, JobStatus::Pending);
 
         let page = reader
+            .view()
             .list_jobs("work", JobStatus::Pending, None, 10)
             .await
             .unwrap();
         assert_eq!(page.jobs.len(), 1);
         assert_eq!(page.jobs[0].id, id);
 
-        assert_eq!(reader.list_queues().await.unwrap(), vec!["work"]);
+        assert_eq!(reader.view().list_queues().await.unwrap(), vec!["work"]);
         assert_eq!(
-            reader.kv_get(b"outcome/1").await.unwrap().unwrap().as_ref(),
+            reader
+                .view()
+                .kv_get(b"outcome/1")
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
             b"ok"
         );
-        let kv_page = reader.kv_scan(b"outcome/", .., 10).await.unwrap();
+        let kv_page = reader.view().kv_scan(b"outcome/", .., 10).await.unwrap();
         assert_eq!(kv_page.entries.len(), 1);
 
         reader.close().await.unwrap();
@@ -471,7 +377,7 @@ mod tests {
         }
 
         let reader = QueueReader::open(store, "test").await.unwrap();
-        let stats = reader.stats("work").await.unwrap();
+        let stats = reader.view().stats("work").await.unwrap();
         assert_eq!(stats.pending, 3);
         assert_eq!(stats.claimed, 0);
         assert_eq!(stats.done, 0);
@@ -502,7 +408,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let job = reader.get_job(&id).await.unwrap().unwrap();
+        let job = reader.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Pending);
 
         reader.close().await.unwrap();
@@ -520,7 +426,7 @@ mod tests {
         let reader = QueueReader::open_with_options(store.clone(), "test", skipping.clone())
             .await
             .unwrap();
-        assert!(reader.get_job(&id).await.unwrap().is_none());
+        assert!(reader.view().get_job(&id).await.unwrap().is_none());
         reader.close().await.unwrap();
 
         // The close flushes the memtable, so a new reader observes the
@@ -529,7 +435,7 @@ mod tests {
         let reader = QueueReader::open_with_options(store, "test", skipping)
             .await
             .unwrap();
-        let job = reader.get_job(&id).await.unwrap().unwrap();
+        let job = reader.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Pending);
         reader.close().await.unwrap();
     }
@@ -541,7 +447,7 @@ mod tests {
         q.enqueue("work", b"a".to_vec()).await.unwrap();
 
         let reader = QueueReader::open(store, "test").await.unwrap();
-        assert_eq!(reader.stats("work").await.unwrap().pending, 1);
+        assert_eq!(reader.view().stats("work").await.unwrap().pending, 1);
 
         // The writer keeps writing after the reader opened and refreshed
         // its checkpoint: claims, settlements and enqueues all succeed.
@@ -552,7 +458,7 @@ mod tests {
             .unwrap()
             .unwrap();
         q.ack(&claim).await.unwrap();
-        let stats = q.stats("work").await.unwrap();
+        let stats = q.view().stats("work").await.unwrap();
         assert_eq!(stats.pending, 1);
         assert_eq!(stats.done, 1);
 
@@ -708,7 +614,14 @@ mod tests {
             .await
             .unwrap();
         let id = q.enqueue("work", vec![7u8; 512]).await.unwrap();
-        let payload_ref = q.get_job(&id).await.unwrap().unwrap().payload_ref.unwrap();
+        let payload_ref = q
+            .view()
+            .get_job(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .payload_ref
+            .unwrap();
         store
             .delete(&Path::from(format!("test-payloads/{payload_ref}")))
             .await
@@ -716,13 +629,16 @@ mod tests {
 
         let reader = QueueReader::open(store, "test").await.unwrap();
         assert!(matches!(
-            reader.get_job(&id).await,
+            reader.view().get_job(&id).await,
             Err(Error::PayloadMissing { .. })
         ));
         // A reader cannot confirm a removal from its lagging view, so
         // the listing reports the missing payload.
         assert!(matches!(
-            reader.list_jobs("work", JobStatus::Pending, None, 10).await,
+            reader
+                .view()
+                .list_jobs("work", JobStatus::Pending, None, 10)
+                .await,
             Err(Error::PayloadMissing { .. })
         ));
 

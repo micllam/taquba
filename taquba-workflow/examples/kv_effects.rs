@@ -121,7 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("run terminated: {}", outcome.status);
 
     println!("final: status = {}", read_status(&queue, run_id).await?);
-    let pending = queue.kv_get(&pending_key(run_id)).await?;
+    let pending = queue.view().kv_get(&pending_key(run_id)).await?;
     println!("final: pending marker present = {}", pending.is_some());
 
     let _ = shutdown_tx.send(());
@@ -130,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn read_status(queue: &Queue, run_id: &str) -> Result<String, taquba::Error> {
-    let value = queue.kv_get(&status_key(run_id)).await?;
+    let value = queue.view().kv_get(&status_key(run_id)).await?;
     Ok(value
         .map(|v| String::from_utf8_lossy(&v).into_owned())
         .unwrap_or_else(|| "<absent>".to_string()))

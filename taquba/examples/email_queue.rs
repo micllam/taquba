@@ -144,11 +144,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!(
         "  transactional: {} pending",
-        q.stats("transactional").await?.pending
+        q.view().stats("transactional").await?.pending
     );
     println!(
         "  marketing:     {} pending",
-        q.stats("marketing").await?.pending
+        q.view().stats("marketing").await?.pending
     );
     println!();
 
@@ -198,8 +198,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wait for both queues to drain. Note that a nacked job sits in
     // retry-backoff under `Scheduled` between attempts.
     loop {
-        let ts = q.stats("transactional").await?;
-        let ms = q.stats("marketing").await?;
+        let ts = q.view().stats("transactional").await?;
+        let ms = q.view().stats("marketing").await?;
         if ts.pending == 0
             && ts.claimed == 0
             && ts.scheduled == 0
@@ -217,13 +217,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = m_handle.await;
 
     println!();
-    let ts = q.stats("transactional").await?;
-    let ms = q.stats("marketing").await?;
+    let ts = q.view().stats("transactional").await?;
+    let ms = q.view().stats("marketing").await?;
     println!("transactional - done:{} dead:{}", ts.done, ts.dead);
     println!("marketing     - done:{} dead:{}", ms.done, ms.dead);
 
     for queue in ["transactional", "marketing"] {
-        let dead = q.dead_jobs(queue, None, 100).await?;
+        let dead = q.view().dead_jobs(queue, None, 100).await?;
         if !dead.is_empty() {
             println!();
             println!("Dead-letter ({queue}):");

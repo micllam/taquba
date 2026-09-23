@@ -110,7 +110,7 @@ pub(crate) fn update_stats(
 
 /// A snapshot of job counts for a single queue.
 ///
-/// Returned by [`Queue::stats`](crate::Queue::stats). Counters are kept
+/// Returned by [`QueueView::stats`](crate::QueueView::stats). Counters are kept
 /// transactionally consistent with job-state writes via SlateDB's merge
 /// operator. Live-state counters reflect the current size of each key space.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

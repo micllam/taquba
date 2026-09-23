@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("enqueued: {id_a}, {id_b}, {id_c}");
 
-    let s = q.stats("tasks").await?;
+    let s = q.view().stats("tasks").await?;
     println!(
         "after enqueue: pending:{} claimed:{} done:{} dead:{}",
         s.pending, s.claimed, s.done, s.dead
@@ -79,20 +79,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // max_attempts=1 so this nack goes straight to dead-letter
     q.nack(&job_c, "unrecoverable failure").await?;
 
-    let dead = q.dead_jobs("tasks", None, 100).await?;
+    let dead = q.view().dead_jobs("tasks", None, 100).await?;
     assert_eq!(dead.len(), 1);
     println!("dead-letter: {}: {:?}", dead[0].id, dead[0].last_error);
 
     q.requeue_dead_job(&dead[0].id).await?;
     println!("requeued dead job for a fresh attempt");
 
-    let s = q.stats("tasks").await?;
+    let s = q.view().stats("tasks").await?;
     println!(
         "final stats: pending:{} claimed:{} done:{} dead:{}",
         s.pending, s.claimed, s.done, s.dead
     );
 
-    println!("known queues: {:?}", q.list_queues().await?);
+    println!("known queues: {:?}", q.view().list_queues().await?);
 
     q.close().await?;
     Ok(())

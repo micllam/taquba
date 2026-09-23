@@ -151,7 +151,7 @@ async fn build_store(
     for handle in handles {
         handle.await?;
     }
-    let stats = queue.stats(QUEUE_NAME).await?;
+    let stats = queue.view().stats(QUEUE_NAME).await?;
     if stats.pending != 0 || stats.claimed != 0 {
         return Err(format!(
             "history drain incomplete: pending={} claimed={}",

@@ -3,7 +3,6 @@ use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::Stream;
 use slatedb::config::{ScanOptions, Settings};
 use slatedb::object_store::ObjectStore;
 use slatedb::{Db, IsolationLevel};
@@ -27,13 +26,14 @@ use crate::lease_registry::{LeaseRegistry, Renewal};
 use crate::options::{EnqueueOptions, OpenOptions, QueueConfig};
 use crate::payload_store::PayloadStore;
 use crate::queue_core::{QueueConfigs, QueueCore};
+use crate::read::{Handle, QueueView};
 use crate::reaper::Reaper;
 use crate::scheduler::Scheduler;
-use crate::stats::{QueueMergeOperator, QueueStats, update_stats};
+use crate::stats::{QueueMergeOperator, update_stats};
 use crate::txn::ClaimEnd;
 use crate::txn::{
-    Attempt, Commit, Durability, commit, get_indexed_job, put_job_record, retry, stage_claim_end,
-    stage_remove, stage_to_pending, take_claim,
+    Attempt, Commit, Durability, commit, put_job_record, retry, stage_claim_end, stage_remove,
+    stage_to_pending, take_claim,
 };
 
 /// Outcome of [`Queue::cancel`], reflecting which lifecycle branch the
@@ -93,14 +93,14 @@ pub enum ClaimOutcome {
     NotFound,
 }
 
-/// One page of a job listing. Returned by [`Queue::list_jobs`].
+/// One page of a job listing. Returned by [`QueueView::list_jobs`](crate::QueueView::list_jobs).
 #[derive(Debug, Clone)]
 pub struct JobPage {
     /// Jobs on this page, in the scan order of the listed state's key
-    /// space (see [`Queue::list_jobs`]).
+    /// space (see [`QueueView::list_jobs`](crate::QueueView::list_jobs)).
     pub jobs: Vec<JobRecord>,
     /// Opaque resume token: pass it as the `cursor` of the next
-    /// [`Queue::list_jobs`] call to continue the listing. `None` when no
+    /// [`QueueView::list_jobs`](crate::QueueView::list_jobs) call to continue the listing. `None` when no
     /// further entries existed at scan time.
     pub next_cursor: Option<Vec<u8>>,
 }
@@ -218,6 +218,7 @@ pub(crate) fn backoff_delay(attempts: u32, base: Duration, max: Duration) -> Dur
 /// shared across processes.
 pub struct Queue {
     pub(crate) core: Arc<QueueCore>,
+    view: QueueView,
     reaper_task: BackgroundTask,
     scheduler_task: BackgroundTask,
     /// `Some` only when built with the `metrics` feature and
@@ -364,12 +365,19 @@ impl Queue {
         };
 
         Ok(Self {
+            view: QueueView::new(Handle::Writer(core.db.clone()), core.payload_store.clone()),
             core,
             reaper_task,
             scheduler_task,
             metrics_sampler,
             heartbeat,
         })
+    }
+
+    /// The writer's live view of the store: the read-only queries, with a
+    /// write visible to the next read.
+    pub fn view(&self) -> &QueueView {
+        &self.view
     }
 
     /// Current time in milliseconds since the UNIX epoch, as read
@@ -1105,7 +1113,7 @@ impl Queue {
     /// Acknowledge successful completion.
     ///
     /// By default the job is deleted outright; the success counter in
-    /// [`QueueStats::done`] is still incremented.
+    /// [`QueueStats::done`](crate::QueueStats::done) is still incremented.
     ///
     /// Set [`QueueConfig::keep_done_jobs`] (per-queue, or on
     /// [`OpenOptions::default_queue_config`] for an instance-wide default)
@@ -1307,127 +1315,6 @@ impl Queue {
         Ok((settled.job, settled.results))
     }
 
-    /// Return a snapshot of job counts for the given queue.
-    pub async fn stats(&self, queue: &str) -> Result<QueueStats> {
-        crate::read::stats(self.core.db.as_ref(), queue).await
-    }
-
-    /// Return the names of all queues that have ever had at least one job.
-    pub async fn list_queues(&self) -> Result<Vec<String>> {
-        crate::read::list_queues(self.core.db.as_ref()).await
-    }
-
-    /// Return a page of dead-letter jobs for the given queue.
-    ///
-    /// `after` is an exclusive cursor; pass `None` to start from the
-    /// beginning or the `id` of the last job from the previous page to
-    /// resume. `limit` caps the number of jobs returned.
-    ///
-    /// Jobs are returned in ULID order, which corresponds to the order in
-    /// which they were originally enqueued.
-    pub async fn dead_jobs(
-        &self,
-        queue: &str,
-        after: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<JobRecord>> {
-        crate::read::dead_jobs(
-            self.core.db.as_ref(),
-            &self.core.payload_store,
-            queue,
-            after,
-            limit,
-        )
-        .await
-    }
-
-    /// Return a page of the given queue's jobs in one lifecycle state.
-    ///
-    /// Jobs are returned in the scan order of the state's key space:
-    ///
-    /// - `Pending`: claim order (priority, then enqueue order).
-    /// - `Scheduled`: `run_at` order, soonest first.
-    /// - `Claimed`: enqueue order, as in [`Queue::dead_jobs`].
-    /// - `Done`: completion-time order, oldest first. Done records exist
-    ///   only on queues with [`QueueConfig::keep_done_jobs`] set.
-    /// - `Dead`: enqueue order, as in [`Queue::dead_jobs`].
-    ///
-    /// The claimed listing is not ordered by lease expiry: a renewal
-    /// changes an expiry without changing a key, so an expiry-ordered
-    /// page boundary would move under a listing.
-    ///
-    /// `cursor` is an opaque resume token: pass `None` to start from the
-    /// beginning, or [`JobPage::next_cursor`] from the previous page to
-    /// continue. A cursor identifies a scan position, not a job, so it
-    /// remains valid when the job it was taken at leaves the state. The
-    /// listing is not a snapshot: a job that changes state between page
-    /// reads may appear on no page or on two pages.
-    ///
-    /// A page can hold fewer than `limit` jobs while more remain,
-    /// because a job removed between the key scan and its payload
-    /// fetch is omitted from the page. The listing is exhausted only
-    /// when [`JobPage::next_cursor`] is `None`.
-    ///
-    /// The pending, claimed and dead key spaces group by queue, so those
-    /// scans cover only the requested queue. The scheduled and done
-    /// listings scan a key space that leads with a timestamp for the
-    /// background sweeps, so they cover every queue and filter on the
-    /// queue name.
-    pub async fn list_jobs(
-        &self,
-        queue: &str,
-        status: JobStatus,
-        cursor: Option<&[u8]>,
-        limit: usize,
-    ) -> Result<JobPage> {
-        crate::read::list_jobs(
-            self.core.db.as_ref(),
-            &self.core.payload_store,
-            queue,
-            status,
-            cursor,
-            limit,
-        )
-        .await
-    }
-
-    /// Every job of `queue` in `status`, in the order [`Self::list_jobs`]
-    /// pages them, as one stream that reads `page_size` jobs at a time.
-    /// A consumer that stops reading fetches no further page; the
-    /// listing semantics are those of `list_jobs`.
-    pub fn jobs<'a>(
-        &'a self,
-        queue: &'a str,
-        status: JobStatus,
-        page_size: usize,
-    ) -> impl Stream<Item = Result<JobRecord>> + 'a {
-        crate::read::jobs(
-            self.core.db.as_ref(),
-            &self.core.payload_store,
-            queue,
-            status,
-            page_size,
-        )
-    }
-
-    /// Return a job's recorded delivery history, in write order.
-    ///
-    /// Each settlement of a claim appends one [`JobAttempt`]: an ack on a
-    /// queue with [`QueueConfig::keep_done_jobs`] set, a [`Self::nack`], a
-    /// [`Self::dead_letter`] and the reaper's handling of an expired
-    /// lease. [`Self::requeue_dead_job`] appends an
-    /// [`AttemptOutcome::Requeued`] marker and keeps the prior entries.
-    ///
-    /// The transaction that removes the job's last record also removes its
-    /// history, so a job for which [`Self::get_job`] returns `None` has an
-    /// empty history. An ack on a queue without retention removes the history
-    /// and does not record the completed attempt. A later job enqueued with the
-    /// same id through [`EnqueueOptions::id_override`] starts with an empty
-    /// history.
-    pub async fn attempt_history(&self, id: &str) -> Result<Vec<JobAttempt>> {
-        crate::read::attempt_history(self.core.db.as_ref(), id).await
-    }
-
     /// Move the dead-letter job `id` back to the pending queue for a
     /// fresh attempt.
     ///
@@ -1602,7 +1489,7 @@ impl Queue {
         // and one that commits before it is visible in the read.
         let mut registration = self.core.completion_waiters.register(id);
 
-        match self.get_job(id).await? {
+        match self.view().get_job(id).await? {
             Some(job) => match job.status {
                 JobStatus::Done => Ok(Completion::Settled(WaitOutcome::Done(Box::new(job)))),
                 JobStatus::Dead => Ok(Completion::Settled(WaitOutcome::Dead(Box::new(job)))),
@@ -1615,36 +1502,6 @@ impl Queue {
             None => Ok(Completion::Settled(
                 registration.try_outcome().unwrap_or(WaitOutcome::NotFound),
             )),
-        }
-    }
-
-    /// Look up a job by ID regardless of its current state.
-    ///
-    /// Returns `None` if the ID was never enqueued or has since been expunged.
-    pub async fn get_job(&self, id: &str) -> Result<Option<JobRecord>> {
-        // The index and the record are read from one snapshot.
-        let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
-        let found = get_indexed_job(&txn, id).await?;
-        txn.rollback();
-
-        let Some((index_key, _, mut job)) = found else {
-            return Ok(None);
-        };
-        match self.core.payload_store.materialize(&mut job).await {
-            Ok(()) => Ok(Some(job)),
-            Err(Error::PayloadMissing { id }) => {
-                // The record can be read just before a record-removing
-                // transaction commits, with the object fetch running
-                // just after that commit's payload-object deletion.
-                // Re-check the index so a job removed in that window
-                // is reported as absent.
-                if self.core.db.get(&index_key).await?.is_none() {
-                    Ok(None)
-                } else {
-                    Err(Error::PayloadMissing { id })
-                }
-            }
-            Err(e) => Err(e),
         }
     }
 
@@ -2120,7 +1977,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::DuplicateJobId { id } if id == "duplicate-kv-id"));
-        assert!(q.kv_get(b"meta/duplicate").await.unwrap().is_none());
+        assert!(q.view().kv_get(b"meta/duplicate").await.unwrap().is_none());
 
         let job = q
             .claim("email", Duration::from_secs(30))
@@ -2244,7 +2101,7 @@ mod tests {
         q.enqueue("email", b"a".to_vec()).await.unwrap();
         q.enqueue("email", b"b".to_vec()).await.unwrap();
 
-        let s = q.stats("email").await.unwrap();
+        let s = q.view().stats("email").await.unwrap();
         assert_eq!(s.pending, 2);
         assert_eq!(s.claimed, 0);
 
@@ -2253,12 +2110,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let s = q.stats("email").await.unwrap();
+        let s = q.view().stats("email").await.unwrap();
         assert_eq!(s.pending, 1);
         assert_eq!(s.claimed, 1);
 
         q.ack(&job).await.unwrap();
-        let s = q.stats("email").await.unwrap();
+        let s = q.view().stats("email").await.unwrap();
         assert_eq!(s.pending, 1);
         assert_eq!(s.claimed, 0);
         assert_eq!(s.done, 1);
@@ -2287,7 +2144,7 @@ mod tests {
             .unwrap();
         q.nack(&job, "fail").await.unwrap();
 
-        let s = q.stats("email").await.unwrap();
+        let s = q.view().stats("email").await.unwrap();
         assert_eq!(s.pending, 0);
         assert_eq!(s.claimed, 0);
         assert_eq!(s.dead, 1);
@@ -2317,7 +2174,7 @@ mod tests {
             .unwrap();
         q.nack(&job, "fatal").await.unwrap();
 
-        let dead = q.dead_jobs("work", None, 100).await.unwrap();
+        let dead = q.view().dead_jobs("work", None, 100).await.unwrap();
         assert_eq!(dead.len(), 1);
         assert_eq!(dead[0].id, id);
         assert_eq!(dead[0].status, JobStatus::Dead);
@@ -2371,7 +2228,13 @@ mod tests {
             .unwrap()
             .unwrap();
         q.nack(&claim, "fatal").await.unwrap();
-        let dead = q.dead_jobs("work", None, 1).await.unwrap().pop().unwrap();
+        let dead = q
+            .view()
+            .dead_jobs("work", None, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
         q.requeue_dead_job(&dead.id).await.unwrap();
 
         // A crash inside the flush window: closing without a flush
@@ -2386,7 +2249,7 @@ mod tests {
         let q = Queue::open_with_options(store, "test", opts())
             .await
             .unwrap();
-        let job = q.get_job(&id).await.unwrap().unwrap();
+        let job = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Pending);
         q.close().await.unwrap();
     }
@@ -2635,7 +2498,7 @@ mod tests {
         let q = Queue::open_with_options(store, "test", opts())
             .await
             .unwrap();
-        let job = q.get_job(&id).await.unwrap().unwrap();
+        let job = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Pending);
         q.close().await.unwrap();
     }
@@ -2671,13 +2534,13 @@ mod tests {
 
         q.dead_letter(&claimed, "permanent failure").await.unwrap();
 
-        let job = q.get_job(&id).await.unwrap().unwrap();
+        let job = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Dead);
         assert_eq!(job.attempts, 1, "attempts should not be incremented");
         assert_eq!(job.last_error.as_deref(), Some("permanent failure"));
         assert!(job.failed_at.is_some());
 
-        let stats = q.stats("work").await.unwrap();
+        let stats = q.view().stats("work").await.unwrap();
         assert_eq!(stats.dead, 1);
         assert_eq!(stats.claimed, 0);
     }
@@ -2699,7 +2562,7 @@ mod tests {
         let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
 
         // Pending
-        let job = q.get_job(&id).await.unwrap().unwrap();
+        let job = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Pending);
 
         // Claimed
@@ -2708,12 +2571,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let job = q.get_job(&id).await.unwrap().unwrap();
+        let job = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Claimed);
 
         // Done
         q.ack(&claimed).await.unwrap();
-        let job = q.get_job(&id).await.unwrap().unwrap();
+        let job = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Done);
 
         q.close().await.unwrap();
@@ -2734,10 +2597,10 @@ mod tests {
         q.ack(&job).await.unwrap();
 
         assert!(
-            q.get_job(&id).await.unwrap().is_none(),
+            q.view().get_job(&id).await.unwrap().is_none(),
             "ack must drop the index by default"
         );
-        let s = q.stats("work").await.unwrap();
+        let s = q.view().stats("work").await.unwrap();
         assert_eq!(s.done, 1, "done counter still tracks throughput");
         assert_eq!(s.pending, 0);
         assert_eq!(s.claimed, 0);
@@ -2748,7 +2611,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_job_returns_none_for_unknown_id() {
         let q = Queue::open(make_store(), "test").await.unwrap();
-        assert!(q.get_job("nonexistent").await.unwrap().is_none());
+        assert!(q.view().get_job("nonexistent").await.unwrap().is_none());
         q.close().await.unwrap();
     }
 
@@ -2776,10 +2639,10 @@ mod tests {
         );
 
         // No longer findable by ID.
-        assert!(q.get_job(&id).await.unwrap().is_none());
+        assert!(q.view().get_job(&id).await.unwrap().is_none());
 
         // Stats reflect the removal.
-        assert_eq!(q.stats("work").await.unwrap().pending, 0);
+        assert_eq!(q.view().stats("work").await.unwrap().pending, 0);
 
         // The dedup key is free for a new job.
         let again = q
@@ -2816,10 +2679,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(q.stats("work").await.unwrap().scheduled, 1);
+        assert_eq!(q.view().stats("work").await.unwrap().scheduled, 1);
         assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Removed);
-        assert_eq!(q.stats("work").await.unwrap().scheduled, 0);
-        assert!(q.get_job(&id).await.unwrap().is_none());
+        assert_eq!(q.view().stats("work").await.unwrap().scheduled, 0);
+        assert!(q.view().get_job(&id).await.unwrap().is_none());
 
         q.close().await.unwrap();
     }
@@ -2880,7 +2743,7 @@ mod tests {
 
         q.nack(&claim, "transient").await.unwrap();
 
-        let requeued = q.get_job(&id).await.unwrap().unwrap();
+        let requeued = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(requeued.status, JobStatus::Pending);
         assert!(
             requeued.cancel_requested,
@@ -2925,7 +2788,7 @@ mod tests {
 
         q.ack(&claim).await.unwrap();
 
-        let done = q.get_job(&id).await.unwrap().unwrap();
+        let done = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(done.status, JobStatus::Done);
         assert!(
             done.cancel_requested,
@@ -2950,7 +2813,7 @@ mod tests {
 
         q.dead_letter(&claim, "permanent").await.unwrap();
 
-        let dead = q.get_job(&id).await.unwrap().unwrap();
+        let dead = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(dead.status, JobStatus::Dead);
         assert!(dead.cancel_requested);
 
@@ -2975,7 +2838,7 @@ mod tests {
         let ids = q.enqueue_batch("work", payloads).await.unwrap();
         assert_eq!(ids.len(), 3);
 
-        let s = q.stats("work").await.unwrap();
+        let s = q.view().stats("work").await.unwrap();
         assert_eq!(s.pending, 3);
 
         // All jobs are findable and ordered FIFO.
@@ -3006,7 +2869,7 @@ mod tests {
         let q = Queue::open(make_store(), "test").await.unwrap();
         let ids = q.enqueue_batch("work", vec![]).await.unwrap();
         assert!(ids.is_empty());
-        assert_eq!(q.stats("work").await.unwrap().pending, 0);
+        assert_eq!(q.view().stats("work").await.unwrap().pending, 0);
         q.close().await.unwrap();
     }
 
@@ -3088,7 +2951,7 @@ mod tests {
             .unwrap();
         q.ack(&j2).await.unwrap();
 
-        assert_eq!(q.stats("work").await.unwrap().pending, 0);
+        assert_eq!(q.view().stats("work").await.unwrap().pending, 0);
         q.close().await.unwrap();
     }
 
@@ -3125,7 +2988,7 @@ mod tests {
             other => panic!("expected New, got {other:?}"),
         };
 
-        let s = q.stats("work").await.unwrap();
+        let s = q.view().stats("work").await.unwrap();
         assert_eq!(s.pending, 1);
 
         let claimed = q
@@ -3136,7 +2999,7 @@ mod tests {
         assert_eq!(claimed.id, id);
         assert_eq!(claimed.payload, b"payload");
 
-        let v = q.kv_get(b"runs/abc").await.unwrap();
+        let v = q.view().kv_get(b"runs/abc").await.unwrap();
         assert_eq!(v.as_deref(), Some(b"submitted".as_slice()));
 
         q.close().await.unwrap();
@@ -3166,14 +3029,14 @@ mod tests {
             other => panic!("expected one new enqueue, got {other:?}"),
         };
         assert_eq!(
-            q.get_job(&id).await.unwrap().unwrap().status,
+            q.view().get_job(&id).await.unwrap().unwrap().status,
             JobStatus::Pending
         );
         assert_eq!(
-            q.kv_get(b"runs/new").await.unwrap().as_deref(),
+            q.view().kv_get(b"runs/new").await.unwrap().as_deref(),
             Some(b"reconciled".as_slice()),
         );
-        assert!(q.kv_get(b"runs/old").await.unwrap().is_none());
+        assert!(q.view().kv_get(b"runs/old").await.unwrap().is_none());
 
         // A dedup hit downgrades that enqueue and leaves the writes applied.
         let results = q
@@ -3188,10 +3051,10 @@ mod tests {
             matches!(results.as_slice(), [EnqueueResult::AlreadyEnqueued(existing)] if *existing == id)
         );
         assert_eq!(
-            q.kv_get(b"runs/new").await.unwrap().as_deref(),
+            q.view().kv_get(b"runs/new").await.unwrap().as_deref(),
             Some(b"again".as_slice()),
         );
-        assert_eq!(q.stats("work").await.unwrap().pending, 1);
+        assert_eq!(q.view().stats("work").await.unwrap().pending, 1);
 
         q.close().await.unwrap();
     }
@@ -3212,7 +3075,8 @@ mod tests {
                 .kv_delete(b"runs/1/step".to_vec())
         };
         async fn pending(q: &Queue) -> usize {
-            q.list_jobs("work", JobStatus::Pending, None, 10)
+            q.view()
+                .list_jobs("work", JobStatus::Pending, None, 10)
                 .await
                 .unwrap()
                 .jobs
@@ -3234,11 +3098,11 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            q.kv_get(b"runs/1").await.unwrap().as_deref(),
+            q.view().kv_get(b"runs/1").await.unwrap().as_deref(),
             Some(b"active".as_slice())
         );
         assert_eq!(
-            q.kv_get(b"runs/1/step").await.unwrap().as_deref(),
+            q.view().kv_get(b"runs/1/step").await.unwrap().as_deref(),
             Some(b"3".as_slice())
         );
         assert_eq!(pending(&q).await, 0);
@@ -3251,10 +3115,10 @@ mod tests {
             .expect("the value matched");
         assert!(matches!(results.as_slice(), [EnqueueResult::New(_)]));
         assert_eq!(
-            q.kv_get(b"runs/1").await.unwrap().as_deref(),
+            q.view().kv_get(b"runs/1").await.unwrap().as_deref(),
             Some(b"done".as_slice())
         );
-        assert!(q.kv_get(b"runs/1/step").await.unwrap().is_none());
+        assert!(q.view().kv_get(b"runs/1/step").await.unwrap().is_none());
         assert_eq!(pending(&q).await, 1);
 
         // Absence is a state to compare against.
@@ -3262,7 +3126,7 @@ mod tests {
         let results = q.kv_compare_commit(b"runs/2", None, claim).await.unwrap();
         assert!(matches!(results.as_deref(), Some([])));
         assert_eq!(
-            q.kv_get(b"runs/2").await.unwrap().as_deref(),
+            q.view().kv_get(b"runs/2").await.unwrap().as_deref(),
             Some(b"active".as_slice())
         );
 
@@ -3308,12 +3172,12 @@ mod tests {
         }
 
         // Only one job was enqueued.
-        let s = q.stats("work").await.unwrap();
+        let s = q.view().stats("work").await.unwrap();
         assert_eq!(s.pending, 1);
 
         // First write applied; second was a dedup hit so it did NOT
         // overwrite the KV value.
-        let v = q.kv_get(b"runs/abc").await.unwrap();
+        let v = q.view().kv_get(b"runs/abc").await.unwrap();
         assert_eq!(v.as_deref(), Some(b"first-record".as_slice()));
 
         q.close().await.unwrap();
@@ -3340,7 +3204,7 @@ mod tests {
             other => panic!("expected KvValueTooLarge, got {other:?}"),
         }
         // Nothing enqueued: validation runs before the transaction.
-        assert_eq!(q.stats("work").await.unwrap().pending, 0);
+        assert_eq!(q.view().stats("work").await.unwrap().pending, 0);
         q.close().await.unwrap();
     }
 
@@ -3366,7 +3230,7 @@ mod tests {
         assert!(job.claimed_at.is_some());
 
         q.nack(&job, "fatal").await.unwrap();
-        let dead = q.get_job(&id).await.unwrap().unwrap();
+        let dead = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(dead.status, JobStatus::Dead);
         assert!(dead.claimed_at.is_none());
         q.close().await.unwrap();
@@ -3399,7 +3263,7 @@ mod tests {
         assert_eq!(claim.status, JobStatus::Claimed);
         assert_eq!(claim.attempts, 1);
         assert_eq!(claim.payload, b"second");
-        let stats = q.stats("q").await.unwrap();
+        let stats = q.view().stats("q").await.unwrap();
         assert_eq!((stats.pending, stats.claimed), (1, 1));
         // The dedup key is released by the claim.
         let again = q
@@ -3419,7 +3283,7 @@ mod tests {
             .unwrap();
         assert_eq!(scanned.id, first);
         q.ack(&claim).await.unwrap();
-        assert!(q.get_job(&second).await.unwrap().is_none());
+        assert!(q.view().get_job(&second).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -3449,7 +3313,7 @@ mod tests {
             panic!("the scheduled job is claimed");
         };
         assert_eq!(early.status, JobStatus::Claimed);
-        let stats = q.stats("q").await.unwrap();
+        let stats = q.view().stats("q").await.unwrap();
         assert_eq!((stats.scheduled, stats.claimed), (0, 1));
         q.ack(&early).await.unwrap();
         let id = q.enqueue("q", b"now".to_vec()).await.unwrap();
@@ -3489,7 +3353,7 @@ mod tests {
 
         clock.advance(Duration::from_secs(11));
         q.reap_now().await.unwrap();
-        let job = q.get_job(&id).await.unwrap().unwrap();
+        let job = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Pending);
         assert!(matches!(q.ack(&claim).await, Err(Error::ClaimLost)));
     }

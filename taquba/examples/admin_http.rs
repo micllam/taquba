@@ -158,14 +158,14 @@ impl IntoResponse for ApiError {
 }
 
 async fn queues(State(q): State<Arc<Queue>>) -> Result<Json<Vec<String>>, ApiError> {
-    Ok(Json(q.list_queues().await?))
+    Ok(Json(q.view().list_queues().await?))
 }
 
 async fn queue_stats(
     State(q): State<Arc<Queue>>,
     Path(queue): Path<String>,
 ) -> Result<Json<QueueStats>, ApiError> {
-    Ok(Json(q.stats(&queue).await?))
+    Ok(Json(q.view().stats(&queue).await?))
 }
 
 #[derive(Deserialize)]
@@ -192,6 +192,7 @@ async fn jobs_page(
     };
     let cursor = params.cursor.as_deref().map(hex_decode).transpose()?;
     let page = q
+        .view()
         .list_jobs(&queue, status, cursor.as_deref(), params.limit)
         .await?;
     let views: Vec<JobView> = page
@@ -241,6 +242,7 @@ async fn dead_page(
     Query(params): Query<DeadPageParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let jobs = q
+        .view()
         .dead_jobs(&queue, params.after.as_deref(), params.limit)
         .await?;
     // A full page may continue; a short page is the end of the set.
@@ -256,7 +258,7 @@ async fn job(
     State(q): State<Arc<Queue>>,
     Path(id): Path<String>,
 ) -> Result<Json<JobView>, ApiError> {
-    match q.get_job(&id).await? {
+    match q.view().get_job(&id).await? {
         Some(job) => Ok(Json(JobView::build(&q, job))),
         None => Err(ApiError::NotFound(format!("job not found: {id}"))),
     }
@@ -268,7 +270,7 @@ async fn job_history(
 ) -> Result<Json<Vec<JobAttempt>>, ApiError> {
     // The history shares the job's lifetime, so an unknown or expunged
     // job returns an empty list, consistent with get_job returning None.
-    Ok(Json(q.attempt_history(&id).await?))
+    Ok(Json(q.view().attempt_history(&id).await?))
 }
 
 async fn cancel_job(

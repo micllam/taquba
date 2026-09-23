@@ -205,7 +205,8 @@ impl GroupStore {
     pub(crate) async fn members(&self, group_id: &RunId) -> Result<Vec<MemberState>> {
         let prefix = group_members_kv_prefix(group_id);
         let mut members = Vec::new();
-        let mut entries = std::pin::pin!(self.queue.kv_entries(&prefix, .., MEMBER_PAGE_SIZE));
+        let mut entries =
+            std::pin::pin!(self.queue.view().kv_entries(&prefix, .., MEMBER_PAGE_SIZE));
         while let Some((kv_key, value)) = entries.try_next().await? {
             let key = String::from_utf8_lossy(&kv_key[prefix.len()..]).into_owned();
             if let Some(record) = durable::decode_or_absent(
@@ -236,7 +237,8 @@ impl GroupStore {
             }
         }
         let prefix = group_members_kv_prefix(group_id);
-        let mut entries = std::pin::pin!(self.queue.kv_entries(&prefix, .., MEMBER_PAGE_SIZE));
+        let mut entries =
+            std::pin::pin!(self.queue.view().kv_entries(&prefix, .., MEMBER_PAGE_SIZE));
         while let Some((key, _)) = entries.try_next().await? {
             keys.push(key);
             if keys.len() == MEMBER_PAGE_SIZE {
@@ -805,11 +807,18 @@ mod tests {
         assert_eq!(results.len(), 1);
         let marker = group_terminal_kv_key(&rid("g"), 10_000);
         assert!(
-            queue.kv_get(&marker).await.unwrap().is_some(),
+            queue.view().kv_get(&marker).await.unwrap().is_some(),
             "the marker is written when the last termination is observed"
         );
         let terminal_record = outcome_kv_key(&run_id);
-        assert!(queue.kv_get(&terminal_record).await.unwrap().is_some());
+        assert!(
+            queue
+                .view()
+                .kv_get(&terminal_record)
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         clock.advance(Duration::from_secs(1));
         assert_eq!(
@@ -819,14 +828,19 @@ mod tests {
         );
         clock.advance(Duration::from_millis(1));
         assert_eq!(runtime.inner.core.sweep_once().await.unwrap(), 1);
-        assert!(queue.kv_get(&marker).await.unwrap().is_none());
+        assert!(queue.view().kv_get(&marker).await.unwrap().is_none());
         assert!(group.members().await.unwrap().is_empty());
         assert!(matches!(
             group.manifest().await,
             Err(Error::GroupNotFound(_))
         ));
         assert!(
-            queue.kv_get(&terminal_record).await.unwrap().is_none(),
+            queue
+                .view()
+                .kv_get(&terminal_record)
+                .await
+                .unwrap()
+                .is_none(),
             "the member's terminal record is removed with the group"
         );
         assert!(

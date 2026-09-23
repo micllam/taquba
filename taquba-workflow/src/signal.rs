@@ -84,7 +84,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             if attempt > 0 {
                 tokio::time::sleep(SIGNAL_WAIT_READ_INTERVAL).await;
             }
-            let Some(waiter) = queue.kv_get(&wait_key).await? else {
+            let Some(waiter) = queue.view().kv_get(&wait_key).await? else {
                 continue;
             };
             let Ok(job_id) = std::str::from_utf8(&waiter).map(str::to_string) else {
@@ -115,7 +115,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         let queue = &self.inner.core.queue;
         let buf_key = signal_buf_kv_key(correlation_key);
         loop {
-            let Some(current) = queue.kv_get(&buf_key).await? else {
+            let Some(current) = queue.view().kv_get(&buf_key).await? else {
                 return Ok(false);
             };
             if queue.kv_compare_delete(&buf_key, &current).await? {
@@ -151,11 +151,12 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         if let Some(existing) = self
             .core
             .queue
+            .view()
             .kv_get(&wait_key)
             .await
             .map_err(worker_error)?
             && let Ok(existing_id) = std::str::from_utf8(&existing)
-            && let Ok(Some(job)) = self.core.queue.get_job(existing_id).await
+            && let Ok(Some(job)) = self.core.queue.view().get_job(existing_id).await
             && job.status == JobStatus::Scheduled
         {
             let message =
@@ -169,6 +170,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         match self
             .core
             .queue
+            .view()
             .kv_get(&buf_key)
             .await
             .map_err(worker_error)?
@@ -222,7 +224,12 @@ impl RuntimeCore {
     ) -> Result<(Option<Vec<u8>>, Vec<Vec<u8>>)> {
         if job.headers.contains_key(HEADER_SIGNAL_DELIVERED) {
             let delivered_key = signal_delivered_kv_key(run_id, step_number);
-            let payload = self.queue.kv_get(&delivered_key).await?.map(|b| b.to_vec());
+            let payload = self
+                .queue
+                .view()
+                .kv_get(&delivered_key)
+                .await?
+                .map(|b| b.to_vec());
             if payload.is_none() {
                 warn!(run_id = %run_id, step_number, "delivered signal record is missing");
             }
@@ -244,7 +251,7 @@ impl RuntimeCore {
         // The timeout promoted this job. A prior attempt of this step may
         // already have consumed the buffer into the delivered record.
         let delivered_key = signal_delivered_kv_key(run_id, step_number);
-        if let Some(prior) = self.queue.kv_get(&delivered_key).await? {
+        if let Some(prior) = self.queue.view().kv_get(&delivered_key).await? {
             return Ok((Some(prior.to_vec()), vec![delivered_key]));
         }
         // A signal buffered after this waiter's settlement read of the
@@ -253,7 +260,7 @@ impl RuntimeCore {
         // the buffer is consumed, so a retry of this step observes the
         // same signal.
         let buf_key = signal_buf_kv_key(correlation_key);
-        if let Some(buffered) = self.queue.kv_get(&buf_key).await? {
+        if let Some(buffered) = self.queue.view().kv_get(&buf_key).await? {
             let buffered = buffered.to_vec();
             self.queue.kv_put(&delivered_key, &buffered).await?;
             remove_entry(&self.queue, &buf_key, &buffered).await;

@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Drain: wait until the queue is empty (jobs claimed and acked).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let stats = queue.stats("webhooks").await?;
+        let stats = queue.view().stats("webhooks").await?;
         if stats.pending == 0 && stats.claimed == 0 && stats.scheduled == 0 {
             break;
         }
@@ -82,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    let stats = queue.stats("webhooks").await?;
+    let stats = queue.view().stats("webhooks").await?;
     println!("Final stats: done={} dead={}", stats.done, stats.dead);
 
     let _ = worker_shutdown_tx.send(());

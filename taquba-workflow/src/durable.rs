@@ -64,7 +64,7 @@ pub(crate) fn decode_or_absent<T: DeserializeOwned>(
 /// The record at `key` of the queue's KV namespace, `None` when no
 /// value is stored there.
 pub(crate) async fn kv_record<T: DeserializeOwned>(queue: &Queue, key: &[u8]) -> Result<Option<T>> {
-    match queue.kv_get(key).await? {
+    match queue.view().kv_get(key).await? {
         Some(bytes) => decode(&bytes).map(Some),
         None => Ok(None),
     }

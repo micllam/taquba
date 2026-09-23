@@ -1000,7 +1000,11 @@ impl RuntimeCore {
     pub(crate) async fn reconcile_dead_steps(&self) -> Result<usize> {
         const PAGE: usize = 256;
         let mut terminated = 0usize;
-        let mut dead = std::pin::pin!(self.queue.jobs(&self.queue_name, JobStatus::Dead, PAGE));
+        let mut dead = std::pin::pin!(self.queue.view().jobs(
+            &self.queue_name,
+            JobStatus::Dead,
+            PAGE
+        ));
         while let Some(job) = dead.try_next().await? {
             if job.headers.contains_key(HEADER_TERMINAL) {
                 continue;
@@ -1044,7 +1048,7 @@ impl RuntimeCore {
             &stop,
             None,
             |reconciled_at: Option<i64>| async move {
-                match self.queue.stats(&self.queue_name).await {
+                match self.queue.view().stats(&self.queue_name).await {
                     Ok(stats) if reconciled_at != Some(stats.dead) => {
                         match self.reconcile_dead_steps().await {
                             Ok(_) => Some(stats.dead),
@@ -1106,7 +1110,7 @@ impl RuntimeCore {
             let Some(current) = self.current_step_if_active(run_id).await? else {
                 return Ok(None);
             };
-            if let Some(job) = self.queue.get_job(&current.job_id).await? {
+            if let Some(job) = self.queue.view().get_job(&current.job_id).await? {
                 return Ok(Some((current, job)));
             }
             if absent.as_deref() == Some(current.job_id.as_str()) {
@@ -1277,7 +1281,7 @@ impl RuntimeCore {
     async fn request_cancel(&self, run_id: &RunId) -> Result<Option<[u8; 32]>> {
         let key = run_kv_key(run_id);
         loop {
-            let Some(current) = self.queue.kv_get(&key).await? else {
+            let Some(current) = self.queue.view().kv_get(&key).await? else {
                 return Ok(None);
             };
             let mut record: DurableRunRecord = durable::decode(&current)?;
@@ -1623,7 +1627,11 @@ mod tests {
     /// Every terminal marker in the queue's KV namespace, as
     /// `(run_id, terminal_at_ms)` pairs in key order (oldest first).
     async fn terminal_markers(queue: &Queue) -> Vec<(RunId, u64)> {
-        let page = queue.kv_scan(TERMINAL_KV_PREFIX, .., 1_000).await.unwrap();
+        let page = queue
+            .view()
+            .kv_scan(TERMINAL_KV_PREFIX, .., 1_000)
+            .await
+            .unwrap();
         page.entries
             .iter()
             .map(|(key, _)| {
@@ -1854,7 +1862,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        let stats = queue.stats("workflow-steps").await.unwrap();
+        let stats = queue.view().stats("workflow-steps").await.unwrap();
         assert_eq!(stats.scheduled, 1);
 
         advance(&clock, Duration::from_secs(61)).await;
@@ -1898,7 +1906,14 @@ mod tests {
 
     async fn wait_for_scheduled(queue: &Queue, count: i64) {
         for _ in 0..200 {
-            if queue.stats("workflow-steps").await.unwrap().scheduled == count {
+            if queue
+                .view()
+                .stats("workflow-steps")
+                .await
+                .unwrap()
+                .scheduled
+                == count
+            {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1965,6 +1980,7 @@ mod tests {
         // Both durable signal entries are consumed.
         assert!(
             queue
+                .view()
                 .kv_get(&signal_wait_kv_key("order-1"))
                 .await
                 .unwrap()
@@ -1972,6 +1988,7 @@ mod tests {
         );
         assert!(
             queue
+                .view()
                 .kv_get(&signal_buf_kv_key("order-1"))
                 .await
                 .unwrap()
@@ -2032,7 +2049,15 @@ mod tests {
             .unwrap();
 
         let queue = open(store.clone()).await;
-        assert_eq!(queue.stats("workflow-steps").await.unwrap().scheduled, 1);
+        assert_eq!(
+            queue
+                .view()
+                .stats("workflow-steps")
+                .await
+                .unwrap()
+                .scheduled,
+            1
+        );
 
         let (runtime, observed, mut rx) =
             signal_probe_runtime(queue.clone(), store, "approval", Duration::from_secs(3600));
@@ -2084,6 +2109,7 @@ mod tests {
 
         assert!(
             queue
+                .view()
                 .kv_get(&signal_wait_kv_key("order-2"))
                 .await
                 .unwrap()
@@ -2131,6 +2157,7 @@ mod tests {
 
         assert!(
             queue
+                .view()
                 .kv_get(&signal_buf_kv_key("order-3"))
                 .await
                 .unwrap()
@@ -2154,6 +2181,7 @@ mod tests {
         assert!(!runtime.clear_signal("order-5").await.unwrap());
         assert!(
             queue
+                .view()
                 .kv_get(&signal_buf_kv_key("order-5"))
                 .await
                 .unwrap()
@@ -2200,12 +2228,13 @@ mod tests {
                 .is_some_and(|e| e.contains("already registered"))
         );
         assert_eq!(
-            queue.stats("workflow-steps").await.unwrap().dead,
+            queue.view().stats("workflow-steps").await.unwrap().dead,
             1,
             "the rejected registration dead-letters run-b's step",
         );
         assert!(
             queue
+                .view()
                 .kv_get(&run_kv_key(&rid("run-b")))
                 .await
                 .unwrap()
@@ -2214,6 +2243,7 @@ mod tests {
         );
         assert!(
             queue
+                .view()
                 .kv_get(&run_kv_key(&rid("run-a")))
                 .await
                 .unwrap()
@@ -2293,6 +2323,7 @@ mod tests {
         );
         assert!(
             queue
+                .view()
                 .kv_get(&signal_wait_kv_key("order-8"))
                 .await
                 .unwrap()
@@ -2367,7 +2398,7 @@ mod tests {
         assert!(first.newly_submitted);
         assert!(runtime.status(&rid("fixed-id")).await.unwrap().is_some());
         assert_eq!(
-            queue.kv_get(b"app/first").await.unwrap().as_deref(),
+            queue.view().kv_get(b"app/first").await.unwrap().as_deref(),
             Some(b"1".as_slice())
         );
 
@@ -2375,12 +2406,12 @@ mod tests {
         assert_eq!(duplicate.run_id, "fixed-id");
         assert!(!duplicate.newly_submitted);
         assert_eq!(duplicate.job_id, first.job_id);
-        assert!(queue.kv_get(b"app/second").await.unwrap().is_none());
+        assert!(queue.view().kv_get(b"app/second").await.unwrap().is_none());
 
         let err = runtime.submit(spec(b"y", b"app/third")).await.unwrap_err();
         assert!(matches!(&err, Error::InputMismatch(id) if id == "fixed-id"));
         assert!(err.is_permanent());
-        assert!(queue.kv_get(b"app/third").await.unwrap().is_none());
+        assert!(queue.view().kv_get(b"app/third").await.unwrap().is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -2409,7 +2440,14 @@ mod tests {
             .await
             .unwrap();
         for _ in 0..200 {
-            if queue.stats("workflow-steps").await.unwrap().scheduled == 1 {
+            if queue
+                .view()
+                .stats("workflow-steps")
+                .await
+                .unwrap()
+                .scheduled
+                == 1
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2437,7 +2475,12 @@ mod tests {
             duplicate.job_id, submitted.job_id,
             "the pointer moved to step 1"
         );
-        let step_1 = queue.get_job(&duplicate.job_id).await.unwrap().unwrap();
+        let step_1 = queue
+            .view()
+            .get_job(&duplicate.job_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(step_1.status, taquba::JobStatus::Scheduled);
         assert_eq!(
             step_1.headers.get(HEADER_STEP).map(String::as_str),
@@ -2474,6 +2517,7 @@ mod tests {
             .await
             .unwrap();
         let scheduled = queue
+            .view()
             .list_jobs("workflow-steps", taquba::JobStatus::Scheduled, None, 10)
             .await
             .unwrap()
@@ -2904,9 +2948,10 @@ mod tests {
 
         // The notification job was enqueued with the exhausted nack, so
         // its effects are committed once the hook fires.
-        assert_eq!(queue.stats("workflow-steps").await.unwrap().dead, 1);
+        assert_eq!(queue.view().stats("workflow-steps").await.unwrap().dead, 1);
         assert!(
             queue
+                .view()
                 .kv_get(&run_kv_key(&handle.run_id))
                 .await
                 .unwrap()
@@ -3144,7 +3189,11 @@ mod tests {
         let markers = terminal_markers(&queue).await;
         assert_eq!(markers, vec![(handle.run_id.clone(), 10_000)]);
         assert_eq!(
-            queue.kv_get(&run_kv_key(&handle.run_id)).await.unwrap(),
+            queue
+                .view()
+                .kv_get(&run_kv_key(&handle.run_id))
+                .await
+                .unwrap(),
             None,
         );
 
@@ -3176,7 +3225,7 @@ mod tests {
         );
         assert!(rx.try_recv().is_err());
 
-        let stats = queue.stats("workflow-steps").await.unwrap();
+        let stats = queue.view().stats("workflow-steps").await.unwrap();
         assert_eq!(stats.dead, 0, "cancel must not dead-letter");
         assert_eq!(stats.pending, 0, "cancelled job must be removed");
     }
@@ -3240,7 +3289,7 @@ mod tests {
             1,
             "cancellation must suppress retries",
         );
-        let stats = queue.stats("workflow-steps").await.unwrap();
+        let stats = queue.view().stats("workflow-steps").await.unwrap();
         assert_eq!(stats.dead, 0, "cancellation must suppress dead-letter");
         assert!(
             hook_rx.try_recv().is_err(),
@@ -3328,7 +3377,7 @@ mod tests {
             Some(outcome.status)
         );
 
-        let stats = queue.stats("workflow-steps").await.unwrap();
+        let stats = queue.view().stats("workflow-steps").await.unwrap();
         assert_eq!(stats.dead, 0);
 
         let _ = shutdown.send(());
@@ -3568,10 +3617,10 @@ mod tests {
             "an unrelated run's memo entries must survive",
         );
         assert!(
-            queue.kv_get(&marker).await.unwrap().is_none(),
+            queue.view().kv_get(&marker).await.unwrap().is_none(),
             "the marker is removed and not retried on every sweep",
         );
-        assert!(queue.kv_get(&unparseable).await.unwrap().is_none());
+        assert!(queue.view().kv_get(&unparseable).await.unwrap().is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -3625,6 +3674,7 @@ mod tests {
         );
         assert!(
             queue
+                .view()
                 .kv_get(&run_kv_key(&handle.run_id))
                 .await
                 .unwrap()
@@ -3656,7 +3706,7 @@ mod tests {
             vec![(handle.run_id.clone(), 10_000)],
             "the worker's settlement writes it",
         );
-        assert_eq!(queue.stats("workflow-steps").await.unwrap().dead, 0);
+        assert_eq!(queue.view().stats("workflow-steps").await.unwrap().dead, 0);
 
         let _ = shutdown.send(());
     }
@@ -3709,12 +3759,12 @@ mod tests {
         // The notification was enqueued by the dead-letter transaction, so
         // the dead job and the marker are already visible, and the staged
         // effect was discarded with the failure.
-        assert_eq!(queue.stats("workflow-steps").await.unwrap().dead, 1);
+        assert_eq!(queue.view().stats("workflow-steps").await.unwrap().dead, 1);
         assert_eq!(
             terminal_markers(&queue).await,
             vec![(handle.run_id.clone(), 10_000)],
         );
-        assert!(queue.kv_get(b"app/step-0").await.unwrap().is_none());
+        assert!(queue.view().kv_get(b"app/step-0").await.unwrap().is_none());
 
         let _ = shutdown.send(());
     }
@@ -4024,7 +4074,7 @@ mod tests {
 
     async fn wait_for_kv(queue: &Queue, key: &[u8]) -> Vec<u8> {
         for _ in 0..200 {
-            if let Some(v) = queue.kv_get(key).await.unwrap() {
+            if let Some(v) = queue.view().kv_get(key).await.unwrap() {
                 return v.to_vec();
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4037,7 +4087,7 @@ mod tests {
 
     async fn wait_for_drained(queue: &Queue) {
         for _ in 0..200 {
-            let stats = queue.stats("workflow-steps").await.unwrap();
+            let stats = queue.view().stats("workflow-steps").await.unwrap();
             if stats.pending == 0 && stats.claimed == 0 && stats.scheduled == 0 {
                 return;
             }
@@ -4241,7 +4291,7 @@ mod tests {
         );
         assert_eq!(wait_for_kv(&queue, b"app/step-0").await, b"done");
         assert_eq!(
-            queue.stats("workflow-steps").await.unwrap().dead,
+            queue.view().stats("workflow-steps").await.unwrap().dead,
             0,
             "a Fail verdict must not dead-letter"
         );
@@ -4331,7 +4381,7 @@ mod tests {
         );
         assert_eq!(wait_for_kv(&queue, b"app/step-0").await, b"done");
         assert_eq!(
-            queue.stats("workflow-steps").await.unwrap().dead,
+            queue.view().stats("workflow-steps").await.unwrap().dead,
             0,
             "a Cancel verdict must not dead-letter"
         );
@@ -4391,7 +4441,14 @@ mod tests {
         assert_eq!(outcome.error, None);
 
         wait_for_drained(&queue).await;
-        assert!(queue.kv_get(b"app/override").await.unwrap().is_none());
+        assert!(
+            queue
+                .view()
+                .kv_get(b"app/override")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let _ = shutdown.send(());
     }
@@ -4427,7 +4484,7 @@ mod tests {
             .await
             .unwrap();
         for _ in 0..200 {
-            if queue.stats("workflow-steps").await.unwrap().claimed == 1 {
+            if queue.view().stats("workflow-steps").await.unwrap().claimed == 1 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4449,6 +4506,7 @@ mod tests {
         assert_eq!(outcome.final_step, 0);
         assert_eq!(
             queue
+                .view()
                 .get_job(&submitted.job_id)
                 .await
                 .unwrap()
@@ -4458,6 +4516,7 @@ mod tests {
         );
         assert!(
             queue
+                .view()
                 .kv_get(&run_kv_key(&rid("hung")))
                 .await
                 .unwrap()
@@ -4465,6 +4524,7 @@ mod tests {
         );
         assert!(
             queue
+                .view()
                 .kv_get(&step_kv_key(&rid("hung")))
                 .await
                 .unwrap()
@@ -4777,12 +4837,12 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.status, TerminalStatus::Failed);
         for _ in 0..200 {
-            if queue.stats("workflow-steps").await.unwrap().dead == 1 {
+            if queue.view().stats("workflow-steps").await.unwrap().dead == 1 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(queue.stats("workflow-steps").await.unwrap().dead, 1);
+        assert_eq!(queue.view().stats("workflow-steps").await.unwrap().dead, 1);
 
         // The retried first attempt left the record pending; the
         // exhausted second attempt's termination commits with the
@@ -4862,7 +4922,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(queue.kv_get(b"app/replayed").await.unwrap().is_none());
+        assert!(
+            queue
+                .view()
+                .kv_get(b"app/replayed")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // Redelivery replays the stored outcome and restores the staged
         // effects into the settlement without invoking the runner.
@@ -4879,10 +4946,15 @@ mod tests {
         assert!(effects.kv_deletes.contains(&b"app/stale".to_vec()));
         queue.ack_with(&job, effects).await.unwrap();
         assert_eq!(
-            queue.kv_get(b"app/replayed").await.unwrap().as_deref(),
+            queue
+                .view()
+                .kv_get(b"app/replayed")
+                .await
+                .unwrap()
+                .as_deref(),
             Some(b"v".as_slice())
         );
-        assert!(queue.kv_get(b"app/stale").await.unwrap().is_none());
+        assert!(queue.view().kv_get(b"app/stale").await.unwrap().is_none());
     }
 
     #[tokio::test(start_paused = true)]

@@ -8,10 +8,10 @@ use crate::keys::{KeyTag, QueueName};
 /// A single job stored in a Taquba queue.
 ///
 /// Returned by [`Queue::claim`](crate::Queue::claim),
-/// [`Queue::get_job`](crate::Queue::get_job),
-/// [`Queue::dead_jobs`](crate::Queue::dead_jobs), and the worker trait.
-/// Mostly read-only from the caller's perspective; fields are mutated by
-/// Taquba as the job moves through its lifecycle (see [`JobStatus`]).
+/// [`QueueView::get_job`](crate::QueueView::get_job),
+/// [`QueueView::dead_jobs`](crate::QueueView::dead_jobs) and the worker trait.
+/// Mostly read-only from the caller's perspective. Fields are mutated by Taquba
+/// as the job moves through its lifecycle (see [`JobStatus`]).
 ///
 /// All timestamp fields (`enqueued_at`, `claimed_at`, `run_at`,
 /// `completed_at`, `failed_at`) are wall-clock milliseconds since the
@@ -130,8 +130,8 @@ pub struct JobRecord {
 /// [`Queue::nack`](crate::Queue::nack),
 /// [`Queue::dead_letter`](crate::Queue::dead_letter) and
 /// [`Queue::renew_lease`](crate::Queue::renew_lease). A [`JobRecord`]
-/// read through [`Queue::get_job`](crate::Queue::get_job) or
-/// [`Queue::list_jobs`](crate::Queue::list_jobs) therefore cannot settle
+/// read through [`QueueView::get_job`](crate::QueueView::get_job) or
+/// [`QueueView::list_jobs`](crate::QueueView::list_jobs) therefore cannot settle
 /// a delivery the caller does not hold.
 ///
 /// The claim id is unique per claim but not ordered, so it identifies a
@@ -151,7 +151,7 @@ pub struct JobRecord {
 /// # use taquba::{JobStatus, Queue, object_store::memory::InMemory};
 /// # async fn run() -> taquba::Result<()> {
 /// let q = Queue::open(Arc::new(InMemory::new()), "demo").await?;
-/// let page = q.list_jobs("work", JobStatus::Claimed, None, 10).await?;
+/// let page = q.view().list_jobs("work", JobStatus::Claimed, None, 10).await?;
 /// let listed = &page.jobs[0];
 /// q.ack(listed).await?; // expected &Claim, found &JobRecord
 /// # Ok(())
@@ -341,8 +341,8 @@ pub enum JobStatus {
     /// set on the job's queue; otherwise the record is deleted on ack.
     Done,
     /// Exhausted all retry attempts and was moved to the dead-letter queue.
-    /// Inspected via [`Queue::dead_jobs`](crate::Queue::dead_jobs); revived
-    /// via [`Queue::requeue_dead_job`](crate::Queue::requeue_dead_job).
+    /// Inspected via [`QueueView::dead_jobs`](crate::QueueView::dead_jobs) and
+    /// revived via [`Queue::requeue_dead_job`](crate::Queue::requeue_dead_job).
     Dead,
 }
 

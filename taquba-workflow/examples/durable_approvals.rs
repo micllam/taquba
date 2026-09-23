@@ -211,7 +211,7 @@ async fn awaiting_approval(queue: Arc<Queue>) {
     let mut stable = 0;
     loop {
         tokio::time::sleep(Duration::from_millis(150)).await;
-        let Ok(stats) = queue.stats("workflow-steps").await else {
+        let Ok(stats) = queue.view().stats("workflow-steps").await else {
             continue;
         };
         if stats.scheduled >= 1 && stats.pending == 0 && stats.claimed == 0 {

@@ -815,7 +815,12 @@ impl CronScheduler {
         let Some(backfill) = &entry.backfill else {
             return Ok(now);
         };
-        let Some(raw) = self.queue.kv_get(&watermark_key(&entry.name)).await? else {
+        let Some(raw) = self
+            .queue
+            .view()
+            .kv_get(&watermark_key(&entry.name))
+            .await?
+        else {
             // The registration rejects a lookback without a floor.
             return Ok(match backfill.start {
                 BackfillStart::CurrentTime => now,
@@ -938,6 +943,7 @@ mod tests {
 
     async fn pending_fire_ms(q: &Queue, queue: &str) -> Vec<i64> {
         let page = q
+            .view()
             .list_jobs(queue, taquba::JobStatus::Pending, None, 100)
             .await
             .unwrap();
@@ -952,6 +958,7 @@ mod tests {
 
     async fn previous_fire_ms(q: &Queue, queue: &str) -> Vec<i64> {
         let page = q
+            .view()
             .list_jobs(queue, taquba::JobStatus::Pending, None, 100)
             .await
             .unwrap();
@@ -962,7 +969,8 @@ mod tests {
     }
 
     async fn watermark(q: &Queue, name: &str) -> Option<i64> {
-        q.kv_get(&watermark_key(name))
+        q.view()
+            .kv_get(&watermark_key(name))
             .await
             .unwrap()
             .map(|v| std::str::from_utf8(&v).unwrap().parse().unwrap())
@@ -1086,7 +1094,7 @@ mod tests {
         assert!(handle.unschedule("minutely"));
         assert!(!handle.unschedule("minutely"));
         assert_eq!(s.step(t0() + minutes(1)).await, None);
-        assert_eq!(q.stats("out").await.unwrap().pending, 0);
+        assert_eq!(q.view().stats("out").await.unwrap().pending, 0);
 
         // The entry registered again starts at the current time.
         handle
@@ -1098,7 +1106,7 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(s.step(t0() + minutes(5)).await, Some(t0() + minutes(6)));
-        assert_eq!(q.stats("out").await.unwrap().pending, 0);
+        assert_eq!(q.view().stats("out").await.unwrap().pending, 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1128,7 +1136,7 @@ mod tests {
         let mut fired = false;
         for _ in 0..100 {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            if q.stats("out").await.unwrap().pending == 1 {
+            if q.view().stats("out").await.unwrap().pending == 1 {
                 fired = true;
                 break;
             }
@@ -1277,6 +1285,7 @@ mod tests {
         s.step(t0() + minutes(1)).await;
 
         let page = q
+            .view()
             .list_jobs("reports", taquba::JobStatus::Pending, None, 100)
             .await
             .unwrap();
@@ -1603,7 +1612,7 @@ mod tests {
             )
             .unwrap();
         s.step(fire_at + Duration::from_secs(30)).await;
-        assert_eq!(q.stats("out").await.unwrap().pending, 1);
+        assert_eq!(q.view().stats("out").await.unwrap().pending, 1);
         assert_eq!(watermark(&q, "minutely").await, Some(ms(fire_at)));
     }
 
@@ -1650,7 +1659,7 @@ mod tests {
             .unwrap();
         let soonest = s.step(t0()).await.expect("satisfiable");
         assert_eq!(soonest, t0() + minutes(1));
-        assert_eq!(q.stats("out").await.unwrap().pending, 0);
+        assert_eq!(q.view().stats("out").await.unwrap().pending, 0);
     }
 
     #[tokio::test]
@@ -1684,14 +1693,14 @@ mod tests {
 
         for _ in 0..100 {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            assert_eq!(q.stats("out").await.unwrap().pending, 0);
+            assert_eq!(q.view().stats("out").await.unwrap().pending, 0);
         }
 
         clock.advance(Duration::from_secs(30));
         let mut fired = false;
         for _ in 0..100 {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            if q.stats("out").await.unwrap().pending == 1 {
+            if q.view().stats("out").await.unwrap().pending == 1 {
                 fired = true;
                 break;
             }
@@ -1727,7 +1736,7 @@ mod tests {
         // nothing enqueued yet.
         let soonest0 = s.step(t0).await.expect("satisfiable");
         assert_eq!(soonest0, t0 + Duration::from_secs(60));
-        assert_eq!(q.stats("out").await.unwrap().pending, 0);
+        assert_eq!(q.view().stats("out").await.unwrap().pending, 0);
 
         // Phase 2: at T0+5m30s, the recorded T0+1m firing
         // enqueues; the missed T0+2m/3m/4m/5m firings are dropped
@@ -1739,6 +1748,6 @@ mod tests {
             t0 + Duration::from_secs(6 * 60),
             "next firing must skip past missed occurrences"
         );
-        assert_eq!(q.stats("out").await.unwrap().pending, 1);
+        assert_eq!(q.view().stats("out").await.unwrap().pending, 1);
     }
 }

@@ -11,7 +11,7 @@ Each rule identifies the code it applies to, whose docs describe the mechanism.
 - **Reader** (`reader.rs`). Do not add `wait_for` or a cross-process control
   convenience to `QueueReader`.
 - **Paged reads.** A new paged read of the KV namespace or of a job status uses
-  `Queue::kv_entries` or `Queue::jobs`, never a custom cursor loop.
+  `QueueView::kv_entries` or `QueueView::jobs`, never a custom cursor loop.
 - **Scan read-ahead** (`reaper.rs::sweep_scan_options`). Do not extend
   read-ahead to another scan without an access-pattern argument.
 

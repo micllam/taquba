@@ -282,7 +282,7 @@ pub enum StepOutcome {
     /// failures (network outage, downstream service down, etc.) return
     /// `Err(StepError::transient)` or `Err(StepError::permanent)` instead;
     /// those dead-letter the step so an operator can find it via
-    /// [`taquba::Queue::dead_jobs`]. `Fail` is a successful execution with
+    /// [`taquba::QueueView::dead_jobs`]. `Fail` is a successful execution with
     /// a negative outcome and does not dead-letter.
     Fail {
         /// Human-readable reason recorded on [`crate::RunOutcome::error`].

@@ -1,17 +1,14 @@
-//! Bodies of the read-only query API, shared between
-//! [`Queue`](crate::Queue) and [`QueueReader`](crate::QueueReader).
-//!
-//! Every query both types expose lives here as a free function over
-//! [`ReadHandle`], with the two types as thin delegating callers. A new
-//! read method on either type is added here and delegated from both, so
-//! the two surfaces cannot drift.
+//! The read-only query API: [`QueueView`], one method for each query, over
+//! [`Handle`], the enum of the two store handles a view reads through (the
+//! writer's [`Db`] or a [`DbReader`]).
 
 use std::future::Future;
 use std::ops::Bound;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures_util::stream::{self, Stream, TryStreamExt};
-use slatedb::{Db, DbIterator, DbReader};
+use slatedb::{Db, DbIterator, DbReader, IsolationLevel};
 
 use crate::error::{Error, Result};
 use crate::history::{JobAttempt, decode_history};
@@ -25,32 +22,22 @@ use crate::liveness::{HeartbeatRecord, WriterHeartbeat};
 use crate::payload_store::PayloadStore;
 use crate::queue::JobPage;
 use crate::stats::{QueueStats, metric_name};
+use crate::txn::get_indexed_job;
 
-/// Uniform point-read and prefix-scan access to a store, implemented by
-/// the writer's [`Db`] and the standalone [`DbReader`].
-pub(crate) trait ReadHandle: Sync {
-    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>>;
-
-    async fn scan_prefix(
-        &self,
-        prefix: Vec<u8>,
-        range: (Bound<Bytes>, Bound<Bytes>),
-    ) -> Result<DbIterator>;
-
-    /// Whether the record listed at `key` has been removed from the
-    /// store. Consulted by [`list_jobs`] when a listed record's payload
-    /// object is absent: the row of a record confirmed removed is
-    /// omitted from the page; otherwise the missing payload is
-    /// reported. A reader answers `false` unconditionally, because it
-    /// re-reads the same lagging view its scan used and so cannot
-    /// confirm a removal; the missing payload it reports resolves once
-    /// its view advances past the removal.
-    async fn job_removed_since_scan(&self, key: &[u8]) -> Result<bool>;
+/// The store handle a view reads through: the writer's [`Db`] or a
+/// [`DbReader`].
+#[derive(Clone)]
+pub(crate) enum Handle {
+    Writer(Arc<Db>),
+    Reader(Arc<DbReader>),
 }
 
-impl ReadHandle for Db {
+impl Handle {
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        Ok(Db::get(self, key).await?)
+        Ok(match self {
+            Handle::Writer(db) => db.get(key).await?,
+            Handle::Reader(reader) => reader.get(key).await?,
+        })
     }
 
     async fn scan_prefix(
@@ -58,263 +45,411 @@ impl ReadHandle for Db {
         prefix: Vec<u8>,
         range: (Bound<Bytes>, Bound<Bytes>),
     ) -> Result<DbIterator> {
-        Ok(Db::scan_prefix(self, prefix, range).await?)
-    }
-
-    async fn job_removed_since_scan(&self, key: &[u8]) -> Result<bool> {
-        Ok(Db::get(self, key).await?.is_none())
+        Ok(match self {
+            Handle::Writer(db) => db.scan_prefix(prefix, range).await?,
+            Handle::Reader(reader) => reader.scan_prefix(prefix, range).await?,
+        })
     }
 }
 
-impl ReadHandle for DbReader {
-    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        Ok(DbReader::get(self, key).await?)
+/// The read-only queries of a store. [`Queue::view`](crate::Queue::view)
+/// returns the writer's live view, and
+/// [`QueueReader::view`](crate::QueueReader::view) returns a reader's
+/// lagging view, with the same methods on both.
+#[derive(Clone)]
+pub struct QueueView {
+    handle: Handle,
+    payloads: Arc<PayloadStore>,
+}
+
+impl QueueView {
+    pub(crate) fn new(handle: Handle, payloads: Arc<PayloadStore>) -> Self {
+        Self { handle, payloads }
     }
 
-    async fn scan_prefix(
+    /// Return a snapshot of job counts for the given queue.
+    pub async fn stats(&self, queue: &str) -> Result<QueueStats> {
+        let queue = QueueName::new(queue)?;
+        Ok(QueueStats {
+            pending: self.count_for(&queue, JobStatus::Pending).await?,
+            claimed: self.count_for(&queue, JobStatus::Claimed).await?,
+            done: self.count_for(&queue, JobStatus::Done).await?,
+            dead: self.count_for(&queue, JobStatus::Dead).await?,
+            scheduled: self.count_for(&queue, JobStatus::Scheduled).await?,
+            queue: queue.into_string(),
+        })
+    }
+
+    async fn count_for(&self, queue: &QueueName, status: JobStatus) -> Result<i64> {
+        let key = stats_key(queue, metric_name(status));
+        match self.handle.get(&key).await? {
+            None => Ok(0),
+            Some(bytes) => bytes
+                .as_ref()
+                .try_into()
+                .map(i64::from_le_bytes)
+                .map_err(|_| Error::InvalidState),
+        }
+    }
+
+    /// Return the names of all queues that have ever had at least one job.
+    pub async fn list_queues(&self) -> Result<Vec<String>> {
+        // The stats key space has a key per queue and metric.
+        let mut seen = std::collections::HashSet::new();
+        let mut queues = Vec::new();
+        let mut iter = self
+            .handle
+            .scan_prefix(
+                tag_prefix(KeyTag::Stats).to_vec(),
+                (Bound::Unbounded, Bound::Unbounded),
+            )
+            .await?;
+        while let Some(kv) = iter.next().await? {
+            let Some((queue, _metric)) = parse_stats_key(&kv.key) else {
+                continue;
+            };
+            if seen.insert(queue.clone()) {
+                queues.push(queue);
+            }
+        }
+        Ok(queues)
+    }
+
+    /// Return a page of the given queue's jobs in one lifecycle state.
+    ///
+    /// Jobs are returned in the scan order of the state's key space:
+    ///
+    /// - `Pending`: claim order (priority, then enqueue order).
+    /// - `Scheduled`: `run_at` order, soonest first.
+    /// - `Claimed`: enqueue order, as in [`QueueView::dead_jobs`].
+    /// - `Done`: completion-time order, oldest first. Done records exist
+    ///   only on queues with
+    ///   [`QueueConfig::keep_done_jobs`](crate::QueueConfig::keep_done_jobs)
+    ///   set.
+    /// - `Dead`: enqueue order, as in [`QueueView::dead_jobs`].
+    ///
+    /// The claimed listing is not ordered by lease expiry: a renewal changes an
+    /// expiry without changing a key, and an expiry-ordered page boundary moves
+    /// under a listing.
+    ///
+    /// `cursor` is an opaque resume token: pass `None` to start from the
+    /// beginning, or [`JobPage::next_cursor`] from the previous page to
+    /// continue. A cursor identifies a scan position and remains valid when the
+    /// job it was taken at leaves the state. The listing is not a snapshot: a
+    /// job that changes state between page reads is absent from every page or
+    /// appears on two pages.
+    ///
+    /// A page can hold fewer than `limit` jobs while more remain,
+    /// because a job removed between the key scan and its payload
+    /// fetch is omitted from the page. The listing is exhausted only
+    /// when [`JobPage::next_cursor`] is `None`.
+    ///
+    /// The pending, claimed and dead key spaces group by queue, so those
+    /// scans cover only the requested queue. The scheduled and done
+    /// listings scan a key space that leads with a timestamp for the
+    /// background sweeps, so they cover every queue and filter on the
+    /// queue name.
+    pub async fn list_jobs(
         &self,
-        prefix: Vec<u8>,
-        range: (Bound<Bytes>, Bound<Bytes>),
-    ) -> Result<DbIterator> {
-        Ok(DbReader::scan_prefix(self, prefix, range).await?)
-    }
-
-    async fn job_removed_since_scan(&self, _key: &[u8]) -> Result<bool> {
-        Ok(false)
-    }
-}
-
-/// Body of `stats`: assemble a [`QueueStats`] snapshot from the queue's
-/// per-state counters.
-pub(crate) async fn stats<H: ReadHandle>(handle: &H, queue: &str) -> Result<QueueStats> {
-    let queue = QueueName::new(queue)?;
-    Ok(QueueStats {
-        pending: count_for(handle, &queue, JobStatus::Pending).await?,
-        claimed: count_for(handle, &queue, JobStatus::Claimed).await?,
-        done: count_for(handle, &queue, JobStatus::Done).await?,
-        dead: count_for(handle, &queue, JobStatus::Dead).await?,
-        scheduled: count_for(handle, &queue, JobStatus::Scheduled).await?,
-        queue: queue.into_string(),
-    })
-}
-
-async fn count_for<H: ReadHandle>(handle: &H, queue: &QueueName, status: JobStatus) -> Result<i64> {
-    let key = stats_key(queue, metric_name(status));
-    match handle.get(&key).await? {
-        None => Ok(0),
-        Some(bytes) => bytes
-            .as_ref()
-            .try_into()
-            .map(i64::from_le_bytes)
-            .map_err(|_| Error::InvalidState),
-    }
-}
-
-/// Body of `list_queues`: distinct queue names, discovered from the
-/// stats key space. A queue appears once it has had at least one job.
-pub(crate) async fn list_queues<H: ReadHandle>(handle: &H) -> Result<Vec<String>> {
-    let mut seen = std::collections::HashSet::new();
-    let mut queues = Vec::new();
-    let mut iter = handle
-        .scan_prefix(
-            tag_prefix(KeyTag::Stats).to_vec(),
-            (Bound::Unbounded, Bound::Unbounded),
-        )
-        .await?;
-    while let Some(kv) = iter.next().await? {
-        let Some((queue, _metric)) = parse_stats_key(&kv.key) else {
-            continue;
+        queue: &str,
+        status: JobStatus,
+        cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<JobPage> {
+        let queue = QueueName::new(queue)?;
+        let empty = JobPage {
+            jobs: Vec::new(),
+            next_cursor: None,
         };
-        if seen.insert(queue.clone()) {
-            queues.push(queue);
+        if limit == 0 {
+            return Ok(empty);
         }
-    }
-    Ok(queues)
-}
+        // `filter_queue` enables the queue-name filter on each scanned
+        // record and is set only for the key spaces that cover every
+        // queue.
+        let (prefix, filter_queue) = match status {
+            JobStatus::Pending => (pending_prefix(&queue), false),
+            JobStatus::Dead => (dead_prefix(&queue), false),
+            JobStatus::Claimed => (claimed_prefix(&queue), false),
+            JobStatus::Scheduled => (tag_prefix(KeyTag::Scheduled).to_vec(), true),
+            JobStatus::Done => (tag_prefix(KeyTag::Done).to_vec(), true),
+        };
+        let start = match cursor {
+            None => Bound::Unbounded,
+            // A cursor from a different key space does not identify a position
+            // within this prefix, and nothing follows it here.
+            Some(c) if !c.starts_with(&prefix) => return Ok(empty),
+            Some(c) => Bound::Excluded(Bytes::copy_from_slice(&c[prefix.len()..])),
+        };
 
-/// Body of `list_jobs`: one page of a queue's jobs in one lifecycle
-/// state, in the scan order of that state's key space.
-pub(crate) async fn list_jobs<H: ReadHandle>(
-    handle: &H,
-    payloads: &PayloadStore,
-    queue: &str,
-    status: JobStatus,
-    cursor: Option<&[u8]>,
-    limit: usize,
-) -> Result<JobPage> {
-    let queue = QueueName::new(queue)?;
-    let empty = JobPage {
-        jobs: Vec::new(),
-        next_cursor: None,
-    };
-    if limit == 0 {
-        return Ok(empty);
-    }
-    // `filter_queue` enables the queue-name filter on each scanned
-    // record and is set only for the key spaces that cover every
-    // queue.
-    let (prefix, filter_queue) = match status {
-        JobStatus::Pending => (pending_prefix(&queue), false),
-        JobStatus::Dead => (dead_prefix(&queue), false),
-        JobStatus::Claimed => (claimed_prefix(&queue), false),
-        JobStatus::Scheduled => (tag_prefix(KeyTag::Scheduled).to_vec(), true),
-        JobStatus::Done => (tag_prefix(KeyTag::Done).to_vec(), true),
-    };
-    let start = match cursor {
-        None => Bound::Unbounded,
-        // A cursor from a different key space does not identify a
-        // position under this prefix; nothing follows it here.
-        Some(c) if !c.starts_with(&prefix) => return Ok(empty),
-        Some(c) => Bound::Excluded(Bytes::copy_from_slice(&c[prefix.len()..])),
-    };
-
-    // Each row includes the key it was scanned at, which is both the
-    // key its record lives under and the position the cursor
-    // resumes from.
-    let mut page: Vec<(Bytes, JobRecord)> = Vec::with_capacity(limit);
-    let mut more = false;
-    let mut iter = handle
-        .scan_prefix(prefix, (start, Bound::Unbounded))
-        .await?;
-    while let Some(kv) = iter.next().await? {
-        let job = JobRecord::decode(&kv.key, &kv.value)?;
-        if filter_queue && job.queue != queue {
-            continue;
+        // Each row includes the key it was scanned at, which is both the
+        // key its record lives under and the position the cursor
+        // resumes from.
+        let mut page: Vec<(Bytes, JobRecord)> = Vec::with_capacity(limit);
+        let mut more = false;
+        let mut iter = self
+            .handle
+            .scan_prefix(prefix, (start, Bound::Unbounded))
+            .await?;
+        while let Some(kv) = iter.next().await? {
+            let job = JobRecord::decode(&kv.key, &kv.value)?;
+            if filter_queue && job.queue != queue {
+                continue;
+            }
+            if page.len() == limit {
+                more = true;
+                break;
+            }
+            page.push((kv.key, job));
         }
-        if page.len() == limit {
-            more = true;
-            break;
-        }
-        page.push((kv.key, job));
-    }
-    let next_cursor = more.then(|| page[page.len() - 1].0.to_vec());
+        let next_cursor = more.then(|| page[page.len() - 1].0.to_vec());
 
-    let mut jobs = Vec::with_capacity(page.len());
-    for (record_key, mut job) in page {
-        match payloads.materialize(&mut job).await {
-            Ok(()) => jobs.push(job),
-            Err(Error::PayloadMissing { id }) => {
-                // The scan can list a record just before a
-                // record-removing transaction commits, with the object
-                // fetch running just after that commit's payload-object
-                // deletion. Whether the removal is observable decides
-                // the report; see [`ReadHandle::job_removed_since_scan`].
-                if !handle.job_removed_since_scan(&record_key).await? {
-                    return Err(Error::PayloadMissing { id });
+        let mut jobs = Vec::with_capacity(page.len());
+        for (record_key, mut job) in page {
+            match self.payloads.materialize(&mut job).await {
+                Ok(()) => jobs.push(job),
+                Err(Error::PayloadMissing { id }) => {
+                    // The scan can list a record just before a record-removing
+                    // transaction commits, with the object fetch running just
+                    // after that commit's payload-object deletion. The writer
+                    // re-reads the record key and omits the row of a record
+                    // confirmed removed. A reader re-reads the same lagging
+                    // view its scan used and so cannot confirm a removal, so it
+                    // reports the missing payload, which resolves once its view
+                    // advances past the removal.
+                    let removed = match &self.handle {
+                        Handle::Writer(db) => db.get(&record_key).await?.is_none(),
+                        Handle::Reader(_) => false,
+                    };
+                    if !removed {
+                        return Err(Error::PayloadMissing { id });
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(JobPage { jobs, next_cursor })
+    }
+
+    /// Every job of `queue` in `status`, in the order [`QueueView::list_jobs`]
+    /// pages them, as one stream that reads `page_size` jobs at a time. A
+    /// consumer that stops reading does not fetch a further page. The listing
+    /// semantics are those of `list_jobs`.
+    pub fn jobs<'a>(
+        &'a self,
+        queue: &'a str,
+        status: JobStatus,
+        page_size: usize,
+    ) -> impl Stream<Item = Result<JobRecord>> + 'a {
+        pages(move |cursor| async move {
+            let page = self
+                .list_jobs(queue, status, cursor.as_deref(), page_size)
+                .await?;
+            Ok((page.jobs, page.next_cursor))
+        })
+    }
+
+    /// Return a page of dead-letter jobs for the given queue.
+    ///
+    /// `after` is an exclusive cursor. Pass `None` to start from the beginning,
+    /// or the `id` of the last job of the previous page to resume. `limit` caps
+    /// the number of jobs returned.
+    ///
+    /// Jobs are returned in ULID order, which corresponds to the order in
+    /// which they were originally enqueued.
+    pub async fn dead_jobs(
+        &self,
+        queue: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<JobRecord>> {
+        // Dead keys are the queue's dead prefix followed by the job id,
+        // so an id cursor converts to the key cursor of the equivalent
+        // `list_jobs` call.
+        let queue = QueueName::new(queue)?;
+        let cursor = after.map(|id| dead_key(&queue, id));
+        Ok(self
+            .list_jobs(&queue, JobStatus::Dead, cursor.as_deref(), limit)
+            .await?
+            .jobs)
+    }
+
+    /// Look up a job by ID regardless of its current state.
+    ///
+    /// Returns `None` for an ID that was never enqueued or whose records
+    /// are removed. The writer's view reads the index and the record
+    /// from one snapshot, and a reader's view reads them as two plain
+    /// reads of its lagging view.
+    pub async fn get_job(&self, id: &str) -> Result<Option<JobRecord>> {
+        match &self.handle {
+            Handle::Reader(reader) => {
+                let Some(current_key) = reader.get(&job_index_key(id)).await? else {
+                    return Ok(None);
+                };
+                let Some(bytes) = reader.get(&current_key).await? else {
+                    return Ok(None);
+                };
+                let mut job = JobRecord::decode(&current_key, &bytes)?;
+                self.payloads.materialize(&mut job).await?;
+                Ok(Some(job))
+            }
+            Handle::Writer(db) => {
+                let txn = db.begin(IsolationLevel::Snapshot).await?;
+                let found = get_indexed_job(&txn, id).await?;
+                txn.rollback();
+
+                let Some((index_key, _, mut job)) = found else {
+                    return Ok(None);
+                };
+                match self.payloads.materialize(&mut job).await {
+                    Ok(()) => Ok(Some(job)),
+                    Err(Error::PayloadMissing { id }) => {
+                        // The record can be read just before a record-removing
+                        // transaction commits, with the object fetch running
+                        // just after that commit's payload-object deletion.
+                        // Re-check the index so a job removed in that window
+                        // is reported as absent.
+                        if db.get(&index_key).await?.is_none() {
+                            Ok(None)
+                        } else {
+                            Err(Error::PayloadMissing { id })
+                        }
+                    }
+                    Err(e) => Err(e),
                 }
             }
-            Err(e) => return Err(e),
         }
     }
-    Ok(JobPage { jobs, next_cursor })
-}
 
-/// Body of `dead_jobs`: one page of a queue's dead-letter jobs in ULID
-/// order, which is the order they were originally enqueued in.
-pub(crate) async fn dead_jobs<H: ReadHandle>(
-    handle: &H,
-    payloads: &PayloadStore,
-    queue: &str,
-    after: Option<&str>,
-    limit: usize,
-) -> Result<Vec<JobRecord>> {
-    // Dead keys are the queue's dead prefix followed by the job id,
-    // so an id cursor converts to the key cursor of the equivalent
-    // `list_jobs` call.
-    let queue = QueueName::new(queue)?;
-    let cursor = after.map(|id| dead_key(&queue, id));
-    Ok(list_jobs(
-        handle,
-        payloads,
-        &queue,
-        JobStatus::Dead,
-        cursor.as_deref(),
-        limit,
-    )
-    .await?
-    .jobs)
-}
-
-/// Body of `attempt_history`: a job's recorded delivery history, in
-/// write order. A job without a history key has an empty history.
-pub(crate) async fn attempt_history<H: ReadHandle>(
-    handle: &H,
-    id: &str,
-) -> Result<Vec<JobAttempt>> {
-    match handle.get(&attempt_history_key(id)).await? {
-        None => Ok(Vec::new()),
-        Some(bytes) => decode_history(&bytes),
-    }
-}
-
-/// Body of the reader's `get_job`: two plain point reads, the index and
-/// then the record it names. The writer's `Queue::get_job` keeps its own
-/// body, which reads both from one transaction snapshot and re-checks
-/// the index when the payload object is absent.
-pub(crate) async fn get_job<H: ReadHandle>(
-    handle: &H,
-    payloads: &PayloadStore,
-    id: &str,
-) -> Result<Option<JobRecord>> {
-    let Some(current_key) = handle.get(&job_index_key(id)).await? else {
-        return Ok(None);
-    };
-    let Some(bytes) = handle.get(&current_key).await? else {
-        return Ok(None);
-    };
-    let mut job = JobRecord::decode(&current_key, &bytes)?;
-    payloads.materialize(&mut job).await?;
-    Ok(Some(job))
-}
-
-/// Body of `writer_heartbeat`: the stored liveness beat decoded to its
-/// public form, or `None` when no writer has ever written one.
-pub(crate) async fn writer_heartbeat<H: ReadHandle>(handle: &H) -> Result<Option<WriterHeartbeat>> {
-    match handle.get(&heartbeat_key()).await? {
-        Some(bytes) => {
-            let record: HeartbeatRecord = rmp_serde::from_slice(&bytes)?;
-            Ok(Some(record.into_public()))
+    /// Return a job's recorded delivery history, in write order.
+    ///
+    /// Each settlement of a claim appends one [`JobAttempt`]: an ack on a
+    /// queue with
+    /// [`QueueConfig::keep_done_jobs`](crate::QueueConfig::keep_done_jobs) set,
+    /// a [`Queue::nack`](crate::Queue::nack), a
+    /// [`Queue::dead_letter`](crate::Queue::dead_letter) and the reaper's
+    /// handling of an expired lease.
+    /// [`Queue::requeue_dead_job`](crate::Queue::requeue_dead_job) appends an
+    /// [`AttemptOutcome::Requeued`](crate::AttemptOutcome::Requeued) marker and
+    /// keeps the prior entries.
+    ///
+    /// The transaction that removes the job's last record also removes its
+    /// history, so a job for which [`QueueView::get_job`] returns `None`
+    /// has an empty history. An ack on a queue without retention removes
+    /// the history and does not record the completed attempt. A later job
+    /// enqueued with the same id through
+    /// [`EnqueueOptions::id_override`](crate::EnqueueOptions::id_override)
+    /// starts with an empty history.
+    pub async fn attempt_history(&self, id: &str) -> Result<Vec<JobAttempt>> {
+        match self.handle.get(&attempt_history_key(id)).await? {
+            None => Ok(Vec::new()),
+            Some(bytes) => decode_history(&bytes),
         }
-        None => Ok(None),
     }
-}
 
-/// Body of `kv_get`: one point read under the user key tag.
-pub(crate) async fn kv_get<H: ReadHandle>(handle: &H, key: &[u8]) -> Result<Option<Bytes>> {
-    handle.get(&user_scoped_key(key)).await
-}
-
-/// Body of `kv_scan`: one page of the user KV namespace under `prefix`
-/// within `range`, in ascending byte order of the keys.
-pub(crate) async fn kv_scan<H: ReadHandle>(
-    handle: &H,
-    prefix: &[u8],
-    range: impl KvRange,
-    limit: usize,
-) -> Result<KvPage> {
-    let empty = KvPage {
-        entries: Vec::new(),
-        more: false,
-    };
-    let Some(range) = subrange(prefix, range) else {
-        return Ok(empty);
-    };
-    if limit == 0 {
-        return Ok(empty);
-    }
-    let mut entries = Vec::with_capacity(limit);
-    let mut more = false;
-    let mut iter = handle.scan_prefix(user_scoped_key(prefix), range).await?;
-    while let Some(kv) = iter.next().await? {
-        if entries.len() == limit {
-            more = true;
-            break;
+    /// The stored liveness beat in its public form, or `None` when no
+    /// writer has ever written one.
+    pub(crate) async fn writer_heartbeat(&self) -> Result<Option<WriterHeartbeat>> {
+        match self.handle.get(&heartbeat_key()).await? {
+            Some(bytes) => {
+                let record: HeartbeatRecord = rmp_serde::from_slice(&bytes)?;
+                Ok(Some(record.into_public()))
+            }
+            None => Ok(None),
         }
-        // A stored key includes the one-byte user tag, and a caller sees
-        // the caller namespace, so the tag is stripped here.
-        entries.push((kv.key[1..].to_vec(), kv.value));
     }
-    Ok(KvPage { entries, more })
+
+    /// Read a value from the user KV namespace.
+    ///
+    /// Caller-supplied keys are internally scoped under a reserved
+    /// user key tag and cannot collide with Taquba's internal layout.
+    pub async fn kv_get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.handle.get(&user_scoped_key(key)).await
+    }
+
+    /// List entries of the user KV namespace under `prefix` within
+    /// `range`, in ascending byte order of the keys.
+    ///
+    /// An empty `prefix` lists the whole namespace, and `..` lists every
+    /// key within the prefix. The bounds of `range`, a [`KvRange`], are
+    /// keys in the caller namespace: `key..` begins at `key`, and
+    /// `(Bound::Excluded(key), Bound::Unbounded)` begins after it, which
+    /// continues a listing from the last key of a page. The page contains
+    /// the keys within the prefix that the range contains. A bound
+    /// outside the prefix is correct as given, and a range without such
+    /// a key returns an empty page. The listing is not a snapshot, so an
+    /// entry written or deleted between page reads is missed or observed
+    /// depending on the position of its key.
+    ///
+    /// Only caller-namespace entries are returned, and Taquba's internal
+    /// key spaces are never visible here. This is the enumeration and
+    /// export primitive for the namespace: a full sweep (`prefix = b""`,
+    /// `..`, continued while [`KvPage::more`]) observes every entry that
+    /// existed for the whole sweep.
+    pub async fn kv_scan(
+        &self,
+        prefix: &[u8],
+        range: impl KvRange,
+        limit: usize,
+    ) -> Result<KvPage> {
+        let empty = KvPage {
+            entries: Vec::new(),
+            more: false,
+        };
+        let Some(range) = subrange(prefix, range) else {
+            return Ok(empty);
+        };
+        if limit == 0 {
+            return Ok(empty);
+        }
+        let mut entries = Vec::with_capacity(limit);
+        let mut more = false;
+        let mut iter = self
+            .handle
+            .scan_prefix(user_scoped_key(prefix), range)
+            .await?;
+        while let Some(kv) = iter.next().await? {
+            if entries.len() == limit {
+                more = true;
+                break;
+            }
+            // A stored key includes the one-byte user tag, and a caller sees
+            // the caller namespace, so the tag is stripped here.
+            entries.push((kv.key[1..].to_vec(), kv.value));
+        }
+        Ok(KvPage { entries, more })
+    }
+
+    /// Every entry of the user KV namespace under `prefix` within
+    /// `range`, in ascending byte order of the keys, as one stream that
+    /// reads through [`QueueView::kv_scan`] `page_size` entries at a
+    /// time. A consumer that stops reading does not fetch a further
+    /// page. The listing semantics are those of `kv_scan`.
+    pub fn kv_entries<'a>(
+        &'a self,
+        prefix: &'a [u8],
+        range: impl KvRange,
+        page_size: usize,
+    ) -> impl Stream<Item = Result<(Vec<u8>, Bytes)>> + 'a {
+        let start = range.start_bound().map(Vec::from);
+        let end = range.end_bound().map(Vec::from);
+        pages(move |cursor| {
+            let (start, end) = (start.clone(), end.clone());
+            async move {
+                // A page follows the last key of the page before it.
+                let start = match &cursor {
+                    Some(last) => Bound::Excluded(last.as_slice()),
+                    None => start.as_ref().map(Vec::as_slice),
+                };
+                let range = (start, end.as_ref().map(Vec::as_slice));
+                let page = self.kv_scan(prefix, range, page_size).await?;
+                let next = page
+                    .more
+                    .then(|| page.entries[page.entries.len() - 1].0.clone());
+                Ok((page.entries, next))
+            }
+        })
+    }
 }
 
 /// The position of a bound relative to the keys within a prefix.
@@ -389,61 +524,11 @@ where
     .try_flatten()
 }
 
-/// Body of `kv_entries`: every entry under `prefix` within `range`, in
-/// ascending key order, read through [`kv_scan`] `page_size` entries
-/// at a time.
-pub(crate) fn kv_entries<'a, H: ReadHandle>(
-    handle: &'a H,
-    prefix: &'a [u8],
-    range: impl KvRange,
-    page_size: usize,
-) -> impl Stream<Item = Result<(Vec<u8>, Bytes)>> + 'a {
-    let start = range.start_bound().map(Vec::from);
-    let end = range.end_bound().map(Vec::from);
-    pages(move |cursor| {
-        let (start, end) = (start.clone(), end.clone());
-        async move {
-            // A page follows the last key of the page before it.
-            let start = match &cursor {
-                Some(last) => Bound::Excluded(last.as_slice()),
-                None => start.as_ref().map(Vec::as_slice),
-            };
-            let range = (start, end.as_ref().map(Vec::as_slice));
-            let page = kv_scan(handle, prefix, range, page_size).await?;
-            let next = page
-                .more
-                .then(|| page.entries[page.entries.len() - 1].0.clone());
-            Ok((page.entries, next))
-        }
-    })
-}
-
-/// Body of `jobs`: every job of `queue` in `status`, in the order
-/// [`list_jobs`] pages them, read `page_size` jobs at a time.
-pub(crate) fn jobs<'a, H: ReadHandle>(
-    handle: &'a H,
-    payloads: &'a PayloadStore,
-    queue: &'a str,
-    status: JobStatus,
-    page_size: usize,
-) -> impl Stream<Item = Result<JobRecord>> + 'a {
-    pages(move |cursor| async move {
-        let page = list_jobs(
-            handle,
-            payloads,
-            queue,
-            status,
-            cursor.as_deref(),
-            page_size,
-        )
-        .await?;
-        Ok((page.jobs, page.next_cursor))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::queue::ClaimOutcome;
+    use crate::reader::QueueReader;
     use crate::test_util::*;
 
     #[tokio::test]
@@ -455,6 +540,7 @@ mod tests {
         q.kv_put(b"q/0", b"v").await.unwrap();
 
         let keys: Vec<Vec<u8>> = q
+            .view()
             .kv_entries(b"p/", .., 2)
             .map_ok(|(key, _)| key)
             .try_collect()
@@ -464,6 +550,7 @@ mod tests {
         assert_eq!(keys, expected);
 
         let from_third: Vec<Vec<u8>> = q
+            .view()
             .kv_entries(b"p/", b"p/2".., 2)
             .map_ok(|(key, _)| key)
             .try_collect()
@@ -482,6 +569,7 @@ mod tests {
         q.enqueue("beta", b"x".to_vec()).await.unwrap();
 
         let listed: Vec<String> = q
+            .view()
             .jobs("alpha", JobStatus::Pending, 2)
             .map_ok(|job| job.id)
             .try_collect()
@@ -498,7 +586,7 @@ mod tests {
         q.enqueue("beta", b"2".to_vec()).await.unwrap();
         q.enqueue("gamma", b"3".to_vec()).await.unwrap();
 
-        let mut queues = q.list_queues().await.unwrap();
+        let mut queues = q.view().list_queues().await.unwrap();
         queues.sort();
         assert_eq!(queues, vec!["alpha", "beta", "gamma"]);
 
@@ -533,23 +621,37 @@ mod tests {
         }
 
         // First page of 2 returns the first two.
-        let p1 = q.dead_jobs("work", None, 2).await.unwrap();
+        let p1 = q.view().dead_jobs("work", None, 2).await.unwrap();
         assert_eq!(p1.len(), 2);
         assert_eq!(p1[0].id, ids[0]);
         assert_eq!(p1[1].id, ids[1]);
 
         // Resume from the last cursor.
-        let p2 = q.dead_jobs("work", Some(&p1[1].id), 2).await.unwrap();
+        let p2 = q
+            .view()
+            .dead_jobs("work", Some(&p1[1].id), 2)
+            .await
+            .unwrap();
         assert_eq!(p2.len(), 2);
         assert_eq!(p2[0].id, ids[2]);
         assert_eq!(p2[1].id, ids[3]);
 
-        let p3 = q.dead_jobs("work", Some(&p2[1].id), 2).await.unwrap();
+        let p3 = q
+            .view()
+            .dead_jobs("work", Some(&p2[1].id), 2)
+            .await
+            .unwrap();
         assert_eq!(p3.len(), 1);
         assert_eq!(p3[0].id, ids[4]);
 
         // limit=0 returns nothing.
-        assert!(q.dead_jobs("work", None, 0).await.unwrap().is_empty());
+        assert!(
+            q.view()
+                .dead_jobs("work", None, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         q.close().await.unwrap();
     }
@@ -586,6 +688,7 @@ mod tests {
         let mut cursor: Option<Vec<u8>> = None;
         loop {
             let page = q
+                .view()
                 .list_jobs("work", JobStatus::Pending, cursor.as_deref(), 2)
                 .await
                 .unwrap();
@@ -634,6 +737,7 @@ mod tests {
             .unwrap();
 
         let page = q
+            .view()
             .list_jobs("work", JobStatus::Scheduled, None, 10)
             .await
             .unwrap();
@@ -672,6 +776,7 @@ mod tests {
         let ids =
             |page: &JobPage| -> Vec<String> { page.jobs.iter().map(|j| j.id.clone()).collect() };
         let page = q
+            .view()
             .list_jobs("work", JobStatus::Claimed, None, 10)
             .await
             .unwrap();
@@ -680,6 +785,7 @@ mod tests {
         // A renewal leaves the ordering alone.
         let renewed = q.renew_lease(&ca, Duration::from_secs(600)).unwrap();
         let page = q
+            .view()
             .list_jobs("work", JobStatus::Claimed, None, 10)
             .await
             .unwrap();
@@ -720,6 +826,7 @@ mod tests {
         let mut pages = 0;
         loop {
             let page = q
+                .view()
                 .list_jobs("qa", JobStatus::Claimed, cursor.as_deref(), 1)
                 .await
                 .unwrap();
@@ -759,12 +866,14 @@ mod tests {
         q.ack(&job).await.unwrap();
 
         let page = q
+            .view()
             .list_jobs("kept", JobStatus::Done, None, 10)
             .await
             .unwrap();
         let ids: Vec<_> = page.jobs.iter().map(|j| j.id.clone()).collect();
         assert_eq!(ids, vec![kept]);
         let page = q
+            .view()
             .list_jobs("gone", JobStatus::Done, None, 10)
             .await
             .unwrap();
@@ -784,6 +893,7 @@ mod tests {
         }
 
         let via_dead_jobs: Vec<_> = q
+            .view()
             .dead_jobs("work", None, 10)
             .await
             .unwrap()
@@ -792,6 +902,7 @@ mod tests {
             .collect();
         assert_eq!(via_dead_jobs.len(), 3);
         let page = q
+            .view()
             .list_jobs("work", JobStatus::Dead, None, 10)
             .await
             .unwrap();
@@ -809,6 +920,7 @@ mod tests {
         let id = q.enqueue("work", payload.clone()).await.unwrap();
 
         let page = q
+            .view()
             .list_jobs("work", JobStatus::Pending, None, 10)
             .await
             .unwrap();
@@ -826,6 +938,7 @@ mod tests {
         q.enqueue("work", b"y".to_vec()).await.unwrap();
 
         let zero = q
+            .view()
             .list_jobs("work", JobStatus::Pending, None, 0)
             .await
             .unwrap();
@@ -833,17 +946,95 @@ mod tests {
         assert!(zero.next_cursor.is_none());
 
         let first = q
+            .view()
             .list_jobs("work", JobStatus::Pending, None, 1)
             .await
             .unwrap();
         assert_eq!(first.jobs.len(), 1);
         let cursor = first.next_cursor.expect("a second pending entry exists");
         let dead = q
+            .view()
             .list_jobs("work", JobStatus::Dead, Some(&cursor), 10)
             .await
             .unwrap();
         assert!(dead.jobs.is_empty());
         assert!(dead.next_cursor.is_none());
+        q.close().await.unwrap();
+    }
+
+    // One function over a view, called with the writer's view and with
+    // a reader's view of the same store.
+    async fn snapshot(
+        r: &QueueView,
+        id: &str,
+    ) -> (QueueStats, Vec<String>, Vec<String>, Vec<String>) {
+        let stats = r.stats("work").await.unwrap();
+        let queues = r.list_queues().await.unwrap();
+        let page = r
+            .list_jobs("work", JobStatus::Pending, None, 10)
+            .await
+            .unwrap();
+        let streamed: Vec<JobRecord> = r
+            .jobs("work", JobStatus::Pending, 1)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            page.jobs.iter().map(|j| &j.id).collect::<Vec<_>>(),
+            streamed.iter().map(|j| &j.id).collect::<Vec<_>>()
+        );
+        let dead: Vec<String> = r
+            .dead_jobs("work", None, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|j| j.id)
+            .collect();
+        let job = r.get_job(id).await.unwrap().unwrap();
+        assert_eq!(job.id, id);
+        let history = r.attempt_history(&dead[0]).await.unwrap();
+        assert_eq!(history.len(), 1);
+        let value = r.kv_get(b"k/1").await.unwrap().unwrap();
+        assert_eq!(value.as_ref(), b"v");
+        let kv_page = r.kv_scan(b"k/", .., 10).await.unwrap();
+        let entries: Vec<(Vec<u8>, Bytes)> =
+            r.kv_entries(b"k/", .., 1).try_collect().await.unwrap();
+        assert_eq!(kv_page.entries, entries);
+        assert_eq!(entries.len(), 2);
+        (
+            stats,
+            queues,
+            page.jobs.into_iter().map(|j| j.id).collect(),
+            dead,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_view_reads_the_same_state_through_the_writer_and_a_reader() {
+        let store = make_store();
+        let q = Queue::open(store.clone(), "test").await.unwrap();
+        let id = q.enqueue("work", b"p".to_vec()).await.unwrap();
+        q.enqueue("work", b"q".to_vec()).await.unwrap();
+        let doomed = q.enqueue("work", b"d".to_vec()).await.unwrap();
+        let ClaimOutcome::Claimed(job) = q
+            .claim_by_id(&doomed, Duration::from_secs(30))
+            .await
+            .unwrap()
+        else {
+            panic!("the job is pending");
+        };
+        q.dead_letter(&job, "failed").await.unwrap();
+        q.kv_put(b"k/1", b"v").await.unwrap();
+        q.kv_put(b"k/2", b"w").await.unwrap();
+
+        let reader = QueueReader::open(store, "test").await.unwrap();
+        let through_writer = snapshot(q.view(), &id).await;
+        let through_reader = snapshot(reader.view(), &id).await;
+        assert_eq!(through_writer, through_reader);
+        assert_eq!(through_writer.0.pending, 2);
+        assert_eq!(through_writer.3, vec![doomed]);
+
+        reader.close().await.unwrap();
         q.close().await.unwrap();
     }
 }

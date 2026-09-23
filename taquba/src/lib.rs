@@ -194,7 +194,7 @@
 //! to a caller-owned KV namespace in a single transaction, so a downstream
 //! crate can keep its own durable coordination state (status markers,
 //! dedup records, pointers to externally-stored blobs) consistent with
-//! the queue across crashes. [`Queue::kv_get`] and [`Queue::kv_delete`]
+//! the queue across crashes. [`QueueView::kv_get`] and [`Queue::kv_delete`]
 //! read and clean up those entries.
 //!
 //! Caller keys live under a reserved user key tag internally so they
@@ -219,9 +219,9 @@
 //! is never deleted by mistake, and [`Queue::kv_compare_put`] writes
 //! only if the key still holds an expected value (or is still absent),
 //! the read-modify-write primitive that makes concurrent updates of
-//! one entry lose no writes. [`Queue::kv_scan`] lists the entries with
+//! one entry lose no writes. [`QueueView::kv_scan`] lists the entries with
 //! a key prefix within a key range, in pages, for enumerating live state
-//! and for exporting the namespace, and [`Queue::kv_entries`] reads the
+//! and for exporting the namespace, and [`QueueView::kv_entries`] reads the
 //! same listing as one stream.
 //! [`Queue::commit_effects`] applies a [`SettlementEffects`] (enqueues,
 //! KV writes and deletes) as one transaction without a job transition,
@@ -275,25 +275,24 @@
 //!
 //! # Inspecting and operating a queue
 //!
-//! The queue exposes its state for operational triage: [`Queue::list_queues`]
-//! names every queue that has ever held a job, [`Queue::stats`] returns
-//! per-state job counts for one queue, [`Queue::get_job`] looks up a single
-//! job by ID in any state, [`Queue::list_jobs`] pages through one queue's
-//! jobs in one lifecycle state ([`Queue::jobs`] reads the same listing
-//! as one stream) and [`Queue::dead_jobs`] pages through the dead-letter
-//! set. [`Queue::attempt_history`] returns a job's recorded
-//! delivery history: one [`JobAttempt`] per settled attempt (retry,
-//! dead-letter, lease expiry, interruption at open, operator requeue,
-//! completion on a queue with retention), so a job that failed three
-//! different ways reports all three errors rather than only the last.
-//! Interventions cover the common operator actions:
+//! The queue exposes its state for operational triage through [`Queue::view`],
+//! a [`QueueView`]: [`QueueView::list_queues`] returns every queue that has
+//! ever held a job, [`QueueView::stats`] returns per-state job counts for one
+//! queue, [`QueueView::get_job`] looks up a single job by ID in any state,
+//! [`QueueView::list_jobs`] pages through one queue's jobs in one lifecycle
+//! state ([`QueueView::jobs`] reads the same listing as one stream) and
+//! [`QueueView::dead_jobs`] pages through the dead-letter set.
+//! [`QueueView::attempt_history`] returns a job's recorded delivery history:
+//! one [`JobAttempt`] per settled attempt (retry, dead-letter, lease expiry,
+//! interruption at open, operator requeue, completion on a queue with
+//! retention), so a job that failed three different ways reports all three
+//! errors. Interventions cover the common operator actions:
 //! [`Queue::requeue_dead_job`] revives a dead job for delivery up to its
-//! `max_attempts` again,
-//! [`Queue::cancel`] removes a pending or scheduled job (or requests
-//! cooperative cancellation of a claimed one), [`Queue::wake_scheduled`]
-//! promotes a scheduled job before its `run_at` and [`Queue::claim_by_id`]
-//! claims one pending or scheduled job without the scan, for a producer
-//! that performs the job it created.
+//! `max_attempts` again, [`Queue::cancel`] removes a pending or scheduled job
+//! (or requests cooperative cancellation of a claimed one),
+//! [`Queue::wake_scheduled`] promotes a scheduled job before its `run_at` and
+//! [`Queue::claim_by_id`] claims one pending or scheduled job without the scan,
+//! for a producer that performs the job it created.
 //!
 //! Because a store is single-writer, an admin surface that mutates state
 //! must live inside the process that owns the queue.
@@ -303,14 +302,14 @@
 //!
 //! # Observing from another process
 //!
-//! The single-writer rule constrains only writes. [`QueueReader`]
-//! opens the same store path from any process with bucket credentials
-//! and serves the queue's read-only API: [`QueueReader::stats`],
-//! [`QueueReader::list_queues`], [`QueueReader::list_jobs`],
-//! [`QueueReader::dead_jobs`], [`QueueReader::get_job`],
-//! [`QueueReader::attempt_history`] and the KV reads. Dashboards, CLIs
-//! and health checks observe a live queue without an admin endpoint
-//! inside the worker process.
+//! The single-writer rule constrains only writes. [`QueueReader`] opens the
+//! same store path from any process with bucket credentials and
+//! [`QueueReader::view`] returns a [`QueueView`] with the reads of
+//! [`Queue::view`]: [`QueueView::stats`], [`QueueView::list_queues`],
+//! [`QueueView::list_jobs`], [`QueueView::dead_jobs`], [`QueueView::get_job`],
+//! [`QueueView::attempt_history`] and the KV reads. Dashboards, CLIs and health
+//! checks observe a live queue without an admin endpoint inside the worker
+//! process.
 //!
 //! A reader is observation only: it takes no writes, offers no lease
 //! view and reads a lagging view of the store. The lag
@@ -356,7 +355,7 @@
 //! the KV namespace: [`Queue::ack_with`] writes outcome entries
 //! atomically with the settlement (and [`Queue::enqueue_with_kv`] maps
 //! caller identifiers to job ids at submit), and the reader's
-//! [`QueueReader::kv_get`] / [`QueueReader::kv_scan`] serve them from
+//! [`QueueView::kv_get`] / [`QueueView::kv_scan`] read them from
 //! any process.
 //!
 //! # Background tasks
@@ -462,6 +461,7 @@ pub use queue::{
     CancelOutcome, ClaimOutcome, EnqueueResult, JobPage, NackOutcome, Queue, WaitOutcome,
     WakeOutcome,
 };
+pub use read::QueueView;
 pub use reader::{QueueReader, ReaderMode, ReaderOptions};
 pub use stats::QueueStats;
 pub use worker::{

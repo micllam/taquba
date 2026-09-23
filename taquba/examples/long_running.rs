@@ -98,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Both jobs outlived the lease and still settled on their first
     // attempt: nothing was reaped back to pending or dead-lettered.
-    let s = q.stats("work").await?;
+    let s = q.view().stats("work").await?;
     println!();
     println!(
         "done:{} pending:{} claimed:{} dead:{}",

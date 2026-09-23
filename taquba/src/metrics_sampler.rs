@@ -15,14 +15,16 @@ use crate::error::Result;
 use crate::job::JobRecord;
 use crate::keys::{QueueName, pending_prefix};
 use crate::queue_core::QueueCore;
-use crate::read::{list_queues, stats};
+use crate::read::{Handle, QueueView};
 pub(crate) struct MetricsSampler {
     core: Arc<QueueCore>,
+    view: QueueView,
 }
 
 impl MetricsSampler {
     pub(crate) fn new(core: Arc<QueueCore>) -> Self {
-        Self { core }
+        let view = QueueView::new(Handle::Writer(core.db.clone()), core.payload_store.clone());
+        Self { core, view }
     }
 }
 
@@ -30,18 +32,18 @@ impl Periodic for MetricsSampler {
     const NAME: &'static str = "metrics sampler";
 
     async fn step(&self) -> Result<()> {
-        sample(&self.core).await
+        sample(&self.core, &self.view).await
     }
 }
 
 /// Read each queue's depth and oldest-pending age once and set the gauges.
-async fn sample(core: &QueueCore) -> Result<()> {
+async fn sample(core: &QueueCore, view: &QueueView) -> Result<()> {
     let db = core.db.as_ref();
     let now = core.now_ms();
-    for queue in list_queues(db).await? {
+    for queue in view.list_queues().await? {
         // A name parsed from a stored key is within the bound.
         let queue = QueueName::new(queue)?;
-        let stats = stats(db, &queue).await?;
+        let stats = view.stats(&queue).await?;
         crate::obs::set_depth(&queue, stats.pending, stats.claimed);
 
         // The front of the pending prefix is the next job to be claimed; its

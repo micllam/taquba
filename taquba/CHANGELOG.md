@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys begins and ends at a bound. `KvPage::next_cursor` becomes
   `KvPage::more`: pass `..` for the whole prefix, and continue a page
   from `Bound::Excluded` of its last key.
+- The read-only queries of `Queue` and `QueueReader` (`stats`,
+  `list_queues`, `list_jobs`, `jobs`, `dead_jobs`, `get_job`,
+  `attempt_history`, `kv_get`, `kv_scan` and `kv_entries`) are the
+  methods of `QueueView`, returned by `Queue::view` and
+  `QueueReader::view`, so one function reads through the writer or
+  through a reader in another process. Call the reads on `view()`.
 
 ## [0.13.0] - 2026-09-16
 

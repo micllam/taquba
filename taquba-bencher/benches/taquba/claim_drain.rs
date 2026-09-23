@@ -131,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tick.tick().await; // skip immediate first tick
             loop {
                 tick.tick().await;
-                let stats = match queue.stats(QUEUE_NAME).await {
+                let stats = match queue.view().stats(QUEUE_NAME).await {
                     Ok(s) => s,
                     Err(_) => continue,
                 };

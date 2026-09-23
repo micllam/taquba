@@ -387,7 +387,7 @@ mod tests {
                     .is_none()
             );
         }
-        let stats = q.stats("work").await.unwrap();
+        let stats = q.view().stats("work").await.unwrap();
         assert_eq!(stats.claimed, 0);
         assert_eq!(stats.pending, 1);
         assert_eq!(stats.dead, 1);
@@ -416,7 +416,7 @@ mod tests {
         clock.advance(Duration::from_millis(2));
         q.reap_now().await.unwrap();
 
-        let stats = q.stats("work").await.unwrap();
+        let stats = q.view().stats("work").await.unwrap();
         assert_eq!(stats.pending, 1);
         assert_eq!(stats.claimed, 0);
 
@@ -435,7 +435,7 @@ mod tests {
             Err(Error::ClaimLost)
         ));
 
-        let stats = q.stats("work").await.unwrap();
+        let stats = q.view().stats("work").await.unwrap();
         assert_eq!(stats.pending, 1);
         assert_eq!(stats.claimed, 0);
         assert_eq!(stats.done, 0);
@@ -450,7 +450,7 @@ mod tests {
         assert_eq!(fresh.attempts, 2);
         q.ack(&fresh).await.unwrap();
 
-        let stats = q.stats("work").await.unwrap();
+        let stats = q.view().stats("work").await.unwrap();
         assert_eq!(stats.pending, 0);
         assert_eq!(stats.claimed, 0);
         assert_eq!(stats.done, 1);
@@ -490,9 +490,9 @@ mod tests {
         clock.advance(Duration::from_millis(2));
         q.reap_now().await.unwrap();
 
-        let dead = q.get_job(&id).await.unwrap().unwrap();
+        let dead = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(dead.status, JobStatus::Dead);
-        let stats = q.stats("work").await.unwrap();
+        let stats = q.view().stats("work").await.unwrap();
         assert_eq!(stats.pending, 0);
         assert_eq!(stats.claimed, 0);
         assert_eq!(stats.dead, 1);
@@ -508,14 +508,14 @@ mod tests {
                 .await,
             Err(Error::ClaimLost)
         ));
-        assert!(q.kv_get(b"k").await.unwrap().is_none());
+        assert!(q.view().kv_get(b"k").await.unwrap().is_none());
 
         assert!(matches!(
             q.renew_lease(&stale, Duration::from_secs(30)),
             Err(Error::ClaimLost)
         ));
 
-        let stats = q.stats("work").await.unwrap();
+        let stats = q.view().stats("work").await.unwrap();
         assert_eq!(stats.pending, 0);
         assert_eq!(stats.claimed, 0);
         assert_eq!(stats.done, 0);
@@ -555,7 +555,7 @@ mod tests {
 
         q.ack(&job).await.unwrap();
 
-        let stats = q.stats("work").await.unwrap();
+        let stats = q.view().stats("work").await.unwrap();
         assert_eq!(stats.pending, 0);
         assert_eq!(stats.claimed, 0);
         assert_eq!(stats.done, 1);
@@ -597,7 +597,12 @@ mod tests {
         assert_eq!(q.cancel(&job1.id).await.unwrap(), CancelOutcome::Requested,);
         assert!(first_token.is_cancelled());
         assert!(
-            q.get_job(&job1.id).await.unwrap().unwrap().cancel_requested,
+            q.view()
+                .get_job(&job1.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .cancel_requested,
             "cancel_requested must persist on the claimed record",
         );
 
@@ -701,12 +706,12 @@ mod tests {
 
         // The "transient" queue has no retention: ack dropped the record.
         assert!(
-            q.get_job(&transient_id).await.unwrap().is_none(),
+            q.view().get_job(&transient_id).await.unwrap().is_none(),
             "queues without keep_done_jobs must drop on ack"
         );
         // The "kept" queue has retention: ack preserved the record.
         assert!(
-            q.get_job(&kept_id).await.unwrap().is_some(),
+            q.view().get_job(&kept_id).await.unwrap().is_some(),
             "queues with keep_done_jobs must retain on ack"
         );
 
@@ -714,7 +719,7 @@ mod tests {
         // the kept record must survive.
         tokio::time::sleep(reaper_interval * 2).await;
         assert!(
-            q.get_job(&kept_id).await.unwrap().is_some(),
+            q.view().get_job(&kept_id).await.unwrap().is_some(),
             "reaper sweep before retention elapses must not purge"
         );
 
@@ -723,7 +728,7 @@ mod tests {
         clock.advance(kept_retention + Duration::from_millis(10));
         tokio::time::sleep(reaper_interval * 2).await;
         assert!(
-            q.get_job(&kept_id).await.unwrap().is_none(),
+            q.view().get_job(&kept_id).await.unwrap().is_none(),
             "reaper sweep after retention elapses must purge"
         );
 
@@ -778,19 +783,41 @@ mod tests {
             q.nack(&job, "fatal").await.unwrap();
         }
 
-        assert_eq!(q.dead_jobs("ephemeral", None, 100).await.unwrap().len(), 1);
-        assert_eq!(q.dead_jobs("durable", None, 100).await.unwrap().len(), 1);
+        assert_eq!(
+            q.view()
+                .dead_jobs("ephemeral", None, 100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            q.view()
+                .dead_jobs("durable", None, 100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         clock.advance(ephemeral_retention + Duration::from_millis(10));
         tokio::time::sleep(reaper_interval * 2).await;
 
         assert_eq!(
-            q.dead_jobs("ephemeral", None, 100).await.unwrap().len(),
+            q.view()
+                .dead_jobs("ephemeral", None, 100)
+                .await
+                .unwrap()
+                .len(),
             0,
             "short-retention queue must be purged"
         );
         assert_eq!(
-            q.dead_jobs("durable", None, 100).await.unwrap().len(),
+            q.view()
+                .dead_jobs("durable", None, 100)
+                .await
+                .unwrap()
+                .len(),
             1,
             "long-retention queue must be untouched by the same sweep"
         );
@@ -858,7 +885,7 @@ mod tests {
         // relative to the retention window, so the record survives even
         // though `enqueued_at` is now far older than the retention.
         tokio::time::sleep(reaper_interval * 2).await;
-        let kept = q.get_job(&id).await.unwrap().expect(
+        let kept = q.view().get_job(&id).await.unwrap().expect(
             "fresh completion must survive the sweep regardless of how long ago the job was enqueued",
         );
         assert!(
@@ -870,7 +897,7 @@ mod tests {
         // the record.
         clock.advance(retention + Duration::from_millis(10));
         tokio::time::sleep(reaper_interval * 2).await;
-        assert!(q.get_job(&id).await.unwrap().is_none());
+        assert!(q.view().get_job(&id).await.unwrap().is_none());
 
         q.close().await.unwrap();
     }
@@ -916,28 +943,37 @@ mod tests {
         let id = job.id.clone();
         q.nack(&job, "fatal").await.unwrap();
 
-        let dead = q.dead_jobs("work", None, 100).await.unwrap();
+        let dead = q.view().dead_jobs("work", None, 100).await.unwrap();
         assert_eq!(dead.len(), 1);
         assert!(dead[0].failed_at.is_some(), "failed_at must be stamped");
-        assert_eq!(q.stats("work").await.unwrap().dead, 1);
+        assert_eq!(q.view().stats("work").await.unwrap().dead, 1);
 
         // Fire a reaper tick before the retention cutoff has elapsed:
         // the dead record must survive.
         tokio::time::sleep(reaper_interval * 2).await;
-        assert_eq!(q.dead_jobs("work", None, 100).await.unwrap().len(), 1);
+        assert_eq!(
+            q.view().dead_jobs("work", None, 100).await.unwrap().len(),
+            1
+        );
 
         // Advance the test clock past the cutoff. The next reaper tick
         // purges the record; the counter and index pointer must also be
         // cleaned up.
         clock.advance(retention + Duration::from_millis(10));
         tokio::time::sleep(reaper_interval * 2).await;
-        assert!(q.dead_jobs("work", None, 100).await.unwrap().is_empty());
+        assert!(
+            q.view()
+                .dead_jobs("work", None, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
-            q.stats("work").await.unwrap().dead,
+            q.view().stats("work").await.unwrap().dead,
             0,
             "dead counter must reflect the sweep"
         );
-        assert!(q.get_job(&id).await.unwrap().is_none());
+        assert!(q.view().get_job(&id).await.unwrap().is_none());
 
         q.close().await.unwrap();
     }
@@ -980,15 +1016,27 @@ mod tests {
             .unwrap();
         q.nack(&job, "fatal").await.unwrap();
 
-        let dead = q.dead_jobs("work", None, 100).await.unwrap().pop().unwrap();
+        let dead = q
+            .view()
+            .dead_jobs("work", None, 100)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
         clock.advance(retention + Duration::from_millis(10));
         tokio::time::sleep(reaper_interval * 2).await;
 
-        assert!(q.dead_jobs("work", None, 100).await.unwrap().is_empty());
+        assert!(
+            q.view()
+                .dead_jobs("work", None, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let err = q.requeue_dead_job(&dead.id).await.unwrap_err();
         assert!(matches!(err, Error::JobNotFound(_)));
-        assert_eq!(q.stats("work").await.unwrap().pending, 0);
-        assert_eq!(q.stats("work").await.unwrap().dead, 0);
+        assert_eq!(q.view().stats("work").await.unwrap().pending, 0);
+        assert_eq!(q.view().stats("work").await.unwrap().dead, 0);
 
         q.close().await.unwrap();
     }
@@ -1025,13 +1073,13 @@ mod tests {
         // The done record is kept, so the payload object stays and the
         // record read materializes it.
         assert_eq!(object_count(&store, "test-payloads").await, 1);
-        let done = q.get_job(&id).await.unwrap().unwrap();
+        let done = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(done.payload, payload);
 
         clock.advance(retention + Duration::from_millis(10));
         tokio::time::sleep(reaper_interval * 2).await;
 
-        assert!(q.get_job(&id).await.unwrap().is_none());
+        assert!(q.view().get_job(&id).await.unwrap().is_none());
         assert_eq!(
             object_count(&store, "test-payloads").await,
             0,
@@ -1072,7 +1120,13 @@ mod tests {
         clock.advance(retention + Duration::from_millis(10));
         tokio::time::sleep(reaper_interval * 2).await;
 
-        assert!(q.dead_jobs("work", None, 10).await.unwrap().is_empty());
+        assert!(
+            q.view()
+                .dead_jobs("work", None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(object_count(&store, "test-payloads").await, 0);
         q.close().await.unwrap();
     }
@@ -1105,7 +1159,7 @@ mod tests {
         clock.advance(Duration::from_millis(20));
         q.reap_now().await.unwrap();
 
-        let dead = q.dead_jobs("work", None, 10).await.unwrap();
+        let dead = q.view().dead_jobs("work", None, 10).await.unwrap();
         assert_eq!(dead.len(), 1);
         assert_eq!(dead[0].id, id);
         assert_eq!(dead[0].payload, payload);
@@ -1142,13 +1196,13 @@ mod tests {
             .unwrap()
             .unwrap();
         q.dead_letter(&job, "failed").await.unwrap();
-        assert_eq!(q.attempt_history(&id).await.unwrap().len(), 1);
+        assert_eq!(q.view().attempt_history(&id).await.unwrap().len(), 1);
 
         clock.advance(retention + Duration::from_millis(10));
         tokio::time::sleep(reaper_interval * 2).await;
 
-        assert!(q.get_job(&id).await.unwrap().is_none());
-        assert!(q.attempt_history(&id).await.unwrap().is_empty());
+        assert!(q.view().get_job(&id).await.unwrap().is_none());
+        assert!(q.view().attempt_history(&id).await.unwrap().is_empty());
         q.close().await.unwrap();
     }
 
@@ -1177,13 +1231,13 @@ mod tests {
             .unwrap()
             .unwrap();
         q.ack(&job).await.unwrap();
-        assert_eq!(q.attempt_history(&id).await.unwrap().len(), 1);
+        assert_eq!(q.view().attempt_history(&id).await.unwrap().len(), 1);
 
         clock.advance(retention + Duration::from_millis(10));
         tokio::time::sleep(reaper_interval * 2).await;
 
-        assert!(q.get_job(&id).await.unwrap().is_none());
-        assert!(q.attempt_history(&id).await.unwrap().is_empty());
+        assert!(q.view().get_job(&id).await.unwrap().is_none());
+        assert!(q.view().attempt_history(&id).await.unwrap().is_empty());
         q.close().await.unwrap();
     }
 
@@ -1212,7 +1266,7 @@ mod tests {
         clock.advance(lease + Duration::from_secs(1));
         q.reap_now().await.unwrap();
 
-        let history = q.attempt_history(&id).await.unwrap();
+        let history = q.view().attempt_history(&id).await.unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].outcome, AttemptOutcome::LeaseExpired);
         assert_eq!(history[0].attempt, 1);
@@ -1253,7 +1307,7 @@ mod tests {
         q.reap_now().await.unwrap();
 
         assert_eq!(
-            q.get_job(&healthy).await.unwrap().unwrap().status,
+            q.view().get_job(&healthy).await.unwrap().unwrap().status,
             JobStatus::Pending
         );
         // The poisoned job's entry is kept for a later tick; the
@@ -1289,12 +1343,12 @@ mod tests {
         let q = Queue::open_with_options(store, "test", opts())
             .await
             .unwrap();
-        let job = q.get_job(&id).await.unwrap().unwrap();
+        let job = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Pending);
-        let stats = q.stats("work").await.unwrap();
+        let stats = q.view().stats("work").await.unwrap();
         assert_eq!(stats.pending, 1);
         assert_eq!(stats.claimed, 0);
-        let history = q.attempt_history(&id).await.unwrap();
+        let history = q.view().attempt_history(&id).await.unwrap();
         assert_eq!(history.last().unwrap().outcome, AttemptOutcome::Interrupted);
 
         // The requeued job is claimable at once: its pending insert is
@@ -1343,9 +1397,9 @@ mod tests {
         let q = Queue::open_with_options(store, "test", opts())
             .await
             .unwrap();
-        let job = q.get_job(&id).await.unwrap().unwrap();
+        let job = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Dead);
-        let stats = q.stats("work").await.unwrap();
+        let stats = q.view().stats("work").await.unwrap();
         assert_eq!(stats.dead, 1);
         assert_eq!(stats.claimed, 0);
         q.close().await.unwrap();

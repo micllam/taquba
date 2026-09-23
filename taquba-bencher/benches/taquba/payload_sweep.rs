@@ -207,7 +207,7 @@ async fn run_one(
             tick.tick().await; // skip immediate first tick
             loop {
                 tick.tick().await;
-                let s = match queue.stats(QUEUE).await {
+                let s = match queue.view().stats(QUEUE).await {
                     Ok(s) => s,
                     Err(_) => continue,
                 };

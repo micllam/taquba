@@ -298,7 +298,7 @@ mod tests {
         let id = enqueue_webhook(&q, "webhooks", request, b"body".to_vec())
             .await
             .unwrap();
-        let job = q.get_job(&id).await.unwrap().expect("job exists");
+        let job = q.view().get_job(&id).await.unwrap().expect("job exists");
 
         assert_eq!(job.payload, b"body");
         assert_eq!(
@@ -324,7 +324,7 @@ mod tests {
         let id = enqueue_webhook(&q, "webhooks", request, b"".to_vec())
             .await
             .unwrap();
-        let job = q.get_job(&id).await.unwrap().unwrap();
+        let job = q.view().get_job(&id).await.unwrap().unwrap();
 
         assert_eq!(job.headers.get(HEADER_METHOD).unwrap(), "POST");
         assert!(!job.headers.contains_key(HEADER_TIMEOUT_MS));
