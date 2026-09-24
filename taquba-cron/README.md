@@ -186,9 +186,11 @@ Expressions are 5-field POSIX cron, parsed by [`croner`](https://crates.io/crate
 ```
 
 A step follows a range or `*`, as in `5-59/5 * * * *`, and the form
-`5/5 * * * *` is rejected. An expression with a seconds field or a year
-field is rejected. An `Expression` is parsed from a string, and the parse
-fails with `Error::InvalidExpression`.
+`5/5 * * * *` is rejected. An expression with a seconds field or a year field is
+rejected. An `Expression` is parsed from a string, and the parse fails with
+`Error::InvalidExpression`. `Expression::next_after` and
+`Expression::previous_before` return the occurrence after and before a time in
+milliseconds since the Unix epoch.
 
 All firing times are evaluated in UTC, against the clock the queue was
 opened with (`Queue::clock`).

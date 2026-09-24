@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Expression::next_after` and `Expression::previous_before`: the scheduler's
+  occurrence search in milliseconds since the Unix epoch, so a caller checks the
+  interval of an expression without a cron parser.
+
 ## [0.10.0] - 2026-09-17
 
 ### Added

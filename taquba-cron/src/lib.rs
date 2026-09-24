@@ -158,8 +158,10 @@
 //!
 //! A step follows a range or `*`, as in `5-59/5 * * * *`, and the form
 //! `5/5 * * * *` is rejected. An expression with a seconds field or a year
-//! field is rejected. An [`Expression`] is parsed from a string, and the
-//! parse fails with [`Error::InvalidExpression`].
+//! field is rejected. An [`Expression`] is parsed from a string, and the parse
+//! fails with [`Error::InvalidExpression`]. [`Expression::next_after`] and
+//! [`Expression::previous_before`] return the occurrence after and before a
+//! time in milliseconds since the Unix epoch.
 //!
 //! All firing times are evaluated in UTC, against the clock the queue was
 //! opened with ([`taquba::Queue::clock`]).
@@ -190,7 +192,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Timelike, Utc};
 use croner::Cron;
 use croner::parser::{CronParser, Seconds};
 use taquba::{EnqueueOptions, EnqueueResult, Queue, WorkerHandle};
@@ -274,16 +276,40 @@ impl std::fmt::Display for Expression {
 }
 
 impl Expression {
-    /// The first occurrence after `anchor`, or `None` for an expression
-    /// without one.
-    fn next_after(&self, anchor: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    /// The first occurrence after `ms`, in milliseconds since the Unix epoch,
+    /// or `None` when the expression does not have an occurrence before the
+    /// year 5000.
+    pub fn next_after(&self, ms: u64) -> Option<u64> {
+        let at = DateTime::from_timestamp_millis(i64::try_from(ms).ok()?)?;
+        u64::try_from(self.next_time_after(at)?.timestamp_millis()).ok()
+    }
+
+    /// The last occurrence before `ms`, in milliseconds since the Unix epoch,
+    /// or `None` when the expression does not have an occurrence at or after
+    /// the epoch.
+    pub fn previous_before(&self, ms: u64) -> Option<u64> {
+        let at = DateTime::from_timestamp_millis(i64::try_from(ms).ok()?)?;
+        u64::try_from(self.previous_time_before(at)?.timestamp_millis()).ok()
+    }
+
+    /// The first occurrence after `anchor`, or `None` for an expression without
+    /// a later occurrence.
+    fn next_time_after(&self, anchor: DateTime<Utc>) -> Option<DateTime<Utc>> {
         self.0.find_next_occurrence(&anchor, false).ok()
     }
 
-    /// The last occurrence before `at`, or `None` for an expression
-    /// without one.
-    fn previous_before(&self, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        self.0.find_previous_occurrence(&at, false).ok()
+    /// The last occurrence before `at`, or `None` for an expression without an
+    /// earlier occurrence.
+    fn previous_time_before(&self, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        // croner compares whole seconds, so the search for a fractional `at`
+        // starts at the following second.
+        let start = if at.timestamp_subsec_nanos() == 0 {
+            at
+        } else {
+            at.with_nanosecond(0)?
+                .checked_add_signed(TimeDelta::seconds(1))?
+        };
+        self.0.find_previous_occurrence(&start, false).ok()
     }
 }
 
@@ -776,7 +802,7 @@ impl CronScheduler {
                     return Some(now + ENQUEUE_RETRY_DELAY);
                 }
             };
-            self.active[i].next_fire = entry.expression.next_after(anchor);
+            self.active[i].next_fire = entry.expression.next_time_after(anchor);
         }
 
         if let Some(fire_at) = self.active[i].next_fire
@@ -789,14 +815,14 @@ impl CronScheduler {
                     } else {
                         now
                     };
-                    self.active[i].next_fire = entry.expression.next_after(anchor);
+                    self.active[i].next_fire = entry.expression.next_time_after(anchor);
                 }
                 Err(e) => {
                     error!(name = %entry.name, error = %e, "failed to enqueue cron job");
                     if entry.backfill.is_some() {
                         return Some(now + ENQUEUE_RETRY_DELAY);
                     }
-                    self.active[i].next_fire = entry.expression.next_after(now);
+                    self.active[i].next_fire = entry.expression.next_time_after(now);
                 }
             }
         }
@@ -852,7 +878,7 @@ impl CronScheduler {
         let fire_ms = fire_at.timestamp_millis();
         let mut headers = entry.headers.clone();
         headers.insert(FIRE_MS_HEADER.to_string(), fire_ms.to_string());
-        if let Some(previous) = entry.expression.previous_before(fire_at) {
+        if let Some(previous) = entry.expression.previous_time_before(fire_at) {
             headers.insert(
                 PREVIOUS_FIRE_MS_HEADER.to_string(),
                 previous.timestamp_millis().to_string(),
@@ -1019,6 +1045,26 @@ mod tests {
         // another form is unequal.
         let every_five: Expression = "*/5 * * * *".parse().unwrap();
         assert_ne!(every_five, "0-59/5 * * * *".parse().unwrap());
+    }
+
+    #[test]
+    fn an_expression_searches_occurrences_strictly_after_and_before_a_time() {
+        let hourly: Expression = "0 * * * *".parse().unwrap();
+        let hour = 60 * 60_000;
+        let at = 10 * hour;
+
+        assert_eq!(hourly.next_after(at), Some(at + hour));
+        assert_eq!(hourly.next_after(at - 1), Some(at));
+        assert_eq!(hourly.previous_before(at), Some(at - hour));
+        assert_eq!(hourly.previous_before(at + 1), Some(at));
+        // An occurrence within the second before a fractional time is found.
+        assert_eq!(hourly.previous_before(at + 999), Some(at));
+
+        // The epoch bounds the search from below, and the year 5000 from above.
+        assert_eq!(hourly.previous_before(0), None);
+        assert_eq!(hourly.next_after(u64::MAX), None);
+        let year_5000_ms = 95_617_584_000_000;
+        assert_eq!(hourly.next_after(year_5000_ms), None);
     }
 
     #[tokio::test]
