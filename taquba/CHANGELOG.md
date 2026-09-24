@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or the absence of one user KV key, so a record and the state written
   with it commit against the value a caller read. A failed compare does
   not apply the effects and returns `None`.
+- `QueueView::job_record`: one job by id in the stored form of
+  `list_jobs`, so a read of its state does not fetch an offloaded
+  payload object.
 
 ### Changed
 

@@ -257,42 +257,51 @@ impl QueueView {
     /// from one snapshot, and a reader's view reads them as two plain
     /// reads of its lagging view.
     pub async fn get_job(&self, id: &str) -> Result<Option<JobRecord>> {
+        let Some((index_key, mut job)) = self.indexed_job(id).await? else {
+            return Ok(None);
+        };
+        match self.payloads.materialize(&mut job).await {
+            Ok(()) => Ok(Some(job)),
+            Err(Error::PayloadMissing { id }) if matches!(self.handle, Handle::Writer(_)) => {
+                // A record read before a record-removing transaction commits
+                // can have its object fetched after that commit deletes the
+                // object. The index is re-checked so a job removed in that
+                // window is reported as absent.
+                if self.handle.get(&index_key).await?.is_none() {
+                    Ok(None)
+                } else {
+                    Err(Error::PayloadMissing { id })
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Look up a job by ID as [`QueueView::get_job`] does, in the stored form
+    /// of [`QueueView::list_jobs`]: an offloaded payload is not fetched, and
+    /// the record has an empty payload with [`JobRecord::payload_ref`] set.
+    pub async fn job_record(&self, id: &str) -> Result<Option<JobRecord>> {
+        Ok(self.indexed_job(id).await?.map(|(_, job)| job))
+    }
+
+    /// The stored record of `id` with its index key.
+    async fn indexed_job(&self, id: &str) -> Result<Option<(Vec<u8>, JobRecord)>> {
         match &self.handle {
             Handle::Reader(reader) => {
-                let Some(current_key) = reader.get(&job_index_key(id)).await? else {
+                let index_key = job_index_key(id);
+                let Some(current_key) = reader.get(&index_key).await? else {
                     return Ok(None);
                 };
                 let Some(bytes) = reader.get(&current_key).await? else {
                     return Ok(None);
                 };
-                let mut job = JobRecord::decode(&current_key, &bytes)?;
-                self.payloads.materialize(&mut job).await?;
-                Ok(Some(job))
+                Ok(Some((index_key, JobRecord::decode(&current_key, &bytes)?)))
             }
             Handle::Writer(db) => {
                 let txn = db.begin(IsolationLevel::Snapshot).await?;
                 let found = get_indexed_job(&txn, id).await?;
                 txn.rollback();
-
-                let Some((index_key, _, mut job)) = found else {
-                    return Ok(None);
-                };
-                match self.payloads.materialize(&mut job).await {
-                    Ok(()) => Ok(Some(job)),
-                    Err(Error::PayloadMissing { id }) => {
-                        // The record can be read just before a record-removing
-                        // transaction commits, with the object fetch running
-                        // just after that commit's payload-object deletion.
-                        // Re-check the index so a job removed in that window
-                        // is reported as absent.
-                        if db.get(&index_key).await?.is_none() {
-                            Ok(None)
-                        } else {
-                            Err(Error::PayloadMissing { id })
-                        }
-                    }
-                    Err(e) => Err(e),
-                }
+                Ok(found.map(|(index_key, _, job)| (index_key, job)))
             }
         }
     }
@@ -906,6 +915,26 @@ mod tests {
         assert!(page.jobs[0].payload.is_empty());
         let job = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.payload, payload);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn job_record_returns_an_offloaded_record_without_its_payload() {
+        let store = make_store();
+        let q = Queue::open_with_options(store.clone(), "test", offload_opts())
+            .await
+            .unwrap();
+        let id = q.enqueue("work", vec![9u8; 512]).await.unwrap();
+
+        let reader = QueueReader::open(store, "test").await.unwrap();
+        for view in [q.view(), reader.view()] {
+            let job = view.job_record(&id).await.unwrap().expect("enqueued");
+            assert_eq!(job.id, id);
+            assert!(job.payload_ref.is_some());
+            assert!(job.payload.is_empty());
+            assert!(view.job_record("unknown").await.unwrap().is_none());
+        }
+        reader.close().await.unwrap();
         q.close().await.unwrap();
     }
 

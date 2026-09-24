@@ -157,10 +157,11 @@ regardless of its size.
 
 A record returned by a claim or by `get_job` has `payload` populated:
 `PayloadStore::materialize` fills it from the object when `payload_ref` is set
-([payload_store.rs][payload_store]). A listing returns the record as stored,
-without the bytes of an offloaded payload. The object exists for the whole life
-of the record. It is written before the transaction that writes the record, and
-deleted only after the transaction that removes the record commits.
+([payload_store.rs][payload_store]). A listing and `job_record` return the
+record as stored, without the bytes of an offloaded payload. The object exists
+for the whole life of the record. It is written before the transaction that
+writes the record, and deleted only after the transaction that removes the
+record commits.
 
 ## The fields a transition sets
 

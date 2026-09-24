@@ -260,11 +260,11 @@
 //! place of the bytes. Claims and [`QueueView::get_job`] fetch the object and
 //! return the payload as usual, so offloading is transparent to worker code. A
 //! listing ([`QueueView::list_jobs`], [`QueueView::jobs`] and
-//! [`QueueView::dead_jobs`]) returns the record as stored, with `payload_ref`
-//! set and without the bytes. The object is deleted when the record leaves the
-//! queue: on ack (or with the done record's retention sweep when
-//! [`QueueConfig::keep_done_jobs`] is set), on cancel and with the dead-letter
-//! retention sweep.
+//! [`QueueView::dead_jobs`]) and [`QueueView::job_record`] return the record as
+//! stored, with `payload_ref` set and without the bytes. The object is deleted
+//! when the record leaves the queue: on ack (or with the done record's
+//! retention sweep when [`QueueConfig::keep_done_jobs`] is set), on cancel and
+//! with the dead-letter retention sweep.
 //!
 //! By default payload objects live next to the queue's own state, under
 //! `"{path}-payloads"` in the object store the queue is opened on.
@@ -306,7 +306,8 @@
 //! same store path from any process with bucket credentials and
 //! [`QueueReader::view`] returns a [`QueueView`] with the reads of
 //! [`Queue::view`]: [`QueueView::stats`], [`QueueView::list_queues`],
-//! [`QueueView::list_jobs`], [`QueueView::dead_jobs`], [`QueueView::get_job`],
+//! [`QueueView::list_jobs`], [`QueueView::jobs`], [`QueueView::dead_jobs`],
+//! [`QueueView::get_job`], [`QueueView::job_record`],
 //! [`QueueView::attempt_history`] and the KV reads. Dashboards, CLIs and health
 //! checks observe a live queue without an admin endpoint inside the worker
 //! process.
