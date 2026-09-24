@@ -156,7 +156,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .await
             .map_err(worker_error)?
             && let Ok(existing_id) = std::str::from_utf8(&existing)
-            && let Ok(Some(job)) = self.core.queue.view().get_job(existing_id).await
+            && let Ok(Some(job)) = self.core.queue.view().job_record(existing_id).await
             && job.status == JobStatus::Scheduled
         {
             let message =

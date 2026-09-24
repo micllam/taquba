@@ -39,8 +39,9 @@ impl WorkflowView {
     /// pending cancellation request reports [`RunState::Cancelling`] at every
     /// lifecycle position of its step, until the run terminates.
     ///
-    /// A pointer whose job is absent on a second read is a state that no
-    /// runtime write produces, reported as [`Error::InconsistentRunState`].
+    /// When a second read returns the current-step pointer with its job still
+    /// absent, the call fails with [`Error::InconsistentRunState`]. The runtime
+    /// does not write a pointer without its job.
     pub async fn status(&self, run_id: &RunId) -> Result<Option<RunStatus>> {
         let Some(record) = self.run_record(run_id).await? else {
             return self.terminated_status(run_id).await;
@@ -99,11 +100,13 @@ impl WorkflowView {
         durable::kv_record(&self.queue, &step_kv_key(run_id)).await
     }
 
-    /// The current step of `run_id` with its queue job, or `None` when the run
-    /// is not active. The pointer and the job change in one transaction, so a
-    /// pointer that moved between the two reads is followed. A pointer that a
-    /// second read returns unchanged, with its job absent, is a state that no
-    /// runtime write produces, reported as [`Error::InconsistentRunState`].
+    /// The current step of `run_id` with its queue job in the stored form of
+    /// [`QueueView::job_record`], or `None` when the run is not active. The
+    /// pointer and the job change in one transaction, so a pointer that moved
+    /// between the two reads is followed. When a second read returns the
+    /// pointer unchanged and its job is still absent, the call fails with
+    /// [`Error::InconsistentRunState`]. The runtime does not write a pointer
+    /// without its job.
     pub(crate) async fn current_job(
         &self,
         run_id: &RunId,
@@ -113,7 +116,7 @@ impl WorkflowView {
             let Some(current) = self.current_step_if_active(run_id).await? else {
                 return Ok(None);
             };
-            if let Some(job) = self.queue.get_job(&current.job_id).await? {
+            if let Some(job) = self.queue.job_record(&current.job_id).await? {
                 return Ok(Some((current, job)));
             }
             if absent.as_deref() == Some(current.job_id.as_str()) {

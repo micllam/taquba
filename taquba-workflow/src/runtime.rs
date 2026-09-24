@@ -1333,6 +1333,7 @@ mod tests {
     use crate::view::WorkflowView;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use taquba::object_store::ObjectStoreExt;
     use taquba::object_store::memory::InMemory;
     use taquba::{LeaseHandle, MockClock, OpenOptions, QueueConfig, QueueReader};
     use tokio::sync::oneshot;
@@ -3129,6 +3130,38 @@ mod tests {
                 terminated_at_ms: 10_000,
             }),
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_status_of_a_run_does_not_read_its_offloaded_step_payload() {
+        let payloads: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (queue, store, _clock) = open_queue_at_with(
+            10_000,
+            OpenOptions::default()
+                .payload_offload_threshold(64)
+                .payload_store(payloads.clone()),
+        )
+        .await;
+        let runtime = WorkflowRuntime::builder(queue, store, UnreachableRunner, NoopTerminalHook)
+            .memo_prefix("memo")
+            .build();
+        let handle = runtime
+            .submit(RunSpec {
+                input: vec![7u8; 512],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // A read that fetches the step's payload object fails once the object
+        // is deleted.
+        let objects: Vec<_> = payloads.list(None).try_collect().await.unwrap();
+        assert!(!objects.is_empty(), "the step payload is offloaded");
+        for object in objects {
+            payloads.delete(&object.location).await.unwrap();
+        }
+        let status = runtime.status(&handle.run_id).await.unwrap().unwrap();
+        assert_eq!(status.state, RunState::Pending);
     }
 
     /// Drive a single step that blocks on a gate, calls `cancel(run_id)`
