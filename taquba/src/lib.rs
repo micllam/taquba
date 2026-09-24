@@ -430,7 +430,6 @@ mod options;
 mod payload_store;
 mod queue;
 mod queue_core;
-mod read;
 mod reader;
 mod reaper;
 mod scheduler;
@@ -438,6 +437,7 @@ mod stats;
 #[cfg(test)]
 mod test_util;
 mod txn;
+mod view;
 /// Worker-loop primitives: the [`worker::Worker`] trait, plus the
 /// [`worker::run_worker`] / [`worker::run_worker_concurrent`] drivers that
 /// own the claim -> process -> ack/nack lifecycle and graceful shutdown,
@@ -461,9 +461,9 @@ pub use queue::{
     CancelOutcome, ClaimOutcome, EnqueueResult, JobPage, NackOutcome, Queue, WaitOutcome,
     WakeOutcome,
 };
-pub use read::QueueView;
 pub use reader::{QueueReader, ReaderMode, ReaderOptions};
 pub use stats::QueueStats;
+pub use view::QueueView;
 pub use worker::{
     FailWith, PermanentFailure, Worker, WorkerError, WorkerHandle, run_worker,
     run_worker_concurrent,

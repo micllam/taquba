@@ -26,7 +26,6 @@ use crate::lease_registry::{LeaseRegistry, Renewal};
 use crate::options::{EnqueueOptions, OpenOptions, QueueConfig};
 use crate::payload_store::PayloadStore;
 use crate::queue_core::{QueueConfigs, QueueCore};
-use crate::read::{Handle, QueueView};
 use crate::reaper::Reaper;
 use crate::scheduler::Scheduler;
 use crate::stats::{QueueMergeOperator, update_stats};
@@ -35,6 +34,7 @@ use crate::txn::{
     Attempt, Commit, Durability, commit, put_job_record, retry, stage_claim_end, stage_remove,
     stage_to_pending, take_claim,
 };
+use crate::view::{Handle, QueueView};
 
 /// Outcome of [`Queue::cancel`], reflecting which lifecycle branch the
 /// job was in.

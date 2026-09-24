@@ -133,7 +133,7 @@ The field a scan orders by comes first.
 order. Each exits at the first key past its cutoff.
 
 `Pending`, `Claimed` and `Dead` lead with the queue name, so the claim scan and
-`list_jobs` ([read.rs][read]) read one queue's range. `Pending` is ordered by
+`list_jobs` ([view.rs][view]) read one queue's range. `Pending` is ordered by
 priority and then by id, and the other two by id.
 
 `Claimed` is read whole once, by `requeue_interrupted_claims`
@@ -255,5 +255,5 @@ such a row and the stats read drops it.
 [queue]: https://github.com/micllam/taquba/blob/master/taquba/src/queue.rs
 [reaper]: https://github.com/micllam/taquba/blob/master/taquba/src/reaper.rs
 [scheduler]: https://github.com/micllam/taquba/blob/master/taquba/src/scheduler.rs
-[read]: https://github.com/micllam/taquba/blob/master/taquba/src/read.rs
+[view]: https://github.com/micllam/taquba/blob/master/taquba/src/view.rs
 [claim_cursor]: https://github.com/micllam/taquba/blob/master/taquba/src/claim_cursor.rs

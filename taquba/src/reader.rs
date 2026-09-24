@@ -20,8 +20,8 @@ use slatedb::{DbReader, DbReaderMode};
 use crate::error::{Error, Result};
 use crate::liveness::{StoreActivity, WriterHeartbeat};
 use crate::payload_store::PayloadStore;
-use crate::read::{Handle, QueueView};
 use crate::stats::QueueMergeOperator;
+use crate::view::{Handle, QueueView};
 
 /// How a [`QueueReader`] follows the writer's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

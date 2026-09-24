@@ -15,7 +15,7 @@ use crate::error::Result;
 use crate::job::JobRecord;
 use crate::keys::{QueueName, pending_prefix};
 use crate::queue_core::QueueCore;
-use crate::read::{Handle, QueueView};
+use crate::view::{Handle, QueueView};
 pub(crate) struct MetricsSampler {
     core: Arc<QueueCore>,
     view: QueueView,
