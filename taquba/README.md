@@ -334,6 +334,21 @@ settlement and discards them when the job is retried.
 See [`examples/atomic_settlement.rs`](examples/atomic_settlement.rs) for a
 runnable order pipeline built on these primitives.
 
+## Expiring caller state
+
+An `ExpiryIndex` is a time-ordered index over one prefix of the caller KV
+namespace. An entry's key is the prefix, the time of its event as 8 bytes
+big-endian and a free suffix, built by `ExpiryIndex::entry_key`.
+`ExpiryIndex::pass` reads the entries oldest first, calls the caller's
+callback for every entry whose time is a retention or more before the time
+the caller passes, and stops at the first entry that is not due. The callback
+returns an `Expired`: the effects that clear the state the entry refers to,
+which commit in the transaction that deletes the entry, or `Keep`.
+
+The index keeps in memory the earliest time of an entry that a pass did not
+read, and a pass returns without a read until that time is due, so a pass at
+a short interval reads the index only when an entry can be due.
+
 ## Large payloads
 
 A job record is rewritten on every state transition (enqueue, claim, nack, ack),

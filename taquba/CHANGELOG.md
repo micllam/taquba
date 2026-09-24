@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `QueueView::job_record`: one job by id in the stored form of
   `list_jobs`, so a read of its state does not fetch an offloaded
   payload object.
+- `ExpiryIndex`: a time-ordered index over one prefix of the caller KV
+  namespace, whose due entries a pass removes in one transaction with
+  the state they refer to, so a crate over the queue does not keep its
+  own retention sweep. A pass returns without a read until an entry can
+  be due.
 
 ### Changed
 
