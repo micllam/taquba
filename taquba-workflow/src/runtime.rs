@@ -22,7 +22,7 @@ use crate::group::{GroupStore, Membership, RunGroup, pending_member, terminated_
 use crate::keys::{
     DEDUP_PREFIX, GROUP_TERMINAL_KV_PREFIX, HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL,
     RESERVED_HEADER_PREFIX, RESERVED_KV_PREFIX, RunId, TERMINAL_KV_PREFIX, hash_input,
-    outcome_kv_key, run_kv_key, step_kv_key, terminal_kv_key,
+    outcome_kv_key, run_kv_key, step_kv_key,
 };
 use crate::memo::{MemoStore, RUN_RESULT_MEMO_KEY};
 use crate::runner::{StepErrorKind, StepOutcome, StepRunner, Trigger};
@@ -365,23 +365,22 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
             memo_store.clone(),
             self.queue.clone(),
         );
-        let mut sweeps = Vec::new();
-        if let Some(retention) = self.memo_retention {
-            sweeps.push(Sweep::new(
+        let memo_sweep = self.memo_retention.map(|retention| {
+            Arc::new(Sweep::new(
                 TERMINAL_KV_PREFIX,
                 retention,
                 RunStore {
                     memo_store: memo_store.clone(),
                 },
-            ));
-        }
-        if let Some(retention) = self.group_retention {
-            sweeps.push(Sweep::new(
+            ))
+        });
+        let group_sweep = self.group_retention.map(|retention| {
+            Arc::new(Sweep::new(
                 GROUP_TERMINAL_KV_PREFIX,
                 retention,
                 group_store.clone(),
-            ));
-        }
+            ))
+        });
         let view = WorkflowView::new(self.queue.view().clone(), memo_store.clone());
         let core = RuntimeCore {
             queue: self.queue,
@@ -391,9 +390,8 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
             poll_interval: self.poll_interval,
             memo_store,
             group_store,
-            memo_retention: self.memo_retention,
-            group_retention: self.group_retention,
-            sweeps,
+            memo_sweep,
+            group_sweep,
             step_output_replay: self.step_output_replay,
             clock: self.clock,
             observes,
@@ -459,18 +457,16 @@ pub(crate) struct RuntimeCore {
     poll_interval: Duration,
     pub(crate) memo_store: MemoStore,
     pub(crate) group_store: GroupStore,
-    /// Window after a run reaches a terminal state during which its
-    /// memo entries and terminal record are retained. `None` disables
-    /// retention entirely (no terminal marker is written and no memo
-    /// sweep runs).
-    pub(crate) memo_retention: Option<Duration>,
-    /// Window after every member of a group terminated during which
-    /// the group's state is retained; `None` writes no group marker.
-    pub(crate) group_retention: Option<Duration>,
-    /// The retention sweeps [`WorkflowRuntime::run`] drives: the memo
-    /// sweep when `memo_retention` is set and the group sweep when
-    /// `group_retention` is set.
-    sweeps: Vec<Sweep>,
+    /// The sweep that removes the memo entries and the terminal record
+    /// of a run a window after its termination, when
+    /// [`WorkflowRuntimeBuilder::memo_retention`] is set. Without it no
+    /// terminal marker is written.
+    pub(crate) memo_sweep: Option<Arc<Sweep>>,
+    /// The sweep that removes the state of a group a window after its
+    /// last member terminated, when
+    /// [`WorkflowRuntimeBuilder::group_retention`] is set. Without it no
+    /// group marker is written.
+    pub(crate) group_sweep: Option<Arc<Sweep>>,
     /// Whether runner-returned step outcomes are persisted and replayed
     /// by `(run_id, step_number, SHA-256(step payload))`.
     pub(crate) step_output_replay: bool,
@@ -661,12 +657,16 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         R: 'static,
         H: 'static,
     {
-        let mut background: Vec<_> = (0..self.inner.core.sweeps.len())
-            .map(|i| {
+        let mut background: Vec<_> = self
+            .inner
+            .core
+            .sweeps()
+            .map(|sweep| {
+                let sweep = sweep.clone();
                 let core = self.inner.core.clone();
                 let token = stop.clone();
                 tokio::spawn(async move {
-                    core.sweeps[i].run(&core.queue, &*core.clock, token).await;
+                    sweep.run(&core.queue, &*core.clock, token).await;
                 })
             })
             .collect();
@@ -917,9 +917,9 @@ impl RuntimeCore {
             outcome_kv_key(&outcome.run_id),
             durable::encode(&termination),
         );
-        if self.memo_retention.is_some() {
+        if let Some(sweep) = &self.memo_sweep {
             kv_writes.insert(
-                terminal_kv_key(&outcome.run_id, termination.terminated_at_ms),
+                sweep.marker_key(&outcome.run_id, termination.terminated_at_ms),
                 Vec::new(),
             );
         }
@@ -1026,14 +1026,20 @@ impl RuntimeCore {
         .await;
     }
 
-    /// One pass of every retention sweep; the number of entities cleared.
+    /// The retention sweeps [`WorkflowRuntime::run`] runs.
+    fn sweeps(&self) -> impl Iterator<Item = &Arc<Sweep>> {
+        self.memo_sweep.iter().chain(self.group_sweep.iter())
+    }
+
+    /// One pass of every retention sweep. Returns the number of markers
+    /// removed.
     #[cfg(test)]
     pub(crate) async fn sweep_once(&self) -> Result<usize> {
-        let mut cleared = 0;
-        for sweep in &self.sweeps {
-            cleared += sweep.pass(&self.queue, &*self.clock).await?;
+        let mut removed = 0;
+        for sweep in self.sweeps() {
+            removed += sweep.pass(&self.queue, &*self.clock).await?;
         }
-        Ok(cleared)
+        Ok(removed)
     }
 
     /// The current-step pointer of a run whose durable record exists.
@@ -1320,9 +1326,7 @@ mod tests {
     use crate::effects::{EffectsHandle, TerminalEffects};
     use crate::group::GroupMember;
     use crate::keys::group_member_kv_key;
-    use crate::keys::{
-        TERMINAL_KV_PREFIX, parse_timestamped_kv_key, signal_buf_kv_key, signal_wait_kv_key,
-    };
+    use crate::keys::{TERMINAL_KV_PREFIX, signal_buf_kv_key, signal_wait_kv_key};
     use crate::runner::{Step, StepError};
     use crate::signal::SignalOutcome;
     use crate::terminal::NoopTerminalHook;
@@ -1333,6 +1337,7 @@ mod tests {
     use crate::view::WorkflowView;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use taquba::ExpiryIndex;
     use taquba::object_store::ObjectStoreExt;
     use taquba::object_store::memory::InMemory;
     use taquba::{LeaseHandle, MockClock, OpenOptions, QueueConfig, QueueReader};
@@ -1489,10 +1494,13 @@ mod tests {
             .kv_scan(TERMINAL_KV_PREFIX, .., 1_000)
             .await
             .unwrap();
+        let index = ExpiryIndex::new(TERMINAL_KV_PREFIX);
         page.entries
             .iter()
             .map(|(key, _)| {
-                parse_timestamped_kv_key(TERMINAL_KV_PREFIX, key).expect("well-formed marker key")
+                let (at_ms, suffix) = index.parse(key).expect("well-formed marker key");
+                let id = std::str::from_utf8(suffix).expect("run id");
+                (RunId::new(id).expect("run id"), at_ms)
             })
             .collect()
     }
@@ -3536,11 +3544,11 @@ mod tests {
             .put("k", b"expensive")
             .await
             .unwrap();
-        // A marker whose id is empty, which no key builder can produce.
-        let marker = [TERMINAL_KV_PREFIX, b"00000000000000000000/"].concat();
+        // A marker with an empty id, which `RunId` rejects.
+        let marker = ExpiryIndex::new(TERMINAL_KV_PREFIX).entry_key(0, b"");
         queue.kv_put(&marker, b"").await.unwrap();
-        let mut unparseable = Vec::from(TERMINAL_KV_PREFIX);
-        unparseable.extend_from_slice(b"not-a-timestamp");
+        // A key too short for a time.
+        let unparseable = [TERMINAL_KV_PREFIX, b"short"].concat();
         queue.kv_put(&unparseable, b"").await.unwrap();
 
         advance(&clock, Duration::from_secs(3_600)).await;
@@ -3790,11 +3798,12 @@ mod tests {
         .build();
 
         let memos = MemoStore::new(store, "workflow-steps-memo");
+        let sweep = runtime.inner.core.memo_sweep.as_ref().unwrap();
         for (run_id, at_ms) in [("old", 1_000u64), ("young", 9_500u64)] {
             let run_id = rid(run_id);
             memos.new_memo(&run_id, 0).put("k", b"v").await.unwrap();
             queue
-                .kv_put(&terminal_kv_key(&run_id, at_ms), b"")
+                .kv_put(&sweep.marker_key(&run_id, at_ms), b"")
                 .await
                 .unwrap();
         }
@@ -3895,12 +3904,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_sweeper_clears_a_marker_only_after_retention_elapses() {
-        // Retention 200ms (sweep interval also 200ms). Advancing 200ms
-        // after the marker is written fires the next sweep tick at the
-        // exact retention boundary; strict `<` means the marker is not
-        // yet expired, so the sweep must skip it. Advancing past the
-        // boundary must then clear the marker and the run's memo
-        // entries.
+        // Retention 200ms (sweep interval also 200ms). A pass 199ms
+        // after the marker is written leaves it. Advancing to 200ms
+        // fires the next sweep tick at the exact retention boundary,
+        // which clears the marker and the run's memo entries.
         let (queue, store, clock) = open_queue_at(10_000).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
@@ -3933,15 +3940,16 @@ mod tests {
             .await
             .unwrap();
 
-        advance(&clock, Duration::from_millis(200)).await;
-        // Let the sweeper finish its boundary tick.
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
+        advance(&clock, Duration::from_millis(199)).await;
+        assert_eq!(runtime.inner.core.sweep_once().await.unwrap(), 0);
         let markers = terminal_markers(&runtime.inner.core.queue).await;
-        assert_eq!(markers.len(), 1, "boundary marker must not be swept");
+        assert_eq!(
+            markers.len(),
+            1,
+            "a marker within the window must not be swept"
+        );
 
-        advance(&clock, Duration::from_millis(300)).await;
+        advance(&clock, Duration::from_millis(1)).await;
         let cleared = yield_until(50, || async {
             terminal_markers(&runtime.inner.core.queue).await.is_empty()
         })

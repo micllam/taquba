@@ -544,9 +544,10 @@ marker exists exactly when the run's terminal outcome committed.
 `WorkflowRuntime::run` sweeps the markers on startup and on
 every retention interval, removing the memo entries, the step-output
 replay entries, the terminal record and the marker of every run whose
-marker is older than the window. The terminating timestamp precedes the
-run id in the marker key, so the sweep reads the expired set from the
-start of the range and stops at the first unexpired marker.
+marker is at least a window old. A marker is an entry of a
+`taquba::ExpiryIndex` with the run id as its suffix, so the sweep reads
+the expired set from the start of the range and stops at the first
+unexpired marker.
 
 Because the sweep is keyed on terminal markers and a terminated run
 never resumes, the entries of an in-flight run are not removed, with

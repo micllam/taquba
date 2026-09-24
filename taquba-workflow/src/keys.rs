@@ -75,10 +75,9 @@ pub(crate) const SIGNAL_BUF_KV_PREFIX: &[u8] = b"workflow/signal-buf/";
 /// claimed and deleted with its settlement.
 pub(crate) const SIGNAL_DELIVERED_KV_PREFIX: &[u8] = b"workflow/signal-delivered/";
 
-/// Prefix for the durable terminal marker: the time-ordered index of
-/// runs that have reached a terminal state, read by the memo-retention
-/// sweep. Written only when [`WorkflowRuntimeBuilder::memo_retention`]
-/// is set, in the same transaction that settles the run.
+/// Prefix of the terminal markers of runs, read by the memo retention
+/// sweep: entries of a [`taquba::ExpiryIndex`] with the run id as the
+/// suffix.
 pub(crate) const TERMINAL_KV_PREFIX: &[u8] = b"workflow/terminals/";
 
 /// Prefix for the durable terminal record of a run:
@@ -103,40 +102,10 @@ pub(crate) fn group_member_kv_key(group_id: &RunId, key: &str) -> Vec<u8> {
     prefixed(&group_members_kv_prefix(group_id), key)
 }
 
-/// Key of the terminal marker for `run_id`, terminated at
-/// `terminal_at_ms`. The zero-padded timestamp leads the suffix, so a
-/// prefix scan returns markers oldest first and the sweep's expired set
-/// is the front of the range. The value is empty: both fields are in
-/// the key.
-pub(crate) fn terminal_kv_key(run_id: &RunId, terminal_at_ms: u64) -> Vec<u8> {
-    timestamped_kv_key(TERMINAL_KV_PREFIX, run_id, terminal_at_ms)
-}
-
-/// Prefix for the durable terminal markers of run groups, read by the
-/// group retention sweep: `workflow/group-terminals/{ts:020}/{group_id}`.
+/// Prefix of the terminal markers of run groups, read by the group
+/// retention sweep: entries of a [`taquba::ExpiryIndex`] with the group
+/// id as the suffix.
 pub(crate) const GROUP_TERMINAL_KV_PREFIX: &[u8] = b"workflow/group-terminals/";
-
-/// Key of the terminal marker of group `group_id`, whose members all
-/// terminated by `terminal_at_ms`.
-pub(crate) fn group_terminal_kv_key(group_id: &RunId, terminal_at_ms: u64) -> Vec<u8> {
-    timestamped_kv_key(GROUP_TERMINAL_KV_PREFIX, group_id, terminal_at_ms)
-}
-
-/// `{prefix}{ts:020}/{id}`: a marker whose zero-padded timestamp leads the
-/// suffix, so a prefix scan returns markers oldest first.
-pub(crate) fn timestamped_kv_key(prefix: &[u8], id: &RunId, ts_ms: u64) -> Vec<u8> {
-    prefixed(prefix, &format!("{ts_ms:020}/{id}"))
-}
-
-/// The `(id, ts_ms)` of a key built by [`timestamped_kv_key`], `None`
-/// for a key outside `prefix`, with a malformed timestamp or with an
-/// id that is not a valid run id.
-pub(crate) fn parse_timestamped_kv_key(prefix: &[u8], key: &[u8]) -> Option<(RunId, u64)> {
-    let suffix = key.strip_prefix(prefix)?;
-    let text = std::str::from_utf8(suffix).ok()?;
-    let (ts, id) = text.split_once('/')?;
-    Some((RunId::new(id).ok()?, ts.parse().ok()?))
-}
 
 /// The SHA-256 digest of `input`.
 pub(crate) fn hash_input(input: &[u8]) -> [u8; 32] {
@@ -361,32 +330,6 @@ mod tests {
         assert_eq!(
             rmp_serde::from_slice::<RunId>(&rmp_serde::to_vec("run-1").unwrap()).unwrap(),
             "run-1"
-        );
-    }
-
-    #[test]
-    fn terminal_marker_keys_sort_oldest_first_and_round_trip() {
-        let old = terminal_kv_key(&RunId::new("run-b").unwrap(), 1_000);
-        let young = terminal_kv_key(&RunId::new("run-a").unwrap(), 2_000);
-        assert!(
-            old < young,
-            "ordering must follow the timestamp ahead of the id"
-        );
-        assert_eq!(
-            parse_timestamped_kv_key(TERMINAL_KV_PREFIX, &young),
-            Some((RunId::new("run-a").unwrap(), 2_000)),
-        );
-        assert_eq!(
-            parse_timestamped_kv_key(
-                TERMINAL_KV_PREFIX,
-                b"workflow/terminals/00000000000000002000/"
-            ),
-            None,
-            "a marker with an empty id is malformed"
-        );
-        assert_eq!(
-            parse_timestamped_kv_key(TERMINAL_KV_PREFIX, b"workflow/runs/run-a"),
-            None
         );
     }
 }

@@ -19,7 +19,7 @@ use crate::durable::{self, DurableMember, DurableTermination};
 use crate::error::{Error, Result};
 use crate::keys::{
     HEADER_GROUP, HEADER_GROUP_KEY, RunId, group_member_kv_key, group_members_kv_prefix,
-    group_terminal_kv_key, outcome_kv_key,
+    outcome_kv_key,
 };
 use crate::memo::MemoStore;
 use crate::runtime::{RunOptions, RunSpec, RunTermination, RuntimeCore};
@@ -526,8 +526,8 @@ impl RunGroup {
     /// [`WorkflowRuntimeBuilder::group_retention`](crate::WorkflowRuntimeBuilder::group_retention).
     async fn mark_terminated(&self) -> Result<()> {
         let core = self.core();
-        if core.group_retention.is_some() {
-            let key = group_terminal_kv_key(&self.id, core.clock.now_ms());
+        if let Some(sweep) = &core.group_sweep {
+            let key = sweep.marker_key(&self.id, core.clock.now_ms());
             core.queue.kv_put(&key, b"").await?;
         }
         Ok(())
@@ -806,7 +806,8 @@ mod tests {
         let results: Vec<MemberResult> =
             group.results().await.unwrap().try_collect().await.unwrap();
         assert_eq!(results.len(), 1);
-        let marker = group_terminal_kv_key(&rid("g"), 10_000);
+        let sweep = runtime.inner.core.group_sweep.as_ref().unwrap();
+        let marker = sweep.marker_key(&rid("g"), 10_000);
         assert!(
             queue.view().kv_get(&marker).await.unwrap().is_some(),
             "the marker is written when the last termination is observed"
@@ -821,7 +822,7 @@ mod tests {
                 .is_some()
         );
 
-        clock.advance(Duration::from_secs(1));
+        clock.advance(Duration::from_millis(999));
         assert_eq!(
             runtime.inner.core.sweep_once().await.unwrap(),
             0,

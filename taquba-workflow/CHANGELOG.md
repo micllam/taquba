@@ -15,6 +15,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtime's view, and `WorkflowRuntime::status` and `WorkflowRuntime::outcome`
   read through it.
 
+### Changed
+
+- The terminal markers of runs and groups are entries of a
+  `taquba::ExpiryIndex`: the time is 8 bytes big-endian after the prefix and
+  the run id follows without a separator, so a marker of 0.12 sorts after
+  every new marker and is never swept. Delete the keys with the prefixes
+  `workflow/terminals/0` and `workflow/group-terminals/0`, remove each run's
+  memos with `MemoStore::clear_memos_for_run` and its outcome record at
+  `workflow/outcomes/{run_id}` with `Queue::kv_delete`, and call
+  `RunGroup::forget` for each group.
+- A marker of a run or a group expires at exactly the retention window.
+  0.12 expired it one millisecond later.
+
 ## [0.12.0] - 2026-09-16
 
 ### Added
