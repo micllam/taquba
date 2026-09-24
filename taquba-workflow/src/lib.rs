@@ -515,12 +515,14 @@
 //! retention is set, the same transaction writes a terminal marker under
 //! `workflow/terminals/`, so the marker exists exactly when the run's
 //! terminal outcome committed. [`WorkflowRuntime::run`] sweeps the
-//! markers on startup and on every retention interval, removing the
-//! memo entries, the step-output replay entries, the terminal record and
-//! the marker of every run whose marker is at least a window old. A
-//! marker is an entry of a [`taquba::ExpiryIndex`] with the run id as
-//! its suffix, so the sweep reads the expired set from the start of the
-//! range and stops at the first unexpired marker.
+//! markers on startup and at every poll interval, removing the memo
+//! entries, the step-output replay entries, the terminal record and the
+//! marker of every run whose marker is at least a window old. A marker
+//! is an entry of a [`taquba::ExpiryIndex`] with the run id as its
+//! suffix, so the sweep reads the expired set from the start of the
+//! range and stops at the first unexpired marker. A pass before a
+//! marker can be expired does not read the index, so a run's state is
+//! removed within a poll interval of the end of its window.
 //!
 //! Because the sweep is keyed on terminal markers and a terminated run
 //! never resumes, the entries of an in-flight run are not removed, with

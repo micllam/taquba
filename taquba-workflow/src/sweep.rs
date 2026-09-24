@@ -62,14 +62,7 @@ pub(crate) struct Sweep {
 impl Sweep {
     /// A sweep over the markers with `prefix`, clearing an entity from
     /// `store` once its marker is `retention` old.
-    ///
-    /// Panics if `retention < 1ms`: smaller values would turn the sweep
-    /// loop into a hot spin.
     pub(crate) fn new(prefix: &'static [u8], retention: Duration, store: impl Clearable) -> Self {
-        assert!(
-            retention >= Duration::from_millis(1),
-            "retention must be at least 1ms",
-        );
         Self {
             index: ExpiryIndex::new(prefix),
             retention,
@@ -86,10 +79,17 @@ impl Sweep {
 
     /// The sweep loop: the first pass runs immediately so a fresh
     /// process catches markers left behind by an earlier one, then one
-    /// pass every `retention` until `stop` is cancelled. A failed pass
-    /// is logged; the next pass retries.
-    pub(crate) async fn run(&self, queue: &Queue, clock: &dyn Clock, stop: CancellationToken) {
-        run_periodically(self.retention, &stop, (), |()| async move {
+    /// pass every `interval` until `stop` is cancelled. A pass before a
+    /// marker can be expired does not read the index. A failed pass is
+    /// logged, and the next pass retries.
+    pub(crate) async fn run(
+        &self,
+        queue: &Queue,
+        clock: &dyn Clock,
+        interval: Duration,
+        stop: CancellationToken,
+    ) {
+        run_periodically(interval, &stop, (), |()| async move {
             if let Err(err) = self.pass(queue, clock).await {
                 warn!("retention sweep failed: {err}");
             }

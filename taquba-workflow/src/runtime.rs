@@ -271,7 +271,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     }
 
     /// Maximum time the worker loop waits on an empty queue before re-checking.
-    /// Defaults to 250ms.
+    /// Defaults to 250ms. The retention sweeps run at this interval.
     pub fn poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
         self
@@ -283,14 +283,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     /// entries and terminal record `retention` after termination. When
     /// unset (default), no marker is written and memo entries and
     /// terminal records are retained indefinitely.
-    ///
-    /// Panics if `retention < 1ms`: smaller values would turn the sweep
-    /// loop into a hot spin.
     pub fn memo_retention(mut self, retention: Duration) -> Self {
-        assert!(
-            retention >= Duration::from_millis(1),
-            "memo_retention must be at least 1ms",
-        );
         self.memo_retention = Some(retention);
         self
     }
@@ -330,17 +323,11 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     /// Remove a [`RunGroup`]'s state (its manifest, member records and
     /// the memo entries and terminal records of its members) `retention` after a
     /// [`RunGroup::results`] consumer observed the last member's
-    /// termination, through a sweep when the worker starts and on every
-    /// retention interval after that. When unset (default), no group
+    /// termination, through a sweep when the worker starts and at every
+    /// poll interval after that. When unset (default), no group
     /// terminal marker is written. A group whose results are never
     /// consumed is retained until [`RunGroup::forget`] in either case.
-    ///
-    /// Panics if `retention < 1ms`.
     pub fn group_retention(mut self, retention: Duration) -> Self {
-        assert!(
-            retention >= Duration::from_millis(1),
-            "group_retention must be at least 1ms",
-        );
         self.group_retention = Some(retention);
         self
     }
@@ -666,7 +653,9 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
                 let core = self.inner.core.clone();
                 let token = stop.clone();
                 tokio::spawn(async move {
-                    sweep.run(&core.queue, &*core.clock, token).await;
+                    sweep
+                        .run(&core.queue, &*core.clock, core.poll_interval, token)
+                        .await;
                 })
             })
             .collect();
@@ -3904,10 +3893,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_sweeper_clears_a_marker_only_after_retention_elapses() {
-        // Retention 200ms (sweep interval also 200ms). A pass 199ms
-        // after the marker is written leaves it. Advancing to 200ms
-        // fires the next sweep tick at the exact retention boundary,
-        // which clears the marker and the run's memo entries.
+        // Retention 200ms and a 10ms poll interval. A pass 199ms after
+        // the marker is written leaves it. Within a poll interval of
+        // the boundary the sweep loop clears the marker and the run's
+        // memo entries.
         let (queue, store, clock) = open_queue_at(10_000).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
@@ -3919,6 +3908,7 @@ mod tests {
             ChannelHook { tx },
         )
         .memo_retention(Duration::from_millis(200))
+        .poll_interval(Duration::from_millis(10))
         .build();
         let shutdown = spawn_runtime(runtime.clone());
 
@@ -3950,6 +3940,7 @@ mod tests {
         );
 
         advance(&clock, Duration::from_millis(1)).await;
+        advance(&clock, Duration::from_millis(10)).await;
         let cleared = yield_until(50, || async {
             terminal_markers(&runtime.inner.core.queue).await.is_empty()
         })

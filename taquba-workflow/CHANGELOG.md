@@ -27,6 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RunGroup::forget` for each group.
 - A marker of a run or a group expires at exactly the retention window.
   0.12 expired it one millisecond later.
+- The retention sweeps run at the runtime's poll interval, and a pass reads
+  the markers only when one can be expired, so the state of a run or a group
+  is removed within a poll interval of the end of its window. 0.12 swept once
+  per retention window.
+- `WorkflowRuntimeBuilder::memo_retention` and
+  `WorkflowRuntimeBuilder::group_retention` accept a window shorter than one
+  millisecond, so a zero window removes the state at the next pass. 0.12
+  panicked on such a window.
 
 ## [0.12.0] - 2026-09-16
 
