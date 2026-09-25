@@ -3,7 +3,6 @@
 
 use std::future::Future;
 use std::pin::pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::TryStreamExt;
@@ -12,6 +11,7 @@ use tracing::warn;
 use crate::effects::SettlementEffects;
 use crate::error::Result;
 use crate::queue::Queue;
+use crate::time_bound::TimeBound;
 
 /// Entries read per page by a pass.
 const PAGE_SIZE: usize = 256;
@@ -38,27 +38,7 @@ const PAGE_SIZE: usize = 256;
 pub struct ExpiryIndex {
     prefix: Vec<u8>,
     /// The earliest time of an entry that a pass did not remove.
-    ///
-    /// Invariant: the bound does not exceed the time of any entry in
-    /// the index whose key `entry_key` built. A pass raises the bound on
-    /// the evidence of its scan alone: every entry before the new value
-    /// is read and removed.
-    bound: AtomicU64,
-}
-
-/// Lowers the bound of an index to `left` when a pass ends, on the
-/// return, the error and the drop of the pass future alike.
-struct PassGuard<'a> {
-    bound: &'a AtomicU64,
-    /// The bound before the pass, which is due, until the scan
-    /// completes and the pass stores the time it established.
-    left: u64,
-}
-
-impl Drop for PassGuard<'_> {
-    fn drop(&mut self) {
-        self.bound.fetch_min(self.left, Ordering::SeqCst);
-    }
+    bound: TimeBound,
 }
 
 /// The outcome of one entry in a pass, returned by the callback.
@@ -89,7 +69,7 @@ impl ExpiryIndex {
     pub fn new(prefix: impl Into<Vec<u8>>) -> Self {
         Self {
             prefix: prefix.into(),
-            bound: AtomicU64::new(0),
+            bound: TimeBound::new(),
         }
     }
 
@@ -99,7 +79,7 @@ impl ExpiryIndex {
     /// an entry written with this key is read by the first pass at
     /// which it is due.
     pub fn entry_key(&self, at_ms: u64, suffix: &[u8]) -> Vec<u8> {
-        self.bound.fetch_min(at_ms, Ordering::SeqCst);
+        self.bound.lower(at_ms);
         self.entry_key_at(at_ms, suffix)
     }
 
@@ -142,19 +122,11 @@ impl ExpiryIndex {
         Fut: Future<Output = Expired>,
     {
         let retention_ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
-        let due = |at_ms: u64| at_ms.saturating_add(retention_ms) <= now_ms;
-        if !due(self.bound.load(Ordering::SeqCst)) {
+        let Some(mut scan) = self.bound.begin(now_ms, retention_ms) else {
             return Ok(0);
-        }
-        // An `entry_key` call during the pass lowers the bound below the
-        // time the guard stores at the end.
-        let mut guard = PassGuard {
-            bound: &self.bound,
-            left: self.bound.swap(u64::MAX, Ordering::SeqCst),
         };
         let mut removed = 0;
-        let mut left = now_ms;
-        let start = self.entry_key_at(guard.left, &[]);
+        let start = self.entry_key_at(scan.from(), &[]);
         let mut entries = pin!(queue.view().kv_entries(&self.prefix, start.., PAGE_SIZE));
         while let Some((key, _)) = entries.try_next().await? {
             let Some((at_ms, suffix)) = self.parse(&key) else {
@@ -162,8 +134,8 @@ impl ExpiryIndex {
                 queue.kv_delete(&key).await?;
                 continue;
             };
-            if !due(at_ms) {
-                left = left.min(at_ms);
+            if !scan.due(at_ms) {
+                scan.retain(at_ms);
                 break;
             }
             match clear(at_ms, suffix.to_vec()).await {
@@ -188,10 +160,10 @@ impl ExpiryIndex {
                     }
                     removed += 1;
                 }
-                Expired::Keep => left = left.min(at_ms),
+                Expired::Keep => scan.retain(at_ms),
             }
         }
-        guard.left = left;
+        scan.complete();
         Ok(removed)
     }
 }

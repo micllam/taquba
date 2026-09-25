@@ -456,6 +456,7 @@ mod scheduler;
 mod stats;
 #[cfg(test)]
 mod test_util;
+mod time_bound;
 mod txn;
 mod view;
 /// Worker-loop primitives: the [`worker::Worker`] trait, plus the
