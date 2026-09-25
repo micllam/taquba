@@ -35,24 +35,26 @@ pub struct EnqueueRequest {
     pub options: EnqueueOptions,
 }
 
-/// Effects applied in the same transaction as a settlement: an
-/// acknowledgement via [`Queue::ack_with`](crate::Queue::ack_with), a dead-letter via
-/// [`Queue::dead_letter_with`](crate::Queue::dead_letter_with) or [`Queue::nack_with`](crate::Queue::nack_with), or a
-/// pending-job removal via [`Queue::cancel_with`](crate::Queue::cancel_with). Either the
-/// settlement and every effect commit together or nothing does. A
-/// branch that applies no effects ([`Queue::nack_with`](crate::Queue::nack_with) while attempts
-/// remain, [`Queue::cancel_with`](crate::Queue::cancel_with) other than
-/// [`CancelOutcome::Removed`](crate::CancelOutcome::Removed)) commits without them. A key named in
-/// both `kv_writes` and `kv_deletes` is rejected with
-/// [`Error::ConflictingKvEffect`]. An entry added with
-/// [`Self::expiry_entry`] is recorded on its [`ExpiryIndex`] once the
+/// Effects applied in the same transaction as a settlement: an acknowledgement
+/// via [`Queue::ack_with`](crate::Queue::ack_with), a dead-letter via
+/// [`Queue::dead_letter_with`](crate::Queue::dead_letter_with) or
+/// [`Queue::nack_with`](crate::Queue::nack_with), a pending-job removal via
+/// [`Queue::cancel_with`](crate::Queue::cancel_with) or an enqueue via
+/// [`Queue::enqueue_with_effects`](crate::Queue::enqueue_with_effects). Either
+/// the settlement and every effect commit together or nothing does. A branch
+/// that does not apply the effects
+/// ([`Queue::nack_with`](crate::Queue::nack_with) while attempts remain,
+/// [`Queue::cancel_with`](crate::Queue::cancel_with) other than
+/// [`CancelOutcome::Removed`](crate::CancelOutcome::Removed), an enqueue on a
+/// `dedup_key` hit) commits without them. A key named in both `kv_writes` and
+/// `kv_deletes` is rejected with [`Error::ConflictingKvEffect`]. An entry added
+/// with [`Self::expiry_entry`] is recorded on its [`ExpiryIndex`] once the
 /// effects apply.
 #[derive(Debug, Clone, Default)]
 pub struct SettlementEffects {
     /// Jobs enqueued atomically with the settlement.
     pub enqueues: Vec<EnqueueRequest>,
-    /// Writes applied to the caller KV namespace, as in
-    /// [`Queue::enqueue_with_kv`](crate::Queue::enqueue_with_kv). Values are size-capped at
+    /// Writes applied to the caller KV namespace. Values are size-capped at
     /// [`MAX_KV_VALUE_SIZE`](crate::MAX_KV_VALUE_SIZE).
     pub kv_writes: HashMap<Vec<u8>, Vec<u8>>,
     /// Keys deleted from the caller KV namespace.
@@ -546,11 +548,11 @@ mod tests {
     async fn ack_with_applies_enqueue_and_kv_effects_atomically() {
         let q = Queue::open(make_store(), "test").await.unwrap();
         let lease = Duration::from_secs(5);
-        q.enqueue_with_kv(
+        q.enqueue_with_effects(
             "work",
             b"first".to_vec(),
             EnqueueOptions::default(),
-            HashMap::from([(b"runs/1".to_vec(), b"active".to_vec())]),
+            SettlementEffects::default().kv_put(b"runs/1", b"active"),
         )
         .await
         .unwrap();

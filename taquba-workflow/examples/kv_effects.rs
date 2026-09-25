@@ -5,7 +5,7 @@
 //! `app/orders/{run_id}/status`:
 //!
 //!   - submission writes `received` in the same transaction as the
-//!     step-0 enqueue (`RunSpec::kv_writes`), together with a pending
+//!     step-0 enqueue (`RunSpec::effects`), together with a pending
 //!     marker;
 //!   - the validation step stages `validated` through `Delivery::effects`,
 //!     so the new status commits with the settlement that enqueues the
@@ -23,12 +23,11 @@
 //! cargo run -p taquba-workflow --example kv_effects
 //! ```
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use taquba::Queue;
 use taquba::object_store::memory::InMemory;
+use taquba::{Queue, SettlementEffects};
 use taquba_workflow::{
     RunId, RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects,
     TerminalHook, WorkflowRuntime,
@@ -95,10 +94,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .submit(RunSpec {
             run_id: Some(RunId::new(run_id)?),
             input: b"2 units of item 7".to_vec(),
-            kv_writes: HashMap::from([
-                (status_key(run_id), b"received".to_vec()),
-                (pending_key(run_id), b"1".to_vec()),
-            ]),
+            effects: SettlementEffects::default()
+                .kv_put(status_key(run_id), b"received")
+                .kv_put(pending_key(run_id), b"1"),
             ..Default::default()
         })
         .await?;

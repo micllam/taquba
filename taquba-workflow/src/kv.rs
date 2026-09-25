@@ -8,16 +8,15 @@ use crate::error::Result;
 /// Read access to Taquba's caller KV namespace during a step.
 ///
 /// Obtained through [`Delivery::kv`](crate::Delivery::kv). [`get`](Self::get)
-/// answers from committed state: a value written by an earlier
-/// settlement (a previous step's [`EffectsHandle`](crate::EffectsHandle)
-/// writes, a [`RunSpec::kv_writes`](crate::RunSpec::kv_writes) entry, a
-/// direct [`taquba::Queue::kv_put`]) is visible, and an effect staged by
-/// the current step becomes visible only once this step's settlement
-/// commits it. The read is also not transactional with that settlement:
-/// a value read here can change before the step's outcome commits.
-/// Delivery is at-least-once, so a read that misses (for example a
-/// marker a crashed settlement never committed) re-executes work that
-/// must be idempotent downstream.
+/// reads from committed state: a value written by an earlier settlement (a
+/// previous step's [`EffectsHandle`](crate::EffectsHandle) writes, a
+/// [`RunSpec::effects`](crate::RunSpec::effects) write, a direct
+/// [`taquba::Queue::kv_put`]) is visible, and an effect staged by the current
+/// step becomes visible only once this step's settlement commits it. The read
+/// is also not transactional with that settlement: a value read here can change
+/// before the step's outcome commits. Delivery is at-least-once, so a read that
+/// misses (for example a marker a crashed settlement never committed)
+/// re-executes work that must be idempotent downstream.
 ///
 /// The handle is cheap to clone and exposes no write or settlement
 /// operation. Use [`KvReadHandle::detached`] when constructing a

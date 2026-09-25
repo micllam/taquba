@@ -137,27 +137,25 @@ queue, for tests.
 ## Submissions
 
 `WorkflowRuntime::submit` takes a `RunSpec`: the first step's `input`, an
-optional `run_id` (a `RunId`, validated at construction to 1 to
-`MAX_RUN_ID_LEN` bytes of `[A-Za-z0-9_-]`, and a ULID is generated when
-absent), the `RunOptions` of its steps (`headers`, a
-`priority` and `max_attempts_per_step` overriding the queue's defaults
-for every step and a `run_at` before which the first step is not
-claimable) and `kv_writes` applied with the enqueue. The returned
-`SubmitOutcome` names the run and the queue job currently representing
+optional `run_id` (a `RunId`, validated at construction to 1 to `MAX_RUN_ID_LEN`
+bytes of `[A-Za-z0-9_-]`, and a ULID is generated when absent), the `RunOptions`
+of its steps (`headers`, a `priority` and `max_attempts_per_step` overriding the
+queue's defaults for every step and a `run_at` before which the first step is
+not claimable) and the `effects` applied with the enqueue. The returned
+`SubmitOutcome` identifies the run and the queue job that currently represents
 it.
 
-`submit` is idempotent on `(run_id, input)`. A re-submission of an
-active run with the same input is a no-op and the returned
-`SubmitOutcome` has `newly_submitted = false`; one with a different
-input is rejected with `Error::InputMismatch`. Duplicates are caught by
-a durable per-run record written atomically with the step-0 enqueue
-(via Taquba's `enqueue_with_kv`), so they are caught across process
-restarts, even after step 0 has been claimed and its dedup key
-released. The record holds a SHA-256 of the original input for the
-mismatch check. A current-step pointer under `workflow/steps/` is
-written beside it, rewritten in the settlement that enqueues each next
-step and names the queue job `SubmitOutcome::job_id` reports for a
-duplicate. Both are removed when the run reaches a terminal state.
+`submit` is idempotent on `(run_id, input)`. A re-submission of an active run
+with the same input is a no-op and the returned `SubmitOutcome` has
+`newly_submitted = false`. A re-submission with a different input is rejected
+with `Error::InputMismatch`. Duplicates are caught by a durable per-run record
+written atomically with the step-0 enqueue (via Taquba's
+`enqueue_with_effects`), so they are caught across process restarts, even after
+step 0 is claimed and its dedup key is released. The record contains a SHA-256
+of the original input for the mismatch check. A current-step pointer under
+`workflow/steps/` is written with it, rewritten in the settlement that enqueues
+each next step and identifies the queue job that `SubmitOutcome::job_id` reports
+for a duplicate. Both are removed when the run reaches a terminal state.
 
 `WorkflowView::status` reads the record, the pointer and the step's queue job
 into a `RunStatus` (`Pending`, `Running` or `Cancelling`, with the current step
@@ -297,8 +295,8 @@ an outcome record) can be written to Taquba's caller KV namespace in the
 same transaction as the run's own transitions, so a crash cannot leave
 the two disagreeing. Two surfaces:
 
-- `RunSpec::kv_writes`: writes applied atomically with the step-0
-  enqueue. A duplicate submission drops its writes.
+- `RunSpec::effects`: a `taquba::SettlementEffects` applied atomically with the
+  step-0 enqueue. A duplicate submission drops its effects.
 - `Delivery::effects`: an `EffectsHandle` that stages writes and deletes
   during a step. Everything staged is applied in the settlement
   transaction that commits the outcome the runner returned, whichever

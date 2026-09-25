@@ -1,9 +1,8 @@
-//! The user KV namespace of a [`Queue`]: the value-size cap, the
-//! standalone and compare operations and the page type for scans.
-//! Caller-supplied keys are scoped under a reserved internal key tag,
-//! so they cannot collide with the queue's own layout. Writes coupled
-//! to a queue transition are [`Queue::enqueue_with_kv`] and the KV
-//! fields of [`SettlementEffects`](crate::SettlementEffects).
+//! The user KV namespace of a [`Queue`]: the value-size cap, the standalone and
+//! compare operations and the page type for scans. Caller-supplied keys are
+//! scoped under a reserved internal key tag, so they cannot collide with the
+//! queue's own layout. Writes coupled to a queue transition are the KV fields
+//! of [`SettlementEffects`](crate::SettlementEffects).
 
 use std::ops::{Bound, Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive};
 
@@ -150,8 +149,9 @@ impl Queue {
     /// call returns.
     ///
     /// This is the standalone form; to couple a KV write with a queue
-    /// transition in one transaction, use [`Self::enqueue_with_kv`] or
-    /// [`SettlementEffects::kv_writes`](crate::SettlementEffects::kv_writes) via [`Self::ack_with`].
+    /// transition in one transaction, pass it in the
+    /// [`SettlementEffects`](crate::SettlementEffects) of
+    /// [`Self::enqueue_with_effects`] or [`Self::ack_with`].
     pub async fn kv_put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         validate_kv_value_size(value)?;
         let handle = self.core.db.put(user_scoped_key(key), value).await?;
@@ -572,11 +572,14 @@ mod tests {
         let store = make_store();
         let q = Queue::open(store.clone(), "test").await.unwrap();
         q.kv_put(b"standalone", b"v1").await.unwrap();
-        let mut kv = HashMap::new();
-        kv.insert(b"coupled".to_vec(), b"v2".to_vec());
-        q.enqueue_with_kv("jobs", b"p".to_vec(), EnqueueOptions::default(), kv)
-            .await
-            .unwrap();
+        q.enqueue_with_effects(
+            "jobs",
+            b"p".to_vec(),
+            EnqueueOptions::default(),
+            SettlementEffects::default().kv_put(b"coupled", b"v2"),
+        )
+        .await
+        .unwrap();
         drop(q);
 
         let q = Queue::open(store, "test").await.unwrap();
@@ -601,11 +604,12 @@ mod tests {
 
         // A user key that matches a real internal key byte-for-byte is
         // scoped under the user tag and cannot interfere with queue state.
-        q.enqueue_with_kv(
+        q.enqueue_with_effects(
             "other",
             b"sentinel".to_vec(),
             EnqueueOptions::default(),
-            HashMap::from([(pending_key(&qn("work"), 1, "fake-id"), b"trickery".to_vec())]),
+            SettlementEffects::default()
+                .kv_put(pending_key(&qn("work"), 1, "fake-id"), b"trickery"),
         )
         .await
         .unwrap();

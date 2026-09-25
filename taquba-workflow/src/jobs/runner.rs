@@ -12,7 +12,7 @@ use crate::{
     RunOptions, RunSpec, RunnerHandle, Step, StepError, StepOutcome, StepRunner, WorkflowRuntime,
 };
 use taquba::object_store::ObjectStore;
-use taquba::{Clock, Queue};
+use taquba::{Clock, Queue, SettlementEffects};
 
 use crate::Result;
 use crate::jobs::context::{JobContext, State};
@@ -227,7 +227,7 @@ impl JobRunner {
                         .or_else(|| job.max_attempts()),
                     ..options
                 },
-                kv_writes: HashMap::new(),
+                effects: SettlementEffects::default(),
             })
             .await?;
         tracing::debug!(

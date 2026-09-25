@@ -109,11 +109,11 @@ pub struct Delivery {
     ///
     /// See [`EffectsHandle`] for the staging rules.
     pub effects: EffectsHandle,
-    /// Read access to the caller KV namespace. A committed value (an
-    /// earlier step's applied effect, a [`crate::RunSpec::kv_writes`]
-    /// entry, a direct [`taquba::Queue::kv_put`]) is readable here;
-    /// effects staged by this step become readable only after it
-    /// settles. The intended use is a read-then-stage marker check:
+    /// Read access to the caller KV namespace. A committed value (an earlier
+    /// step's applied effect, a [`crate::RunSpec::effects`] write, a direct
+    /// [`taquba::Queue::kv_put`]) is readable here. Effects staged by this step
+    /// become readable only after it settles. The intended use is a
+    /// read-then-stage marker check:
     ///
     /// ```ignore
     /// if step.kv.get(b"app/indexed/doc-1").await?.is_none() {

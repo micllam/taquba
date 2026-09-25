@@ -35,10 +35,10 @@ embedded library whose state is in object storage. Its distinguishing
 properties:
 
 - **Transactional coordination without a database.** One transaction can
-  acknowledge a job, enqueue its follow-up jobs and update caller-owned
-  durable KV state (`ack_with`, `enqueue_with_kv`), so state machines
-  built on the queue remain consistent across crashes without an outbox or
-  a second datastore.
+  acknowledge a job, enqueue its follow-up jobs and update caller-owned durable
+  KV state (`ack_with`, `enqueue_with_effects`), so state machines built on the
+  queue remain consistent across crashes without an outbox or a second
+  datastore.
 - **Data residency by construction.** Records are written only to the
   bucket you configure.
 

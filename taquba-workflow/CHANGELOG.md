@@ -35,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `WorkflowRuntimeBuilder::group_retention` accept a window shorter than one
   millisecond, so a zero window removes the state at the next pass. 0.12
   panicked on such a window.
+- `RunSpec::kv_writes` becomes `RunSpec::effects`, a
+  `taquba::SettlementEffects`, so a submission commits enqueues, KV deletes and
+  expiry entries with the step-0 enqueue and drops them on a duplicate
+  submission as it drops the KV writes. Build the field with
+  `SettlementEffects::default().kv_writes(map)`.
 
 ## [0.12.0] - 2026-09-16
 

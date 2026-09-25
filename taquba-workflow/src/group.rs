@@ -382,7 +382,7 @@ impl RunGroup {
                         run_id: Some(membership.run_id()),
                         input: member.input,
                         options: options.clone(),
-                        kv_writes: HashMap::new(),
+                        effects: SettlementEffects::default(),
                     },
                 )
                 .await

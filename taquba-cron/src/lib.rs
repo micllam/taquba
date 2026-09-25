@@ -195,7 +195,7 @@ use std::time::Duration;
 use chrono::{DateTime, TimeDelta, Timelike, Utc};
 use croner::Cron;
 use croner::parser::{CronParser, Seconds};
-use taquba::{EnqueueOptions, EnqueueResult, Queue, WorkerHandle};
+use taquba::{EnqueueOptions, EnqueueResult, Queue, SettlementEffects, WorkerHandle};
 use tokio::sync::Notify;
 use tokio::time::sleep;
 use tracing::{debug, error, warn};
@@ -892,10 +892,10 @@ impl CronScheduler {
         if entry.backfill.is_some() {
             let key = watermark_key(&entry.name);
             let value = fire_ms.to_string().into_bytes();
-            let writes = HashMap::from([(key.clone(), value.clone())]);
-            let result = self
+            let effects = SettlementEffects::default().kv_put(key.clone(), value.clone());
+            let (result, _) = self
                 .queue
-                .enqueue_with_kv(&entry.queue, entry.payload.clone(), opts, writes)
+                .enqueue_with_effects(&entry.queue, entry.payload.clone(), opts, effects)
                 .await?;
             if matches!(result, EnqueueResult::AlreadyEnqueued(_)) {
                 self.queue.kv_put(&key, &value).await?;

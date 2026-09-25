@@ -51,10 +51,9 @@ pub enum Error {
     #[error("run `{0}` has inconsistent durable state")]
     InconsistentRunState(RunId),
 
-    /// A caller KV key passed via [`crate::RunSpec::kv_writes`] or staged
-    /// through an [`crate::EffectsHandle`] starts with the reserved
-    /// `workflow/` prefix. The runtime owns that prefix; callers must use
-    /// any other key.
+    /// A caller KV key passed via [`crate::RunSpec::effects`] or staged through
+    /// an [`crate::EffectsHandle`] starts with the reserved `workflow/` prefix.
+    /// The runtime owns that prefix. A caller must use another key.
     #[error("kv key `{0}` uses the reserved `workflow/` prefix")]
     ReservedKvKey(String),
 

@@ -281,11 +281,12 @@ limit further, the lock being per queue.
 
 ## Coordinating with caller state
 
-`Queue::enqueue_with_kv` enqueues a job *and* applies a set of writes to a
-caller-owned KV namespace in a single transaction, so a downstream crate can
-keep its own durable coordination state (status markers, dedup records,
-pointers to externally-stored blobs) consistent with the queue across crashes.
-`QueueView::kv_get` and `Queue::kv_delete` read and clean up those entries.
+`Queue::enqueue_with_effects` enqueues a job *and* applies the KV writes of a
+`SettlementEffects` to a caller-owned KV namespace in a single transaction, so a
+downstream crate can keep its own durable coordination state (status markers,
+dedup records, pointers to externally-stored blobs) consistent with the queue
+across crashes. `QueueView::kv_get` and `Queue::kv_delete` read and clean up
+those entries.
 
 Caller keys live under a reserved user key tag internally so they cannot
 collide with Taquba's own layout. Per-value size is capped at
@@ -295,10 +296,10 @@ content-addressed key and put only the pointer in KV.
 
 The primary pattern couples KV mutations to queue operations: to create or
 update an entry atomically with a queue transition, include it in the
-`kv_writes` map of an `enqueue_with_kv` or `ack_with` call. Note the dedup
-interaction: a `dedup_key` hit discards the accompanying `kv_writes`, so
-derive them deterministically from the dedup key (see the
-`enqueue_with_kv` docs).
+`SettlementEffects` of an `enqueue_with_effects` or `ack_with` call. Note the
+dedup interaction: a `dedup_key` hit discards the accompanying effects, so
+derive them deterministically from the dedup key (see the `enqueue_with_effects`
+docs).
 
 Standalone primitives exist for state whose lifecycle is not tied to a
 single queue transition: `Queue::kv_put` writes an entry durably on its own,
@@ -446,11 +447,10 @@ nothing about that process's workers. A clean `Queue::close` commits a
 final beat marked closed, so a stale closed beat distinguishes a
 deliberate shutdown from a writer whose process terminated.
 
-To make job outcomes observable across processes, settle them into the
-KV namespace: `Queue::ack_with` writes outcome entries atomically with
-the settlement (and `Queue::enqueue_with_kv` maps caller identifiers to
-job ids at submit), and the reader's `kv_get` / `kv_scan` serve them
-from any process.
+To make job outcomes observable across processes, settle them into the KV
+namespace: `Queue::ack_with` writes outcome entries atomically with the
+settlement (and `Queue::enqueue_with_effects` maps caller identifiers to job ids
+at submit), and the reader's `kv_get` / `kv_scan` read them from any process.
 
 ## License
 

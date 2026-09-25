@@ -1,10 +1,10 @@
 // cargo run -p taquba --example atomic_settlement
 //
-// Demonstrates transactional coordination between queue state and
-// caller-owned KV state, via `Queue::enqueue_with_kv`,
-// `Worker::process_with_effects`, and `Queue::ack_with`:
+// Demonstrates transactional coordination between queue state and caller-owned
+// KV state, via `Queue::enqueue_with_effects`, `Worker::process_with_effects`,
+// and `Queue::ack_with`:
 //
-// - Intake: `enqueue_with_kv` creates each order job and its durable
+// - Intake: `enqueue_with_effects` creates each order job and its durable
 //   status marker ("received") in one transaction, with a dedup key so
 //   a duplicate submission of the same order collapses onto the
 //   in-flight job.
@@ -24,7 +24,6 @@
 // or status update is missing, and no outbox pattern or second
 // datastore is involved.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -90,14 +89,12 @@ impl Worker for ConfirmationWorker {
 }
 
 async fn submit_order(q: &Queue, order_id: &str) -> taquba::Result<()> {
-    let mut kv = HashMap::new();
-    kv.insert(status_key(order_id), b"received".to_vec());
-    let outcome = q
-        .enqueue_with_kv(
+    let (outcome, _) = q
+        .enqueue_with_effects(
             ORDERS_QUEUE,
             order_id.as_bytes().to_vec(),
             EnqueueOptions::default().dedup_key(Some(format!("order:{order_id}"))),
-            kv,
+            SettlementEffects::default().kv_put(status_key(order_id), b"received"),
         )
         .await?;
     match outcome {

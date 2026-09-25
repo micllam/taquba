@@ -21,9 +21,9 @@ pub const HEADER_STEP: &str = "workflow.step";
 /// them as its own and strips them before invoking the runner.
 pub const RESERVED_HEADER_PREFIX: &str = "workflow.";
 
-/// Reserved prefix the runtime owns in the caller KV namespace. Keys
-/// passed via [`RunSpec::kv_writes`](crate::RunSpec::kv_writes) or staged through an
-/// [`crate::EffectsHandle`] must not start with this prefix; they are
+/// Reserved prefix the runtime owns in the caller KV namespace. Keys passed via
+/// [`RunSpec::effects`](crate::RunSpec::effects) or staged through an
+/// [`crate::EffectsHandle`] must not start with this prefix. Such a key is
 /// rejected with [`Error::ReservedKvKey`].
 pub const RESERVED_KV_PREFIX: &str = "workflow/";
 

@@ -191,8 +191,8 @@ impl Default for ReaderOptions {
 /// outcomes readable across processes by settling them into the user KV
 /// namespace: [`Queue::ack_with`](crate::Queue::ack_with) writes outcome
 /// entries atomically with the settlement (and
-/// [`Queue::enqueue_with_kv`](crate::Queue::enqueue_with_kv) maps caller
-/// identifiers to job ids at submit), and
+/// [`Queue::enqueue_with_effects`](crate::Queue::enqueue_with_effects) maps
+/// caller identifiers to job ids at submit), and
 /// [`QueueView::kv_get`](crate::QueueView::kv_get) /
 /// [`QueueView::kv_scan`](crate::QueueView::kv_scan) read them here.
 pub struct QueueReader {

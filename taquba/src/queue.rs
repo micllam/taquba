@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,7 +20,7 @@ use crate::job::{Claim, JobRecord, JobStatus};
 use crate::keys::{
     QueueName, claimed_key, dedup_index_key, job_index_key, pending_prefix, user_scoped_key,
 };
-use crate::kv::{kv_state_matches, validate_kv_value_size};
+use crate::kv::kv_state_matches;
 use crate::lease_registry::{LeaseRegistry, Renewal};
 use crate::options::{EnqueueOptions, OpenOptions, QueueConfig};
 use crate::payload_store::PayloadStore;
@@ -139,15 +138,15 @@ pub(crate) fn validate_id_override(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Outcome of [`Queue::enqueue_with_kv`].
+/// Outcome of [`Queue::enqueue_with_effects`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnqueueResult {
-    /// A new job was enqueued. The string is its freshly-allocated id.
-    /// The accompanying `kv_writes` map was applied atomically.
+    /// A new job was enqueued, with its effects. The string is the id of the
+    /// new job.
     New(String),
-    /// A pending or scheduled job with the same `dedup_key` already
-    /// existed; no new job was written and **no KV writes were applied**.
-    /// The string is the existing job's id.
+    /// A pending or scheduled job with the same `dedup_key` already existed. No
+    /// new job was written and the effects were not applied. The string is the
+    /// existing job's id.
     AlreadyEnqueued(String),
 }
 
@@ -486,23 +485,25 @@ impl Queue {
         opts: EnqueueOptions,
     ) -> Result<String> {
         let prepared = self.core.prepare_job_record(queue, payload, opts)?;
-        self.write_job(prepared, HashMap::new())
+        self.write_job(prepared, PreparedEffects::default())
             .await
-            .map(EnqueueResult::into_id)
+            .map(|(result, _)| result.into_id())
     }
 
-    /// Enqueue a job AND apply a set of writes to the user KV namespace
-    /// in a single transaction.
+    /// Enqueue a job and apply `effects` in one transaction.
     ///
-    /// On success ([`EnqueueResult::New`]), the job is enqueued and every
-    /// entry in `kv_writes` is applied atomically. On a `dedup_key` hit
-    /// ([`EnqueueResult::AlreadyEnqueued`]), **no KV writes are applied**
-    /// and the existing job's id is returned. Because a dedup hit
-    /// discards `kv_writes`, derive them deterministically from the
-    /// dedup key: a producer that retries after a crash then converges
-    /// on the winning submission's writes rather than diverging from
-    /// them. This is not an upsert; a KV write that must apply
-    /// regardless of the dedup outcome belongs in [`Self::kv_put`].
+    /// When the job is new ([`EnqueueResult::New`]), the job and every effect
+    /// commit together: the enqueues, the KV writes, the KV deletes and the
+    /// expiry entries, which are recorded on their
+    /// [`ExpiryIndex`](crate::ExpiryIndex) once the transaction commits. On a
+    /// `dedup_key` hit ([`EnqueueResult::AlreadyEnqueued`]) the effects are not
+    /// applied and the existing job's id is returned. Because a dedup hit
+    /// discards the effects, derive them from the dedup key: a producer that
+    /// retries after a crash then converges on the winning submission's writes.
+    /// A write that must apply regardless of the dedup outcome belongs in
+    /// [`Self::kv_put`] or [`Self::commit_effects`]. The second value returned
+    /// contains one [`EnqueueResult`] per enqueue of `effects`, in order, as
+    /// [`Self::ack_with`] returns them, and is empty on a dedup hit.
     ///
     /// Caller-supplied KV keys are internally scoped under a reserved
     /// user key tag so they cannot collide with Taquba's internal layout.
@@ -512,16 +513,15 @@ impl Queue {
     /// transaction begins. Conflict retries are handled internally.
     ///
     /// ```no_run
-    /// # use std::collections::HashMap;
     /// # use taquba::{EnqueueOptions, EnqueueResult};
+    /// # use taquba::SettlementEffects;
     /// # async fn ex(q: &taquba::Queue) -> taquba::Result<()> {
-    /// let mut kv = HashMap::new();
-    /// kv.insert(b"runs/abc".to_vec(), b"submitted".to_vec());
-    /// let outcome = q.enqueue_with_kv(
+    /// let effects = SettlementEffects::default().kv_put(b"runs/abc", b"submitted");
+    /// let (outcome, _) = q.enqueue_with_effects(
     ///     "workflow-steps",
     ///     b"step-0-payload".to_vec(),
     ///     EnqueueOptions::default().dedup_key("run:abc:0".to_string()),
-    ///     kv,
+    ///     effects,
     /// ).await?;
     /// match outcome {
     ///     EnqueueResult::New(id) => println!("submitted: {id}"),
@@ -529,29 +529,26 @@ impl Queue {
     /// }
     /// # Ok(()) }
     /// ```
-    #[instrument(skip(self, payload, kv_writes), fields(queue, job_id))]
-    pub async fn enqueue_with_kv(
+    #[instrument(skip(self, payload, effects), fields(queue, job_id))]
+    pub async fn enqueue_with_effects(
         &self,
         queue: &str,
         payload: Vec<u8>,
         opts: EnqueueOptions,
-        kv_writes: HashMap<Vec<u8>, Vec<u8>>,
-    ) -> Result<EnqueueResult> {
-        for value in kv_writes.values() {
-            validate_kv_value_size(value)?;
-        }
-
+        effects: SettlementEffects,
+    ) -> Result<(EnqueueResult, Vec<EnqueueResult>)> {
         let prepared = self.core.prepare_job_record(queue, payload, opts)?;
-        self.write_job(prepared, kv_writes).await
+        let effects = self.core.prepare_effects(effects).await?;
+        self.write_job(prepared, effects).await
     }
 
-    /// Apply `effects` as one transaction with no job transition: the
-    /// enqueues, the KV writes and the KV deletes commit together or not
-    /// at all. Returns one [`EnqueueResult`] per enqueue, in order; an
-    /// enqueue whose `dedup_key` matches a pending or scheduled job is
-    /// reported as [`EnqueueResult::AlreadyEnqueued`] while the rest of
-    /// the effects still apply, unlike [`Self::enqueue_with_kv`], whose
-    /// writes belong to the one job it enqueues.
+    /// Apply `effects` as one transaction without a job transition: the
+    /// enqueues, the KV writes and the KV deletes commit together or not at
+    /// all. Returns one [`EnqueueResult`] per enqueue, in order. An enqueue
+    /// whose `dedup_key` matches a pending or scheduled job is reported as
+    /// [`EnqueueResult::AlreadyEnqueued`] while the rest of the effects still
+    /// apply, unlike [`Self::enqueue_with_effects`], whose effects belong to
+    /// the one job it enqueues.
     ///
     /// The effects of a claim's own settlement belong on [`Self::ack_with`]
     /// and the other `*_with` settlements. This method is for state a
@@ -635,44 +632,54 @@ impl Queue {
         fetched.into_iter().collect()
     }
 
-    /// Persist a prepared [`JobRecord`], optionally checking a dedup index
-    /// and caller-supplied id uniqueness, and optionally applying
-    /// additional KV writes, all in a single transaction. Retries on
-    /// transaction conflict.
+    /// Persist a prepared [`JobRecord`] with its prepared `effects` in a single
+    /// transaction, checking the dedup index and, for a caller-supplied id, the
+    /// job index. Retries on transaction conflict.
     ///
-    /// Returns [`EnqueueResult::AlreadyEnqueued`] (with **no** KV writes
-    /// applied) if `job.dedup_key` is set and a pending or scheduled job
-    /// with the same dedup key already exists. Returns
-    /// [`Error::DuplicateJobId`] if `id_override` was used and the id is
-    /// already indexed. Otherwise writes the record + job index + (when set)
-    /// dedup index + every entry in `kv_writes`, and returns
-    /// [`EnqueueResult::New`].
+    /// Returns [`EnqueueResult::AlreadyEnqueued`] without the effects if
+    /// `job.dedup_key` is set and a pending or scheduled job with the same
+    /// dedup key already exists. Returns [`Error::DuplicateJobId`] if
+    /// `id_override` was used and the id is already indexed. Otherwise writes
+    /// the record, the job index, the dedup index (when set) and the effects,
+    /// and returns [`EnqueueResult::New`] with the results of the effects'
+    /// enqueues. Every branch ends with [`QueueCore::finish_effects`].
     async fn write_job(
         &self,
         mut prepared: PreparedJob,
-        kv_writes: HashMap<Vec<u8>, Vec<u8>>,
-    ) -> Result<EnqueueResult> {
-        self.core.payload_store.offload(&mut prepared.job).await?;
-        let result = self.write_job_txn(&prepared, &kv_writes).await;
-        // A payload object is live only when a new record committed;
-        // on a dedup downgrade or an error the record does not exist,
-        // so remove the object written above.
-        if !matches!(result, Ok(EnqueueResult::New(_))) {
+        effects: PreparedEffects,
+    ) -> Result<(EnqueueResult, Vec<EnqueueResult>)> {
+        let written = match self.core.payload_store.offload(&mut prepared.job).await {
+            Ok(()) => self.write_job_txn(&prepared, &effects).await,
+            Err(err) => Err(err),
+        };
+        // A payload object is live only when a new record committed. On a dedup
+        // downgrade or an error the record does not exist, so remove the object
+        // written above.
+        if !matches!(written, Ok(Ok(_))) {
             self.core.payload_store.delete_for(&prepared.job).await;
         }
-        result
+        let results = match &written {
+            Ok(Ok((_, results))) => Some(results.as_slice()),
+            _ => None,
+        };
+        self.core.finish_effects(effects, results).await;
+        written.map(|written| match written {
+            Ok((id, results)) => (EnqueueResult::New(id), results),
+            Err(already_enqueued) => (EnqueueResult::AlreadyEnqueued(already_enqueued), Vec::new()),
+        })
     }
 
-    /// The transaction loop of [`Self::write_job`], after any payload
-    /// offload has happened.
+    /// The transaction loop of [`Self::write_job`], after any payload offload
+    /// has happened. The inner `Ok` is the id of the new job with the results
+    /// of the effects' enqueues, and the inner `Err` is the id of the pending
+    /// or scheduled job that a dedup key matched, as `stage_job_writes` reports
+    /// it.
     async fn write_job_txn(
         &self,
         prepared: &PreparedJob,
-        kv_writes: &HashMap<Vec<u8>, Vec<u8>>,
-    ) -> Result<EnqueueResult> {
+        effects: &PreparedEffects,
+    ) -> Result<std::result::Result<(String, Vec<EnqueueResult>), String>> {
         let timer = crate::obs::start();
-        // `Err` is the id of the pending or scheduled job that a dedup
-        // key matched, as `stage_job_writes` reports it.
         let written = retry(&self.core.db, Durability::Awaited, |txn| async move {
             let staged = match self.core.stage_job_writes(&txn, prepared).await? {
                 Ok(staged) => staged,
@@ -681,20 +688,15 @@ impl Queue {
                     return Ok(Attempt::Abort(Err(already_enqueued)));
                 }
             };
-            for (k, v) in kv_writes {
-                txn.put(user_scoped_key(k), v)?;
-            }
-            Ok(Attempt::Commit(txn, Ok(staged)))
+            let staged_effects = self.core.stage_effects(&txn, effects).await?;
+            Ok(Attempt::Commit(txn, Ok((staged, staged_effects))))
         })
         .await?;
-        match written {
-            Ok(staged) => {
-                crate::obs::enqueue_committed(&staged.queue, timer);
-                self.core.note_staged_job(&staged);
-                Ok(EnqueueResult::New(staged.id))
-            }
-            Err(already_enqueued) => Ok(EnqueueResult::AlreadyEnqueued(already_enqueued)),
-        }
+        Ok(written.map(|(staged, staged_effects)| {
+            crate::obs::enqueue_committed(&staged.queue, timer);
+            self.core.note_staged_job(&staged);
+            (staged.id, self.core.note_staged_effects(staged_effects))
+        }))
     }
 
     /// Claim the next pending job using the configured default lease duration.
@@ -1137,12 +1139,11 @@ impl Queue {
     /// a follow-up job exists only if this settlement won.
     ///
     /// Each enqueue in [`SettlementEffects::enqueues`] behaves exactly like
-    /// [`Self::enqueue_with`]: a `dedup_key` hit downgrades that
-    /// request to [`EnqueueResult::AlreadyEnqueued`] without affecting
-    /// the ack or the other effects, and a future `run_at` lands the
-    /// job in the scheduled key space. The returned results align
-    /// index-wise with `effects.enqueues`. KV writes and deletes
-    /// behave like [`Self::enqueue_with_kv`] and [`Self::kv_delete`].
+    /// [`Self::enqueue_with`]: a `dedup_key` hit downgrades that request to
+    /// [`EnqueueResult::AlreadyEnqueued`] without affecting the ack or the
+    /// other effects, and a future `run_at` lands the job in the scheduled key
+    /// space. The returned results align index-wise with `effects.enqueues`. KV
+    /// writes and deletes behave like [`Self::kv_put`] and [`Self::kv_delete`].
     #[instrument(skip(self, claim, effects), fields(queue = %claim.queue, job_id = %claim.id))]
     pub async fn ack_with(
         &self,
@@ -1779,6 +1780,7 @@ impl Queue {
 mod tests {
     use super::*;
     use crate::EnqueueRequest;
+    use crate::expiry::{Expired, ExpiryIndex};
     use crate::keys::MAX_QUEUE_NAME_LEN;
     use crate::kv::MAX_KV_VALUE_SIZE;
     use crate::options::{PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_NORMAL};
@@ -1953,7 +1955,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_enqueue_with_kv_duplicate_id_override_rejects_kv_writes() {
+    async fn enqueue_with_effects_with_a_duplicate_id_override_applies_no_effects() {
         let q = Queue::open(make_store(), "test").await.unwrap();
 
         q.enqueue_with(
@@ -1968,14 +1970,14 @@ mod tests {
         .unwrap();
 
         let err = q
-            .enqueue_with_kv(
+            .enqueue_with_effects(
                 "email",
                 b"second".to_vec(),
                 EnqueueOptions {
                     id_override: Some("duplicate-kv-id".to_string()),
                     ..EnqueueOptions::default()
                 },
-                HashMap::from([(b"meta/duplicate".to_vec(), b"written".to_vec())]),
+                SettlementEffects::default().kv_put(b"meta/duplicate", b"written"),
             )
             .await
             .unwrap_err();
@@ -2977,23 +2979,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_enqueue_with_kv_new_writes_apply() {
+    async fn enqueue_with_effects_applies_the_effects_with_a_new_job() {
         let q = Queue::open(make_store(), "test").await.unwrap();
-        let mut kv = HashMap::new();
-        kv.insert(b"runs/abc".to_vec(), b"submitted".to_vec());
+        let index = ExpiryIndex::new(b"expiry/".to_vec());
+        q.kv_put(b"runs/old", b"stale").await.unwrap();
+        // The bound of the index is 5_000 before the enqueue, so a pass reads
+        // the entry at 1_000 only if the enqueue records it.
+        q.commit_effects(SettlementEffects::default().expiry_entry(&index, 5_000, b"later"))
+            .await
+            .unwrap();
 
-        let outcome = q
-            .enqueue_with_kv("work", b"payload".to_vec(), EnqueueOptions::default(), kv)
+        let (outcome, results) = q
+            .enqueue_with_effects(
+                "work",
+                b"payload".to_vec(),
+                EnqueueOptions::default(),
+                SettlementEffects::default()
+                    .enqueue(EnqueueRequest {
+                        queue: "next".to_string(),
+                        payload: b"follow-up".to_vec(),
+                        options: EnqueueOptions::default(),
+                    })
+                    .kv_put(b"runs/abc", b"submitted")
+                    .kv_delete(b"runs/old")
+                    .expiry_entry(&index, 1_000, b"abc"),
+            )
             .await
             .unwrap();
         let id = match outcome {
             EnqueueResult::New(id) => id,
             other => panic!("expected New, got {other:?}"),
         };
+        assert!(matches!(results.as_slice(), [EnqueueResult::New(_)]));
 
-        let s = q.view().stats("work").await.unwrap();
-        assert_eq!(s.pending, 1);
-
+        assert_eq!(q.view().stats("work").await.unwrap().pending, 1);
+        assert_eq!(q.view().stats("next").await.unwrap().pending, 1);
         let claimed = q
             .claim("work", Duration::from_secs(30))
             .await
@@ -3001,9 +3021,22 @@ mod tests {
             .unwrap();
         assert_eq!(claimed.id, id);
         assert_eq!(claimed.payload, b"payload");
+        assert_eq!(
+            q.view().kv_get(b"runs/abc").await.unwrap().as_deref(),
+            Some(b"submitted".as_slice())
+        );
+        assert!(q.view().kv_get(b"runs/old").await.unwrap().is_none());
 
-        let v = q.view().kv_get(b"runs/abc").await.unwrap();
-        assert_eq!(v.as_deref(), Some(b"submitted".as_slice()));
+        let mut seen = Vec::new();
+        let removed = index
+            .pass(&q, 5_000, Duration::ZERO, |at_ms, suffix| {
+                seen.push((at_ms, suffix));
+                std::future::ready(Expired::Delete(SettlementEffects::default()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(seen, [(1_000, b"abc".to_vec()), (5_000, b"later".to_vec())]);
 
         q.close().await.unwrap();
     }
@@ -3137,18 +3170,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_enqueue_with_kv_dedup_hit_skips_kv_writes() {
+    async fn enqueue_with_effects_applies_no_effects_on_a_dedup_hit() {
         let q = Queue::open(make_store(), "test").await.unwrap();
+        let index = ExpiryIndex::new(b"expiry/".to_vec());
+        let opts = || EnqueueOptions {
+            dedup_key: Some("run-abc".into()),
+            ..Default::default()
+        };
 
-        let first_outcome = q
-            .enqueue_with_kv(
+        let (first_outcome, _) = q
+            .enqueue_with_effects(
                 "work",
                 b"first".to_vec(),
-                EnqueueOptions {
-                    dedup_key: Some("run-abc".into()),
-                    ..Default::default()
-                },
-                HashMap::from([(b"runs/abc".to_vec(), b"first-record".to_vec())]),
+                opts(),
+                SettlementEffects::default().kv_put(b"runs/abc", b"first-record"),
             )
             .await
             .unwrap();
@@ -3157,15 +3192,19 @@ mod tests {
             other => panic!("expected New, got {other:?}"),
         };
 
-        let second_outcome = q
-            .enqueue_with_kv(
+        let (second_outcome, results) = q
+            .enqueue_with_effects(
                 "work",
                 b"second".to_vec(),
-                EnqueueOptions {
-                    dedup_key: Some("run-abc".into()),
-                    ..Default::default()
-                },
-                HashMap::from([(b"runs/abc".to_vec(), b"second-record".to_vec())]),
+                opts(),
+                SettlementEffects::default()
+                    .enqueue(EnqueueRequest {
+                        queue: "next".to_string(),
+                        payload: b"follow-up".to_vec(),
+                        options: EnqueueOptions::default(),
+                    })
+                    .kv_put(b"runs/abc", b"second-record")
+                    .expiry_entry(&index, 1_000, b"abc"),
             )
             .await
             .unwrap();
@@ -3173,29 +3212,35 @@ mod tests {
             EnqueueResult::AlreadyEnqueued(id) => assert_eq!(id, first_id),
             other => panic!("expected AlreadyEnqueued, got {other:?}"),
         }
+        assert!(results.is_empty());
 
-        // Only one job was enqueued.
-        let s = q.view().stats("work").await.unwrap();
-        assert_eq!(s.pending, 1);
-
-        // First write applied; second was a dedup hit so it did NOT
-        // overwrite the KV value.
-        let v = q.view().kv_get(b"runs/abc").await.unwrap();
-        assert_eq!(v.as_deref(), Some(b"first-record".as_slice()));
+        assert_eq!(q.view().stats("work").await.unwrap().pending, 1);
+        assert_eq!(q.view().stats("next").await.unwrap().pending, 0);
+        assert_eq!(
+            q.view().kv_get(b"runs/abc").await.unwrap().as_deref(),
+            Some(b"first-record".as_slice())
+        );
+        assert!(
+            q.view()
+                .kv_get(&index.entry_key(1_000, b"abc"))
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         q.close().await.unwrap();
     }
 
     #[tokio::test]
-    async fn test_enqueue_with_kv_rejects_oversized_value() {
+    async fn enqueue_with_effects_rejects_an_oversized_value() {
         let q = Queue::open(make_store(), "test").await.unwrap();
         let oversized = vec![0u8; MAX_KV_VALUE_SIZE + 1];
         let err = q
-            .enqueue_with_kv(
+            .enqueue_with_effects(
                 "work",
                 b"x".to_vec(),
                 EnqueueOptions::default(),
-                HashMap::from([(b"big".to_vec(), oversized)]),
+                SettlementEffects::default().kv_put(b"big", oversized),
             )
             .await
             .unwrap_err();

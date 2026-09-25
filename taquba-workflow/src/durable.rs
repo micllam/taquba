@@ -79,12 +79,11 @@ use crate::runner::{StepErrorKind, StepOutcome, Trigger};
 use crate::terminal::{RunOutcome, TerminalStatus};
 
 /// Durable per-run record written atomically with the step-0 enqueue in
-/// [`WorkflowRuntime::submit`] via [`Queue::enqueue_with_kv`]. Carries
-/// just enough state to detect duplicate submissions across runtime
-/// restarts, to reject re-submissions that change the input and to
-/// carry a cancellation request to the run's next step. Deleted with
-/// the settlement that terminates the run, staged in
-/// `terminate_collecting_effects`.
+/// [`WorkflowRuntime::submit`] via [`Queue::enqueue_with_effects`]. It contains
+/// just enough state to detect duplicate submissions across runtime restarts,
+/// to reject re-submissions that change the input and to record a cancellation
+/// request for the run's next step. Deleted with the settlement that terminates
+/// the run, staged in `terminate_collecting_effects`.
 ///
 /// `run_id` keeps the record self-describing for ad hoc operator
 /// inspection; `submitted_at_ms` is useful for ordering and stale-record

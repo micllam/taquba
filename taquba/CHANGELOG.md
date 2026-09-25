@@ -46,6 +46,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   due, from the earliest such job, so an idle queue does not read from
   the store at the scheduler interval. The done retention sweep reads
   the done key space the same way, at the reaper interval.
+- `Queue::enqueue_with_kv` becomes `Queue::enqueue_with_effects`, which takes a
+  `SettlementEffects` in place of the map of KV writes and returns the job's
+  `EnqueueResult` paired with the results of the effects' enqueues, so the
+  enqueues, the KV deletes and the expiry entries of a submission commit with a
+  new job and are dropped on a `dedup_key` hit as the KV writes are. Pass
+  `SettlementEffects::default().kv_writes(map)` and read the job's result from
+  the first value of the pair.
 
 ## [0.13.0] - 2026-09-16
 

@@ -104,14 +104,15 @@ pub struct RunSpec {
     pub input: Vec<u8>,
     /// The settings of the run's steps.
     pub options: RunOptions,
-    /// Writes applied to the caller KV namespace in the same transaction
-    /// as the step-0 enqueue. Applied only when the submission is new: a
-    /// duplicate submission's writes are dropped, and the writes do not
-    /// participate in the duplicate-submission input check. Keys must
-    /// not start with the reserved `workflow/` prefix
-    /// ([`RESERVED_KV_PREFIX`]); values are capped at
+    /// Effects applied in the same transaction as the step-0 enqueue, as
+    /// [`taquba::Queue::enqueue_with_effects`] applies them: the enqueues, the
+    /// KV writes, the KV deletes and the expiry entries. Applied only when the
+    /// submission is new: a duplicate submission's effects are dropped, and the
+    /// effects do not participate in the duplicate-submission input check. A KV
+    /// key written or deleted must not start with the reserved `workflow/`
+    /// prefix ([`RESERVED_KV_PREFIX`]). Values are capped at
     /// [`taquba::MAX_KV_VALUE_SIZE`].
-    pub kv_writes: HashMap<Vec<u8>, Vec<u8>>,
+    pub effects: SettlementEffects,
 }
 
 /// Outcome of [`WorkflowRuntime::submit`].
@@ -725,7 +726,8 @@ impl RuntimeCore {
                 return Err(Error::ReservedHeaderInSubmit(k.clone()));
             }
         }
-        for key in spec.kv_writes.keys() {
+        let deletes = spec.effects.kv_deletes.iter();
+        for key in spec.effects.kv_writes.keys().chain(deletes) {
             if key.starts_with(RESERVED_KV_PREFIX.as_bytes()) {
                 return Err(Error::ReservedKvKey(
                     String::from_utf8_lossy(key).into_owned(),
@@ -785,11 +787,12 @@ impl RuntimeCore {
             input_hash,
             cancel_requested: false,
         });
-        let mut kv = spec.kv_writes;
-        kv.insert(run_kv_key(run_id), record_bytes);
-        kv.insert(step_kv_key(run_id), current_step_bytes(0, &job_id));
+        let mut effects = spec
+            .effects
+            .kv_put(run_kv_key(run_id), record_bytes)
+            .kv_put(step_kv_key(run_id), current_step_bytes(0, &job_id));
         if let Some(membership) = membership {
-            kv.insert(
+            effects = effects.kv_put(
                 membership.kv_key(),
                 durable::encode(&pending_member(run_id)),
             );
@@ -797,8 +800,9 @@ impl RuntimeCore {
 
         let job_id = match self
             .queue
-            .enqueue_with_kv(&request.queue, request.payload, request.options, kv)
+            .enqueue_with_effects(&request.queue, request.payload, request.options, effects)
             .await?
+            .0
         {
             EnqueueResult::New(id) => id,
             // A concurrent submission committed first; its record holds
@@ -1325,9 +1329,9 @@ mod tests {
     use crate::view::WorkflowView;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use taquba::ExpiryIndex;
     use taquba::object_store::ObjectStoreExt;
     use taquba::object_store::memory::InMemory;
+    use taquba::{Expired, ExpiryIndex};
     use taquba::{LeaseHandle, MockClock, OpenOptions, QueueConfig, QueueReader};
     use tokio::sync::oneshot;
 
@@ -2229,7 +2233,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_duplicate_submit_is_idempotent_drops_its_kv_writes_and_rejects_a_changed_input() {
+    async fn a_duplicate_submit_is_idempotent_drops_its_effects_and_rejects_a_changed_input() {
         let (queue, store) = open_queue().await;
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -2243,7 +2247,7 @@ mod tests {
         let spec = |input: &[u8], key: &[u8]| RunSpec {
             run_id: Some(rid("fixed-id")),
             input: input.to_vec(),
-            kv_writes: HashMap::from([(key.to_vec(), b"1".to_vec())]),
+            effects: SettlementEffects::default().kv_put(key, b"1"),
             ..Default::default()
         };
 
@@ -3505,12 +3509,65 @@ mod tests {
         let err = runtime
             .submit(RunSpec {
                 input: Vec::new(),
-                kv_writes: HashMap::from([(b"workflow/x".to_vec(), b"v".to_vec())]),
+                effects: SettlementEffects::default().kv_put(b"workflow/x", b"v"),
                 ..Default::default()
             })
             .await
             .unwrap_err();
         assert!(matches!(err, Error::ReservedKvKey(_)));
+
+        let err = runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                effects: SettlementEffects::default().kv_delete(b"workflow/x"),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::ReservedKvKey(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn submit_applies_the_deletes_and_expiry_entries_of_the_spec() {
+        let (queue, store, _clock) = open_queue_at(10_000).await;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            ScriptedRunner::new(vec![]),
+            ChannelHook { tx },
+        )
+        .build();
+        let index = ExpiryIndex::new(b"app/expiry/".to_vec());
+        queue.kv_put(b"app/stale", b"1").await.unwrap();
+        // An entry at 9_000 sets the bound of the index, so a pass reads the
+        // entry at 8_000 only if the submit records it.
+        queue
+            .commit_effects(SettlementEffects::default().expiry_entry(&index, 9_000, b"later"))
+            .await
+            .unwrap();
+
+        runtime
+            .submit(RunSpec {
+                input: b"x".to_vec(),
+                effects: SettlementEffects::default()
+                    .kv_delete(b"app/stale")
+                    .expiry_entry(&index, 8_000, b"run"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(queue.view().kv_get(b"app/stale").await.unwrap().is_none());
+        let mut seen = Vec::new();
+        index
+            .pass(&queue, 10_000, Duration::ZERO, |at_ms, suffix| {
+                seen.push((at_ms, suffix));
+                std::future::ready(Expired::Delete(SettlementEffects::default()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(seen, [(8_000, b"run".to_vec()), (9_000, b"later".to_vec())]);
     }
 
     #[tokio::test(start_paused = true)]
