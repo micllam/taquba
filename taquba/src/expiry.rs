@@ -26,7 +26,7 @@ const PAGE_SIZE: usize = 256;
 /// commit in the transaction that deletes the entry.
 ///
 /// The index keeps in memory the earliest time of an entry that a pass
-/// did not read, and a pass returns without a read until that time is
+/// did not remove, and a pass returns without a read until that time is
 /// due. [`entry_key`](Self::entry_key) lowers the time, so the writers
 /// of an index and its pass share one `ExpiryIndex`. An entry written
 /// with a key built elsewhere is removed at most one `retention` after
@@ -34,8 +34,28 @@ const PAGE_SIZE: usize = 256;
 #[derive(Debug)]
 pub struct ExpiryIndex {
     prefix: Vec<u8>,
-    /// The earliest time of an entry that a pass did not read.
+    /// The earliest time of an entry that a pass did not remove.
+    ///
+    /// Invariant: the bound does not exceed the time of any entry in
+    /// the index whose key `entry_key` built. A pass raises the bound on
+    /// the evidence of its scan alone: every entry before the new value
+    /// is read and removed.
     bound: AtomicU64,
+}
+
+/// Lowers the bound of an index to `left` when a pass ends, on the
+/// return, the error and the drop of the pass future alike.
+struct PassGuard<'a> {
+    bound: &'a AtomicU64,
+    /// The bound before the pass, which is due, until the scan
+    /// completes and the pass stores the time it established.
+    left: u64,
+}
+
+impl Drop for PassGuard<'_> {
+    fn drop(&mut self) {
+        self.bound.fetch_min(self.left, Ordering::SeqCst);
+    }
 }
 
 /// The outcome of one entry in a pass, returned by the callback.
@@ -54,9 +74,8 @@ pub enum Expired {
         /// The effects committed with the entry delete on a match.
         effects: SettlementEffects,
     },
-    /// Leave the entry and continue the pass. The entry is read again
-    /// by the next pass that reads the index, at the latest one
-    /// `retention` after this pass.
+    /// Leave the entry and continue the pass. The next pass reads the
+    /// entry again.
     Keep,
 }
 
@@ -99,8 +118,9 @@ impl ExpiryIndex {
     /// Returns the count of entries removed through `clear`. A key with
     /// fewer than 8 bytes after the prefix is deleted without a call. A
     /// pass before an entry can be due returns without a read. A KV
-    /// failure ends the pass with the error, and the next pass reads
-    /// the entries left.
+    /// failure ends the pass with the error. The next pass reads the
+    /// entries that a failed pass, or a pass whose future is dropped,
+    /// did not remove.
     pub async fn pass<F, Fut>(
         &self,
         queue: &Queue,
@@ -117,8 +137,12 @@ impl ExpiryIndex {
         if !due(self.bound.load(Ordering::SeqCst)) {
             return Ok(0);
         }
-        // An `entry_key` call during the pass lowers the bound again.
-        self.bound.store(u64::MAX, Ordering::SeqCst);
+        // An `entry_key` call during the pass lowers the bound below the
+        // time the guard stores at the end.
+        let mut guard = PassGuard {
+            bound: &self.bound,
+            left: self.bound.swap(u64::MAX, Ordering::SeqCst),
+        };
         let mut removed = 0;
         let mut left = now_ms;
         let mut entries = pin!(queue.view().kv_entries(&self.prefix, .., PAGE_SIZE));
@@ -154,10 +178,10 @@ impl ExpiryIndex {
                     }
                     removed += 1;
                 }
-                Expired::Keep => {}
+                Expired::Keep => left = left.min(at_ms),
             }
         }
-        self.bound.fetch_min(left, Ordering::SeqCst);
+        guard.left = left;
         Ok(removed)
     }
 }
@@ -165,6 +189,7 @@ impl ExpiryIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv::MAX_KV_VALUE_SIZE;
     use crate::test_util::*;
 
     const RETENTION: Duration = Duration::from_millis(1_000);
@@ -278,26 +303,100 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keep_leaves_the_entry_and_the_next_read_is_one_retention_after_the_pass() {
+    async fn keep_leaves_the_entry_and_the_next_pass_reads_it_again() {
         let q = Queue::open(make_store(), "test").await.unwrap();
         let index = ExpiryIndex::new(b"x/".to_vec());
         q.kv_put(&index.entry_key(1_000, b"a"), b"").await.unwrap();
-        let mut calls = 0;
+        q.kv_put(&index.entry_key(1_500, b"b"), b"").await.unwrap();
+        let mut kept = 0;
 
-        for now_ms in [2_000, 2_999, 3_000] {
+        for now_ms in [2_500, 2_999, 3_000] {
             index
-                .pass(&q, now_ms, RETENTION, |_, _| {
-                    calls += 1;
-                    std::future::ready(Expired::Keep)
+                .pass(&q, now_ms, RETENTION, |_, suffix| {
+                    if suffix == b"a" {
+                        kept += 1;
+                        std::future::ready(Expired::Keep)
+                    } else {
+                        std::future::ready(Expired::Delete(SettlementEffects::default()))
+                    }
                 })
                 .await
                 .unwrap();
         }
 
-        // The pass at 2_000 reads the entry, the pass at 2_999 is before
-        // the bound is due and the pass at 3_000 reads the entry again.
-        assert_eq!(calls, 2);
+        // The bound stays at the kept entry's time, so the entry removed
+        // after it does not defer the next read.
+        assert_eq!(kept, 3);
         assert_eq!(suffixes(&q, &index, b"x/").await, [b"a".to_vec()]);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_kv_failure_ends_the_pass_and_the_next_pass_reads_the_entries_left() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let index = ExpiryIndex::new(b"x/".to_vec());
+        q.kv_put(&index.entry_key(1_000, b"a"), b"").await.unwrap();
+        q.kv_put(&index.entry_key(2_000, b"b"), b"").await.unwrap();
+
+        // The effects of the first entry fail the commit.
+        let err = index
+            .pass(&q, 3_000, RETENTION, |_, _| {
+                std::future::ready(Expired::Delete(
+                    SettlementEffects::default().kv_put(b"big", vec![0u8; MAX_KV_VALUE_SIZE + 1]),
+                ))
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::KvValueTooLarge { .. }));
+
+        let mut seen = Vec::new();
+        let removed = index
+            .pass(&q, 3_000, RETENTION, |_, suffix| {
+                seen.push(suffix);
+                std::future::ready(Expired::Delete(SettlementEffects::default()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(seen, [b"a".to_vec(), b"b".to_vec()]);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dropped_pass_future_leaves_the_bound_at_the_entries_left() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let index = ExpiryIndex::new(b"x/".to_vec());
+        q.kv_put(&index.entry_key(1_000, b"a"), b"").await.unwrap();
+        q.kv_put(&index.entry_key(2_000, b"b"), b"").await.unwrap();
+
+        // The callback of the second entry never returns, and the pass
+        // future is dropped once it is reached.
+        let reached = tokio::sync::Notify::new();
+        let pass = index.pass(&q, 3_000, RETENTION, |at_ms, _| {
+            let reached = &reached;
+            async move {
+                if at_ms == 1_000 {
+                    return Expired::Delete(SettlementEffects::default());
+                }
+                reached.notify_one();
+                std::future::pending().await
+            }
+        });
+        tokio::select! {
+            _ = pass => unreachable!("the callback of the second entry never returns"),
+            () = reached.notified() => {}
+        }
+
+        let mut seen = Vec::new();
+        let removed = index
+            .pass(&q, 3_000, RETENTION, |_, suffix| {
+                seen.push(suffix);
+                std::future::ready(Expired::Delete(SettlementEffects::default()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(seen, [b"b".to_vec()]);
         q.close().await.unwrap();
     }
 
