@@ -1,6 +1,8 @@
+use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use slatedb::IsolationLevel;
 use slatedb::config::ScanOptions;
 use tracing::{debug, warn};
@@ -263,19 +265,42 @@ impl QueueCore {
             _ => return Err(Error::InvalidState),
         };
         let now = self.now_ms();
-        let min_cutoff = min_cutoff.map(|r| now.saturating_sub(r.as_millis() as u64));
 
-        let mut victims: Vec<(Vec<u8>, JobRecord)> = Vec::new();
-        let mut iter = self
-            .db
-            .scan_prefix_with_options(tag_prefix(tag), .., &sweep_scan_options())
-            .await?;
+        // The done scan runs from the done bound: a key at or after
+        // `now - max_retention` ends it, and a key the sweep leaves in
+        // place is retained, so the bound does not pass it.
+        let mut scan = None;
+        let mut iter = match min_cutoff {
+            Some(max_retention) => {
+                let retention_ms = u64::try_from(max_retention.as_millis()).unwrap_or(u64::MAX);
+                let Some(started) = self.done_bound.begin(now, retention_ms) else {
+                    return Ok(());
+                };
+                let start = Bytes::copy_from_slice(&started.from().to_be_bytes());
+                scan = Some(started);
+                self.db
+                    .scan_prefix_with_options(
+                        tag_prefix(tag),
+                        (Bound::Included(start), Bound::Unbounded),
+                        &sweep_scan_options(),
+                    )
+                    .await?
+            }
+            None => {
+                self.db
+                    .scan_prefix_with_options(tag_prefix(tag), .., &sweep_scan_options())
+                    .await?
+            }
+        };
+        let mut victims: Vec<(Vec<u8>, JobRecord, Option<u64>)> = Vec::new();
         while let Some(kv) = iter.next().await? {
-            if let Some(min_cutoff) = min_cutoff {
-                let Some(terminal_at_in_key) = parse_key_timestamp(&kv.key, tag) else {
+            let at_in_key = parse_key_timestamp(&kv.key, tag);
+            if let Some(scan) = &mut scan {
+                let Some(at_in_key) = at_in_key else {
                     continue;
                 };
-                if terminal_at_in_key >= min_cutoff {
+                if !scan.due(at_in_key) {
+                    scan.retain(at_in_key);
                     break;
                 }
             }
@@ -290,18 +315,29 @@ impl QueueCore {
             let Some(terminal_at) = terminal_at else {
                 continue;
             };
-            let Some(retention) = retention_for(&job.queue) else {
-                continue;
+            let retained = match retention_for(&job.queue) {
+                Some(retention) => terminal_at >= now.saturating_sub(retention.as_millis() as u64),
+                None => true,
             };
-            let cutoff = now.saturating_sub(retention.as_millis() as u64);
-            if terminal_at < cutoff {
-                victims.push((kv.key.to_vec(), job));
+            if retained {
+                if let (Some(scan), Some(at_in_key)) = (&mut scan, at_in_key) {
+                    scan.retain(at_in_key);
+                }
+                continue;
             }
+            victims.push((kv.key.to_vec(), job, at_in_key));
         }
         drop(iter);
 
-        for (key, job) in victims {
-            self.sweep_victim(&key, &job).await?;
+        for (key, job, at_in_key) in victims {
+            if !self.sweep_victim(&key, &job).await?
+                && let (Some(scan), Some(at_in_key)) = (&mut scan, at_in_key)
+            {
+                scan.retain(at_in_key);
+            }
+        }
+        if let Some(scan) = scan {
+            scan.complete();
         }
         Ok(())
     }
@@ -317,8 +353,9 @@ impl QueueCore {
     /// decrement. A conflicting commit leaves the victim to the next
     /// sweep. The payload object is deleted only after the commit, so a
     /// crash in between leaves an orphaned object, never a live record
-    /// whose payload is gone.
-    async fn sweep_victim(&self, key: &[u8], job: &JobRecord) -> Result<()> {
+    /// whose payload is gone. Returns `false` when a conflict left the
+    /// record in place.
+    async fn sweep_victim(&self, key: &[u8], job: &JobRecord) -> Result<bool> {
         let txn = self.db.begin(IsolationLevel::Snapshot).await?;
         let existed = txn.get(key).await?.is_some();
         if existed {
@@ -326,14 +363,14 @@ impl QueueCore {
         }
         match commit(txn, Durability::Deferred).await? {
             Commit::Committed => {}
-            Commit::Conflict => return Ok(()),
+            Commit::Conflict => return Ok(false),
         }
         if existed && let Some(payload_ref) = &job.payload_ref {
             self.payload_store
                 .delete_best_effort(payload_ref, &job.id)
                 .await;
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -822,6 +859,45 @@ mod tests {
             "long-retention queue must be untouched by the same sweep"
         );
 
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_ack_kept_after_an_empty_done_sweep_is_swept_at_its_expiry() {
+        let initial = 1_700_000_000_000_u64;
+        let clock = MockClock::new(initial);
+        let retention = Duration::from_millis(50);
+        let opts = OpenOptions {
+            default_queue_config: QueueConfig {
+                keep_done_jobs: Some(retention),
+                ..QueueConfig::default()
+            },
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+        let reaper = Reaper::new(Arc::clone(&q.core));
+
+        // A sweep over an empty done key space leaves the bound at the
+        // maximum, and the ack that follows lowers it.
+        reaper.step().await.unwrap();
+        q.enqueue("work", b"x".to_vec()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.ack(&job).await.unwrap();
+
+        clock.advance(retention);
+        reaper.step().await.unwrap();
+        assert!(q.view().get_job(&job.id).await.unwrap().is_some());
+
+        clock.advance(Duration::from_millis(1));
+        reaper.step().await.unwrap();
+        assert!(q.view().get_job(&job.id).await.unwrap().is_none());
         q.close().await.unwrap();
     }
 

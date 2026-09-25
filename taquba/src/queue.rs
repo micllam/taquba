@@ -333,6 +333,7 @@ impl Queue {
             configs: QueueConfigs::new(opts.default_queue_config, opts.queue_configs),
             claim_cursor: ClaimCursor::new(),
             scheduled_bound: TimeBound::new(),
+            done_bound: TimeBound::new(),
             lease_registry: LeaseRegistry::new(),
             completion_waiters: Arc::new(CompletionWaiters::default()),
             payload_store,

@@ -44,7 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `QueueView::get_job`.
 - The scheduler reads the scheduled key space only when a job can be
   due, from the earliest such job, so an idle queue does not read from
-  the store at the scheduler interval.
+  the store at the scheduler interval. The done retention sweep reads
+  the done key space the same way, at the reaper interval.
 
 ## [0.13.0] - 2026-09-16
 

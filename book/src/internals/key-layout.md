@@ -130,10 +130,10 @@ The field a scan orders by comes first.
 `Scheduled` and `Done` lead with a timestamp. The scheduler
 (`promote_due_jobs`, [scheduler.rs][scheduler]) and the done retention sweep
 (`sweep_expired`, [reaper.rs][reaper]) each read one global range in time
-order. Each exits at the first key past its cutoff. The scheduler keeps in
-memory the earliest `run_at` of a live scheduled key, lowered after every
-commit that writes one, so a pass does not read until a job can be due and
-starts its read at that key.
+order. Each exits at the first key past its cutoff. Each keeps in memory the
+earliest timestamp of a live key of its space, lowered after every commit
+that writes one, so a pass does not read until a key can be due and starts
+its read at that key.
 
 `Pending`, `Claimed` and `Dead` lead with the queue name, so the claim scan and
 `list_jobs` ([view.rs][view]) read one queue's range. `Pending` is ordered by

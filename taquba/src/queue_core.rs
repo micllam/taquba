@@ -56,6 +56,9 @@ pub(crate) struct QueueCore {
     /// The bound of the scheduled key space: the earliest `run_at` of a
     /// live scheduled key, lowered after every commit that writes one.
     pub(crate) scheduled_bound: TimeBound,
+    /// The bound of the done key space: the earliest `completed_at` of
+    /// a live done key, lowered after every commit that writes one.
+    pub(crate) done_bound: TimeBound,
     pub(crate) lease_registry: LeaseRegistry,
     pub(crate) completion_waiters: Arc<CompletionWaiters>,
     pub(crate) payload_store: Arc<PayloadStore>,
@@ -96,6 +99,11 @@ impl QueueCore {
             && let Some(run_at) = job.run_at
         {
             self.scheduled_bound.lower(run_at);
+        }
+        if let ClaimEnd::Done { keep: true } = end
+            && let Some(completed_at) = job.completed_at
+        {
+            self.done_bound.lower(completed_at);
         }
         if let ClaimEnd::Done { keep: false } = end {
             self.payload_store.delete_for(job).await;
