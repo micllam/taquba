@@ -26,11 +26,14 @@ const PAGE_SIZE: usize = 256;
 /// commit in the transaction that deletes the entry.
 ///
 /// The index keeps in memory the earliest time of an entry that a pass
-/// did not remove, and a pass returns without a read until that time is
-/// due. [`entry_key`](Self::entry_key) lowers the time, so the writers
-/// of an index and its pass share one `ExpiryIndex`. An entry written
-/// with a key built elsewhere is removed at most one `retention` after
-/// it is due.
+/// did not remove. A pass returns without a read until that time is
+/// due, and starts its scan at the key with that time, so the keys of
+/// the entries that earlier passes deleted are not read.
+/// [`entry_key`](Self::entry_key) lowers the time, so every writer of
+/// an index and its pass share one `ExpiryIndex`. An entry with a key
+/// built elsewhere and a time before the bound is outside the scan. It
+/// is read once an `entry_key` call lowers the bound to its time, or
+/// by a new `ExpiryIndex`.
 #[derive(Debug)]
 pub struct ExpiryIndex {
     prefix: Vec<u8>,
@@ -97,6 +100,12 @@ impl ExpiryIndex {
     /// which it is due.
     pub fn entry_key(&self, at_ms: u64, suffix: &[u8]) -> Vec<u8> {
         self.bound.fetch_min(at_ms, Ordering::SeqCst);
+        self.entry_key_at(at_ms, suffix)
+    }
+
+    /// The key of the entry for an event at `at_ms` with `suffix`,
+    /// without a change of the bound.
+    fn entry_key_at(&self, at_ms: u64, suffix: &[u8]) -> Vec<u8> {
         let mut key = Vec::with_capacity(self.prefix.len() + 8 + suffix.len());
         key.extend_from_slice(&self.prefix);
         key.extend_from_slice(&at_ms.to_be_bytes());
@@ -114,13 +123,13 @@ impl ExpiryIndex {
 
     /// One pass at `now_ms`: calls `clear` with the time and the suffix
     /// of every entry whose time is `retention` or more before `now_ms`,
-    /// oldest first, and applies the [`Expired`] its future returns.
-    /// Returns the count of entries removed through `clear`. A key with
-    /// fewer than 8 bytes after the prefix is deleted without a call. A
-    /// pass before an entry can be due returns without a read. A KV
-    /// failure ends the pass with the error. The next pass reads the
-    /// entries that a failed pass, or a pass whose future is dropped,
-    /// did not remove.
+    /// oldest first from the bound, and applies the [`Expired`] its
+    /// future returns. Returns the count of entries removed through
+    /// `clear`. A key with fewer than 8 bytes after the prefix is
+    /// deleted without a call. A pass before an entry can be due
+    /// returns without a read. A KV failure ends the pass with the
+    /// error. The next pass reads the entries that a failed pass, or a
+    /// pass whose future is dropped, did not remove.
     pub async fn pass<F, Fut>(
         &self,
         queue: &Queue,
@@ -145,7 +154,8 @@ impl ExpiryIndex {
         };
         let mut removed = 0;
         let mut left = now_ms;
-        let mut entries = pin!(queue.view().kv_entries(&self.prefix, .., PAGE_SIZE));
+        let start = self.entry_key_at(guard.left, &[]);
+        let mut entries = pin!(queue.view().kv_entries(&self.prefix, start.., PAGE_SIZE));
         while let Some((key, _)) = entries.try_next().await? {
             let Some((at_ms, suffix)) = self.parse(&key) else {
                 warn!(key = %String::from_utf8_lossy(&key), "expiry index key without a time; deleted");
@@ -417,10 +427,6 @@ mod tests {
             .unwrap();
         assert_eq!((removed, calls), (0, 0));
 
-        // An entry due at 1_500, written with a key the index did not
-        // build, waits for the next read of the index.
-        let other = ExpiryIndex::new(b"x/".to_vec());
-        q.kv_put(&other.entry_key(500, b"raw"), b"").await.unwrap();
         let removed = index
             .pass(&q, 1_999, RETENTION, |_, _| {
                 calls += 1;
@@ -430,16 +436,55 @@ mod tests {
             .unwrap();
         assert_eq!((removed, calls), (0, 0));
 
-        let mut seen = Vec::new();
         let removed = index
+            .pass(&q, 2_000, RETENTION, |_, _| {
+                calls += 1;
+                std::future::ready(Expired::Delete(SettlementEffects::default()))
+            })
+            .await
+            .unwrap();
+        assert_eq!((removed, calls), (1, 1));
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_scan_starts_at_the_bound_and_a_new_index_reads_from_the_front() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let index = ExpiryIndex::new(b"x/".to_vec());
+        q.kv_put(&index.entry_key(1_000, b"a"), b"").await.unwrap();
+        // The pass leaves the bound at 1_000, the time of the entry it
+        // read and did not remove.
+        index
+            .pass(&q, 1_500, RETENTION, |_, _| {
+                std::future::ready(Expired::Keep)
+            })
+            .await
+            .unwrap();
+
+        // An entry before the bound, written with a key the index did
+        // not build, is before the start of the scan.
+        let other = ExpiryIndex::new(b"x/".to_vec());
+        q.kv_put(&other.entry_key(500, b"raw"), b"").await.unwrap();
+        let mut seen = Vec::new();
+        index
             .pass(&q, 2_000, RETENTION, |_, suffix| {
                 seen.push(suffix);
                 std::future::ready(Expired::Delete(SettlementEffects::default()))
             })
             .await
             .unwrap();
-        assert_eq!(removed, 2);
-        assert_eq!(seen, [b"raw".to_vec(), b"a".to_vec()]);
+        assert_eq!(seen, [b"a".to_vec()]);
+        assert_eq!(suffixes(&q, &index, b"x/").await, [b"raw".to_vec()]);
+
+        let mut seen = Vec::new();
+        ExpiryIndex::new(b"x/".to_vec())
+            .pass(&q, 2_000, RETENTION, |_, suffix| {
+                seen.push(suffix);
+                std::future::ready(Expired::Delete(SettlementEffects::default()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(seen, [b"raw".to_vec()]);
         q.close().await.unwrap();
     }
 

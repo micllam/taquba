@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   namespace, whose due entries a pass removes in one transaction with
   the state they refer to, so a crate over the queue does not keep its
   own retention sweep. A pass returns without a read until an entry can
-  be due.
+  be due and starts its scan at that entry.
 
 ### Changed
 

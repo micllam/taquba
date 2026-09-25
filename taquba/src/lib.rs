@@ -263,9 +263,10 @@
 //! which commit in the transaction that deletes the entry, or `Keep`.
 //!
 //! The index keeps in memory the earliest time of an entry that a pass
-//! did not remove, and a pass returns without a read until that time is
+//! did not remove. A pass returns without a read until that time is
 //! due, so a pass at a short interval reads the index only when an
-//! entry can be due.
+//! entry can be due. The scan starts at the key with that time, so the
+//! keys of the entries that earlier passes deleted are not read.
 //!
 //! # Large payloads
 //!
