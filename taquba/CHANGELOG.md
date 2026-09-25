@@ -42,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does not read an object and does not fail on a payload object removed
   after the scan. Fetch one job with its payload through
   `QueueView::get_job`.
+- The scheduler reads the scheduled key space only when a job can be
+  due, from the earliest such job, so an idle queue does not read from
+  the store at the scheduler interval.
 
 ## [0.13.0] - 2026-09-16
 

@@ -1,5 +1,7 @@
+use std::ops::Bound;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tracing::debug;
 
 use crate::background::Periodic;
@@ -28,24 +30,34 @@ impl Periodic for Scheduler {
 }
 
 impl QueueCore {
-    /// Scan the scheduled key space and move any job whose `run_at` has passed
-    /// into the pending key space so workers can claim it.
+    /// Scan the scheduled key space from its bound and move any job
+    /// whose `run_at` has passed into the pending key space so workers
+    /// can claim it. Without a job that can be due, the call does not
+    /// read.
     pub(crate) async fn promote_due_jobs(&self) -> Result<()> {
         let now = self.now_ms();
+        let Some(mut scan) = self.scheduled_bound.begin(now, 0) else {
+            return Ok(());
+        };
         let mut due_keys = Vec::new();
 
+        // A scheduled key leads with `run_at`, and the range is within
+        // the prefix, so the scan starts at the bound and the first key
+        // with a `run_at` in the future ends it.
+        let start = Bytes::copy_from_slice(&scan.from().to_be_bytes());
         let mut iter = self
             .db
-            .scan_prefix(tag_prefix(KeyTag::Scheduled), ..)
+            .scan_prefix(
+                tag_prefix(KeyTag::Scheduled),
+                (Bound::Included(start), Bound::Unbounded),
+            )
             .await?;
         while let Some(kv) = iter.next().await? {
-            // Scheduled keys lead with `run_at`, so the scan is sorted globally
-            // by it and the first key with a timestamp in the future ends the
-            // scan.
             let Some(run_at) = parse_key_timestamp(&kv.key, KeyTag::Scheduled) else {
                 continue;
             };
-            if run_at > now {
+            if !scan.due(run_at) {
+                scan.retain(run_at);
                 break;
             }
             due_keys.push(kv.key.clone());
@@ -55,6 +67,7 @@ impl QueueCore {
         for key_bytes in due_keys {
             self.promote_job(&key_bytes).await?;
         }
+        scan.complete();
 
         Ok(())
     }
@@ -96,6 +109,88 @@ impl QueueCore {
 mod tests {
     use super::*;
     use crate::test_util::*;
+
+    #[tokio::test]
+    async fn a_promotion_pass_over_an_empty_key_space_leaves_no_read_for_the_next() {
+        let initial = 1_700_000_000_000u64;
+        let clock = MockClock::new(initial);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+
+        q.promote_scheduled_now().await.unwrap();
+        clock.advance(Duration::from_secs(3_600));
+        assert!(q.core.scheduled_bound.begin(clock.now_ms(), 0).is_none());
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_enqueue_with_run_at_after_an_empty_pass_is_promoted_when_due() {
+        let initial = 1_700_000_000_000u64;
+        let clock = MockClock::new(initial);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+        q.promote_scheduled_now().await.unwrap();
+
+        let run_at = std::time::UNIX_EPOCH + Duration::from_millis(initial + 100);
+        q.enqueue_with(
+            "jobs",
+            b"soon".to_vec(),
+            EnqueueOptions {
+                run_at: Some(run_at),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        clock.advance(Duration::from_millis(100));
+        q.promote_scheduled_now().await.unwrap();
+
+        let s = q.view().stats("jobs").await.unwrap();
+        assert_eq!((s.scheduled, s.pending), (0, 1));
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_nack_with_backoff_after_an_empty_pass_is_promoted_when_due() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            default_queue_config: QueueConfig {
+                retry_backoff_base: Duration::from_millis(10),
+                retry_backoff_max: Duration::from_millis(10),
+                ..QueueConfig::default()
+            },
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+        q.promote_scheduled_now().await.unwrap();
+
+        q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.nack(&job, "boom").await.unwrap();
+        clock.advance(Duration::from_millis(10));
+        q.promote_scheduled_now().await.unwrap();
+
+        let s = q.view().stats("work").await.unwrap();
+        assert_eq!((s.scheduled, s.pending), (0, 1));
+        q.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn test_enqueue_at_past_is_immediately_pending() {

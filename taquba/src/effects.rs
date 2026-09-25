@@ -164,10 +164,14 @@ struct QueueInserts<'a> {
 pub(crate) struct StagedJob {
     pub(crate) id: String,
     pub(crate) queue: QueueName,
-    /// `Some` when the job landed in the pending key space, in which
-    /// case the commit must be followed by a cursor insert note, which
-    /// also wakes a waiting worker.
+    /// `Some` when the job is written to the pending key space, in
+    /// which case the commit must be followed by a cursor insert note,
+    /// which also wakes a waiting worker.
     pub(crate) pending_key: Option<Vec<u8>>,
+    /// `Some` when the job is written to the scheduled key space, in
+    /// which case the commit must be followed by a lowering of the
+    /// scheduled bound.
+    pub(crate) run_at: Option<u64>,
 }
 
 impl QueueCore {
@@ -367,6 +371,9 @@ impl QueueCore {
                     inserts.min_pending_key = Some(pending_key);
                 }
             }
+            if let Some(run_at) = staged_job.run_at {
+                self.scheduled_bound.lower(run_at);
+            }
             debug!(queue = %staged_job.queue, job_id = %staged_job.id, "job enqueued");
         }
         for (queue, inserts) in by_queue {
@@ -423,18 +430,22 @@ impl QueueCore {
             id: job.id.clone(),
             queue: job.queue.clone(),
             pending_key: matches!(job.status, JobStatus::Pending).then(|| key.clone()),
+            run_at: job.run_at.filter(|_| job.status == JobStatus::Scheduled),
         }))
     }
 
     /// The work that follows the commit of one staged job: a Pending job
     /// is recorded on the claim cursor, which wakes a waiting worker, and
-    /// a Scheduled job becomes claimable later through the scheduler
-    /// loop, which records its own insert. Every staged job is counted
-    /// as enqueued here, whichever transaction committed it.
+    /// a Scheduled job lowers the scheduled bound to its `run_at`. Every
+    /// staged job is counted as enqueued here, whichever transaction
+    /// committed it.
     pub(crate) fn note_staged_job(&self, staged: &StagedJob) {
         if let Some(ref pending_key) = staged.pending_key {
             self.claim_cursor
                 .note_pending_insert(&staged.queue, pending_key);
+        }
+        if let Some(run_at) = staged.run_at {
+            self.scheduled_bound.lower(run_at);
         }
         crate::obs::enqueued(&staged.queue, 1);
         debug!(queue = %staged.queue, job_id = %staged.id, "job enqueued");

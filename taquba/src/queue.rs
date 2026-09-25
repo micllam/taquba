@@ -29,6 +29,7 @@ use crate::queue_core::{QueueConfigs, QueueCore};
 use crate::reaper::Reaper;
 use crate::scheduler::Scheduler;
 use crate::stats::{QueueMergeOperator, update_stats};
+use crate::time_bound::TimeBound;
 use crate::txn::ClaimEnd;
 use crate::txn::{
     Attempt, Commit, Durability, commit, put_job_record, retry, stage_claim_end, stage_remove,
@@ -331,6 +332,7 @@ impl Queue {
             clock: opts.clock,
             configs: QueueConfigs::new(opts.default_queue_config, opts.queue_configs),
             claim_cursor: ClaimCursor::new(),
+            scheduled_bound: TimeBound::new(),
             lease_registry: LeaseRegistry::new(),
             completion_waiters: Arc::new(CompletionWaiters::default()),
             payload_store,

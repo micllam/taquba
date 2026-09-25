@@ -17,6 +17,7 @@ use crate::lease_registry::LeaseRegistry;
 use crate::options::QueueConfig;
 use crate::payload_store::PayloadStore;
 use crate::queue::WaitOutcome;
+use crate::time_bound::TimeBound;
 use crate::txn::ClaimEnd;
 use crate::txn::{Attempt, Durability, get_indexed_job, retry};
 
@@ -52,6 +53,9 @@ pub(crate) struct QueueCore {
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) configs: QueueConfigs,
     pub(crate) claim_cursor: ClaimCursor,
+    /// The bound of the scheduled key space: the earliest `run_at` of a
+    /// live scheduled key, lowered after every commit that writes one.
+    pub(crate) scheduled_bound: TimeBound,
     pub(crate) lease_registry: LeaseRegistry,
     pub(crate) completion_waiters: Arc<CompletionWaiters>,
     pub(crate) payload_store: Arc<PayloadStore>,
@@ -87,6 +91,11 @@ impl QueueCore {
         self.lease_registry.remove(&job.queue, &job.id, claim_id);
         if let Some(key) = pending_key {
             self.claim_cursor.note_pending_insert(&job.queue, key);
+        }
+        if job.status == JobStatus::Scheduled
+            && let Some(run_at) = job.run_at
+        {
+            self.scheduled_bound.lower(run_at);
         }
         if let ClaimEnd::Done { keep: false } = end {
             self.payload_store.delete_for(job).await;
