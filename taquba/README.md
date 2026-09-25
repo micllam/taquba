@@ -338,7 +338,7 @@ runnable order pipeline built on these primitives.
 
 An `ExpiryIndex` is a time-ordered index over one prefix of the caller KV
 namespace. An entry's key is the prefix, the time of its event as 8 bytes
-big-endian and a free suffix, built by `ExpiryIndex::entry_key`.
+big-endian and a free suffix, written with `SettlementEffects::expiry_entry`.
 `ExpiryIndex::pass` reads the entries oldest first, calls the caller's
 callback for every entry whose time is a retention or more before the time
 the caller passes, and stops at the first entry that is not due. The callback

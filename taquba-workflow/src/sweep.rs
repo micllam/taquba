@@ -71,10 +71,20 @@ impl Sweep {
     }
 
     /// The key of the marker of the entity `id`, terminated at `at_ms`.
-    /// The call lowers the time until which a pass returns without a
-    /// read, so every marker is built through the sweep that reads it.
+    #[cfg(test)]
     pub(crate) fn marker_key(&self, id: &RunId, at_ms: u64) -> Vec<u8> {
         self.index.entry_key(at_ms, id.as_str().as_bytes())
+    }
+
+    /// `effects` with the marker of the entity `id`, terminated at
+    /// `at_ms`.
+    pub(crate) fn mark(
+        &self,
+        effects: SettlementEffects,
+        id: &RunId,
+        at_ms: u64,
+    ) -> SettlementEffects {
+        effects.expiry_entry(&self.index, at_ms, id.as_str().as_bytes())
     }
 
     /// The sweep loop: the first pass runs immediately so a fresh

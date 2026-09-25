@@ -10,6 +10,7 @@ use tracing::debug;
 use ulid::Ulid;
 
 use crate::error::{Error, Result};
+use crate::expiry::ExpiryIndex;
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{
     QueueName, dedup_index_key, job_index_key, pending_key, scheduled_key, user_scoped_key,
@@ -43,7 +44,9 @@ pub struct EnqueueRequest {
 /// remain, [`Queue::cancel_with`](crate::Queue::cancel_with) other than
 /// [`CancelOutcome::Removed`](crate::CancelOutcome::Removed)) commits without them. A key named in
 /// both `kv_writes` and `kv_deletes` is rejected with
-/// [`Error::ConflictingKvEffect`].
+/// [`Error::ConflictingKvEffect`]. An entry added with
+/// [`Self::expiry_entry`] is recorded on its [`ExpiryIndex`] once the
+/// effects apply.
 #[derive(Debug, Clone, Default)]
 pub struct SettlementEffects {
     /// Jobs enqueued atomically with the settlement.
@@ -54,6 +57,9 @@ pub struct SettlementEffects {
     pub kv_writes: HashMap<Vec<u8>, Vec<u8>>,
     /// Keys deleted from the caller KV namespace.
     pub kv_deletes: Vec<Vec<u8>>,
+    /// The index and the time of every entry added with
+    /// [`Self::expiry_entry`].
+    pub expiry_entries: Vec<(ExpiryIndex, u64)>,
 }
 
 impl SettlementEffects {
@@ -82,6 +88,17 @@ impl SettlementEffects {
     #[must_use]
     pub fn kv_put(mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
         self.kv_writes.insert(key.into(), value.into());
+        self
+    }
+
+    /// Add the entry of `index` for an event at `at_ms` with `suffix` to
+    /// [`Self::kv_writes`], with an empty value, and to
+    /// [`Self::expiry_entries`].
+    #[must_use]
+    pub fn expiry_entry(mut self, index: &ExpiryIndex, at_ms: u64, suffix: &[u8]) -> Self {
+        self.kv_writes
+            .insert(index.entry_key(at_ms, suffix), Vec::new());
+        self.expiry_entries.push((index.clone(), at_ms));
         self
     }
 
@@ -115,6 +132,8 @@ pub(crate) struct PreparedEffects {
     pub(crate) prepared_jobs: Vec<PreparedJob>,
     pub(crate) kv_writes: HashMap<Vec<u8>, Vec<u8>>,
     pub(crate) kv_deletes: Vec<Vec<u8>>,
+    /// Recorded on their indexes once the effects apply.
+    pub(crate) expiry_entries: Vec<(ExpiryIndex, u64)>,
 }
 
 /// Effects staged into a settlement transaction by
@@ -253,6 +272,9 @@ impl QueueCore {
                         self.payload_store.delete_for(&prepared.job).await;
                     }
                 }
+                for (index, at_ms) in &prepared.expiry_entries {
+                    index.written(*at_ms);
+                }
             }
             None => self.discard_prepared(&prepared.prepared_jobs).await,
         }
@@ -289,6 +311,7 @@ impl QueueCore {
             prepared_jobs,
             kv_writes: effects.kv_writes,
             kv_deletes: effects.kv_deletes,
+            expiry_entries: effects.expiry_entries,
         })
     }
 
@@ -442,6 +465,7 @@ mod tests {
             }],
             kv_writes: HashMap::from([(b"runs/1".to_vec(), b"done".to_vec())]),
             kv_deletes: Vec::new(),
+            expiry_entries: Vec::new(),
         };
         q.enqueue("work", b"job".to_vec()).await.unwrap();
         let job = q
@@ -532,6 +556,7 @@ mod tests {
                     }],
                     kv_writes: HashMap::from([(b"runs/2".to_vec(), b"done".to_vec())]),
                     kv_deletes: vec![b"runs/1".to_vec()],
+                    expiry_entries: Vec::new(),
                 },
             )
             .await
@@ -567,6 +592,7 @@ mod tests {
             }],
             kv_writes: HashMap::from([(b"k".to_vec(), b"v".to_vec())]),
             kv_deletes: Vec::new(),
+            expiry_entries: Vec::new(),
         };
         assert!(matches!(
             q.ack_with(&job, effects()).await,
@@ -654,6 +680,7 @@ mod tests {
                     }],
                     kv_writes: HashMap::from([(b"runs/1".to_vec(), b"failed".to_vec())]),
                     kv_deletes: Vec::new(),
+                    expiry_entries: Vec::new(),
                 },
             )
             .await
@@ -692,6 +719,7 @@ mod tests {
                     }],
                     kv_writes: HashMap::from([(b"k".to_vec(), b"v".to_vec())]),
                     kv_deletes: Vec::new(),
+                    expiry_entries: Vec::new(),
                 },
             )
             .await
@@ -735,6 +763,7 @@ mod tests {
                     }],
                     kv_writes: HashMap::from([(b"runs/1".to_vec(), b"failed".to_vec())]),
                     kv_deletes: Vec::new(),
+                    expiry_entries: Vec::new(),
                 },
             )
             .await
@@ -774,6 +803,7 @@ mod tests {
                     }],
                     kv_writes: HashMap::new(),
                     kv_deletes: vec![b"runs/1".to_vec()],
+                    expiry_entries: Vec::new(),
                 },
             )
             .await
@@ -808,6 +838,7 @@ mod tests {
                     }],
                     kv_writes: HashMap::from([(b"k".to_vec(), b"v".to_vec())]),
                     kv_deletes: Vec::new(),
+                    expiry_entries: Vec::new(),
                 },
             )
             .await

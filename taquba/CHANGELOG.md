@@ -19,8 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ExpiryIndex`: a time-ordered index over one prefix of the caller KV
   namespace, whose due entries a pass removes in one transaction with
   the state they refer to, so a crate over the queue does not keep its
-  own retention sweep. A pass returns without a read until an entry can
-  be due and starts its scan at that entry.
+  own retention sweep. An entry is written with
+  `SettlementEffects::expiry_entry`, listed in `expiry_entries`. A pass
+  returns without a read until an entry can be due and starts its scan
+  at that entry.
 
 ### Changed
 

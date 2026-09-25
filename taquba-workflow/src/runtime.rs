@@ -900,18 +900,13 @@ impl RuntimeCore {
         terminal_step: &ClaimedStep<'_>,
         termination: DurableTermination,
     ) -> SettlementEffects {
+        let terminated_at_ms = termination.terminated_at_ms;
         let kv_deletes = vec![run_kv_key(&outcome.run_id), step_kv_key(&outcome.run_id)];
         let mut kv_writes = HashMap::new();
         kv_writes.insert(
             outcome_kv_key(&outcome.run_id),
             durable::encode(&termination),
         );
-        if let Some(sweep) = &self.memo_sweep {
-            kv_writes.insert(
-                sweep.marker_key(&outcome.run_id, termination.terminated_at_ms),
-                Vec::new(),
-            );
-        }
         if let Some(membership) = &terminal_step.membership {
             kv_writes.insert(
                 membership.kv_key(),
@@ -923,10 +918,14 @@ impl RuntimeCore {
         } else {
             Vec::new()
         };
-        SettlementEffects::default()
+        let effects = SettlementEffects::default()
             .enqueues(enqueues)
             .kv_writes(kv_writes)
-            .kv_deletes(kv_deletes)
+            .kv_deletes(kv_deletes);
+        match &self.memo_sweep {
+            Some(sweep) => sweep.mark(effects, &outcome.run_id, terminated_at_ms),
+            None => effects,
+        }
     }
 
     /// Terminate every run whose step job the queue dead-lettered
@@ -3792,7 +3791,7 @@ mod tests {
             let run_id = rid(run_id);
             memos.new_memo(&run_id, 0).put("k", b"v").await.unwrap();
             queue
-                .kv_put(&sweep.marker_key(&run_id, at_ms), b"")
+                .commit_effects(sweep.mark(SettlementEffects::default(), &run_id, at_ms))
                 .await
                 .unwrap();
         }

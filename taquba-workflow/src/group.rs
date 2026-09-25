@@ -527,8 +527,8 @@ impl RunGroup {
     async fn mark_terminated(&self) -> Result<()> {
         let core = self.core();
         if let Some(sweep) = &core.group_sweep {
-            let key = sweep.marker_key(&self.id, core.clock.now_ms());
-            core.queue.kv_put(&key, b"").await?;
+            let effects = sweep.mark(SettlementEffects::default(), &self.id, core.clock.now_ms());
+            core.queue.commit_effects(effects).await?;
         }
         Ok(())
     }

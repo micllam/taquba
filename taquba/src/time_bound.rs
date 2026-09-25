@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// keys lead with the time of their event.
 ///
 /// Invariant: the bound does not exceed the time of any live key whose
-/// writer calls [`lower`](Self::lower). A scan raises the bound on the
+/// writer calls [`lower`](Self::lower) after the commit of the key. A
+/// scan raises the bound on the
 /// evidence of its read alone: every key before the new value is read
 /// and removed. The bound is process state and starts at zero, so the
 /// first scan after an open reads from the front of the key space.
@@ -24,8 +25,9 @@ impl TimeBound {
         }
     }
 
-    /// Lowers the bound to `at_ms`, for a key at that time, before or
-    /// after the write of the key.
+    /// Lowers the bound to `at_ms` for a key at that time, after the
+    /// commit that writes the key. A scan that ends between a call
+    /// before the commit and the commit raises the bound past the key.
     pub(crate) fn lower(&self, at_ms: u64) {
         self.bound.fetch_min(at_ms, Ordering::SeqCst);
     }
