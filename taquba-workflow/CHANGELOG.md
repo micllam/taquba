@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-25
+
 ### Added
 
 - `WorkflowView`: the status and the outcome of a run, read through a
@@ -40,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expiry entries with the step-0 enqueue and drops them on a duplicate
   submission as it drops the KV writes. Build the field with
   `SettlementEffects::default().kv_writes(map)`.
+- Raised the minimum `taquba` requirement to 0.14 and, for the
+  `webhooks` feature, the `taquba-webhooks` requirement to 0.10.
 
 ## [0.12.0] - 2026-09-16
 

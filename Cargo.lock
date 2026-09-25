@@ -3212,7 +3212,7 @@ dependencies = [
 
 [[package]]
 name = "taquba"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3254,7 +3254,7 @@ dependencies = [
 
 [[package]]
 name = "taquba-cron"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "chrono",
  "croner",
@@ -3266,7 +3266,7 @@ dependencies = [
 
 [[package]]
 name = "taquba-webhooks"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "reqwest 0.12.28",
@@ -3278,7 +3278,7 @@ dependencies = [
 
 [[package]]
 name = "taquba-workflow"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "bytes",

@@ -7,11 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-25
+
 ### Added
 
 - `Expression::next_after` and `Expression::previous_before`: the scheduler's
   occurrence search in milliseconds since the Unix epoch, so a caller checks the
   interval of an expression without a cron parser.
+
+### Changed
+
+- Raised the minimum `taquba` requirement to 0.14.
 
 ## [0.10.0] - 2026-09-17
 

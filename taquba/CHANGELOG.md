@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-25
+
 ### Added
 
 - `Queue::kv_compare_commit`: `commit_effects` conditional on the value
