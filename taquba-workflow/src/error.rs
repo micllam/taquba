@@ -232,6 +232,7 @@ mod tests {
             (Error::DuplicateMemberKey("k".into()), true),
             (Error::GroupMismatch(rid("b")), true),
             (Error::GroupNotFound(rid("b")), true),
+            (Error::GroupActive(rid("b")), false),
             (Error::RunNotFound(rid("run-1")), true),
             (
                 Error::MemberNotSubmitted {
