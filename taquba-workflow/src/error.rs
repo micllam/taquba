@@ -20,11 +20,11 @@ pub enum Error {
         value: String,
     },
 
-    /// A submission included a user header starting with the reserved
-    /// `workflow.*` prefix. The runtime owns that prefix; submitters must use
-    /// any other key.
-    #[error("submission header `{0}` uses the reserved `workflow.*` prefix")]
-    ReservedHeaderInSubmit(String),
+    /// A header of a submission, or of an enqueue among the effects of a
+    /// caller, starts with the reserved `workflow.*` prefix. The runtime
+    /// owns that prefix. A caller must use another key.
+    #[error("header `{0}` uses the reserved `workflow.*` prefix")]
+    ReservedHeader(String),
 
     /// A run id or group id is empty, longer than
     /// [`crate::MAX_RUN_ID_LEN`] bytes or contains a character outside
@@ -51,8 +51,15 @@ pub enum Error {
     #[error("run `{0}` has inconsistent durable state")]
     InconsistentRunState(RunId),
 
+    /// An enqueue among the effects of a caller targets the queue of the
+    /// runtime. The runtime owns that queue, and a job reaches it through
+    /// a submission.
+    #[error("enqueue targets the reserved queue `{0}` of the runtime")]
+    ReservedQueue(String),
+
     /// A caller KV key passed via [`crate::RunSpec::effects`] or staged through
-    /// an [`crate::EffectsHandle`] starts with the reserved `workflow/` prefix.
+    /// an [`crate::EffectsHandle`] or a [`crate::TerminalEffects`] starts with
+    /// the reserved `workflow/` prefix.
     /// The runtime owns that prefix. A caller must use another key.
     #[error("kv key `{0}` uses the reserved `workflow/` prefix")]
     ReservedKvKey(String),
@@ -133,11 +140,12 @@ impl Error {
         match self {
             Self::MissingHeader(_)
             | Self::InvalidStepHeader { .. }
-            | Self::ReservedHeaderInSubmit(_)
+            | Self::ReservedHeader(_)
             | Self::InvalidRunId { .. }
             | Self::InputMismatch(_)
             | Self::InconsistentRunState(_)
             | Self::ReservedKvKey(_)
+            | Self::ReservedQueue(_)
             | Self::ConflictingKvEffect(_)
             | Self::EffectsSealed
             | Self::Serialization(_)
@@ -194,7 +202,7 @@ mod tests {
                 },
                 true,
             ),
-            (Error::ReservedHeaderInSubmit("workflow.foo".into()), true),
+            (Error::ReservedHeader("workflow.foo".into()), true),
             (
                 Error::InvalidRunId {
                     run_id: String::new(),
@@ -205,6 +213,7 @@ mod tests {
             (Error::InputMismatch(rid("run-1")), true),
             (Error::InconsistentRunState(rid("run-1")), true),
             (Error::ReservedKvKey("workflow/x".into()), true),
+            (Error::ReservedQueue("workflow-steps".into()), true),
             (Error::ConflictingKvEffect("k".into()), true),
             (Error::EffectsSealed, true),
             (

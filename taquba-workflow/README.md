@@ -336,8 +336,11 @@ order flow maintaining a status row through both surfaces.
 
 ## Reserved headers
 
-Step jobs reserve the `workflow.*` prefix; submission rejects user
-headers starting with it. Other headers on `RunOptions::headers` thread
+Step jobs reserve the `workflow.*` prefix. A submission rejects a header
+that starts with it, in `RunOptions::headers` and in an enqueue of
+`RunSpec::effects`, and `TerminalEffects::enqueue` rejects it in an enqueue
+of the hook. Both reject an enqueue to the queue of the runtime with
+`Error::ReservedQueue`. Other headers on `RunOptions::headers` thread
 through every step and reach the terminal hook on `RunOutcome::headers`.
 
 | Key | Meaning |

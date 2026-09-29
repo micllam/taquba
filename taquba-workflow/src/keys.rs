@@ -4,11 +4,13 @@
 //! [`RunId`].
 
 use std::borrow::Borrow;
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::Deref;
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
+use taquba::{EnqueueRequest, SettlementEffects};
 
 use crate::error::{Error, Result};
 
@@ -16,9 +18,10 @@ use crate::error::{Error, Result};
 pub const HEADER_RUN_ID: &str = "workflow.run_id";
 /// Header key carrying the zero-based step number on every step job.
 pub const HEADER_STEP: &str = "workflow.step";
-/// Reserved prefix the runtime owns on step-job headers. Submitter-supplied
-/// headers must not start with this prefix; if they do, the runtime treats
-/// them as its own and strips them before invoking the runner.
+/// Reserved prefix the runtime owns on job headers. A header of a
+/// submission, or of an enqueue among the effects of a caller, must not
+/// start with this prefix. Such a header is rejected with
+/// [`Error::ReservedHeader`].
 pub const RESERVED_HEADER_PREFIX: &str = "workflow.";
 
 /// Reserved prefix the runtime owns in the caller KV namespace. Keys passed via
@@ -26,6 +29,52 @@ pub const RESERVED_HEADER_PREFIX: &str = "workflow.";
 /// [`crate::EffectsHandle`] must not start with this prefix. Such a key is
 /// rejected with [`Error::ReservedKvKey`].
 pub const RESERVED_KV_PREFIX: &str = "workflow/";
+
+/// Fails with [`Error::ReservedKvKey`] for a caller KV key with the
+/// reserved prefix.
+pub(crate) fn check_kv_key(key: &[u8]) -> Result<()> {
+    if key.starts_with(RESERVED_KV_PREFIX.as_bytes()) {
+        return Err(Error::ReservedKvKey(
+            String::from_utf8_lossy(key).into_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Fails with [`Error::ReservedHeader`] for a caller header with the
+/// reserved prefix.
+pub(crate) fn check_headers(headers: &HashMap<String, String>) -> Result<()> {
+    match headers
+        .keys()
+        .find(|name| name.starts_with(RESERVED_HEADER_PREFIX))
+    {
+        Some(name) => Err(Error::ReservedHeader(name.clone())),
+        None => Ok(()),
+    }
+}
+
+/// Checks an enqueue of a caller: its headers, and its queue against
+/// `runtime_queue`, the queue of the runtime. Fails with
+/// [`Error::ReservedHeader`] or [`Error::ReservedQueue`].
+pub(crate) fn check_enqueue(request: &EnqueueRequest, runtime_queue: Option<&str>) -> Result<()> {
+    if runtime_queue == Some(request.queue.as_str()) {
+        return Err(Error::ReservedQueue(request.queue.clone()));
+    }
+    check_headers(&request.options.headers)
+}
+
+/// Checks every KV key and every enqueue of the effects of a caller
+/// of the runtime with the queue `runtime_queue`.
+pub(crate) fn check_effects(effects: &SettlementEffects, runtime_queue: &str) -> Result<()> {
+    let deletes = effects.kv_deletes.iter();
+    for key in effects.kv_writes.keys().chain(deletes) {
+        check_kv_key(key)?;
+    }
+    for request in &effects.enqueues {
+        check_enqueue(request, Some(runtime_queue))?;
+    }
+    Ok(())
+}
 
 /// Header key marking a job as a terminal-notification job, whose
 /// payload is the run's committed outcome and whose worker is the

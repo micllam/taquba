@@ -311,10 +311,14 @@
 //! # Reserved headers
 //!
 //! Step jobs reserve the `workflow.*` header prefix
-//! ([`RESERVED_HEADER_PREFIX`]); submission rejects user headers starting
-//! with it. [`HEADER_RUN_ID`] and [`HEADER_STEP`] are set by the runtime
-//! on every step. Other headers on [`RunOptions::headers`] thread through
-//! every step and reach the terminal hook on [`RunOutcome::headers`].
+//! ([`RESERVED_HEADER_PREFIX`]). A submission rejects a header that
+//! starts with it, in [`RunOptions::headers`] and in an enqueue of
+//! [`RunSpec::effects`], and [`TerminalEffects::enqueue`] rejects it in
+//! an enqueue of the hook. Both reject an enqueue to the queue of the
+//! runtime with [`Error::ReservedQueue`]. [`HEADER_RUN_ID`] and
+//! [`HEADER_STEP`] are set by the runtime on every step. Other headers
+//! on [`RunOptions::headers`] thread through every step and reach the
+//! terminal hook on [`RunOutcome::headers`].
 //!
 //! # Run groups
 //!

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use taquba::EnqueueRequest;
 
 use crate::error::{Error, Result};
-use crate::keys::RESERVED_KV_PREFIX;
+use crate::keys::{check_enqueue, check_kv_key};
 
 /// Application KV effects staged during a step, applied in the same
 /// transaction as the settlement that commits the step's outcome.
@@ -80,10 +80,7 @@ impl EffectsState {
         if self.sealed {
             return Err(Error::EffectsSealed);
         }
-        if key.starts_with(RESERVED_KV_PREFIX.as_bytes()) {
-            return Err(Error::ReservedKvKey(display_key(key)));
-        }
-        Ok(())
+        check_kv_key(key)
     }
 }
 
@@ -170,6 +167,8 @@ pub struct TerminalEffects {
 struct TerminalState {
     kv: EffectsState,
     enqueues: Vec<EnqueueRequest>,
+    /// The queue of the runtime, `None` for a detached handle.
+    runtime_queue: Option<String>,
 }
 
 impl TerminalEffects {
@@ -177,14 +176,22 @@ impl TerminalEffects {
     /// [`TerminalHook`](crate::TerminalHook) directly in tests. A
     /// detached handle accepts and validates effects like a
     /// delivery-bound one, is never sealed and its staged effects are
-    /// never applied.
+    /// never applied. It does not belong to a runtime, so it accepts an
+    /// enqueue to every queue.
     pub fn detached() -> Self {
-        Self::for_delivery()
-    }
-
-    pub(crate) fn for_delivery() -> Self {
         Self {
             inner: Arc::new(Mutex::new(TerminalState::default())),
+        }
+    }
+
+    /// A handle for a delivery of the runtime with the queue
+    /// `runtime_queue`.
+    pub(crate) fn for_delivery(runtime_queue: &str) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(TerminalState {
+                runtime_queue: Some(runtime_queue.to_string()),
+                ..Default::default()
+            })),
         }
     }
 
@@ -193,12 +200,16 @@ impl TerminalEffects {
     ///
     /// # Errors
     ///
-    /// [`Error::EffectsSealed`] when the hook has returned.
+    /// [`Error::EffectsSealed`] when the hook has returned,
+    /// [`Error::ReservedHeader`] when a header of `request` starts with
+    /// the reserved `workflow.*` prefix and [`Error::ReservedQueue`]
+    /// when `request` targets the queue of the runtime.
     pub fn enqueue(&self, request: EnqueueRequest) -> Result<()> {
         let mut state = self.inner.lock().unwrap();
         if state.kv.sealed {
             return Err(Error::EffectsSealed);
         }
+        check_enqueue(&request, state.runtime_queue.as_deref())?;
         state.enqueues.push(request);
         Ok(())
     }
@@ -280,7 +291,7 @@ mod tests {
 
     #[test]
     fn the_terminal_handle_applies_the_staging_and_seal_rules() {
-        let handle = TerminalEffects::for_delivery();
+        let handle = TerminalEffects::for_delivery("workflow-steps");
         assert!(matches!(
             handle.put("workflow/x", "v"),
             Err(Error::ReservedKvKey(_))
@@ -295,6 +306,27 @@ mod tests {
             Err(Error::ConflictingKvEffect(_))
         ));
         handle.delete("b").unwrap();
+        assert!(matches!(
+            handle.enqueue(taquba::EnqueueRequest {
+                queue: "side".to_string(),
+                payload: Vec::new(),
+                options: taquba::EnqueueOptions::default().headers(HashMap::from([(
+                    "workflow.terminal".to_string(),
+                    "1".to_string()
+                )])),
+            }),
+            Err(Error::ReservedHeader(name)) if name == "workflow.terminal"
+        ));
+        let to_runtime = || taquba::EnqueueRequest {
+            queue: "workflow-steps".to_string(),
+            payload: Vec::new(),
+            options: Default::default(),
+        };
+        assert!(matches!(
+            handle.enqueue(to_runtime()),
+            Err(Error::ReservedQueue(queue)) if queue == "workflow-steps"
+        ));
+        TerminalEffects::detached().enqueue(to_runtime()).unwrap();
         handle
             .enqueue(taquba::EnqueueRequest {
                 queue: "side".to_string(),

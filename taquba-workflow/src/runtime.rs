@@ -20,9 +20,9 @@ use crate::effects::StagedEffects;
 use crate::error::{Error, Result};
 use crate::group::{GroupStore, Membership, RunGroup, pending_member, terminated_member};
 use crate::keys::{
-    DEDUP_PREFIX, GROUP_TERMINAL_KV_PREFIX, HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL,
-    RESERVED_HEADER_PREFIX, RESERVED_KV_PREFIX, RunId, TERMINAL_KV_PREFIX, hash_input,
-    outcome_kv_key, run_kv_key, step_kv_key,
+    DEDUP_PREFIX, GROUP_TERMINAL_KV_PREFIX, HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RunId,
+    TERMINAL_KV_PREFIX, check_effects, check_headers, hash_input, outcome_kv_key, run_kv_key,
+    step_kv_key,
 };
 use crate::memo::{MemoStore, RUN_RESULT_MEMO_KEY};
 use crate::runner::{StepErrorKind, StepOutcome, StepRunner, Trigger};
@@ -72,7 +72,7 @@ pub(crate) struct StepEnqueueOpts {
 pub struct RunOptions {
     /// Submitter-supplied metadata, threaded through every step of the
     /// run and surfaced to the terminal hook. Reserved `workflow.*` keys
-    /// are rejected at submission with [`Error::ReservedHeaderInSubmit`].
+    /// are rejected at submission with [`Error::ReservedHeader`].
     pub headers: HashMap<String, String>,
     /// Priority of every step; the queue's default when `None`.
     pub priority: Option<u32>,
@@ -110,8 +110,11 @@ pub struct RunSpec {
     /// submission is new: a duplicate submission's effects are dropped, and the
     /// effects do not participate in the duplicate-submission input check. A KV
     /// key written or deleted must not start with the reserved `workflow/`
-    /// prefix ([`RESERVED_KV_PREFIX`]). Values are capped at
-    /// [`taquba::MAX_KV_VALUE_SIZE`].
+    /// prefix ([`RESERVED_KV_PREFIX`](crate::RESERVED_KV_PREFIX)), and a
+    /// header of an enqueue must not start with the reserved `workflow.*`
+    /// prefix ([`RESERVED_HEADER_PREFIX`](crate::RESERVED_HEADER_PREFIX)).
+    /// An enqueue must not target the queue of the runtime. Values are
+    /// capped at [`taquba::MAX_KV_VALUE_SIZE`].
     pub effects: SettlementEffects,
 }
 
@@ -442,7 +445,7 @@ pub(crate) struct RuntimeInner<R, H> {
 pub(crate) struct RuntimeCore {
     pub(crate) queue: Arc<Queue>,
     pub(crate) view: WorkflowView,
-    queue_name: String,
+    pub(crate) queue_name: String,
     max_concurrent_steps: usize,
     poll_interval: Duration,
     pub(crate) memo_store: MemoStore,
@@ -703,7 +706,7 @@ impl RuntimeCore {
     /// [`WorkflowRuntime::submit`].
     #[instrument(skip(self, spec), fields(run_id))]
     pub(crate) async fn submit(&self, spec: RunSpec) -> Result<SubmitOutcome> {
-        let run_id = Self::validate_spec(&spec)?;
+        let run_id = self.validate_spec(&spec)?;
         tracing::Span::current().record("run_id", run_id.as_str());
         self.enqueue_run(&run_id, spec, None).await
     }
@@ -716,26 +719,15 @@ impl RuntimeCore {
         membership: &Membership,
         spec: RunSpec,
     ) -> Result<SubmitOutcome> {
-        let run_id = Self::validate_spec(&spec)?;
+        let run_id = self.validate_spec(&spec)?;
         self.enqueue_run(&run_id, spec, Some(membership)).await
     }
 
-    /// Check `spec`'s headers and KV keys, and return the run id,
-    /// generated when the spec names none.
-    fn validate_spec(spec: &RunSpec) -> Result<RunId> {
-        for k in spec.options.headers.keys() {
-            if k.starts_with(RESERVED_HEADER_PREFIX) {
-                return Err(Error::ReservedHeaderInSubmit(k.clone()));
-            }
-        }
-        let deletes = spec.effects.kv_deletes.iter();
-        for key in spec.effects.kv_writes.keys().chain(deletes) {
-            if key.starts_with(RESERVED_KV_PREFIX.as_bytes()) {
-                return Err(Error::ReservedKvKey(
-                    String::from_utf8_lossy(key).into_owned(),
-                ));
-            }
-        }
+    /// Check `spec`'s headers and effects, and return the run id,
+    /// generated when the spec does not include one.
+    fn validate_spec(&self, spec: &RunSpec) -> Result<RunId> {
+        check_headers(&spec.options.headers)?;
+        check_effects(&spec.effects, &self.queue_name)?;
         Ok(spec.run_id.clone().unwrap_or_else(RunId::generate))
     }
 
@@ -3481,7 +3473,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn submit_rejects_reserved_headers_and_reserved_kv_keys() {
+    async fn submit_rejects_the_reserved_names_in_its_headers_and_effects() {
         let (queue, store, _clock) = open_queue_at(10_000).await;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
@@ -3504,9 +3496,40 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, Error::ReservedHeaderInSubmit(k) if k == "workflow.run_id"),
+            matches!(&err, Error::ReservedHeader(k) if k == "workflow.run_id"),
             "got: {err:?}"
         );
+
+        let err = runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                effects: SettlementEffects::default().enqueue(EnqueueRequest {
+                    queue: "side".to_string(),
+                    payload: Vec::new(),
+                    options: EnqueueOptions::default().headers(HashMap::from([(
+                        "workflow.step".to_string(),
+                        "0".to_string(),
+                    )])),
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::ReservedHeader(k) if k == "workflow.step"));
+
+        let err = runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                effects: SettlementEffects::default().enqueue(EnqueueRequest {
+                    queue: "workflow-steps".to_string(),
+                    payload: Vec::new(),
+                    options: EnqueueOptions::default(),
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::ReservedQueue(q) if q == "workflow-steps"));
 
         let err = runtime
             .submit(RunSpec {

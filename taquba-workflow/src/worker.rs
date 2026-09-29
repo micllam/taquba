@@ -210,7 +210,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 PermanentFailure::new(err.to_string())
             })?
             .into();
-        let effects = TerminalEffects::for_delivery();
+        let effects = TerminalEffects::for_delivery(&self.core.queue_name);
         let result = self.terminal_hook.on_termination(&outcome, &effects).await;
         let (staged, enqueues) = effects.seal_and_take();
         match result {

@@ -15,6 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed the member records, so the results of a later submission failed
   with `MemberNotSubmitted`. Call `RunGroup::cancel` and read
   `RunGroup::results` to the end before `forget`.
+- `RunSpec::effects` and `TerminalEffects::enqueue` reject an enqueue with
+  a header of the reserved `workflow.*` prefix, so a caller cannot enqueue
+  a job that a runtime reads as a step or a notification. Use another
+  header prefix.
+- `RunSpec::effects` and `TerminalEffects::enqueue` reject an enqueue to
+  the queue of the runtime with the new `Error::ReservedQueue`. 0.13
+  committed the job, and the worker dead-lettered it for the missing
+  `workflow.run_id` header. Submit a run, or enqueue to another queue.
+- `Error::ReservedHeaderInSubmit` becomes `Error::ReservedHeader`, because
+  it is also returned for the header of an enqueue. Rename the variant in
+  a match.
 
 ### Fixed
 
