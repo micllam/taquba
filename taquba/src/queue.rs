@@ -556,51 +556,52 @@ impl Queue {
     /// transition of its own to carry it, such as reconciling the state
     /// of a job the reaper dead-lettered.
     pub async fn commit_effects(&self, effects: SettlementEffects) -> Result<Vec<EnqueueResult>> {
-        let committed = self.commit_effects_where(effects, None).await?;
-        Ok(committed.expect("a commit without a compare arm is unconditional"))
+        let committed = self.commit_effects_where(effects, &[]).await?;
+        Ok(committed.expect("a commit without a compare is unconditional"))
     }
 
     /// Apply `effects` as [`Self::commit_effects`] does, only if the
-    /// current state of the user KV key `key` matches `expected`:
-    /// `Some(v)` requires the key to hold exactly `v`, and `None`
-    /// requires the key to be absent.
+    /// current state of every user KV key of `compares` matches its
+    /// expected state: `Some(v)` requires the key to contain exactly
+    /// `v`, and `None` requires the key to be absent.
     ///
-    /// Returns the enqueue results when the state matched and the
-    /// effects were applied, and `None` when it did not (nothing is
-    /// changed in that case). The compare and the effects execute in
+    /// Returns the enqueue results when every state matched and the
+    /// effects were applied, and `None` when one did not (nothing is
+    /// changed in that case). The compares and the effects execute in
     /// one transaction, so no concurrent write can be interleaved
-    /// between the compare and the commit: either this call applies the
+    /// between a compare and the commit: either this call applies the
     /// effects to the state it compared against, or it reports `None`.
     /// The effects are durable before the call returns `Some`, and they
-    /// can write or delete `key` itself.
+    /// can write or delete a compared key.
     pub async fn kv_compare_commit(
         &self,
-        key: &[u8],
-        expected: Option<&[u8]>,
+        compares: &[(&[u8], Option<&[u8]>)],
         effects: SettlementEffects,
     ) -> Result<Option<Vec<EnqueueResult>>> {
-        self.commit_effects_where(effects, Some((key, expected)))
-            .await
+        self.commit_effects_where(effects, compares).await
     }
 
     /// Body of `commit_effects` and `kv_compare_commit`: the transaction
-    /// loop over the prepared effects, with the compare arm `guard`
-    /// (the key and its expected state) tested first when one is given.
+    /// loop over the prepared effects, with every compare of `compares`
+    /// (a key and its expected state) tested first.
     async fn commit_effects_where(
         &self,
         effects: SettlementEffects,
-        guard: Option<(&[u8], Option<&[u8]>)>,
+        compares: &[(&[u8], Option<&[u8]>)],
     ) -> Result<Option<Vec<EnqueueResult>>> {
         let prepared = self.core.prepare_effects(effects).await?;
-        let guard = guard.map(|(key, expected)| (user_scoped_key(key), expected));
+        let compares: Vec<_> = compares
+            .iter()
+            .map(|(key, expected)| (user_scoped_key(key), *expected))
+            .collect();
         let committed = {
-            let (prepared, guard) = (&prepared, &guard);
+            let (prepared, compares) = (&prepared, &compares);
             retry(&self.core.db, Durability::Awaited, |txn| async move {
-                if let Some((scoped, expected)) = guard
-                    && !kv_state_matches(&txn, scoped, *expected).await?
-                {
-                    txn.rollback();
-                    return Ok(Attempt::Abort(None));
+                for (scoped, expected) in compares {
+                    if !kv_state_matches(&txn, scoped, *expected).await? {
+                        txn.rollback();
+                        return Ok(Attempt::Abort(None));
+                    }
                 }
                 let staged = self.core.stage_effects(&txn, prepared).await?;
                 Ok(Attempt::Commit(txn, Some(staged)))
@@ -3096,7 +3097,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kv_compare_commit_applies_the_effects_only_when_the_key_matches() {
+    async fn kv_compare_commit_applies_the_effects_only_when_every_key_matches() {
         let q = Queue::open(make_store(), "test").await.unwrap();
         q.kv_put(b"runs/1", b"active").await.unwrap();
         q.kv_put(b"runs/1/step", b"3").await.unwrap();
@@ -3122,16 +3123,26 @@ mod tests {
         // A different value and a wrong absence expectation do not apply
         // the effects.
         assert!(
-            q.kv_compare_commit(b"runs/1", Some(b"stale"), effects())
+            q.kv_compare_commit(&[(b"runs/1", Some(b"stale"))], effects())
                 .await
                 .unwrap()
                 .is_none()
         );
         assert!(
-            q.kv_compare_commit(b"runs/1", None, effects())
+            q.kv_compare_commit(&[(b"runs/1", None)], effects())
                 .await
                 .unwrap()
                 .is_none()
+        );
+        // One compare of a list that does not match has the same effect.
+        assert!(
+            q.kv_compare_commit(
+                &[(b"runs/1", Some(b"active")), (b"runs/1/step", Some(b"2"))],
+                effects()
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
         assert_eq!(
             q.view().kv_get(b"runs/1").await.unwrap().as_deref(),
@@ -3143,9 +3154,12 @@ mod tests {
         );
         assert_eq!(pending(&q).await, 0);
 
-        // The expected value applies the effects, the compared key included.
+        // The expected values apply the effects, the compared keys included.
         let results = q
-            .kv_compare_commit(b"runs/1", Some(b"active"), effects())
+            .kv_compare_commit(
+                &[(b"runs/1", Some(b"active")), (b"runs/1/step", Some(b"3"))],
+                effects(),
+            )
             .await
             .unwrap()
             .expect("the value matched");
@@ -3159,7 +3173,10 @@ mod tests {
 
         // Absence is a state to compare against.
         let claim = SettlementEffects::default().kv_put(b"runs/2".to_vec(), b"active".to_vec());
-        let results = q.kv_compare_commit(b"runs/2", None, claim).await.unwrap();
+        let results = q
+            .kv_compare_commit(&[(b"runs/2", None)], claim)
+            .await
+            .unwrap();
         assert!(matches!(results.as_deref(), Some([])));
         assert_eq!(
             q.view().kv_get(b"runs/2").await.unwrap().as_deref(),

@@ -152,8 +152,7 @@ impl ExpiryIndex {
                 } => {
                     let applied = queue
                         .kv_compare_commit(
-                            &compared,
-                            expected.as_deref(),
+                            &[(&compared, expected.as_deref())],
                             effects.kv_delete(key.clone()),
                         )
                         .await?;

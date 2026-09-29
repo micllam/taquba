@@ -226,8 +226,8 @@
 //! KV writes and deletes) as one transaction without a job transition,
 //! for state that must move in one step when no transition of its own
 //! includes it. [`Queue::kv_compare_commit`] applies the same effects
-//! only if the value stored at one key equals an expected value, or the
-//! key is absent.
+//! only if the value stored at each key of a list equals an expected
+//! value, or the key is absent.
 //!
 //! [`Queue::ack_with`] extends the same atomicity to settlement: it
 //! acknowledges a claimed job and, in the same transaction, enqueues
