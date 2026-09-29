@@ -26,7 +26,7 @@ use crate::keys::{
 };
 use crate::memo::{MemoStore, RUN_RESULT_MEMO_KEY};
 use crate::runner::{StepErrorKind, StepOutcome, StepRunner, Trigger};
-use crate::sweep::{Clearable, Sweep, run_periodically};
+use crate::sweep::{Clearable, Cleared, Sweep, run_periodically};
 use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
 use crate::view::WorkflowView;
 use crate::worker::{ClaimedStep, StepWorker};
@@ -325,9 +325,11 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     /// the memo entries and terminal records of its members) `retention` after a
     /// [`RunGroup::results`] consumer observed the last member's
     /// termination, through a sweep when the worker starts and at every
-    /// poll interval after that. When unset (default), no group
-    /// terminal marker is written. A group whose results are never
-    /// consumed is retained until [`RunGroup::forget`] in either case.
+    /// poll interval after that. A group submitted again after that
+    /// observation is retained until `retention` after the next
+    /// observation. When unset (default), no group terminal marker is
+    /// written. A group whose results are never consumed is retained
+    /// until [`RunGroup::forget`] in either case.
     pub fn group_retention(mut self, retention: Duration) -> Self {
         self.group_retention = Some(retention);
         self
@@ -405,9 +407,9 @@ struct RunStore {
 impl Clearable for RunStore {
     type Error = Error;
 
-    async fn clear(&self, run_id: &RunId) -> Result<Vec<Vec<u8>>> {
+    async fn clear(&self, run_id: &RunId, _marked_at_ms: u64) -> Result<Cleared> {
         self.memo_store.clear_memos_for_run(run_id).await?;
-        Ok(vec![outcome_kv_key(run_id)])
+        Ok(Cleared::Removed(vec![outcome_kv_key(run_id)]))
     }
 }
 

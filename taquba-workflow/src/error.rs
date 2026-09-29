@@ -116,6 +116,11 @@ pub enum Error {
     /// A group operation named a group with no manifest.
     #[error("group `{0}` not found")]
     GroupNotFound(RunId),
+
+    /// [`RunGroup::forget`](crate::RunGroup::forget) was called for a
+    /// group with an active member.
+    #[error("group `{0}` has an active member")]
+    GroupActive(RunId),
 }
 
 impl Error {
@@ -143,7 +148,7 @@ impl Error {
             | Self::GroupMismatch(_)
             | Self::GroupNotFound(_) => true,
             Self::Queue(e) => e.is_permanent(),
-            Self::Store(_) => false,
+            Self::Store(_) | Self::GroupActive(_) => false,
         }
     }
 }

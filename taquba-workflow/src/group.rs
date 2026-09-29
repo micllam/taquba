@@ -5,9 +5,10 @@
 //! and removes the group's state; [`jobs::JobGroup`](crate::jobs::JobGroup)
 //! is its typed presentation.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use futures_util::stream::{self, FuturesUnordered, Stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use taquba::object_store::{ObjectStore, path::Path};
@@ -23,14 +24,14 @@ use crate::keys::{
 };
 use crate::memo::MemoStore;
 use crate::runtime::{RunOptions, RunSpec, RunTermination, RuntimeCore};
-use crate::sweep::Clearable;
+use crate::sweep::{Clearable, Cleared};
 use crate::terminal::{RunOutcome, TerminalStatus};
 
 /// Member submissions and cancellations in flight at once. Each blocks
 /// on a durable commit, and concurrent commits share WAL flushes.
 const SUBMIT_CONCURRENCY: usize = 32;
-/// Member records read per page, and deleted per transaction by
-/// [`GroupStore::forget`].
+/// Member records read per page, and members removed per transaction
+/// by [`GroupStore::remove`].
 const MEMBER_PAGE_SIZE: usize = 1000;
 
 /// The run id of the member `key` of group `group_id`: the hex SHA-256
@@ -220,52 +221,151 @@ impl GroupStore {
         Ok(members)
     }
 
-    /// Remove the state of `group_id`: the memo entries and the terminal
-    /// record of every member in its manifest, its member records and
-    /// the manifest. A group without a manifest has its member records
-    /// removed and nothing else.
+    /// Removes the state of `group_id`. Fails with
+    /// [`Error::GroupActive`] when a member is active, or when a member
+    /// is submitted before the removal commits.
     pub(crate) async fn forget(&self, group_id: &RunId) -> Result<()> {
-        let mut keys = Vec::new();
+        let removal = self.removal(group_id).await?;
+        if removal.any_member(|member| member.terminated.is_none()) || !self.remove(removal).await?
+        {
+            return Err(Error::GroupActive(group_id.clone()));
+        }
+        Ok(())
+    }
+
+    /// The state of `group_id` as one read of its manifest and its
+    /// member records: every member of the manifest, and every member
+    /// record without a member in the manifest.
+    async fn removal(&self, group_id: &RunId) -> Result<Removal> {
+        let mut members = BTreeMap::new();
         if let Some(manifest) = self.read_manifest(group_id).await? {
-            for member in &manifest.members {
-                let run_id = member_run_id(group_id, &member.key);
-                self.memo_store.clear_memos_for_run(&run_id).await?;
-                keys.push(outcome_kv_key(&run_id));
-                if keys.len() == MEMBER_PAGE_SIZE {
-                    self.delete_keys(std::mem::take(&mut keys)).await?;
-                }
+            for member in manifest.members {
+                members.insert(
+                    group_member_kv_key(group_id, &member.key),
+                    RemovedMember {
+                        run_id: Some(member_run_id(group_id, &member.key)),
+                        stored: None,
+                        record: None,
+                    },
+                );
             }
         }
         let prefix = group_members_kv_prefix(group_id);
         let mut entries =
             std::pin::pin!(self.queue.view().kv_entries(&prefix, .., MEMBER_PAGE_SIZE));
-        while let Some((key, _)) = entries.try_next().await? {
-            keys.push(key);
-            if keys.len() == MEMBER_PAGE_SIZE {
-                self.delete_keys(std::mem::take(&mut keys)).await?;
-            }
+        while let Some((key, value)) = entries.try_next().await? {
+            let record = durable::decode_or_absent(
+                &value,
+                "group member record",
+                &format_args!(
+                    "{group_id}/{}",
+                    String::from_utf8_lossy(&key[prefix.len()..])
+                ),
+            );
+            let member = members.entry(key).or_insert(RemovedMember {
+                run_id: None,
+                stored: None,
+                record: None,
+            });
+            member.stored = Some(value);
+            member.record = record;
         }
-        if !keys.is_empty() {
-            self.delete_keys(keys).await?;
-        }
-        self.objects.delete(&self.manifest_path(group_id)).await?;
-        Ok(())
+        Ok(Removal {
+            group_id: group_id.clone(),
+            members,
+        })
     }
 
-    /// Delete the KV entries under `keys` in one transaction.
-    async fn delete_keys(&self, keys: Vec<Vec<u8>>) -> Result<()> {
-        self.queue
-            .commit_effects(SettlementEffects::default().kv_deletes(keys))
+    /// Remove the state that `removal` read: the member records and
+    /// the terminal record of every member of the manifest, then the
+    /// memo entries of those members and the manifest. A group without
+    /// a manifest has its member records removed and nothing else.
+    ///
+    /// A transaction removes the KV state of [`MEMBER_PAGE_SIZE`]
+    /// members and compares the record of each with the state that
+    /// `removal` read. Returns `false` without a further removal when a
+    /// compare does not match.
+    async fn remove(&self, removal: Removal) -> Result<bool> {
+        let members: Vec<_> = removal.members.iter().collect();
+        for page in members.chunks(MEMBER_PAGE_SIZE) {
+            let compares: Vec<_> = page
+                .iter()
+                .map(|(key, member)| (key.as_slice(), member.stored.as_deref()))
+                .collect();
+            let outcomes = page
+                .iter()
+                .filter_map(|(_, member)| member.run_id.as_ref().map(outcome_kv_key));
+            let records = page
+                .iter()
+                .filter(|(_, member)| member.stored.is_some())
+                .map(|(key, _)| (*key).clone());
+            let effects =
+                SettlementEffects::default().kv_deletes(records.chain(outcomes).collect());
+            if self
+                .queue
+                .kv_compare_commit(&compares, effects)
+                .await?
+                .is_none()
+            {
+                return Ok(false);
+            }
+        }
+        for run_id in removal.members.values().filter_map(|m| m.run_id.as_ref()) {
+            self.memo_store.clear_memos_for_run(run_id).await?;
+        }
+        self.objects
+            .delete(&self.manifest_path(&removal.group_id))
             .await?;
-        Ok(())
+        Ok(true)
+    }
+}
+
+/// One member of a [`Removal`].
+struct RemovedMember {
+    /// The member's run id, for a member of the manifest.
+    run_id: Option<RunId>,
+    /// The stored bytes of the member record, `None` without a record.
+    stored: Option<Bytes>,
+    /// The decoded member record, `None` without a record or for a
+    /// record that fails to decode.
+    record: Option<DurableMember>,
+}
+
+/// The state of a group that [`GroupStore::remove`] removes, with the
+/// KV key of each member record.
+struct Removal {
+    group_id: RunId,
+    members: BTreeMap<Vec<u8>, RemovedMember>,
+}
+
+impl Removal {
+    /// Whether `test` is true for the record of a member.
+    fn any_member(&self, test: impl Fn(&DurableMember) -> bool) -> bool {
+        self.members
+            .values()
+            .filter_map(|member| member.record.as_ref())
+            .any(test)
     }
 }
 
 impl Clearable for GroupStore {
     type Error = Error;
 
-    async fn clear(&self, group_id: &RunId) -> Result<Vec<Vec<u8>>> {
-        self.forget(group_id).await.map(|()| Vec::new())
+    /// A member that is active, or that terminated after the marker,
+    /// belongs to a later submission of the group, whose marker
+    /// [`RunGroup::results`] writes.
+    async fn clear(&self, group_id: &RunId, marked_at_ms: u64) -> Result<Cleared> {
+        let removal = self.removal(group_id).await?;
+        let superseded = removal.any_member(|member| {
+            member
+                .terminated
+                .as_ref()
+                .is_none_or(|termination| termination.terminated_at_ms > marked_at_ms)
+        });
+        if superseded || !self.remove(removal).await? {
+            return Ok(Cleared::Superseded);
+        }
+        Ok(Cleared::Removed(Vec::new()))
     }
 }
 
@@ -535,8 +635,11 @@ impl RunGroup {
 
     /// Remove the group's state: its manifest, member records and the
     /// memo entries, run result records and terminal records of its
-    /// members. A later [`submit`](Self::submit) under the same id
-    /// starts from nothing.
+    /// members. A later [`submit`](Self::submit) with the same id
+    /// starts from nothing. Returns [`Error::GroupActive`] for a group
+    /// with an active member, whose state stays, and for a group whose
+    /// member is submitted before the removal commits. A transaction
+    /// removes the records of 1,000 members.
     pub async fn forget(&self) -> Result<()> {
         self.store().forget(&self.id).await
     }
@@ -778,13 +881,90 @@ mod tests {
             .await
             .unwrap();
         assert!(!plain.newly_submitted);
+    }
 
+    #[tokio::test(start_paused = true)]
+    async fn forget_refuses_a_group_with_an_active_member() {
+        let (queue, store) = open_queue().await;
+        let runtime = WorkflowRuntime::builder(queue, store, TwoSteps, NoopTerminalHook).build();
+        let group = runtime.group(rid("g"));
+        group
+            .submit(vec![member("a")], &RunOptions::default())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            group.forget().await,
+            Err(Error::GroupActive(id)) if id == "g"
+        ));
+        assert_eq!(group.status().await.unwrap().pending, 1);
+
+        assert_eq!(group.cancel().await.unwrap(), 1);
         group.forget().await.unwrap();
         assert!(group.members().await.unwrap().is_empty());
         assert!(matches!(
             group.manifest().await,
             Err(Error::GroupNotFound(_))
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_does_not_apply_after_a_later_submission() {
+        let (queue, store) = open_queue().await;
+        let runtime = WorkflowRuntime::builder(queue, store, TwoSteps, NoopTerminalHook).build();
+        let group = runtime.group(rid("g"));
+        let options = RunOptions::default();
+        group.submit(vec![member("a")], &options).await.unwrap();
+        assert_eq!(group.cancel().await.unwrap(), 1);
+
+        // The submission commits between the read and the removal.
+        let removal = group.store().removal(&rid("g")).await.unwrap();
+        group.submit(vec![member("a")], &options).await.unwrap();
+        assert!(!group.store().remove(removal).await.unwrap());
+        assert_eq!(group.status().await.unwrap().pending, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_group_sweep_retains_a_group_submitted_again_after_its_marker() {
+        let (queue, store, clock) = open_queue_at(10_000).await;
+        let runtime = WorkflowRuntime::builder(queue.clone(), store, TwoSteps, NoopTerminalHook)
+            .group_retention(Duration::from_secs(1))
+            .build();
+        let group = runtime.group(rid("g"));
+        let sweep = runtime.inner.core.group_sweep.as_ref().unwrap();
+        let options = RunOptions::default();
+        let submit = || group.submit(vec![member("a")], &options);
+        let observe = || async {
+            let results: Vec<MemberResult> =
+                group.results().await.unwrap().try_collect().await.unwrap();
+            assert_eq!(results.len(), 1);
+        };
+
+        submit().await.unwrap();
+        assert_eq!(group.cancel().await.unwrap(), 1);
+        observe().await;
+
+        // The member is active when the first marker expires.
+        clock.advance(Duration::from_millis(500));
+        submit().await.unwrap();
+        clock.advance(Duration::from_millis(500));
+        assert_eq!(runtime.inner.core.sweep_once().await.unwrap(), 1);
+        let first = sweep.marker_key(&rid("g"), 10_000);
+        assert!(queue.view().kv_get(&first).await.unwrap().is_none());
+        assert_eq!(group.status().await.unwrap().pending, 1);
+
+        // The member terminated after the second marker and its
+        // termination is not observed when that marker expires.
+        assert_eq!(group.cancel().await.unwrap(), 1);
+        observe().await;
+        clock.advance(Duration::from_millis(500));
+        submit().await.unwrap();
+        assert_eq!(group.cancel().await.unwrap(), 1);
+        clock.advance(Duration::from_millis(500));
+        assert_eq!(runtime.inner.core.sweep_once().await.unwrap(), 1);
+        let second = sweep.marker_key(&rid("g"), 11_000);
+        assert!(queue.view().kv_get(&second).await.unwrap().is_none());
+        assert_eq!(group.status().await.unwrap().cancelled, 1);
     }
 
     #[tokio::test(start_paused = true)]

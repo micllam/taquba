@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `RunGroup::forget` and `JobGroup::forget` fail with the new
+  `Error::GroupActive` for a group with an active member, whose state stays,
+  and for a group whose member is submitted before the removal commits. 0.13
+  removed the member records, so the results of a later submission failed
+  with `MemberNotSubmitted`. Call `RunGroup::cancel` and read
+  `RunGroup::results` to the end before `forget`.
+
+### Fixed
+
+- The group retention sweep retains a group that is submitted again after
+  its terminal marker. 0.13 removed the group a window after the first
+  marker, while the members of the later submission were active.
+
 ## [0.13.0] - 2026-09-25
 
 ### Added
