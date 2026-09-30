@@ -6,7 +6,7 @@ rules for that crate.
 ## Checks
 
 Before reporting a change as done, run the commands of the `lint` and `test`
-jobs in `.github/workflows/ci.yml`.
+jobs in `.github/workflows/ci.yml`. Run `vale sync` after a clone.
 
 ## Invariants
 

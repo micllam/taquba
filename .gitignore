@@ -1,3 +1,6 @@
 /target
 
 /book/book/
+
+/.vale/styles/*
+!/.vale/styles/Taquba/

@@ -1,0 +1,12 @@
+extends: substitution
+message: '''%s'' for ''%s'''
+level: error
+ignorecase: true
+swap:
+  'parked': 'waiting, or "held in `scheduled`"'
+  'make-up': 'backfill, replayed'
+  'stopped beating': 'stopped committing beats'
+  'retry budgets?': 'attempt count reset'
+  'tak(e|es|ing|en) ([a-z]+ )?(it |the [a-z]+ |a [a-z]+ )?back': 'ends the claim, ends the assignment, requeues, or name the transition'
+  'mailbox(es)?': 'name the literal storage'
+  'terminal prefix(es)?': 'name the literal prefix'
