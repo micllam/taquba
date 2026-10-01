@@ -1,7 +1,7 @@
 //! HTTP webhook delivery on top of the [Taquba] durable task queue.
 //!
-//! Aimed at workloads where a webhook is the announcement of an event
-//! (alerting on a timeseries DB, event relays, push notifications).
+//! Aimed at workloads where a webhook is the announcement of an event (alerting
+//! on a timeseries DB, event relays, push notifications).
 //!
 //! # Usage
 //!
@@ -41,8 +41,8 @@
 //!
 //! # Reserved header keys
 //!
-//! Webhook configuration travels with each job in [`taquba::JobRecord::headers`]
-//! under reserved keys:
+//! Webhook configuration travels with each job in
+//! [`taquba::JobRecord::headers`] under reserved keys:
 //!
 //! | Key | Required | Meaning |
 //! |---|---|---|
@@ -51,13 +51,13 @@
 //! | [`HEADER_TIMEOUT_MS`] (`webhook.timeout_ms`) | no | Per-request timeout (default [`DEFAULT_TIMEOUT`]) |
 //! | [`HTTP_HEADER_PREFIX`]`<name>` (`http.<name>`) | no | HTTP header to send |
 //!
-//! Other entries in `headers` are ignored by the worker; your application
-//! can use them for its own metadata.
+//! The worker ignores other entries in `headers`, and an application can use
+//! them for its own metadata.
 //!
-//! [`webhook_enqueue_request`] builds the enqueue request without
-//! performing it, so a delivery can be staged into a settlement
-//! transaction via [`taquba::SettlementEffects::enqueues`] and committed
-//! atomically with an acknowledgement.
+//! [`webhook_enqueue_request`] builds the enqueue request without performing
+//! it. A delivery staged into a settlement transaction via
+//! [`taquba::SettlementEffects::enqueues`] commits atomically with an
+//! acknowledgement.
 //!
 //! # Delivery semantics
 //!
@@ -72,18 +72,18 @@
 //! # Bounded deliveries
 //!
 //! Every delivery is bounded: the request timeout is the job's
-//! [`HEADER_TIMEOUT_MS`] header when present, otherwise the worker's
-//! default ([`DEFAULT_TIMEOUT`], configurable via
-//! [`WebhookWorker::with_default_timeout`]). Before sending, the worker
-//! extends the job's lease to cover the timeout, so a slow receiver
-//! does not cause the job to be re-queued mid-delivery.
+//! [`HEADER_TIMEOUT_MS`] header when present, otherwise the worker's default
+//! ([`DEFAULT_TIMEOUT`], configurable via
+//! [`WebhookWorker::with_default_timeout`]). Before sending, the worker extends
+//! the job's lease to cover the timeout, so a slow receiver does not cause the
+//! job to be re-queued mid-delivery.
 //!
 //! # Receiver-side idempotency
 //!
 //! Each delivery includes a `Webhook-Id` header (configurable via
-//! [`WebhookWorker::with_delivery_id_header`]) carrying [`taquba::JobRecord::id`].
-//! Taquba is at-least-once, so receivers must deduplicate on this header to
-//! handle retries correctly.
+//! [`WebhookWorker::with_delivery_id_header`]) that contains
+//! [`taquba::JobRecord::id`]. Taquba delivers a job at least once, so receivers
+//! must deduplicate on this header to handle retries correctly.
 //!
 //! [Taquba]: https://docs.rs/taquba
 
@@ -97,16 +97,16 @@ use taquba::{EnqueueOptions, EnqueueRequest, Queue};
 /// Errors returned by the producer and worker.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The job's headers don't include [`HEADER_URL`], or the value is empty.
+    /// The job's headers do not include [`HEADER_URL`], or the value is empty.
     /// Permanent: a misconfigured job will not become valid on retry.
     #[error("missing webhook URL (header `{HEADER_URL}`)")]
     MissingUrl,
     /// The [`HEADER_METHOD`] value is not a recognizable HTTP method.
-    /// Permanent: header value won't change across retries.
+    /// Permanent: the header value does not change across retries.
     #[error("invalid HTTP method `{0}`")]
     InvalidMethod(String),
-    /// [`HEADER_TIMEOUT_MS`] was present but couldn't be parsed as a non-negative integer.
-    /// Permanent: header value won't change across retries.
+    /// The [`HEADER_TIMEOUT_MS`] value is not a non-negative integer.
+    /// Permanent: the header value does not change across retries.
     #[error("invalid `{HEADER_TIMEOUT_MS}` `{0}`: not a non-negative integer")]
     InvalidTimeout(String),
     /// HTTP delivery failed transiently (network, TLS, timeout, 5xx, 408, 429).
@@ -124,10 +124,9 @@ pub enum Error {
 }
 
 impl Error {
-    /// True if this error should dead-letter the job rather than retry.
-    /// Permanent errors include configuration mistakes, HTTP client
-    /// errors, and permanent variants of the underlying Taquba queue
-    /// error.
+    /// True if the worker dead-letters the job on this error, without a retry.
+    /// Permanent errors include configuration mistakes, HTTP client errors and
+    /// permanent variants of the underlying Taquba queue error.
     ///
     /// [`Self::Queue`] delegates to [`taquba::Error::is_permanent`].
     pub fn is_permanent(&self) -> bool {
@@ -147,12 +146,15 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// [`taquba::JobRecord::headers`] key for the target URL. Required.
 pub const HEADER_URL: &str = "webhook.url";
-/// [`taquba::JobRecord::headers`] key for the HTTP method. Optional, defaults to `POST`.
+/// [`taquba::JobRecord::headers`] key for the HTTP method. Optional, defaults
+/// to `POST`.
 pub const HEADER_METHOD: &str = "webhook.method";
-/// [`taquba::JobRecord::headers`] key for the per-request timeout, in milliseconds. Optional.
+/// [`taquba::JobRecord::headers`] key for the per-request timeout, in
+/// milliseconds. Optional.
 pub const HEADER_TIMEOUT_MS: &str = "webhook.timeout_ms";
-/// Prefix marking a [`taquba::JobRecord::headers`] entry that should be passed
-/// through as an outgoing HTTP request header (e.g. `http.Content-Type`).
+/// Prefix of a [`taquba::JobRecord::headers`] entry that the worker sends as an
+/// outgoing HTTP request header. The entry `http.Content-Type` becomes the
+/// header `Content-Type`.
 pub const HTTP_HEADER_PREFIX: &str = "http.";
 
 /// A single webhook delivery to enqueue. Build with [`Self::new`] and the
@@ -170,7 +172,7 @@ pub struct WebhookRequest {
 }
 
 impl WebhookRequest {
-    /// Build a new POST request to `url` with no headers and no timeout.
+    /// Build a new POST request to `url`, without headers or a timeout.
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
@@ -180,7 +182,7 @@ impl WebhookRequest {
         }
     }
 
-    /// Override the HTTP method (e.g. `"PUT"`, `"PATCH"`).
+    /// Override the HTTP method, such as `"PUT"` or `"PATCH"`.
     pub fn method(mut self, method: impl Into<String>) -> Self {
         self.method = method.into();
         self
@@ -192,7 +194,8 @@ impl WebhookRequest {
         self
     }
 
-    /// Set a per-request timeout. Without it, the reqwest client's default applies.
+    /// Set a per-request timeout. Without it, the reqwest client's default
+    /// applies.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
@@ -204,9 +207,9 @@ impl WebhookRequest {
 /// [`taquba::SettlementEffects::enqueues`]. [`enqueue_webhook`] is the
 /// standalone form.
 ///
-/// `body` becomes the HTTP request body; `request` is encoded into the
-/// job's [`taquba::JobRecord::headers`] under the reserved keys
-/// documented at the crate root.
+/// `body` becomes the HTTP request body, and `request` is encoded into the
+/// job's [`taquba::JobRecord::headers`] with the reserved keys that the crate
+/// root documents.
 pub fn webhook_enqueue_request(
     target_queue: &str,
     request: WebhookRequest,
@@ -236,12 +239,12 @@ pub fn webhook_enqueue_request(
     }
 }
 
-/// Enqueue a webhook delivery onto Taquba's `target_queue`. The returned
-/// string is the [`taquba::JobRecord::id`] of the new job.
+/// Enqueue a webhook delivery onto Taquba's `target_queue`. The returned string
+/// is the [`taquba::JobRecord::id`] of the new job.
 ///
-/// `body` becomes the HTTP request body; `request` is encoded into the job's
-/// [`taquba::JobRecord::headers`] under the reserved keys documented at the
-/// crate root.
+/// `body` becomes the HTTP request body, and `request` is encoded into the
+/// job's [`taquba::JobRecord::headers`] with the reserved keys that the crate
+/// root documents.
 pub async fn enqueue_webhook(
     queue: &Queue,
     target_queue: &str,

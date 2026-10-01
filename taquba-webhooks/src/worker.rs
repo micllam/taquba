@@ -6,25 +6,25 @@ use tracing::debug;
 
 use crate::{Error, HEADER_METHOD, HEADER_TIMEOUT_MS, HEADER_URL, HTTP_HEADER_PREFIX};
 
-/// Upper bound on a delivery when the job declares no
-/// [`HEADER_TIMEOUT_MS`](crate::HEADER_TIMEOUT_MS) override and the
-/// worker sets no [`WebhookWorker::with_default_timeout`].
+/// Upper bound on a delivery when neither the job's
+/// [`HEADER_TIMEOUT_MS`](crate::HEADER_TIMEOUT_MS) header nor
+/// [`WebhookWorker::with_default_timeout`] sets one.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// HTTP-based webhook delivery worker. Implements [`taquba::Worker`] so it
-/// drops straight into [`taquba::run_worker`] / [`taquba::run_worker_concurrent`].
+/// drops straight into [`taquba::run_worker`] /
+/// [`taquba::run_worker_concurrent`].
 ///
-/// Build with [`Self::new`] (or [`Self::with_client`] if you need to share a
-/// pre-configured [`reqwest::Client`]) and chain the optional builder methods.
+/// Build with [`Self::new`] (or [`Self::with_client`] to share a pre-configured
+/// [`reqwest::Client`]) and chain the optional builder methods.
 ///
 /// Every delivery is bounded: the request timeout is the job's
 /// [`HEADER_TIMEOUT_MS`](crate::HEADER_TIMEOUT_MS) header when present,
-/// otherwise the worker's default ([`DEFAULT_TIMEOUT`] unless overridden
-/// with [`Self::with_default_timeout`]). The timeout is applied per
-/// request and takes precedence over a timeout configured on the
-/// [`reqwest::Client`]. Before sending, the worker extends the job's
-/// lease to cover the timeout, so a slow receiver does not cause the
-/// job to be re-queued mid-delivery.
+/// otherwise the worker's default ([`DEFAULT_TIMEOUT`] unless overridden with
+/// [`Self::with_default_timeout`]). The timeout is applied per request and
+/// takes precedence over a timeout configured on the [`reqwest::Client`].
+/// Before sending, the worker extends the job's lease to cover the timeout, so
+/// a slow receiver does not cause the job to be re-queued mid-delivery.
 pub struct WebhookWorker {
     client: reqwest::Client,
     delivery_id_header: Option<String>,
@@ -47,22 +47,22 @@ impl WebhookWorker {
     }
 
     /// Override the request timeout applied to jobs that declare no
-    /// [`HEADER_TIMEOUT_MS`](crate::HEADER_TIMEOUT_MS) header. Defaults
-    /// to [`DEFAULT_TIMEOUT`].
+    /// [`HEADER_TIMEOUT_MS`](crate::HEADER_TIMEOUT_MS) header. Defaults to
+    /// [`DEFAULT_TIMEOUT`].
     pub fn with_default_timeout(mut self, timeout: Duration) -> Self {
         self.default_timeout = timeout;
         self
     }
 
-    /// Override the header name used to carry [`taquba::JobRecord::id`] for
-    /// receiver-side idempotency. Defaults to `Webhook-Id`.
+    /// Override the name of the header that contains [`taquba::JobRecord::id`]
+    /// for receiver-side idempotency. Defaults to `Webhook-Id`.
     pub fn with_delivery_id_header(mut self, name: impl Into<String>) -> Self {
         self.delivery_id_header = Some(name.into());
         self
     }
 
-    /// Disable the delivery-ID header entirely. Receivers won't be able to
-    /// dedupe retries; only set this if you have your own idempotency mechanism.
+    /// Disable the delivery-ID header. Without it, a receiver must deduplicate
+    /// retries through its own idempotency mechanism.
     pub fn without_delivery_id_header(mut self) -> Self {
         self.delivery_id_header = None;
         self
@@ -89,8 +89,8 @@ impl Worker for WebhookWorker {
     }
 }
 
-/// The request timeout for a delivery: the job's [`HEADER_TIMEOUT_MS`]
-/// header, or `default` when the header is absent.
+/// The request timeout for a delivery: the job's [`HEADER_TIMEOUT_MS`] header,
+/// or `default` when the header is absent.
 fn effective_timeout(
     headers: &std::collections::HashMap<String, String>,
     default: Duration,
@@ -142,8 +142,8 @@ async fn deliver(
 
     req = req.timeout(timeout);
 
-    // One extension covering the bounded send; there is no progress
-    // signal inside it to renew on.
+    // One extension covers the bounded send, which does not signal progress for
+    // a renewal.
     lease
         .ensure_at_least(timeout)
         .map_err(|e| Error::Delivery(format!("lease extension failed: {e}")))?;
@@ -160,7 +160,8 @@ async fn deliver(
         return Ok(());
     }
 
-    // Capture a short body preview to help with debugging without bloating logs.
+    // Capture a short body preview to help with debugging without bloating
+    // logs.
     let body_preview = response
         .text()
         .await
@@ -169,9 +170,8 @@ async fn deliver(
         .unwrap_or_default();
     let message = format!("HTTP {status}: {body_preview}");
 
-    // 4xx client errors are permanent (the receiver is rejecting the request
-    // intentionally, retrying won't help), except 408 Request Timeout and
-    // 429 Too Many Requests, which are retry-friendly per HTTP semantics.
+    // A 4xx client error is permanent, except 408 Request Timeout and 429 Too
+    // Many Requests, which HTTP semantics define as retryable.
     if status.is_client_error()
         && status != reqwest::StatusCode::REQUEST_TIMEOUT
         && status != reqwest::StatusCode::TOO_MANY_REQUESTS

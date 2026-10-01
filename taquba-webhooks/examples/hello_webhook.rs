@@ -1,8 +1,8 @@
 // cargo run -p taquba-webhooks --example hello_webhook
 //
-// End-to-end demo of taquba-webhooks: spins up a local axum HTTP listener
-// that captures incoming requests, enqueues a few webhook deliveries pointed
-// at it, runs the WebhookWorker, prints what arrived, and shuts down.
+// End-to-end demo of taquba-webhooks: starts a local axum HTTP listener that
+// captures incoming requests, enqueues a few webhook deliveries to it, runs the
+// WebhookWorker, prints what arrived and shuts down.
 
 use std::sync::Arc;
 use std::time::Duration;
