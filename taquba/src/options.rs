@@ -234,6 +234,19 @@ pub struct OpenOptions {
     ///
     /// [wal]: crate::ReaderOptions::wal_object_store
     pub wal_object_store: Option<Arc<dyn ObjectStore>>,
+    /// Whether the writer process runs SlateDB's compactor. Defaults to `true`.
+    /// With `false`, a compactor outside the process compacts the store, and a
+    /// store without one accumulates its L0 files.
+    ///
+    /// A store whose compactor runs outside the process must be opened with
+    /// `false`: a fenced in-process compactor closes the writer.
+    pub in_process_compactor: bool,
+    /// Whether the writer process runs SlateDB's garbage collector, which
+    /// removes the manifest versions, WAL files and SST files that are
+    /// unreachable from the current manifest and its checkpoints. Defaults to
+    /// `true`. With `false`, a garbage collector outside the process removes
+    /// them, and a store without one keeps every file.
+    pub in_process_garbage_collector: bool,
 }
 
 impl OpenOptions {
@@ -336,6 +349,20 @@ impl OpenOptions {
         self.wal_object_store = wal_object_store.into();
         self
     }
+
+    /// Set [`Self::in_process_compactor`].
+    #[must_use]
+    pub fn in_process_compactor(mut self, in_process_compactor: bool) -> Self {
+        self.in_process_compactor = in_process_compactor;
+        self
+    }
+
+    /// Set [`Self::in_process_garbage_collector`].
+    #[must_use]
+    pub fn in_process_garbage_collector(mut self, in_process_garbage_collector: bool) -> Self {
+        self.in_process_garbage_collector = in_process_garbage_collector;
+        self
+    }
 }
 
 impl Default for OpenOptions {
@@ -353,6 +380,8 @@ impl Default for OpenOptions {
             payload_store: None,
             payload_path: None,
             wal_object_store: None,
+            in_process_compactor: true,
+            in_process_garbage_collector: true,
         }
     }
 }

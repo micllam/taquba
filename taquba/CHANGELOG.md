@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `OpenOptions::in_process_compactor` and
+  `OpenOptions::in_process_garbage_collector`: whether the writer process runs
+  SlateDB's compactor and garbage collector, so a store maintained outside the
+  process opens without them. Both default to `true`, and an existing open is
+  unchanged.
+
 ### Changed
 
 - `Queue::kv_compare_commit` takes a list of compares and applies the effects

@@ -377,6 +377,10 @@
 //!   from another process, only when [`OpenOptions::liveness_heartbeat`]
 //!   is set.
 //!
+//! SlateDB's compactor and garbage collector run in the same process unless
+//! [`OpenOptions::in_process_compactor`] or
+//! [`OpenOptions::in_process_garbage_collector`] is `false`.
+//!
 //! Opening a queue also re-queues every job left claimed by a previous process:
 //! crash recovery happens at open, and lease expiry detects a delivery that
 //! stops progressing while the process lives. A job interrupted this way

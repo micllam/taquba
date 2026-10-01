@@ -307,6 +307,12 @@ impl Queue {
         if let Some(flush_interval) = opts.flush_interval {
             settings.flush_interval = Some(flush_interval);
         }
+        if !opts.in_process_compactor {
+            settings.compactor_options = None;
+        }
+        if !opts.in_process_garbage_collector {
+            settings.garbage_collector_options = None;
+        }
         let mut builder = Db::builder(path, object_store)
             .with_merge_operator(Arc::new(QueueMergeOperator))
             .with_settings(settings);
@@ -2477,6 +2483,40 @@ mod tests {
             .unwrap();
         let job = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Pending);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_queue_without_the_in_process_compactor_leaves_the_compactor_epoch_at_zero() {
+        let store = make_store();
+        let opts = || {
+            OpenOptions::default()
+                .in_process_compactor(false)
+                .in_process_garbage_collector(false)
+        };
+        let q = Queue::open_with_options(store.clone(), "test", opts())
+            .await
+            .unwrap();
+        let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
+        q.close().await.unwrap();
+
+        // An in-process compactor fences the manifest at open, which raises the
+        // compactor epoch, and the writer reads the latest manifest at the next
+        // open.
+        let q = Queue::open_with_options(store.clone(), "test", opts())
+            .await
+            .unwrap();
+        assert_eq!(q.core.db.manifest().compactor_epoch(), 0);
+        let job = q.view().get_job(&id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Pending);
+        q.close().await.unwrap();
+
+        let q = Queue::open(store.clone(), "test").await.unwrap();
+        q.close().await.unwrap();
+        let q = Queue::open_with_options(store, "test", opts())
+            .await
+            .unwrap();
+        assert_eq!(q.core.db.manifest().compactor_epoch(), 1);
         q.close().await.unwrap();
     }
 
