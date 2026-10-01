@@ -1,9 +1,9 @@
 // cargo run -p taquba-cron --example hello_cron
 //
-// Wires a cron schedule to a Taquba worker. Registers a single schedule
-// firing every minute on the 0-second mark, plus a worker that prints each
-// enqueued job. The example runs for up to 10 minutes or until Ctrl-C,
-// whichever comes first.
+// Wires a cron schedule to a Taquba worker. Registers a single schedule firing
+// every minute on the 0-second mark, plus a worker that prints each enqueued
+// job. The example runs for up to 10 minutes or until Ctrl-C, whichever comes
+// first.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,7 +30,8 @@ impl Worker for PrintWorker {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // In production you'd swap InMemory for an S3 / GCS / Azure / local-disk store.
+    // A production deployment replaces InMemory with an S3, GCS, Azure or
+    // local-disk store.
     let queue = Arc::new(Queue::open(Arc::new(InMemory::new()), "cron-demo").await?);
 
     let scheduler = CronScheduler::new(queue.clone());
