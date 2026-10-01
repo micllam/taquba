@@ -1,12 +1,12 @@
 //! In-process registry of tasks waiting for a job's terminal transition.
 //!
 //! A waiter registers its job id before it reads the job's state, so a
-//! transition that commits after the read reaches it through the
-//! registry; one that commits before the read is visible in the
-//! read. Every terminal transition settles its job's waiters after its
-//! commit, with the outcome the transition wrote, so a waiter learns
-//! the outcome without a second read. The outcome is built only when
-//! the job has waiters, so a transition without one costs a map lookup.
+//! transition that commits after the read reaches it through the registry. A
+//! transition that commits before the read is visible in the read. Every
+//! terminal transition settles its job's waiters after its commit, with the
+//! outcome the transition wrote, so a waiter learns the outcome without a
+//! second read. The outcome is built only when the job has waiters, so a
+//! transition without one costs a map lookup.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -35,8 +35,8 @@ pub(crate) struct Registration {
 }
 
 impl CompletionWaiters {
-    /// Register a waiter for `id`. Synchronous, so a caller can register
-    /// before its first await.
+    /// Register a waiter for `id`. The call is synchronous, which lets a caller
+    /// register before its first await.
     pub(crate) fn register(self: &Arc<Self>, id: &str) -> Registration {
         let (sender, receiver) = oneshot::channel();
         let key = {
@@ -151,9 +151,9 @@ mod tests {
 
     use crate::test_util::*;
 
-    /// Poll `fut` once with a no-op waker. A pending result shows the
-    /// future reached its first await, which for `wait_for_completion`
-    /// is past the waiter registration.
+    /// Poll `fut` once with a no-op waker. A pending result shows the future
+    /// reached its first await, which for `wait_for_completion` is past the
+    /// waiter registration.
     fn poll_once<F: std::future::Future>(fut: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         fut.poll(&mut cx)
@@ -181,8 +181,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_for_completion_wakes_on_ack() {
-        // Default retention deletes the record on ack; the waiter
-        // receives it from the settlement.
+        // Default retention deletes the record on ack. The waiter receives it
+        // from the settlement.
         let q = Queue::open(make_store(), "test").await.unwrap();
         let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
 
@@ -261,8 +261,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_for_completion_does_not_wake_on_cancel_requested() {
-        // A `Claimed` cancel fires the token but the job is still in
-        // flight; the wait continues until the worker settles the claim.
+        // A `Claimed` cancel fires the token but the job is still in flight.
+        // The wait continues until the worker settles the claim.
         let q = Queue::open(make_store(), "test").await.unwrap();
         q.enqueue("work", b"payload".to_vec()).await.unwrap();
         let job = q
@@ -338,8 +338,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_for_completion_delivers_offloaded_payloads_inline() {
-        // Covers the three settlements that hold a stored record: ack,
-        // worker dead-letter and reaper dead-letter.
+        // Covers the three settlements that hold a stored record: ack, worker
+        // dead-letter and reaper dead-letter.
         let clock = Arc::new(MockClock::new(1_000_000));
         let opts = OpenOptions {
             reaper_interval: Duration::from_secs(3600),
@@ -409,8 +409,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_for_completion_reports_a_removal_that_races_the_read() {
-        // An outcome delivered after the registration takes precedence
-        // over `NotFound` when the record is gone at the read.
+        // An outcome delivered after the registration takes precedence over
+        // `NotFound` when the record is gone at the read.
         let q = Queue::open(make_store(), "test").await.unwrap();
         let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
         let mut registration = q.core.completion_waiters.register(&id);

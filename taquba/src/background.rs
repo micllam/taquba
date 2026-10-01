@@ -1,5 +1,5 @@
-//! Background tasks of an open queue: a spawned task with a shutdown
-//! signal, and the periodic tick every such task runs on.
+//! Background tasks of an open queue: a spawned task with a shutdown signal,
+//! and the periodic tick every such task runs on.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -16,8 +16,7 @@ pub(crate) trait Periodic: Send + Sync + 'static {
     /// Name used in the task's log lines.
     const NAME: &'static str;
 
-    /// Run one tick. An error is logged at warn level and the task
-    /// continues.
+    /// Run one tick. An error is logged at warn level and the task continues.
     fn step(&self) -> impl Future<Output = Result<()>> + Send;
 }
 
@@ -29,9 +28,9 @@ impl<P: Periodic> Periodic for Arc<P> {
     }
 }
 
-/// A spawned task stopped by [`BackgroundTask::stop`]. The task is
-/// given a [`Ticker`] and runs until the ticker reports shutdown,
-/// which dropping the handle also signals.
+/// A spawned task stopped by [`BackgroundTask::stop`]. The task is given a
+/// [`Ticker`] and runs until the ticker reports shutdown, which dropping the
+/// handle also signals.
 pub(crate) struct BackgroundTask<T = ()> {
     shutdown: watch::Sender<bool>,
     handle: JoinHandle<T>,
@@ -55,8 +54,8 @@ impl<T: Send + 'static> BackgroundTask<T> {
         }
     }
 
-    /// Signal shutdown and wait for the task to finish. Returns its
-    /// output, or `None` when the task panicked.
+    /// Signal shutdown and wait for the task to finish. Returns its output, or
+    /// `None` when the task panicked.
     pub(crate) async fn stop(self) -> Option<T> {
         let _ = self.shutdown.send(true);
         match self.handle.await {
@@ -70,8 +69,8 @@ impl<T: Send + 'static> BackgroundTask<T> {
 }
 
 impl BackgroundTask {
-    /// Spawn `task` so that its [`Periodic::step`] runs once per
-    /// `interval` until shutdown.
+    /// Spawn `task` so that its [`Periodic::step`] runs once per `interval`
+    /// until shutdown.
     pub(crate) fn spawn_periodic<P: Periodic>(interval: Duration, task: P) -> BackgroundTask {
         BackgroundTask::spawn(interval, |mut ticker| async move {
             while ticker.tick().await {
@@ -91,9 +90,8 @@ pub(crate) struct Ticker {
 }
 
 impl Ticker {
-    /// Wait for the next tick. Returns `false` once shutdown is
-    /// signalled or the [`BackgroundTask`] is dropped, which ends the
-    /// task's loop.
+    /// Wait for the next tick. Returns `false` once shutdown is signalled or
+    /// the [`BackgroundTask`] is dropped, which ends the task's loop.
     pub(crate) async fn tick(&mut self) -> bool {
         tokio::select! {
             _ = tokio::time::sleep(self.interval) => true,

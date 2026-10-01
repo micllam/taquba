@@ -40,8 +40,8 @@ impl Worker for ResizeWorker {
     async fn process(&self, job: &JobRecord, _lease: &LeaseHandle) -> Result<(), WorkerError> {
         let task = ResizeTask::decode(&job.payload);
 
-        // In a real worker you would call an image library here.
-        // For this example we just simulate work with a short sleep.
+        // A real worker calls an image library here. This example simulates the
+        // work with a short sleep.
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         println!(
@@ -70,14 +70,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .default_priority(PRIORITY_NORMAL),
     );
 
-    // To use S3 or MinIO instead of memory, swap InMemory for an S3Builder:
+    // To use S3 or MinIO in place of memory, swap InMemory for an S3Builder:
     //
-    //   let store = Arc::new(
-    //       object_store::aws::AmazonS3Builder::new()
-    //           .with_bucket_name("my-queue-bucket")
-    //           .with_region("us-east-1")
-    //           .build()?,
-    //   );
+    // ```text
+    // let store = Arc::new(
+    //     object_store::aws::AmazonS3Builder::new()
+    //         .with_bucket_name("my-queue-bucket")
+    //         .with_region("us-east-1")
+    //         .build()?,
+    // );
+    // ```
     let q = Arc::new(Queue::open_with_options(Arc::new(InMemory::new()), "demo", opts).await?);
 
     println!("Enqueueing urgent thumbnail jobs (PRIORITY_HIGH)...");

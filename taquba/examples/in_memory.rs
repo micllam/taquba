@@ -1,8 +1,8 @@
 // cargo run -p taquba --example in_memory
 //
-// Demonstrates the core taquba API using an in-memory store.
-// Nothing is persisted: the queue disappears when the process exits.
-// This is the fastest way to explore the API locally.
+// Demonstrates the core taquba API using an in-memory store. Nothing is
+// persisted: the queue disappears when the process exits. This is the fastest
+// way to explore the API locally.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,8 +13,8 @@ use taquba::{EnqueueOptions, OpenOptions, Queue, QueueConfig, object_store::memo
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(InMemory::new());
     // Disable retry backoff so the demo can re-claim a nacked job immediately.
-    // In production the default exponential backoff (1s base, 5min cap) will park
-    // failed jobs in the scheduled space until their delay elapses.
+    // In production the default exponential backoff (1s base, 5min cap) will
+    // park failed jobs in the scheduled space until their delay elapses.
     let opts = OpenOptions::default().default_queue_config(
         QueueConfig::default()
             .retry_backoff_base(Duration::ZERO)
@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     q.nack(&job_b, "something went wrong").await?;
     println!("nacked task B - it will be retried");
 
-    // task B is back at the front; claim it again
+    // task B is back at the front, so claim it again
     let job_b2 = q
         .claim("tasks", Duration::from_secs(30))
         .await?

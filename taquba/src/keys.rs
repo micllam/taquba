@@ -1,32 +1,30 @@
 //! Binary key encoding for the queue's internal key spaces.
 //!
 //! Every internal key is `[tag, version, fields...]`: a [`KeyTag`]
-//! discriminator byte, the key-format version byte and the key space's
-//! fields. Fields use order-preserving encodings: timestamps are
-//! big-endian `u64`, priorities are big-endian `u32`, and a queue name
-//! that is followed by further fields is preceded by its length as one
-//! byte (queue names are limited to [`MAX_QUEUE_NAME_LEN`] bytes).
-//! Job IDs are stored as their byte form and always occupy the tail of
-//! a key.
+//! discriminator byte, the key-format version byte and the key space's fields.
+//! Fields use order-preserving encodings: timestamps are big-endian `u64`,
+//! priorities are big-endian `u32`, and a queue name followed by further fields
+//! is preceded by its length as one byte (queue names are limited to
+//! [`MAX_QUEUE_NAME_LEN`] bytes). Job IDs are stored as their byte form and
+//! always occupy the tail of a key.
 //!
-//! Scan layouts follow one rule: the field the scan orders by comes
-//! first. The `Scheduled` and `Done` spaces lead with a timestamp so
-//! the scheduler and retention sweeps perform one global scan with an
-//! early exit; the `Pending`, `Claimed` and `Dead` spaces lead with the
-//! queue name so a listing covers one queue, `Pending` ordered by
-//! priority and then by ID and the other two by ID. The dead retention
-//! sweep is the exception: it scans the whole `Dead` space and reads
-//! the age off each record.
+//! Scan layouts follow one rule: the field the scan orders by comes first. The
+//! `Scheduled` and `Done` spaces lead with a timestamp so the scheduler and
+//! retention sweeps perform one global scan with an early exit. The `Pending`,
+//! `Claimed` and `Dead` spaces lead with the queue name so a listing covers one
+//! queue, `Pending` ordered by priority and then by ID and the other two by ID.
+//! The dead retention sweep is the exception: it scans the whole `Dead` space
+//! and reads the age from each record.
 //!
-//! A claimed job occupies one key: `Claimed` holds the record under a
-//! key stable for the life of the claim. The lease itself, the current
-//! expiry and the claim id, is process state held in
-//! `crate::lease_registry`, never stored: a lease held by a process
-//! that no longer runs is void, so every claimed record found at open
-//! is re-queued and a renewal writes nothing durable.
+//! A claimed job occupies one key: `Claimed` contains the record at a key
+//! stable for the life of the claim. The lease itself, the current expiry and
+//! the claim id, is process state kept in `crate::lease_registry` and never
+//! stored: a lease of a process that no longer runs is void, so every claimed
+//! record found at open is re-queued and a renewal does not write durable
+//! state.
 //!
-//! User KV keys are `[KeyTag::User, caller bytes]` with no version
-//! byte: caller bytes are opaque data, not a schema this module owns.
+//! User KV keys are `[KeyTag::User, caller bytes]` without a version byte:
+//! caller bytes are opaque data outside the schema of this module.
 
 use std::borrow::Borrow;
 use std::fmt;
@@ -38,17 +36,17 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::error::{Error, Result};
 use crate::job::JobStatus;
 
-/// Maximum byte length of a queue name, imposed by the one-byte length
-/// field in key encodings.
+/// Maximum byte length of a queue name, imposed by the one-byte length field in
+/// key encodings.
 pub const MAX_QUEUE_NAME_LEN: usize = 255;
 
 /// A queue name within the bound of the key encoding: at most
-/// [`MAX_QUEUE_NAME_LEN`] bytes, the range of the one-byte length
-/// field. `QueueName` is the parameter type of every key builder, so a
-/// key over an unvalidated name does not compile, and the type of
-/// [`JobRecord::queue`](crate::JobRecord::queue). A name is validated
-/// by [`QueueName::new`], by [`str::parse`] and by deserialization. The
-/// type dereferences to `str` and implements `PartialEq<str>`.
+/// [`MAX_QUEUE_NAME_LEN`] bytes, the range of the one-byte length field.
+/// `QueueName` is the parameter type of every key builder, so a key over an
+/// unvalidated name does not compile, and the type of
+/// [`JobRecord::queue`](crate::JobRecord::queue). A name is validated by
+/// [`QueueName::new`], by [`str::parse`] and by deserialization. The type
+/// dereferences to `str` and implements `PartialEq<str>`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct QueueName(String);
@@ -143,22 +141,22 @@ impl<'de> Deserialize<'de> for QueueName {
     }
 }
 
-/// Version byte written into every internal key after the tag.
-/// `0x00` is reserved as invalid.
+/// Version byte written into every internal key after the tag. `0x00` is
+/// reserved as invalid.
 pub(crate) const KEY_VERSION: u8 = 1;
 
-/// Key-space discriminator: the first byte of every stored key.
-/// `0x00` is reserved as invalid.
+/// Key-space discriminator: the first byte of every stored key. `0x00` is
+/// reserved as invalid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(test, derive(strum::EnumIter))]
 #[repr(u8)]
 pub(crate) enum KeyTag {
     /// `[tag, ver, qlen, queue, priority u32 BE, id]`
     Pending = 0x01,
-    /// `[tag, ver, qlen, queue, id]`; the value is the job record. The
-    /// key is stable for the lifetime of the claim, so a lease renewal
-    /// leaves it untouched. The claim's lease lives in
-    /// `crate::lease_registry`, not in a key space.
+    /// `[tag, ver, qlen, queue, id]`. The value is the job record. The key is
+    /// stable for the lifetime of the claim, so a lease renewal leaves it
+    /// untouched. The claim's lease is kept in `crate::lease_registry`, outside
+    /// every key space.
     Claimed = 0x02,
     /// `[tag, ver, run_at u64 BE, qlen, queue, id]`
     Scheduled = 0x03,
@@ -166,7 +164,7 @@ pub(crate) enum KeyTag {
     Done = 0x04,
     /// `[tag, ver, qlen, queue, id]`
     Dead = 0x05,
-    /// `[tag, ver, id]`; the value is the job's current primary key.
+    /// `[tag, ver, id]`. The value is the job's current primary key.
     JobIndex = 0x06,
     /// `[tag, ver, qlen, queue, dedup key bytes]`
     Dedup = 0x07,
@@ -174,18 +172,17 @@ pub(crate) enum KeyTag {
     Cursor = 0x08,
     /// `[tag, ver, qlen, queue, metric name]`
     Stats = 0x09,
-    /// `[tag, ver, id]`; the value is the job's attempt history, a
-    /// merge-appended concatenation of serialized [`crate::JobAttempt`]
-    /// entries in write order. Deleted in the same transaction that
-    /// removes the job's last record (ack without retention, cancel,
-    /// the retention sweeps).
+    /// `[tag, ver, id]`. The value is the job's attempt history, a
+    /// merge-appended concatenation of serialized [`crate::JobAttempt`] entries
+    /// in write order. Deleted in the same transaction that removes the job's
+    /// last record (ack without retention, cancel, the retention sweeps).
     AttemptHistory = 0x0A,
-    /// `[tag, ver]`; a single key per store. The value is the writer's
-    /// most recent liveness heartbeat, written every
-    /// [`crate::OpenOptions::liveness_heartbeat`] interval and read
-    /// through [`crate::QueueReader::writer_heartbeat`].
+    /// `[tag, ver]`, a single key per store. The value is the writer's most
+    /// recent liveness heartbeat, written every
+    /// [`crate::OpenOptions::liveness_heartbeat`] interval and read through
+    /// [`crate::QueueReader::writer_heartbeat`].
     Heartbeat = 0x0B,
-    /// `[tag, caller bytes]`; no version byte, caller bytes are opaque.
+    /// `[tag, caller bytes]`, without a version byte. Caller bytes are opaque.
     User = 0xFF,
 }
 
@@ -214,8 +211,8 @@ impl KeyTag {
         })
     }
 
-    /// The state of a job record stored under this tag, or `None` for
-    /// a key space that holds no job records.
+    /// The state of a job record stored with this tag, or `None` for a key
+    /// space without job records.
     pub(crate) fn job_status(self) -> Option<JobStatus> {
         match self {
             KeyTag::Pending => Some(JobStatus::Pending),
@@ -355,7 +352,7 @@ pub(crate) fn tag_prefix(tag: KeyTag) -> [u8; 2] {
     header(tag)
 }
 
-/// Scope a caller-supplied KV key under the user tag.
+/// Scope a caller-supplied KV key within the user tag.
 pub(crate) fn user_scoped_key(key: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + key.len());
     out.push(KeyTag::User as u8);
@@ -363,28 +360,27 @@ pub(crate) fn user_scoped_key(key: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Parse the leading big-endian timestamp from a time-first key of the
-/// given tag. Returns `None` when the key is not in that key space, is
-/// not the current key version or is too short.
+/// Parse the leading big-endian timestamp from a time-first key of the given
+/// tag. Returns `None` when the key is not in that key space, is not the
+/// current key version or is too short.
 ///
-/// Used by the reaper, scheduler and retention sweeps to early-exit a
-/// prefix scan once they reach a key whose timestamp is past the
-/// relevant cutoff.
+/// Used by the reaper, scheduler and retention sweeps to early-exit a prefix
+/// scan once they reach a key whose timestamp is past the relevant cutoff.
 pub(crate) fn parse_key_timestamp(key: &[u8], tag: KeyTag) -> Option<u64> {
     let rest = key.strip_prefix(header(tag).as_slice())?;
     let ts: [u8; 8] = rest.get(..8)?.try_into().ok()?;
     Some(u64::from_be_bytes(ts))
 }
 
-/// Parse the queue name from a cursor key. Returns `None` when the key
-/// is not a current-version cursor key or is malformed.
+/// Parse the queue name from a cursor key. Returns `None` when the key is not a
+/// current-version cursor key or is malformed.
 pub(crate) fn parse_cursor_key(key: &[u8]) -> Option<QueueName> {
     let rest = key.strip_prefix(header(KeyTag::Cursor).as_slice())?;
     QueueName::new(std::str::from_utf8(rest).ok()?).ok()
 }
 
-/// Parse `(queue, metric)` from a stats key. Returns `None` when the
-/// key is not a current-version stats key or is malformed.
+/// Parse `(queue, metric)` from a stats key. Returns `None` when the key is not
+/// a current-version stats key or is malformed.
 pub(crate) fn parse_stats_key(key: &[u8]) -> Option<(String, String)> {
     let rest = key.strip_prefix(header(KeyTag::Stats).as_slice())?;
     let (qlen, rest) = rest.split_first()?;

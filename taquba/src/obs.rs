@@ -2,28 +2,30 @@
 //! facade.
 //!
 //! taquba emits counters and latency histograms for each queue state
-//! transition. The macros are no-ops until the host process installs a
-//! recorder (for example `metrics-exporter-prometheus`, or
-//! `metrics-exporter-opentelemetry` for OTLP); taquba never installs one or
-//! depends on an exporter.
+//! transition. The macros are no-ops until the host process installs a recorder
+//! (for example `metrics-exporter-prometheus`, or
+//! `metrics-exporter-opentelemetry` for OTLP). taquba never installs a recorder
+//! or depends on an exporter.
 //!
-//! All emission requires the `metrics` cargo feature. Every function
-//! here has a no-op counterpart compiled when the feature is off, so call
-//! sites stay unconditional and compile to nothing.
+//! All emission requires the `metrics` cargo feature. Every function here has a
+//! no-op counterpart compiled when the feature is off, so call sites stay
+//! unconditional and compile to nothing.
 //!
-//! Metric names and labels form a stable interface that dashboards depend
-//! on, so treat a rename as a breaking change:
+//! Metric names and labels form a stable interface that dashboards depend on,
+//! so treat a rename as a breaking change:
 //! - `taquba_jobs_enqueued_total{queue}`: jobs written to pending/scheduled.
-//! - `taquba_jobs_claimed_total{queue}`: jobs handed to workers.
+//! - `taquba_jobs_claimed_total{queue}`: jobs assigned to workers.
 //! - `taquba_jobs_completed_total{queue}`: jobs acked successfully.
-//! - `taquba_jobs_nacked_total{queue}`: jobs requeued or scheduled after a nack.
+//! - `taquba_jobs_nacked_total{queue}`: jobs requeued or scheduled after a
+//!   nack.
 //! - `taquba_jobs_dead_lettered_total{queue}`: jobs moved to the dead set.
 //! - `taquba_jobs_reaped_total{queue}`: expired claims requeued by the reaper.
 //! - `taquba_lease_renewals_total{queue}`: lease renewals on claimed jobs.
 //! - `taquba_heartbeat_failures_total`: liveness heartbeat commits that
-//!   failed; store-level, so it carries no `queue` label.
-//! - `taquba_enqueue_duration_seconds{queue}` / `taquba_claim_duration_seconds{queue}`
-//!   / `taquba_ack_duration_seconds{queue}`: per-operation latency histograms.
+//!   failed. The metric is store-level, so it does not have a `queue` label.
+//! - `taquba_enqueue_duration_seconds{queue}` /
+//!   `taquba_claim_duration_seconds{queue}` /
+//!   `taquba_ack_duration_seconds{queue}`: per-operation latency histograms.
 //! - `taquba_pending_jobs{queue}` / `taquba_claimed_jobs{queue}`: current
 //!   queue depth gauges, sampled by the background metrics sampler.
 //! - `taquba_oldest_pending_age_seconds{queue}`: age of the pending job at the
@@ -47,7 +49,8 @@ mod imp {
         Some(Instant::now())
     }
 
-    /// Register metric descriptions. Idempotent; called once per queue open.
+    /// Register metric descriptions. Idempotent, and called once per queue
+    /// open.
     pub(crate) fn describe() {
         metrics::describe_counter!(
             "taquba_jobs_enqueued_total",
@@ -193,7 +196,7 @@ mod imp {
             description: &str,
             labels: &[(&str, &str)],
         ) -> Arc<dyn UpDownCounterFn> {
-            // `metrics` has no up-down counter; map it onto a gauge.
+            // `metrics` lacks an up-down counter, so map it onto a gauge.
             let name = name.to_string();
             metrics::describe_gauge!(name.clone(), description.to_string());
             Arc::new(UpDownCounterHandle(metrics::gauge!(
@@ -209,7 +212,7 @@ mod imp {
             labels: &[(&str, &str)],
             _boundaries: &[f64],
         ) -> Arc<dyn HistogramFn> {
-            // Bucket boundaries are configured on the exporter, not here.
+            // Bucket boundaries are configured on the exporter.
             let name = name.to_string();
             metrics::describe_histogram!(name.clone(), description.to_string());
             Arc::new(HistogramHandle(metrics::histogram!(
@@ -346,8 +349,8 @@ mod tests {
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        // A current-thread runtime, so every emission runs on the thread
-        // that installed the recorder.
+        // A current-thread runtime, so every emission runs on the thread that
+        // installed the recorder.
         metrics::with_local_recorder(&recorder, || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()

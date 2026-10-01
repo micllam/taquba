@@ -1,23 +1,25 @@
 //! Writer-liveness observables for admin tooling.
 //!
-//! A [`QueueReader`](crate::QueueReader) can observe a store without
-//! fencing its writer, but nothing in the queue's job state indicates
-//! whether a writer process is alive: the lease is process state with
-//! no reader view, and opening a [`Queue`](crate::Queue) as a probe
-//! fences a live writer and re-queues every claimed job. This module
-//! defines the two observables a reader exposes instead:
+//! A [`QueueReader`](crate::QueueReader) can observe a store without fencing
+//! its writer, but nothing in the queue's job state indicates whether a writer
+//! process is alive: the lease is process state without a reader view, and
+//! opening a [`Queue`](crate::Queue) as a probe fences a live writer and
+//! re-queues every claimed job. This module defines the two observables a
+//! reader exposes instead:
 //!
 //! - [`StoreActivity`], read from the store's manifest and durable
-//!   sequence number with no writer cooperation. Wall-clock fields are
-//!   for display only; a caller deciding a destructive action watches
+//!   sequence number without writer cooperation. Wall-clock fields are
+//!   for display only. A caller deciding a destructive action watches
 //!   [`StoreActivity::durable_seq`] for advance over a few poll
-//!   intervals, a judgment free of clock comparison.
+//!   intervals, a judgement free of clock comparison.
 //! - [`WriterHeartbeat`], the record a writer with
-//!   [`OpenOptions::liveness_heartbeat`](crate::OpenOptions::liveness_heartbeat)
-//!   enabled commits on an interval. A beat is an ordinary store
-//!   commit, so a superseded writer stops producing observable beats
-//!   at its next flush: a fresh beat proves the process that owns the
-//!   store is alive, and proves nothing about that process's workers.
+//!   [`OpenOptions::liveness_heartbeat`][heartbeat] enabled commits on an
+//!   interval. A beat is an ordinary store commit, so a superseded writer
+//!   stops producing observable beats at its next flush. A fresh beat
+//!   establishes that the process owning the store is alive. It does not
+//!   establish the state of that process's workers.
+//!
+//! [heartbeat]: crate::OpenOptions::liveness_heartbeat
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,25 +33,26 @@ use crate::keys::heartbeat_key;
 use crate::queue_core::QueueCore;
 
 /// Store-level activity read from a [`QueueReader`](crate::QueueReader),
-/// with no writer cooperation required.
+/// without writer cooperation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreActivity {
-    /// Timestamp in milliseconds embedded in the newest L0 SST the
-    /// manifest references, or `None` when the manifest lists no L0
-    /// SSTs (a fresh store or one whose L0 was fully compacted).
-    /// Flush-granular and read from the writer's clock: WAL writes do
-    /// not update it and an idle writer leaves it stale, so it is for
-    /// display only, never an input to a destructive decision.
+    /// Timestamp in milliseconds embedded in the newest L0 SST the manifest
+    /// references, or `None` when the manifest does not list an L0 SST (a fresh
+    /// store or one whose L0 was fully compacted). Flush-granular and read from
+    /// the writer's clock: WAL writes do not update it and an idle writer
+    /// leaves it stale, so it is for display only, never an input to a
+    /// destructive decision.
     pub last_flush_at_ms: Option<u64>,
-    /// The writer epoch recorded in the manifest. Advances each time a
-    /// process opens the store as its writer.
+    /// The writer epoch recorded in the manifest. Advances each time a process
+    /// opens the store as its writer.
     pub writer_epoch: u64,
-    /// Sequence number at or below which every write is durably
-    /// persisted, as observed by this reader's view. Free of clock
-    /// skew and commit-granular: observing it advance across a few
-    /// [`ReaderOptions::manifest_poll_interval`](crate::ReaderOptions::manifest_poll_interval)s
-    /// proves live commits, the check a destructive operation performs
-    /// before proceeding.
+    /// Sequence number at or below which every write is durably persisted, as
+    /// observed by this reader's view. Free of clock skew and commit-granular:
+    /// observing it advance across a few
+    /// [`ReaderOptions::manifest_poll_interval`][poll]s establishes live
+    /// commits, the check a destructive operation performs before proceeding.
+    ///
+    /// [poll]: crate::ReaderOptions::manifest_poll_interval
     pub durable_seq: u64,
 }
 
@@ -58,41 +61,37 @@ pub struct StoreActivity {
 /// enabled, read through
 /// [`QueueReader::writer_heartbeat`](crate::QueueReader::writer_heartbeat).
 ///
-/// A beat is an ordinary store commit, so it proves the process that
-/// owns the store was alive when the beat became durable; it proves
-/// nothing about that process's workers. Judge staleness in units of
-/// [`Self::interval`], allowing for the reader's own lag and for the
-/// writer's commit latency (successive beats are spaced the interval
-/// plus one durable commit apart, and a commit waits for the store's
-/// flush interval), or watch [`Self::counter`] advance across polls to
-/// avoid clock comparison entirely.
+/// A beat is an ordinary store commit, so it establishes that the process
+/// owning the store was alive when the beat became durable. It does not
+/// establish the state of that process's workers. Judge staleness in units of
+/// [`Self::interval`], and allow for the reader's own lag and for the writer's
+/// commit latency (successive beats are spaced the interval plus one durable
+/// commit apart, and a commit waits for the store's flush interval), or watch
+/// [`Self::counter`] advance across polls to avoid clock comparison entirely.
 ///
-/// A clean [`Queue::close`](crate::Queue::close) commits a final beat
-/// marked [`Self::closed`], so a stale closed beat distinguishes a
-/// deliberate shutdown from a writer whose process terminated. The
-/// marker is best-effort: a writer that fails to commit the marker
-/// leaves its last periodic beat in place.
+/// A clean [`Queue::close`](crate::Queue::close) commits a final beat marked
+/// [`Self::closed`], so a stale closed beat distinguishes a deliberate shutdown
+/// from a writer whose process terminated. The marker is best-effort: a writer
+/// that fails to commit the marker leaves its last periodic beat in place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriterHeartbeat {
-    /// Beat counter, increasing across beats and across writer
-    /// restarts.
+    /// Beat counter, increasing across beats and across writer restarts.
     pub counter: u64,
-    /// The writer clock's time in milliseconds when the beat was
-    /// written.
+    /// The writer clock's time in milliseconds when the beat was written.
     pub at_ms: u64,
     /// The interval between the writer's beats.
     pub interval: Duration,
-    /// The writer epoch the process held when it opened the store. A
-    /// beat whose epoch is below the manifest's current writer epoch
-    /// was written by a superseded writer.
+    /// The writer epoch the process held when it opened the store. A beat whose
+    /// epoch is below the manifest's current writer epoch was written by a
+    /// superseded writer.
     pub writer_epoch: u64,
     /// Whether this beat is the closing beat of a clean
-    /// [`Queue::close`](crate::Queue::close). The next open writes an
-    /// unclosed beat.
+    /// [`Queue::close`](crate::Queue::close). The next open writes an unclosed
+    /// beat.
     pub closed: bool,
 }
 
-/// Serialized form of a heartbeat, stored under the heartbeat key.
+/// Serialized form of a heartbeat, stored at the heartbeat key.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct HeartbeatRecord {
     pub(crate) counter: u64,
@@ -114,22 +113,22 @@ impl HeartbeatRecord {
     }
 }
 
-/// Background task committing one beat per interval while the queue is
-/// open. A failed beat is logged at error level and counted; the task
-/// continues, because a fencing failure also fails the queue's own
-/// writes and those surface to callers.
+/// Background task committing one beat per interval while the queue is open. A
+/// failed beat is logged at error level and counted. The task continues,
+/// because a fencing failure also fails the queue's own writes and those
+/// surface to callers.
 pub(crate) struct HeartbeatTask {
     core: Arc<QueueCore>,
     interval: Duration,
-    /// Counter of the next beat. Continues from the stored beat's
-    /// counter, so it increases across writer restarts.
+    /// Counter of the next beat. Continues from the stored beat's counter, so
+    /// it increases across writer restarts.
     next_counter: u64,
     writer_epoch: u64,
 }
 
 impl HeartbeatTask {
-    /// Build the task for an open store and commit its first beat, so
-    /// an open store with the heartbeat enabled always holds one.
+    /// Build the task for an open store and commit its first beat, so an open
+    /// store with the heartbeat enabled always contains one.
     pub(crate) async fn start(core: Arc<QueueCore>, interval: Duration) -> Result<Self> {
         let next_counter = match core.db.get(heartbeat_key()).await? {
             Some(bytes) => rmp_serde::from_slice::<HeartbeatRecord>(&bytes)?.counter + 1,
@@ -145,12 +144,11 @@ impl HeartbeatTask {
         Ok(task)
     }
 
-    /// Commit one beat, awaiting durability so the beat is observable
-    /// by readers when the call returns. The counter advances even when
-    /// the commit fails: a failed put can still have committed durably,
-    /// and a repeated counter would stall a reader that watches it for
-    /// advance. A gap is harmless; the counter is only required to
-    /// increase.
+    /// Commit one beat, awaiting durability so the beat is observable by
+    /// readers when the call returns. The counter advances even when the commit
+    /// fails: a failed put can still be durably committed, and a repeated
+    /// counter stalls a reader that watches it for advance. A gap does not
+    /// stall a reader, because the counter is only required to increase.
     async fn beat(&mut self, closed: bool) -> Result<()> {
         let record = HeartbeatRecord {
             counter: self.next_counter,
@@ -166,8 +164,8 @@ impl HeartbeatTask {
         Ok(())
     }
 
-    /// Beat until shutdown, then return the task so the closer can
-    /// commit the closing beat.
+    /// Beat until shutdown, then return the task so the closer can commit the
+    /// closing beat.
     pub(crate) async fn run(mut self, mut ticker: Ticker) -> Self {
         while ticker.tick().await {
             if let Err(e) = self.beat(false).await {
@@ -183,9 +181,9 @@ impl HeartbeatTask {
         self
     }
 
-    /// Commit the closing beat of a clean close. Best-effort: a failure
-    /// is logged and counted, leaving the last periodic beat in place,
-    /// and the close proceeds.
+    /// Commit the closing beat of a clean close. Best-effort: a failure is
+    /// logged and counted and leaves the last periodic beat in place. The close
+    /// proceeds.
     pub(crate) async fn write_closing_beat(mut self) {
         if let Err(e) = self.beat(true).await {
             crate::obs::heartbeat_failed();

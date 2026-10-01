@@ -1,5 +1,5 @@
-//! A time-ordered index over one prefix of the caller KV namespace,
-//! whose due entries a pass removes with the state they refer to.
+//! A time-ordered index over one prefix of the caller KV namespace, whose due
+//! entries a pass removes with the state they refer to.
 
 use std::future::Future;
 use std::pin::pin;
@@ -19,24 +19,23 @@ const PAGE_SIZE: usize = 256;
 
 /// A time-ordered index over one prefix of the caller KV namespace.
 ///
-/// An entry's key is the prefix, the time of its event as 8 bytes
-/// big-endian and a free suffix, with an empty value. A pass reads the
-/// entries oldest first, calls the consumer's callback for every entry
-/// whose time is `retention` or more before the time of the pass and
-/// stops at the first entry that is not due. The callback's KV deletes
-/// commit in the transaction that deletes the entry.
+/// An entry's key is the prefix, the time of its event as 8 bytes big-endian
+/// and a free suffix, with an empty value. A pass reads the entries oldest
+/// first, calls the consumer's callback for every entry whose time is
+/// `retention` or more before the time of the pass and stops at the first entry
+/// that is not due. The callback's KV deletes commit in the transaction that
+/// deletes the entry.
 ///
-/// The index keeps in memory the earliest time of an entry that a pass
-/// did not remove. A pass returns without a read until that time is
-/// due, and starts its scan at the key with that time, so the keys of
-/// the entries that earlier passes deleted are not read. An entry is
-/// written with [`SettlementEffects::expiry_entry`], and the queue
-/// lowers that time to the entry's time once the effects commit. Clones
-/// of an index share the time, so every writer of an index and its pass
-/// hold clones of one `ExpiryIndex`. An entry written by another path
-/// is outside the scan while its time is before the bound. It is read
-/// once an entry at or before its time commits, or by a new
-/// `ExpiryIndex`.
+/// The index keeps in memory the earliest time of an entry that a pass did not
+/// remove. A pass returns without a read until that time is due, and starts its
+/// scan at the key with that time, so the keys of the entries that earlier
+/// passes deleted are not read. An entry is written with
+/// [`SettlementEffects::expiry_entry`], and the queue lowers that time to the
+/// entry's time once the effects commit. Clones of an index share the time, so
+/// every writer of an index and its pass hold clones of one `ExpiryIndex`. An
+/// entry written by another path is outside the scan while its time is before
+/// the bound. It is read once an entry at or before its time commits, or by a
+/// new `ExpiryIndex`.
 #[derive(Debug, Clone)]
 pub struct ExpiryIndex {
     prefix: Arc<[u8]>,
@@ -50,8 +49,8 @@ pub enum Expired {
     /// Commit the effects in the transaction that deletes the entry.
     Delete(SettlementEffects),
     /// As [`Delete`](Self::Delete) when the user KV key `key` matches
-    /// `expected`, as [`Queue::kv_compare_commit`] compares it, and a
-    /// delete of the entry alone when it does not.
+    /// `expected`, as [`Queue::kv_compare_commit`] compares it, and a delete of
+    /// the entry alone when it does not.
     DeleteIf {
         /// The key compared.
         key: Vec<u8>,
@@ -60,15 +59,14 @@ pub enum Expired {
         /// The effects committed with the entry delete on a match.
         effects: SettlementEffects,
     },
-    /// Leave the entry and continue the pass. The next pass reads the
-    /// entry again.
+    /// Leave the entry and continue the pass. The next pass reads the entry
+    /// again.
     Keep,
 }
 
 impl ExpiryIndex {
-    /// An index over the entries with `prefix`. Every key with the
-    /// prefix is read as an entry, so the prefix must not contain
-    /// other keys.
+    /// An index over the entries with `prefix`. Every key with the prefix is
+    /// read as an entry, so the prefix must not contain other keys.
     pub fn new(prefix: impl Into<Vec<u8>>) -> Self {
         Self {
             prefix: Arc::from(prefix.into()),
@@ -77,10 +75,10 @@ impl ExpiryIndex {
     }
 
     /// The key of the entry for an event at `at_ms` with `suffix`:
-    /// `{prefix}{at_ms as 8 bytes big-endian}{suffix}`. The call does
-    /// not record the entry. An entry written with this key through
-    /// [`SettlementEffects::kv_put`] is outside the scan while its time
-    /// is before the bound.
+    /// `{prefix}{at_ms as 8 bytes big-endian}{suffix}`. The call does not
+    /// record the entry. An entry written with this key through
+    /// [`SettlementEffects::kv_put`] is outside the scan while its time is
+    /// before the bound.
     pub fn entry_key(&self, at_ms: u64, suffix: &[u8]) -> Vec<u8> {
         let mut key = Vec::with_capacity(self.prefix.len() + 8 + suffix.len());
         key.extend_from_slice(&self.prefix);
@@ -89,29 +87,27 @@ impl ExpiryIndex {
         key
     }
 
-    /// The time and the suffix of the entry at `key`, or `None` for a
-    /// key outside the prefix or with fewer than 8 bytes after it.
+    /// The time and the suffix of the entry at `key`, or `None` for a key
+    /// outside the prefix or with fewer than 8 bytes after it.
     pub fn parse<'k>(&self, key: &'k [u8]) -> Option<(u64, &'k [u8])> {
         let rest = key.strip_prefix(&*self.prefix)?;
         let (time, suffix) = rest.split_first_chunk::<8>()?;
         Some((u64::from_be_bytes(*time), suffix))
     }
 
-    /// Records that an entry at `at_ms` is committed. Called after the
-    /// commit.
+    /// Records that an entry at `at_ms` is committed. Called after the commit.
     pub(crate) fn written(&self, at_ms: u64) {
         self.bound.lower(at_ms);
     }
 
-    /// One pass at `now_ms`: calls `clear` with the time and the suffix
-    /// of every entry whose time is `retention` or more before `now_ms`,
-    /// oldest first from the bound, and applies the [`Expired`] its
-    /// future returns. Returns the count of entries removed through
-    /// `clear`. A key with fewer than 8 bytes after the prefix is
-    /// deleted without a call. A pass before an entry can be due
-    /// returns without a read. A KV failure ends the pass with the
-    /// error. The next pass reads the entries that a failed pass, or a
-    /// pass whose future is dropped, did not remove.
+    /// One pass at `now_ms`: calls `clear` with the time and the suffix of
+    /// every entry whose time is `retention` or more before `now_ms`, in time
+    /// order from the bound. It applies the [`Expired`] that each future
+    /// returns. Returns the count of entries removed through `clear`. A key
+    /// with fewer than 8 bytes after the prefix is deleted without a call. A
+    /// pass before an entry can be due returns without a read. A KV failure
+    /// ends the pass with the error. The next pass reads the entries that a
+    /// failed pass, or a pass whose future is dropped, did not remove.
     pub async fn pass<F, Fut>(
         &self,
         queue: &Queue,
@@ -312,8 +308,8 @@ mod tests {
                 .unwrap();
         }
 
-        // The bound stays at the kept entry's time, so the entry removed
-        // after it does not defer the next read.
+        // The bound stays at the kept entry's time, so the entry removed after
+        // it does not defer the next read.
         assert_eq!(kept, 3);
         assert_eq!(suffixes(&q, &index, b"x/").await, [b"a".to_vec()]);
         q.close().await.unwrap();
@@ -357,8 +353,8 @@ mod tests {
         put(&q, &index, 1_000, b"a").await;
         put(&q, &index, 2_000, b"b").await;
 
-        // The callback of the second entry never returns, and the pass
-        // future is dropped once it is reached.
+        // The callback of the second entry never returns, and the pass future
+        // is dropped once it is reached.
         let reached = tokio::sync::Notify::new();
         let pass = index.pass(&q, 3_000, RETENTION, |at_ms, _| {
             let reached = &reached;
@@ -393,8 +389,8 @@ mod tests {
         let q = Queue::open(make_store(), "test").await.unwrap();
         let index = ExpiryIndex::new(b"x/".to_vec());
         put(&q, &index, 1_000, b"a").await;
-        // The pass reads the entry, which is not due, and leaves the
-        // bound at its time.
+        // The pass reads the entry before it is due and leaves the bound at its
+        // time.
         let mut calls = 0;
         let removed = index
             .pass(&q, 1_500, RETENTION, |_, _| {
@@ -430,8 +426,8 @@ mod tests {
         let q = Queue::open(make_store(), "test").await.unwrap();
         let index = ExpiryIndex::new(b"x/".to_vec());
         put(&q, &index, 1_000, b"a").await;
-        // The pass leaves the bound at 1_000, the time of the entry it
-        // read and did not remove.
+        // The pass leaves the bound at 1_000, the time of the entry it read and
+        // did not remove.
         index
             .pass(&q, 1_500, RETENTION, |_, _| {
                 std::future::ready(Expired::Keep)
@@ -439,8 +435,8 @@ mod tests {
             .await
             .unwrap();
 
-        // An entry before the bound, written without a record of its
-        // commit, is before the start of the scan.
+        // An entry before the bound, written without a record of its commit, is
+        // before the start of the scan.
         q.kv_put(&index.entry_key(500, b"raw"), b"").await.unwrap();
         let mut seen = Vec::new();
         index
@@ -526,8 +522,8 @@ mod tests {
             })
             .await
             .unwrap();
-        // An entry the index does not know about. A lowered bound
-        // exposes it to the next pass.
+        // An entry the index does not know about. A lowered bound exposes it to
+        // the next pass.
         q.kv_put(&index.entry_key(1_000, b"raw"), b"")
             .await
             .unwrap();

@@ -8,8 +8,8 @@
 //   "marketing"     - newsletters, promotional emails.
 //                     Low priority, up to 2 delivery attempts.
 //
-// Both queues share a single Queue instance. Workers drain transactional
-// jobs before marketing jobs thanks to the priority difference.
+// Both queues share a single Queue instance. Workers drain transactional jobs
+// before marketing jobs thanks to the priority difference.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,8 +20,8 @@ use taquba::{
     run_worker,
 };
 
-// In a real application you would encode these as JSON or MessagePack.
-// Here we use a simple "to:subject" text format to keep the example dependency-free.
+// A real application encodes these as JSON or MessagePack. This example uses a
+// simple "to:subject" text format to stay dependency-free.
 fn encode(to: &str, subject: &str) -> Vec<u8> {
     format!("{to}\x00{subject}").into_bytes()
 }
@@ -93,14 +93,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .default_priority(PRIORITY_LOW),
     );
 
-    // To use S3 or MinIO instead of memory, swap InMemory for an S3Builder:
+    // To use S3 or MinIO in place of memory, swap InMemory for an S3Builder:
     //
-    //   let store = Arc::new(
-    //       object_store::aws::AmazonS3Builder::new()
-    //           .with_bucket_name("my-queue-bucket")
-    //           .with_region("us-east-1")
-    //           .build()?,
-    //   );
+    // ```text
+    // let store = Arc::new(
+    //     object_store::aws::AmazonS3Builder::new()
+    //         .with_bucket_name("my-queue-bucket")
+    //         .with_region("us-east-1")
+    //         .build()?,
+    // );
+    // ```
     let q = Arc::new(Queue::open_with_options(Arc::new(InMemory::new()), "demo", opts).await?);
 
     println!("Enqueueing jobs...");
@@ -122,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    // Marketing jobs inherit PRIORITY_LOW; they will drain after transactional.
+    // Marketing jobs inherit PRIORITY_LOW, so they drain after transactional.
     q.enqueue(
         "marketing",
         encode("alice@example.com", "This week's deals"),
@@ -152,8 +154,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!();
 
-    // Spawn one worker per queue.
-    // The worker fails every 4th SMTP call to exercise the retry path.
+    // Spawn one worker per queue. The worker fails every 4th SMTP call to
+    // exercise the retry path.
     let worker = Arc::new(EmailWorker::new(4));
 
     let (t_shutdown_tx, t_shutdown_rx) = tokio::sync::oneshot::channel::<()>();

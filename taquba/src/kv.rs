@@ -16,12 +16,13 @@ use crate::txn::{Attempt, Durability, retry};
 
 /// Maximum size of a single value in the user KV namespace.
 ///
-/// The KV namespace is sized for coordination state (pointers, status
-/// markers, dedup records, small lifecycle records), not bulk payload.
-/// Values exceeding this cap return [`Error::KvValueTooLarge`].
+/// The KV namespace is sized for coordination state (pointers, status markers,
+/// dedup records, small lifecycle records), and bulk payload does not belong in
+/// it. Values exceeding this cap return [`Error::KvValueTooLarge`].
 ///
-/// Store large blobs in the underlying [`ObjectStore`](crate::object_store::ObjectStore) under a
-/// content-addressed key and put only the pointer in KV.
+/// Store large blobs in the underlying
+/// [`ObjectStore`](crate::object_store::ObjectStore) under a content-addressed
+/// key and put only the pointer in KV.
 pub const MAX_KV_VALUE_SIZE: usize = 256 * 1024;
 
 /// Validate a user KV value against [`MAX_KV_VALUE_SIZE`].
@@ -49,10 +50,11 @@ pub(crate) async fn kv_state_matches(
     })
 }
 
-/// A range of keys within a prefix, as [`QueueView::kv_scan`](crate::QueueView::kv_scan) takes it. The
-/// standard range forms over any byte string implement it: `..`,
-/// `key..`, `..key`, `..=key`, `a..b` and `a..=b`. A pair of [`Bound`]s
-/// implements it, which is the form of an exclusive start.
+/// A range of keys within a prefix, as
+/// [`QueueView::kv_scan`](crate::QueueView::kv_scan) takes it. The standard
+/// range forms over any byte string implement it: `..`, `key..`, `..key`,
+/// `..=key`, `a..b` and `a..=b`. A pair of [`Bound`]s implements it, which is
+/// the form of an exclusive start.
 pub trait KvRange {
     /// The lower bound of the range.
     fn start_bound(&self) -> Bound<&[u8]>;
@@ -123,15 +125,16 @@ impl<K: AsRef<[u8]>> KvRange for (Bound<K>, Bound<K>) {
     }
 }
 
-/// One page of a user KV listing. Returned by [`QueueView::kv_scan`](crate::QueueView::kv_scan).
+/// One page of a user KV listing. Returned by
+/// [`QueueView::kv_scan`](crate::QueueView::kv_scan).
 #[derive(Debug, Clone)]
 pub struct KvPage {
-    /// Entries on this page as `(key, value)` pairs, in ascending byte
-    /// order of the keys. Keys are in the caller namespace, without the
-    /// internal user key tag.
+    /// Entries on this page as `(key, value)` pairs, in ascending byte order of
+    /// the keys. Keys are in the caller namespace, without the internal user
+    /// key tag.
     pub entries: Vec<(Vec<u8>, Bytes)>,
-    /// Whether an entry within the range followed the last entry of this
-    /// page at scan time. The listing continues with the range from
+    /// Whether an entry within the range followed the last entry of this page
+    /// at scan time. The listing continues with the range from
     /// `Bound::Excluded` of that entry's key to the same end.
     pub more: bool,
 }
@@ -139,16 +142,15 @@ pub struct KvPage {
 impl Queue {
     /// Write a value to the user KV namespace.
     ///
-    /// Caller-supplied keys are internally scoped under a reserved
-    /// user key tag and cannot collide with Taquba's internal layout.
-    /// Values above [`MAX_KV_VALUE_SIZE`] return
-    /// [`Error::KvValueTooLarge`]; unlike job payloads, user KV values
-    /// are never offloaded to the payload store, so the cap is a hard
-    /// error. Store larger values as objects under caller-owned keys
-    /// and keep only the pointer in KV. The write is durable before the
-    /// call returns.
+    /// Caller-supplied keys are internally scoped under a reserved user key tag
+    /// and cannot collide with Taquba's internal layout. Values above
+    /// [`MAX_KV_VALUE_SIZE`] return [`Error::KvValueTooLarge`]. Unlike job
+    /// payloads, user KV values are never offloaded to the payload store, so
+    /// the cap is a hard error. Store larger values as objects under
+    /// caller-owned keys and keep only the pointer in KV. The write is durable
+    /// before the call returns.
     ///
-    /// This is the standalone form; to couple a KV write with a queue
+    /// This is the standalone form. To couple a KV write with a queue
     /// transition in one transaction, pass it in the
     /// [`SettlementEffects`](crate::SettlementEffects) of
     /// [`Self::enqueue_with_effects`] or [`Self::ack_with`].
@@ -161,57 +163,53 @@ impl Queue {
 
     /// Delete a value from the user KV namespace.
     ///
-    /// Caller-supplied keys are internally scoped under a reserved
-    /// user key tag and cannot collide with Taquba's internal layout.
+    /// Caller-supplied keys are internally scoped under a reserved user key tag
+    /// and cannot collide with Taquba's internal layout.
     pub async fn kv_delete(&self, key: &[u8]) -> Result<()> {
         let handle = self.core.db.delete(user_scoped_key(key)).await?;
         handle.await_durable().await?;
         Ok(())
     }
 
-    /// Delete a value from the user KV namespace only if its current
-    /// value equals `expected`.
+    /// Delete a value from the user KV namespace only if its current value
+    /// equals `expected`.
     ///
-    /// Returns `true` when the value matched and was deleted, `false`
-    /// when the key was absent or held a different value (nothing is
-    /// changed in that case). The read and the delete execute in one
-    /// transaction, so no concurrent write can be interleaved between
-    /// the compare and the delete: either this call deletes the value
-    /// it compared against, or it reports `false`. The delete is
-    /// durable before the call returns `true`.
+    /// Returns `true` when the value matched and was deleted, `false` when the
+    /// key was absent or held a different value (nothing is changed in that
+    /// case). The read and the delete execute in one transaction, so no
+    /// concurrent write can be interleaved between the compare and the delete:
+    /// either this call deletes the value it compared against, or it reports
+    /// `false`. The delete is durable before the call returns `true`.
     ///
-    /// Use this to consume a value that a concurrent writer may replace,
-    /// where an unconditional [`Self::kv_delete`] could delete a newer
-    /// value than the one read.
+    /// Use this to consume a value that a concurrent writer can replace. An
+    /// unconditional [`Self::kv_delete`] can delete a newer value than the one
+    /// read.
     pub async fn kv_compare_delete(&self, key: &[u8], expected: &[u8]) -> Result<bool> {
         self.kv_compare_then(key, Some(expected), |txn, scoped| txn.delete(scoped))
             .await
     }
 
-    /// Write a value to the user KV namespace only if its current state
-    /// matches `expected`.
+    /// Write a value to the user KV namespace only if its current state matches
+    /// `expected`.
     ///
-    /// `expected` is the compare arm: `Some(v)` requires the key to
-    /// currently hold exactly `v`; `None` requires the key to be
-    /// absent. Returns `true` when the state matched and the write was
-    /// applied, `false` when it did not (nothing is changed in that
-    /// case). The read and the write execute in one transaction, so no
-    /// concurrent write can be interleaved between the compare and the
-    /// write: either this call replaces the state it compared against,
-    /// or it reports `false`. The write is durable before the call
+    /// `expected` is the compare arm: `Some(v)` requires the key to contain
+    /// exactly `v`, and `None` requires the key to be absent. Returns `true`
+    /// when the state matched and the write was applied, `false` when it did
+    /// not (nothing is changed in that case). The read and the write execute in
+    /// one transaction, so no concurrent write can be interleaved between the
+    /// compare and the write: either this call replaces the state it compared
+    /// against, or it reports `false`. The write is durable before the call
     /// returns `true`.
     ///
-    /// Values above [`MAX_KV_VALUE_SIZE`] return
-    /// [`Error::KvValueTooLarge`].
+    /// Values above [`MAX_KV_VALUE_SIZE`] return [`Error::KvValueTooLarge`].
     ///
-    /// This is the read-modify-write primitive for the namespace: read
-    /// a value, compute its successor and call
-    /// `kv_compare_put(key, Some(&read), &next)` in a retry loop, or
-    /// claim a key exclusively with `kv_compare_put(key, None, &init)`.
-    /// Transaction conflicts with concurrent writers are retried
-    /// internally, but a contended key serializes its writers; state
-    /// with many independent writers scales better split across
-    /// multiple keys than concentrated in one key.
+    /// This is the read-modify-write primitive for the namespace: read a value,
+    /// compute its successor and call `kv_compare_put(key, Some(&read), &next)`
+    /// in a retry loop, or claim a key exclusively with
+    /// `kv_compare_put(key, None, &init)`. Transaction conflicts with
+    /// concurrent writers are retried internally, but a contended key
+    /// serializes its writers. State with many independent writers scales
+    /// better split across multiple keys than concentrated in one key.
     pub async fn kv_compare_put(
         &self,
         key: &[u8],
@@ -223,10 +221,10 @@ impl Queue {
             .await
     }
 
-    /// Compare the current state of the user KV key against `expected`
-    /// (`None` requires absence) and, when it matches, stage `write` in
-    /// the same transaction and commit durably. Returns whether the
-    /// state matched; conflicts are retried.
+    /// Compare the current state of the user KV key against `expected` (`None`
+    /// requires absence) and, when it matches, stage `write` in the same
+    /// transaction and commit durably. Returns whether the state matched, and
+    /// retries conflicts.
     async fn kv_compare_then(
         &self,
         key: &[u8],
@@ -259,14 +257,14 @@ mod tests {
         q.kv_put(b"slot", b"v1").await.unwrap();
 
         store.fail_puts(true);
-        // The compare-miss arm is read-only and completes despite the
-        // write fault.
+        // The compare-miss arm is read-only and completes despite the write
+        // fault.
         assert!(!q.kv_compare_put(b"slot", Some(b"v0"), b"v2").await.unwrap());
-        // The matched arm awaits durability. SlateDB retries transient
-        // store errors with backoff instead of failing the flush, so the
-        // call must stall rather than report success. Paused runtime time
-        // drives the retry backoff virtually; the elapsed timeout drops
-        // the in-flight call, simulating a crash mid-outage.
+        // The matched arm awaits durability. SlateDB retries a transient store
+        // error with backoff and does not fail the flush, so the call must
+        // stall without reporting success. Paused runtime time advances the
+        // retry backoff virtually. The elapsed timeout drops the in-flight
+        // call, which simulates a crash mid-outage.
         let stalled = tokio::time::timeout(
             Duration::from_secs(30),
             q.kv_compare_put(b"slot", Some(b"v1"), b"v2"),
@@ -602,8 +600,8 @@ mod tests {
         // Enqueue a real job so the internal pending key space is in use.
         q.enqueue("work", b"payload".to_vec()).await.unwrap();
 
-        // A user key that matches a real internal key byte-for-byte is
-        // scoped under the user tag and cannot interfere with queue state.
+        // A user key that matches a real internal key byte-for-byte is scoped
+        // with the user tag and cannot interfere with queue state.
         q.enqueue_with_effects(
             "other",
             b"sentinel".to_vec(),

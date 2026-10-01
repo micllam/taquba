@@ -1,7 +1,7 @@
 // cargo run -p taquba --example worker
 //
-// Demonstrates the Worker trait. Implement `process` and taquba handles
-// the claim / ack / nack loop automatically, including retry on failure.
+// Demonstrates the Worker trait. Implement `process` and taquba handles the
+// claim / ack / nack loop automatically, including retry on failure.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The worker fails every 3rd call, demonstrating automatic retry.
     let worker = Arc::new(PrintWorker::new(3));
 
-    // Drive the worker via a oneshot shutdown signal. When the queue is fully
+    // Run the worker with a oneshot shutdown signal. When the queue is fully
     // drained we send `()`, run_worker finishes its current poll and returns
     // cleanly (no aborted in-flight jobs).
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -95,8 +95,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
     });
 
-    // Wait until the queue is drained, including jobs parked in `scheduled`
-    // for retry backoff.
+    // Wait until the queue is drained, including jobs held in `scheduled` for
+    // retry backoff.
     loop {
         let s = q.view().stats("jobs").await?;
         if s.pending == 0 && s.claimed == 0 && s.scheduled == 0 {

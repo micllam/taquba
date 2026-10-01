@@ -3,8 +3,8 @@ use thiserror::Error;
 /// Errors returned by Taquba's public API.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// The underlying [SlateDB] storage layer reported a failure (transaction
-    /// commit failed, object-store I/O error, etc.).
+    /// The underlying [SlateDB] storage layer reported a failure, such as a
+    /// failed transaction commit or an object-store I/O error.
     ///
     /// [SlateDB]: https://github.com/slatedb/slatedb
     #[error("storage error: {0}")]
@@ -24,30 +24,28 @@ pub enum Error {
     #[error("job not found: {0}")]
     JobNotFound(String),
 
-    /// An operation was issued against a job in the wrong state; for example,
-    /// `requeue_dead_job` on a record that is not in the dead state.
-    /// Settlement cannot report this: it takes a `Claim`, so a record
-    /// read through `get_job` or `list_jobs` cannot be settled at all.
+    /// An operation was issued against a job in the wrong state, for example
+    /// `requeue_dead_job` on a record that is not in the dead state. Settlement
+    /// cannot report this: it takes a `Claim`, so a record read through
+    /// `get_job` or `list_jobs` cannot be settled at all.
     #[error("job is not in the expected state")]
     InvalidState,
 
-    /// A settlement or lease operation found no claim under the record it
-    /// was given: the lease expired and the reaper requeued the job, or the
-    /// job was settled already. Retrying with the same record cannot
-    /// succeed; a redelivered attempt settles the job instead. A record
-    /// taken before a lease renewal is not stale, because the renewal
-    /// leaves the claim id unchanged.
+    /// A settlement or lease operation found no claim under the record it was
+    /// given: the lease expired and the reaper requeued the job, or the job was
+    /// settled already. Retrying with the same record cannot succeed, and a
+    /// redelivered attempt settles the job. A record taken before a lease
+    /// renewal is not stale, because the renewal leaves the claim id unchanged.
     #[error("job claim is no longer held")]
     ClaimLost,
 
-    /// A lease renewal was refused because cancellation of the job has
-    /// been requested. The claim is still held and settleable; with
-    /// renewal refused, the lease expires unless the delivery settles
-    /// first.
+    /// A lease renewal was refused because cancellation of the job was
+    /// requested. The claim is still held and settleable. With renewal refused,
+    /// the lease expires unless the delivery settles first.
     #[error("job cancellation has been requested")]
     CancelRequested,
 
-    /// A [`crate::SettlementEffects`] value names the same key in both
+    /// A [`crate::SettlementEffects`] value includes the same key in both
     /// `kv_writes` and `kv_deletes`. The effects are rejected before the
     /// settlement transaction begins.
     #[error("kv key {key:?} is both written and deleted by one settlement")]
@@ -69,9 +67,9 @@ pub enum Error {
     },
 
     /// A caller-supplied [`crate::EnqueueOptions::id_override`] failed
-    /// validation. Caller-supplied ids must be 1-128 bytes of
-    /// `[A-Za-z0-9_-]`; ids that violate either bound are rejected at the
-    /// API boundary before any state is written.
+    /// validation. Caller-supplied ids must be 1-128 bytes of `[A-Za-z0-9_-]`.
+    /// An id that violates either bound is rejected at the API boundary before
+    /// any state is written.
     #[error("invalid job id `{id}`: {reason}")]
     InvalidId {
         /// The id that was rejected.
@@ -90,29 +88,28 @@ pub enum Error {
     },
 
     /// A queue name failed validation. Queue names are limited to
-    /// [`crate::MAX_QUEUE_NAME_LEN`] bytes by the key encoding and are
-    /// rejected at the API boundary before any state is written.
+    /// [`crate::MAX_QUEUE_NAME_LEN`] bytes by the key encoding and are rejected
+    /// at the API boundary before any state is written.
     #[error("invalid queue name `{queue}`: {reason}")]
     InvalidQueueName {
-        /// The queue name that was rejected.
+        /// The rejected queue name.
         queue: String,
         /// Why it was rejected.
         reason: &'static str,
     },
 
-    /// The payload object store reported a failure while writing,
-    /// reading or deleting an offloaded payload. See
+    /// The payload object store reported a failure while writing, reading or
+    /// deleting an offloaded payload. See
     /// [`crate::OpenOptions::payload_offload_threshold`].
     #[error("payload store error: {0}")]
     PayloadStore(#[from] slatedb::object_store::Error),
 
-    /// An offloaded payload object was absent when a claim or a job
-    /// read tried to fetch it. On the writing [`crate::Queue`] the
-    /// record still exists but its payload cannot be recovered; this
-    /// indicates external deletion of the payload object. Through a
-    /// [`crate::QueueReader`] the condition can be transient: a job
-    /// removal deletes the payload object after its record, so a
-    /// reader whose lagging view still holds the record can find the
+    /// An offloaded payload object was absent when a claim or a job read tried
+    /// to fetch it. On the writing [`crate::Queue`] the record still exists but
+    /// its payload cannot be recovered, which indicates external deletion of
+    /// the payload object. Through a [`crate::QueueReader`] the condition can
+    /// be transient: a job removal deletes the payload object after its record,
+    /// so a reader whose lagging view still contains the record can find the
     /// object gone until the view advances past the removal.
     #[error("offloaded payload missing for job `{id}`")]
     PayloadMissing {
@@ -120,27 +117,26 @@ pub enum Error {
         id: String,
     },
 
-    /// [`crate::QueueReader::open`] found no store at the path: the
-    /// open failed on the missing manifest and the path holds no
-    /// objects at all, so no writer has ever created the store there.
-    /// A store whose path holds objects but whose manifest cannot be
-    /// read reports [`Self::Storage`].
+    /// [`crate::QueueReader::open`] found no store at the path: the open failed
+    /// on the missing manifest and the path contains zero objects, so no writer
+    /// ever created the store there. A store whose path contains objects but
+    /// whose manifest cannot be read reports [`Self::Storage`].
     #[error("no store exists at `{path}`")]
     StoreNotInitialized {
-        /// The store path that holds no objects.
+        /// The empty store path.
         path: String,
     },
 }
 
 impl Error {
-    /// True if retrying the operation will not change the outcome; callers
-    /// should fast-fail rather than back off.
+    /// True if retrying the operation will not change the outcome, and a
+    /// backoff before a retry does not help.
     ///
     /// [`Self::Storage`] is conservatively treated as transient, as is
     /// [`Self::StoreNotInitialized`]: a health check racing the first
-    /// deployment observes it until the writer creates the store, so a
-    /// retry can succeed. The remaining variants report incorrect
-    /// usage or malformed data, which retrying cannot change.
+    /// deployment observes it until the writer creates the store, and a later
+    /// retry can succeed. The remaining variants report incorrect usage or
+    /// malformed data, which retrying cannot change.
     pub fn is_permanent(&self) -> bool {
         match self {
             Self::Serialization(_)

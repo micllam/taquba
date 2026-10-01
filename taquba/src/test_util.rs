@@ -29,8 +29,8 @@ pub(crate) fn make_store() -> Arc<dyn ObjectStore> {
 }
 
 /// OpenOptions that disable retry backoff so nack tests can re-claim
-/// immediately. Production defaults are exponential, so the "claim
-/// straight after nack" assertion needs an explicit opt-out.
+/// immediately. Production defaults are exponential, so the "claim straight
+/// after nack" assertion needs an explicit opt-out.
 pub(crate) fn no_backoff_opts() -> OpenOptions {
     OpenOptions {
         default_queue_config: QueueConfig {
@@ -42,8 +42,8 @@ pub(crate) fn no_backoff_opts() -> OpenOptions {
     }
 }
 
-/// OpenOptions with a small offload threshold so tests exercise the
-/// offload path.
+/// OpenOptions with a small offload threshold so tests exercise the offload
+/// path.
 pub(crate) fn offload_opts() -> OpenOptions {
     OpenOptions {
         payload_offload_threshold: Some(64),
@@ -56,8 +56,8 @@ pub(crate) fn offload_opts() -> OpenOptions {
     }
 }
 
-/// Number of objects under `prefix` in `store`. Payload objects for
-/// a queue opened at `"test"` live under `"test-payloads"`.
+/// Number of objects under `prefix` in `store`. Payload objects for a queue
+/// opened at `"test"` live under `"test-payloads"`.
 pub(crate) async fn object_count(store: &Arc<dyn ObjectStore>, prefix: &str) -> usize {
     store
         .list_with_delimiter(Some(&slatedb::object_store::path::Path::from(prefix)))
@@ -76,17 +76,16 @@ use slatedb::object_store::{
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// In-memory object store whose `put` and `delete` requests fail with
-/// a synthetic service-unavailable error while the corresponding flag
-/// is set. Reads and lists are unaffected.
+/// In-memory object store whose `put` and `delete` requests fail with a
+/// synthetic service-unavailable error while the corresponding flag is set.
+/// Reads and lists are unaffected.
 #[derive(Debug)]
 pub(crate) struct FaultStore {
     inner: Arc<dyn ObjectStore>,
     fail_puts: AtomicBool,
     fail_deletes: AtomicBool,
-    /// Puts permitted before every later put fails. `usize::MAX`
-    /// disables the countdown, leaving `fail_puts` as the only cause
-    /// of failure.
+    /// Puts permitted before every later put fails. `usize::MAX` disables the
+    /// countdown, and `fail_puts` is then the only cause of failure.
     puts_before_failure: AtomicUsize,
 }
 
@@ -113,9 +112,9 @@ impl FaultStore {
         self.puts_before_failure.store(n, Ordering::SeqCst);
     }
 
-    /// Whether this put fails, consuming one permitted put when it
-    /// does not. Callers of the payload store issue puts
-    /// sequentially, so a read followed by a store is sufficient.
+    /// Whether this put fails, consuming one permitted put when it does not.
+    /// Callers of the payload store issue puts sequentially, so a read followed
+    /// by a store is sufficient.
     pub(crate) fn put_fails(&self) -> bool {
         if self.fail_puts.load(Ordering::SeqCst) {
             return true;
@@ -174,8 +173,8 @@ impl ObjectStore for FaultStore {
         self.inner.get_opts(location, options).await
     }
 
-    // Deletion reaches the trait through `delete_stream`, so the fault
-    // is injected by replacing each location's result with an error.
+    // Deletion reaches the trait through `delete_stream`, so the fault is
+    // injected by replacing each location's result with an error.
     fn delete_stream(
         &self,
         locations: BoxStream<'static, StoreResult<StorePath>>,

@@ -18,15 +18,14 @@ use crate::txn::{
     Attempt, ClaimEnd, Commit, Durability, commit, retry, stage_claim_end, stage_remove,
 };
 
-/// Target bytes fetched per object-store request by the recovery and
-/// retention scans.
+/// Target bytes fetched per object-store request by the recovery and retention
+/// scans.
 const SWEEP_READ_AHEAD_BYTES: usize = 256 * 1024;
 
-/// [`ScanOptions`] for the recovery and retention scans. Both read
-/// their key prefix sequentially in a single pass, so each fetch reads
-/// a large contiguous span, amortizing object-store round trips.
-/// Blocks are not cached: a swept record is deleted or rewritten and
-/// never read again.
+/// [`ScanOptions`] for the recovery and retention scans. Both read their key
+/// prefix sequentially in a single pass, so each fetch reads a large contiguous
+/// span, amortising object-store round trips. Blocks are not cached: a swept
+/// record is deleted or rewritten and never read again.
 fn sweep_scan_options() -> ScanOptions {
     ScanOptions::default().with_read_ahead_bytes(SWEEP_READ_AHEAD_BYTES)
 }
@@ -44,15 +43,15 @@ impl Reaper {
 impl Periodic for Reaper {
     const NAME: &'static str = "lease reaper";
 
-    /// Reap expired leases, then run the done and dead retention sweeps
-    /// of every queue with a retention configured. A sweep error is
-    /// logged here; the reap error is returned.
+    /// Reap expired leases, then run the done and dead retention sweeps of
+    /// every queue with a retention configured. A sweep error is logged here,
+    /// and the reap error is returned.
     async fn step(&self) -> Result<()> {
         let core = &self.core;
         let reaped = core.reap_expired().await;
-        // The largest configured `keep_done_jobs`: no done record newer
-        // than `now - max_keep_done` is expired on any queue, so the
-        // time-ordered done scan stops at the first key past it.
+        // The largest configured `keep_done_jobs`: no done record newer than
+        // `now - max_keep_done` is expired on any queue, so the time-ordered
+        // done scan stops at the first key past it.
         let max_keep_done = core.configs.iter().filter_map(|c| c.keep_done_jobs).max();
         if max_keep_done.is_some()
             && let Err(e) = core
@@ -80,12 +79,11 @@ impl Periodic for Reaper {
     }
 }
 
-/// The transition for a claim that ends without a settlement: the
-/// job is dead-lettered once its attempts are exhausted and otherwise
-/// returns to pending without a backoff. Shared by the reaper and the
-/// open-time recovery of interrupted claims. Metrics stay at the call
-/// sites, because the same `Retry` counts as a nack on the worker path
-/// and as a reap here.
+/// The transition for a claim that ends without a settlement: the job is
+/// dead-lettered once its attempts are exhausted and otherwise returns to
+/// pending without a backoff. Shared by the reaper and the open-time recovery
+/// of interrupted claims. Metrics stay at the call sites, because the same
+/// `Retry` counts as a nack on the worker path and as a reap here.
 fn unsettled_claim_end<'a>(
     job: &JobRecord,
     outcome: AttemptOutcome,
@@ -103,23 +101,23 @@ fn unsettled_claim_end<'a>(
 }
 
 impl QueueCore {
-    /// Requeue or dead-letter every claim whose lease has expired.
+    /// Requeue or dead-letter every claim whose lease expired.
     pub(crate) async fn reap_expired(&self) -> Result<()> {
         let due = self.lease_registry.take_due(self.now_ms());
 
-        // Due entries stay in the registry, marked, while they are
-        // examined; each is removed only after its reap commits. A tick
-        // that ends early therefore leaves nothing displaced, and the
-        // next tick retries whatever remains due.
+        // Due entries stay in the registry, marked, while they are examined.
+        // Each is removed only after its reap commits. A tick that ends early
+        // therefore leaves each unreaped entry in the registry, and the next
+        // tick retries every entry that remains due.
         for lease in &due {
             match self.reap_job(lease).await {
                 Ok(()) => {}
-                // A storage failure applies to the remaining entries as
-                // well; end the tick.
+                // A storage failure applies to the remaining entries as well,
+                // so the tick ends.
                 Err(e @ Error::Storage(_)) => return Err(e),
                 // Any other error, an undecodable record for example, is
                 // specific to this job. Its entry stays marked for the next
-                // tick and must not block the entries behind it.
+                // tick and must not block the entries after it.
                 Err(e) => {
                     warn!(queue = %lease.queue, job_id = %lease.id, "reaping expired lease failed: {e}");
                 }
@@ -140,21 +138,19 @@ impl QueueCore {
         let (id, claim_id) = (id.as_str(), *claim_id);
         let claimed_key_bytes = &claimed_key(queue, id);
 
-        // The commit does not await WAL durability: each expired claim is
-        // its own transaction, so awaiting the flush would serialise the
-        // sweep at one job per flush interval, and a commit lost in a
-        // crash is redone by the requeue of claimed records at the next
-        // open.
+        // The commit does not await WAL durability: each expired claim has its
+        // own transaction, so a commit that awaits the flush serialises the
+        // sweep at one job per flush interval. A commit lost in a crash is
+        // redone by the requeue of claimed records at the next open.
         let reaped = retry(&self.db, Durability::Deferred, |txn| async move {
-            // A settlement removes the entry after its commit; an entry
-            // that is gone or belongs to a new claim leaves nothing to
-            // reap. The check runs after the transaction begins: a claim
-            // transition the check does not see must then commit after the
-            // snapshot and conflict on the staged delete of the claimed
-            // key. Checked before the transaction, a late settlement and
-            // re-claim completing in between would leave this transaction
-            // reading the new claim's record, indistinguishable in the
-            // store from the old claim's.
+            // A settlement removes the entry after its commit. When the entry
+            // is gone or belongs to a new claim, the reap aborts. The check
+            // runs after the transaction begins: a claim transition the check
+            // does not see must then commit after the snapshot and conflict on
+            // the staged delete of the claimed key. A check before the
+            // transaction lets a late settlement and re-claim complete in
+            // between, and this transaction then reads the new claim's record,
+            // which the store does not distinguish from the old claim's.
             match registry.current(queue, id) {
                 Some((_, current)) if current == claim_id => {}
                 _ => {
@@ -163,10 +159,10 @@ impl QueueCore {
                 }
             }
 
-            // An entry with no claimed record is the residue of a claim
-            // whose commit failed (the entry is registered first), or of a
-            // settlement whose entry removal has not run yet. Neither case
-            // leaves a claim to recover; drop the entry.
+            // An entry without a claimed record is the residue of a claim whose
+            // commit failed (the entry is registered first), or of a settlement
+            // whose entry removal did not run yet. Neither case leaves a claim
+            // to recover, so the entry is dropped.
             let Some(raw) = txn.get(claimed_key_bytes).await? else {
                 txn.rollback();
                 registry.remove(queue, id, claim_id);
@@ -193,16 +189,15 @@ impl QueueCore {
         Ok(())
     }
 
-    /// Re-queue every claimed record found in the store. Called at open,
-    /// before workers or the reaper start: the queue is single-process and
-    /// single-writer, so a claim present at open belongs to a process that
-    /// no longer runs and is void. The requeue consumes no attempt itself;
-    /// attempts count claims, so `max_attempts` still bounds a
-    /// crash-looping job.
+    /// Re-queue every claimed record found in the store. Called at open, before
+    /// workers or the reaper start: the queue is single-process and
+    /// single-writer, so a claim present at open belongs to a process that no
+    /// longer runs and is void. The requeue itself does not consume an attempt.
+    /// Attempts count claims, so `max_attempts` still bounds a crash-looping
+    /// job.
     ///
-    /// Runs after the claim cursor is restored, and notes each re-queued
-    /// job's pending key, which sorts before the restored clean-close
-    /// bound.
+    /// Runs after the claim cursor is restored, and notes each re-queued job's
+    /// pending key, which sorts before the restored clean-close bound.
     pub(crate) async fn requeue_interrupted_claims(&self) -> Result<()> {
         let mut interrupted: Vec<JobRecord> = Vec::new();
         let mut iter = self
@@ -212,8 +207,8 @@ impl QueueCore {
         while let Some(kv) = iter.next().await? {
             match JobRecord::decode(&kv.key, &kv.value) {
                 Ok(job) => interrupted.push(job),
-                // Re-queueing needs the record; the key is left in place
-                // for later inspection.
+                // Re-queueing needs the record, so the key is left in place for
+                // later inspection.
                 Err(e) => warn!(key = ?kv.key, "undecodable claimed record at open: {e}"),
             }
         }
@@ -228,11 +223,11 @@ impl QueueCore {
                 "claim interrupted by process exit",
             );
             let pending_key = stage_claim_end(&txn, &mut job, &end, self.now_ms())?;
-            // The commit does not await WAL durability: awaiting the flush
-            // would serialise the open at one job per flush interval, and a
+            // The commit does not await WAL durability: a commit that awaits
+            // the flush serialises the open at one job per flush interval. A
             // requeue lost in a crash is redone by the next open from the
-            // claimed record it left in place. Nothing else writes at open,
-            // so a commit error surfaces to the caller and fails the open.
+            // claimed record it left in place. Nothing else writes at open, so
+            // a commit error surfaces to the caller and fails the open.
             txn.commit().await?;
             if let Some(pending_key) = pending_key {
                 self.claim_cursor
@@ -242,17 +237,15 @@ impl QueueCore {
         Ok(())
     }
 
-    /// Delete the records of `status` (`Done` or `Dead`) whose retention
-    /// window has expired. The window is resolved per record from the
-    /// job's queue via `retention_for`; records on queues without a
-    /// window are skipped.
+    /// Delete the records of `status` (`Done` or `Dead`) whose retention window
+    /// ended. The window is resolved per record from the job's queue via
+    /// `retention_for`. Records on queues without a window are skipped.
     ///
-    /// Done keys lead with `completed_at` (see [`crate::keys::done_key`]),
-    /// so `max_retention`, the largest window configured on any queue,
-    /// ends the done scan at the first key newer than `now - max_retention`:
-    /// no later record can be expired for any queue. Dead keys group by
-    /// queue, so the dead scan reads the whole key space and ignores
-    /// `max_retention`.
+    /// Done keys lead with `completed_at` (see [`crate::keys::done_key`]), so
+    /// `max_retention`, the largest window configured on any queue, ends the
+    /// done scan at the first key newer than `now - max_retention`: no later
+    /// record can be expired for any queue. Dead keys group by queue, so the
+    /// dead scan reads the whole key space and ignores `max_retention`.
     async fn sweep_expired(
         &self,
         status: JobStatus,
@@ -267,8 +260,8 @@ impl QueueCore {
         let now = self.now_ms();
 
         // The done scan runs from the done bound: a key at or after
-        // `now - max_retention` ends it, and a key the sweep leaves in
-        // place is retained, so the bound does not pass it.
+        // `now - max_retention` ends it, and a key the sweep leaves in place is
+        // retained, so the bound does not pass it.
         let mut scan = None;
         let mut iter = match min_cutoff {
             Some(max_retention) => {
@@ -343,18 +336,17 @@ impl QueueCore {
     }
 
     /// Delete one expired record in its own transaction: re-check that the
-    /// record still exists, then stage its removal, which decrements the
-    /// dead counter of a dead record so `QueueStats::dead` reflects the
-    /// live size of the dead-letter set.
+    /// record still exists, then stage its removal, which decrements the dead
+    /// counter of a dead record so `QueueStats::dead` reflects the live size of
+    /// the dead-letter set.
     ///
     /// The commit does not await WAL durability: a commit lost in a crash
-    /// leaves the record in place for the next sweep and the existence
-    /// re-check keeps the rerun idempotent, including the counter
-    /// decrement. A conflicting commit leaves the victim to the next
-    /// sweep. The payload object is deleted only after the commit, so a
-    /// crash in between leaves an orphaned object, never a live record
-    /// whose payload is gone. Returns `false` when a conflict left the
-    /// record in place.
+    /// leaves the record in place for the next sweep and the existence re-check
+    /// keeps the rerun idempotent, including the counter decrement. A
+    /// conflicting commit leaves the victim to the next sweep. The payload
+    /// object is deleted only after the commit, so a crash in between leaves an
+    /// orphaned object, never a live record whose payload is gone. Returns
+    /// `false` when a conflict left the record in place.
     async fn sweep_victim(&self, key: &[u8], job: &JobRecord) -> Result<bool> {
         let txn = self.db.begin(IsolationLevel::Snapshot).await?;
         let existed = txn.get(key).await?.is_some();
@@ -569,9 +561,8 @@ mod tests {
 
     #[tokio::test]
     async fn ack_succeeds_on_expired_lease_before_reaper_runs() {
-        // Settlement is fenced on the claim id. The claim stays
-        // settleable past its lease expiry until the reaper requeues
-        // the job.
+        // Settlement is fenced on the claim id. The claim stays settleable past
+        // its lease expiry until the reaper requeues the job.
         let clock = MockClock::new(1_700_000_000_000);
         let opts = OpenOptions {
             clock: Arc::new(clock.clone()),
@@ -609,11 +600,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel_persists_across_reaper_requeue() {
-        // Claim -> cancel -> drop the job back to pending via the reaper
-        // (lease elapsed) -> re-claim sees cancel_requested and a pre-fired token.
+        // Claim -> cancel -> drop the job back to pending via the reaper (lease
+        // elapsed) -> re-claim sees cancel_requested and a pre-fired token.
         //
-        // Disable the auto-reaper so the cancel definitely happens while
-        // the job is Claimed; trigger the requeue manually with reap_now.
+        // Disable the auto-reaper so the cancel definitely happens while the
+        // job is Claimed, and trigger the requeue manually with reap_now.
         let clock = MockClock::new(1_700_000_000_000);
         let opts = OpenOptions {
             clock: Arc::new(clock.clone()),
@@ -689,7 +680,7 @@ mod tests {
         assert!(!q.core.lease_registry.cancel(&qn("work"), &id));
         assert!(!token.is_cancelled());
 
-        // The requeued job holds no entry to fire.
+        // The requeued job does not have an entry to fire.
         assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Removed);
         assert_eq!(q.core.lease_registry.len(), 0);
         q.close().await.unwrap();
@@ -697,10 +688,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_retention_is_per_queue_on_ack_and_sweep() {
-        // Two queues sharing one Queue instance, with very different
-        // retention policies. The default-config queue ("transient") drops
-        // jobs on ack; the per-queue override ("kept") retains them. Then
-        // the same background reaper sweep must respect each queue's window.
+        // Two queues sharing one Queue instance, with very different retention
+        // policies. The default-config queue ("transient") drops jobs on ack,
+        // and the per-queue override ("kept") retains them. Then the same
+        // background reaper sweep must respect each queue's window.
         let clock = MockClock::new(1_700_000_000_000);
         let reaper_interval = Duration::from_millis(10);
         let kept_retention = Duration::from_millis(50);
@@ -741,7 +732,7 @@ mod tests {
         q.ack(&kept_job).await.unwrap();
         q.ack(&transient_job).await.unwrap();
 
-        // The "transient" queue has no retention: ack dropped the record.
+        // The "transient" queue lacks a retention: ack dropped the record.
         assert!(
             q.view().get_job(&transient_id).await.unwrap().is_none(),
             "queues without keep_done_jobs must drop on ack"
@@ -752,16 +743,16 @@ mod tests {
             "queues with keep_done_jobs must retain on ack"
         );
 
-        // Fire a reaper tick before the retention window has elapsed:
-        // the kept record must survive.
+        // Fire a reaper tick before the retention window elapses: the kept
+        // record must stay.
         tokio::time::sleep(reaper_interval * 2).await;
         assert!(
             q.view().get_job(&kept_id).await.unwrap().is_some(),
             "reaper sweep before retention elapses must not purge"
         );
 
-        // Advance the test clock past the retention window; the next
-        // reaper tick purges the record.
+        // Advance the test clock past the retention window. The next reaper
+        // tick purges the record.
         clock.advance(kept_retention + Duration::from_millis(10));
         tokio::time::sleep(reaper_interval * 2).await;
         assert!(
@@ -774,9 +765,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_dead_retention_is_per_queue() {
-        // Two queues with different dead-letter retention windows. The
-        // same reaper sweep purges the short-window queue's record while
-        // leaving the long-window one intact.
+        // Two queues with different dead-letter retention windows. The same
+        // reaper sweep purges the short-window queue's record while leaving the
+        // long-window one intact.
         let clock = MockClock::new(1_700_000_000_000);
         let reaper_interval = Duration::from_millis(10);
         let ephemeral_retention = Duration::from_millis(50);
@@ -880,8 +871,8 @@ mod tests {
             .unwrap();
         let reaper = Reaper::new(Arc::clone(&q.core));
 
-        // A sweep over an empty done key space leaves the bound at the
-        // maximum, and the ack that follows lowers it.
+        // A sweep over an empty done key space leaves the bound at the maximum,
+        // and the ack that follows lowers it.
         reaper.step().await.unwrap();
         q.enqueue("work", b"x".to_vec()).await.unwrap();
         let job = q
@@ -905,8 +896,8 @@ mod tests {
     async fn test_done_retention_uses_completion_time_not_enqueue_time() {
         // Both the scheduler (`run_at < now_ms`) and the retention sweep
         // (`completed_at < now_ms - retention`) compare against the queue's
-        // clock, so virtualising it via `MockClock` is enough to drive
-        // both deterministically.
+        // clock, so virtualising it via `MockClock` is enough to run both
+        // deterministically.
         let initial = 1_700_000_000_000_u64;
         let clock = MockClock::new(initial);
         let reaper_interval = Duration::from_millis(10);
@@ -925,8 +916,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Construct `run_at` from the mock clock so it is comparable to
-        // the queue's `now_ms` without relying on the system clock.
+        // Construct `run_at` from the mock clock so it is comparable to the
+        // queue's `now_ms` without relying on the system clock.
         let run_at = std::time::UNIX_EPOCH + Duration::from_millis(initial) + schedule_delay;
         let id = q
             .enqueue_with(
@@ -957,9 +948,9 @@ mod tests {
         );
         q.ack(&job).await.unwrap();
 
-        // Fire a reaper tick right after ack: completion is fresh
-        // relative to the retention window, so the record survives even
-        // though `enqueued_at` is now far older than the retention.
+        // Fire a reaper tick right after ack: completion is fresh relative to
+        // the retention window, so the record stays even though `enqueued_at`
+        // is now far older than the retention.
         tokio::time::sleep(reaper_interval * 2).await;
         let kept = q.view().get_job(&id).await.unwrap().expect(
             "fresh completion must survive the sweep regardless of how long ago the job was enqueued",
@@ -969,8 +960,8 @@ mod tests {
             "ack must stamp completed_at when keep_done_jobs is set"
         );
 
-        // Advance past the retention window; the next reaper tick purges
-        // the record.
+        // Advance past the retention window. The next reaper tick purges the
+        // record.
         clock.advance(retention + Duration::from_millis(10));
         tokio::time::sleep(reaper_interval * 2).await;
         assert!(q.view().get_job(&id).await.unwrap().is_none());
@@ -980,11 +971,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_dead_retention_sweep_boundary() {
-        // Drive a job to dead-letter, then exercise both sides of the
-        // retention cutoff with a single configured window: a reaper tick
-        // before the cutoff has elapsed must leave the job alone; one
-        // after it elapses must purge it (along with its index pointer
-        // and the `dead` counter).
+        // Move a job to dead-letter, then exercise both sides of the retention
+        // cutoff with a single configured window. A reaper tick before the
+        // cutoff elapses must leave the job alone, and one after it elapses
+        // must purge it (along with its index pointer and the `dead` counter).
         let clock = MockClock::new(1_700_000_000_000);
         let reaper_interval = Duration::from_millis(10);
         let retention = Duration::from_millis(50);
@@ -1024,17 +1014,17 @@ mod tests {
         assert!(dead[0].failed_at.is_some(), "failed_at must be stamped");
         assert_eq!(q.view().stats("work").await.unwrap().dead, 1);
 
-        // Fire a reaper tick before the retention cutoff has elapsed:
-        // the dead record must survive.
+        // Fire a reaper tick before the retention cutoff elapses: the dead
+        // record must stay.
         tokio::time::sleep(reaper_interval * 2).await;
         assert_eq!(
             q.view().dead_jobs("work", None, 100).await.unwrap().len(),
             1
         );
 
-        // Advance the test clock past the cutoff. The next reaper tick
-        // purges the record; the counter and index pointer must also be
-        // cleaned up.
+        // Advance the test clock past the cutoff. The next reaper tick purges
+        // the record, and the counter and index pointer must also be cleaned
+        // up.
         clock.advance(retention + Duration::from_millis(10));
         tokio::time::sleep(reaper_interval * 2).await;
         assert!(
@@ -1146,8 +1136,8 @@ mod tests {
             .unwrap();
         q.ack(&job).await.unwrap();
 
-        // The done record is kept, so the payload object stays and the
-        // record read materializes it.
+        // The done record is kept, so the payload object stays and the record
+        // read materializes it.
         assert_eq!(object_count(&store, "test-payloads").await, 1);
         let done = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(done.payload, payload);
@@ -1387,8 +1377,8 @@ mod tests {
             q.view().get_job(&healthy).await.unwrap().unwrap().status,
             JobStatus::Pending
         );
-        // The poisoned job's entry is kept for a later tick; the
-        // healthy job's was removed by its requeue.
+        // The poisoned job's entry is kept for a later tick, and the healthy
+        // job's was removed by its requeue.
         assert_eq!(q.core.lease_registry.len(), 1);
         q.close().await.unwrap();
     }
@@ -1410,13 +1400,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        // Drop the claim without settling it, as a crashed worker would.
+        // Drop the claim without settling it, as a crashed worker does.
         drop(claim);
         q.close().await.unwrap();
 
-        // A claim present at open belongs to a process that no longer
-        // holds the store, so it is requeued immediately, before its
-        // lease expires.
+        // A claim present at open belongs to a process that no longer has the
+        // store open, so it is requeued immediately, before its lease expires.
         let q = Queue::open_with_options(store, "test", opts())
             .await
             .unwrap();
@@ -1428,9 +1417,9 @@ mod tests {
         let history = q.view().attempt_history(&id).await.unwrap();
         assert_eq!(history.last().unwrap().outcome, AttemptOutcome::Interrupted);
 
-        // The requeued job is claimable at once: its pending insert is
-        // recorded against the restored clean-close bound. The next
-        // attempt is consumed by the re-claim.
+        // The requeued job is claimable at once: its pending insert is recorded
+        // against the restored clean-close bound. The next attempt is consumed
+        // by the re-claim.
         let reclaim = q
             .claim("work", Duration::from_secs(30))
             .await

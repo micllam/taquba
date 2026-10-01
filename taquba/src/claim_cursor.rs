@@ -10,35 +10,33 @@ use crate::error::Result;
 use crate::keys::{KeyTag, QueueName, cursor_key, parse_cursor_key, tag_prefix};
 use crate::queue_core::QueueCore;
 
-/// Upper bound on wakeups issued for one batch of inserts. Beyond the
-/// cap, woken workers drain the backlog by looping on claim, and
-/// `Notify::notify_one` stores at most one permit when no task is
-/// waiting, so extra calls would be wasted work.
+/// Upper bound on wakeups issued for one batch of inserts. Beyond the cap,
+/// woken workers drain the backlog by looping on claim, and
+/// `Notify::notify_one` stores at most one permit when no task is waiting, so
+/// further calls do not wake a task.
 const MAX_INSERT_WAKEUPS: usize = 64;
 
-/// Per-queue in-process claim state: a scan-start bound, a
-/// pending-insert epoch, the insert wakeup and the claim lock.
+/// Per-queue in-process claim state: a scan-start bound, a pending-insert
+/// epoch, the insert wakeup and the claim lock.
 ///
-/// The scan-start bound is the position the next claim scans from,
-/// skipping the tombstone band left by previously claimed (and
-/// deleted) pending entries. After a claim it excludes the claimed
-/// key; after an insert that lands at or before it, it moves back to
-/// include the inserted key. The invariant is that every live
-/// pending key sorts at or after the bound, so the claim path only
-/// falls back to a front prefix scan when the bound is unknown (cold
-/// start or process restart).
+/// The scan-start bound is the position the next claim scans from, skipping the
+/// tombstone band left by previously claimed (and deleted) pending entries.
+/// After a claim it excludes the claimed key. After an insert at or before it,
+/// it moves back to include the inserted key. The invariant is that every live
+/// pending key sorts at or after the bound, so the claim path only falls back
+/// to a front prefix scan when the bound is unknown (after a process start or
+/// restart).
 ///
-/// The epoch counts committed pending inserts. When a claim's full
-/// prefix scan ends without a live key, it records the epoch it observed before
-/// its transaction began; until the next insert bumps the epoch,
-/// subsequent claims return `None` without scanning. Without this,
-/// every poll of an empty queue re-scans the tombstone band from the
-/// front, which grows with every job claimed since the last
-/// compaction.
+/// The epoch counts committed pending inserts. When a claim's full prefix scan
+/// ends without a live key, it records the epoch it observed before its
+/// transaction began. Until the next insert bumps the epoch, subsequent claims
+/// return `None` without scanning. Without this, every poll of an empty queue
+/// re-scans the tombstone band from the front, which grows with every job
+/// claimed after the last compaction.
 ///
-/// The bound and emptiness marker survive a clean close
-/// ([`Self::export`] / [`Self::restore`]); after a crash the first
-/// claim falls back to a prefix scan and re-warms the state naturally.
+/// The bound and emptiness marker persist across a clean close
+/// ([`Self::export`] / [`Self::restore`]). After a crash the first claim falls
+/// back to a prefix scan and re-warms the state naturally.
 #[derive(Default)]
 pub(crate) struct ClaimCursor {
     inner: Arc<Mutex<HashMap<QueueName, QueueClaimState>>>,
@@ -48,9 +46,9 @@ pub(crate) struct ClaimCursor {
 #[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ScanFrom {
     pub(crate) key: Bytes,
-    /// `true` when `key` itself may be live (it was inserted at or
-    /// before the previous bound); `false` when `key` was claimed and
-    /// the scan starts strictly after it.
+    /// `true` when `key` itself can be live (it was inserted at or before the
+    /// previous bound), and `false` when `key` was claimed and the scan starts
+    /// strictly after it.
     pub(crate) inclusive: bool,
 }
 
@@ -59,48 +57,46 @@ struct QueueClaimState {
     scan_from: Option<ScanFrom>,
     /// Bumped after every committed pending insert.
     epoch: u64,
-    /// The epoch observed by a claim whose full prefix scan found
-    /// nothing. While it equals `epoch`, the queue is known empty.
+    /// The epoch observed by a claim whose full prefix scan ended without a
+    /// key. While it equals `epoch`, the queue is known empty.
     empty_as_of: Option<u64>,
-    /// Smallest key inserted at or after the bound since the last
-    /// [`ClaimCursor::advance`] consumed it. Job ids are generated
-    /// before their enqueue transaction commits, so a key can sort
-    /// below keys an in-flight claim is about to advance past while
-    /// still sorting after the bound when its insert is recorded.
-    /// `advance` clamps to this key so the bound never jumps over an
-    /// insert it could not have observed.
+    /// Smallest key inserted at or after the bound, among the inserts recorded
+    /// after [`ClaimCursor::advance`] last consumed it. Because job ids are
+    /// generated before their enqueue transaction commits, a key can sort below
+    /// keys an in-flight claim is about to advance past while still sorting
+    /// after the bound when its insert is recorded. `advance` clamps to this
+    /// key so the bound never jumps over an insert that the claim's snapshot
+    /// can miss.
     min_insert_ahead: Option<Bytes>,
     /// Queue-scoped wakeup for tasks waiting in `claim_with_wait` or
-    /// `wait_for_jobs_on`. Each recorded insert issues one
-    /// `notify_one`, waking one waiting worker per job instead of the
-    /// whole pool.
+    /// `wait_for_jobs_on`. Each recorded insert issues one `notify_one`, which
+    /// wakes one waiting worker per job and leaves the rest of the pool
+    /// waiting.
     wakeup: Arc<Notify>,
-    /// Held across the queue's claim transaction, so same-queue claim
-    /// attempts serialise here in place of a transaction-conflict
-    /// retry. Per queue, so different queues' claims run in parallel.
+    /// Held across the queue's claim transaction, so same-queue claim attempts
+    /// serialise here in place of a transaction-conflict retry. Per queue, so
+    /// different queues' claims run in parallel.
     claim_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl QueueClaimState {
-    /// Whether a full scan ended without a live key and no insert
-    /// followed.
+    /// Whether a full scan ended without a live key and no insert followed.
     fn known_empty(&self) -> bool {
         self.empty_as_of == Some(self.epoch)
     }
 }
 
-/// Snapshot of one queue's claim-scan state, taken at the start of a
-/// claim attempt.
+/// Snapshot of one queue's claim-scan state, taken at the start of a claim
+/// attempt.
 pub(crate) struct ClaimScanStart {
     pub(crate) scan_from: Option<ScanFrom>,
     pub(crate) epoch: u64,
     pub(crate) known_empty: bool,
 }
 
-/// One queue's persistable claim-scan state: the scan bound and
-/// whether a full scan ended without a live key. Exported at clean
-/// close, stored as the record at the queue's [`cursor_key`] and
-/// restored at the next open.
+/// One queue's persistable claim-scan state: the scan bound and whether a full
+/// scan ended without a live key. Exported at clean close, stored as the record
+/// at the queue's [`cursor_key`] and restored at the next open.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct CursorState {
     pub(crate) scan_from: Option<ScanFrom>,
@@ -112,10 +108,9 @@ impl ClaimCursor {
         Self::default()
     }
 
-    /// Snapshot the scan state for one claim attempt. The epoch must
-    /// be read before the claim's transaction begins: emptiness
-    /// recorded against it is then revoked by any insert the
-    /// transaction's snapshot could have missed.
+    /// Snapshot the scan state for one claim attempt. The epoch must be read
+    /// before the claim's transaction begins: emptiness recorded against it is
+    /// then revoked by any insert that the transaction's snapshot can miss.
     pub(crate) fn begin_claim(&self, queue: &str) -> ClaimScanStart {
         let map = self.inner.lock().unwrap();
         match map.get(queue) {
@@ -132,15 +127,14 @@ impl ClaimCursor {
         }
     }
 
-    /// Advance the scan start past `claimed`, without ever moving it
-    /// past a key the claim could not have observed. The advance is
-    /// dropped entirely if an insert moved the bound back while the
-    /// claim was in flight (the next claim scans from the moved bound
-    /// instead), and it is clamped to the smallest key inserted ahead
-    /// of the bound since the previous advance, because such a key may
-    /// have committed after the claim's snapshot yet sort at or below
-    /// `claimed` (a key equal to `claimed` is a reinsert of the job
-    /// the claim took, requeued after its lease expired within the
+    /// Advance the scan start past `claimed`, without ever moving it past a key
+    /// that the claim's snapshot can miss. The advance is dropped entirely if
+    /// an insert moved the bound back while the claim was in flight (the next
+    /// claim scans from the moved bound instead). Otherwise it is clamped to
+    /// the smallest key inserted after the bound in the interval after the
+    /// previous advance. Such a key can commit after the claim's snapshot and
+    /// still sort at or below `claimed` (a key equal to `claimed` is a reinsert
+    /// of the job the claim took, requeued after its lease expired within the
     /// claim).
     pub(crate) fn advance(&self, queue: &QueueName, claimed: Bytes, observed: &ClaimScanStart) {
         let mut map = self.inner.lock().unwrap();
@@ -160,20 +154,19 @@ impl ClaimCursor {
         };
     }
 
-    /// Record that a full scan of the pending prefix ended without a
-    /// live key, as of the `observed` snapshot the attempt began with.
-    /// The scan-start bound is kept: nothing is live before it, and an
-    /// insert before it moves it. Claims short-circuit to `None` until
-    /// the next insert bumps the epoch past the snapshot's.
+    /// Record that a full scan of the pending prefix ended without a live key,
+    /// as of the `observed` snapshot the attempt began with. The scan-start
+    /// bound is kept: nothing is live before it, and an insert before it moves
+    /// it. Claims short-circuit to `None` until the next insert bumps the epoch
+    /// past the snapshot's.
     pub(crate) fn mark_empty(&self, queue: &QueueName, observed: &ClaimScanStart) {
         let mut map = self.inner.lock().unwrap();
         let s = map.entry(queue.clone()).or_default();
         s.empty_as_of = Some(observed.epoch);
     }
 
-    /// Whether a full scan of `queue` ended without a live key and no
-    /// insert followed. Read without a claim attempt, before the claim
-    /// lock is taken.
+    /// Whether a full scan of `queue` ended without a live key and no insert
+    /// followed. Read without a claim attempt, before the claim lock is taken.
     pub(crate) fn known_empty(&self, queue: &str) -> bool {
         self.inner
             .lock()
@@ -182,34 +175,32 @@ impl ClaimCursor {
             .is_some_and(QueueClaimState::known_empty)
     }
 
-    /// Record one committed pending insert. See
-    /// [`Self::note_pending_inserts`] for the semantics, including why
-    /// this must be called after the insert's transaction commits.
+    /// Record one committed pending insert. See [`Self::note_pending_inserts`]
+    /// for the semantics, including why this must be called after the insert's
+    /// transaction commits.
     pub(crate) fn note_pending_insert(&self, queue: &QueueName, new_key: &[u8]) {
         self.note_pending_inserts(queue, new_key, 1);
     }
 
-    /// Record `count` committed pending inserts whose smallest key
-    /// is `min_key`: bump the epoch, revoking any emptiness recorded
-    /// against an earlier one, update the scan state so no claim can
-    /// miss the key, and issue one queue-scoped wakeup per insert
-    /// (capped) so waiting workers wake one per job.
+    /// Record `count` committed pending inserts whose smallest key is
+    /// `min_key`: bump the epoch, revoking any emptiness recorded against an
+    /// earlier one, update the scan state so no claim can miss the key, and
+    /// issue one queue-scoped wakeup per insert (capped) so waiting workers
+    /// wake one per job.
     ///
-    /// The scan-start bound moves back to include `min_key` when a
-    /// scan from it would otherwise skip the key. When no bound
-    /// exists, one is set only if a prior scan ended without a live key
-    /// (no insert recorded since); otherwise keys from before this
-    /// process may be live and claims must keep falling back to the
-    /// front scan. A key a scan would already yield is recorded for
-    /// [`Self::advance`] to clamp to, because an in-flight claim may
-    /// otherwise advance the bound past it.
+    /// The scan-start bound moves back to include `min_key` when a scan from it
+    /// skips the key. When no bound exists, one is set only if a prior scan
+    /// ended without a live key and no insert was recorded after it. Otherwise
+    /// keys from before this process can be live, and claims must keep falling
+    /// back to the front scan. A key that a scan from the bound already yields
+    /// is recorded for [`Self::advance`] to clamp to, because an in-flight
+    /// claim can otherwise advance the bound past it.
     ///
-    /// Every site that writes pending keys (enqueue, batch
-    /// enqueue, nack-requeue, dead-job requeue, reaper-requeue,
-    /// scheduler promotion) calls this *after* its transaction
-    /// commits. Calling it before the commit would let a concurrent
-    /// claim scan miss the job, record emptiness at the already-bumped
-    /// epoch, and strand the job until the next insert.
+    /// Every site that writes pending keys (enqueue, batch enqueue,
+    /// nack-requeue, dead-job requeue, reaper-requeue, scheduler promotion)
+    /// calls this *after* its transaction commits. A call before the commit
+    /// lets a concurrent claim scan miss the job and record emptiness at the
+    /// already-bumped epoch, and the job then waits for the next insert.
     pub(crate) fn note_pending_inserts(&self, queue: &QueueName, min_key: &[u8], count: usize) {
         let wakeup = {
             let mut map = self.inner.lock().unwrap();
@@ -217,15 +208,14 @@ impl ClaimCursor {
             let was_known_empty = s.known_empty();
             s.epoch += 1;
             let include_min_key = match &s.scan_from {
-                // Move the bound back when a scan from it would skip
-                // the key.
+                // Move the bound back when a scan from it skips the key.
                 Some(sf) => {
                     min_key < sf.key.as_ref() || (min_key == sf.key.as_ref() && !sf.inclusive)
                 }
-                // Bound unknown (cold start or restart): a bound is set
-                // only when a scan ended without a live key. Otherwise
-                // keys from before this process can be live, and claims
-                // keep falling back to the front scan.
+                // Bound unknown (process start or restart): a bound is set only
+                // when a scan ended without a live key. Otherwise keys from
+                // before this process can be live, and claims keep falling back
+                // to the front scan.
                 None => was_known_empty,
             };
             if include_min_key {
@@ -235,10 +225,9 @@ impl ClaimCursor {
                 });
                 s.min_insert_ahead = None;
             } else {
-                // A scan would already yield the key (or no bound is
-                // set yet), but an in-flight claim may be about to
-                // advance the bound past it; record it so that advance
-                // clamps.
+                // A scan from the bound already yields the key (or no bound is
+                // set yet), but an in-flight claim can advance the bound past
+                // it. Record the key so that the advance clamps.
                 let key = Bytes::copy_from_slice(min_key);
                 let is_new_min = s
                     .min_insert_ahead
@@ -255,9 +244,9 @@ impl ClaimCursor {
         }
     }
 
-    /// Export every queue's persistable state. Queues with neither a
-    /// bound nor recorded emptiness are omitted; their next claim
-    /// falls back to the front prefix scan regardless.
+    /// Export every queue's persistable state. Queues with neither a bound nor
+    /// recorded emptiness are omitted, and their next claim falls back to the
+    /// front prefix scan regardless.
     pub(crate) fn export(&self) -> Vec<(QueueName, CursorState)> {
         let map = self.inner.lock().unwrap();
         map.iter()
@@ -277,11 +266,11 @@ impl ClaimCursor {
             .collect()
     }
 
-    /// Restore one queue's state from a record persisted at the
-    /// previous clean close. Must be called before the queue serves
-    /// traffic: the persisted state is valid because nothing mutates
-    /// the store while it is closed, and any insert after this call
-    /// updates the restored state through the normal paths.
+    /// Restore one queue's state from a record persisted at the previous clean
+    /// close. Must be called before the queue accepts calls: the persisted
+    /// state is valid because nothing mutates the store while it is closed, and
+    /// any insert after this call updates the restored state through the normal
+    /// paths.
     pub(crate) fn restore(&self, queue: &QueueName, state: CursorState) {
         let mut map = self.inner.lock().unwrap();
         let s = map.entry(queue.clone()).or_default();
@@ -291,13 +280,13 @@ impl ClaimCursor {
         }
     }
 
-    /// The queue-scoped wakeup that [`Self::note_pending_inserts`]
-    /// notifies, one `notify_one` per recorded insert. `notify_one`
-    /// leaves a permit when no task is waiting, so a waiter that
-    /// subscribes after an insert still wakes immediately.
+    /// The queue-scoped wakeup that [`Self::note_pending_inserts`] notifies,
+    /// one `notify_one` per recorded insert. `notify_one` leaves a permit when
+    /// no task is waiting, so a waiter that subscribes after an insert still
+    /// wakes immediately.
     ///
-    /// A name over the key encoding's bound cannot receive an insert, so
-    /// the returned wakeup for such a name is never notified.
+    /// A name over the key encoding's bound cannot receive an insert, so the
+    /// returned wakeup for such a name is never notified.
     pub(crate) fn wakeup_for(&self, queue: &str) -> Arc<Notify> {
         let mut map = self.inner.lock().unwrap();
         if let Some(s) = map.get(queue) {
@@ -309,7 +298,8 @@ impl ClaimCursor {
         }
     }
 
-    /// The mutex a claim on `queue` holds across its scan and commit.
+    /// The mutex that a claim on `queue` keeps locked across its scan and
+    /// commit.
     pub(crate) fn claim_lock_for(&self, queue: &QueueName) -> Arc<tokio::sync::Mutex<()>> {
         self.inner
             .lock()
@@ -322,12 +312,11 @@ impl ClaimCursor {
 }
 
 /// Write each queue's claim-scan state at its cursor key. Only a clean
-/// [`Queue::close`](crate::Queue::close) writes the records, and the
-/// next open deletes them before it accepts any call, so a record is
-/// never observed after the state it describes changes.
-/// Runs after the background tasks have stopped; `close` consumes the
-/// handle, so the exported state cannot change between the export and
-/// the database closing.
+/// [`Queue::close`](crate::Queue::close) writes the records, and the next open
+/// deletes them before it accepts any call, so a record is never observed after
+/// the state it describes changes. Runs after the background tasks stop.
+/// `close` consumes the handle, so the exported state does not change between
+/// the export and the database closing.
 pub(crate) async fn persist_cursor_state(core: &QueueCore) -> Result<()> {
     let states = core.claim_cursor.export();
     if states.is_empty() {
@@ -341,21 +330,20 @@ pub(crate) async fn persist_cursor_state(core: &QueueCore) -> Result<()> {
     Ok(())
 }
 
-/// Restore the claim cursor from cursor records persisted by the
-/// previous clean close, then delete them before the queue accepts any
-/// call. A record is valid only as of the close that wrote it: once
-/// inserts resume, the live bound can move before the persisted one.
-/// The delete does not await WAL durability. Every insert after it
-/// follows it in the WAL, so a flush that makes an insert durable makes
-/// the delete durable, and a flush lost in a crash loses the inserts
-/// with the delete. A record that survives a crash therefore describes
-/// a store without inserts after the close that wrote it, and the next
-/// open restores it again.
+/// Restore the claim cursor from cursor records persisted by the previous clean
+/// close, then delete them before the queue accepts any call. A record is valid
+/// only as of the close that wrote it: once inserts resume, the live bound can
+/// move before the persisted one. The delete does not await WAL durability.
+/// Every insert after it follows it in the WAL, so a flush that makes an insert
+/// durable makes the delete durable, and a flush lost in a crash loses the
+/// inserts with the delete. A record that persists across a crash therefore
+/// describes a store without inserts after the close that wrote it, and the
+/// next open restores it again.
 ///
-/// A record that does not decode, or whose key does not name a queue,
-/// is deleted with a warning and does not restore any state. A scan
-/// from the front of the prefix is always correct, and the loss of the
-/// record adds exactly one such scan at the next open.
+/// A record that does not decode, or whose key does not identify a queue, is
+/// deleted with a warning and does not restore any state. A scan from the front
+/// of the prefix is always correct, and the loss of the record adds exactly one
+/// such scan at the next open.
 pub(crate) async fn restore_cursor_state(core: &QueueCore) -> Result<()> {
     let txn = core.db.begin(IsolationLevel::Snapshot).await?;
     let mut records = Vec::new();
@@ -528,10 +516,9 @@ mod tests {
             &scan,
         );
 
-        // While a claim that observed the bound at job-2 is in flight,
-        // job-3 commits. It sorts after the bound, so it does not move
-        // it, but it sorts below the keys the claim is about to
-        // advance past.
+        // While a claim that observed the bound at job-2 is in flight, job-3
+        // commits. It sorts after the bound, so it does not move it, but it
+        // sorts below the keys the claim is about to advance past.
         let observed = state.begin_claim("q");
         state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-3");
         state.advance(
@@ -586,9 +573,9 @@ mod tests {
             &scan,
         );
 
-        // The claim takes job-5, whose lease expires within the claim,
-        // and the reaper requeues it at its original key before the
-        // claim's bound update runs.
+        // The claim takes job-5, whose lease expires within the claim, and the
+        // reaper requeues it at its original key before the claim's bound
+        // update runs.
         let observed = state.begin_claim("q");
         state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-5");
         state.advance(
@@ -631,8 +618,8 @@ mod tests {
     fn advance_clamps_to_key_inserted_during_a_cold_start_claim() {
         let state = ClaimCursor::new();
 
-        // A cold-start claim observes no bound and front-scans. While
-        // it runs, a reaper requeue inserts a key that sorts below the
+        // A claim after a process start finds the bound unset and front-scans.
+        // While it runs, a reaper requeue inserts a key that sorts below the
         // keys the claim will advance past.
         let observed = state.begin_claim("q");
         state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-1");
@@ -828,8 +815,8 @@ mod tests {
         let q = Queue::open(make_store(), "test").await.unwrap();
         let lease = Duration::from_secs(5);
 
-        // A successful claim_with_wait passes the wakeup on, leaving a
-        // stale permit behind when no task is waiting.
+        // A successful claim_with_wait passes the wakeup on and leaves a stale
+        // permit when no task is waiting.
         q.enqueue("work", b"job".to_vec()).await.unwrap();
         let job = q
             .claim_with_wait("work", lease, Duration::from_secs(1))
@@ -1035,8 +1022,8 @@ mod tests {
         q.ack(&job).await.unwrap();
         q.close().await.unwrap();
 
-        // A high-priority job sorts before the restored bound, which
-        // sits in the normal-priority band.
+        // A high-priority job sorts before the restored bound, which sits in
+        // the normal-priority band.
         let q = Queue::open(store, "test").await.unwrap();
         q.enqueue_with(
             "work",
@@ -1061,8 +1048,8 @@ mod tests {
         let lease = Duration::from_secs(5);
         let q = Queue::open(store.clone(), "test").await.unwrap();
         q.enqueue("work", b"only".to_vec()).await.unwrap();
-        // There is no exportable state for the queue, so the close does
-        // not overwrite the record.
+        // There is no exportable state for the queue, so the close does not
+        // overwrite the record.
         q.core
             .db
             .put(cursor_key(&qn("work")), b"not a cursor record")
@@ -1100,9 +1087,9 @@ mod tests {
         q.ack(&job).await.unwrap();
         q.close().await.unwrap();
 
-        // A flush interval longer than the test, so the open's delete of
-        // the record is durable only with a later awaited write. Closing
-        // without a flush discards it, the effect of a crash.
+        // A flush interval longer than the test, so the open's delete of the
+        // record is durable only with a later awaited write. Closing without a
+        // flush discards it, the effect of a crash.
         let opts = OpenOptions {
             flush_interval: Some(Duration::from_secs(3600)),
             ..OpenOptions::default()

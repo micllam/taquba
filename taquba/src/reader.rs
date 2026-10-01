@@ -1,11 +1,11 @@
 //! Read-only, cross-process observation of a queue's store.
 //!
 //! [`QueueReader`] opens the same object-store path as a live
-//! [`Queue`](crate::Queue) and serves the queue's read-only API from a
-//! second process: dashboards, CLIs and health checks that must observe
-//! a queue they do not own. The reader is observation only: it takes no
-//! writes, holds no clock and offers no lease view, and its view lags
-//! the writer by the writer's flush interval plus the reader's
+//! [`Queue`](crate::Queue) and provides the queue's read-only API to a second
+//! process: dashboards, CLIs and health checks that must observe a queue they
+//! do not own. The reader is observation only: it does not write, does not keep
+//! a clock and does not offer a lease view, and its view lags the writer by the
+//! writer's flush interval plus the reader's
 //! [`ReaderOptions::manifest_poll_interval`].
 
 use std::sync::Arc;
@@ -26,19 +26,18 @@ use crate::view::{Handle, QueueView};
 /// How a [`QueueReader`] follows the writer's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReaderMode {
-    /// Maintain a checkpoint against the latest store state, refreshed
-    /// on every manifest poll, so the objects the reader's view
-    /// references are protected from garbage collection while it pages
-    /// through them. Checkpoint refreshes are manifest writes, so this
-    /// mode requires write credentials to the bucket; it never touches
-    /// the writer's epoch and does not fence the writer.
+    /// Maintain a checkpoint against the latest store state, refreshed on every
+    /// manifest poll, so the objects the reader's view references are protected
+    /// from garbage collection while it pages through them. Checkpoint
+    /// refreshes are manifest writes, so this mode requires write credentials
+    /// to the bucket. It never touches the writer's epoch and does not fence
+    /// the writer.
     #[default]
     ManagedCheckpoint,
-    /// Follow the latest manifest without a checkpoint. Performs no
-    /// object-store writes, so read-only credentials suffice, but
-    /// nothing protects the view from garbage collection: a read
-    /// against an aged view can fail on a collected object and must be
-    /// retried.
+    /// Follow the latest manifest without a checkpoint. This mode does not
+    /// write to the object store, so read-only credentials suffice, but nothing
+    /// protects the view from garbage collection: a read against an aged view
+    /// can fail on a collected object and must be retried.
     FollowLatest,
 }
 
@@ -48,35 +47,32 @@ pub struct ReaderOptions {
     /// How the reader follows the writer's state. Defaults to
     /// [`ReaderMode::ManagedCheckpoint`].
     pub mode: ReaderMode,
-    /// How often the reader polls for new manifest and WAL data.
-    /// Defaults to 10 seconds. Together with the writer's flush
-    /// interval this bounds the reader's lag behind the writer.
+    /// How often the reader polls for new manifest and WAL data. Defaults to 10
+    /// seconds. Together with the writer's flush interval this bounds the
+    /// reader's lag behind the writer.
     pub manifest_poll_interval: Duration,
-    /// Expiry granted to the managed checkpoint on each refresh.
-    /// Defaults to 10 minutes; must be at least twice
-    /// [`Self::manifest_poll_interval`]. Ignored under
-    /// [`ReaderMode::FollowLatest`].
+    /// Expiry granted to the managed checkpoint on each refresh. Defaults to 10
+    /// minutes, and must be at least twice [`Self::manifest_poll_interval`].
+    /// Ignored under [`ReaderMode::FollowLatest`].
     pub checkpoint_lifetime: Duration,
     /// Object store for offloaded payloads. Must match the writer's
-    /// [`OpenOptions::payload_store`](crate::OpenOptions::payload_store);
-    /// `None` (the default) uses the object store the reader is opened
-    /// on.
+    /// [`OpenOptions::payload_store`](crate::OpenOptions::payload_store).
+    /// `None` (the default) uses the object store the reader is opened on.
     pub payload_store: Option<Arc<dyn ObjectStore>>,
-    /// Path prefix for offloaded payload objects. Must match the
-    /// writer's [`OpenOptions::payload_path`](crate::OpenOptions::payload_path);
-    /// `None` (the default) uses `"{path}-payloads"`.
+    /// Path prefix for offloaded payload objects. Must match the writer's
+    /// [`OpenOptions::payload_path`](crate::OpenOptions::payload_path). `None`
+    /// (the default) uses `"{path}-payloads"`.
     pub payload_path: Option<String>,
     /// Object store for the write-ahead log. Must match the writer's
-    /// [`OpenOptions::wal_object_store`](crate::OpenOptions::wal_object_store);
-    /// `None` (the default) uses the object store the reader is opened
-    /// on. Without it a reader of a writer with a separate WAL store
-    /// cannot see transitions not yet flushed to the primary store.
+    /// [`OpenOptions::wal_object_store`](crate::OpenOptions::wal_object_store).
+    /// `None` (the default) uses the object store the reader is opened on.
+    /// Without it a reader of a writer with a separate WAL store cannot see
+    /// transitions not yet flushed to the primary store.
     pub wal_object_store: Option<Arc<dyn ObjectStore>>,
-    /// When `true`, the reader reads no WAL at open or on refresh and
-    /// observes only state flushed to the primary store. Lowers the
-    /// cost of opening and refreshing a reader, for deployments with
-    /// many readers whose queries tolerate the additional lag.
-    /// Defaults to `false`.
+    /// When `true`, the reader does not read the WAL at open or on refresh and
+    /// observes only state flushed to the primary store. Lowers the cost of
+    /// opening and refreshing a reader, for deployments with many readers whose
+    /// queries tolerate the additional lag. Defaults to `false`.
     pub skip_wal_replay: bool,
 }
 
@@ -148,42 +144,39 @@ impl Default for ReaderOptions {
     }
 }
 
-/// A read-only view of a queue store, openable from a process other
-/// than the writer's.
+/// A read-only view of a queue store, openable from a process other than the
+/// writer's.
 ///
-/// Serves the same read-only API as [`Queue`](crate::Queue): job counts,
-/// queue and job listings, job lookup, attempt histories and the user
-/// KV namespace. The two surfaces share their implementations, so a
-/// query returns the same result through either, up to the reader's
-/// lag.
+/// Provides the same read-only API as [`Queue`](crate::Queue): job counts,
+/// queue and job listings, job lookup, attempt histories and the user KV
+/// namespace. The two surfaces share their implementations, so a query returns
+/// the same result through either, up to the reader's lag.
 ///
 /// # Semantics of a lagging view
 ///
-/// The reader observes whole commits or nothing: a transaction's writes
-/// become visible together. The view lags the writer by up to the
-/// writer's flush interval plus
-/// [`ReaderOptions::manifest_poll_interval`].
+/// The reader observes whole commits or nothing: a transaction's writes become
+/// visible together. The view lags the writer by up to the writer's flush
+/// interval plus [`ReaderOptions::manifest_poll_interval`].
 ///
-/// A job reported `Claimed` means a claim was taken and no settlement
-/// is visible yet. It says nothing about liveness: the lease is state
-/// inside the writer process, so the reader offers no lease view, and a
-/// claimed record can belong to a process that no longer runs.
+/// A job reported `Claimed` means a claim was taken and a settlement is not
+/// visible yet. It does not indicate liveness: the lease is state inside the
+/// writer process, so the reader does not offer a lease view, and a claimed
+/// record can belong to a process that no longer runs.
 ///
-/// [`Error::PayloadMissing`](crate::Error::PayloadMissing) from a
-/// reader can be transient: a job removal deletes the payload object
-/// after its record, so a reader whose view still holds the record can
-/// find the object gone. The condition clears once the view advances
-/// past the removal, bounded by the reader's lag.
+/// [`Error::PayloadMissing`](crate::Error::PayloadMissing) from a reader can be
+/// transient: a job removal deletes the payload object after its record, so a
+/// reader whose view still contains the record can find the object gone. The
+/// condition clears once the view advances past the removal, bounded by the
+/// reader's lag.
 ///
 /// # Compatibility and failure modes
 ///
-/// Reader and writer must run the same taquba minor version: the
-/// on-disk layout may change between minors and no layout stamp is
-/// stored. Opening a reader against a path no writer has ever created
-/// fails with [`Error::StoreNotInitialized`](crate::Error::StoreNotInitialized);
-/// a health check racing the first deployment must expect that error.
-/// A path with an unreadable manifest fails with
-/// [`Error::Storage`](crate::Error::Storage).
+/// Reader and writer must run the same taquba minor version: the on-disk layout
+/// can change between minors, and the store does not record a layout version.
+/// Opening a reader against a path that a writer never created fails with
+/// [`Error::StoreNotInitialized`](crate::Error::StoreNotInitialized). A health
+/// check racing the first deployment must expect that error. A path with an
+/// unreadable manifest fails with [`Error::Storage`](crate::Error::Storage).
 ///
 /// # Observable outcomes
 ///
@@ -224,8 +217,8 @@ impl QueueReader {
         };
         let mut builder = DbReader::builder(path, object_store.clone())
             .with_reader_mode(mode)
-            // Stats counters and attempt histories are merge operands;
-            // without the operator their reads fail.
+            // Stats counters and attempt histories are merge operands. Without
+            // the operator their reads fail.
             .with_merge_operator(Arc::new(QueueMergeOperator))
             .with_options(DbReaderOptions {
                 manifest_poll_interval: opts.manifest_poll_interval,
@@ -239,8 +232,8 @@ impl QueueReader {
         let reader = builder.build().await;
         let reader = match reader {
             Ok(reader) => reader,
-            // A missing manifest and a corrupt one share an error kind;
-            // an empty path identifies the never-written store.
+            // A missing manifest and a corrupt one share an error kind. An
+            // empty path identifies the never-written store.
             Err(e)
                 if e.kind() == slatedb::ErrorKind::Data
                     && store_path_is_empty(&object_store, path).await =>
@@ -258,21 +251,20 @@ impl QueueReader {
         })
     }
 
-    /// Return store-level activity read from this reader's view of the
-    /// manifest and the durable sequence number.
+    /// Return store-level activity read from this reader's view of the manifest
+    /// and the durable sequence number.
     ///
-    /// [`StoreActivity::last_flush_at_ms`] and
-    /// [`StoreActivity::writer_epoch`] answer a display query with no
-    /// waiting. A destructive operation judges liveness by reading
-    /// [`StoreActivity::durable_seq`] more than once, a few
-    /// [`ReaderOptions::manifest_poll_interval`]s apart, and treating
-    /// advance as proof of live commits; that judgment involves no
-    /// clock comparison.
+    /// [`StoreActivity::last_flush_at_ms`] and [`StoreActivity::writer_epoch`]
+    /// return a value for a display query without waiting. A destructive
+    /// operation judges liveness by reading [`StoreActivity::durable_seq`] more
+    /// than once, a few [`ReaderOptions::manifest_poll_interval`]s apart, and
+    /// treating an advance as evidence of live commits. That judgement does not
+    /// compare clocks.
     pub fn last_store_activity(&self) -> StoreActivity {
         let status = self.reader.status();
         let manifest = &status.current_manifest;
-        // L0 SSTs are written by the writer's memtable flusher, newest
-        // at the front; their ids embed the writer clock's timestamp.
+        // L0 SSTs are written by the writer's memtable flusher, newest at the
+        // front. Their ids embed the writer clock's timestamp.
         let last_flush_at_ms = manifest.l0().front().and_then(|view| match view.sst.id {
             SsTableId::Compacted(id) => Some(id.timestamp_ms()),
             SsTableId::Wal(_) => None,
@@ -285,32 +277,34 @@ impl QueueReader {
     }
 
     /// Return the most recent liveness beat committed by a writer with
-    /// [`OpenOptions::liveness_heartbeat`](crate::OpenOptions::liveness_heartbeat)
-    /// enabled, or `None` when no writer has ever written one.
+    /// [`OpenOptions::liveness_heartbeat`][heartbeat] enabled, or `None` when a
+    /// writer never wrote one.
     ///
-    /// See [`WriterHeartbeat`] for what a beat proves and how to judge
-    /// its staleness.
+    /// See [`WriterHeartbeat`] for what a beat establishes and how to judge its
+    /// staleness.
+    ///
+    /// [heartbeat]: crate::OpenOptions::liveness_heartbeat
     pub async fn writer_heartbeat(&self) -> Result<Option<WriterHeartbeat>> {
         self.view.writer_heartbeat().await
     }
 
-    /// The reader's lagging view of the store: the read-only queries over
-    /// the flushed state the reader's manifest poll last observed.
+    /// The reader's lagging view of the store: the read-only queries over the
+    /// flushed state the reader's manifest poll last observed.
     pub fn view(&self) -> &QueueView {
         &self.view
     }
 
-    /// Close the reader, stopping its manifest polling and releasing
-    /// its managed checkpoint.
+    /// Close the reader, stopping its manifest polling and releasing its
+    /// managed checkpoint.
     pub async fn close(&self) -> Result<()> {
         self.reader.close().await?;
         Ok(())
     }
 }
 
-/// Whether the store path holds no objects at all. Consulted only after
-/// an open failure, to separate a never-written store from one whose
-/// manifest cannot be read.
+/// Whether the store path is without objects. Consulted only after an open
+/// failure, to separate a never-written store from one whose manifest cannot be
+/// read.
 async fn store_path_is_empty(store: &Arc<dyn ObjectStore>, path: &str) -> bool {
     let prefix = slatedb::object_store::path::Path::from(path);
     let mut listing = store.list(Some(&prefix));
@@ -397,8 +391,8 @@ mod tests {
         )
         .await
         .unwrap();
-        // Durable but not yet flushed to the primary store: the record
-        // is only readable through the WAL store.
+        // Durable but not yet flushed to the primary store: the record is only
+        // readable through the WAL store.
         let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
 
         let reader = QueueReader::open_with_options(
@@ -429,8 +423,8 @@ mod tests {
         assert!(reader.view().get_job(&id).await.unwrap().is_none());
         reader.close().await.unwrap();
 
-        // The close flushes the memtable, so a new reader observes the
-        // job without reading the WAL.
+        // The close flushes the memtable, so a new reader observes the job
+        // without reading the WAL.
         q.close().await.unwrap();
         let reader = QueueReader::open_with_options(store, "test", skipping)
             .await
@@ -449,8 +443,8 @@ mod tests {
         let reader = QueueReader::open(store, "test").await.unwrap();
         assert_eq!(reader.view().stats("work").await.unwrap().pending, 1);
 
-        // The writer keeps writing after the reader opened and refreshed
-        // its checkpoint: claims, settlements and enqueues all succeed.
+        // The writer keeps writing after the reader opened and refreshed its
+        // checkpoint: claims, settlements and enqueues all succeed.
         q.enqueue("work", b"b".to_vec()).await.unwrap();
         let claim = q
             .claim("work", Duration::from_secs(30))

@@ -1,15 +1,17 @@
 // cargo run -p taquba --example admin_http
 //
-// A minimal admin HTTP server for inspecting and operating a live queue.
-// It maps the queue's inspection and intervention APIs onto JSON endpoints:
+// A minimal admin HTTP server for inspecting and operating a live queue. It
+// maps the queue's inspection and intervention APIs onto JSON endpoints:
 //
 //   GET  /queues                  list_queues: every queue seen so far
 //   GET  /queues/{queue}/stats    stats: job counts by lifecycle state
 //   GET  /queues/{queue}/jobs     list_jobs: page through one lifecycle
-//                                 state (?status=pending|scheduled|claimed|
-//                                 done|dead&cursor=<token>&limit=<n>)
+//                                 state, with the query parameters
+//                                 `status=pending|scheduled|claimed|done|dead`,
+//                                 `cursor=<token>` and `limit=<n>`
 //   GET  /queues/{queue}/dead     dead_jobs: page through the dead-letter
-//                                 set (?after=<id>&limit=<n>)
+//                                 set, with the query parameters
+//                                 `after=<id>` and `limit=<n>`
 //   GET  /jobs/{id}               get_job: one job, in any state
 //   GET  /jobs/{id}/history       attempt_history: every settled attempt
 //                                 (retries, dead-letters, lease expiries)
@@ -17,29 +19,28 @@
 //                                 request cooperative cancellation of a
 //                                 claimed one
 //   POST /jobs/{id}/requeue       requeue_dead_job: revive a dead job with
-//                                 a fresh retry budget
+//                                 a reset attempt count
 //
-// The process generates its own demo traffic so every endpoint returns
-// data: an "emails" queue with a worker and a producer (some jobs fail
-// permanently and dead-letter, some retry transiently before
-// succeeding), and a workerless "reports" queue (jobs stay pending,
-// plus one scheduled for tomorrow).
+// The process generates its own demo traffic so every endpoint returns data: an
+// "emails" queue with a worker and a producer (some jobs fail permanently and
+// dead-letter, some retry transiently before succeeding), and a workerless
+// "reports" queue (jobs stay pending, plus one scheduled for tomorrow).
 //
 // A typical triage flow, in another terminal:
 //
-//   curl -s localhost:3000/queues
-//   curl -s localhost:3000/queues/emails/stats
-//   curl -s 'localhost:3000/queues/reports/jobs?status=pending'
-//   curl -s 'localhost:3000/queues/emails/dead?limit=10'
-//   curl -s localhost:3000/jobs/<id>            # why did it die?
-//   curl -s localhost:3000/jobs/<id>/history    # every attempt's error
-//   curl -s -X POST localhost:3000/jobs/<id>/requeue
-//   curl -s -X POST localhost:3000/jobs/<id>/cancel
+//   `curl -s localhost:3000/queues`
+//   `curl -s localhost:3000/queues/emails/stats`
+//   `curl -s 'localhost:3000/queues/reports/jobs?status=pending'`
+//   `curl -s 'localhost:3000/queues/emails/dead?limit=10'`
+//   `curl -s localhost:3000/jobs/<id>`            # the reason it died
+//   `curl -s localhost:3000/jobs/<id>/history`    # every attempt's error
+//   `curl -s -X POST localhost:3000/jobs/<id>/requeue`
+//   `curl -s -X POST localhost:3000/jobs/<id>/cancel`
 //
-// This is a recipe to copy and adapt, not a production admin plane: there
-// is no authentication, no TLS and no rate limiting. Because a store is
-// single-writer, an admin surface that mutates state (requeue, cancel)
-// must live inside the process that owns the queue, as it does here.
+// This is a recipe to copy and adapt. It is not a production admin plane, and
+// it lacks authentication, TLS and rate limiting. Because a store is
+// single-writer, an admin surface that mutates state (requeue, cancel) must
+// live inside the process that owns the queue, as it does here.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,9 +59,9 @@ use taquba::{
     object_store::memory::InMemory, run_worker,
 };
 
-/// Admin-facing view of a [`JobRecord`]: serde renders the raw-byte
-/// `payload` as a JSON array of numbers, so this view substitutes a
-/// bounded, human-readable preview.
+/// Admin-facing view of a [`JobRecord`]: serde renders the raw-byte `payload`
+/// as a JSON array of numbers, so this view substitutes a bounded,
+/// human-readable preview.
 #[derive(Serialize)]
 struct JobView {
     id: String,
@@ -124,7 +125,7 @@ impl JobView {
 }
 
 /// Maps `taquba::Error` onto HTTP status codes. Only the variants an admin
-/// caller can trigger get their own status; everything else is a 500.
+/// caller can trigger get their own status. Every other variant is a 500.
 enum ApiError {
     BadRequest(String),
     NotFound(String),
@@ -206,7 +207,7 @@ async fn jobs_page(
     })))
 }
 
-// The listing cursor is opaque bytes; hex makes it URL-safe.
+// The listing cursor is opaque bytes, and hex makes it URL-safe.
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -245,7 +246,7 @@ async fn dead_page(
         .view()
         .dead_jobs(&queue, params.after.as_deref(), params.limit)
         .await?;
-    // A full page may continue; a short page is the end of the set.
+    // A full page can have a next page, and a short page is the end of the set.
     let next_after = (jobs.len() == params.limit).then(|| jobs.last().map(|j| j.id.clone()));
     let views: Vec<JobView> = jobs
         .into_iter()
@@ -268,8 +269,8 @@ async fn job_history(
     State(q): State<Arc<Queue>>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<JobAttempt>>, ApiError> {
-    // The history shares the job's lifetime, so an unknown or expunged
-    // job returns an empty list, consistent with get_job returning None.
+    // The history shares the job's lifetime, so an unknown or expunged job
+    // returns an empty list, consistent with get_job returning None.
     Ok(Json(q.view().attempt_history(&id).await?))
 }
 
@@ -288,8 +289,8 @@ async fn requeue_job(
     State(q): State<Arc<Queue>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // A missing job maps to 404 via `Error::JobNotFound`, and a job in
-    // another state to 409 via `Error::InvalidState`.
+    // A missing job maps to 404 via `Error::JobNotFound`, and a job in another
+    // state to 409 via `Error::InvalidState`.
     q.requeue_dead_job(&id).await?;
     Ok(Json(json!({ "outcome": "requeued" })))
 }
@@ -310,8 +311,8 @@ impl Worker for EmailWorker {
             )
             .into());
         }
-        // Simulate slow work so claimed jobs are observable and a cancel
-        // has a live claim to target.
+        // Simulate slow work so claimed jobs are observable and a cancel has a
+        // live claim to target.
         tokio::select! {
             _ = lease.cancel_token().cancelled() => {
                 // Cancellation is cooperative: stop early, ack normally.
@@ -326,8 +327,8 @@ impl Worker for EmailWorker {
 }
 
 async fn spawn_demo_traffic(q: &Arc<Queue>) -> Result<(), taquba::Error> {
-    // Seed the dead-letter set so /dead has content immediately, and one
-    // flaky mail so /jobs/{id}/history shows a retries-then-success run.
+    // Seed the dead-letter set so /dead has content immediately, and one flaky
+    // mail so /jobs/{id}/history shows a retries-then-success run.
     q.enqueue("emails", b"boom: mail to nobody@example.com".to_vec())
         .await?;
     q.enqueue("emails", b"boom: mail to invalid@@address".to_vec())
@@ -335,8 +336,8 @@ async fn spawn_demo_traffic(q: &Arc<Queue>) -> Result<(), taquba::Error> {
     q.enqueue("emails", b"flaky: mail to greylisted@example.com".to_vec())
         .await?;
 
-    // "reports" has no worker: its jobs stay pending, plus one scheduled
-    // for tomorrow.
+    // "reports" does not have a worker: its jobs stay pending, plus one
+    // scheduled for tomorrow.
     for name in ["weekly-usage", "billing-summary", "storage-audit"] {
         q.enqueue("reports", format!("report: {name}").into_bytes())
             .await?;
@@ -348,8 +349,8 @@ async fn spawn_demo_traffic(q: &Arc<Queue>) -> Result<(), taquba::Error> {
     )
     .await?;
 
-    // Worker loop for "emails"; the pending() shutdown future never
-    // resolves, so it runs until the process exits.
+    // Worker loop for "emails". The pending() shutdown future never resolves,
+    // so the loop runs until the process exits.
     let worker_q = q.clone();
     tokio::spawn(async move {
         if let Err(e) = run_worker(
@@ -365,9 +366,9 @@ async fn spawn_demo_traffic(q: &Arc<Queue>) -> Result<(), taquba::Error> {
         }
     });
 
-    // Producer: one email every few seconds; every fourth fails permanently
-    // and dead-letters, and every fourth starting from the second retries
-    // twice before succeeding.
+    // Producer: one email every few seconds. Every fourth fails permanently and
+    // dead-letters, and every fourth starting from the second retries twice
+    // before succeeding.
     let producer_q = q.clone();
     tokio::spawn(async move {
         let mut n = 0u64;
@@ -399,9 +400,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         QueueConfig::default()
             .max_attempts(3)
             .retry_backoff_base(Duration::from_millis(500))
-            // Retain done records for an hour, so a completed job's record
-            // and attempt history stay inspectable instead of being
-            // removed on ack.
+            // Retain done records for an hour, so a completed job's record and
+            // attempt history stay inspectable after the ack.
             .keep_done_jobs(Some(Duration::from_secs(3600))),
     );
     let q =

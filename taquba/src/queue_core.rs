@@ -21,8 +21,8 @@ use crate::time_bound::TimeBound;
 use crate::txn::ClaimEnd;
 use crate::txn::{Attempt, Durability, get_indexed_job, retry};
 
-/// The per-queue configurations of an open queue: a default and the
-/// overrides keyed by queue name.
+/// The per-queue configurations of an open queue: a default and the overrides,
+/// with the queue name as their key.
 pub(crate) struct QueueConfigs {
     default: QueueConfig,
     per_queue: HashMap<String, QueueConfig>,
@@ -44,45 +44,42 @@ impl QueueConfigs {
     }
 }
 
-/// The handles every component of an open queue operates on: the
-/// store, the clock, the configurations and the in-process registries.
-/// Held as one `Arc` by the [`Queue`](crate::Queue) and by each
-/// background task.
+/// The handles every component of an open queue operates on: the store, the
+/// clock, the configurations and the in-process registries. Held as one `Arc`
+/// by the [`Queue`](crate::Queue) and by each background task.
 pub(crate) struct QueueCore {
     pub(crate) db: Arc<Db>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) configs: QueueConfigs,
     pub(crate) claim_cursor: ClaimCursor,
-    /// The bound of the scheduled key space: the earliest `run_at` of a
-    /// live scheduled key, lowered after every commit that writes one.
+    /// The bound of the scheduled key space: the earliest `run_at` of a live
+    /// scheduled key, lowered after every commit that writes one.
     pub(crate) scheduled_bound: TimeBound,
-    /// The bound of the done key space: the earliest `completed_at` of
-    /// a live done key, lowered after every commit that writes one.
+    /// The bound of the done key space: the earliest `completed_at` of a live
+    /// done key, lowered after every commit that writes one.
     pub(crate) done_bound: TimeBound,
     pub(crate) lease_registry: LeaseRegistry,
     pub(crate) completion_waiters: Arc<CompletionWaiters>,
     pub(crate) payload_store: Arc<PayloadStore>,
-    /// Source of job ids. Pending keys sort by id within a priority, so
-    /// ids must increase with enqueue order, including inside one
-    /// millisecond. One generator per store suffices: a store has a
-    /// single writer process.
+    /// Source of job ids. Pending keys sort by id within a priority, so ids
+    /// must increase with enqueue order, including inside one millisecond. One
+    /// generator per store suffices: a store has a single writer process.
     pub(crate) id_gen: std::sync::Mutex<ulid::Generator>,
 }
 
 impl QueueCore {
-    /// Current time in milliseconds since the UNIX epoch, read from
-    /// the configured [`Clock`].
+    /// Current time as a Unix timestamp in milliseconds, read from the
+    /// configured [`Clock`].
     pub(crate) fn now_ms(&self) -> u64 {
         self.clock.now_ms()
     }
 
-    /// Complete a claim-ending transition after its commit. It removes
-    /// the lease entry, fenced on `claim_id`, records the pending insert,
-    /// deletes the payload object of a done job whose record was not kept
-    /// and delivers a terminal outcome to the job's completion waiters.
-    /// The delivered record includes its payload inline, taken from
-    /// `claim` when one is given and otherwise fetched from the payload
-    /// store, only when the job has waiters.
+    /// Complete a claim-ending transition after its commit. It removes the
+    /// lease entry, fenced on `claim_id`, records the pending insert, deletes
+    /// the payload object of a done job whose record was not kept and delivers
+    /// a terminal outcome to the job's completion waiters. The delivered record
+    /// includes its payload inline, taken from `claim` when one is given and
+    /// otherwise fetched from the payload store, only when the job has waiters.
     pub(crate) async fn finish_claim_end(
         &self,
         job: &JobRecord,
@@ -133,11 +130,11 @@ impl QueueCore {
         };
         self.completion_waiters.settle(&job.id, || outcome);
     }
-    /// One job transition addressed by id. The job's current record is
-    /// read inside a retried transaction and passed to `transition`
-    /// with the key it is stored at. The transition stages the next
-    /// state and returns the call's value, or aborts with a value. A job
-    /// without a record aborts with `missing()`.
+    /// One job transition addressed by id. The job's current record is read
+    /// inside a retried transaction and passed to `transition` with the key it
+    /// is stored at. The transition stages the next state and returns the
+    /// call's value, or aborts with a value. A job without a record aborts with
+    /// `missing()`.
     pub(crate) async fn transition_by_id<T, F, Fut>(
         &self,
         id: &str,

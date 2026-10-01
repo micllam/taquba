@@ -1,38 +1,35 @@
-//! In-memory registry of claimed jobs' leases: the authoritative source
-//! of every claim's current expiry, claim id and cancellation token.
+//! In-memory registry of claimed jobs' leases: the authoritative source of
+//! every claim's current expiry, claim id and cancellation token.
 //!
-//! Lease state is process state, not durable state. The queue is
-//! single-writer and single-process, so every path that consults or
-//! changes a lease (claim, renewal, settlement, the reaper) runs beside
-//! this registry, and a lease held by a process that no longer runs is
-//! void by definition: the store's only durable record of a claim is
-//! the claimed job record, and every claimed record found at open is
-//! re-queued before workers start. Renewal is therefore a memory
-//! operation with no durable write.
+//! Lease state is process state and is never durable. The queue is
+//! single-writer and single-process, so every path that consults or changes a
+//! lease (claim, renewal, settlement, the reaper) runs in the same process as
+//! this registry, and a lease held by a process that no longer runs is void by
+//! definition: the store's only durable record of a claim is the claimed job
+//! record, and every claimed record found at open is re-queued before workers
+//! start. Renewal is therefore a memory operation without a durable write.
 //!
-//! Coherence with the store follows two rules. An entry is inserted
-//! before the transaction writing its claim commits, so a failed commit
-//! leaves a stale entry: it is discarded when it comes due (the reaper
-//! finds no claimed record under it), while a missing entry would leave
-//! its claim invisible to the reaper until the next open.
-//! And an entry is removed only after the transaction ending its claim
-//! has committed, fenced on the claim id, so a removal that runs
-//! after a re-claim of the same job cannot delete the new claim's
-//! entry.
+//! Coherence with the store follows two rules. An entry is inserted before the
+//! transaction writing its claim commits, so a failed commit leaves a stale
+//! entry: it is discarded when it comes due (the reaper does not find a claimed
+//! record for it). With the opposite order, a missing entry leaves its claim
+//! invisible to the reaper until the next open. And an entry is removed only
+//! after the transaction ending its claim commits, fenced on the claim id, so a
+//! removal that runs after a re-claim of the same job cannot delete the new
+//! claim's entry.
 //!
-//! The entry also holds the claim's cancellation token, fired by
-//! [`Queue::cancel`](crate::Queue::cancel) through the registry. The
-//! token is registered before the claim commits, so a cancellation
-//! racing the commit finds it, and is removed with the entry, so a
-//! settlement's cleanup cannot discard the token of a later claim of
-//! the same job.
+//! The entry also contains the claim's cancellation token, fired by
+//! [`Queue::cancel`](crate::Queue::cancel) through the registry. The token is
+//! registered before the claim commits, so a cancellation racing the commit
+//! finds it, and is removed with the entry, so a settlement's cleanup cannot
+//! discard the token of a later claim of the same job.
 //!
-//! The reaper examines due entries in place: [`LeaseRegistry::take_due`]
-//! marks entries and leaves them in the registry, and a marked entry
-//! refuses renewal. Renewal and the reaper share no durable key, so no
-//! transaction conflict orders them; the mark closes the race between
-//! a renewal and a requeue already under way. A failed reap leaves its
-//! entry marked and in place for the next tick.
+//! The reaper examines due entries in place: [`LeaseRegistry::take_due`] marks
+//! entries and leaves them in the registry, and a marked entry refuses renewal.
+//! Renewal and the reaper do not share a durable key, so a transaction conflict
+//! does not order them. The mark closes the race between a renewal and a
+//! requeue already under way. A failed reap leaves its entry marked and in
+//! place for the next tick.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -45,15 +42,14 @@ use crate::keys::QueueName;
 /// How [`LeaseRegistry::renew`] applies the requested expiry.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Renewal {
-    /// Set the expiry to the requested value, which may shorten the
-    /// lease.
+    /// Set the expiry to the requested value, which can shorten the lease.
     Set,
-    /// Raise the expiry to the requested value when the lease ends
-    /// sooner; a lease that already lasts longer is unchanged.
+    /// Raise the expiry to the requested value when the lease ends sooner. A
+    /// lease that already lasts longer is unchanged.
     Extend,
 }
 
-/// A due lease the reaper has marked and is examining.
+/// A due lease that the reaper marked and is examining.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct DueLease {
     pub(crate) queue: QueueName,
@@ -68,23 +64,23 @@ struct Entry {
     /// The claim's cooperative cancellation token, fired by
     /// [`LeaseRegistry::cancel`].
     cancel: CancellationToken,
-    /// Set once the reaper has taken the entry as due. A marked entry
-    /// refuses renewal and leaves the registry only through removal.
+    /// Set once the reaper takes the entry as due. A marked entry refuses
+    /// renewal and leaves the registry only through removal.
     reaping: bool,
 }
 
 #[derive(Default)]
 struct Inner {
     by_job: HashMap<(QueueName, String), Entry>,
-    /// Expiry-ordered view of `by_job`. Every mutation updates both
-    /// under one lock, and the tuple is unique because a job holds at
-    /// most one lease.
+    /// Expiry-ordered view of `by_job`. Every mutation updates both under one
+    /// lock, and the tuple is unique because a job has at most one lease.
     by_expiry: BTreeSet<(u64, QueueName, String)>,
 }
 
-/// Claimed jobs' leases, keyed by job and ordered by expiry.
+/// Claimed jobs' leases. The registry uses the job as its key and orders the
+/// leases by expiry.
 ///
-/// Shared between the queue and the reaper via `Clone`; all clones
+/// Shared between the queue and the reaper via `Clone`, and all clones
 /// reference the same registry.
 #[derive(Clone, Default)]
 pub(crate) struct LeaseRegistry {
@@ -96,10 +92,10 @@ impl LeaseRegistry {
         Self::default()
     }
 
-    /// Record a claim's lease and cancellation token, replacing any
-    /// previous entry for the job. Called before the transaction
-    /// writing the claim commits, so a failed commit leaves a stale
-    /// entry, discarded when it comes due.
+    /// Record a claim's lease and cancellation token, replacing any previous
+    /// entry for the job. Called before the transaction writing the claim
+    /// commits, so a failed commit leaves a stale entry, discarded when it
+    /// comes due.
     pub(crate) fn insert(
         &self,
         queue: &QueueName,
@@ -130,11 +126,10 @@ impl LeaseRegistry {
         );
     }
 
-    /// Apply `expires_at` to the lease per `mode`. Returns whether the
-    /// expiry changed. Fails with [`Error::ClaimLost`], leaving the
-    /// registry unchanged, when the job holds no lease, the lease
-    /// belongs to a different claim or the reaper has already taken the
-    /// entry as due.
+    /// Apply `expires_at` to the lease per `mode`. Returns whether the expiry
+    /// changed. Fails with [`Error::ClaimLost`] when the job does not have a
+    /// lease, the lease belongs to a different claim or the reaper already took
+    /// the entry as due. A failure leaves the registry unchanged.
     pub(crate) fn renew(
         &self,
         queue: &QueueName,
@@ -168,8 +163,8 @@ impl LeaseRegistry {
         Ok(true)
     }
 
-    /// The job's current expiry and claim id, or `None` when it
-    /// holds no lease.
+    /// The job's current expiry and claim id, or `None` when it does not have a
+    /// lease.
     pub(crate) fn current(&self, queue: &QueueName, id: &str) -> Option<(u64, u64)> {
         self.lock()
             .by_job
@@ -177,12 +172,12 @@ impl LeaseRegistry {
             .map(|e| (e.expires_at, e.claim_id))
     }
 
-    /// Fire the cancellation token of the claim currently holding the
-    /// job. Returns `false` when the job holds no lease. The entry
-    /// remains; a claim ends through a settlement or the reaper.
+    /// Fire the cancellation token of the claim currently holding the job.
+    /// Returns `false` when the job does not have a lease. The entry remains,
+    /// and a claim ends through a settlement or the reaper.
     pub(crate) fn cancel(&self, queue: &QueueName, id: &str) -> bool {
-        // Fired outside the lock: firing wakes waiters, and a waiter
-        // must be free to read the registry.
+        // Fired outside the lock: firing wakes waiters, and a waiter must be
+        // free to read the registry.
         let token = self
             .lock()
             .by_job
@@ -197,10 +192,10 @@ impl LeaseRegistry {
         }
     }
 
-    /// Return every entry due at or before `now`, soonest first,
-    /// marking each as being reaped. Entries stay in the registry: the
-    /// reaper examines in place and removes only after its commit, so a
-    /// tick that ends early leaves nothing displaced.
+    /// Return every entry due at or before `now`, soonest first, marking each
+    /// as being reaped. Entries stay in the registry: the reaper examines in
+    /// place and removes only after its commit, so a tick that ends early
+    /// leaves every entry in the registry.
     pub(crate) fn take_due(&self, now: u64) -> Vec<DueLease> {
         let mut inner = self.lock();
         let due_keys: Vec<(u64, QueueName, String)> = inner
@@ -228,10 +223,9 @@ impl LeaseRegistry {
     }
 
     /// Remove the job's entry if it still belongs to the claim `claim_id`
-    /// identifies. Called after the transaction ending the claim has
-    /// committed; the fence makes a removal that runs after a re-claim
-    /// of the same job a no-op, leaving the new claim's entry in
-    /// place.
+    /// identifies. Called after the transaction ending the claim commits. The
+    /// fence makes a removal that runs after a re-claim of the same job a
+    /// no-op, so the new claim's entry stays in place.
     pub(crate) fn remove(&self, queue: &QueueName, id: &str, claim_id: u64) {
         let mut inner = self.lock();
         let key = (queue.clone(), id.to_string());
@@ -356,8 +350,8 @@ mod tests {
         let first = CancellationToken::new();
         let second = CancellationToken::new();
         registry.insert(&qn("q"), "a", 10, 1, first.clone());
-        // The re-claim registers before the first claim's settlement
-        // reaches its removal.
+        // The re-claim registers before the first claim's settlement reaches
+        // its removal.
         registry.insert(&qn("q"), "a", 40, 2, second.clone());
         registry.remove(&qn("q"), "a", 1);
 
@@ -400,8 +394,7 @@ mod tests {
         let new_expiry = q.renew_lease(&job, Duration::from_secs(30)).unwrap();
         assert!(new_expiry > original_expiry, "renewed expiry must be later");
 
-        // Reaper skips the renewed lease even once the original expiry
-        // has passed.
+        // Reaper skips the renewed lease even after the original expiry passes.
         clock.advance(Duration::from_secs(1));
         q.reap_now().await.unwrap();
         assert!(
@@ -413,7 +406,7 @@ mod tests {
 
         let fetched = q.view().get_job(&job.id).await.unwrap().unwrap();
         assert_eq!(fetched.status, JobStatus::Claimed);
-        // The claim still holds, so the original handle settles it.
+        // The claim is still live, so the original handle settles it.
         q.ack(&job).await.unwrap();
 
         q.close().await.unwrap();
@@ -480,8 +473,8 @@ mod tests {
         let renewed = q.renew_lease(&job, Duration::from_secs(60)).unwrap();
         assert_eq!(q.lease_expiry("work", &job.id), Some(renewed));
 
-        // The claim taken before the renewal keeps its claim id, so it
-        // still settles the delivery.
+        // The claim taken before the renewal keeps its claim id, so it still
+        // settles the delivery.
         q.ack(&job).await.unwrap();
 
         let stats = q.view().stats("work").await.unwrap();
@@ -512,8 +505,8 @@ mod tests {
         clock.advance(Duration::from_millis(2));
         q.reap_now().await.unwrap();
 
-        // The re-claim writes the same claimed key the stale copy names,
-        // so only the claim id separates the two deliveries.
+        // The re-claim writes the same claimed key the stale copy names, so
+        // only the claim id separates the two deliveries.
         let fresh = q
             .claim("work", Duration::from_secs(30))
             .await
@@ -570,7 +563,7 @@ mod tests {
         );
         assert!(q.lease_expiry("work", &job.id).is_none());
 
-        // Nothing is left to come due, so the reaper requeues nothing,
+        // Nothing is left to come due, so the reaper does not requeue the job,
         // even past the renewed expiry.
         assert!(renewed > clock.now_ms());
         clock.advance(Duration::from_secs(61));
@@ -602,11 +595,11 @@ mod tests {
             .unwrap();
         q.ack(&claim).await.unwrap();
 
-        // The registry lags the store: an entry is removed only after
-        // the commit that ends its claim, so a settlement transaction
-        // begun inside that lag passes the claim id check and conflicts
-        // with nothing. Recreate the lagging entry and require the
-        // in-transaction record read to reject the settlement.
+        // The registry lags the store: an entry is removed only after the
+        // commit that ends its claim, so a settlement transaction begun inside
+        // that lag passes the claim id check and conflicts with nothing.
+        // Recreate the lagging entry and require the in-transaction record read
+        // to reject the settlement.
         q.core.lease_registry.insert(
             &qn("work"),
             &claim.id,

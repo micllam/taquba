@@ -18,7 +18,7 @@ use crate::queue::Queue;
 pub type WorkerError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// Marker error: returning this from [`Worker::process`] dead-letters the job
-/// immediately rather than retrying. The runner records the error's `Display`
+/// immediately, without a retry. The runner records the error's `Display`
 /// output in the job's `last_error` field.
 ///
 /// Use when the failure is *known* not to recover on retry.
@@ -34,7 +34,7 @@ pub type WorkerError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// ```
 #[derive(Debug, Clone)]
 pub struct PermanentFailure {
-    /// Human-readable reason; recorded on the job's `last_error` field.
+    /// Human-readable reason, recorded on the job's `last_error` field.
     pub reason: String,
 }
 
@@ -73,11 +73,11 @@ impl std::error::Error for PermanentFailure {}
 /// ```
 #[derive(Debug)]
 pub struct FailWith {
-    /// The failure itself. Settlement routing (dead-letter or retry)
-    /// follows this error.
+    /// The failure itself. Settlement routing (dead-letter or retry) follows
+    /// this error.
     pub error: WorkerError,
-    /// Effects applied atomically with a dead-lettering settlement of
-    /// this failure.
+    /// Effects applied atomically with a dead-lettering settlement of this
+    /// failure.
     pub effects: SettlementEffects,
 }
 
@@ -123,27 +123,25 @@ impl std::error::Error for FailWith {
 /// }
 /// ```
 /// Implement exactly one of [`Worker::process`] and
-/// [`Worker::process_with_effects`]: each default delegates to the
-/// other, so a type implementing neither fails to compile at its
-/// first use (the two default futures embed each other, which rustc
-/// rejects as a layout cycle).
+/// [`Worker::process_with_effects`]. Each default delegates to the other, so a
+/// type implementing neither fails to compile at its first use (the two default
+/// futures embed each other, which rustc rejects as a layout cycle).
 pub trait Worker: Send + Sync {
     /// Process a single claimed job.
     ///
-    /// Return `Ok(())` to ack the job (mark it complete) or `Err(_)` to nack
-    /// it (re-queue with backoff, or dead-letter once `attempts` exceeds
+    /// Return `Ok(())` to ack the job (mark it complete) or `Err(_)` to nack it
+    /// (re-queue with backoff, or dead-letter once `attempts` exceeds
     /// `max_attempts`). The returned error is converted to a string via
     /// `Display` and stored on the job's `last_error` field.
     ///
-    /// `lease` extends the claim's lease for long-running work; see
-    /// [`LeaseHandle::ensure_at_least`]. The claim itself stays with
-    /// the worker loop, which settles the job when this returns, so an
-    /// implementation cannot settle its own job mid-execution.
+    /// `lease` extends the claim's lease for long-running work, through
+    /// [`LeaseHandle::ensure_at_least`]. The claim itself stays with the worker
+    /// loop, which settles the job when this returns, so an implementation
+    /// cannot settle its own job mid-execution.
     ///
     /// Processing is called sequentially for each job in [`run_worker`], or
     /// concurrently up to the configured limit in [`run_worker_concurrent`].
-    /// Implementations must be idempotent: Taquba guarantees at-least-once
-    /// delivery, not exactly-once.
+    /// Implementations must be idempotent: Taquba delivers a job at least once.
     fn process(
         &self,
         job: &JobRecord,
@@ -152,14 +150,14 @@ pub trait Worker: Send + Sync {
         async move { self.process_with_effects(job, lease).await.map(|_| ()) }
     }
 
-    /// Process a single claimed job and return effects to apply
-    /// atomically with its acknowledgement.
+    /// Process a single claimed job and return effects to apply atomically with
+    /// its acknowledgement.
     ///
-    /// Like [`Self::process`], but an `Ok` return supplies
+    /// Like [`Self::process`], but an `Ok` return contains
     /// [`SettlementEffects`] that the worker loop passes to
-    /// [`crate::Queue::ack_with`], so follow-up enqueues and caller KV
-    /// changes land in the same transaction as the ack. Errors behave
-    /// exactly as in [`Self::process`].
+    /// [`crate::Queue::ack_with`], so follow-up enqueues and caller KV changes
+    /// are written in the same transaction as the ack. Errors behave exactly as
+    /// in [`Self::process`].
     fn process_with_effects(
         &self,
         job: &JobRecord,
@@ -176,36 +174,34 @@ pub trait Worker: Send + Sync {
 /// Run a polling worker loop: claim the next job, call [`Worker::process`],
 /// then ack on success or nack on failure.
 ///
-/// `shutdown` is any future that resolves when the worker should stop. Common
+/// `shutdown` is any future that resolves when the worker must stop. Common
 /// choices:
 /// - `tokio::signal::ctrl_c()` - exit on Ctrl-C
 /// - `async move { rx.await.ok(); }` - exit when a oneshot fires
 /// - `std::future::pending::<()>()` - never exit
 ///
 /// Shutdown is only honoured at safe points: between jobs and while the queue
-/// is idle. An in-flight `process` call is always allowed to finish so the
-/// claim does not get abandoned to the reaper (which would waste a retry on
-/// every graceful restart). The drain has no internal bound; the bound is
-/// the process supervisor's kill timeout. A killed process is recovered at the
-/// next open, where every claimed job is requeued immediately and its
-/// next claim consumes one attempt.
+/// is idle. An in-flight `process` call always finishes, so a graceful restart
+/// does not leave the claim to the reaper, which consumes a retry. The drain
+/// does not have an internal bound, and the process supervisor's kill timeout
+/// bounds it. A killed process is recovered at the next open, where every
+/// claimed job is requeued immediately and its next claim consumes one attempt.
 ///
 /// `poll_interval` is the maximum time the loop will wait on an empty queue
 /// before re-checking. In-process inserts wake the loop immediately via the
 /// queue-scoped notify (one waiting worker per inserted job), so this only
-/// bounds the latency of out-of-band events (e.g. a scheduled job becoming
-/// due).
+/// bounds the latency of out-of-band events, such as a scheduled job becoming
+/// due.
 ///
-/// Errors from the claim path terminate the loop and propagate.
-/// Settlement failures do not: they affect only the one job. In
-/// particular, when a job outlives its lease and the reaper requeues it,
-/// the late settlement fails with [`Error::ClaimLost`]; the loop logs it
-/// and continues, and the redelivered attempt settles the job instead.
-/// Size the queue's lease to cover processing time so late settlements
-/// are rare, or have a long-running [`Worker::process`] extend it
-/// through the [`LeaseHandle`] it was given: renewal advances the lease
-/// and leaves the claim valid for the settlement the loop performs
-/// afterwards.
+/// Errors from the claim path terminate the loop and propagate. Settlement
+/// failures do not: they affect only the one job. In particular, when a job
+/// outlives its lease and the reaper requeues it, the late settlement fails
+/// with [`Error::ClaimLost`]. The loop logs it and continues, and the
+/// redelivered attempt settles the job instead. Size the queue's lease to cover
+/// processing time so late settlements are rare, or have a long-running
+/// [`Worker::process`] extend it through the [`LeaseHandle`] it was given:
+/// renewal advances the lease and leaves the claim valid for the settlement the
+/// loop performs afterwards.
 pub async fn run_worker<W, F>(
     queue_handle: &Queue,
     queue: &str,
@@ -222,8 +218,8 @@ where
         match queue_handle.claim_next(queue).await? {
             Some(job) => {
                 // Process is uncancellable: no select around it. Even if
-                // shutdown was signalled while we were claiming, we finish
-                // the job we just took the lease on.
+                // shutdown was signalled while we were claiming, we finish the
+                // job we just took the lease on.
                 process_and_settle(queue_handle, queue, worker, job).await;
                 if check_shutdown(shutdown.as_mut()) {
                     debug!(queue = queue, "worker shutdown requested");
@@ -231,9 +227,8 @@ where
                 }
             }
             None => {
-                // Empty queue: wait for new work, the poll timeout, or
-                // shutdown. This is the only point where shutdown can
-                // interrupt the loop.
+                // Empty queue: wait for new work, the poll timeout or shutdown.
+                // This is the only point where shutdown can interrupt the loop.
                 tokio::select! {
                     biased;
                     _ = &mut shutdown => {
@@ -250,17 +245,18 @@ where
 /// Run a concurrent polling worker loop that processes up to `concurrency` jobs
 /// simultaneously.
 ///
-/// Behaves like [`run_worker`] but spawns each job onto a [`tokio::task::JoinSet`]
-/// so up to `concurrency` jobs run in parallel. Jobs are claimed in batches
-/// sized to the free capacity via [`Queue::claim_batch`], so a backlog costs
-/// one claim transaction per batch instead of per job; each job is still
-/// processed and acked individually. On shutdown the loop stops claiming new
-/// work and waits for the in-flight set to drain before returning, without
-/// an internal bound; see [`run_worker`] on recovery from a supervisor kill.
+/// Behaves like [`run_worker`] but spawns each job onto a
+/// [`tokio::task::JoinSet`] so up to `concurrency` jobs run in parallel. Jobs
+/// are claimed in batches sized to the free capacity via
+/// [`Queue::claim_batch`], so a backlog costs one claim transaction per batch.
+/// Each job is still processed and acked individually. On shutdown the loop
+/// stops claiming new work and waits for the in-flight set to drain before
+/// returning, without an internal bound. [`run_worker`] describes recovery from
+/// a supervisor kill.
 ///
 /// Claim errors propagate and terminate the loop. Settlement failures and
-/// panics inside spawned tasks are logged but do not terminate the loop;
-/// see [`run_worker`] for the [`Error::ClaimLost`] case.
+/// panics inside spawned tasks are logged but do not terminate the loop.
+/// [`run_worker`] describes the [`Error::ClaimLost`] case.
 pub async fn run_worker_concurrent<W, F>(
     queue_handle: &Arc<Queue>,
     queue: &str,
@@ -284,8 +280,8 @@ where
         }
 
         // If at capacity, wait for one slot to free up. Shutdown can interrupt
-        // this wait; any spawned tasks already running will be drained at the
-        // bottom of the loop.
+        // this wait. Spawned tasks already running are drained at the bottom of
+        // the loop.
         if set.len() >= concurrency {
             tokio::select! {
                 biased;
@@ -299,9 +295,9 @@ where
             continue;
         }
 
-        // Claim up to the free capacity in one transaction. If the queue
-        // is non-empty, spawn each claimed job and loop. If empty, wait
-        // for new work or shutdown.
+        // Claim up to the free capacity in one transaction. If the queue is
+        // non-empty, spawn each claimed job and loop. If empty, wait for new
+        // work or shutdown.
         let free = concurrency - set.len();
         let lease = queue_handle.queue_config(queue).lease_duration;
         let jobs = queue_handle.claim_batch(queue, free, lease).await?;
@@ -337,20 +333,19 @@ where
     Ok(())
 }
 
-/// Log a spawned worker task that ended by panic. A settlement failure
-/// is logged by the task itself.
+/// Log a spawned worker task that ended by panic. A settlement failure is
+/// logged by the task itself.
 fn note_task_result(queue: &str, result: std::result::Result<(), tokio::task::JoinError>) {
     if let Err(e) = result {
         warn!(queue = queue, "worker task panicked: {e}");
     }
 }
 
-/// Process one claimed job and apply its settlement (ack with effects,
-/// nack, or dead-letter). Settlement failures are absorbed: they affect
-/// one job, not the loop. A [`Error::ClaimLost`] means the job outlived
-/// its lease and the reaper requeued it, so the redelivered attempt
-/// settles it instead; any other settlement failure leaves the claim to
-/// the reaper.
+/// Process one claimed job and apply its settlement (ack with effects, nack or
+/// dead-letter). A settlement failure affects one job and does not stop the
+/// loop. A [`Error::ClaimLost`] means the job outlived its lease and the reaper
+/// requeued it, so the redelivered attempt settles it. Any other settlement
+/// failure leaves the claim to the reaper.
 async fn process_and_settle<W: Worker>(
     queue_handle: &Queue,
     queue: &str,
@@ -390,10 +385,10 @@ async fn process_and_settle<W: Worker>(
     }
 }
 
-/// Whether the pinned shutdown future has resolved, polled without
-/// waiting. Used to honour shutdown between jobs without putting
-/// `process` inside a `select!`, which would cancel it if the shutdown
-/// signal arrived while a claim was in flight.
+/// Whether the pinned shutdown future is resolved, polled without waiting. Used
+/// to honour shutdown between jobs without putting `process` inside a
+/// `select!`, which cancels it when the shutdown signal arrives while a claim
+/// is in flight.
 fn check_shutdown<F: Future<Output = ()>>(shutdown: std::pin::Pin<&mut F>) -> bool {
     shutdown.now_or_never().is_some()
 }
@@ -401,19 +396,18 @@ fn check_shutdown<F: Future<Output = ()>>(shutdown: std::pin::Pin<&mut F>) -> bo
 /// A loop spawned as a Tokio task by [`WorkerHandle::spawn`].
 ///
 /// Dropping the handle does not stop the loop: the task runs until the
-/// `shutdown` future passed to `spawn` resolves, the loop returns on
-/// its own or [`shutdown`](Self::shutdown) is called.
+/// `shutdown` future passed to `spawn` resolves, the loop returns on its own or
+/// [`shutdown`](Self::shutdown) is called.
 pub struct WorkerHandle<T = Result<()>> {
     stop: CancellationToken,
     join: JoinHandle<T>,
 }
 
 impl<T: Send + 'static> WorkerHandle<T> {
-    /// Spawn the loop `run` builds as a Tokio task. The token passed to
-    /// `run` is cancelled when `shutdown` resolves or
-    /// [`shutdown`](Self::shutdown) is called; the loop is expected to
-    /// return once it observes the cancellation, for instance by passing
-    /// `stop.cancelled_owned()` to [`run_worker`].
+    /// Spawn the loop `run` builds as a Tokio task. The token passed to `run`
+    /// is cancelled when `shutdown` resolves or [`shutdown`](Self::shutdown) is
+    /// called. The loop must return once it observes the cancellation, for
+    /// instance by passing `stop.cancelled_owned()` to [`run_worker`].
     ///
     /// ```rust,ignore
     /// let handle = WorkerHandle::spawn(tokio::signal::ctrl_c().map(|_| ()), |stop| async move {
@@ -449,9 +443,9 @@ impl<T: Send + 'static> WorkerHandle<T> {
         self.wait().await
     }
 
-    /// Wait for the loop to return on its own, because the `shutdown`
-    /// future passed to [`spawn`](Self::spawn) resolved or the loop
-    /// ended by itself. A panic in the loop is resumed here.
+    /// Wait for the loop to return on its own, because the `shutdown` future
+    /// passed to [`spawn`](Self::spawn) resolved or the loop ended by itself. A
+    /// panic in the loop is resumed here.
     pub async fn wait(self) -> T {
         match self.join.await {
             Ok(output) => output,
@@ -566,9 +560,9 @@ mod tests {
             _lease: &LeaseHandle,
         ) -> std::result::Result<(), WorkerError> {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                // First attempt: outlive the lease and let the reaper
-                // requeue the job, so the loop's ack finds the claim
-                // gone and fails with ClaimLost.
+                // First attempt: outlive the lease and let the reaper requeue
+                // the job, so the loop's ack finds the claim gone and fails
+                // with ClaimLost.
                 self.clock.advance(self.lease + Duration::from_millis(1));
                 self.queue.reap_now().await?;
             }
@@ -620,8 +614,8 @@ mod tests {
         .await
         .unwrap();
 
-        // The first attempt's settlement lost the claim; the loop kept
-        // running and the redelivered attempt settled the job.
+        // The first attempt's settlement lost the claim. The loop kept running
+        // and the redelivered attempt settled the job.
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         let stats = queue.view().stats("work").await.unwrap();
         assert_eq!(stats.pending, 0);
@@ -814,7 +808,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_worker_dead_letters_on_permanent_failure() {
-        // A Worker returning PermanentFailure should dead-letter immediately,
+        // A Worker returning PermanentFailure dead-letters immediately,
         // skipping the retry/backoff path that a plain error takes.
         use crate::worker::{PermanentFailure, Worker, WorkerError, run_worker};
 
@@ -872,8 +866,8 @@ mod tests {
         use crate::worker::{Worker, WorkerError, run_worker};
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        // Worker that takes 100ms to process, long enough that shutdown
-        // fires while the job is in flight.
+        // Worker that takes 100ms to process, long enough that shutdown fires
+        // while the job is in flight.
         struct SlowWorker {
             finished: Arc<AtomicBool>,
         }
@@ -911,7 +905,8 @@ mod tests {
             .await
         });
 
-        // Wait for the worker to claim the job, then immediately request shutdown.
+        // Wait for the worker to claim the job, then immediately request
+        // shutdown.
         loop {
             if q.view().stats("work").await.unwrap().claimed == 1 {
                 break;
@@ -925,7 +920,7 @@ mod tests {
             finished.load(Ordering::SeqCst),
             "in-flight job must finish before shutdown returns"
         );
-        // And the job was acked, not left in claimed: for the reaper.
+        // And the job was acked and was not left in claimed for the reaper.
         assert_eq!(q.view().stats("work").await.unwrap().claimed, 0);
         assert_eq!(q.view().stats("work").await.unwrap().done, 1);
     }

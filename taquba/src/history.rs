@@ -1,24 +1,23 @@
 //! Per-job attempt history.
 //!
-//! Each settlement of a claim (ack, nack, dead-letter, lease expiry) and
-//! each operator revival appends one [`JobAttempt`] entry to the job's
-//! history key ([`crate::keys::KeyTag::AttemptHistory`]) through the
-//! merge operator, so each event adds exactly one write to its
-//! settlement transaction and the accumulated history is never read or
-//! rewritten there. Entries are individually serialized with
-//! MessagePack and the merged value is their plain concatenation;
-//! MessagePack values are self-delimiting, so decoding reads the
+//! Each settlement of a claim (ack, nack, dead-letter, lease expiry) and each
+//! operator revival appends one [`JobAttempt`] entry to the job's history key
+//! ([`crate::keys::KeyTag::AttemptHistory`]) through the merge operator, so
+//! each event adds exactly one write to its settlement transaction and the
+//! accumulated history is never read or rewritten there. Entries are
+//! individually serialized with MessagePack and the merged value is their plain
+//! concatenation. MessagePack values are self-delimiting, so decoding reads the
 //! buffer entry by entry.
 //!
 //! The history is retained exactly as long as the job is findable via
 //! [`QueueView::get_job`](crate::QueueView::get_job): the transaction that
-//! removes the job's last record (ack without retention, cancel of a
-//! pending or scheduled job, the done and dead retention sweeps) also
-//! deletes the history key, because every such removal is staged by
-//! `txn::stage_remove`. [`Queue::requeue_dead_job`](crate::Queue::requeue_dead_job)
-//! keeps the history and appends a [`AttemptOutcome::Requeued`] marker,
-//! so entries recorded before the revival remain distinguishable after
-//! the attempt counter resets.
+//! removes the job's last record (ack without retention, cancel of a pending or
+//! scheduled job, the done and dead retention sweeps) also deletes the history
+//! key, because every such removal is staged by `txn::stage_remove`.
+//! [`Queue::requeue_dead_job`](crate::Queue::requeue_dead_job) keeps the
+//! history and appends a [`AttemptOutcome::Requeued`] marker, so entries
+//! recorded before the revival remain distinguishable after the attempt counter
+//! resets.
 
 use serde::{Deserialize, Serialize};
 use slatedb::DbTransaction;
@@ -28,14 +27,14 @@ use crate::keys::attempt_history_key;
 
 /// One recorded event in a job's delivery history.
 ///
-/// Returned by [`QueueView::attempt_history`](crate::QueueView::attempt_history)
-/// in write order. All timestamps are wall-clock milliseconds since the
-/// UNIX epoch.
+/// Returned by
+/// [`QueueView::attempt_history`](crate::QueueView::attempt_history) in write
+/// order. All timestamps are wall-clock Unix timestamps in milliseconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobAttempt {
     /// The delivery attempt this event settles. `0` for
-    /// [`AttemptOutcome::Requeued`], which is a lifecycle marker rather
-    /// than an attempt.
+    /// [`AttemptOutcome::Requeued`], which is a lifecycle marker and not an
+    /// attempt.
     pub attempt: u32,
     /// When the attempt's claim was taken. `None` for
     /// [`AttemptOutcome::Requeued`].
@@ -57,24 +56,24 @@ pub struct JobAttempt {
 pub enum AttemptOutcome {
     /// The attempt acked the job.
     Completed,
-    /// The attempt failed via [`Queue::nack`](crate::Queue::nack) and
-    /// the job was re-queued or scheduled for a retry.
+    /// The attempt failed via [`Queue::nack`](crate::Queue::nack) and the job
+    /// was re-queued or scheduled for a retry.
     Retried,
     /// The attempt failed terminally: an explicit
     /// [`Queue::dead_letter`](crate::Queue::dead_letter), a
-    /// [`Queue::nack`](crate::Queue::nack) at the attempt limit or an
-    /// expired or interrupted claim at the attempt limit.
+    /// [`Queue::nack`](crate::Queue::nack) at the attempt limit or an expired
+    /// or interrupted claim at the attempt limit.
     DeadLettered,
-    /// The claim's lease expired and the reaper re-queued the job. The
-    /// worker's own outcome for this attempt is unknown.
-    LeaseExpired,
-    /// The process holding the claim exited without settling it; the
-    /// job was re-queued when the store was next opened. The worker's
+    /// The claim's lease expired and the reaper re-queued the job. The worker's
     /// own outcome for this attempt is unknown.
+    LeaseExpired,
+    /// The process holding the claim exited without settling it. The job was
+    /// re-queued when the store was next opened. The worker's own outcome for
+    /// this attempt is unknown.
     Interrupted,
     /// An operator revived the dead job via
-    /// [`Queue::requeue_dead_job`](crate::Queue::requeue_dead_job),
-    /// resetting its attempt count.
+    /// [`Queue::requeue_dead_job`](crate::Queue::requeue_dead_job), resetting
+    /// its attempt count.
     Requeued,
 }
 
@@ -274,8 +273,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        // Default backoff is non-zero, so the nacked job waits in
-        // `Scheduled` with one history entry.
+        // Default backoff is non-zero, so the nacked job waits in `Scheduled`
+        // with one history entry.
         q.nack(&job, "failed").await.unwrap();
         assert_eq!(q.view().attempt_history(&id).await.unwrap().len(), 1);
 

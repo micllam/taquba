@@ -30,10 +30,9 @@ impl Periodic for Scheduler {
 }
 
 impl QueueCore {
-    /// Scan the scheduled key space from its bound and move any job
-    /// whose `run_at` has passed into the pending key space so workers
-    /// can claim it. Without a job that can be due, the call does not
-    /// read.
+    /// Scan the scheduled key space from its bound and move any job whose
+    /// `run_at` is in the past into the pending key space so workers can claim
+    /// it. Without a job that can be due, the call does not read.
     pub(crate) async fn promote_due_jobs(&self) -> Result<()> {
         let now = self.now_ms();
         let Some(mut scan) = self.scheduled_bound.begin(now, 0) else {
@@ -41,9 +40,9 @@ impl QueueCore {
         };
         let mut due_keys = Vec::new();
 
-        // A scheduled key leads with `run_at`, and the range is within
-        // the prefix, so the scan starts at the bound and the first key
-        // with a `run_at` in the future ends it.
+        // A scheduled key leads with `run_at`, and the range is within the
+        // prefix, so the scan starts at the bound and the first key with a
+        // `run_at` in the future ends it.
         let start = Bytes::copy_from_slice(&scan.from().to_be_bytes());
         let mut iter = self
             .db
@@ -74,16 +73,15 @@ impl QueueCore {
 
     async fn promote_job(&self, scheduled_key_bytes: &[u8]) -> Result<()> {
         // Promotion commits do not await WAL durability. Each due job is
-        // promoted in its own transaction, so awaiting the flush
-        // serialises the sweep at one job per flush interval. A commit
-        // lost in a crash leaves the scheduled key in place with its
-        // `run_at` still in the past, and the next tick re-promotes it:
-        // the rewrite is idempotent. Any later durable commit flushes
-        // preceding WAL entries, so a job's post-promotion history is
-        // never durable without the promotion itself.
+        // promoted in its own transaction, so awaiting the flush serialises the
+        // sweep at one job per flush interval. A commit lost in a crash leaves
+        // the scheduled key in place with its `run_at` still in the past, and
+        // the next tick re-promotes it: the rewrite is idempotent. Any later
+        // durable commit flushes preceding WAL entries, so a job's
+        // post-promotion history is never durable without the promotion itself.
         let promoted = retry(&self.db, Durability::Deferred, |txn| async move {
             let Some(raw) = txn.get(scheduled_key_bytes).await? else {
-                // Already promoted by a concurrent call; nothing to do.
+                // Already promoted by a concurrent call, so the attempt aborts.
                 txn.rollback();
                 return Ok(Attempt::Abort(None));
             };
@@ -503,8 +501,8 @@ mod tests {
             .unwrap();
         q.nack(&job, "worker failed").await.unwrap();
 
-        // The retry backoff moves the job back to `scheduled`; promote it
-        // and verify the redelivered record still carries the wake payload.
+        // The retry backoff moves the job back to `scheduled`. Promote it and
+        // verify that the redelivered record still contains the wake payload.
         clock.advance(Duration::from_secs(5));
         q.promote_scheduled_now().await.unwrap();
 
@@ -559,7 +557,8 @@ mod tests {
         clock.advance(Duration::from_millis(5));
         q.promote_scheduled_now().await.unwrap();
 
-        // High-priority should come first even though scheduled was enqueued first.
+        // High-priority must come first even though scheduled was enqueued
+        // first.
         let j1 = q
             .claim("jobs", Duration::from_secs(30))
             .await
@@ -611,8 +610,7 @@ mod tests {
         let id = job.id.clone();
         q.nack(&job, "boom").await.unwrap();
 
-        // The job waits in the scheduled key space until the backoff
-        // elapses.
+        // The job waits in the scheduled key space until the backoff elapses.
         let s = q.view().stats("work").await.unwrap();
         assert_eq!(s.pending, 0);
         assert_eq!(s.claimed, 0);
@@ -668,8 +666,8 @@ mod tests {
             .await
             .unwrap();
 
-        // The payload offloads at enqueue even though the record lands
-        // in the scheduled key space.
+        // The payload offloads at enqueue even though the record is written to
+        // the scheduled key space.
         assert_eq!(object_count(&store, "test-payloads").await, 1);
         let scheduled = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(scheduled.status, JobStatus::Scheduled);
@@ -678,8 +676,8 @@ mod tests {
         clock.advance(Duration::from_millis(60_001));
         q.promote_scheduled_now().await.unwrap();
 
-        // Promotion moves the record without touching the object; the
-        // claim materializes the payload.
+        // Promotion moves the record without touching the object, and the claim
+        // materializes the payload.
         assert_eq!(object_count(&store, "test-payloads").await, 1);
         let job = q
             .claim("work", Duration::from_secs(30))

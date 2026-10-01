@@ -11,22 +11,22 @@ use crate::error::{Error, Result};
 use crate::keys::QueueName;
 use crate::lease_registry::{LeaseRegistry, Renewal};
 
-/// Margin added on top of a requested remaining duration, so a delivery
-/// that runs to its declared bound still has lease left to settle in.
+/// Margin added on top of a requested remaining duration, so a delivery that
+/// runs to its declared bound still has lease left to settle in.
 pub(crate) const SETTLEMENT_MARGIN: Duration = Duration::from_secs(5);
 
 /// A handle on one claim's lease and cancellation token, passed to
 /// [`crate::Worker::process`] by the worker loop.
 ///
-/// The handle extends the lease and exposes the delivery's cancellation
-/// token without exposing the claim or the queue, so a handler can
-/// prevent lease expiry during a long delivery and observe an external
-/// [`crate::Queue::cancel`], but cannot settle its own job. It is cheap
-/// to clone; clones refer to the same lease.
+/// The handle extends the lease and exposes the delivery's cancellation token
+/// without exposing the claim or the queue. Through the handle, a handler
+/// prevents lease expiry during a long delivery and observes an external
+/// [`crate::Queue::cancel`], but it cannot settle its own job. A clone copies
+/// the queue name and the job id, and clones refer to the same lease.
 ///
-/// [`LeaseHandle::detached`] builds a handle bound to no queue, whose
-/// calls succeed without effect and whose token is never fired, so
-/// handler types stay constructible in unit tests.
+/// [`LeaseHandle::detached`] builds a handle without a queue, whose calls
+/// succeed without effect and whose token is never fired, so handler types stay
+/// constructible in unit tests.
 #[derive(Clone)]
 pub struct LeaseHandle {
     inner: Option<Inner>,
@@ -63,9 +63,9 @@ impl LeaseHandle {
         }
     }
 
-    /// A handle bound to no lease. Every call succeeds without effect
-    /// and the cancellation token is never fired. For constructing
-    /// handler-facing types in unit tests.
+    /// A handle without a lease. Every call succeeds without effect and the
+    /// cancellation token is never fired. For constructing handler-facing types
+    /// in unit tests.
     pub fn detached() -> Self {
         Self {
             inner: None,
@@ -74,30 +74,29 @@ impl LeaseHandle {
     }
 
     /// The delivery's cooperative cancellation token, fired by
-    /// [`crate::Queue::cancel`] while the delivery's claim holds the
-    /// job, and already fired when the job was re-claimed with
+    /// [`crate::Queue::cancel`] while the delivery's claim on the job is live,
+    /// and already fired when the job was re-claimed with
     /// [`crate::JobRecord::cancel_requested`] persisted.
     ///
-    /// A handler may `select!` on it to stop early and return as
-    /// usual.
+    /// A handler can `select!` on it to stop early and return as usual.
     pub fn cancel_token(&self) -> &CancellationToken {
         &self.cancel
     }
 
-    /// Ensure the lease lasts at least `remaining` from now, extending
-    /// it if it would end sooner. An internal margin is added on top of
-    /// `remaining`, so a delivery that runs to the requested bound
-    /// still has lease left to settle in. The lease is never shortened.
+    /// Extend the lease to last at least `remaining` from now when it ends
+    /// sooner. An internal margin is added on top of `remaining`, so a delivery
+    /// that runs to the requested bound still has lease left to settle in. The
+    /// lease is never shortened.
     ///
-    /// Call this at progress points of a long-running delivery. For a
-    /// single slow call, give the call a timeout and pass that timeout
-    /// here before issuing it, so the lease covers the call.
+    /// Call this at progress points of a long-running delivery. For a single
+    /// slow call, give the call a timeout and pass that timeout here before
+    /// issuing it, so the lease covers the call.
     ///
-    /// Fails with [`Error::ClaimLost`] once the claim has ended or the
-    /// reaper has begun re-queuing the expired lease; stop working on
-    /// the delivery then, since another claim may already own the job.
-    /// Fails with [`Error::CancelRequested`] once cancellation of the
-    /// job has been requested, leaving the lease to expire.
+    /// Fails with [`Error::ClaimLost`] once the claim ends or the reaper begins
+    /// re-queuing the expired lease. The handler must then stop working on the
+    /// delivery, because another claim can already own the job. Fails with
+    /// [`Error::CancelRequested`] once cancellation of the job is requested,
+    /// and does not extend the lease.
     pub fn ensure_at_least(&self, remaining: Duration) -> Result<()> {
         let Some(inner) = &self.inner else {
             return Ok(());
@@ -162,7 +161,7 @@ mod tests {
             CancellationToken::new(),
         );
 
-        // Covered: 10s + margin fits inside the 30s lease.
+        // Covered: 10s + margin is within the 30s lease.
         handle.ensure_at_least(Duration::from_secs(10)).unwrap();
         assert!(registry.contains(&qn("q"), "a", 1_030_000));
 

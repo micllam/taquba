@@ -16,11 +16,10 @@ use crate::keys::{
 use crate::lease_registry::LeaseRegistry;
 use crate::stats::update_stats;
 
-/// Write a job record at `key` and repoint its index entry at the same
-/// key.
+/// Write a job record at `key` and repoint its index entry to `key`.
 ///
-/// `index_key` must be [`crate::keys::job_index_key`] of the record's
-/// job id. `value` is the record serialized with
+/// `index_key` must be [`crate::keys::job_index_key`] of the record's job id.
+/// `value` is the record serialized with
 /// [`JobRecord::stored_bytes`](crate::JobRecord::stored_bytes).
 pub(crate) fn put_job_record(
     txn: &DbTransaction,
@@ -33,10 +32,9 @@ pub(crate) fn put_job_record(
     Ok(())
 }
 
-/// Resolve a job id through its index entry within `txn`: returns the
-/// index key, the record's current key and the decoded record, or
-/// `None` when the id is not indexed or the indexed key holds no
-/// record.
+/// Resolve a job id through its index entry within `txn`: returns the index
+/// key, the record's current key and the decoded record, or `None` when the id
+/// is not indexed or the indexed key does not have a record.
 pub(crate) async fn get_indexed_job(
     txn: &DbTransaction,
     id: &str,
@@ -52,9 +50,9 @@ pub(crate) async fn get_indexed_job(
     Ok(Some((index_key, current_key, job)))
 }
 
-/// Verify that the claim `claim_id` identifies is still the job's live
-/// claim, stage the deletion of its record and return the stored record.
-/// Returns [`Error::ClaimLost`] when the claim has ended.
+/// Verify that the claim `claim_id` identifies is still the job's live claim,
+/// stage the deletion of its record and return the stored record. Returns
+/// [`Error::ClaimLost`] when the claim ended.
 ///
 /// This is the fence every settlement passes through, in three parts. The
 /// registry claim id check rejects a settlement superseded by a re-claim. The
@@ -66,10 +64,9 @@ pub(crate) async fn get_indexed_job(
 /// retry re-runs both checks. A renewal changes neither the claim id nor the
 /// record, so a claim held across a renewal still settles.
 ///
-/// A settlement that writes a record must base it on the returned
-/// record, which includes changes committed during the claim (a
-/// cancel's `cancel_requested` flag); the claim's own copy predates
-/// them.
+/// A settlement that writes a record must base it on the returned record, which
+/// includes changes committed during the claim (a cancel's `cancel_requested`
+/// flag). The claim's own copy predates them.
 pub(crate) async fn take_claim(
     txn: &DbTransaction,
     registry: &LeaseRegistry,
@@ -95,23 +92,22 @@ pub(crate) async fn take_claim(
 pub(crate) enum Durability {
     /// The commit returns once the write is durable.
     Awaited,
-    /// The commit returns once the write is applied in memory. A
-    /// transition committed this way must be redone on recovery when
-    /// the flush is lost.
+    /// The commit returns once the write is applied in memory. A transition
+    /// committed this way must be redone on recovery when the flush is lost.
     Deferred,
 }
 
-/// Outcome of a commit that raised no storage error.
+/// Outcome of a commit without a storage error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Commit {
     Committed,
-    /// Another transaction committed a conflicting write; the caller
+    /// Another transaction committed a conflicting write, and the caller
     /// retries against fresh state.
     Conflict,
 }
 
-/// Commit `txn`. A transaction conflict is reported as
-/// [`Commit::Conflict`]; a storage failure is returned as an error.
+/// Commit `txn`. A transaction conflict is reported as [`Commit::Conflict`],
+/// and a storage failure is returned as an error.
 pub(crate) async fn commit(txn: DbTransaction, durability: Durability) -> Result<Commit> {
     match txn.commit().await {
         Ok(handle) => {
@@ -129,18 +125,17 @@ pub(crate) async fn commit(txn: DbTransaction, durability: Durability) -> Result
 pub(crate) enum Attempt<T> {
     /// Commit the transaction, then return the value.
     Commit(DbTransaction, T),
-    /// Return the value without a commit. The body drops or rolls back
-    /// the transaction before it returns this.
+    /// Return the value without a commit. The body drops or rolls back the
+    /// transaction before it returns this.
     Abort(T),
 }
 
-/// Run `body` against a fresh `Snapshot` transaction until its commit
-/// does not conflict. A [`Commit::Conflict`] begins a new transaction
-/// and runs `body` again, against fresh state, and an
-/// [`Attempt::Abort`] returns the value without a commit. `body`
-/// takes the transaction by value and returns it in
-/// [`Attempt::Commit`], so its future does not borrow from the call
-/// and is `Send` wherever its captures are.
+/// Run `body` against a fresh `Snapshot` transaction until its commit does not
+/// conflict. A [`Commit::Conflict`] begins a new transaction and runs `body`
+/// again against fresh state. An [`Attempt::Abort`] returns the value without a
+/// commit. `body` takes the transaction by value and returns it in
+/// [`Attempt::Commit`], so its future does not borrow from the call and is
+/// `Send` wherever its captures are.
 pub(crate) async fn retry<T, F, Fut>(db: &Db, durability: Durability, body: F) -> Result<T>
 where
     F: Fn(DbTransaction) -> Fut,
@@ -161,10 +156,10 @@ where
     }
 }
 
-/// Stage the transition of a claimed job to the dead-letter set: the
-/// record is rewritten under its dead key with `error` as its last
-/// error, a `DeadLettered` attempt is appended and the stats are
-/// adjusted. The caller has staged the deletion of the claimed key.
+/// Stage the transition of a claimed job to the dead-letter set: the record is
+/// rewritten at its dead key with `error` as its last error, a `DeadLettered`
+/// attempt is appended and the stats are adjusted. The caller stages the
+/// deletion of the claimed key before the call.
 fn stage_dead_letter(
     txn: &DbTransaction,
     job: &mut JobRecord,
@@ -208,10 +203,9 @@ fn stage_dead_letter(
     Ok(())
 }
 
-/// Stage the move of a job into the pending key space from the state
-/// `from`, whose record the caller has staged for deletion. Returns the
-/// pending key, which the caller reports to the claim cursor after the
-/// commit.
+/// Stage the move of a job into the pending key space from the state `from`,
+/// whose record the caller already staged for deletion. Returns the pending
+/// key, which the caller reports to the claim cursor after the commit.
 pub(crate) fn stage_to_pending(
     txn: &DbTransaction,
     job: &mut JobRecord,
@@ -226,16 +220,15 @@ pub(crate) fn stage_to_pending(
     Ok(pending)
 }
 
-/// The transition that ends a claim, chosen by the settling path from
-/// the stored record read inside its transaction.
+/// The transition that ends a claim, chosen by the settling path from the
+/// stored record read inside its transaction.
 pub(crate) enum ClaimEnd<'a> {
-    /// The job completed. With `keep` a done record is written;
-    /// otherwise the record, its index entry and its attempt history
-    /// are removed.
+    /// The job completed. With `keep` a done record is written. Otherwise the
+    /// record, its index entry and its attempt history are removed.
     Done { keep: bool },
     /// The job returns to the queue: to pending immediately, or to the
-    /// scheduled key space when `run_at` is set. `error`, when present,
-    /// is recorded on the job and in its attempt history.
+    /// scheduled key space when `run_at` is set. `error`, when present, is
+    /// recorded on the job and in its attempt history.
     Retry {
         run_at: Option<u64>,
         outcome: AttemptOutcome,
@@ -246,20 +239,19 @@ pub(crate) enum ClaimEnd<'a> {
 }
 
 impl ClaimEnd<'_> {
-    /// Whether the transition ends the job rather than returning it
-    /// to the queue.
+    /// Whether the transition ends the job, which every transition except a
+    /// retry does.
     pub(crate) fn is_terminal(&self) -> bool {
         !matches!(self, Self::Retry { .. })
     }
 }
 
-/// Stage the removal of a job's last record, stored at `current_key`:
-/// the record, its job index entry, its attempt history and, when the
-/// job has a dedup key, the dedup index entry. The counter of the
-/// job's status is decremented, except the `Done` counter, which
-/// counts completions and is cumulative. Every path that removes a
-/// job's last record stages it here, so the history shares the
-/// record's lifetime by construction.
+/// Stage the removal of a job's last record, stored at `current_key`: the
+/// record, its job index entry, its attempt history and, when the job has a
+/// dedup key, the dedup index entry. The counter of the job's status is
+/// decremented, except the `Done` counter, which counts completions and is
+/// cumulative. Every path that removes a job's last record stages it here, so
+/// the history shares the record's lifetime by construction.
 pub(crate) fn stage_remove(txn: &DbTransaction, current_key: &[u8], job: &JobRecord) -> Result<()> {
     txn.delete(current_key)?;
     txn.delete(job_index_key(&job.id))?;
@@ -273,10 +265,10 @@ pub(crate) fn stage_remove(txn: &DbTransaction, current_key: &[u8], job: &JobRec
     Ok(())
 }
 
-/// Stage the transition that ends a claim. The caller has read the
-/// stored record and staged the deletion of its claimed key; on return
-/// `job` is the record as written. Returns the pending key when the
-/// job returned to pending, for the caller to record after the commit.
+/// Stage the transition that ends a claim. Before the call, the caller reads
+/// the stored record and stages the deletion of its claimed key. On return
+/// `job` is the record as written. Returns the pending key when the job
+/// returned to pending, for the caller to record after the commit.
 pub(crate) fn stage_claim_end(
     txn: &DbTransaction,
     job: &mut JobRecord,
@@ -308,8 +300,8 @@ pub(crate) fn stage_claim_end(
                 )?;
                 update_stats(txn, &job.queue, &[(JobStatus::Claimed, -1)])?;
             } else {
-                // The removal stages the claimed key's deletion a second
-                // time. The write set records the key once.
+                // The removal stages the claimed key's deletion a second time.
+                // The write set records the key once.
                 stage_remove(txn, &claimed_key(&job.queue, &job.id), job)?;
                 job.status = JobStatus::Done;
                 job.completed_at = Some(now);

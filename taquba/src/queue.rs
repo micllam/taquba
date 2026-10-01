@@ -36,41 +36,39 @@ use crate::txn::{
 };
 use crate::view::{Handle, QueueView};
 
-/// Outcome of [`Queue::cancel`], reflecting which lifecycle branch the
-/// job was in.
+/// Outcome of [`Queue::cancel`], reflecting which lifecycle branch the job was
+/// in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelOutcome {
-    /// The job was `Pending` or `Scheduled` and has been removed from the
+    /// The job was `Pending` or `Scheduled`, and the call removed it from the
     /// queue. No worker will ever see it.
     Removed,
-    /// The job was `Claimed`; the cancellation has been requested via the
-    /// persisted [`JobRecord::cancel_requested`] flag and the in-process
-    /// [`Claim::cancel_token`] has been fired. The worker is still
-    /// running and will eventually `ack` / `nack` / `dead_letter` the
-    /// job according to its own logic.
+    /// The job was `Claimed`. The call requested the cancellation via the
+    /// persisted [`JobRecord::cancel_requested`] flag and fired the in-process
+    /// [`Claim::cancel_token`]. The worker is still running and will eventually
+    /// `ack` / `nack` / `dead_letter` the job according to its own logic.
     Requested,
-    /// No job with this ID was found, or it was already in a terminal
-    /// state (`Done` / `Dead`).
+    /// No job with this ID was found, or it was already in a terminal state
+    /// (`Done` / `Dead`).
     NotFound,
 }
 
-/// Outcome of [`Queue::nack_with`], reflecting which settlement branch
-/// the failure took.
+/// Outcome of [`Queue::nack_with`], reflecting which settlement branch the
+/// failure took.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NackOutcome {
-    /// Attempts remained, so the job was re-queued (immediately or
-    /// after backoff) and the effects were discarded.
+    /// Attempts remained, so the job was re-queued (immediately or after
+    /// backoff) and the effects were discarded.
     Retried,
-    /// Attempts were exhausted, so the job was dead-lettered and the
-    /// effects were applied. The results align index-wise with the
-    /// effects' enqueues.
+    /// Attempts were exhausted, so the job was dead-lettered and the effects
+    /// were applied. The results align index-wise with the effects' enqueues.
     DeadLettered(Vec<EnqueueResult>),
 }
 
 /// Outcome of [`Queue::wake_scheduled`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeOutcome {
-    /// The job was `Scheduled` and has been moved to pending. It is
+    /// The job was `Scheduled`, and the call moved it to pending. It is
     /// claimable immediately.
     Woken,
     /// A job with this ID exists but is not `Scheduled` (it is pending,
@@ -83,35 +81,35 @@ pub enum WakeOutcome {
 /// Outcome of [`Queue::claim_by_id`].
 #[derive(Debug)]
 pub enum ClaimOutcome {
-    /// The job was `Pending` or `Scheduled` and is now claimed by the
-    /// caller.
+    /// The job was `Pending` or `Scheduled` and is now claimed by the caller.
     Claimed(Box<Claim>),
-    /// A job with this ID exists but is claimed, done or dead. Nothing
-    /// was changed.
+    /// A job with this ID exists but is claimed, done or dead. Nothing was
+    /// changed.
     NotClaimable,
     /// No job with this ID was found.
     NotFound,
 }
 
-/// One page of a job listing. Returned by [`QueueView::list_jobs`](crate::QueueView::list_jobs).
+/// One page of a job listing. Returned by
+/// [`QueueView::list_jobs`](crate::QueueView::list_jobs).
 #[derive(Debug, Clone)]
 pub struct JobPage {
-    /// Jobs on this page, in the scan order of the listed state's key
-    /// space (see [`QueueView::list_jobs`](crate::QueueView::list_jobs)).
+    /// Jobs on this page, in the scan order of the listed state's key space
+    /// (see [`QueueView::list_jobs`](crate::QueueView::list_jobs)).
     pub jobs: Vec<JobRecord>,
     /// Opaque resume token: pass it as the `cursor` of the next
-    /// [`QueueView::list_jobs`](crate::QueueView::list_jobs) call to continue the listing. `None` when no
-    /// further entries existed at scan time.
+    /// [`QueueView::list_jobs`](crate::QueueView::list_jobs) call to continue
+    /// the listing. `None` when no further entries existed at scan time.
     pub next_cursor: Option<Vec<u8>>,
 }
 
-/// Maximum byte length of a caller-supplied
-/// [`EnqueueOptions::id_override`]. Enforces a sane cap on key sizes
-/// independently of the underlying object store's path limits.
+/// Maximum byte length of a caller-supplied [`EnqueueOptions::id_override`].
+/// Enforces a sane cap on key sizes independently of the underlying object
+/// store's path limits.
 const MAX_ID_OVERRIDE_LEN: usize = 128;
 
 /// Validate a caller-supplied job id. Caller-supplied ids must be
-/// 1-[`MAX_ID_OVERRIDE_LEN`] bytes of `[A-Za-z0-9_-]`, keeping ids safe
+/// 1-[`MAX_ID_OVERRIDE_LEN`] bytes of `[A-Za-z0-9_-]`. The bound keeps ids safe
 /// for object-store paths and log lines downstream.
 pub(crate) fn validate_id_override(id: &str) -> Result<()> {
     if id.is_empty() {
@@ -166,11 +164,10 @@ impl EnqueueResult {
     }
 }
 
-/// Generate a claim id. A ULID's low 64 bits fall inside its 80-bit
-/// random component, so claim ids are distinct across claims of the same
-/// job. The value identifies a claim and is not ordered, so it fences
-/// only against this queue's own state and is not a fencing token for
-/// anything outside it.
+/// Generate a claim id. A ULID's low 64 bits fall inside its 80-bit random
+/// component, so claim ids are distinct across claims of the same job. The
+/// value identifies a claim and is not ordered, so it fences only against this
+/// queue's own state and is not a fencing token for anything outside it.
 fn new_claim_id() -> u64 {
     Ulid::new().0 as u64
 }
@@ -193,17 +190,18 @@ pub(crate) fn backoff_delay(attempts: u32, base: Duration, max: Duration) -> Dur
 ///
 /// # Lifecycle
 ///
-/// Open with [`Queue::open`] or [`Queue::open_with_options`], use the queue, then call
-/// [`Queue::close`] to flush state and shut down background tasks cleanly.
+/// Open with [`Queue::open`] or [`Queue::open_with_options`], use the queue,
+/// then call [`Queue::close`] to flush state and shut down background tasks
+/// cleanly.
 ///
 /// # Background tasks
 ///
 /// Background tasks run while the queue is open:
 ///
-/// - **Reaper**: re-queues or dead-letters jobs whose lease has expired and
-///   runs the done and dead-letter retention sweeps
+/// - **Reaper**: re-queues or dead-letters jobs whose lease expired and runs
+///   the done and dead-letter retention sweeps
 ///   ([`OpenOptions::reaper_interval`]).
-/// - **Scheduler**: promotes jobs whose `run_at` has passed from the
+/// - **Scheduler**: promotes jobs whose `run_at` is past from the
 ///   scheduled state to pending ([`OpenOptions::scheduler_interval`]).
 /// - **Metrics sampler**, when [`OpenOptions::metrics_sample_interval`] is
 ///   set: emits per-queue depth and oldest-pending-age gauges.
@@ -213,9 +211,10 @@ pub(crate) fn backoff_delay(attempts: u32, base: Duration, max: Duration) -> Dur
 ///
 /// # Concurrency
 ///
-/// `Queue` is `Send + Sync` and cheap to clone behind an [`Arc`]. All workers must run
-/// in the same process: SlateDB's single-writer constraint means the queue cannot be
-/// shared across processes.
+/// `Queue` is `Send + Sync` and is shared through an [`Arc`], whose clone
+/// increments a reference count. All workers must run in the same process:
+/// SlateDB's single-writer constraint means the queue cannot be shared across
+/// processes.
 pub struct Queue {
     pub(crate) core: Arc<QueueCore>,
     view: QueueView,
@@ -224,18 +223,18 @@ pub struct Queue {
     /// `Some` only when built with the `metrics` feature and
     /// `OpenOptions::metrics_sample_interval` was set.
     metrics_sampler: Option<BackgroundTask>,
-    /// `Some` only when `OpenOptions::liveness_heartbeat` was set.
-    /// Stopping returns the task so `close` can commit the closing
-    /// beat with the task's counter.
+    /// `Some` only when `OpenOptions::liveness_heartbeat` was set. Stopping
+    /// returns the task so `close` can commit the closing beat with the task's
+    /// counter.
     heartbeat: Option<BackgroundTask<crate::liveness::HeartbeatTask>>,
 }
 
 /// Outcome of [`Queue::wait_for_completion`].
 ///
-/// The terminal variants name the transition that ended the job. A
-/// transition observed while waiting delivers the final [`JobRecord`]
-/// as the settlement wrote it, with the payload inline, whether or not
-/// the queue retains the record afterwards:
+/// The terminal variants identify the transition that ended the job. A
+/// transition observed while waiting delivers the final [`JobRecord`] as the
+/// settlement wrote it, with the payload inline, whether or not the queue
+/// retains the record afterwards:
 ///
 /// | Transition                                             | Outcome |
 /// |--------------------------------------------------------|---------|
@@ -245,33 +244,31 @@ pub struct Queue {
 /// | Reaper dead-letter (lease expired past `max_attempts`) | `Dead(record)` |
 /// | [`Queue::cancel`] removing a `Pending`/`Scheduled` job | `Cancelled` |
 ///
-/// A job that was already terminal when the call began is reported
-/// from its retained record (`Done` only under
-/// [`QueueConfig::keep_done_jobs`], `Dead` always); a job whose record
-/// was deleted before the call began is `NotFound`.
+/// A job that was already terminal when the call began is reported from its
+/// retained record (`Done` only under [`QueueConfig::keep_done_jobs`], `Dead`
+/// always). A job whose record was deleted before the call began is `NotFound`.
 #[derive(Debug, Clone)]
 pub enum WaitOutcome {
     /// The job was acknowledged.
     Done(Box<JobRecord>),
     /// The job was dead-lettered. The dead record is always kept.
     Dead(Box<JobRecord>),
-    /// The job was removed by [`Queue::cancel`] before it was claimed.
-    /// No record survives the removal.
+    /// The job was removed by [`Queue::cancel`] before it was claimed. No
+    /// record remains after the removal.
     Cancelled,
     /// No job with this ID was present at the start of the call.
     NotFound,
 }
 
-/// The state of a job at the start of a completion wait: its outcome
-/// when already terminal, otherwise the registration its outcome will
-/// arrive on.
+/// The state of a job at the start of a completion wait: its outcome when
+/// already terminal, otherwise the registration its outcome will arrive on.
 enum Completion {
     Settled(WaitOutcome),
     Pending(Registration),
 }
 
-/// The outcome a registration received. The sender is consumed only by
-/// a settlement, so the channel cannot close without an outcome.
+/// The outcome a registration received. The sender is consumed only by a
+/// settlement, so the channel cannot close without an outcome.
 fn delivered(received: std::result::Result<WaitOutcome, oneshot::error::RecvError>) -> WaitOutcome {
     received.expect("a completion sender is consumed only by a settlement")
 }
@@ -283,7 +280,7 @@ struct SettledClaim<'e> {
     end: ClaimEnd<'e>,
     /// The pending key when the job returned to pending.
     pending_key: Option<Vec<u8>>,
-    /// The effects' results; `None` when the transition discarded them.
+    /// The effects' results, or `None` when the transition discarded them.
     results: Option<Vec<EnqueueResult>>,
 }
 
@@ -320,7 +317,7 @@ impl Queue {
         {
             builder = builder.with_metrics_recorder(crate::obs::slatedb_recorder());
         }
-        // A configuration for a name the key encoding cannot store
+        // A configuration for a queue name over the limit of the key encoding
         // does not apply to any job, so the names are validated here.
         for queue in opts.queue_configs.keys() {
             QueueName::new(queue.as_str())?;
@@ -339,11 +336,10 @@ impl Queue {
             id_gen: std::sync::Mutex::new(ulid::Generator::new()),
         });
         crate::claim_cursor::restore_cursor_state(&core).await?;
-        // A claimed record found at open belongs to a process that no
-        // longer holds the store, so its claim is void and the job is
-        // re-queued immediately. Runs after `restore_cursor_state` so
-        // each re-queued job's pending insert is recorded against the
-        // restored bound.
+        // A claimed record found at open belongs to a process that no longer
+        // owns the store, so its claim is void and the job is re-queued
+        // immediately. Runs after `restore_cursor_state` so each re-queued
+        // job's pending insert is recorded against the restored bound.
         core.requeue_interrupted_claims().await?;
         let reaper_task =
             BackgroundTask::spawn_periodic(opts.reaper_interval, Reaper::new(core.clone()));
@@ -376,24 +372,24 @@ impl Queue {
         })
     }
 
-    /// The writer's live view of the store: the read-only queries, with a
-    /// write visible to the next read.
+    /// The writer's live view of the store: the read-only queries, with a write
+    /// visible to the next read.
     pub fn view(&self) -> &QueueView {
         &self.view
     }
 
-    /// Current time in milliseconds since the UNIX epoch, as read
-    /// from this queue's configured [`Clock`].
+    /// Current time as a Unix timestamp in milliseconds, as read from this
+    /// queue's configured [`Clock`].
     pub(crate) fn now_ms(&self) -> u64 {
         self.core.now_ms()
     }
 
     /// Generate a job id without enqueuing anything.
     ///
-    /// For callers that need the id before the enqueue commits, to write
-    /// a record pointing at the job in the same transaction; pass it as
-    /// [`EnqueueOptions::id_override`]. Ids increase with call order and
-    /// take their timestamp from this queue's [`Clock`].
+    /// For callers that need the id before the enqueue commits, to write a
+    /// record pointing at the job in the same transaction. Pass it as
+    /// [`EnqueueOptions::id_override`]. Ids increase with call order and take
+    /// their timestamp from this queue's [`Clock`].
     pub fn next_job_id(&self) -> String {
         self.core.next_job_id()
     }
@@ -407,12 +403,12 @@ impl Queue {
         self.queue_config(queue).lease_duration
     }
 
-    /// Build the lease handle for a claim: the capability the worker
-    /// loops pass to [`Worker::process`](crate::worker::Worker::process).
-    /// The handle extends the lease and exposes the claim's cancellation
-    /// token but cannot settle the job, so a handler never holds a claim
-    /// and a queue together. Callers running `Worker::process` from
-    /// their own claim loop build the handle here.
+    /// Build the lease handle for a claim: the capability the worker loops pass
+    /// to [`Worker::process`](crate::worker::Worker::process). The handle
+    /// extends the lease and exposes the claim's cancellation token but cannot
+    /// settle the job, so a handler never has a claim and a queue together.
+    /// Callers running `Worker::process` from their own claim loop build the
+    /// handle here.
     pub fn lease_handle(&self, claim: &Claim) -> crate::lease::LeaseHandle {
         crate::lease::LeaseHandle::new(
             self.core.lease_registry.clone(),
@@ -424,21 +420,20 @@ impl Queue {
         )
     }
 
-    /// Look up the configured `keep_done_jobs` retention for a queue.
-    /// `None` means [`Self::ack`] deletes successful jobs outright on that queue.
+    /// Look up the configured `keep_done_jobs` retention for a queue. `None`
+    /// means [`Self::ack`] deletes successful jobs outright on that queue.
     pub fn queue_keep_done_jobs(&self, queue: &str) -> Option<Duration> {
         self.queue_config(queue).keep_done_jobs
     }
 
-    /// Look up the configured dead-letter retention for a queue.
-    /// `None` means the dead-letter sweep is disabled for that queue.
+    /// Look up the configured dead-letter retention for a queue. `None` means
+    /// the dead-letter sweep is disabled for that queue.
     pub fn queue_dead_retention(&self, queue: &str) -> Option<Duration> {
         self.queue_config(queue).dead_retention
     }
 
-    /// The [`Clock`] this queue was opened with. Returned as a cheap
-    /// `Arc` clone so downstream crates can share the same time
-    /// source for their own timestamp work.
+    /// The [`Clock`] this queue was opened with, as an `Arc` clone that shares
+    /// the time source with downstream crates for their own timestamp work.
     pub fn clock(&self) -> Arc<dyn Clock> {
         self.core.clock.clone()
     }
@@ -472,10 +467,10 @@ impl Queue {
     /// When `dedup_key` is `Some` and a pending job with the same key already
     /// exists, this returns the existing job's ID without creating a new one.
     /// When `run_at` is in the past or is now, the job is written straight to
-    /// pending; otherwise it waits in the scheduled key space until the
+    /// pending. Otherwise it waits in the scheduled key space until the
     /// background scheduler promotes it.
     ///
-    /// Queue names are limited to [`crate::MAX_QUEUE_NAME_LEN`] bytes;
+    /// Queue names are limited to [`crate::MAX_QUEUE_NAME_LEN`] bytes, and
     /// longer names return [`Error::InvalidQueueName`].
     #[instrument(skip(self, payload), fields(queue, job_id))]
     pub async fn enqueue_with(
@@ -505,11 +500,10 @@ impl Queue {
     /// contains one [`EnqueueResult`] per enqueue of `effects`, in order, as
     /// [`Self::ack_with`] returns them, and is empty on a dedup hit.
     ///
-    /// Caller-supplied KV keys are internally scoped under a reserved
-    /// user key tag so they cannot collide with Taquba's internal layout.
-    /// Each value is validated against
-    /// [`MAX_KV_VALUE_SIZE`](crate::MAX_KV_VALUE_SIZE) up front;
-    /// oversized values return [`Error::KvValueTooLarge`] before the
+    /// Caller-supplied KV keys are internally scoped under a reserved user key
+    /// tag so they cannot collide with Taquba's internal layout. Each value is
+    /// validated against [`MAX_KV_VALUE_SIZE`](crate::MAX_KV_VALUE_SIZE) up
+    /// front, and oversized values return [`Error::KvValueTooLarge`] before the
     /// transaction begins. Conflict retries are handled internally.
     ///
     /// ```no_run
@@ -550,29 +544,28 @@ impl Queue {
     /// apply, unlike [`Self::enqueue_with_effects`], whose effects belong to
     /// the one job it enqueues.
     ///
-    /// The effects of a claim's own settlement belong on [`Self::ack_with`]
-    /// and the other `*_with` settlements. This method is for state a
-    /// layer keeps beside the queue and must move in one step without a
-    /// transition of its own to carry it, such as reconciling the state
-    /// of a job the reaper dead-lettered.
+    /// The effects of a claim's own settlement belong on [`Self::ack_with`] and
+    /// the other `*_with` settlements. This method is for state that a layer
+    /// keeps separate from the queue and must move in one step without a
+    /// transition of its own, such as reconciling the state of a job the reaper
+    /// dead-lettered.
     pub async fn commit_effects(&self, effects: SettlementEffects) -> Result<Vec<EnqueueResult>> {
         let committed = self.commit_effects_where(effects, &[]).await?;
         Ok(committed.expect("a commit without a compare is unconditional"))
     }
 
-    /// Apply `effects` as [`Self::commit_effects`] does, only if the
-    /// current state of every user KV key of `compares` matches its
-    /// expected state: `Some(v)` requires the key to contain exactly
-    /// `v`, and `None` requires the key to be absent.
+    /// Apply `effects` as [`Self::commit_effects`] does, only if the current
+    /// state of every user KV key of `compares` matches its expected state:
+    /// `Some(v)` requires the key to contain exactly `v`, and `None` requires
+    /// the key to be absent.
     ///
-    /// Returns the enqueue results when every state matched and the
-    /// effects were applied, and `None` when one did not (nothing is
-    /// changed in that case). The compares and the effects execute in
-    /// one transaction, so no concurrent write can be interleaved
-    /// between a compare and the commit: either this call applies the
-    /// effects to the state it compared against, or it reports `None`.
-    /// The effects are durable before the call returns `Some`, and they
-    /// can write or delete a compared key.
+    /// Returns the enqueue results when every state matched and the effects
+    /// were applied, and `None` when one did not (nothing is changed in that
+    /// case). The compares and the effects execute in one transaction, so no
+    /// concurrent write can be interleaved between a compare and the commit:
+    /// either this call applies the effects to the state it compared against,
+    /// or it reports `None`. The effects are durable before the call returns
+    /// `Some`, and they can write or delete a compared key.
     pub async fn kv_compare_commit(
         &self,
         compares: &[(&[u8], Option<&[u8]>)],
@@ -581,9 +574,9 @@ impl Queue {
         self.commit_effects_where(effects, compares).await
     }
 
-    /// Body of `commit_effects` and `kv_compare_commit`: the transaction
-    /// loop over the prepared effects, with every compare of `compares`
-    /// (a key and its expected state) tested first.
+    /// Body of `commit_effects` and `kv_compare_commit`: the transaction loop
+    /// over the prepared effects, with every compare of `compares` (a key and
+    /// its expected state) tested first.
     async fn commit_effects_where(
         &self,
         effects: SettlementEffects,
@@ -621,10 +614,10 @@ impl Queue {
         committed
     }
 
-    /// Fetch the offloaded payloads of `jobs` concurrently, bounding a
-    /// batch's wall time by the slowest object rather than the sum of
-    /// the fetches. Jobs with inline payloads are untouched. On a fetch
-    /// failure, one error is returned after every fetch has settled.
+    /// Fetch the offloaded payloads of `jobs` concurrently. The slowest object
+    /// bounds the wall time of a batch, and the fetch times do not add up. Jobs
+    /// with inline payloads are untouched. On a fetch failure, one error is
+    /// returned after every fetch settles.
     async fn materialize_payloads(&self, jobs: &mut [Claim]) -> Result<()> {
         let store = &self.core.payload_store;
         let fetched =
@@ -670,11 +663,10 @@ impl Queue {
         })
     }
 
-    /// The transaction loop of [`Self::write_job`], after any payload offload
-    /// has happened. The inner `Ok` is the id of the new job with the results
-    /// of the effects' enqueues, and the inner `Err` is the id of the pending
-    /// or scheduled job that a dedup key matched, as `stage_job_writes` reports
-    /// it.
+    /// The transaction loop of [`Self::write_job`], after any payload offload.
+    /// The inner `Ok` is the id of the new job with the results of the effects'
+    /// enqueues, and the inner `Err` is the id of the pending or scheduled job
+    /// that a dedup key matched, as `stage_job_writes` reports it.
     async fn write_job_txn(
         &self,
         prepared: &PreparedJob,
@@ -708,36 +700,33 @@ impl Queue {
 
     /// Block up to `max_wait` for a job to become claimable on `queue`.
     ///
-    /// The wakeup is queue-scoped and delivered to one waiter per
-    /// inserted job, so a pool of waiting workers does not contend on
-    /// the claim path when a single job arrives. To wait on several
-    /// queues at once, `select!` over one call per queue. Returning
-    /// does not guarantee a job is still available
-    /// (another worker may claim it first); follow up with a claim
-    /// call and wait again if it returns `None`.
+    /// The wakeup is queue-scoped and delivered to one waiter per inserted job,
+    /// so a pool of waiting workers does not contend on the claim path when a
+    /// single job arrives. To wait on several queues at once, `select!` over
+    /// one call per queue. Returning does not guarantee a job is still
+    /// available, because another worker can claim it first. Follow up with a
+    /// claim call, and wait again if it returns `None`.
     pub async fn wait_for_jobs_on(&self, queue: &str, max_wait: Duration) {
         let wakeup = self.core.claim_cursor.wakeup_for(queue);
         let notified = wakeup.notified();
         tokio::pin!(notified);
-        // `enable` consumes a permit left by an insert that landed
-        // before this waiter subscribed, so the wait returns
-        // immediately instead of sleeping past an already-available
-        // job.
+        // `enable` consumes a permit left by an insert written before this
+        // waiter subscribed, so the wait returns immediately and does not sleep
+        // past an already-available job.
         notified.as_mut().enable();
         let _ = tokio::time::timeout(max_wait, notified).await;
     }
 
     /// Claim the next pending job, waiting up to `max_wait` for one to appear.
     ///
-    /// Workers should prefer this over a polling [`Self::claim_next`] +
-    /// [`tokio::time::sleep`] loop: when a job lands on `queue` (enqueue,
-    /// retry requeue, dead-job requeue, scheduled-job promotion, lease
-    /// reap), the wakeup is delivered via an in-memory notify so the
-    /// worker resumes immediately, without waiting out the poll interval.
-    /// Wakeups are queue-scoped and delivered to one waiter per inserted
-    /// job, so a pool of waiting workers does not contend on the claim path
-    /// when a single job arrives. Only when nothing is available within
-    /// `max_wait` does the call return `None`.
+    /// This replaces a polling [`Self::claim_next`] + [`tokio::time::sleep`]
+    /// loop: when a job is written to `queue` (enqueue, retry requeue, dead-job
+    /// requeue, scheduled-job promotion, lease reap), the wakeup is delivered
+    /// via an in-memory notify so the worker resumes immediately, without
+    /// waiting out the poll interval. Wakeups are queue-scoped and delivered to
+    /// one waiter per inserted job, so a pool of waiting workers does not
+    /// contend on the claim path when a single job arrives. Only when nothing
+    /// is available within `max_wait` does the call return `None`.
     ///
     /// The `lease_duration` controls how long the resulting claim is held.
     pub async fn claim_with_wait(
@@ -749,10 +738,9 @@ impl Queue {
         let deadline = tokio::time::Instant::now() + max_wait;
         loop {
             if let Some(job) = self.claim(queue, lease_duration).await? {
-                // Pass the wakeup on: the wait below may have consumed a
-                // permit another waiter needs, and when a backlog
-                // remains each delivered job should wake one more
-                // worker.
+                // Pass the wakeup on: the wait below can consume a permit that
+                // another waiter needs, and while a backlog remains each
+                // delivered job wakes one more worker.
                 self.core.claim_cursor.wakeup_for(queue).notify_one();
                 return Ok(Some(job));
             }
@@ -760,44 +748,41 @@ impl Queue {
             if now >= deadline {
                 return Ok(None);
             }
-            // An insert between the empty scan and this wait leaves a
-            // permit that the wait consumes, so no insert is missed.
-            // A wake does not reserve the job: another worker may claim
-            // it first, in which case the loop waits out the remaining
-            // time. A stale permit costs one extra pass.
+            // An insert between the empty scan and this wait leaves a permit
+            // that the wait consumes, so no insert is missed. A wake does not
+            // reserve the job: another worker can claim it first, and then the
+            // loop waits out the remaining time. A stale permit costs one extra
+            // pass.
             self.wait_for_jobs_on(queue, deadline - now).await;
         }
     }
 
-    /// Claim the next pending job with an explicit lease duration.
-    /// Returns `None` if the queue is empty.
+    /// Claim the next pending job with an explicit lease duration. Returns
+    /// `None` if the queue is empty.
     ///
-    /// The claim commit does not await WAL durability. If the process
-    /// crashes before the claim is flushed, the job is still pending on
-    /// recovery and is redelivered immediately rather than after its
-    /// lease expires; at-least-once delivery is unaffected. Any later
-    /// durable commit (ack, nack, enqueue) flushes preceding WAL
-    /// entries, so a settled job's claim is always durable.
+    /// The claim commit does not await WAL durability. If the process crashes
+    /// before the claim is flushed, the job is still pending on recovery and is
+    /// redelivered immediately, without waiting for its lease to expire.
+    /// At-least-once delivery is unaffected. Any later durable commit (ack,
+    /// nack, enqueue) flushes preceding WAL entries, so a settled job's claim
+    /// is always durable.
     ///
     /// Same-queue claim attempts serialise through an in-process
-    /// `tokio::sync::Mutex`, avoiding the transaction-conflict
-    /// retry that would otherwise resolve which worker takes the
-    /// head of the pending key space. The lock is per-queue, so different
-    /// queues' claim paths still run in parallel.
+    /// `tokio::sync::Mutex`, so a transaction-conflict retry does not decide
+    /// which worker takes the head of the pending key space. The lock is
+    /// per-queue, so different queues' claim paths still run in parallel.
     ///
-    /// A per-queue in-memory cursor records the most recently
-    /// claimed key and is used as the start bound on the next
-    /// scan. This lets steady-state claims skip over the
-    /// tombstones left by previously claimed (and deleted)
-    /// pending entries. When the cursor scan ends without a key
-    /// inside the queue's prefix (cursor exhausted, or an older
-    /// job was requeued by `nack` before the cursor), the
-    /// claim falls back to a front prefix scan and resets the
-    /// cursor. When the front scan also ends without a key, the queue is
-    /// marked empty in memory and subsequent claims return `None`
-    /// without scanning until the next pending insert, so polling
-    /// an empty queue does not re-walk the tombstone band left by
-    /// previously claimed jobs.
+    /// A per-queue in-memory cursor records the most recently claimed key and
+    /// is used as the start bound on the next scan. This lets steady-state
+    /// claims skip over the tombstones left by previously claimed (and deleted)
+    /// pending entries. When the cursor scan ends without a key inside the
+    /// queue's prefix (cursor exhausted, or an older job was requeued by `nack`
+    /// before the cursor), the claim falls back to a front prefix scan and
+    /// resets the cursor. When the front scan also ends without a key, the
+    /// queue is marked empty in memory and subsequent claims return `None`
+    /// without scanning until the next pending insert, so polling an empty
+    /// queue does not re-read the tombstone band left by previously claimed
+    /// jobs.
     #[instrument(skip(self), fields(queue))]
     pub async fn claim(&self, queue: &str, lease_duration: Duration) -> Result<Option<Claim>> {
         Ok(self.claim_batch(queue, 1, lease_duration).await?.pop())
@@ -805,20 +790,19 @@ impl Queue {
 
     /// Claim up to `max_jobs` pending jobs in one transaction.
     ///
-    /// Jobs are returned in claim order (priority, then enqueue order)
-    /// and share one lease started at the same instant: size batches so
-    /// the lease covers processing the whole batch, or renew leases as
-    /// the batch progresses. Returns an empty `Vec` when the queue is
-    /// empty and fewer than `max_jobs` jobs when the queue runs out.
+    /// Jobs are returned in claim order (priority, then enqueue order) and
+    /// share one lease with one start instant. Size batches so the lease covers
+    /// processing the whole batch, or renew leases as the batch progresses.
+    /// Returns an empty `Vec` when the queue is empty and fewer than `max_jobs`
+    /// jobs when the queue runs out.
     ///
-    /// One batch costs one claim-lock hold, one transaction, and one
-    /// commit regardless of size, so a fetcher that claims batches and
-    /// dispatches jobs to local workers contends far less on a busy
-    /// queue than one [`Self::claim`] call per job.
-    /// [`run_worker_concurrent`](crate::run_worker_concurrent) is that
-    /// pattern built in: it claims batches sized to its free capacity.
-    /// Durability, serialisation, and cursor semantics are those of
-    /// [`Self::claim`].
+    /// One batch costs one claim-lock hold, one transaction and one commit
+    /// regardless of size, so a fetcher that claims batches and dispatches jobs
+    /// to local workers contends far less on a busy queue than one
+    /// [`Self::claim`] call per job.
+    /// [`run_worker_concurrent`](crate::run_worker_concurrent) is that pattern
+    /// built in: it claims batches sized to its free capacity. Durability,
+    /// serialisation and cursor semantics are those of [`Self::claim`].
     #[instrument(skip(self), fields(queue, max_jobs))]
     pub async fn claim_batch(
         &self,
@@ -830,11 +814,11 @@ impl Queue {
         if max_jobs == 0 {
             return Ok(Vec::new());
         }
-        // Empty check before taking the claim lock: a queue known to be
-        // empty is reported from in-process state, without contention
-        // with claims that have work to do. A stale value is safe in
-        // both directions. Emptiness is revoked only by an insert, and
-        // a stale "not empty" falls through to the locked scan.
+        // Empty check before taking the claim lock: a queue known to be empty
+        // is reported from in-process state, without contention with claims
+        // that have work to do. A stale value is safe in both directions.
+        // Emptiness is revoked only by an insert, and a stale "not empty" falls
+        // through to the locked scan.
         if self.core.claim_cursor.known_empty(&queue) {
             return Ok(Vec::new());
         }
@@ -844,21 +828,20 @@ impl Queue {
             self.claim_batch_locked(&queue, max_jobs, lease_duration)
                 .await?
         };
-        // Offloaded payloads are fetched after the claim lock is
-        // released, so other claims on the queue proceed during the
-        // object-store reads. On a fetch failure the claim has already
-        // committed: the affected jobs stay claimed until their leases
-        // expire and are then redelivered. Their cancel tokens stay
-        // registered, so a cancel during that window still fires the
-        // token and persists the request.
+        // Offloaded payloads are fetched after the claim lock is released, so
+        // other claims on the queue proceed during the object-store reads. On a
+        // fetch failure the claim has already committed: the affected jobs stay
+        // claimed until their leases expire and are then redelivered. Their
+        // cancel tokens stay registered, so a cancel during that window still
+        // fires the token and persists the request.
         self.materialize_payloads(&mut jobs).await?;
         Ok(jobs)
     }
 
-    /// The scan-and-claim transaction of [`Self::claim_batch`]. The
-    /// caller holds the queue's claim lock for the duration of the
-    /// call; offloaded payloads are not fetched here, so the lock is
-    /// never held across a payload read.
+    /// The scan-and-claim transaction of [`Self::claim_batch`]. The caller must
+    /// hold the queue's claim lock for the duration of the call. Offloaded
+    /// payloads are not fetched here, so the lock is never held across a
+    /// payload read.
     async fn claim_batch_locked(
         &self,
         queue: &QueueName,
@@ -869,10 +852,9 @@ impl Queue {
         let prefix_bytes = prefix.as_slice();
         let timer = crate::obs::start();
         loop {
-            // The scan state (and its pending-insert epoch) is read
-            // before the transaction begins, so any insert the snapshot
-            // could miss bumps the epoch after this read and revokes the
-            // emptiness recorded below.
+            // The scan state (and its pending-insert epoch) is read before the
+            // transaction begins, so any insert the snapshot can miss bumps the
+            // epoch after this read and revokes the emptiness recorded below.
             let scan = self.core.claim_cursor.begin_claim(queue);
             if scan.known_empty {
                 return Ok(Vec::new());
@@ -880,20 +862,20 @@ impl Queue {
             let txn = self.core.db.begin(IsolationLevel::Snapshot).await?;
 
             let mut candidates = Vec::new();
-            // Set when the scan ran out of pending keys before filling
-            // the batch, proving nothing is live beyond the candidates.
+            // Set when the scan ran out of pending keys before filling the
+            // batch, proving nothing is live beyond the candidates.
             let mut drained = false;
             // SlateDB leaves block caching off for scans. This scan takes at
             // most `max_jobs` entries from one prefix and the next claim
-            // resumes where it stopped, so uncached it re-reads the same
-            // block once a compacted sorted run overlaps the prefix.
+            // resumes where it stopped, so uncached it re-reads the same block
+            // once a compacted sorted run overlaps the prefix.
             let scan_options = ScanOptions::default().with_cache_blocks(true);
             let mut iter = match scan.scan_from.clone() {
                 // Resume from the recorded bound (after the last claimed key,
                 // or a key inserted before it). The subrange is relative to the
-                // prefix, so scan_prefix ends at the prefix upper bound natively
-                // and a drained queue is detected without scanning beyond the
-                // prefix.
+                // prefix, so scan_prefix ends at the prefix upper bound
+                // natively and a drained queue is detected without scanning
+                // beyond the prefix.
                 Some(sf) => {
                     let suffix = sf.key.slice(prefix_bytes.len()..);
                     let start = if sf.inclusive {
@@ -908,9 +890,9 @@ impl Queue {
                     )
                     .await?
                 }
-                // Front scan: bound unknown (cold start or process
-                // restart), so pre-existing keys may be live anywhere
-                // in the prefix.
+                // Front scan: bound unknown (the first claim after the queue
+                // opens), so pre-existing keys can be live anywhere in the
+                // prefix.
                 None => {
                     txn.scan_prefix_with_options(prefix_bytes, .., &scan_options)
                         .await?
@@ -926,10 +908,10 @@ impl Queue {
                 }
             }
             if candidates.is_empty() {
-                // Every live pending key sorts at or after a known bound
-                // (an insert before it moves it back), so a bound scan that
-                // ends without a key establishes that the queue is empty,
-                // without a read of the tombstone band from the front.
+                // Every live pending key sorts at or after a known bound (an
+                // insert before it moves it back), so a bound scan that ends
+                // without a key establishes that the queue is empty, without a
+                // read of the tombstone band from the front.
                 self.core.claim_cursor.mark_empty(queue, &scan);
                 return Ok(Vec::new());
             }
@@ -949,11 +931,11 @@ impl Queue {
                 job.claimed_at = Some(now);
                 job.attempts += 1;
 
-                // Take the dedup_key off the record BEFORE serializing the
-                // claimed-state copy. If we left it on, a later nack would put a
-                // record back into pending still carrying the key, and the next
-                // claim would try to delete a dedup index that may by now
-                // belong to a *different* job, corrupting the dedup invariant.
+                // Remove the dedup_key from the record BEFORE serializing the
+                // claimed-state copy. With the key left on, a later nack
+                // returns the record to pending with the key still set. The
+                // next claim then deletes a dedup index that can by then belong
+                // to a *different* job, which corrupts the dedup invariant.
                 let dedup_key_to_release = job.dedup_key.take();
                 let claim_id = new_claim_id();
                 let claimed = claimed_key(&job.queue, &job.id);
@@ -961,18 +943,18 @@ impl Queue {
 
                 txn.delete(&kv.key)?;
                 put_job_record(&txn, &claimed, &job_index_key(&job.id), &value)?;
-                // A cancellation requested during an earlier claim of
-                // the job is persisted on the record and fires this
-                // claim's token immediately.
+                // A cancellation requested during an earlier claim of the job
+                // is persisted on the record and fires this claim's token
+                // immediately.
                 let cancel = tokio_util::sync::CancellationToken::new();
                 if job.cancel_requested {
                     cancel.cancel();
                 }
-                // Registered before the commit, so a failed commit
-                // leaves a stale entry, discarded when due; a missing
-                // entry would leave the claim invisible to the reaper
-                // until the next open, and a cancellation racing the
-                // commit would find no token to fire.
+                // Registered before the commit, so a failed commit leaves a
+                // stale entry, which the reaper discards when due. A missing
+                // entry hides the claim from the reaper until the next open,
+                // and a cancellation racing the commit does not find a token to
+                // fire.
                 self.core.lease_registry.insert(
                     &job.queue,
                     &job.id,
@@ -992,28 +974,26 @@ impl Queue {
                 &[(JobStatus::Pending, -count), (JobStatus::Claimed, count)],
             )?;
 
-            // Claims commit without awaiting WAL durability. The claimed
-            // state only matters across a restart, where either version
-            // of it recovers: a claim lost with the unflushed WAL leaves
-            // the job pending, and a durable one is requeued at open,
-            // the difference being only that the durable claim has
-            // consumed an attempt.
+            // Claims commit without awaiting WAL durability. The claimed state
+            // only matters across a restart, where either version of it
+            // recovers: a claim lost with the unflushed WAL leaves the job
+            // pending, and a durable one is requeued at open. The only
+            // difference is that the durable claim consumed an attempt.
             match commit(txn, Durability::Deferred).await? {
                 Commit::Committed => {
                     self.core
                         .claim_cursor
                         .advance(queue, last_pending_key, &scan);
                     if drained {
-                        // The scan ran dry inside this snapshot, so
-                        // nothing is left after taking these jobs; record
-                        // emptiness so the next poll short-circuits. Any
-                        // insert since the epoch read revokes it.
+                        // The scan ran dry inside this snapshot, so nothing is
+                        // left after taking these jobs. Record emptiness so the
+                        // next poll short-circuits. Any insert after the epoch
+                        // read revokes it.
                         self.core.claim_cursor.mark_empty(queue, &scan);
                     }
-                    // The claim histogram measures the claim
-                    // transaction; offloaded payload fetches happen
-                    // after the claim lock is released and are not
-                    // included.
+                    // The claim histogram measures the claim transaction.
+                    // Offloaded payload fetches happen after the claim lock is
+                    // released and are not included.
                     crate::obs::claimed(queue, jobs.len() as u64, timer);
                     debug!(queue = %queue, count = jobs.len(), "jobs claimed");
                     return Ok(jobs);
@@ -1029,28 +1009,27 @@ impl Queue {
     /// Claim one pending or scheduled job by ID with an explicit lease
     /// duration.
     ///
-    /// This is the targeted counterpart of [`Self::claim`]: the same
-    /// transition (to claimed), applied to a single job by ID at the
-    /// caller's initiative and without the scan, for a producer that
-    /// performs the job it created or an operator that runs one job
-    /// now. A scheduled job is claimed before its `run_at`. The claim
-    /// consumes an attempt, releases the job's dedup key and registers
-    /// its lease exactly as a scan claim does, so the reaper requeues it
-    /// when the lease expires and the next open requeues it after a
+    /// This is the targeted counterpart of [`Self::claim`]: the same transition
+    /// (to claimed), applied to a single job by ID at the caller's initiative
+    /// and without the scan, for a producer that performs the job it created or
+    /// an operator that runs one job now. A scheduled job is claimed before its
+    /// `run_at`. The claim consumes an attempt, releases the job's dedup key
+    /// and registers its lease exactly as a scan claim does, so the reaper
+    /// requeues it when the lease expires and the next open requeues it after a
     /// crash. The claim commits without awaiting WAL durability, as
     /// [`Self::claim`] does.
     ///
     /// Exactly one caller wins the transition: a concurrent scan claim,
-    /// scheduler promotion, [`Self::cancel`] and this call conflict on
-    /// the record, and the loser observes [`ClaimOutcome::NotClaimable`]
-    /// or [`ClaimOutcome::NotFound`].
+    /// scheduler promotion, [`Self::cancel`] and this call conflict on the
+    /// record, and the loser observes [`ClaimOutcome::NotClaimable`] or
+    /// [`ClaimOutcome::NotFound`].
     #[instrument(skip(self), fields(job_id = %id))]
     pub async fn claim_by_id(&self, id: &str, lease_duration: Duration) -> Result<ClaimOutcome> {
         let timer = crate::obs::start();
-        // `Err` is an outcome reached without a commit. The claim lock and
-        // the claim cursor are not touched, as in `cancel`: removing a
-        // pending key keeps every live key at or after the scan bound, and
-        // a concurrent scan claim conflicts on the key.
+        // `Err` is an outcome reached without a commit. The claim lock and the
+        // claim cursor are not touched, as in `cancel`: removing a pending key
+        // keeps every live key at or after the scan bound, and a concurrent
+        // scan claim conflicts on the key.
         let claimed: std::result::Result<Claim, ClaimOutcome> = self
             .core
             .transition_by_id(
@@ -1067,9 +1046,9 @@ impl Queue {
                     job.status = JobStatus::Claimed;
                     job.claimed_at = Some(now);
                     job.attempts += 1;
-                    // The dedup key leaves the record before the claimed
-                    // copy is written, as in the scan claim, so a later
-                    // requeue cannot release another job's index entry.
+                    // The dedup key leaves the record before the claimed copy
+                    // is written, as in the scan claim, so a later requeue
+                    // cannot release another job's index entry.
                     let dedup_key_to_release = job.dedup_key.take();
                     let claim_id = new_claim_id();
                     let value = job.stored_bytes()?;
@@ -1084,10 +1063,9 @@ impl Queue {
                     if job.cancel_requested {
                         cancel.cancel();
                     }
-                    // Registered before the commit, as in the scan claim:
-                    // a failed commit leaves a stale entry, discarded when
-                    // due, where a missing entry would hide the claim from
-                    // the reaper.
+                    // Registered before the commit, as in the scan claim. A
+                    // failed commit leaves a stale entry that is discarded when
+                    // due, and a missing entry hides the claim from the reaper.
                     self.core.lease_registry.insert(
                         &job.queue,
                         &job.id,
@@ -1118,26 +1096,26 @@ impl Queue {
 
     /// Acknowledge successful completion.
     ///
-    /// By default the job is deleted outright; the success counter in
+    /// By default the job is deleted outright. The success counter in
     /// [`QueueStats::done`](crate::QueueStats::done) is still incremented.
     ///
     /// Set [`QueueConfig::keep_done_jobs`] (per-queue, or on
-    /// [`OpenOptions::default_queue_config`] for an instance-wide default)
-    /// to retain completed jobs for a bounded duration.
+    /// [`OpenOptions::default_queue_config`] for an instance-wide default) to
+    /// retain completed jobs for a bounded duration.
     pub async fn ack(&self, claim: &Claim) -> Result<()> {
         self.ack_with(claim, SettlementEffects::default())
             .await
             .map(|_| ())
     }
 
-    /// Acknowledge successful completion and apply `effects` in the
-    /// same transaction.
+    /// Acknowledge successful completion and apply `effects` in the same
+    /// transaction.
     ///
-    /// Either the acknowledgement and every effect land together or
-    /// nothing does. In particular, if the job's claim is no longer
-    /// present (its lease expired and the reaper requeued it), the call
-    /// fails with [`Error::ClaimLost`] and no effect is applied, so
-    /// a follow-up job exists only if this settlement won.
+    /// Either the acknowledgement and every effect land together or nothing
+    /// does. In particular, if the job's claim is no longer present (its lease
+    /// expired and the reaper requeued it), the call fails with
+    /// [`Error::ClaimLost`] and no effect is applied, so a follow-up job exists
+    /// only if this settlement won.
     ///
     /// Each enqueue in [`SettlementEffects::enqueues`] behaves exactly like
     /// [`Self::enqueue_with`]: a `dedup_key` hit downgrades that request to
@@ -1161,27 +1139,27 @@ impl Queue {
         Ok(results.unwrap_or_default())
     }
 
-    /// Report failure. Re-queues if attempts < max_attempts, otherwise dead-letters.
+    /// Report failure. Re-queues if attempts < max_attempts, otherwise
+    /// dead-letters.
     ///
-    /// Re-queued jobs honour the queue's `retry_backoff_base` and `retry_backoff_max`:
-    /// when the backoff is non-zero, the job is parked in the scheduled key space and
-    /// the background scheduler promotes it once the delay has elapsed. With zero
-    /// backoff the job goes straight back to pending.
+    /// Re-queued jobs honour the queue's `retry_backoff_base` and
+    /// `retry_backoff_max`: when the backoff is non-zero, the job waits in the
+    /// scheduled key space and the background scheduler promotes it once the
+    /// delay elapses. With zero backoff the job goes straight back to pending.
     pub async fn nack(&self, claim: &Claim, error: &str) -> Result<()> {
         self.nack_with(claim, error, SettlementEffects::default())
             .await
             .map(|_| ())
     }
 
-    /// Report failure and apply `effects` in the same transaction when
-    /// the failure dead-letters the job.
+    /// Report failure and apply `effects` in the same transaction when the
+    /// failure dead-letters the job.
     ///
-    /// Behaves like [`Self::nack`]. While attempts remain the job is
-    /// re-queued, the effects are discarded and the call returns
-    /// [`NackOutcome::Retried`]; a later settlement supplies its own
-    /// effects. Once attempts are exhausted the job is dead-lettered
-    /// and the effects are applied atomically with that transition,
-    /// exactly as in [`Self::ack_with`], and the call returns
+    /// Behaves like [`Self::nack`]. While attempts remain the job is re-queued,
+    /// the effects are discarded and the call returns [`NackOutcome::Retried`].
+    /// A later settlement passes its own effects. Once attempts are exhausted
+    /// the job is dead-lettered and the effects are applied atomically with
+    /// that transition, exactly as in [`Self::ack_with`], and the call returns
     /// [`NackOutcome::DeadLettered`].
     #[instrument(skip(self, claim, effects), fields(queue = %claim.queue, job_id = %claim.id))]
     pub async fn nack_with(
@@ -1220,28 +1198,27 @@ impl Queue {
         }
     }
 
-    /// Dead-letter a claimed job immediately, regardless of its `attempts`.
-    /// Use this when the failure is *known* to be permanent and retrying
-    /// would be wasted work.
+    /// Dead-letter a claimed job immediately, regardless of its `attempts`. Use
+    /// this when the failure is *known* to be permanent and a retry cannot
+    /// succeed.
     ///
-    /// Unlike [`Self::nack`], this does not increment `attempts` or schedule
-    /// a backoff: the job goes straight to the dead-letter set.
+    /// Unlike [`Self::nack`], this does not increment `attempts` or schedule a
+    /// backoff: the job goes straight to the dead-letter set.
     /// [`worker::run_worker`](crate::worker::run_worker) and
     /// [`worker::run_worker_concurrent`](crate::worker::run_worker_concurrent)
-    /// dead-letter through [`Self::dead_letter_with`] when a worker
-    /// returns [`worker::PermanentFailure`](crate::worker::PermanentFailure).
+    /// dead-letter through [`Self::dead_letter_with`] when a worker returns
+    /// [`worker::PermanentFailure`](crate::worker::PermanentFailure).
     pub async fn dead_letter(&self, claim: &Claim, reason: &str) -> Result<()> {
         self.dead_letter_with(claim, reason, SettlementEffects::default())
             .await
             .map(|_| ())
     }
 
-    /// Dead-letter a claimed job and apply `effects` in the same
-    /// transaction.
+    /// Dead-letter a claimed job and apply `effects` in the same transaction.
     ///
-    /// Behaves like [`Self::dead_letter`]; the effects behave exactly
-    /// as in [`Self::ack_with`], and the returned results align
-    /// index-wise with the effects' enqueues.
+    /// Behaves like [`Self::dead_letter`]. The effects behave exactly as in
+    /// [`Self::ack_with`], and the returned results align index-wise with the
+    /// effects' enqueues.
     #[instrument(skip(self, claim, effects), fields(queue = %claim.queue, job_id = %claim.id))]
     pub async fn dead_letter_with(
         &self,
@@ -1257,13 +1234,12 @@ impl Queue {
     }
 
     /// The settlement of a claim, shared by [`Self::ack_with`],
-    /// [`Self::nack_with`] and [`Self::dead_letter_with`]. The effects
-    /// are prepared once before the retry loop. Every iteration fences
-    /// the claim, chooses the transition from the stored record and
-    /// the current time with `end_for`, stages it and, when the
-    /// transition is terminal, stages the effects. Returns the written
-    /// record and the effects' results, `None` when the transition
-    /// discarded them.
+    /// [`Self::nack_with`] and [`Self::dead_letter_with`]. The effects are
+    /// prepared once before the retry loop. Every iteration fences the claim,
+    /// chooses the transition from the stored record and the current time with
+    /// `end_for`, stages it and, when the transition is terminal, stages the
+    /// effects. Returns the written record and the effects' results, `None`
+    /// when the transition discarded them.
     async fn settle_claim<'e>(
         &self,
         claim: &Claim,
@@ -1277,9 +1253,8 @@ impl Queue {
         let settled: Result<SettledClaim<'e>> = {
             let (prepared, end_for) = (&prepared, &end_for);
             retry(&self.core.db, Durability::Awaited, |txn| async move {
-                // The returned record is the base for the written
-                // record; the claim's copy predates a cancel committed
-                // during the delivery.
+                // The returned record is the base for the written record. The
+                // claim's copy predates a cancel committed during the delivery.
                 let mut job =
                     take_claim(&txn, &self.core.lease_registry, queue, id, claim_id).await?;
                 let now = self.now_ms();
@@ -1320,16 +1295,15 @@ impl Queue {
         Ok((settled.job, settled.results))
     }
 
-    /// Move the dead-letter job `id` back to the pending queue for a
-    /// fresh attempt.
+    /// Move the dead-letter job `id` back to the pending queue for a fresh
+    /// attempt.
     ///
-    /// Resets `attempts` to 0 and clears `last_error`, so the job is
-    /// delivered up to its `max_attempts` again. The stored record is
-    /// read inside the transaction, and the commit is durable before
-    /// the call returns. A job without a record, removed by the
-    /// retention sweep or by a concurrent revival, is
-    /// [`Error::JobNotFound`], and a job in any state other than `Dead`
-    /// is [`Error::InvalidState`].
+    /// Resets `attempts` to 0 and clears `last_error`, so the job is delivered
+    /// up to its `max_attempts` again. The stored record is read inside the
+    /// transaction, and the commit is durable before the call returns. A job
+    /// without a record, removed by the retention sweep or by a concurrent
+    /// revival, is [`Error::JobNotFound`], and a job in any state other than
+    /// `Dead` is [`Error::InvalidState`].
     #[instrument(skip(self), fields(job_id = %id))]
     pub async fn requeue_dead_job(&self, id: &str) -> Result<()> {
         let (job, pending): (JobRecord, Vec<u8>) = self
@@ -1377,27 +1351,25 @@ impl Queue {
         Ok(())
     }
 
-    /// Extend the lease on a claimed job, returning the new expiry as
-    /// epoch milliseconds.
+    /// Extend the lease on a claimed job, returning the new expiry as epoch
+    /// milliseconds.
     ///
     /// Call this periodically for long-running jobs to prevent the reaper from
     /// treating them as abandoned and re-queuing them.
     ///
-    /// The lease is process state, so renewal is a synchronous memory
-    /// operation with no durable write. The claim is unchanged and
-    /// stays valid for settlement; [`Self::lease_expiry`] reports the
-    /// current value.
+    /// The lease is process state, so renewal is a synchronous memory operation
+    /// without a durable write. The claim is unchanged and stays valid for
+    /// settlement, and [`Self::lease_expiry`] reports the current value.
     ///
-    /// Fails with [`Error::ClaimLost`] once the claim has ended or the
-    /// reaper has begun re-queuing the expired lease. Fails with
-    /// [`Error::CancelRequested`] once [`Self::cancel`] has been called
-    /// on the job, leaving the lease to expire.
+    /// Fails with [`Error::ClaimLost`] once the claim ended or the reaper began
+    /// re-queuing the expired lease. Fails with [`Error::CancelRequested`] once
+    /// [`Self::cancel`] was called on the job, and the lease then expires.
     ///
-    /// This method serves callers that call [`Self::claim`] /
-    /// [`Self::claim_batch`] directly and hold the [`Claim`]. Inside
-    /// a [`Worker::process`](crate::worker::Worker::process) hook the
-    /// claim stays with the worker loop; extend the lease there through
-    /// the [`crate::LeaseHandle`] the hook receives.
+    /// This method is for callers that call [`Self::claim`] /
+    /// [`Self::claim_batch`] directly and hold the [`Claim`]. Inside a
+    /// [`Worker::process`](crate::worker::Worker::process) hook the claim stays
+    /// with the worker loop. Extend the lease there through the
+    /// [`crate::LeaseHandle`] that the hook receives.
     #[instrument(skip(self, claim), fields(queue = %claim.queue, job_id = %claim.id))]
     pub fn renew_lease(&self, claim: &Claim, extension: Duration) -> Result<u64> {
         let job = claim.job();
@@ -1421,9 +1393,9 @@ impl Queue {
     /// The current lease expiry of a claimed job, as epoch milliseconds.
     ///
     /// The lease is process state, so this is a synchronous read of the
-    /// in-memory lease registry and reflects any renewal. Returns `None`
-    /// when no live lease for the job exists in this process, including
-    /// when the job is in any state other than `Claimed`.
+    /// in-memory lease registry and reflects any renewal. Returns `None` when
+    /// no live lease for the job exists in this process, including when the job
+    /// is in any state other than `Claimed`.
     pub fn lease_expiry(&self, queue: &str, id: &str) -> Option<u64> {
         let queue = QueueName::new(queue).ok()?;
         self.core
@@ -1434,35 +1406,35 @@ impl Queue {
 
     /// Wait until the given job reaches a terminal state.
     ///
-    /// Wake-up is notification-based: every terminal transition in the
-    /// queue (`ack`, `nack` past `max_attempts`, `dead_letter`,
-    /// `cancel`-Removed, reaper dead-letter) delivers its outcome to the
-    /// tasks waiting on that job. There is no per-job polling.
-    /// Transient transitions (a `nack` that re-queues for retry, the
-    /// reaper re-queuing an expired lease, the scheduler promoting a
-    /// scheduled job) do **not** wake the wait: they are not terminal.
+    /// Wake-up is notification-based: every terminal transition in the queue
+    /// (`ack`, `nack` past `max_attempts`, `dead_letter`, `cancel`-Removed,
+    /// reaper dead-letter) delivers its outcome to the tasks waiting on that
+    /// job. There is no per-job polling. Transient transitions (a `nack` that
+    /// re-queues for retry, the reaper re-queuing an expired lease, the
+    /// scheduler promoting a scheduled job) do **not** wake the wait: they are
+    /// not terminal.
     ///
-    /// See [`WaitOutcome`] for the transition each variant reports and
-    /// whether it carries a record. [`Self::wait_for_completion_timeout`]
-    /// bounds the wait.
+    /// See [`WaitOutcome`] for the transition each variant reports and whether
+    /// it contains a record. [`Self::wait_for_completion_timeout`] bounds the
+    /// wait.
     ///
     /// # Multiple waiters per job
     ///
-    /// Several tasks may wait on the same job ID concurrently; each
+    /// Several tasks can wait on the same job ID concurrently, and each
     /// receives the same outcome when the terminal transition fires.
     ///
     /// # Already-terminal jobs
     ///
-    /// If the job is already terminal (`Done` with `keep_done_jobs`, or
-    /// `Dead`) at call time, this returns immediately with the kept
-    /// record. There is no need to subscribe before enqueueing as the
-    /// pre-check covers it.
+    /// If the job is already terminal (`Done` with `keep_done_jobs`, or `Dead`)
+    /// at call time, this returns immediately with the kept record. A
+    /// subscription before the enqueue is unnecessary, because the pre-check
+    /// covers it.
     ///
     /// # Across-process semantics
     ///
-    /// The completion signal is in-process. A wait in process A on a job
-    /// being worked in process B is not supported; taquba is
-    /// single-process by design.
+    /// The completion signal is in-process. A wait in process A on a job worked
+    /// in process B is not supported, because taquba is single-process by
+    /// design.
     pub async fn wait_for_completion(&self, id: &str) -> Result<WaitOutcome> {
         match self.completion(id).await? {
             Completion::Settled(outcome) => Ok(outcome),
@@ -1470,8 +1442,8 @@ impl Queue {
         }
     }
 
-    /// [`Self::wait_for_completion`] bounded by `timeout`: `None` when
-    /// the timeout elapses before the job reaches a terminal state.
+    /// [`Self::wait_for_completion`] bounded by `timeout`: `None` when the
+    /// timeout elapses before the job reaches a terminal state.
     pub async fn wait_for_completion_timeout(
         &self,
         id: &str,
@@ -1489,9 +1461,9 @@ impl Queue {
     }
 
     async fn completion(&self, id: &str) -> Result<Completion> {
-        // Registered before the storage read: a terminal transition
-        // that commits after the read then reaches the registration,
-        // and one that commits before it is visible in the read.
+        // Registered before the storage read: a terminal transition that
+        // commits after the read then reaches the registration, and one that
+        // commits before it is visible in the read.
         let mut registration = self.core.completion_waiters.register(id);
 
         match self.view().get_job(id).await? {
@@ -1500,10 +1472,9 @@ impl Queue {
                 JobStatus::Dead => Ok(Completion::Settled(WaitOutcome::Dead(Box::new(job)))),
                 _ => Ok(Completion::Pending(registration)),
             },
-            // A transition that removed the record between the
-            // registration and the read has delivered its outcome, or
-            // is about to; the registration is consulted before the ID
-            // is reported absent.
+            // A transition that removed the record between the registration and
+            // the read delivered its outcome already, or is about to. The
+            // registration is consulted before the ID is reported absent.
             None => Ok(Completion::Settled(
                 registration.try_outcome().unwrap_or(WaitOutcome::NotFound),
             )),
@@ -1535,15 +1506,14 @@ impl Queue {
             .map(|(outcome, _)| outcome)
     }
 
-    /// Cancel a job and apply `effects` in the same transaction as its
-    /// removal.
+    /// Cancel a job and apply `effects` in the same transaction as its removal.
     ///
-    /// Behaves like [`Self::cancel`]. On [`CancelOutcome::Removed`]
-    /// the effects are applied atomically with the removal, exactly as
-    /// in [`Self::ack_with`], and the returned results align
-    /// index-wise with the effects' enqueues. On every other outcome
-    /// the effects are discarded and the results are empty; a claimed
-    /// job's terminal settlement supplies its own effects.
+    /// Behaves like [`Self::cancel`]. On [`CancelOutcome::Removed`] the effects
+    /// are applied atomically with the removal, exactly as in
+    /// [`Self::ack_with`], and the returned results align index-wise with the
+    /// effects' enqueues. On every other outcome the effects are discarded and
+    /// the results are empty. A claimed job's terminal settlement passes its
+    /// own effects.
     pub async fn cancel_with(
         &self,
         id: &str,
@@ -1564,9 +1534,9 @@ impl Queue {
         outcome
     }
 
-    /// The transaction loop of [`Self::cancel_with`]: resolve the job,
-    /// apply the transition its state allows and commit, including the
-    /// post-commit notifications of the committed outcome.
+    /// The transaction loop of [`Self::cancel_with`]: resolve the job, apply
+    /// the transition its state allows and commit, including the post-commit
+    /// notifications of the committed outcome.
     async fn cancel_txn(
         &self,
         id: &str,
@@ -1592,9 +1562,9 @@ impl Queue {
                         }
                         JobStatus::Claimed => {
                             if job.cancel_requested {
-                                // The flag is already persisted. The token
-                                // is fired again, because a re-claim after
-                                // the first request has a fresh token.
+                                // The flag is already persisted. The token is
+                                // fired again, because a re-claim after the
+                                // first request has a fresh token.
                                 txn.rollback();
                                 self.core.lease_registry.cancel(&job.queue, id);
                                 debug!(job_id = %id, "cancel re-requested on claimed job");
@@ -1622,19 +1592,19 @@ impl Queue {
             Ok(committed) => committed,
             Err(outcome) => return Ok((outcome, Vec::new())),
         };
-        // Fired on the Removed path as well: the worker of a claim the
-        // reaper requeued just before this call can still observe the
-        // token. That claim's end removes the entry.
+        // Fired on the Removed path as well: the worker of a claim the reaper
+        // requeued just before this call can still observe the token. That
+        // claim's end removes the entry.
         self.core.lease_registry.cancel(&job.queue, id);
         let results = staged
             .map(|s| self.core.note_staged_effects(s))
             .unwrap_or_default();
-        // Removed = terminal (job is gone). Requested = not yet
-        // terminal; the worker's settlement delivers the outcome when it
-        // acks / nacks / dead-letters.
+        // Removed = terminal (job is gone). Requested = not yet terminal, and
+        // the worker's settlement delivers the outcome when it acks / nacks /
+        // dead-letters.
         if matches!(outcome, CancelOutcome::Removed) {
-            // The record is deleted, so its payload object (if any) is
-            // removed here, after the commit.
+            // The record is deleted, so its payload object (if any) is removed
+            // here, after the commit.
             self.core.payload_store.delete_for(&job).await;
             self.core
                 .completion_waiters
@@ -1647,26 +1617,25 @@ impl Queue {
     /// Move a `Scheduled` job to pending immediately, before its `run_at`,
     /// optionally attaching `wake_payload` bytes to the record.
     ///
-    /// This is the targeted counterpart of the scheduler's due-job
-    /// promotion: the same transition (scheduled to pending), applied to one
-    /// job by ID at the caller's initiative instead of at `run_at`. On
-    /// [`WakeOutcome::Woken`] the job is claimable immediately and any
-    /// worker waiting on the queue is notified.
+    /// This is the targeted counterpart of the scheduler's due-job promotion:
+    /// the same transition (scheduled to pending), applied to one job by ID
+    /// when the caller asks, without waiting for `run_at`. On
+    /// [`WakeOutcome::Woken`] the job is claimable immediately and any worker
+    /// waiting on the queue is notified.
     ///
-    /// The wake stamps [`JobRecord::woken_at`], so a worker can
-    /// distinguish an early wake from ordinary promotion at `run_at`
-    /// regardless of whether bytes were attached. `wake_payload` is
-    /// stored on [`JobRecord::wake_payload`]. Both values persist on the
-    /// record across later transitions, so redelivery after a lease
-    /// expiry observes them again. The payload contributes to the
-    /// serialized record that is rewritten on each transition; it is
-    /// intended for coordination data, not bulk payload.
+    /// The wake sets [`JobRecord::woken_at`], which distinguishes an early wake
+    /// from ordinary promotion at `run_at` regardless of whether bytes were
+    /// attached. `wake_payload` is stored on [`JobRecord::wake_payload`]. Both
+    /// values persist on the record across later transitions, so redelivery
+    /// after a lease expiry observes them again. The payload is part of the
+    /// serialized record that each transition rewrites. It is intended for
+    /// coordination data, and bulk payload does not belong in it.
     ///
     /// Exactly one caller wins the transition: a concurrent scheduler
     /// promotion, `wake_scheduled` call, or [`Self::cancel`] and this call
     /// conflict on the scheduled record, and the loser observes
-    /// [`WakeOutcome::NotScheduled`] or [`WakeOutcome::NotFound`]. The
-    /// commit is durable before the call returns.
+    /// [`WakeOutcome::NotScheduled`] or [`WakeOutcome::NotFound`]. The commit
+    /// is durable before the call returns.
     pub async fn wake_scheduled(
         &self,
         id: &str,
@@ -1707,9 +1676,9 @@ impl Queue {
 
     /// Enqueue multiple jobs atomically in a single transaction.
     ///
-    /// All jobs use the queue's configured `max_attempts` and `default_priority`.
-    /// Returns the IDs in the same order as `payloads`. The enqueues are
-    /// committed as the effects of [`Self::commit_effects`].
+    /// All jobs use the queue's configured `max_attempts` and
+    /// `default_priority`. Returns the IDs in the same order as `payloads`. The
+    /// enqueues are committed as the effects of [`Self::commit_effects`].
     pub async fn enqueue_batch(&self, queue: &str, payloads: Vec<Vec<u8>>) -> Result<Vec<String>> {
         if payloads.is_empty() {
             return Ok(Vec::new());
@@ -1742,22 +1711,22 @@ impl Queue {
         self.core.reap_expired().await
     }
 
-    /// Trigger an immediate scheduled-job promotion sweep (primarily useful in tests).
+    /// Trigger an immediate scheduled-job promotion sweep (primarily useful in
+    /// tests).
     pub async fn promote_scheduled_now(&self) -> Result<()> {
         self.core.promote_due_jobs().await
     }
 
-    /// Shut down the background reaper and scheduler, persist each
-    /// queue's claim-scan state, then close the underlying database.
+    /// Shut down the background reaper and scheduler, persist each queue's
+    /// claim-scan state, then close the underlying database.
     ///
-    /// The persisted state lets the next open resume claims at the
-    /// recorded bound without a scan of the tombstone band left by
-    /// previously claimed jobs. It is written best-effort: a failed
-    /// write is logged, the database still closes, and the next open
-    /// scans from the front of the prefix. With
-    /// [`OpenOptions::liveness_heartbeat`] set, a final beat marked
-    /// closed is committed best-effort as well, so readers can
-    /// distinguish this close from a writer that stopped committing beats.
+    /// The persisted state lets the next open resume claims at the recorded
+    /// bound without a scan of the tombstone band left by previously claimed
+    /// jobs. It is written best-effort: a failed write is logged, the database
+    /// still closes and the next open scans from the front of the prefix. With
+    /// [`OpenOptions::liveness_heartbeat`] set, a final beat marked closed is
+    /// committed best-effort as well, so readers can distinguish this close
+    /// from a writer that stopped committing beats.
     pub async fn close(self) -> Result<()> {
         tokio::join!(self.reaper_task.stop(), self.scheduler_task.stop(), async {
             if let Some(sampler) = self.metrics_sampler {
@@ -1897,7 +1866,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::InvalidId { .. }));
 
-        // No job should have been written for any of the rejected ids.
+        // No job is written for any of the rejected ids.
         assert!(
             q.claim("email", Duration::from_secs(30))
                 .await
@@ -2186,7 +2155,7 @@ mod tests {
         assert_eq!(dead[0].status, JobStatus::Dead);
         assert!(dead[0].failed_at.is_some());
 
-        // Requeue and verify it's workable again
+        // A requeued dead job is claimable again.
         q.requeue_dead_job(&dead[0].id).await.unwrap();
 
         let revived = q
@@ -2207,8 +2176,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_revival_is_durable_before_the_call_returns() {
-        // A flush interval longer than the test, so a write is durable
-        // only when its commit awaits the flush.
+        // A flush interval longer than the test, so a write is durable only
+        // when its commit awaits the flush.
         let opts = || OpenOptions {
             flush_interval: Some(Duration::from_secs(3600)),
             ..OpenOptions::default()
@@ -2243,8 +2212,8 @@ mod tests {
             .unwrap();
         q.requeue_dead_job(&dead.id).await.unwrap();
 
-        // A crash inside the flush window: closing without a flush
-        // discards every write that is not durable.
+        // A crash inside the flush window: closing without a flush discards
+        // every write that is not durable.
         q.core
             .db
             .close_with_options(slatedb::config::CloseOptions::default().with_flush_type(None))
@@ -2321,7 +2290,8 @@ mod tests {
     async fn test_priority_ordering() {
         let q = Queue::open(make_store(), "test").await.unwrap();
 
-        // Enqueue in reverse priority order to prove ordering is by priority, not insertion.
+        // Enqueue in reverse priority order, so insertion order and priority
+        // order differ.
         let id_low = q
             .enqueue_with(
                 "jobs",
@@ -2381,8 +2351,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_ids_increase_within_one_millisecond() {
-        // A clock that never advances puts every id in one millisecond,
-        // which is the case a non-monotonic id source orders arbitrarily.
+        // A clock that never advances puts every id in one millisecond, which
+        // is the case a non-monotonic id source orders arbitrarily.
         let clock = MockClock::new(1_700_000_000_000);
         let q = Queue::open_with_options(
             make_store(),
@@ -2397,7 +2367,7 @@ mod tests {
 
         let ids: Vec<String> = (0..10).map(|_| q.next_job_id()).collect();
 
-        // The first ten characters of a ULID are its millisecond timestamp.
+        // The first ten characters of a ULID encode its millisecond timestamp.
         assert!(
             ids.iter().all(|id| id[..10] == ids[0][..10]),
             "every id must carry the frozen clock's millisecond"
@@ -2439,7 +2409,8 @@ mod tests {
             .await
             .unwrap();
 
-        // A high-priority job that is nacked should still come back before a normal job.
+        // A high-priority job that is nacked still comes back before a normal
+        // job.
         let id_high = q
             .enqueue_with(
                 "jobs",
@@ -2472,7 +2443,7 @@ mod tests {
 
         q.nack(&job, "retry me").await.unwrap();
 
-        // High-priority job should be claimed again before the normal one.
+        // The high-priority job is claimed again before the normal one.
         let reclaimed = q
             .claim("jobs", Duration::from_secs(30))
             .await
@@ -2493,14 +2464,14 @@ mod tests {
             .await
             .unwrap();
         let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
-        // The durable enqueue has flushed the WAL, so its objects exist
-        // and only the configured WAL store holds them.
+        // The durable enqueue flushed the WAL, so its objects exist and only
+        // the configured WAL store contains them.
         assert!(object_count(&wal_store, "test/wal").await > 0);
         assert_eq!(object_count(&store, "test/wal").await, 0);
         drop(q);
 
-        // The enqueue was not flushed to the primary store, so recovery
-        // at open replays it from the WAL store.
+        // The enqueue was not flushed to the primary store, so recovery at open
+        // replays it from the WAL store.
         let q = Queue::open_with_options(store, "test", opts())
             .await
             .unwrap();
@@ -2511,7 +2482,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dead_letter_skips_attempts_check() {
-        // dead_letter() should move a job claimed -> dead unconditionally,
+        // dead_letter() moves a job claimed -> dead unconditionally,
         // without bumping attempts or honouring max_attempts.
         let q = Queue::open_with_options(
             make_store(),
@@ -2567,11 +2538,9 @@ mod tests {
 
         let id = q.enqueue("work", b"payload".to_vec()).await.unwrap();
 
-        // Pending
         let job = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Pending);
 
-        // Claimed
         let claimed = q
             .claim("work", Duration::from_secs(30))
             .await
@@ -2580,7 +2549,6 @@ mod tests {
         let job = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Claimed);
 
-        // Done
         q.ack(&claimed).await.unwrap();
         let job = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Done);
@@ -2711,7 +2679,8 @@ mod tests {
         assert_eq!(q.cancel(&job.id).await.unwrap(), CancelOutcome::Requested);
         assert!(token.is_cancelled());
 
-        // Worker can still ack normally; cancellation is cooperative.
+        // The worker can still ack normally, because cancellation is
+        // cooperative.
         q.ack(&job).await.unwrap();
         q.close().await.unwrap();
     }
@@ -2897,19 +2866,20 @@ mod tests {
             .await
             .unwrap();
 
-        // Claim and nack the first job; with no backoff it goes back to pending.
+        // Claim and nack the first job. Without a backoff it goes back to
+        // pending.
         let job = q
             .claim("work", Duration::from_secs(30))
             .await
             .unwrap()
             .unwrap();
         // After claim, dedup_key must be cleared on the record so a future
-        // claim doesn't try to release the (now reused) index.
+        // claim does not try to release the (now reused) index.
         assert!(job.dedup_key.is_none());
         q.nack(&job, "transient").await.unwrap();
 
-        // A fresh enqueue_unique with the same key should be accepted now
-        // (claim released the index) and create a different job.
+        // A fresh enqueue_unique with the same key is accepted now (claim
+        // released the index) and creates a different job.
         let id2 = q
             .enqueue_with(
                 "work",
@@ -2923,16 +2893,16 @@ mod tests {
             .unwrap();
         assert_ne!(id1, id2);
 
-        // Drain both jobs; both must complete and the second job's dedup
-        // index must remain intact while it sits in pending.
+        // Drain both jobs. Both must complete, and the second job's dedup index
+        // must remain intact while it sits in pending.
         let j1 = q
             .claim("work", Duration::from_secs(30))
             .await
             .unwrap()
             .unwrap();
-        // While j1 is claimed (and may be the retry of id1), a third
-        // enqueue_unique with the same key must STILL be blocked by id2's
-        // index entry.
+        // While j1 is claimed (and can be the retry of id1), a third
+        // enqueue_unique with the same key must STILL be blocked by id2's index
+        // entry.
         let id3 = q
             .enqueue_with(
                 "work",
@@ -3120,8 +3090,8 @@ mod tests {
                 .len()
         }
 
-        // A different value and a wrong absence expectation do not apply
-        // the effects.
+        // A different value and a wrong absence expectation do not apply the
+        // effects.
         assert!(
             q.kv_compare_commit(&[(b"runs/1", Some(b"stale"))], effects())
                 .await
@@ -3301,8 +3271,8 @@ mod tests {
         q.close().await.unwrap();
     }
 
-    // Every claimed record must hold a registry entry; a record
-    // without one is invisible to the reaper until the next open.
+    // Every claimed record must have a registry entry. A record without one is
+    // invisible to the reaper until the next open.
 
     #[tokio::test]
     async fn claim_by_id_claims_the_named_pending_job_and_consumes_an_attempt() {

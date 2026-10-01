@@ -54,8 +54,8 @@ impl Handle {
 
 /// The read-only queries of a store. [`Queue::view`](crate::Queue::view)
 /// returns the writer's live view, and
-/// [`QueueReader::view`](crate::QueueReader::view) returns a reader's
-/// lagging view, with the same methods on both.
+/// [`QueueReader::view`](crate::QueueReader::view) returns a reader's lagging
+/// view, with the same methods on both.
 #[derive(Clone)]
 pub struct QueueView {
     handle: Handle,
@@ -144,11 +144,10 @@ impl QueueView {
     /// [`QueueView::get_job`] returns the record with its payload. The listing
     /// is exhausted when [`JobPage::next_cursor`] is `None`.
     ///
-    /// The pending, claimed and dead key spaces group by queue, so those
-    /// scans cover only the requested queue. The scheduled and done
-    /// listings scan a key space that leads with a timestamp for the
-    /// background sweeps, so they cover every queue and filter on the
-    /// queue name.
+    /// The pending, claimed and dead key spaces group by queue, so those scans
+    /// cover only the requested queue. The scheduled and done listings scan a
+    /// key space that leads with a timestamp for the background sweeps, so they
+    /// cover every queue and filter on the queue name.
     pub async fn list_jobs(
         &self,
         queue: &str,
@@ -164,9 +163,8 @@ impl QueueView {
         if limit == 0 {
             return Ok(empty);
         }
-        // `filter_queue` enables the queue-name filter on each scanned
-        // record and is set only for the key spaces that cover every
-        // queue.
+        // `filter_queue` enables the queue-name filter on each scanned record
+        // and is set only for the key spaces that cover every queue.
         let (prefix, filter_queue) = match status {
             JobStatus::Pending => (pending_prefix(&queue), false),
             JobStatus::Dead => (dead_prefix(&queue), false),
@@ -230,8 +228,8 @@ impl QueueView {
     /// or the `id` of the last job of the previous page to resume. `limit` caps
     /// the number of jobs returned.
     ///
-    /// Jobs are returned in ULID order, which corresponds to the order in
-    /// which they were originally enqueued, in the stored form of
+    /// Jobs are returned in ULID order, which corresponds to the order in which
+    /// they were originally enqueued, in the stored form of
     /// [`QueueView::list_jobs`].
     pub async fn dead_jobs(
         &self,
@@ -239,9 +237,9 @@ impl QueueView {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<JobRecord>> {
-        // Dead keys are the queue's dead prefix followed by the job id,
-        // so an id cursor converts to the key cursor of the equivalent
-        // `list_jobs` call.
+        // Dead keys are the queue's dead prefix followed by the job id, so an
+        // id cursor converts to the key cursor of the equivalent `list_jobs`
+        // call.
         let queue = QueueName::new(queue)?;
         let cursor = after.map(|id| dead_key(&queue, id));
         Ok(self
@@ -252,10 +250,10 @@ impl QueueView {
 
     /// Look up a job by ID regardless of its current state.
     ///
-    /// Returns `None` for an ID that was never enqueued or whose records
-    /// are removed. The writer's view reads the index and the record
-    /// from one snapshot, and a reader's view reads them as two plain
-    /// reads of its lagging view.
+    /// Returns `None` for an ID that was never enqueued or whose records are
+    /// removed. The writer's view reads the index and the record from one
+    /// snapshot, and a reader's view reads them as two plain reads of its
+    /// lagging view.
     pub async fn get_job(&self, id: &str) -> Result<Option<JobRecord>> {
         let Some((index_key, mut job)) = self.indexed_job(id).await? else {
             return Ok(None);
@@ -308,10 +306,9 @@ impl QueueView {
 
     /// Return a job's recorded delivery history, in write order.
     ///
-    /// Each settlement of a claim appends one [`JobAttempt`]: an ack on a
-    /// queue with
-    /// [`QueueConfig::keep_done_jobs`](crate::QueueConfig::keep_done_jobs) set,
-    /// a [`Queue::nack`](crate::Queue::nack), a
+    /// Each settlement of a claim appends one [`JobAttempt`]: an ack on a queue
+    /// with [`QueueConfig::keep_done_jobs`](crate::QueueConfig::keep_done_jobs)
+    /// set, a [`Queue::nack`](crate::Queue::nack), a
     /// [`Queue::dead_letter`](crate::Queue::dead_letter) and the reaper's
     /// handling of an expired lease.
     /// [`Queue::requeue_dead_job`](crate::Queue::requeue_dead_job) appends an
@@ -319,10 +316,10 @@ impl QueueView {
     /// keeps the prior entries.
     ///
     /// The transaction that removes the job's last record also removes its
-    /// history, so a job for which [`QueueView::get_job`] returns `None`
-    /// has an empty history. An ack on a queue without retention removes
-    /// the history and does not record the completed attempt. A later job
-    /// enqueued with the same id through
+    /// history, so a job for which [`QueueView::get_job`] returns `None` has an
+    /// empty history. An ack on a queue without retention removes the history
+    /// and does not record the completed attempt. A later job enqueued with the
+    /// same id through
     /// [`EnqueueOptions::id_override`](crate::EnqueueOptions::id_override)
     /// starts with an empty history.
     pub async fn attempt_history(&self, id: &str) -> Result<Vec<JobAttempt>> {
@@ -332,8 +329,8 @@ impl QueueView {
         }
     }
 
-    /// The stored liveness beat in its public form, or `None` when no
-    /// writer has ever written one.
+    /// The stored liveness beat in its public form, or `None` when no writer
+    /// has ever written one.
     pub(crate) async fn writer_heartbeat(&self) -> Result<Option<WriterHeartbeat>> {
         match self.handle.get(&heartbeat_key()).await? {
             Some(bytes) => {
@@ -346,31 +343,31 @@ impl QueueView {
 
     /// Read a value from the user KV namespace.
     ///
-    /// Caller-supplied keys are internally scoped under a reserved
-    /// user key tag and cannot collide with Taquba's internal layout.
+    /// Caller-supplied keys are internally scoped under a reserved user key tag
+    /// and cannot collide with Taquba's internal layout.
     pub async fn kv_get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.handle.get(&user_scoped_key(key)).await
     }
 
-    /// List entries of the user KV namespace under `prefix` within
-    /// `range`, in ascending byte order of the keys.
+    /// List entries of the user KV namespace under `prefix` within `range`, in
+    /// ascending byte order of the keys.
     ///
-    /// An empty `prefix` lists the whole namespace, and `..` lists every
-    /// key within the prefix. The bounds of `range`, a [`KvRange`], are
-    /// keys in the caller namespace: `key..` begins at `key`, and
+    /// An empty `prefix` lists the whole namespace, and `..` lists every key
+    /// within the prefix. The bounds of `range`, a [`KvRange`], are keys in the
+    /// caller namespace: `key..` begins at `key`, and
     /// `(Bound::Excluded(key), Bound::Unbounded)` begins after it, which
-    /// continues a listing from the last key of a page. The page contains
-    /// the keys within the prefix that the range contains. A bound
-    /// outside the prefix is correct as given, and a range without such
-    /// a key returns an empty page. The listing is not a snapshot, so an
-    /// entry written or deleted between page reads is missed or observed
-    /// depending on the position of its key.
+    /// continues a listing from the last key of a page. The page contains the
+    /// keys within the prefix that the range contains. A bound outside the
+    /// prefix is correct as given, and a range without such a key returns an
+    /// empty page. The listing is not a snapshot, so an entry written or
+    /// deleted between page reads is missed or observed depending on the
+    /// position of its key.
     ///
-    /// Only caller-namespace entries are returned, and Taquba's internal
-    /// key spaces are never visible here. This is the enumeration and
-    /// export primitive for the namespace: a full sweep (`prefix = b""`,
-    /// `..`, continued while [`KvPage::more`]) observes every entry that
-    /// existed for the whole sweep.
+    /// Only caller-namespace entries are returned, and Taquba's internal key
+    /// spaces are never visible here. This is the enumeration and export
+    /// primitive for the namespace: a full sweep (`prefix = b""`, `..`,
+    /// continued while [`KvPage::more`]) observes every entry that existed for
+    /// the whole sweep.
     pub async fn kv_scan(
         &self,
         prefix: &[u8],
@@ -405,11 +402,11 @@ impl QueueView {
         Ok(KvPage { entries, more })
     }
 
-    /// Every entry of the user KV namespace under `prefix` within
-    /// `range`, in ascending byte order of the keys, as one stream that
-    /// reads through [`QueueView::kv_scan`] `page_size` entries at a
-    /// time. A consumer that stops reading does not fetch a further
-    /// page. The listing semantics are those of `kv_scan`.
+    /// Every entry of the user KV namespace under `prefix` within `range`, in
+    /// ascending byte order of the keys, as one stream that reads through
+    /// [`QueueView::kv_scan`] `page_size` entries at a time. A consumer that
+    /// stops reading does not fetch a further page. The listing semantics are
+    /// those of `kv_scan`.
     pub fn kv_entries<'a>(
         &'a self,
         prefix: &'a [u8],
@@ -461,10 +458,9 @@ fn side(prefix: &[u8], bound: Bound<&[u8]>) -> Side {
     }
 }
 
-/// The bounds of `range` on the part of the key after `prefix`, as the
-/// scan takes them, or `None` for a range without a key within the
-/// prefix. The store rejects an empty range, and the test of the bounds
-/// here is the store's test.
+/// The bounds of `range` on the part of the key after `prefix` in the form the
+/// scan takes, or `None` for a range without a key within the prefix. The store
+/// rejects an empty range, and the test of the bounds here is the store's test.
 fn subrange(prefix: &[u8], range: impl KvRange) -> Option<(Bound<Bytes>, Bound<Bytes>)> {
     let start = match side(prefix, range.start_bound()) {
         Side::Before => Bound::Unbounded,
@@ -484,18 +480,17 @@ fn subrange(prefix: &[u8], range: impl KvRange) -> Option<(Bound<Bytes>, Bound<B
     non_empty.then_some((start, end))
 }
 
-/// The items of a paged read as one stream, fetched one page at a
-/// time: `fetch` takes the cursor of the page to read, `None` for the
-/// first, and returns the page's items with the cursor of the next
-/// page, `None` once the read is exhausted. A consumer that stops
-/// reading fetches no further page.
+/// The items of a paged read as one stream, fetched one page at a time: `fetch`
+/// takes the cursor of the page to read, `None` for the first, and returns the
+/// page's items with the cursor of the next page, `None` once the read is
+/// exhausted. A consumer that stops reading does not fetch a further page.
 fn pages<T, F, Fut>(fetch: F) -> impl Stream<Item = Result<T>>
 where
     F: FnMut(Option<Vec<u8>>) -> Fut,
     Fut: Future<Output = Result<(Vec<T>, Option<Vec<u8>>)>>,
 {
-    // The outer `Option` is `None` once the read is exhausted; the
-    // inner one is the cursor `fetch` takes.
+    // The outer `Option` is `None` once the read is exhausted. The inner
+    // `Option` is the cursor `fetch` takes.
     stream::try_unfold((Some(None), fetch), |(cursor, mut fetch)| async move {
         let Some(cursor) = cursor else {
             return Ok::<_, Error>(None);
@@ -629,7 +624,7 @@ mod tests {
         assert_eq!(p3.len(), 1);
         assert_eq!(p3[0].id, ids[4]);
 
-        // limit=0 returns nothing.
+        // limit=0 returns an empty page.
         assert!(
             q.view()
                 .dead_jobs("work", None, 0)
@@ -743,8 +738,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Claim order is the reverse of expiry order, so a listing
-        // ordered by lease expiry would return these in reverse order.
+        // Claim order is the reverse of expiry order, so a listing ordered by
+        // lease expiry returns these in reverse order.
         let mut handles = Vec::new();
         for secs in [90, 60, 30] {
             q.enqueue("work", vec![secs as u8]).await.unwrap();
@@ -792,9 +787,8 @@ mod tests {
             .await
             .unwrap();
         let mut expected = Vec::new();
-        // Alternate claims between the two queues, so a listing that
-        // scanned a key space covering both would page the other
-        // queue's rows in.
+        // Alternate claims between the two queues, so a listing that scans a
+        // key space covering both pages the other queue's rows in.
         for i in 0..3u8 {
             let id = q.enqueue("qa", vec![i]).await.unwrap();
             q.enqueue("qb", vec![i]).await.unwrap();
@@ -969,8 +963,8 @@ mod tests {
         q.close().await.unwrap();
     }
 
-    // One function over a view, called with the writer's view and with
-    // a reader's view of the same store.
+    // One function over a view, called with the writer's view and with a
+    // reader's view of the same store.
     async fn snapshot(
         r: &QueueView,
         id: &str,

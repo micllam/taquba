@@ -1,9 +1,9 @@
 // cargo run -p taquba --example long_running
 //
 // Demonstrates keeping a claim alive past the queue's lease with the
-// `LeaseHandle` handed to `Worker::process`, in the two supported
-// patterns: extending the lease at progress points, and covering a
-// single slow call that has a timeout.
+// `LeaseHandle` passed to `Worker::process`, in the two supported patterns:
+// extending the lease at progress points, and covering a single slow call that
+// has a timeout.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,8 +13,8 @@ use taquba::{
     object_store::memory::InMemory, run_worker,
 };
 
-// Deliberately short: the lease is a hang timer, and long work holds
-// its claim by extending it.
+// Deliberately short: the lease is a hang timer, and long work keeps its claim
+// by extending it.
 const LEASE: Duration = Duration::from_secs(2);
 const PHASE: Duration = Duration::from_secs(1);
 
@@ -29,9 +29,9 @@ impl Worker for LongRunningWorker {
     }
 }
 
-// Extend at progress points. Each phase secures enough lease before it
-// runs, so the 3s job survives the 2s lease for as long as it keeps
-// making progress; a phase that stalls lets the lease expire.
+// Extend at progress points. Each phase secures enough lease before it runs, so
+// the 3s job outlasts the 2s lease for as long as it keeps making progress. A
+// phase that stalls lets the lease expire.
 async fn phased(job: &JobRecord, lease: &LeaseHandle) -> Result<(), WorkerError> {
     for phase in 1..=3 {
         lease.ensure_at_least(PHASE)?;
@@ -41,9 +41,9 @@ async fn phased(job: &JobRecord, lease: &LeaseHandle) -> Result<(), WorkerError>
     Ok(())
 }
 
-// Cover one slow call. The call gets a timeout and the lease
-// is extended to cover it, so the two limit each other; a call with
-// no timeout gives the lease nothing to cover.
+// Cover one slow call. The call gets a timeout and the lease is extended to
+// cover it, so the two limit each other. A call without a timeout does not give
+// the lease a bound to cover.
 async fn bounded(job: &JobRecord, lease: &LeaseHandle) -> Result<(), WorkerError> {
     let bound = Duration::from_secs(3);
     lease.ensure_at_least(bound)?;
@@ -61,8 +61,8 @@ async fn external_call() -> Result<(), WorkerError> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Frequent reaper ticks, so an expired lease would be noticed
-    // well within the demo's runtime.
+    // Frequent reaper ticks, so the reaper notices an expired lease well within
+    // the demo's runtime.
     let mut opts = OpenOptions::default().reaper_interval(Duration::from_millis(500));
     opts.queue_configs.insert(
         "work".to_string(),
@@ -96,8 +96,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = shutdown_tx.send(());
     let _ = handle.await;
 
-    // Both jobs outlived the lease and still settled on their first
-    // attempt: nothing was reaped back to pending or dead-lettered.
+    // Both jobs outlived the lease and still settled on their first attempt:
+    // nothing was reaped back to pending or dead-lettered.
     let s = q.view().stats("work").await?;
     println!();
     println!(

@@ -1,6 +1,5 @@
-//! Caller-facing configuration: the per-queue and open-time
-//! configuration of a [`Queue`](crate::Queue) and the per-call enqueue
-//! overrides.
+//! Caller-facing configuration: the per-queue and open-time configuration of a
+//! [`Queue`](crate::Queue) and the per-call enqueue overrides.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,19 +12,22 @@ use crate::clock::{Clock, default_clock};
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(30);
 
-/// High-priority bucket. Jobs at this priority are dequeued before normal and low.
+/// High-priority bucket. Jobs at this priority are dequeued before normal and
+/// low.
 pub const PRIORITY_HIGH: u32 = 100;
 /// Default priority. FIFO ordering is preserved within the same priority level.
 pub const PRIORITY_NORMAL: u32 = 1_000;
-/// Low-priority bucket. Jobs at this priority are dequeued after high and normal.
+/// Low-priority bucket. Jobs at this priority are dequeued after high and
+/// normal.
 pub const PRIORITY_LOW: u32 = 10_000;
 
-/// Default value of [`OpenOptions::payload_offload_threshold`]: payloads
-/// larger than this are stored as objects in the payload object store
-/// instead of inline in the job record.
+/// Default value of [`OpenOptions::payload_offload_threshold`]: payloads larger
+/// than this are stored as objects in the payload object store, outside the job
+/// record.
 pub const DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD: usize = 256 * 1024;
 
-/// Configuration applied to a specific queue (or used as the default for all queues).
+/// Configuration applied to a specific queue (or used as the default for all
+/// queues).
 ///
 /// Construct via [`QueueConfig::default`] and override as required:
 ///
@@ -34,35 +36,39 @@ pub const DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD: usize = 256 * 1024;
 /// ```
 #[derive(Debug, Clone)]
 pub struct QueueConfig {
-    /// Maximum delivery attempts before a job is dead-lettered. Attempts
-    /// count claims: a job interrupted by a process restart is requeued
-    /// at the next open, and its next claim consumes an attempt.
+    /// Maximum delivery attempts before a job is dead-lettered. Attempts count
+    /// claims: a job interrupted by a process restart is requeued at the next
+    /// open, and its next claim consumes an attempt.
     pub max_attempts: u32,
-    /// How long a claimed job's lease lasts. Used by [`Queue::claim_next`](crate::Queue::claim_next).
+    /// How long a claimed job's lease lasts. Used by
+    /// [`Queue::claim_next`](crate::Queue::claim_next).
     pub lease_duration: Duration,
     /// Default priority assigned to jobs enqueued without an explicit priority.
-    /// Lower numbers are dequeued first. Use the [`PRIORITY_HIGH`], [`PRIORITY_NORMAL`],
-    /// and [`PRIORITY_LOW`] constants, or any `u32` value.
+    /// Lower numbers are dequeued first. Use the [`PRIORITY_HIGH`],
+    /// [`PRIORITY_NORMAL`], and [`PRIORITY_LOW`] constants, or any `u32` value.
     pub default_priority: u32,
-    /// Base delay for exponential retry backoff after a [`Queue::nack`](crate::Queue::nack).
-    /// The delay for attempt `N` is `min(retry_backoff_base * 2^(N - 1), retry_backoff_max)`.
-    /// Set to [`Duration::ZERO`] to disable backoff and re-queue immediately.
+    /// Base delay for exponential retry backoff after a
+    /// [`Queue::nack`](crate::Queue::nack). The delay for attempt `N` is
+    /// `min(retry_backoff_base * 2^(N - 1), retry_backoff_max)`. Set to
+    /// [`Duration::ZERO`] to disable backoff and re-queue immediately.
     pub retry_backoff_base: Duration,
-    /// Upper bound on the retry backoff delay. Ignored when `retry_backoff_base`
-    /// is zero.
+    /// Upper bound on the retry backoff delay. Ignored when
+    /// `retry_backoff_base` is zero.
     pub retry_backoff_max: Duration,
     /// If `Some(duration)`, completed jobs on this queue are written to the
-    /// done key space and retained for `duration`. The reaper purges them
-    /// once `completed_at + duration` has passed.
+    /// done key space and retained for `duration`. The reaper purges them once
+    /// `completed_at + duration` is past.
     ///
-    /// If `None` (default), [`Queue::ack`](crate::Queue::ack) deletes successful jobs outright.
+    /// If `None` (default), [`Queue::ack`](crate::Queue::ack) deletes
+    /// successful jobs outright.
     ///
-    /// The success counter in [`QueueStats::done`](crate::QueueStats::done) is incremented either way.
+    /// The success counter in [`QueueStats::done`](crate::QueueStats::done) is
+    /// incremented either way.
     pub keep_done_jobs: Option<Duration>,
     /// Maximum age of a dead-letter job on this queue before the retention
     /// sweep purges it. Default is 7 days, which gives operators time to
-    /// inspect or requeue without leaking storage. `None` disables the
-    /// sweep for this queue: dead jobs accumulate without bound.
+    /// inspect or requeue without leaking storage. `None` disables the sweep
+    /// for this queue: dead jobs accumulate without bound.
     pub dead_retention: Option<Duration>,
 }
 
@@ -133,102 +139,100 @@ impl Default for QueueConfig {
 
 /// Configuration for opening a [`Queue`](crate::Queue) instance.
 pub struct OpenOptions {
-    /// How often the background reaper scans for expired leases. Defaults to 5s.
-    /// The same loop also performs done- and dead-job retention sweeps.
+    /// How often the background reaper scans for expired leases. Defaults to
+    /// 5s. The same loop also performs done- and dead-job retention sweeps.
     pub reaper_interval: Duration,
-    /// How often the background scheduler promotes due jobs to pending. Defaults to 1s.
+    /// How often the background scheduler promotes due jobs to pending.
+    /// Defaults to 1s.
     pub scheduler_interval: Duration,
     /// Default configuration applied to any queue not listed in
     /// [`Self::queue_configs`]. Retention policies
-    /// ([`QueueConfig::keep_done_jobs`], [`QueueConfig::dead_retention`])
-    /// live on `QueueConfig`, so per-queue overrides can pick different
-    /// retention windows for, say, ephemeral webhook deliveries vs.
+    /// ([`QueueConfig::keep_done_jobs`], [`QueueConfig::dead_retention`]) live
+    /// on `QueueConfig`, so per-queue overrides can choose different retention
+    /// windows, such as one for ephemeral webhook deliveries and another for
     /// long-running workflows.
     pub default_queue_config: QueueConfig,
     /// Per-queue overrides. Keys are queue names.
     pub queue_configs: HashMap<String, QueueConfig>,
-    /// Time source for every state-transition timestamp and every
-    /// time-based comparison (retention cutoffs, scheduled-job
-    /// promotion). Defaults to [`SystemClock`](crate::SystemClock).
-    /// Substitute [`MockClock`](crate::MockClock) in tests to advance
-    /// time deterministically.
+    /// Time source for every state-transition timestamp and every time-based
+    /// comparison (retention cutoffs, scheduled-job promotion). Defaults to
+    /// [`SystemClock`](crate::SystemClock). Substitute
+    /// [`MockClock`](crate::MockClock) in tests to advance time
+    /// deterministically.
     pub clock: Arc<dyn Clock>,
-    /// Override SlateDB's WAL flush interval. `None` keeps SlateDB's
-    /// own default.
+    /// Override SlateDB's WAL flush interval. `None` keeps SlateDB's own
+    /// default.
     ///
-    /// The transitions that await durability (`enqueue`, `ack`,
-    /// `nack`, `dead_letter`) block until the next flush tick, so this
-    /// value is the lower bound on their per-operation latency.
-    /// `claim` and the background sweeps commit without awaiting the
-    /// flush and are not bound by it.
+    /// The transitions that await durability (`enqueue`, `ack`, `nack`,
+    /// `dead_letter`) block until the next flush tick, so this value is the
+    /// lower bound on their per-operation latency. `claim` and the background
+    /// sweeps commit without awaiting the flush and are not bound by it.
     ///
-    /// Does not affect durability semantics: the awaiting transitions
-    /// wait for the flush whatever the interval is, and a non-awaiting
-    /// transition lost in a crash is redone on recovery, so
-    /// at-least-once delivery is preserved regardless of the interval
-    /// chosen.
+    /// Does not affect durability semantics: the awaiting transitions wait for
+    /// the flush at any interval, and a non-awaiting transition lost in a crash
+    /// is redone on recovery, so at-least-once delivery is preserved regardless
+    /// of the interval chosen.
     pub flush_interval: Option<Duration>,
-    /// How often the background metrics sampler reads per-queue depth and
-    /// the oldest-pending age and emits them as gauges. `None` (the default)
-    /// disables the sampler. Has no effect unless the crate is built with the
-    /// `metrics` feature; event counters and latency histograms are emitted
+    /// How often the background metrics sampler reads per-queue depth and the
+    /// oldest-pending age and emits them as gauges. `None` (the default)
+    /// disables the sampler. The sampler runs only when the crate is built with
+    /// the `metrics` feature. Event counters and latency histograms are emitted
     /// inline regardless of this setting.
     pub metrics_sample_interval: Option<Duration>,
     /// Interval on which the writer commits a liveness heartbeat that
-    /// [`crate::QueueReader::writer_heartbeat`] reads from another
-    /// process. `None` (the default) writes no heartbeat.
+    /// [`crate::QueueReader::writer_heartbeat`] reads from another process.
+    /// `None` (the default) disables the heartbeat.
     ///
-    /// A beat is an ordinary store commit, so a fresh beat proves the
-    /// process that owns the store is alive; it proves nothing about
-    /// that process's workers. A writer that lost the store to a
-    /// successor stops producing observable beats at its next flush,
-    /// and each failed beat is logged at error level and counted as
-    /// `taquba_heartbeat_failures_total` (`metrics` feature). The first
-    /// beat is committed during open, and a clean
-    /// [`Queue::close`](crate::Queue::close) commits a final beat marked
-    /// closed, so a stale closed beat distinguishes a deliberate shutdown
-    /// from a writer whose process terminated. The heartbeat adds one
-    /// durable commit per interval, with negligible WAL, L0 and
-    /// compaction churn.
+    /// A beat is an ordinary store commit, so a fresh beat establishes that the
+    /// process owning the store is alive. It does not establish the state of
+    /// that process's workers. A writer that lost the store to a successor
+    /// stops producing observable beats at its next flush, and each failed beat
+    /// is logged at error level and counted as
+    /// `taquba_heartbeat_failures_total` (`metrics` feature). The first beat is
+    /// committed during open, and a clean [`Queue::close`](crate::Queue::close)
+    /// commits a final beat marked closed, so a stale closed beat distinguishes
+    /// a deliberate shutdown from a writer whose process terminated. The
+    /// heartbeat adds one durable commit per interval, with negligible WAL, L0
+    /// and compaction churn.
     ///
-    /// A beat awaits durability, so successive beats land the interval
-    /// plus one commit latency apart. Choose an interval well above
-    /// [`Self::flush_interval`], so the cadence readers observe stays
-    /// close to the declared interval by which they judge staleness.
+    /// A beat awaits durability, so successive beats land the interval plus one
+    /// commit latency apart. Choose an interval well above
+    /// [`Self::flush_interval`], so the cadence readers observe stays close to
+    /// the declared interval by which they judge staleness.
     pub liveness_heartbeat: Option<Duration>,
     /// Payload size in bytes above which an enqueued payload is offloaded:
-    /// written once as an object in the payload object store, with the
-    /// record storing [`JobRecord::payload_ref`](crate::JobRecord::payload_ref) instead of inline bytes.
-    /// State transitions then rewrite only the small record, and claims
-    /// fetch the payload from the object store. Defaults to
-    /// [`DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD`]; `None` disables offloading,
-    /// keeping every payload inline regardless of size.
+    /// written once as an object in the payload object store, with the record
+    /// storing [`JobRecord::payload_ref`](crate::JobRecord::payload_ref) in
+    /// place of inline bytes. State transitions then rewrite only the small
+    /// record, and claims fetch the payload from the object store. Defaults to
+    /// [`DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD`]. `None` disables offloading, and
+    /// every payload stays inline regardless of size.
     pub payload_offload_threshold: Option<usize>,
     /// Object store for offloaded payloads. `None` (the default) uses the
-    /// object store the queue is opened on. Configuring a separate store
-    /// places payload bytes in a different bucket or account from the
-    /// queue's own state.
+    /// object store the queue is opened on. Configuring a separate store places
+    /// payload bytes in a different bucket or account from the queue's own
+    /// state.
     pub payload_store: Option<Arc<dyn ObjectStore>>,
-    /// Path prefix for offloaded payload objects within the payload
-    /// object store. `None` (the default) uses `"{path}-payloads"`, a
-    /// sibling of the path the queue is opened at, which cannot overlap
-    /// SlateDB's own layout. A custom value that shares the object
-    /// store with the queue must not equal or nest within the queue's
-    /// `path`.
+    /// Path prefix for offloaded payload objects within the payload object
+    /// store. `None` (the default) uses `"{path}-payloads"`, a sibling of the
+    /// path the queue is opened at, which cannot overlap SlateDB's own layout.
+    /// A custom value that shares the object store with the queue must not
+    /// equal or nest within the queue's `path`.
     pub payload_path: Option<String>,
-    /// Object store for the write-ahead log. `None` (the default) keeps
-    /// the WAL on the object store the queue is opened on.
+    /// Object store for the write-ahead log. `None` (the default) keeps the WAL
+    /// on the object store the queue is opened on.
     ///
-    /// The transitions that await durability block on a WAL flush, so a
-    /// WAL store with lower write latency lowers their latency floor
-    /// (see [`Self::flush_interval`]); the manifest and compacted data
-    /// stay on the primary store. WAL objects live under the queue's
-    /// `path` within this store. A recent transition exists only in the
-    /// WAL until flushed to the primary store, so its durability is the
-    /// WAL store's. Every open of the same path must configure the same
-    /// pair of stores, and a [`QueueReader`](crate::QueueReader) must
-    /// receive this store via
-    /// [`ReaderOptions::wal_object_store`](crate::ReaderOptions::wal_object_store).
+    /// The transitions that await durability block on a WAL flush, so a WAL
+    /// store with lower write latency lowers their latency floor (see
+    /// [`Self::flush_interval`]). The manifest and compacted data stay on the
+    /// primary store. WAL objects live under the queue's `path` within this
+    /// store. A recent transition exists only in the WAL until flushed to the
+    /// primary store, so its durability is the WAL store's. Every open of the
+    /// same path must configure the same pair of stores, and a
+    /// [`QueueReader`](crate::QueueReader) must receive this store via
+    /// [`ReaderOptions::wal_object_store`][wal].
+    ///
+    /// [wal]: crate::ReaderOptions::wal_object_store
     pub wal_object_store: Option<Arc<dyn ObjectStore>>,
 }
 
@@ -355,8 +359,8 @@ impl Default for OpenOptions {
 
 /// Per-call overrides for [`Queue::enqueue_with`](crate::Queue::enqueue_with).
 ///
-/// Every field defaults to `None`, and `headers` to an empty map. Construct
-/// via [`EnqueueOptions::default`] and the setters:
+/// Every field defaults to `None`, and `headers` to an empty map. Construct via
+/// [`EnqueueOptions::default`] and the setters:
 ///
 /// ```
 /// use std::time::{Duration, SystemTime};
@@ -369,44 +373,47 @@ pub struct EnqueueOptions {
     /// Override the queue's default `max_attempts` for just this job.
     pub max_attempts: Option<u32>,
     /// Override the queue's `default_priority`. Use [`PRIORITY_HIGH`],
-    /// [`PRIORITY_NORMAL`], [`PRIORITY_LOW`], or any `u32`; lower wins.
+    /// [`PRIORITY_NORMAL`], [`PRIORITY_LOW`] or any `u32`. Lower wins.
     pub priority: Option<u32>,
-    /// Earliest time at which the job may be claimed. If the value is in the
-    /// past or `None`, the job is written straight to pending; otherwise it
+    /// Earliest time at which the job can be claimed. If the value is in the
+    /// past or `None`, the job is written straight to pending. Otherwise it
     /// waits in the scheduled key space until promoted by the background
     /// scheduler.
     pub run_at: Option<std::time::SystemTime>,
     /// Block creation if a pending or scheduled job with the same key already
-    /// exists; in that case the existing job's ID is returned. The key is
+    /// exists. In that case the existing job's ID is returned. The key is
     /// released when the job is claimed, so re-enqueueing after processing
     /// begins is allowed.
     pub dedup_key: Option<String>,
     /// Arbitrary string-keyed metadata to attach to the job. Stored alongside
-    /// the payload and surfaced as [`JobRecord::headers`](crate::JobRecord::headers). Useful for fields
-    /// that should stay separable from the opaque payload, e.g. webhook
+    /// the payload and surfaced as
+    /// [`JobRecord::headers`](crate::JobRecord::headers). Useful for fields
+    /// that must stay separable from the opaque payload, such as webhook
     /// delivery metadata (URL, HTTP headers, signing key id) or cron-style
     /// metadata (schedule name, nominal fire time). Defaults to empty.
     pub headers: HashMap<String, String>,
-    /// Override the job id that the queue would otherwise generate.
+    /// Override the job id that the queue generates by default.
     ///
-    /// When `None` (the default), the queue assigns a monotonic ULID.
-    /// When `Some`, the supplied id is used as the job's id.
+    /// When `None` (the default), the queue assigns a monotonic ULID. When
+    /// `Some`, the supplied id is used as the job's id.
     ///
     /// Useful when callers need the id to be known *before* the enqueue
     /// returns.
     ///
     /// Duplicate caller-supplied ids are rejected with
-    /// [`Error::DuplicateJobId`](crate::Error::DuplicateJobId) while the existing job is still indexed.
-    /// ULID generation guarantees uniqueness for the `None` path.
+    /// [`Error::DuplicateJobId`](crate::Error::DuplicateJobId) while the
+    /// existing job is still indexed. ULID generation guarantees uniqueness for
+    /// the `None` path.
     ///
-    /// Constraints (enforced; violations return [`Error::InvalidId`](crate::Error::InvalidId)):
+    /// Constraints (enforced, and a violation returns
+    /// [`Error::InvalidId`](crate::Error::InvalidId)):
     ///
     /// - 1-128 bytes long.
     /// - Characters limited to `[A-Za-z0-9_-]`.
     ///
-    /// Prefer ULID-shaped ids when FIFO-within-priority claim ordering
-    /// matters: `pending` and `scheduled` keys end with the id, so claim
-    /// order follows id sort.
+    /// Prefer ULID-shaped ids when FIFO-within-priority claim ordering matters:
+    /// `pending` and `scheduled` keys end with the id, so claim order follows
+    /// id sort.
     pub id_override: Option<String>,
 }
 

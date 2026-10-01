@@ -9,20 +9,18 @@
 //   a duplicate submission of the same order collapses onto the
 //   in-flight job.
 // - Processing: the order worker returns `SettlementEffects` from
-//   `process_with_effects`; the worker loop applies them via
+//   `process_with_effects`. The worker loop applies them via
 //   `Queue::ack_with`, so the order's ack, the follow-up confirmation
-//   enqueue, and the status update to "processed" land in the same
+//   enqueue and the status update to "processed" commit in the same
 //   transaction. A confirmation job exists only if the settlement that
-//   created it won: if the order's lease had expired and the claim was
-//   gone, nothing would be applied and the retried attempt would
-//   settle instead.
+//   created it won: if the order's lease expired and the claim is gone,
+//   nothing is applied and the retried attempt settles the order.
 // - Confirmation: the confirmation worker settles the same way, moving
 //   the status to "confirmed".
 //
-// A crash at any point leaves the status marker consistent with the
-// queue: there is no window where an order is acked but its follow-up
-// or status update is missing, and no outbox pattern or second
-// datastore is involved.
+// A crash at any point leaves the status marker consistent with the queue:
+// there is no window where an order is acked but its follow-up or status update
+// is missing, and no outbox pattern or second datastore is involved.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,8 +37,8 @@ fn status_key(order_id: &str) -> Vec<u8> {
     format!("order:{order_id}").into_bytes()
 }
 
-/// Processes an order and, atomically with its ack, enqueues the
-/// confirmation job and moves the order's status to "processed".
+/// Processes an order and, atomically with its ack, enqueues the confirmation
+/// job and moves the order's status to "processed".
 struct OrderWorker;
 
 impl Worker for OrderWorker {
@@ -52,7 +50,7 @@ impl Worker for OrderWorker {
         let order_id = std::str::from_utf8(&job.payload)?.to_string();
         println!("[orders]        processing order {order_id}");
 
-        // ... charge the customer, reserve stock, etc. ...
+        // ... charge the customer, reserve stock and so on ...
 
         let mut effects = SettlementEffects::default();
         effects.enqueues.push(EnqueueRequest {
@@ -118,8 +116,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     submit_order(&q, "1001").await?;
     println!();
 
-    // One worker loop per queue, each stopped via a oneshot once every
-    // order has reached "confirmed".
+    // One worker loop per queue, each stopped via a oneshot once every order is
+    // "confirmed".
     let (orders_tx, orders_rx) = tokio::sync::oneshot::channel::<()>();
     let (confirm_tx, confirm_rx) = tokio::sync::oneshot::channel::<()>();
     let order_loop = {
@@ -180,8 +178,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "order {order_id}: {}",
             String::from_utf8_lossy(status.as_deref().unwrap_or(b"<missing>"))
         );
-        // Terminal cleanup: the queue operations these markers relate
-        // to have all completed, so standalone deletion is safe.
+        // Terminal cleanup: the queue operations these markers relate to have
+        // all completed, so standalone deletion is safe.
         q.kv_delete(&status_key(order_id)).await?;
     }
     Ok(())

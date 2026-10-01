@@ -13,9 +13,8 @@ use crate::keys::{KeyTag, QueueName};
 /// Mostly read-only from the caller's perspective. Fields are mutated by Taquba
 /// as the job moves through its lifecycle (see [`JobStatus`]).
 ///
-/// All timestamp fields (`enqueued_at`, `claimed_at`, `run_at`,
-/// `completed_at`, `failed_at`) are wall-clock milliseconds since the
-/// UNIX epoch.
+/// All timestamp fields (`enqueued_at`, `claimed_at`, `run_at`, `completed_at`,
+/// `failed_at`) are wall-clock Unix timestamps in milliseconds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobRecord {
     /// Unique [ULID](https://github.com/ulid/spec) assigned at enqueue time.
@@ -34,33 +33,34 @@ pub struct JobRecord {
     /// string.
     #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
-    /// Name of this job's payload object in the payload object store.
-    /// `Some` only when the payload exceeded
-    /// [`OpenOptions::payload_offload_threshold`](crate::OpenOptions::payload_offload_threshold)
-    /// at enqueue. Managed by the queue; callers never set it.
+    /// Name of this job's payload object in the payload object store. `Some`
+    /// only when the payload exceeded
+    /// [`crate::OpenOptions::payload_offload_threshold`] at enqueue. Managed by
+    /// the queue, and callers never set it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_ref: Option<String>,
     /// Optional string-keyed metadata stored alongside the payload. Useful for
-    /// data that benefits from being separable from the opaque body, e.g. HTTP
-    /// headers or a target URL for a webhook delivery, or a schedule name and
-    /// nominal run time for a cron-style job. Set via
-    /// [`EnqueueOptions::headers`](crate::EnqueueOptions::headers); defaults to
-    /// empty.
+    /// data that benefits from being separable from the opaque body, such as
+    /// HTTP headers or a target URL for a webhook delivery, or a schedule name
+    /// and nominal run time for a cron-style job. Set via
+    /// [`EnqueueOptions::headers`](crate::EnqueueOptions::headers), and empty
+    /// by default.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
-    /// Current lifecycle state. Derived from the key space the record
-    /// is read from; the stored value carries no copy of it.
+    /// Current lifecycle state. Derived from the key space the record is read
+    /// from, and the stored value does not contain a copy of it.
     #[serde(skip, default = "JobStatus::initial")]
     pub status: JobStatus,
-    /// How many delivery attempts have been started so far. Incremented on
-    /// each [`Queue::claim`](crate::Queue::claim).
+    /// How many delivery attempts started so far. Incremented on each
+    /// [`Queue::claim`](crate::Queue::claim).
     pub attempts: u32,
     /// Maximum delivery attempts before the job is dead-lettered. Defaults to
-    /// the queue's configured value (see [`QueueConfig::max_attempts`](crate::QueueConfig)).
+    /// the queue's configured value (see
+    /// [`QueueConfig::max_attempts`](crate::QueueConfig)).
     pub max_attempts: u32,
     /// When the job was first enqueued. Preserved across
     /// [`Queue::requeue_dead_job`](crate::Queue::requeue_dead_job) so the
-    /// original enqueue time survives a re-fail cycle.
+    /// original enqueue time persists across a re-fail cycle.
     pub enqueued_at: u64,
     /// When the most recent claim happened, if the job has ever been claimed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,31 +69,30 @@ pub struct JobRecord {
     /// while `status == Scheduled`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_at: Option<u64>,
-    /// When [`Queue::wake_scheduled`](crate::Queue::wake_scheduled) moved
-    /// this job to pending before its `run_at`. `None` for jobs that became
-    /// pending any other way, including promotion at `run_at` by the
-    /// scheduler, so a worker can distinguish an early wake from an
-    /// ordinary promotion regardless of whether bytes were attached. Once
-    /// set, the value persists across later transitions (retries,
-    /// redelivery after lease expiry).
+    /// When [`Queue::wake_scheduled`](crate::Queue::wake_scheduled) moved this
+    /// job to pending before its `run_at`. `None` for jobs that became pending
+    /// any other way, including promotion at `run_at` by the scheduler. The
+    /// field distinguishes an early wake from an ordinary promotion regardless
+    /// of whether bytes were attached. Once set, the value persists across
+    /// later transitions (retries, redelivery after lease expiry).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub woken_at: Option<u64>,
-    /// Bytes attached by [`Queue::wake_scheduled`](crate::Queue::wake_scheduled)
-    /// when this job was woken before its `run_at`. `None` when the wake
-    /// attached no bytes or the job was never woken early; check
-    /// [`Self::woken_at`] for the early-wake marker itself. Once attached,
-    /// the value persists across later transitions, so a worker observes it
-    /// on every delivery of the job.
+    /// Bytes attached by
+    /// [`Queue::wake_scheduled`](crate::Queue::wake_scheduled) when this job
+    /// was woken before its `run_at`. `None` when the wake attached zero bytes
+    /// or the job was never woken early. [`Self::woken_at`] is the early-wake
+    /// marker itself. Once attached, the value persists across later
+    /// transitions, so a worker observes it on every delivery of the job.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
     pub wake_payload: Option<Vec<u8>>,
-    /// Priority bucket; lower numbers are claimed first. See
+    /// Priority bucket. Lower numbers are claimed first. See
     /// [`PRIORITY_HIGH`](crate::PRIORITY_HIGH),
     /// [`PRIORITY_NORMAL`](crate::PRIORITY_NORMAL), and
     /// [`PRIORITY_LOW`](crate::PRIORITY_LOW).
     pub priority: u32,
     /// The most recent error message reported via
-    /// [`Queue::nack`](crate::Queue::nack), or a Taquba-generated message
-    /// (e.g. `"lease expired"`) when the reaper dead-letters a job.
+    /// [`Queue::nack`](crate::Queue::nack), or a Taquba-generated message such
+    /// as `"lease expired"` when the reaper dead-letters a job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     /// Set when [`EnqueueOptions::dedup_key`](crate::EnqueueOptions::dedup_key)
@@ -103,7 +102,8 @@ pub struct JobRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedup_key: Option<String>,
     /// When the job was successfully acked. `Some` only when the record was
-    /// kept (see [`QueueConfig::keep_done_jobs`](crate::QueueConfig::keep_done_jobs)).
+    /// kept (see
+    /// [`QueueConfig::keep_done_jobs`](crate::QueueConfig::keep_done_jobs)).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<u64>,
     /// When the job entered the dead-letter state. Used by the background
@@ -111,42 +111,41 @@ pub struct JobRecord {
     /// `enqueued_at` (which is stale after a requeue / re-fail cycle).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_at: Option<u64>,
-    /// Whether [`Queue::cancel`](crate::Queue::cancel) has been called while
-    /// this job was `Claimed`. Persisted so that a re-claim after lease
-    /// expiry surfaces a pre-cancelled [`Claim::cancel_token`] instead of
-    /// resetting state silently.
+    /// Whether [`Queue::cancel`](crate::Queue::cancel) was called while this
+    /// job was `Claimed`. Persisted so that a re-claim after lease expiry
+    /// surfaces a pre-cancelled [`Claim::cancel_token`], without a silent reset
+    /// of the state.
     ///
-    /// Workers do not need to read this directly; they observe
-    /// cancellation through [`Claim::cancel_token`] or
+    /// Workers do not read this directly. They observe cancellation through
+    /// [`Claim::cancel_token`] or
     /// [`LeaseHandle::cancel_token`](crate::LeaseHandle::cancel_token).
     #[serde(default, skip_serializing_if = "is_false")]
     pub cancel_requested: bool,
 }
 
-/// A held claim on a job: the record as it was delivered, the claim id
-/// that identifies this delivery and the delivery's cancellation token.
+/// A held claim on a job: the record as it was delivered, the claim id that
+/// identifies this delivery and the delivery's cancellation token.
 ///
 /// Produced only by the `Queue::claim*` calls, and required by
 /// [`Queue::ack`](crate::Queue::ack),
 /// [`Queue::ack_with`](crate::Queue::ack_with),
 /// [`Queue::nack`](crate::Queue::nack),
 /// [`Queue::dead_letter`](crate::Queue::dead_letter) and
-/// [`Queue::renew_lease`](crate::Queue::renew_lease). A [`JobRecord`]
-/// read through [`QueueView::get_job`](crate::QueueView::get_job) or
-/// [`QueueView::list_jobs`](crate::QueueView::list_jobs) therefore cannot settle
-/// a delivery the caller does not hold.
+/// [`Queue::renew_lease`](crate::Queue::renew_lease). A [`JobRecord`] read
+/// through [`QueueView::get_job`](crate::QueueView::get_job) or
+/// [`QueueView::list_jobs`](crate::QueueView::list_jobs) therefore cannot
+/// settle a delivery the caller does not hold.
 ///
 /// The claim id is unique per claim but not ordered, so it identifies a
-/// delivery without ranking it. It fences settlement against the queue's
-/// own state and is deliberately not exposed: it is not a fencing token
-/// for an external system, which needs monotonicity to reject a stale
-/// writer.
+/// delivery without ranking it. It fences settlement against the queue's own
+/// state and is deliberately not exposed: it is not a fencing token for an
+/// external system, which needs monotonicity to reject a stale writer.
 ///
-/// Dereferences to the claimed [`JobRecord`], so a caller reads
-/// `claim.payload` and `claim.id` directly.
+/// Dereferences to the claimed [`JobRecord`], so a caller reads `claim.payload`
+/// and `claim.id` directly.
 ///
-/// A record read through any other path cannot be settled, and that is
-/// enforced at compile time rather than reported at runtime:
+/// A record read through any other path cannot be settled, and the compiler
+/// enforces that, without a runtime error:
 ///
 /// ```compile_fail
 /// # use std::sync::Arc;
@@ -160,9 +159,8 @@ pub struct JobRecord {
 /// # }
 /// ```
 ///
-/// Not [`Clone`]: a claim is the sole handle able to settle its
-/// delivery. The record itself is reachable through [`Claim::job`] and
-/// [`Claim::into_job`].
+/// Not [`Clone`]: a claim is the sole handle able to settle its delivery. The
+/// record itself is reachable through [`Claim::job`] and [`Claim::into_job`].
 #[derive(Debug)]
 pub struct Claim {
     job: JobRecord,
@@ -184,12 +182,12 @@ impl Claim {
     }
 
     /// The delivery's cooperative cancellation token, fired by
-    /// [`Queue::cancel`](crate::Queue::cancel) while this claim holds
-    /// the job, and already fired when the job was re-claimed with
+    /// [`Queue::cancel`](crate::Queue::cancel) while this claim is live, and
+    /// already fired when the job was re-claimed with
     /// [`JobRecord::cancel_requested`] persisted.
     ///
-    /// A caller may `select!` on it to stop early and settle the job as
-    /// usual. The token is in-process state and is not persisted.
+    /// A caller can `select!` on it to stop early and settle the job as usual.
+    /// The token is in-process state and is not persisted.
     pub fn cancel_token(&self) -> &CancellationToken {
         &self.cancel
     }
@@ -203,8 +201,8 @@ impl Claim {
         &self.job
     }
 
-    /// Consume the claim and return the record, discarding the claim id.
-    /// The record can no longer settle the delivery.
+    /// Consume the claim and return the record, discarding the claim id. The
+    /// record can no longer settle the delivery.
     pub fn into_job(self) -> JobRecord {
         self.job
     }
@@ -219,14 +217,14 @@ impl std::ops::Deref for Claim {
 }
 
 impl JobRecord {
-    /// Whether the current attempt is the job's last: a transient
-    /// failure of it dead-letters the job instead of retrying.
+    /// Whether the current attempt is the job's last: a transient failure of it
+    /// dead-letters the job, without a retry.
     pub fn is_last_attempt(&self) -> bool {
         self.attempts >= self.max_attempts
     }
 
-    /// Construct a fresh record in the pending state with every other
-    /// field at its initial value.
+    /// Construct a fresh record in the pending state with every other field at
+    /// its initial value.
     pub(crate) fn new_pending(
         id: String,
         queue: QueueName,
@@ -258,9 +256,8 @@ impl JobRecord {
         }
     }
 
-    /// Decode a record stored under `key`, taking its state from the
-    /// key space. A key outside the job-state key spaces is a decode
-    /// error.
+    /// Decode a record stored under `key`, taking its state from the key space.
+    /// A key outside the job-state key spaces is a decode error.
     pub(crate) fn decode(key: &[u8], bytes: &[u8]) -> crate::error::Result<JobRecord> {
         let status = KeyTag::of(key)
             .and_then(KeyTag::job_status)
@@ -272,10 +269,10 @@ impl JobRecord {
         Ok(job)
     }
 
-    /// Serialize the record in its stored form: when the payload is
-    /// offloaded ([`Self::payload_ref`] is `Some`), the inline payload
-    /// is excluded so state transitions never rewrite payload bytes.
-    /// Every record write serializes through this method.
+    /// Serialize the record in its stored form: when the payload is offloaded
+    /// ([`Self::payload_ref`] is `Some`), the inline payload is excluded so
+    /// state transitions never rewrite payload bytes. Every record write
+    /// serializes through this method.
     pub(crate) fn stored_bytes(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
         if self.payload_ref.is_none() {
             return rmp_serde::to_vec_named(self);
@@ -283,8 +280,8 @@ impl JobRecord {
         rmp_serde::to_vec_named(&self.stored_clone())
     }
 
-    /// Clone the record in its stored form: identical to [`Clone`]
-    /// except that an offloaded payload is not copied into the clone.
+    /// Clone the record in its stored form: identical to [`Clone`] except that
+    /// an offloaded payload is not copied into the clone.
     pub(crate) fn stored_clone(&self) -> JobRecord {
         JobRecord {
             payload: if self.payload_ref.is_some() {
@@ -340,7 +337,7 @@ pub enum JobStatus {
     Claimed,
     /// Successfully completed. Only persisted if
     /// [`QueueConfig::keep_done_jobs`](crate::QueueConfig::keep_done_jobs) is
-    /// set on the job's queue; otherwise the record is deleted on ack.
+    /// set on the job's queue. Otherwise the record is deleted on ack.
     Done,
     /// Exhausted all retry attempts and was moved to the dead-letter queue.
     /// Inspected via [`QueueView::dead_jobs`](crate::QueueView::dead_jobs) and
@@ -356,9 +353,9 @@ mod tests {
 
     #[test]
     fn payload_bytes_are_stored_as_a_binary_string() {
-        // A binary string stores the bytes as they are, so the stored
-        // record contains the payload as one contiguous window. An
-        // integer array prefixes every byte at or above `0x80`.
+        // A binary string stores the bytes as they are, so the stored record
+        // contains the payload as one contiguous window. An integer array
+        // prefixes every byte at or above `0x80`.
         let payload: Vec<u8> = (0..=255).collect();
         let mut job = JobRecord::new_pending("j".into(), qn("q"), payload.clone(), 3, 0, 1);
         job.wake_payload = Some(payload.iter().rev().copied().collect());

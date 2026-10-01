@@ -8,7 +8,7 @@ use taquba::{Queue, object_store::memory::InMemory};
 
 #[tokio::main]
 async fn main() -> taquba::Result<()> {
-    // Point at any object store: S3, GCS, Azure Blob, MinIO, or a local dir.
+    // Point at any object store: S3, GCS, Azure Blob, MinIO or a local dir.
     let q = Queue::open(Arc::new(InMemory::new()), "demo").await?;
 
     q.enqueue("email", b"alice@example.com".to_vec()).await?;

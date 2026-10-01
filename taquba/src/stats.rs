@@ -17,11 +17,11 @@ pub(crate) fn metric_name(status: JobStatus) -> &'static str {
     }
 }
 
-/// Merge operator covering every merging key space, dispatching on the
-/// key's tag byte: stats counters ([`KeyTag::Stats`]) accumulate i64
-/// deltas in little-endian encoding, and attempt history
-/// ([`KeyTag::AttemptHistory`]) appends serialized entries by
-/// concatenation. Both avoid read-modify-write races on their keys.
+/// Merge operator covering every merging key space, dispatching on the key's
+/// tag byte: stats counters ([`KeyTag::Stats`]) accumulate i64 deltas in
+/// little-endian encoding, and attempt history ([`KeyTag::AttemptHistory`])
+/// appends serialized entries by concatenation. Both avoid read-modify-write
+/// races on their keys.
 pub struct QueueMergeOperator;
 
 impl MergeOperator for QueueMergeOperator {
@@ -96,12 +96,11 @@ pub(crate) fn update_stats(
         if *delta != 0 {
             let key = stats_key(queue, metric_name(*status));
             txn.merge(&key, (*delta).to_le_bytes())?;
-            // Counter merges are commutative, so two transactions
-            // merging the same stats key do not actually conflict.
-            // Without this, every job-state transition on a queue
-            // contends on the same handful of stats keys and
-            // transaction-conflict retries dominate claim latency
-            // under concurrency.
+            // Counter merges are commutative, so two transactions merging the
+            // same stats key do not actually conflict. Without this, every
+            // job-state transition on a queue contends on the same handful of
+            // stats keys and transaction-conflict retries dominate claim
+            // latency under concurrency.
             txn.unmark_write([key.as_slice()])?;
         }
     }
@@ -121,15 +120,15 @@ pub struct QueueStats {
     pub pending: i64,
     /// Jobs currently held by a worker under a lease.
     pub claimed: i64,
-    /// Jobs that completed successfully (cumulative throughput, not
-    /// decremented by retention sweeps).
+    /// Jobs that completed successfully (cumulative throughput, which retention
+    /// sweeps do not decrement).
     pub done: i64,
     /// Jobs currently in the dead-letter set. Decremented on
     /// [`Queue::requeue_dead_job`](crate::Queue::requeue_dead_job) and on
     /// retention sweeps.
     pub dead: i64,
     /// Jobs waiting for their `run_at` time before becoming pending. Includes
-    /// jobs in retry-backoff between a [`Queue::nack`](crate::Queue::nack)
-    /// and the scheduler's next promotion sweep.
+    /// jobs in retry-backoff between a [`Queue::nack`](crate::Queue::nack) and
+    /// the scheduler's next promotion sweep.
     pub scheduled: i64,
 }

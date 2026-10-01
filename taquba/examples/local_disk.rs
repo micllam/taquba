@@ -1,8 +1,8 @@
 // cargo run -p taquba --example local_disk
 //
-// Demonstrates taquba backed by the local filesystem.
-// Jobs written in one run survive process restarts; run it twice to see
-// the second run claim the jobs left by the first.
+// Demonstrates taquba backed by the local filesystem. Jobs written in one run
+// persist across process restarts. Run it twice to see the second run claim the
+// jobs left by the first.
 
 use std::sync::Arc;
 
@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  enqueued {id}");
         }
     } else {
-        // Subsequent run: claim and process whatever is pending.
+        // Subsequent run: claim and process every pending job.
         println!("{pending_before} pending job(s) found - claiming them now.");
         println!();
 
