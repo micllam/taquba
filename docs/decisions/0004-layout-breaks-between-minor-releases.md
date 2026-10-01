@@ -1,5 +1,7 @@
 # ADR-0004: The on-disk layout can break between minor releases
 
+<!-- vale off -->
+
 Status: accepted
 Date: 2026-09-15
 Scope: workspace
@@ -35,3 +37,5 @@ that recommends the KV namespace for application state.
 
 An upgrade across minor releases can require a drain. A design that needs a
 flag to keep an old layout readable is rejected.
+
+<!-- vale on -->

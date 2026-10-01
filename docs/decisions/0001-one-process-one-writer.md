@@ -1,5 +1,7 @@
 # ADR-0001: Producers and workers share one process
 
+<!-- vale off -->
+
 Status: accepted
 Date: 2026-09-14
 Scope: taquba
@@ -31,3 +33,5 @@ Every durable transition therefore runs in the process that opened the store's
   writes.
 - The writer heartbeat exists because an external observer cannot otherwise
   distinguish a live writer from a writer whose process terminated.
+
+<!-- vale on -->

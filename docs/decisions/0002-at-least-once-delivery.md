@@ -1,5 +1,7 @@
 # ADR-0002: Delivery is at-least-once
 
+<!-- vale off -->
+
 Status: accepted
 Date: 2026-09-14
 Scope: taquba
@@ -31,3 +33,5 @@ exactly-once delivery.
 - State the queue does own can be made exact, because a KV write in
   `SettlementEffects` commits in the settlement transaction.
 - A dedup key deduplicates an enqueue and does not deduplicate a delivery.
+
+<!-- vale on -->

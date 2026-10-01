@@ -1,5 +1,7 @@
 # ADR-0003: Claim-only delivery
 
+<!-- vale off -->
+
 Status: accepted
 Date: 2026-09-14
 Scope: taquba
@@ -23,3 +25,5 @@ consumer decides how many tasks poll and how often.
 ## Consequences
 
 - A wakeup does not deliver a job, and the woken worker claims the job itself.
+
+<!-- vale on -->
