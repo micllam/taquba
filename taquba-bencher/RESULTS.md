@@ -59,6 +59,8 @@ windows, backlog behaviour, deviations from defaults>.
 
 ## Log
 
+<!-- vale off -->
+
 ### 2026-06-25 - payload_sweep (write amplification vs payload size) on real S3
 
 - **taquba:** 0.9.0 (`5b22a80`)
@@ -266,5 +268,7 @@ Notes:
 - **Claim latency depends on live-queue depth versus the tombstone band.** Low under deep backlog (run 3000/s: live jobs at the scan front, ~1.3 ms flat), but grows when the live queue is shallow while churning fast (run 700/s, 60 s: 1 -> 260 ms), consistent with `pending:` tombstones accumulating faster than compaction reclaims them. `claim_batch` amortizes per-claim transaction overhead but, on this reading, not the scan cost. The 300 s run shows the steady-state behavior: claim latency does **not** grow unbounded but follows a **sawtooth**, climbing to ~200-470 ms p99 then resetting to ~1-5 ms (clear resets at t~78, 121, 154, 230, 255 s), a pattern we attribute to periodic compaction reclaiming the tombstone band.
 - **Throughput dips periodically.** Over 300 s there are periodic throughput dips that drive backlog spikes (pending to ~200-470) and e2e spikes to ~1-2 s, with an occasional ~1 s near-stall (one window completing ~40 ops) followed by a catch-up burst. These coincide with the claim-latency resets above, so we attribute them to compaction transiently slowing the single writer, though the benches do not observe compaction directly. Average throughput holds ~700/s, but **tail latency is governed by these periodic events**, not steady-state op cost.
 - The 500/s row did not reach its offered rate: 4 producers each block ~35 ms on a durable S3 write, capping enqueue at ~115/s; it is recorded as the low-load latency datapoint, not a throughput measurement.
+
+<!-- vale on -->
 
 Add entries above this line, newest first.
