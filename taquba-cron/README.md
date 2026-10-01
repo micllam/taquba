@@ -213,6 +213,8 @@ opened with (`Queue::clock`).
   them in code on startup. The *enqueued jobs* are durable via Taquba, as
   is the backfill watermark.
 
+<!-- vale off -->
+
 ## License
 
 Licensed under either of
@@ -232,3 +234,5 @@ Unless you explicitly state otherwise, any contribution intentionally
 submitted for inclusion in the work by you, as defined in the Apache-2.0
 license, shall be dual licensed as above, without any additional terms or
 conditions.
+
+<!-- vale on -->

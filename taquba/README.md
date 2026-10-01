@@ -452,6 +452,8 @@ namespace: `Queue::ack_with` writes outcome entries atomically with the
 settlement (and `Queue::enqueue_with_effects` maps caller identifiers to job ids
 at submit), and the reader's `kv_get` / `kv_scan` read them from any process.
 
+<!-- vale off -->
+
 ## License
 
 Licensed under either of
@@ -471,3 +473,5 @@ Unless you explicitly state otherwise, any contribution intentionally
 submitted for inclusion in the work by you, as defined in the Apache-2.0
 license, shall be dual licensed as above, without any additional terms or
 conditions.
+
+<!-- vale on -->
