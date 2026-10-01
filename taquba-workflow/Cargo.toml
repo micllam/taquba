@@ -17,8 +17,8 @@ default = []
 webhooks = ["dep:taquba-webhooks"]
 
 [package.metadata.docs.rs]
-# Build docs with `webhooks` enabled so `WebhookTerminalHook` is visible
-# on docs.rs.
+# Build docs with `webhooks` enabled so `WebhookTerminalHook` is visible on
+# docs.rs.
 all-features = true
 
 [dependencies]
@@ -34,8 +34,8 @@ sha2 = "0.10"
 
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
-# Used only for `CancellationToken`, which is re-exported on `Step` so
-# runners can opt in to cooperative mid-step cancellation.
+# Used only for `CancellationToken`, which is re-exported on `Step` so runners
+# can opt in to cooperative mid-step cancellation.
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 
 ulid = { workspace = true }

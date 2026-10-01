@@ -35,10 +35,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # STORE_URL parsing.
 url = { workspace = true }
 
-# Bench files are grouped under benches/<crate> by the crate they
-# exercise; `harness = false` disables libtest's bench harness so each
-# file runs as a plain `#[tokio::main]` binary. `cargo bench` is used
-# for discovery only, not for the harness.
+# Bench files are grouped under benches/<crate> by the crate they exercise;
+# `harness = false` disables libtest's bench harness so each file runs as a
+# plain `#[tokio::main]` binary. `cargo bench` is used for discovery only, not
+# for the harness.
 
 [[bench]]
 name = "claim_drain"

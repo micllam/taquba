@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Samples object count and bytes under an S3 prefix every interval_sec,
-# appending epoch,objects,bytes rows to a CSV to track storage growth
-# over a long run. On a missing CLI or aws error it appends an ERR row
-# (and an aws-err log) instead of 0,0, so 0,0 means a genuinely empty
-# prefix.
+# appending epoch,objects,bytes rows to a CSV to track storage growth over a
+# long run. On a missing CLI or aws error it appends an ERR row (and an aws-err
+# log) instead of 0,0, so 0,0 means a genuinely empty prefix.
 #
 # Usage: sample-storage.sh s3://bucket/prefix out.csv [interval_sec]
 set -euo pipefail
