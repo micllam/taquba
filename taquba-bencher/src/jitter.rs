@@ -1,7 +1,7 @@
-//! An `ObjectStore` wrapper that adds random tail latency to the write
-//! path, layered over a base store. It injects object-store PUT tail
-//! latency as a controllable variable so its effect on e2e latency and
-//! backlog can be studied locally with no cloud cost.
+//! An `ObjectStore` wrapper that adds random tail latency to the write path,
+//! layered over a base store. It injects object-store PUT tail latency as a
+//! controllable variable so its effect on e2e latency and backlog can be
+//! studied locally, without cloud resources.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,13 +14,13 @@ use taquba::object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
 };
 
-/// Delays each write by a random duration in `[0, max_jitter]`,
-/// right-skewed so most delays are small and a few are close to the
-/// maximum, approximating object-store tail latency. Reads, lists and
-/// deletes pass through unchanged. Jitter is applied to single PUTs and to
-/// the start of a multipart upload, not to each multipart part, so the data
-/// streamed during a multipart upload is not delayed; the latency-sensitive
-/// single-PUT write path is covered.
+/// Delays each write by a random duration in `[0, max_jitter]`, right-skewed so
+/// most delays are small and a few are close to the maximum, approximating
+/// object-store tail latency. Reads, lists and deletes pass through unchanged.
+/// Jitter is applied to single PUTs and to the start of a multipart upload and
+/// is not applied to each multipart part, so the data streamed during a
+/// multipart upload is not delayed. The latency-sensitive single-PUT write path
+/// is covered.
 #[derive(Debug)]
 pub struct JitterStore {
     inner: Arc<dyn ObjectStore>,
@@ -50,9 +50,9 @@ impl std::fmt::Display for JitterStore {
 }
 
 // Only the write entry points add jitter and the no-default methods are
-// delegated; the remaining trait methods keep their defaults, which route
-// through these (for example `put` calls `put_opts`, `get` calls
-// `get_opts`), so reads stay jitter-free and writes are covered.
+// delegated. The remaining trait methods keep their defaults, which route
+// through these (for example `put` calls `put_opts`, `get` calls `get_opts`),
+// so reads stay jitter-free and writes are covered.
 #[async_trait]
 impl ObjectStore for JitterStore {
     async fn put_opts(

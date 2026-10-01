@@ -1,10 +1,10 @@
 // cargo bench -p taquba-bencher --bench group_throughput > group.csv
 //
-// Group throughput benchmark for typed jobs. Runs N_ITEMS jobs of a
-// group through N_PHASES memoized phases that do no work, so the
-// measured cost is the per-item overhead: run submission, the single
-// workflow step, one memo write per phase, terminal accounting and the
-// result read. Completions are counted per second.
+// Group throughput benchmark for typed jobs. Runs N_ITEMS jobs of a group
+// through N_PHASES memoized phases that do no work, so the measured cost is the
+// per-item overhead: run submission, the single workflow step, one memo write
+// per phase, terminal accounting and the result read. Completions are counted
+// per second.
 //
 // Parameters (env vars, all optional).
 //   N_ITEMS             jobs in the group (default 500).
@@ -14,20 +14,19 @@
 //   STORE_LATENCY_MS    injected object-store latency per call (default 0).
 //                       When set, the in-memory store is wrapped in
 //                       object_store's ThrottledStore so every get, put,
-//                       list, and delete sleeps this long before running,
+//                       list and delete sleeps this long before running,
 //                       approximating an S3-class backend.
 //   STORE_JITTER_MS     random tail latency in [0, STORE_JITTER_MS] added to
 //                       each write on top of STORE_LATENCY_MS (default 0).
 //   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
-//                       az://..., file:///abs/path) to run against
-//                       instead of the in-memory store; see
+//                       az://..., file:///abs/path) to run against in
+//                       place of the in-memory store, described in
 //                       the crate README. Incompatible with
 //                       STORE_LATENCY_MS and STORE_JITTER_MS.
 //
-// Output (stdout): CSV with header `window_sec,completed`, one row per
-// second with the cumulative number of terminal items. A summary
-// (items/s, succeeded / failed counts) goes to stderr so stdout stays
-// a clean data stream.
+// Output (stdout): CSV with header `window_sec,completed`, one row per second
+// with the cumulative number of terminal items. A summary (items/s, succeeded /
+// failed counts) goes to stderr so stdout stays a clean data stream.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -70,8 +69,8 @@ impl Job for Item {
     }
 }
 
-/// Cumulative completions per elapsed second, from the completion
-/// instants of a run.
+/// Cumulative completions per elapsed second, from the completion instants of a
+/// run.
 fn progress_rows(started: Instant, completions: &[Instant]) -> Vec<(u64, usize)> {
     let mut rows = Vec::new();
     let mut completed = 0;

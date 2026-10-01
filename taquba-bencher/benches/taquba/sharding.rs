@@ -1,25 +1,24 @@
 // cargo bench -p taquba-bencher --bench sharding > sharding.csv
 //
-// In-process sharding throughput benchmark. SlateDB serializes WAL flushes
-// per store (one object-store PUT in flight at a time), so a single store's
-// durable-commit ceiling is roughly its per-PUT batch size divided by the
-// PUT latency. Each store has its own flush loop, so running N_SHARDS stores
-// in one process gives N_SHARDS independent PUT streams. This bench opens
-// N_SHARDS stores, saturates each with producers doing durable enqueues, and
-// reports the aggregate enqueue throughput, so a sweep over N_SHARDS shows
-// whether throughput scales with shard count (it should, up to the object
+// In-process sharding throughput benchmark. SlateDB serializes WAL flushes per
+// store (one object-store PUT in flight at a time), so a single store's
+// durable-commit ceiling is roughly its per-PUT batch size divided by the PUT
+// latency. Each store has its own flush loop, so running N_SHARDS stores in one
+// process gives N_SHARDS independent PUT streams. This bench opens N_SHARDS
+// stores, saturates each with producers doing durable enqueues, and reports the
+// aggregate enqueue throughput, so a sweep over N_SHARDS shows whether
+// throughput scales with shard count (the expected result, up to the object
 // store's real PUT capacity) and how balanced the shards are.
 //
-// The shards are independent SlateDB databases under distinct sub-prefixes
-// of one object store (paths `shard-0`, `shard-1`, ...), which also spreads
-// load across prefixes (relevant to S3's per-prefix request limits). Each
-// shard keeps single-writer semantics; this is the in-process form of the
-// scale-out that an external coordinator would otherwise distribute across
-// nodes.
+// The shards are independent SlateDB databases under distinct sub-prefixes of
+// one object store (paths `shard-0`, `shard-1`, ...), which also spreads load
+// across prefixes (relevant to S3's per-prefix request limits). Each shard
+// keeps single-writer semantics. This is the in-process form of a scale-out
+// across nodes, which requires an external coordinator.
 //
 // This is produce-only: jobs are enqueued and never consumed, so the stores
-// grow for the duration of the run. Keep DURATION_SEC modest, especially on
-// the in-memory store.
+// grow for the duration of the run. Keep DURATION_SEC modest, especially on the
+// in-memory store.
 //
 // Parameters (env vars, all optional).
 //   N_SHARDS            independent stores opened in this process (default 1).
@@ -32,20 +31,21 @@
 //   STORE_LATENCY_MS    injected object-store latency per call (default 0).
 //                       When set, the in-memory store is wrapped in
 //                       object_store's ThrottledStore so every get, put,
-//                       list, and delete sleeps this long before running,
+//                       list and delete sleeps this long before running,
 //                       approximating an S3-class backend. Set this to see
 //                       the per-store serialized-flush ceiling and the
 //                       multiplier from sharding without real cloud storage.
 //   STORE_JITTER_MS     random tail latency in [0, STORE_JITTER_MS] added to
 //                       each write on top of STORE_LATENCY_MS (default 0).
 //   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
-//                       az://..., file:///abs/path) to run against
-//                       instead of the in-memory store; see the crate
-//                       README. Incompatible with STORE_LATENCY_MS and STORE_JITTER_MS.
+//                       az://..., file:///abs/path) to run against in place of
+//                       the in-memory store, described in the crate README.
+//                       Incompatible
+//                       with STORE_LATENCY_MS and STORE_JITTER_MS.
 //
 // Output (stdout): CSV with header `window_sec,enq_per_sec`, the aggregate
 // enqueues completed in each one-second window across all shards. The final
-// window may be partial. Per-shard totals and a summary go to stderr.
+// window can be partial. Per-shard totals and a summary go to stderr.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -80,8 +80,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let store = store_from_env(store_latency_ms)?;
 
-    // Each shard is an independent SlateDB database under its own sub-prefix
-    // of the shared object store, so each has its own serialized flush loop.
+    // Each shard is an independent SlateDB database under its own sub-prefix of
+    // the shared object store, so each has its own serialized flush loop.
     let mut shards: Vec<Arc<Queue>> = Vec::with_capacity(n_shards);
     for i in 0..n_shards {
         let queue = Queue::open_with_options(

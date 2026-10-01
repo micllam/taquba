@@ -4,8 +4,8 @@
 // concurrent produce/consume load on its own SlateDB store for DURATION_SEC
 // (producers enqueue as fast as possible while workers claim and ack), then
 // drains the backlog. Reports one row per size: enqueue throughput and
-// per-operation latencies, plus the per-job bytes and request counts written
-// to object storage.
+// per-operation latencies, plus the per-job bytes and request counts written to
+// object storage.
 //
 // Each size runs sequentially on its own store path (`bench-db-<size>`) so
 // sizes do not share state. The whole run shares one `CountingStore`, so a
@@ -21,28 +21,28 @@
 //   CLAIM_BATCH         jobs claimed per claim_batch call (default 64).
 //   LEASE_SEC           claim lease in seconds (default 60).
 //   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1).
-//   STORE_LATENCY_MS    injected per-call object-store latency (default 0;
+//   STORE_LATENCY_MS    injected per-call object-store latency (default 0,
 //                       in-memory store only).
-//   STORE_JITTER_MS     random write tail latency (default 0; in-memory only).
-//   STORE_URL           object-store URL to run against instead of the
+//   STORE_JITTER_MS     random write tail latency (default 0, in-memory only).
+//   STORE_URL           object-store URL to run against in place of the
 //                       in-memory store (s3://.., gs://.., az://..,
-//                       file:///abs/path); see the crate README.
+//                       file:///abs/path). See the crate README.
 //
 // Output (stdout): CSV with header
 // `payload_bytes,enq_per_s,enq_mbps,enq_p50_us,enq_p99_us,done_per_s,e2e_p50_us,e2e_p99_us,ack_p99_us,bytes_per_job,puts_per_job,store_amp`.
-// `enq_per_s` is the saturating durable-enqueue rate; `enq_mbps` is
+// `enq_per_s` is the saturating durable-enqueue rate. `enq_mbps` is
 // `enq_per_s * payload`. `bytes_per_job` is object-store PUT bytes per
 // fully-processed job. `store_amp` is `bytes_per_job / payload`: end-to-end
 // object-store bytes written per logical payload byte, combining taquba's
-// per-transition rewrites and the engine's WAL, flush and compaction. It is
-// not the storage engine's LSM write amplification in isolation, and in
-// short runs compaction may not have run, so large-payload values are a lower
-// bound. The `e2e_*` columns are enqueue-to-ack latency under saturating load,
-// so they reflect backlog rather than clean round-trip latency; use
+// per-transition rewrites and the engine's WAL, flush and compaction. It is not
+// the storage engine's LSM write amplification in isolation, and a short run
+// can end before compaction runs, so large-payload values are a lower bound.
+// The `e2e_*` columns are enqueue-to-ack latency under saturating load, so they
+// include the backlog wait and do not measure clean round-trip latency. Use
 // steady_state with PAYLOAD_BYTES for round-trip latency versus payload.
 // Progress prints go to stderr (so stdout stays a clean data stream) and
-// include a per-second cumulative store_amp for each size, making its rise and
-// plateau as compaction amortizes visible during the run.
+// include a per-second cumulative store_amp for each size, which shows its rise
+// and plateau as compaction amortises during the run.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -59,8 +59,9 @@ const IDLE_BACKOFF: Duration = Duration::from_millis(2);
 /// Queue name used within each per-size store.
 const QUEUE: &str = "bench";
 
-/// Per-size throughput and latency. Storage bytes are not carried here; the
-/// caller reads them from the `CountingStore` counter change across the run.
+/// Per-size throughput and latency. The struct does not contain storage bytes.
+/// The caller reads them from the `CountingStore` counter change across the
+/// run.
 struct RunResult {
     enq_count: u64,
     enq_p50_us: u64,
@@ -114,7 +115,7 @@ async fn run_one(
     );
 
     let bench_start = Instant::now();
-    // PUT bytes counted before this size; subtracting it gives the per-size
+    // PUT bytes counted before this size. Subtracting it gives the per-size
     // delta, so the watcher's cumulative store_amp excludes earlier sizes.
     let bytes0 = counting.put_bytes();
     let acked = Arc::new(AtomicU64::new(0));
@@ -149,11 +150,11 @@ async fn run_one(
     }
 
     // Workers: claim a batch, read each job's enqueue timestamp, ack each.
-    // claim_batch amortizes the per-claim lock hold and commit across the
-    // batch, so the drain rate matches the group-committed enqueue rate rather
-    // than serializing one claim per object-store round trip. An empty batch
-    // is terminal only once producers have stopped and the watcher has
-    // declared the backlog drained.
+    // claim_batch amortises the per-claim lock hold and commit across the
+    // batch, so the drain rate matches the group-committed enqueue rate and
+    // does not serialise one claim per object-store round trip. An empty batch
+    // is terminal only after the producers stop and the watcher declares the
+    // backlog drained.
     type DoneSample = (u64, u64); // (e2e_us, ack_us)
     let mut worker_handles = Vec::with_capacity(n_workers);
     for worker_idx in 0..n_workers {
@@ -212,7 +213,7 @@ async fn run_one(
                     Err(_) => continue,
                 };
                 // Cumulative store_amp for this size so far, so its rise and
-                // plateau as compaction amortizes are visible during the run.
+                // plateau as compaction amortises are visible during the run.
                 let done = acked.load(Ordering::Relaxed);
                 let bytes = counting.put_bytes().saturating_sub(bytes0);
                 let store_amp = if done > 0 {

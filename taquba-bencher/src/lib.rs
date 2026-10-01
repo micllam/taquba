@@ -1,7 +1,6 @@
-//! Shared setup for the taquba workspace's benchmark binaries, which
-//! live under `benches/`. This crate is an internal workspace member
-//! and is never published; see `README.md` for the benchmark
-//! catalogue and conventions.
+//! Shared setup for the taquba workspace's benchmark binaries, which live under
+//! `benches/`. This crate is an internal workspace member and is never
+//! published. `README.md` has the benchmark catalogue and conventions.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,15 +33,14 @@ pub fn pct(sorted: &[u64], p: usize) -> u64 {
 /// Object store for a bench run, selected by env vars.
 ///
 /// With `STORE_URL` set (`s3://bucket/prefix`, `gs://...`, `az://...`,
-/// `file:///abs/path`), opens that store and places each run under a
-/// fresh `bench-<unix-millis>` prefix so a rerun never observes a
-/// previous run's state; the prefix is printed to stderr. Cloud
-/// schemes require the matching cargo feature on this crate and read
-/// provider configuration from the `AWS_*` / `GOOGLE_*` / `AZURE_*`
-/// env vars. `STORE_LATENCY_MS` (fixed per-call latency) and
-/// `STORE_JITTER_MS` (random tail latency added to writes) throttle the
-/// in-memory store only, so combining either with `STORE_URL` is an
-/// error.
+/// `file:///abs/path`), opens that store and places each run under a fresh
+/// `bench-<unix-millis>` prefix so a rerun never observes a previous run's
+/// state. The prefix is printed to stderr. Cloud schemes require the matching
+/// cargo feature on this crate and read provider configuration from the `AWS_*`
+/// / `GOOGLE_*` / `AZURE_*` env vars. `STORE_LATENCY_MS` (fixed per-call
+/// latency) and `STORE_JITTER_MS` (random tail latency added to writes)
+/// throttle the in-memory store only, so combining either with `STORE_URL` is
+/// an error.
 ///
 /// Without `STORE_URL`, the in-memory store from `store_with_latency`.
 pub fn store_from_env(latency_ms: u64) -> Result<Arc<dyn ObjectStore>, Box<dyn std::error::Error>> {
@@ -57,20 +55,19 @@ pub fn store_from_env(latency_ms: u64) -> Result<Arc<dyn ObjectStore>, Box<dyn s
         );
     }
     let url = url::Url::parse(&raw)?;
-    // object_store's config keys are lowercase versions of the provider
-    // env var names; the prefix filter keeps unrelated env vars whose
-    // lowercase form is also a valid config key (TOKEN, ENDPOINT) out
-    // of the store configuration.
+    // object_store's config keys are lowercase versions of the provider env var
+    // names. The prefix filter keeps unrelated env vars whose lowercase form is
+    // also a valid config key (TOKEN, ENDPOINT) out of the store configuration.
     let options = std::env::vars().filter_map(|(key, value)| {
         let key = key.to_ascii_lowercase();
         (key.starts_with("aws_") || key.starts_with("google_") || key.starts_with("azure_"))
             .then_some((key, value))
     });
     let (store, path) = parse_url_opts(&url, options)?;
-    // Each run goes under a unique prefix so concurrent or repeated runs do
-    // not collide. STORE_PREFIX overrides it with a fixed value, which lets
-    // several processes (e.g. cold_start's build and measure phases) share
-    // one store.
+    // Each run goes to a unique prefix so concurrent or repeated runs do not
+    // collide. STORE_PREFIX overrides it with a fixed value, which lets several
+    // processes (such as cold_start's build and measure phases) share one
+    // store.
     let run_prefix = match std::env::var("STORE_PREFIX") {
         Ok(prefix) => path.join(prefix),
         Err(_) => {
@@ -84,12 +81,12 @@ pub fn store_from_env(latency_ms: u64) -> Result<Arc<dyn ObjectStore>, Box<dyn s
     Ok(Arc::new(PrefixStore::new(store, run_prefix)))
 }
 
-/// In-memory object store, wrapped in `object_store`'s `ThrottledStore`
-/// when `latency_ms` is above 0 so every get, put, list, and delete
-/// sleeps that long before running, approximating an S3-class backend,
-/// and in a `JitterStore` when `jitter_ms` is above 0 so each write also
-/// pays a random tail latency in `[0, jitter_ms]` on top of the fixed
-/// floor, injecting object-store PUT tail latency.
+/// In-memory object store, wrapped in `object_store`'s `ThrottledStore` when
+/// `latency_ms` is above 0 so every get, put, list and delete sleeps that long
+/// before running, approximating an S3-class backend, and in a `JitterStore`
+/// when `jitter_ms` is above 0 so each write also pays a random tail latency in
+/// `[0, jitter_ms]` on top of the fixed floor, injecting object-store PUT tail
+/// latency.
 fn store_with_latency(latency_ms: u64, jitter_ms: u64) -> Arc<dyn ObjectStore> {
     let base: Arc<dyn ObjectStore> = if latency_ms > 0 {
         let wait = Duration::from_millis(latency_ms);
@@ -111,9 +108,9 @@ fn store_with_latency(latency_ms: u64, jitter_ms: u64) -> Arc<dyn ObjectStore> {
     }
 }
 
-/// Install a stderr tracing subscriber honouring `RUST_LOG` (e.g.
-/// `RUST_LOG=taquba=warn`) so queue warnings such as
-/// transaction-conflict retries are visible during runs.
+/// Install a stderr tracing subscriber honouring `RUST_LOG` (for example
+/// `RUST_LOG=taquba=warn`) so queue warnings such as transaction-conflict
+/// retries are visible during runs.
 pub fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -136,7 +133,7 @@ pub fn metrics_sample_interval() -> Option<Duration> {
 }
 
 /// Install a Prometheus recorder (no HTTP server) so taquba's metric emission
-/// runs under load; the `metrics` facade macros are no-ops without a recorder.
+/// runs under load. The `metrics` facade macros are no-ops without a recorder.
 /// Returns the handle for a shutdown snapshot via [`report_metrics`]. Only the
 /// `metrics`-feature build exercises the emission path under load.
 #[cfg(feature = "metrics")]

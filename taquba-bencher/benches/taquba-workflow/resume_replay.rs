@@ -1,19 +1,18 @@
 // cargo bench -p taquba-bencher --bench resume_replay > resume.csv
 //
-// Resume benchmark for per-item memoization. Every job of a group
-// runs N_PHASES memoized phases of PHASE_WORK_MS simulated work each;
-// when FAIL_AT is above 0, each job fails transiently on its first
-// attempt after completing FAIL_AT phases, so the retry re-enters the
-// handler and resumes through memo hits without re-paying the
-// completed phases. Setting MEMO=0 runs the identical workload
-// without memoization, so the difference between the two runs is the
+// Resume benchmark for per-item memoization. Every job of a group runs N_PHASES
+// memoized phases of PHASE_WORK_MS simulated work each. When FAIL_AT is above
+// 0, each job fails transiently on its first attempt after completing FAIL_AT
+// phases, so the retry re-enters the handler and resumes through memo hits
+// without re-paying the completed phases. Setting MEMO=0 runs the identical
+// workload without memoization, so the difference between the two runs is the
 // work that memoization saves a retried item.
 //
 // Parameters (env vars, all optional).
 //   N_ITEMS             jobs in the group (default 200).
 //   N_PHASES            memoized phases per item (default 4).
 //   FAIL_AT             phases each item completes before its injected
-//                       first-attempt transient failure; 0 disables
+//                       first-attempt transient failure, where 0 disables
 //                       the injection (default 2). Must be at most
 //                       N_PHASES.
 //   PHASE_WORK_MS       simulated work per phase execution (default 20).
@@ -24,21 +23,21 @@
 //   STORE_LATENCY_MS    injected object-store latency per call (default 0).
 //                       When set, the in-memory store is wrapped in
 //                       object_store's ThrottledStore so every get, put,
-//                       list, and delete sleeps this long before running,
+//                       list and delete sleeps this long before running,
 //                       approximating an S3-class backend. Applies to
 //                       memo reads and writes as well as the queue.
 //   STORE_JITTER_MS     random tail latency in [0, STORE_JITTER_MS] added to
 //                       each write on top of STORE_LATENCY_MS (default 0).
 //   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
-//                       az://..., file:///abs/path) to run against
-//                       instead of the in-memory store; see
+//                       az://..., file:///abs/path) to run against in
+//                       place of the in-memory store, described in
 //                       the crate README. Incompatible with
 //                       STORE_LATENCY_MS and STORE_JITTER_MS.
 //
-// Output (stdout): CSV with header `window_sec,completed`, one row per
-// second with the cumulative number of terminal items. A summary
-// (items/s, phase executions against the no-retry floor) goes to
-// stderr so stdout stays a clean data stream.
+// Output (stdout): CSV with header `window_sec,completed`, one row per second
+// with the cumulative number of terminal items. A summary (items/s, phase
+// executions against the no-retry floor) goes to stderr so stdout stays a clean
+// data stream.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -117,8 +116,8 @@ impl Job for Item {
     }
 }
 
-/// Cumulative completions per elapsed second, from the completion
-/// instants of a run.
+/// Cumulative completions per elapsed second, from the completion instants of a
+/// run.
 fn progress_rows(started: Instant, completions: &[Instant]) -> Vec<(u64, usize)> {
     let mut rows = Vec::new();
     let mut completed = 0;
@@ -166,8 +165,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     QueueConfig::default()
                         .keep_done_jobs(None)
                         // Zero backoff: a retried item goes straight back to
-                        // pending, so the measured resume cost is the replay
-                        // itself, not the backoff wait.
+                        // pending, so the measured resume time is the replay
+                        // alone, without a backoff wait.
                         .retry_backoff_base(Duration::ZERO),
                 )
                 .flush_interval(Some(Duration::from_millis(flush_interval_ms))),
@@ -222,9 +221,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{sec},{completed}");
     }
 
-    // Each phase execution memoization avoided appears as the
-    // difference between the executions a retry-free run needs and
-    // the executions this run performed.
+    // Each phase execution memoization avoided appears as the difference
+    // between the executions a retry-free run needs and the executions this run
+    // performed.
     let floor = n_items * n_phases;
     let executed = resume.executions.load(Ordering::SeqCst);
     let secs = elapsed.as_secs_f64();

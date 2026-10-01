@@ -1,37 +1,37 @@
 # Benchmark results
 
-Recorded results from runs of the benchmarks in this crate. This file
-is the single source of truth for published taquba performance numbers;
-READMEs and other docs reference it rather than inlining figures, so a
-number is always tied to the version and environment that produced it.
+Recorded results from runs of the benchmarks in this crate. This file is the
+single source of truth for published taquba performance numbers. READMEs and
+other docs reference it and do not inline figures, so a number is always tied to
+the version and environment that produced it.
 
 ## Conventions
 
-- **Append-only.** Add a new entry per run; never edit or overwrite a
-  past entry. An old entry is stamped with its commit and date.
-- **One entry per environment.** A run against the in-memory store and a
-  run against real S3 are separate entries, never merged.
-- **Reproducible.** Each entry records the exact commit, instance type,
-  store, and parameters, so a reader can recreate the same environment
-  (see `terraform/`) and rerun it.
-- **The commit is the provenance anchor.** This crate is unpublished and
-  has no version of its own. Because it and `taquba` move together in one
-  repo, the entry's commit pins everything at once: taquba's source, the
-  bench code, and the bench's default parameters. Two entries are
-  comparable only if the bench code did not change between their commits.
-- **A changed benchmark starts a new series.** When a bench's workload,
-  defaults, or what it measures changes in a way that affects its
-  numbers, note the change in the next entry and treat that bench's
-  earlier entries as a closed series rather than continuing the same
-  table. The commits differ, so the provenance holds, but the note is
-  what tells a reader the numbers are no longer directly comparable.
-- **Raw output is not committed.** Criterion-style CSV streams are
-  transient build artifacts. Summarise the relevant percentiles here and
-  discard the raw CSV, or archive it in the run's object-store prefix.
+- **Append-only.** Add a new entry per run. Never edit or overwrite a past
+  entry. An old entry records its commit and date.
+- **One entry per environment.** A run against the in-memory store and a run
+  against real S3 are separate entries, never merged.
+- **Reproducible.** Each entry records the exact commit, instance type, store
+  and parameters, enough to recreate the same environment (see `terraform/`) and
+  rerun it.
+- **The commit is the provenance anchor.** This crate is unpublished and does
+  not have a version of its own. Because it and `taquba` move together in one
+  repo, the entry's commit pins everything at once: taquba's source, the bench
+  code and the bench's default parameters. Two entries are comparable only if
+  the bench code did not change between their commits.
+- **A changed benchmark starts a new series.** When a bench's workload, defaults
+  or what it measures changes in a way that affects its numbers, note the change
+  in the next entry. Treat that bench's earlier entries as a closed series, and
+  do not continue the same table. The commits differ, so the provenance remains
+  valid, but only the note tells a reader that the numbers are no longer
+  directly comparable.
+- **Raw output is not committed.** Criterion-style CSV streams are transient
+  build artifacts. Summarise the relevant percentiles here and discard the raw
+  CSV, or archive it in the run's object-store prefix.
 
-When a published claim depends on a number, cite the entry it comes
-from (date and commit) so readers can see which run it was based on,
-even after newer numbers replace it.
+When a published claim depends on a number, cite the entry it comes from (date
+and commit) so readers can see which run it was based on, even after newer
+numbers replace it.
 
 ## Entry template
 

@@ -1,12 +1,11 @@
 // cargo bench -p taquba-bencher --bench step_transitions > steps.csv
 //
-// Step-transition benchmark for the workflow runtime. Submits N_RUNS
-// runs of N_STEPS steps each; the runner returns Continue immediately
-// with the payload unchanged, so the measured cost is the runtime's
-// own overhead: persisting the step transition, enqueuing the next
-// step, and the claim / dispatch round trip back into the runner. The
-// transition latency of step k is the time between step k-1 and step k
-// of the same run completing.
+// Step-transition benchmark for the workflow runtime. Submits N_RUNS runs of
+// N_STEPS steps each. The runner returns Continue immediately with the payload
+// unchanged, so the measured cost is the runtime's own overhead: persisting the
+// step transition, enqueuing the next step and the claim / dispatch round trip
+// back into the runner. The transition latency of step k is the time between
+// step k-1 and step k of the same run completing.
 //
 // Parameters (env vars, all optional).
 //   N_RUNS                concurrent workflow runs (default 100).
@@ -20,23 +19,22 @@
 //   STORE_LATENCY_MS      injected object-store latency per call (default 0).
 //                         When set, the in-memory store is wrapped in
 //                         object_store's ThrottledStore so every get, put,
-//                         list, and delete sleeps this long before running,
+//                         list and delete sleeps this long before running,
 //                         approximating an S3-class backend.
 //   STORE_JITTER_MS       random tail latency in [0, STORE_JITTER_MS] added
 //                         to each write on top of STORE_LATENCY_MS (default 0).
 //   STORE_URL             object-store URL (s3://bucket/prefix, gs://...,
-//                         az://..., file:///abs/path) to run against
-//                         instead of the in-memory store; see
+//                         az://..., file:///abs/path) to run against in
+//                         place of the in-memory store, described in
 //                         the crate README. Incompatible with
 //                         STORE_LATENCY_MS and STORE_JITTER_MS.
 //   DURATION_CAP_SEC      abort threshold (default 600).
 //
 // Output (stdout): CSV with header
-// `window_sec,n_steps,transition_p50_us,transition_p99_us`, one row per
-// second, counting step completions in that second and the
-// distribution of transition latencies that ended in it. A summary
-// (steps/s, run end-to-end percentiles) goes to stderr so stdout stays
-// a clean data stream.
+// `window_sec,n_steps,transition_p50_us,transition_p99_us`, one row per second,
+// counting step completions in that second and the distribution of transition
+// latencies that ended in it. A summary (steps/s, run end-to-end percentiles)
+// goes to stderr so stdout stays a clean data stream.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -146,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .max_concurrent_steps(max_concurrent_steps)
     .build();
 
-    // Worker: runs until every submitted run has terminated.
+    // Worker: runs until every submitted run is terminated.
     let worker = {
         let runtime = runtime.clone();
         let terminated = terminated.clone();
@@ -192,7 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bench_start.elapsed().as_secs_f64(),
     );
 
-    // Wait for the worker, which exits once every run has terminated.
+    // Wait for the worker, which exits once every run is terminated.
     let cap = Duration::from_secs(cap_sec);
     match tokio::time::timeout(cap, worker).await {
         Ok(joined) => joined??,
@@ -206,9 +204,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_steps as f64 / wall_secs,
     );
 
-    // Per-run step series: transitions and end-to-end latency. The
-    // runner (inside the runtime) still holds the samples handle, so
-    // take the contents rather than unwrapping the Arc.
+    // Per-run step series: transitions and end-to-end latency. The runner
+    // (inside the runtime) still keeps the samples handle, so the bench takes
+    // the contents in place of unwrapping the Arc.
     let samples = std::mem::take(&mut *samples.lock().unwrap());
     let mut per_run: Vec<Vec<(u32, u64)>> = vec![Vec::with_capacity(n_steps as usize); n_runs];
     for (elapsed_us, run_idx, step_number) in samples {
@@ -225,7 +223,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let submit_at_for: std::collections::HashMap<u32, u64> = submit_times.into_iter().collect();
     for (run_idx, mut steps) in per_run.into_iter().enumerate() {
         steps.sort_unstable();
-        // Retried steps record one sample per attempt; keep the last.
+        // Retried steps record one sample per attempt, and the bench keeps the
+        // last.
         steps.dedup_by_key(|(step_number, _)| *step_number);
         for window in steps.windows(2) {
             let ((_, prev_us), (_, cur_us)) = (window[0], window[1]);

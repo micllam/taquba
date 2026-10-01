@@ -1,10 +1,9 @@
-//! An `ObjectStore` wrapper that records write-path bytes and request
-//! counts, layered over a base store, so a benchmark can measure how many
-//! bytes and requests reach object storage. Single PUTs and multipart
-//! upload parts are both counted, so the total is complete however the store
-//! writes an object; `multipart_count` reports how many multipart uploads
-//! occurred, as a diagnostic (their bytes and parts are already in the
-//! totals).
+//! An `ObjectStore` wrapper that records write-path bytes and request counts,
+//! layered over a base store, for a measurement of the bytes and requests that
+//! reach object storage. Single PUTs and multipart upload parts are both
+//! counted, so the total is complete for either way the store writes an object.
+//! `multipart_count` reports how many multipart uploads occurred, as a
+//! diagnostic (their bytes and parts are already in the totals).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,8 +16,8 @@ use taquba::object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, UploadPart,
 };
 
-/// Records write-path bytes and request counts across single PUTs and
-/// multipart upload parts. Reads, lists and deletes pass through unchanged.
+/// Records write-path bytes and request counts across single PUTs and multipart
+/// upload parts. Reads, lists and deletes pass through unchanged.
 #[derive(Debug)]
 pub struct CountingStore {
     inner: Arc<dyn ObjectStore>,
@@ -44,14 +43,14 @@ impl CountingStore {
         self.put_bytes.load(Ordering::Relaxed)
     }
 
-    /// Total write requests, counting each single PUT and each
-    /// multipart part as one.
+    /// Total write requests, counting each single PUT and each multipart part
+    /// as one.
     pub fn put_count(&self) -> u64 {
         self.put_count.load(Ordering::Relaxed)
     }
 
-    /// Number of multipart uploads started, a diagnostic; their bytes and
-    /// parts are already included in `put_bytes` and `put_count`.
+    /// Number of multipart uploads started, a diagnostic. Their bytes and parts
+    /// are already included in `put_bytes` and `put_count`.
     pub fn multipart_count(&self) -> u64 {
         self.multipart_count.load(Ordering::Relaxed)
     }
@@ -63,10 +62,10 @@ impl std::fmt::Display for CountingStore {
     }
 }
 
-// Only the write entry points record; the no-default methods are delegated
-// and the remaining trait methods keep their defaults, which route through
-// these (for example `put` calls `put_opts`), so every write is counted and
-// reads stay untouched.
+// Only the write entry points record. The no-default methods are delegated and
+// the remaining trait methods keep their defaults, which route through these
+// (for example `put` calls `put_opts`), so every write is counted and reads
+// stay untouched.
 #[async_trait]
 impl ObjectStore for CountingStore {
     async fn put_opts(

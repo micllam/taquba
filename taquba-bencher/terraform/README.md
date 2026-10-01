@@ -1,26 +1,26 @@
 # Benchmark infrastructure
 
-Terraform that provisions a single EC2 host and an S3 bucket in one
-region for running the `taquba-bencher` benchmarks against real object
-storage, which allows published numbers (recorded in `../RESULTS.md`) to
-come from a reproducible environment.
+Terraform that provisions a single EC2 host and an S3 bucket in one region for
+running the `taquba-bencher` benchmarks against real object storage, which
+allows published numbers (recorded in `../RESULTS.md`) to come from a
+reproducible environment.
 
 What it creates:
 
-- An EC2 instance (default `m7i.xlarge`, a non-burstable type so CPU
-  credits cannot throttle a run) that on first boot installs Rust,
-  clones taquba at `git_ref`, and builds `taquba-bencher --features aws`.
-- An S3 bucket for bench data, private, with a lifecycle rule that
-  expires `bench-` run prefixes after one day.
-- A least-privilege IAM role granting the host access to that bucket
-  only, plus Session Manager for a keyless, inbound-port-free shell.
+- An EC2 instance (default `m7i.xlarge`, a non-burstable type so CPU credits
+  cannot throttle a run) that on first boot installs Rust, clones taquba at
+  `git_ref`, and builds `taquba-bencher --features aws`.
+- An S3 bucket for bench data, private, with a lifecycle rule that expires
+  `bench-` run prefixes after one day.
+- A least-privilege IAM role granting the host access to that bucket only, plus
+  Session Manager for a keyless, inbound-port-free shell.
 
 The host and bucket are placed in the same region.
 
 ## Usage
 
-Requires the Terraform CLI, AWS credentials in the environment, and the
-AWS CLI with the Session Manager plugin for connecting.
+Requires the Terraform CLI, AWS credentials in the environment, and the AWS CLI
+with the Session Manager plugin for connecting.
 
 ```bash
 cp terraform.tfvars.example terraform.tfvars   # set a unique bucket_name
@@ -47,15 +47,15 @@ STORE_URL=s3://<bucket> AWS_REGION=<region> \
 terraform destroy
 ```
 
-Record the `git_ref` you built and the instance type in the
-`RESULTS.md` entry so the numbers stay tied to their environment.
+Record the built `git_ref` and the instance type in the `RESULTS.md` entry so
+the numbers stay tied to their environment.
 
 ## Sampling storage during a run
 
 To track storage growth over a long run (leak and drift checks),
-`sample-storage.sh` appends `epoch,objects,bytes` rows to a CSV on a
-fixed interval. The AWS CLI is preinstalled by `user_data`, so run it
-from the cloned repo on the host:
+`sample-storage.sh` appends `epoch,objects,bytes` rows to a CSV on a fixed
+interval. The AWS CLI is preinstalled by `user_data`, so run it from the cloned
+repo on the host:
 
 ```bash
 # Sample the run's prefix every 5 minutes.
@@ -63,16 +63,15 @@ from the cloned repo on the host:
   s3://<bucket>/<store-prefix> storage.csv 300
 ```
 
-On a missing CLI or an `aws s3 ls` error it appends an `ERR` row
-(and an `*.aws-err.log`). It loops until killed.
+On a missing CLI or an `aws s3 ls` error it appends an `ERR` row (and an
+`*.aws-err.log`). It loops until killed.
 
 ## Running a long bench in the background
 
-An SSM shell terminates when the connection drops, and a foreground
-bench terminates with it. For multi-hour runs, start the bench and the
-sampler as transient `systemd-run` units; they survive disconnects and
-are queryable with
-`systemctl` and `journalctl`:
+An SSM shell terminates when the connection drops, and a foreground bench
+terminates with it. For multi-hour runs, start the bench and the sampler as
+transient `systemd-run` units. They persist across disconnects and are queryable
+with `systemctl` and `journalctl`:
 
 ```bash
 # Bench. bash -c sets the toolchain env and redirects output to files.
@@ -93,23 +92,23 @@ systemctl stop taquba-storage    # stop the sampler once the bench ends
 
 ## Retrieving results before destroy
 
-`terraform destroy` deletes everything, including the instance and the
-bucket (`force_destroy` removes the bucket even with run data still in
-it). Note where the data resides before destroying:
+`terraform destroy` deletes everything, including the instance and the bucket
+(`force_destroy` removes the bucket even with run data still in it). Note where
+the data resides before destroying:
 
-- The **bucket** holds the system-under-test's data (the
-  `bench-<unix-millis>` queue workload), not your results.
-- The benches write their CSV to **stdout on the host**, so the numbers
-  land on the instance's local disk, which destroy also deletes.
+- The **bucket** contains the system-under-test's data (the
+  `bench-<unix-millis>` queue workload) and does not contain the results.
+- The benches write their CSV to **stdout on the host**, so the numbers are
+  written to the instance's local disk, which destroy also deletes.
 
-Both locations are therefore removed on destroy; capture anything needed
-first. Since `../RESULTS.md` records summarised percentiles rather
-than raw CSV, the minimum is to read the run's summary off the host (it
-prints to stderr) and write the entry before destroying.
+Both locations are therefore removed on destroy. Capture anything needed first.
+Because `../RESULTS.md` records summarised percentiles in place of raw CSV, the
+minimum is to read the run's summary off the host (it prints to stderr) and
+write the entry before destroying.
 
-To keep the raw CSV as well, copy it off the host before destroy. If you
-stage it through S3, use a `results/` prefix so the `bench-` lifecycle
-rule does not expire it within a day:
+To keep the raw CSV as well, copy it off the host before destroy. To stage it
+through S3, use a `results/` prefix so the `bench-` lifecycle rule does not
+expire it within a day:
 
 ```bash
 # On the host, after the run.
@@ -121,5 +120,5 @@ aws s3 cp s3://<bucket>/results/steady-<date>.csv .
 
 ## State
 
-State is local by default. For shared or long-lived use, configure
-an S3 backend in `versions.tf`.
+State is local by default. For shared or long-lived use, configure an S3 backend
+in `versions.tf`.

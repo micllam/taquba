@@ -1,43 +1,45 @@
 // cargo bench -p taquba-bencher --bench cold_start > cold.csv
 //
-// Cold-start benchmark for the reopen (cold-open) cost and the claim path
-// after a process restart. Phase one builds history: N_HISTORY jobs are
-// enqueued, claimed, and acked, leaving a tombstone band at the front of
-// the `pending:` key space, and N_LIVE jobs are then enqueued and left
-// pending. Phase two reopens the same store and measures the reopen and
-// each of the claims that follow. The claim cursor's scan bound is
-// in-memory state lost on restart, so the first claim falls back to a front
-// prefix scan across the band; the series shows what that scan costs and
-// how quickly later claims recover once the bound is re-established. The
-// reopen time itself (`open_ms`) is the cold-open metric: it is dominated by
-// WAL replay since the last checkpoint, so it scales with store size and
-// with how much WAL is left unflushed.
+// Cold-start benchmark for the reopen (cold-open) cost and the claim path after
+// a process restart. Phase one builds history: N_HISTORY jobs are enqueued,
+// claimed and acked, which leaves a tombstone band at the front of the
+// `pending:` key space, and N_LIVE jobs are then enqueued and left pending.
+// Phase two reopens the same store and measures the reopen and each of the
+// claims that follow. The claim cursor's scan bound is in-memory state lost on
+// restart, so the first claim falls back to a front prefix scan across the
+// band. The series shows what that scan costs and how quickly later claims
+// recover once the bound is re-established. The reopen time itself (`open_ms`)
+// is the cold-open metric: it is dominated by the replay of the WAL written
+// after the last checkpoint, so it scales with store size and with how much WAL
+// is left unflushed.
 //
 // PHASE selects how the two halves run:
 //   full     (default) one process: build, graceful close (which
 //            checkpoints the memtable), reopen, measure. The reopen here
-//            replays a near-empty WAL, so this is the CHEAP cold-open arm.
-//            Works with the in-memory store.
-//   build    build the store, then either close gracefully or crash; then
-//            exit. Requires STORE_URL (a persistent store shared with the
-//            measure process).
+//            replays a near-empty WAL, so this is the SHORT-REPLAY cold-open
+//            arm. Works with the in-memory store.
+//   build    build the store, then either close gracefully or crash, and
+//            then exit. Requires STORE_URL (a persistent store shared with
+//            the measure process).
 //   measure  reopen an existing store (from a prior build) and measure.
 //            Requires STORE_URL.
-// The EXPENSIVE cold-open arm (reopen against a long unflushed WAL) is
-// `PHASE=build GRACEFUL_CLOSE=0` (which exits via process::exit, skipping
-// all flush and Drop, so the memtable is never checkpointed) followed by
+//
+// The LONG-REPLAY cold-open arm (reopen against a long unflushed WAL) is
+// `PHASE=build GRACEFUL_CLOSE=0` (which exits via process::exit, skipping all
+// flush and Drop, so the memtable is never checkpointed) followed by
 // `PHASE=measure`, both with the same STORE_URL and STORE_PREFIX so the two
-// processes share one store. Comparing its `open_ms` with the graceful
-// arm's (`GRACEFUL_CLOSE=1`) quantifies the force-flush lever. For example:
+// processes share one store. Comparing its `open_ms` with the graceful arm's
+// (`GRACEFUL_CLOSE=1`) quantifies the force-flush lever. For example:
 //   STORE_URL=s3://bucket STORE_PREFIX=coldopen PHASE=build GRACEFUL_CLOSE=0 ... <bin>
 //   STORE_URL=s3://bucket STORE_PREFIX=coldopen PHASE=measure ... <bin> > cold.csv
 //
 // Parameters (env vars, all optional).
 //   PHASE               full | build | measure (default full).
 //   GRACEFUL_CLOSE      in PHASE=build, 1 (default) closes cleanly and
-//                       checkpoints the memtable; 0 crashes (process::exit
-//                       without close), leaving the WAL unflushed since the
-//                       last checkpoint. Ignored outside PHASE=build.
+//                       checkpoints the memtable. 0 crashes (process::exit
+//                       without close), and the WAL written after the last
+//                       checkpoint stays unflushed. Ignored outside
+//                       PHASE=build.
 //   N_HISTORY           jobs enqueued and acked before the restart
 //                       (default 20_000). Sets the width of the
 //                       tombstone band the first claim scans across.
@@ -47,24 +49,23 @@
 //   STORE_LATENCY_MS    injected object-store latency per call (default 0).
 //                       When set, the in-memory store is wrapped in
 //                       object_store's ThrottledStore so every get, put,
-//                       list, and delete sleeps this long before running,
+//                       list and delete sleeps this long before running,
 //                       approximating an S3-class backend. Applies to the
 //                       history build as well as the measured phase.
 //   STORE_JITTER_MS     random tail latency in [0, STORE_JITTER_MS] added to
 //                       each write on top of STORE_LATENCY_MS (default 0).
 //   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
-//                       az://..., file:///abs/path) to run against
-//                       instead of the in-memory store; see
-//                       the crate README. Incompatible with
-//                       STORE_LATENCY_MS and STORE_JITTER_MS. Required for PHASE=build/measure.
+//                       az://..., file:///abs/path) to run against in place
+//                       of the in-memory store. See the crate README.
+//                       Incompatible with STORE_LATENCY_MS and
+//                       STORE_JITTER_MS. Required for PHASE=build/measure.
 //   STORE_PREFIX        fixed store sub-prefix (default: a unique per-run
 //                       `bench-<millis>`). Required for PHASE=build/measure
 //                       so both processes share one store location.
 //
 // Output (stdout): CSV with header `claim_idx,claim_us`, one row per
-// post-restart claim in claim order (emitted by the full and measure
-// phases). Reopen time and a summary go to stderr so stdout stays a clean
-// data stream.
+// post-restart claim in claim order (emitted by the full and measure phases).
+// Reopen time and a summary go to stderr so stdout stays a clean data stream.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -75,12 +76,12 @@ use taquba_bencher::{env_var, init_tracing, pct, store_from_env};
 
 const QUEUE_NAME: &str = "bench";
 
-/// Lease used for the measured post-restart claims, each acked
-/// immediately after it is recorded.
+/// Lease used for the measured post-restart claims, each acked immediately
+/// after it is recorded.
 const LEASE: Duration = Duration::from_secs(5);
-/// Lease used while draining the history phase. Long enough that
-/// acking a full batch against an injected-latency store never lets
-/// the lease expire mid-batch.
+/// Lease used while draining the history phase. Long enough that acking a full
+/// batch against an injected-latency store never lets the lease expire
+/// mid-batch.
 const HISTORY_LEASE: Duration = Duration::from_secs(60);
 /// Concurrent claim/ack tasks draining the history phase.
 const HISTORY_WORKERS: usize = 32;
@@ -95,10 +96,10 @@ fn open_options(flush_interval_ms: u64) -> OpenOptions {
         .flush_interval(Some(Duration::from_millis(flush_interval_ms)))
 }
 
-/// Build the on-disk history a restart will see: enqueue and drain
-/// N_HISTORY jobs (leaving a tombstone band), then enqueue N_LIVE jobs and
-/// leave them pending. Returns the still-open queue; the caller decides
-/// whether to close it gracefully or crash.
+/// Build the on-disk history a restart will see: enqueue and drain N_HISTORY
+/// jobs (leaving a tombstone band), then enqueue N_LIVE jobs and leave them
+/// pending. Returns the still-open queue. The caller decides whether to close
+/// it gracefully or crash.
 async fn build_store(
     store: Arc<dyn ObjectStore>,
     flush_interval_ms: u64,
@@ -129,8 +130,8 @@ async fn build_store(
                     .claim_batch(QUEUE_NAME, HISTORY_CLAIM_BATCH, HISTORY_LEASE)
                     .await
                 {
-                    // The history phase never re-enqueues, so an empty
-                    // batch is terminal for this worker.
+                    // The history phase never re-enqueues, so an empty batch is
+                    // terminal for this worker.
                     Ok(jobs) if jobs.is_empty() => break,
                     Ok(jobs) => {
                         for job in &jobs {
@@ -170,10 +171,10 @@ async fn build_store(
     Ok(queue)
 }
 
-/// Reopen the store, recording the reopen time, then claim and ack the
-/// surviving jobs serially so each row is one claim's latency, until the
-/// queue is drained. Emits the `claim_idx,claim_us` CSV on stdout and a
-/// summary (including the reopen time) on stderr.
+/// Reopen the store, recording the reopen time, then claim and ack the jobs
+/// that remain after the restart serially so each row is one claim's latency,
+/// until the queue is drained. Emits the `claim_idx,claim_us` CSV on stdout and
+/// a summary (including the reopen time) on stderr.
 async fn measure_reopen(
     store: Arc<dyn ObjectStore>,
     flush_interval_ms: u64,
@@ -243,9 +244,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // build and measure run in separate processes and so need a store that
-    // survives a process exit (STORE_URL) at a shared, fixed location
-    // (STORE_PREFIX, since store_from_env otherwise picks a unique per-run
-    // prefix that the two processes would not agree on).
+    // persists across a process exit (STORE_URL) at a shared, fixed location
+    // (STORE_PREFIX, because store_from_env otherwise chooses a unique per-run
+    // prefix that the two processes do not agree on).
     if phase == "build" || phase == "measure" {
         if std::env::var("STORE_URL").is_err() {
             return Err(format!(
@@ -268,8 +269,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match phase.as_str() {
         // One process: build, graceful close (checkpoints the memtable),
-        // reopen, measure. The reopen replays a near-empty WAL, so this is
-        // the cheap cold-open arm.
+        // reopen, measure. The reopen replays a near-empty WAL, so this is the
+        // short-replay cold-open arm.
         "full" => {
             let queue = build_store(
                 store.clone(),
@@ -293,9 +294,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("build: graceful close complete; memtable checkpointed");
             } else {
                 // Crash arm: exit without close so the memtable is never
-                // checkpointed, leaving a long WAL for the measure phase to
-                // replay. process::exit skips all Drop, so there is no flush
-                // and no lingering SlateDB flush task, matching a real crash.
+                // checkpointed and the measure phase has a long WAL to replay.
+                // process::exit skips all Drop, so there is no flush and no
+                // lingering SlateDB flush task, matching a real crash.
                 eprintln!("build: crash exit (no close); WAL left unflushed since last checkpoint");
                 std::process::exit(0);
             }

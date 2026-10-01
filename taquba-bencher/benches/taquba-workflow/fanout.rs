@@ -1,12 +1,11 @@
 // cargo bench -p taquba-bencher --bench fanout > fanout.csv
 //
-// Fan-out benchmark for typed jobs: submit N_JOBS concurrently with
-// idempotency keys, await every handle, then submit the identical
-// batch again so each handle short-circuits to its cached outcome
-// record. The cold phase measures the full round trip (run record plus
-// enqueue, claim, run, outcome-record write, completion notification,
-// outcome read); the resubmit phase measures the idempotent
-// short-circuit that crash-resume relies on.
+// Fan-out benchmark for typed jobs: submit N_JOBS concurrently with idempotency
+// keys, await every handle, then submit the identical batch again so each
+// handle short-circuits to its cached outcome record. The cold phase measures
+// the full round trip (run record plus enqueue, claim, run, outcome-record
+// write, completion notification, outcome read). The resubmit phase measures
+// the idempotent short-circuit that crash-resume relies on.
 //
 // Parameters (env vars, all optional).
 //   N_JOBS              jobs per phase (default 500).
@@ -16,20 +15,20 @@
 //   STORE_LATENCY_MS    injected object-store latency per call (default 0).
 //                       When set, the in-memory store is wrapped in
 //                       object_store's ThrottledStore so every get, put,
-//                       list, and delete sleeps this long before running,
+//                       list and delete sleeps this long before running,
 //                       approximating an S3-class backend. Applies to
 //                       outcome records as well as the queue.
 //   STORE_JITTER_MS     random tail latency in [0, STORE_JITTER_MS] added to
 //                       each write on top of STORE_LATENCY_MS (default 0).
 //   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
-//                       az://..., file:///abs/path) to run against
-//                       instead of the in-memory store; see
+//                       az://..., file:///abs/path) to run against in
+//                       place of the in-memory store, described in
 //                       the crate README. Incompatible with
 //                       STORE_LATENCY_MS and STORE_JITTER_MS.
 //
-// Output (stdout): CSV with header `phase,jobs,secs,jobs_per_sec`,
-// one row per phase (`cold`, `resubmit`). Status prints go to stderr
-// so stdout stays a clean data stream.
+// Output (stdout): CSV with header `phase,jobs,secs,jobs_per_sec`, one row per
+// phase (`cold`, `resubmit`). Status prints go to stderr so stdout stays a
+// clean data stream.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -69,8 +68,8 @@ impl Job for BenchJob {
     }
 }
 
-/// Submit `n_jobs` concurrently, await every handle, and return the
-/// phase duration plus how many of the handles were newly submitted.
+/// Submit `n_jobs` concurrently, await every handle and return the phase
+/// duration plus how many of the handles were newly submitted.
 async fn run_phase(
     runner: &JobRunner,
     n_jobs: u32,
@@ -138,8 +137,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         n_jobs as f64 / cold_secs,
     );
 
-    // The identical batch again: every handle should short-circuit to
-    // the cached outcome record without re-running the job.
+    // The identical batch again: the bench expects every handle to
+    // short-circuit to the cached outcome record without re-running the job.
     let (resubmit_secs, resubmit_new) = run_phase(&runner, n_jobs, job_work_ms).await?;
     let total_executed = EXECUTIONS.load(Ordering::SeqCst);
     eprintln!(

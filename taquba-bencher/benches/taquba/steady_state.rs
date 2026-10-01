@@ -1,47 +1,47 @@
 // cargo bench -p taquba-bencher --bench steady_state > steady.csv
 //
-// Steady-state benchmark for concurrent produce and consume. Producers
-// sustain a fixed offered enqueue rate for DURATION_SEC while workers
-// claim and ack concurrently; producers then stop and workers drain the
-// backlog. Emits a per-second time series so degradation over time
-// (compaction stalls, tombstone accumulation, backlog growth) is visible,
-// unlike a drain-shaped run that starts from a prefilled queue.
+// Steady-state benchmark for concurrent produce and consume. Producers sustain
+// a fixed offered enqueue rate for DURATION_SEC while workers claim and ack
+// concurrently. Producers then stop and workers drain the backlog. Emits a
+// per-second time series so degradation over time (compaction stalls, tombstone
+// accumulation, backlog growth) is visible, unlike a drain-shaped run that
+// starts from a prefilled queue.
 //
 // Parameters (env vars, all optional).
-//   DURATION_SEC        seconds producers sustain the offered rate (default 60).
+//   DURATION_SEC        seconds producers sustain RATE (default 60).
 //   RATE                offered enqueue rate in jobs/sec across all
 //                       producers (default 500).
 //   RATE_SCHEDULE       optional comma-separated `seconds:rate` segments
-//                       describing a time-varying offered rate, e.g.
+//                       describing a time-varying offered rate, such as
 //                       `60:0,300:500,120:2000` for 60s idle, then 300s at
 //                       500/s, then 120s at 2000/s. A rate of 0 is an idle
 //                       segment (producers sleep). Mutually exclusive with
-//                       RATE and DURATION_SEC; the total run length is the
+//                       RATE and DURATION_SEC. The total run length is the
 //                       sum of the segment seconds. Producers follow the
-//                       schedule independently; workers drain after the last
-//                       segment as usual.
+//                       schedule independently, and workers drain after the
+//                       last segment as usual.
 //   N_PRODUCERS         concurrent enqueue tasks (default 4). Each producer
 //                       enqueues serially, so the offered rate is capped at
 //                       roughly N_PRODUCERS / per-enqueue-latency.
 //   N_WORKERS           concurrent claim/ack tasks (default 50). Must be
 //                       at least N_QUEUES so every queue has a worker.
 //   N_QUEUES            queues the load is spread across (default 1).
-//                       Producers enqueue round-robin; worker i serves
-//                       queue i mod N_QUEUES. Values above 1 exercise
+//                       Producers enqueue round-robin, and worker i claims
+//                       from queue i mod N_QUEUES. Values above 1 exercise
 //                       the global reaper / scheduler prefix scans and
 //                       the per-queue claim state under many queues.
 //   CLAIM_BATCH         jobs claimed per claim_batch call (default 1).
-//                       Values above 1 amortize the per-claim lock hold
-//                       and commit across the batch; each job is still
+//                       Values above 1 amortise the per-claim lock hold
+//                       and commit across the batch. Each job is still
 //                       acked individually.
 //   WAIT_CLAIM_MS       when above 0, workers use claim_with_wait with
-//                       this wait instead of polling claim_batch, so
+//                       this wait in place of polling claim_batch, so
 //                       idle workers wait on the queue-scoped notify and
 //                       wake one per inserted job. claim_p99_us is
 //                       reported as 0 in this mode: a successful call's
 //                       latency is dominated by time waiting for
 //                       a job to exist, which is not claim-path cost.
-//   DRAIN_TIMEOUT_SEC   seconds the backlog drain may run after producers
+//   DRAIN_TIMEOUT_SEC   seconds the backlog drain can run after producers
 //                       stop before the run is abandoned (default 0, no
 //                       limit). On expiry the CSV is written and the
 //                       process exits non-zero.
@@ -50,31 +50,31 @@
 //   STORE_LATENCY_MS    injected object-store latency per call (default 0).
 //                       When set, the in-memory store is wrapped in
 //                       object_store's ThrottledStore so every get, put,
-//                       list, and delete sleeps this long before running,
+//                       list and delete sleeps this long before running,
 //                       approximating an S3-class backend.
 //   STORE_JITTER_MS     random tail latency in [0, STORE_JITTER_MS] added
 //                       to each write on top of STORE_LATENCY_MS (default 0),
 //                       injecting object-store PUT tail latency to study its
 //                       effect on e2e and backlog without real S3.
 //   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
-//                       az://..., file:///abs/path) to run against
-//                       instead of the in-memory store; see
-//                       the crate README. Incompatible with
-//                       STORE_LATENCY_MS and STORE_JITTER_MS.
+//                       az://..., file:///abs/path) to run against in
+//                       place of the in-memory store. See the crate
+//                       README. Incompatible with STORE_LATENCY_MS and
+//                       STORE_JITTER_MS.
 //   METRICS_SAMPLE_MS   gauge sampler interval in ms (default 1000). Only
 //                       effective when built with `--features metrics`, which
 //                       installs a recorder so taquba's metric emission runs
-//                       under load; used to validate that path and its
-//                       overhead, not as a measurement source (the bench
-//                       still times operations directly).
+//                       under load. It is for a check of that path and its
+//                       overhead and is never a measurement source (the
+//                       bench still times operations directly).
 //
 // Output (stdout): CSV with header
 // `window_sec,n_enq,enq_p99_us,n_done,e2e_p50_us,e2e_p95_us,e2e_p99_us,claim_p99_us,ack_p99_us,pending`.
-// `n_enq`/`n_done` count enqueues and acks completed in that second.
-// `e2e_*` is enqueue-call start to ack completion. `pending` is the
-// queue depth sampled once per second; growth across windows means the
-// offered rate exceeds what the queue sustains. Status and progress
-// prints go to stderr so stdout stays a clean data stream.
+// `n_enq`/`n_done` count enqueues and acks completed in that second. `e2e_*` is
+// enqueue-call start to ack completion. `pending` is the queue depth sampled
+// once per second. Growth across windows means the offered rate exceeds what
+// the queue sustains. Status and progress prints go to stderr so stdout stays a
+// clean data stream.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -83,18 +83,18 @@ use std::time::{Duration, Instant};
 use taquba::{OpenOptions, Queue, QueueConfig};
 use taquba_bencher::{env_var, init_tracing, pct, store_from_env};
 
-/// Lease held while a worker has a job claimed. Long enough that an
-/// idle scheduler tick during the bench never lets a lease expire.
+/// Lease held while a worker has a job claimed. Long enough that an idle
+/// scheduler tick during the bench never lets a lease expire.
 const LEASE: Duration = Duration::from_secs(5);
-/// Watcher poll interval: how often stats are sampled for the
-/// `pending` column and the drain check.
+/// Watcher poll interval: how often stats are sampled for the `pending` column
+/// and the drain check.
 const WATCHER_TICK: Duration = Duration::from_secs(1);
-/// How long an idle worker sleeps before re-polling while producers
-/// are still running.
+/// How long an idle worker sleeps before re-polling while producers are still
+/// running.
 const IDLE_BACKOFF: Duration = Duration::from_millis(2);
 
-/// Records the first error reported by a producer or worker. Later
-/// errors are discarded.
+/// Records the first error reported by a producer or worker. Later errors are
+/// discarded.
 fn record_error(slot: &Mutex<Option<String>>, message: String) {
     let mut slot = slot.lock().expect("task error mutex poisoned");
     if slot.is_none() {
@@ -102,10 +102,9 @@ fn record_error(slot: &Mutex<Option<String>>, message: String) {
     }
 }
 
-/// Parse a `RATE_SCHEDULE` value: a comma-separated list of
-/// `seconds:rate` segments (e.g. `60:0,300:500,120:2000`). A rate of 0 is
-/// an idle segment. Empty segments are skipped; at least one valid segment
-/// is required.
+/// Parse a `RATE_SCHEDULE` value: a comma-separated list of `seconds:rate`
+/// segments, such as `60:0,300:500,120:2000`. A rate of 0 is an idle segment.
+/// Empty segments are skipped. At least one valid segment is required.
 fn parse_schedule(spec: &str) -> Result<Vec<(u64, f64)>, String> {
     let mut schedule = Vec::new();
     for seg in spec.split(',') {
@@ -194,9 +193,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new((0..n_queues).map(|i| format!("bench-{i}")).collect());
 
     // With `--features metrics`, install a recorder so the queue's metric
-    // emissions run under load (the facade macros are no-ops with no recorder);
-    // the gauge sampler is enabled via metrics_sample_interval below. Rendered
-    // once at shutdown as a sanity check.
+    // emissions run under load (the facade macros are no-ops without a
+    // recorder). The gauge sampler is enabled via metrics_sample_interval
+    // below. Rendered once at shutdown as a sanity check.
     #[cfg(feature = "metrics")]
     let prometheus = taquba_bencher::install_metrics_recorder();
 
@@ -215,28 +214,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bench_start = Instant::now();
     let producers_done = Arc::new(AtomicBool::new(false));
-    // Set by the watcher once stats report the queue fully drained.
-    // Workers exit on this rather than on their own empty polls: a
-    // lease that expires after a worker's last poll is requeued by the
-    // reaper and must still find live workers.
+    // Set by the watcher once stats report the queue fully drained. Workers
+    // exit on this flag, and their own empty polls do not stop them: a lease
+    // that expires after a worker's last poll is requeued by the reaper and
+    // must still find live workers.
     let drain_complete = Arc::new(AtomicBool::new(false));
     // Set by the watcher when DRAIN_TIMEOUT_SEC expires. Unlike
     // `drain_complete` it stops workers without waiting for an empty poll,
     // which an undrained queue never yields.
     let drain_abandoned = Arc::new(AtomicBool::new(false));
-    // First error returned by a producer or worker; it fails the run.
+    // First error returned by a producer or worker, which fails the run.
     let task_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     // Each entry is (elapsed_us_at_completion, latency_us).
     type Sample = (u64, u64);
 
-    // Producers: each follows the offered-rate schedule independently.
-    // Within a non-idle segment a producer sustains seg_rate / N_PRODUCERS
-    // via an interval whose default Burst missed-tick behaviour catches up
-    // after a slow enqueue, preserving the offered rate on average,
-    // enqueuing round-robin across the queues. An idle (rate 0) segment
-    // sleeps until it ends. The enqueue timestamp is stored in the payload's
-    // first 8 bytes so workers can compute end-to-end latency.
+    // Producers: each follows the offered-rate schedule independently. Within a
+    // non-idle segment a producer sustains seg_rate / N_PRODUCERS via an
+    // interval whose default Burst missed-tick behaviour catches up after a
+    // slow enqueue, preserving the offered rate on average, enqueuing
+    // round-robin across the queues. An idle (rate 0) segment sleeps until it
+    // ends. The enqueue timestamp is stored in the payload's first 8 bytes so
+    // workers can compute end-to-end latency.
     let schedule = Arc::new(schedule);
     let mut producer_handles = Vec::with_capacity(n_producers);
     for producer_idx in 0..n_producers {
@@ -288,10 +287,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }));
     }
 
-    // Workers: claim a batch, read each job's embedded enqueue
-    // timestamp, ack each job. The batch's claim latency is recorded on
-    // every job it delivered. Each worker serves one queue. An empty
-    // poll is terminal only once producers have stopped.
+    // Workers: claim a batch, read each job's embedded enqueue timestamp, ack
+    // each job. The batch's claim latency is recorded on every job it
+    // delivered. Each worker claims from one queue. An empty poll is terminal
+    // only after the producers stop.
     type DoneSample = (u64, u64, u64, u64); // (elapsed_us, e2e_us, claim_us, ack_us)
     let mut worker_handles = Vec::with_capacity(n_workers);
     for worker_idx in 0..n_workers {
@@ -325,9 +324,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Ok(jobs) => {
-                        // In wait mode the call's latency is mostly time
-                        // waiting for a job to exist, not claim
-                        // cost; report zero rather than a misleading mix.
+                        // In wait mode the call's latency is mostly the wait
+                        // for a job to exist and does not measure claim cost.
+                        // Report zero in place of a misleading mix.
                         let claim_us = if wait_claim_ms > 0 {
                             0
                         } else {
@@ -360,9 +359,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }));
     }
 
-    // Watcher: sample queue depth once per second for the `pending`
-    // column and print progress, summed across all queues. Exits when
-    // producers have stopped and every queue has fully drained.
+    // Watcher: sample queue depth once per second for the `pending` column and
+    // print progress, summed across all queues. Exits when the producers are
+    // stopped and every queue is fully drained.
     let watcher = {
         let queue = queue.clone();
         let queue_names = queue_names.clone();
@@ -371,7 +370,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let drain_abandoned = drain_abandoned.clone();
         tokio::spawn(async move {
             let mut depth_samples: Vec<(u64, i64)> = Vec::new();
-            // First sample after producers stopped; DRAIN_TIMEOUT_SEC runs
+            // First sample after the producers stopped. DRAIN_TIMEOUT_SEC runs
             // from here.
             let mut drain_start: Option<Instant> = None;
             let mut undrained: Option<i64> = None;

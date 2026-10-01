@@ -1,16 +1,15 @@
 // cargo bench -p taquba-bencher --bench reaper_storm > storm.csv
 //
-// Mass lease-expiry benchmark for the reaper. Phase one builds the
-// storm: N_EXPIRED jobs are enqueued on one queue and claimed with a
-// lease that expires immediately, never acked, simulating a crash
-// that abandoned every claim; the reaper interval is set long
-// enough that no sweep runs, so the storm survives a clean close
-// intact. Phase two reopens the store with a
-// normal reaper interval while producers and workers run a steady
-// load on a second queue, and tracks both the sweep's progress and
-// the live queue's latencies per second. The reaper requeues each
-// expired claim in its own durable transaction, so the sweep rate is
-// expected to track the WAL flush interval.
+// Mass lease-expiry benchmark for the reaper. Phase one builds the storm:
+// N_EXPIRED jobs are enqueued on one queue and claimed with a lease that
+// expires immediately, never acked, simulating a crash that abandoned every
+// claim. The bench sets a reaper interval long enough that no sweep runs, so
+// the storm persists intact across a clean close. Phase two reopens the store
+// with a normal reaper interval while producers and workers run a steady load
+// on a second queue, and tracks both the sweep's progress and the live queue's
+// latencies per second. The reaper requeues each expired claim in its own
+// durable transaction, so the sweep rate is expected to track the WAL flush
+// interval.
 //
 // Parameters (env vars, all optional).
 //   N_EXPIRED           abandoned claims built before the restart
@@ -21,19 +20,20 @@
 //   N_WORKERS           concurrent claim/ack tasks on the live queue
 //                       (default 20).
 //   REAPER_INTERVAL_MS  reaper interval for the measured phase
-//                       (default 1_000; the library default is 5_000).
+//                       (default 1_000, where the library default is
+//                       5_000).
 //   PAYLOAD_BYTES       per-job payload size, min 8 (default 64).
 //   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1).
 //   STORE_LATENCY_MS    injected object-store latency per call (default 0).
 //                       When set, the in-memory store is wrapped in
 //                       object_store's ThrottledStore so every get, put,
-//                       list, and delete sleeps this long before running,
+//                       list and delete sleeps this long before running,
 //                       approximating an S3-class backend.
 //   STORE_JITTER_MS     random tail latency in [0, STORE_JITTER_MS] added to
 //                       each write on top of STORE_LATENCY_MS (default 0).
 //   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
-//                       az://..., file:///abs/path) to run against
-//                       instead of the in-memory store; see
+//                       az://..., file:///abs/path) to run against in
+//                       place of the in-memory store, described in
 //                       the crate README. Incompatible with
 //                       STORE_LATENCY_MS and STORE_JITTER_MS.
 //   DURATION_CAP_SEC    abort threshold for the measured phase
@@ -42,15 +42,16 @@
 //                       effective when built with `--features metrics`, which
 //                       installs a recorder so taquba's metric emission
 //                       (including the reaper's reaped counter) runs under
-//                       load; validates that path, not a measurement source.
+//                       load. The recorder validates that path and is not a
+//                       measurement source.
 //
 // Output (stdout): CSV with header
 // `window_sec,storm_claimed,storm_pending,n_done,e2e_p50_us,e2e_p99_us,claim_p99_us`.
-// `storm_claimed` counts abandoned claims the sweep has not yet
-// requeued; `storm_pending` counts requeued ones. The remaining
-// columns describe the live queue: acks completed in that second,
-// enqueue-to-ack latency, and per-claim latency. Status and progress
-// prints go to stderr so stdout stays a clean data stream.
+// `storm_claimed` counts abandoned claims that the sweep did not yet requeue,
+// and `storm_pending` counts requeued ones. The remaining columns describe the
+// live queue: acks completed in that second, enqueue-to-ack latency and
+// per-claim latency. Status and progress prints go to stderr so stdout stays a
+// clean data stream.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,17 +63,17 @@ use taquba_bencher::{env_var, init_tracing, pct, store_from_env};
 const LIVE_QUEUE: &str = "live";
 const STORM_QUEUE: &str = "storm";
 
-/// Lease held while a live worker has a job claimed. Long enough that
-/// the reaper never sweeps a live claim during the bench.
+/// Lease held while a live worker has a job claimed. Long enough that the
+/// reaper never sweeps a live claim during the bench.
 const LIVE_LEASE: Duration = Duration::from_secs(60);
-/// Lease used to build the storm; expired well before phase two opens.
+/// Lease used to build the storm. It expires well before phase two opens.
 const STORM_LEASE: Duration = Duration::from_millis(1);
 /// Jobs claimed per claim_batch call while building the storm.
 const STORM_CLAIM_BATCH: usize = 256;
 /// Jobs per enqueue_batch call while building the storm.
 const STORM_ENQUEUE_BATCH: usize = 1_000;
-/// Reaper interval for phase one, long enough that no sweep runs
-/// while the storm is being built.
+/// Reaper interval for phase one, long enough that no sweep runs while the
+/// storm is being built.
 const BUILD_REAPER_INTERVAL: Duration = Duration::from_secs(3_600);
 /// Watcher poll interval: how often both queues' stats are sampled.
 const WATCHER_TICK: Duration = Duration::from_secs(1);
@@ -92,8 +93,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
     // With `--features metrics`, install a recorder so the queue's metric
-    // emissions (including the reaper's reaped counter) run under load;
-    // rendered once at shutdown as a sanity check.
+    // emissions (including the reaper's reaped counter) run under load. The
+    // bench renders the recorder once at shutdown as a sanity check.
     #[cfg(feature = "metrics")]
     let prometheus = taquba_bencher::install_metrics_recorder();
 
@@ -142,8 +143,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     queue.close().await?;
 
-    // Phase two: reopen with a normal reaper interval; the first sweep
-    // finds every storm claim expired. Live traffic runs concurrently.
+    // Phase two: reopen with a normal reaper interval. The first sweep finds
+    // every storm claim expired. Live traffic runs concurrently.
     let queue = Arc::new(
         Queue::open_with_options(
             store,
@@ -154,18 +155,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let bench_start = Instant::now();
     let producers_done = Arc::new(AtomicBool::new(false));
-    // Set by the watcher once no storm claims remain; producers stop
-    // offering load at that point.
+    // Set by the watcher once no storm claims remain. Producers stop offering
+    // load at that point.
     let sweep_complete = Arc::new(AtomicBool::new(false));
-    // Set by the watcher once the live queue has fully drained after
-    // the producers stopped; workers exit on this rather than on
-    // their own empty polls.
+    // Set by the watcher once the live queue has fully drained after the
+    // producers stopped. Workers exit on this flag, and an empty poll of their
+    // own does not end them.
     let drain_complete = Arc::new(AtomicBool::new(false));
 
-    // Producers: sustain rate / N_PRODUCERS on the live queue until
-    // the sweep completes. The enqueue timestamp is stored in the
-    // payload's first 8 bytes so workers can compute end-to-end
-    // latency.
+    // Producers: sustain rate / N_PRODUCERS on the live queue until the sweep
+    // completes. The enqueue timestamp is stored in the payload's first 8 bytes
+    // so workers can compute end-to-end latency.
     let mut producer_handles = Vec::with_capacity(n_producers);
     for producer_idx in 0..n_producers {
         let queue = queue.clone();
@@ -189,8 +189,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }));
     }
 
-    // Workers: claim and ack on the live queue, recording per-claim
-    // and end-to-end latency.
+    // Workers: claim and ack on the live queue, recording per-claim and
+    // end-to-end latency.
     type DoneSample = (u64, u64, u64); // (elapsed_us, e2e_us, claim_us)
     let mut worker_handles = Vec::with_capacity(n_workers);
     for worker_idx in 0..n_workers {
@@ -227,8 +227,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }));
     }
 
-    // Watcher: sample both queues once per second, flag sweep
-    // completion and the final live drain.
+    // Watcher: sample both queues once per second, flag sweep completion and
+    // the final live drain.
     let watcher = {
         let queue = queue.clone();
         let producers_done = producers_done.clone();
@@ -343,9 +343,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Sweep summary at the watcher's one-second granularity. When the
-    // sweep finishes before the first sample, no sample shows the full
-    // storm and the start falls back to zero.
+    // Sweep summary at the watcher's one-second granularity. When the sweep
+    // finishes before the first sample, no sample shows the full storm and the
+    // start falls back to zero.
     let sweep_start = storm_samples
         .iter()
         .take_while(|(_, claimed, _)| *claimed == n_expired as i64)

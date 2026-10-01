@@ -1,9 +1,8 @@
 // cargo bench -p taquba-bencher --bench claim_drain > drain.csv
 //
-// Drain-shape benchmark for the claim path. Pre-fills the queue with
-// N_JOBS jobs, then spawns N_WORKERS workers that drain it. Measures
-// per-claim latency and emits a per-second time series of p50/p95/p99
-// in microseconds.
+// Drain-pattern benchmark for the claim path. Pre-fills the queue with N_JOBS
+// jobs, then spawns N_WORKERS workers that drain it. Measures per-claim latency
+// and emits a per-second time series of p50/p95/p99 in microseconds.
 //
 // Parameters (env vars, all optional).
 //   N_JOBS              jobs enqueued before the drain starts (default 5_000).
@@ -11,17 +10,17 @@
 //   PAYLOAD_BYTES       per-job payload size (default 64).
 //   FLUSH_INTERVAL_MS   SlateDB WAL flush interval in ms (default 1)
 //                       Lower than slatedb's 100ms default so the per-
-//                       commit floor doesn't mask tombstone-scan time.
+//                       commit floor does not mask tombstone-scan time.
 //   STORE_LATENCY_MS    injected object-store latency per call (default 0).
 //                       When set, the in-memory store is wrapped in
 //                       object_store's ThrottledStore so every get, put,
-//                       list, and delete sleeps this long before running,
+//                       list and delete sleeps this long before running,
 //                       approximating an S3-class backend.
 //   STORE_JITTER_MS     random tail latency in [0, STORE_JITTER_MS] added to
 //                       each write on top of STORE_LATENCY_MS (default 0).
 //   STORE_URL           object-store URL (s3://bucket/prefix, gs://...,
-//                       az://..., file:///abs/path) to run against
-//                       instead of the in-memory store; see
+//                       az://..., file:///abs/path) to run against in
+//                       place of the in-memory store, described in
 //                       the crate README. Incompatible with
 //                       STORE_LATENCY_MS and STORE_JITTER_MS.
 //
@@ -36,11 +35,11 @@ use taquba_bencher::{env_var, init_tracing, pct, store_from_env};
 
 const QUEUE_NAME: &str = "bench";
 
-/// Lease held while a worker has a job claimed. Long enough that an
-/// idle scheduler tick during the bench never lets a lease expire.
+/// Lease held while a worker has a job claimed. Long enough that an idle
+/// scheduler tick during the bench never lets a lease expire.
 const LEASE: Duration = Duration::from_secs(5);
-/// Watcher poll interval: how often we read `stats()` to decide
-/// whether the drain has finished.
+/// Watcher poll interval: how often we read `stats()` to decide whether the
+/// drain is finished.
 const WATCHER_TICK: Duration = Duration::from_secs(1);
 
 #[tokio::main(flavor = "multi_thread")]
@@ -87,7 +86,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bench_start = Instant::now();
 
-    // Workers
     let mut worker_handles = Vec::with_capacity(n_workers);
     for worker_idx in 0..n_workers {
         let queue = queue.clone();
@@ -106,9 +104,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Ok(None) => {
-                        // The bench pre-fills before workers start and
-                        // never re-enqueues, so an empty observation is
-                        // terminal for this worker.
+                        // The bench pre-fills before workers start and never
+                        // re-enqueues, so an empty observation is terminal for
+                        // this worker.
                         break;
                     }
                     Err(e) => {
@@ -121,9 +119,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }));
     }
 
-    // Drain watcher: print per-second progress and exit when the
-    // queue has fully drained. Workers self-terminate on empty, so
-    // there is no shutdown signal to coordinate.
+    // Drain watcher: print per-second progress and exit when the queue has
+    // fully drained. Workers self-terminate on empty, so there is no shutdown
+    // signal to coordinate.
     let watcher = {
         let queue = queue.clone();
         tokio::spawn(async move {
