@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures_util::stream::{self, Stream, TryStreamExt};
-use slatedb::{Db, DbIterator, DbReader, IsolationLevel};
+use slatedb::config::ScanOptions;
+use slatedb::{Db, DbIterator, DbReader, IsolationLevel, IterationOrder};
 
 use crate::error::{Error, Result};
 use crate::history::{JobAttempt, decode_history};
@@ -17,7 +18,7 @@ use crate::keys::{
     KeyTag, QueueName, attempt_history_key, claimed_prefix, dead_key, dead_prefix, heartbeat_key,
     job_index_key, parse_stats_key, pending_prefix, stats_key, tag_prefix, user_scoped_key,
 };
-use crate::kv::{KvPage, KvRange};
+use crate::kv::{KvOrder, KvPage, KvRange};
 use crate::liveness::{HeartbeatRecord, WriterHeartbeat};
 use crate::payload_store::PayloadStore;
 use crate::queue::JobPage;
@@ -44,10 +45,20 @@ impl Handle {
         &self,
         prefix: Vec<u8>,
         range: (Bound<Bytes>, Bound<Bytes>),
+        order: KvOrder,
     ) -> Result<DbIterator> {
+        let order = match order {
+            KvOrder::Ascending => IterationOrder::Ascending,
+            KvOrder::Descending => IterationOrder::Descending,
+        };
+        let options = ScanOptions::default().with_order(order);
         Ok(match self {
-            Handle::Writer(db) => db.scan_prefix(prefix, range).await?,
-            Handle::Reader(reader) => reader.scan_prefix(prefix, range).await?,
+            Handle::Writer(db) => db.scan_prefix_with_options(prefix, range, &options).await?,
+            Handle::Reader(reader) => {
+                reader
+                    .scan_prefix_with_options(prefix, range, &options)
+                    .await?
+            }
         })
     }
 }
@@ -102,6 +113,7 @@ impl QueueView {
             .scan_prefix(
                 tag_prefix(KeyTag::Stats).to_vec(),
                 (Bound::Unbounded, Bound::Unbounded),
+                KvOrder::Ascending,
             )
             .await?;
         while let Some(kv) = iter.next().await? {
@@ -186,7 +198,7 @@ impl QueueView {
         let mut more = false;
         let mut iter = self
             .handle
-            .scan_prefix(prefix, (start, Bound::Unbounded))
+            .scan_prefix(prefix, (start, Bound::Unbounded), KvOrder::Ascending)
             .await?;
         while let Some(kv) = iter.next().await? {
             let job = JobRecord::decode(&kv.key, &kv.value)?;
@@ -350,7 +362,7 @@ impl QueueView {
     }
 
     /// List entries of the user KV namespace under `prefix` within `range`, in
-    /// ascending byte order of the keys.
+    /// the key order `order`.
     ///
     /// An empty `prefix` lists the whole namespace, and `..` lists every key
     /// within the prefix. The bounds of `range`, a [`KvRange`], are keys in the
@@ -372,6 +384,7 @@ impl QueueView {
         &self,
         prefix: &[u8],
         range: impl KvRange,
+        order: KvOrder,
         limit: usize,
     ) -> Result<KvPage> {
         let empty = KvPage {
@@ -388,7 +401,7 @@ impl QueueView {
         let mut more = false;
         let mut iter = self
             .handle
-            .scan_prefix(user_scoped_key(prefix), range)
+            .scan_prefix(user_scoped_key(prefix), range, order)
             .await?;
         while let Some(kv) = iter.next().await? {
             if entries.len() == limit {
@@ -403,7 +416,7 @@ impl QueueView {
     }
 
     /// Every entry of the user KV namespace under `prefix` within `range`, in
-    /// ascending byte order of the keys, as one stream that reads through
+    /// the key order `order`, as one stream that reads through
     /// [`QueueView::kv_scan`] `page_size` entries at a time. A consumer that
     /// stops reading does not fetch a further page. The listing semantics are
     /// those of `kv_scan`.
@@ -411,6 +424,7 @@ impl QueueView {
         &'a self,
         prefix: &'a [u8],
         range: impl KvRange,
+        order: KvOrder,
         page_size: usize,
     ) -> impl Stream<Item = Result<(Vec<u8>, Bytes)>> + 'a {
         let start = range.start_bound().map(Vec::from);
@@ -418,13 +432,17 @@ impl QueueView {
         pages(move |cursor| {
             let (start, end) = (start.clone(), end.clone());
             async move {
-                // A page follows the last key of the page before it.
-                let start = match &cursor {
-                    Some(last) => Bound::Excluded(last.as_slice()),
-                    None => start.as_ref().map(Vec::as_slice),
-                };
-                let range = (start, end.as_ref().map(Vec::as_slice));
-                let page = self.kv_scan(prefix, range, page_size).await?;
+                // A page follows the last key of the page before it, on the
+                // side of the range the order reads towards.
+                let mut start = start.as_ref().map(Vec::as_slice);
+                let mut end = end.as_ref().map(Vec::as_slice);
+                if let Some(last) = &cursor {
+                    match order {
+                        KvOrder::Ascending => start = Bound::Excluded(last.as_slice()),
+                        KvOrder::Descending => end = Bound::Excluded(last.as_slice()),
+                    }
+                }
+                let page = self.kv_scan(prefix, (start, end), order, page_size).await?;
                 let next = page
                     .more
                     .then(|| page.entries[page.entries.len() - 1].0.clone());
@@ -521,7 +539,7 @@ mod tests {
 
         let keys: Vec<Vec<u8>> = q
             .view()
-            .kv_entries(b"p/", .., 2)
+            .kv_entries(b"p/", .., KvOrder::Ascending, 2)
             .map_ok(|(key, _)| key)
             .try_collect()
             .await
@@ -531,12 +549,40 @@ mod tests {
 
         let from_third: Vec<Vec<u8>> = q
             .view()
-            .kv_entries(b"p/", b"p/2".., 2)
+            .kv_entries(b"p/", b"p/2".., KvOrder::Ascending, 2)
             .map_ok(|(key, _)| key)
             .try_collect()
             .await
             .unwrap();
         assert_eq!(from_third, expected[2..]);
+    }
+
+    #[tokio::test]
+    async fn kv_entries_cross_page_boundaries_in_descending_key_order() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        for i in 0..5u8 {
+            q.kv_put(&[b'p', b'/', b'0' + i], b"v").await.unwrap();
+        }
+        q.kv_put(b"q/0", b"v").await.unwrap();
+
+        let keys: Vec<Vec<u8>> = q
+            .view()
+            .kv_entries(b"p/", .., KvOrder::Descending, 2)
+            .map_ok(|(key, _)| key)
+            .try_collect()
+            .await
+            .unwrap();
+        let expected: Vec<Vec<u8>> = (0..5u8).rev().map(|i| vec![b'p', b'/', b'0' + i]).collect();
+        assert_eq!(keys, expected);
+
+        let below_third: Vec<Vec<u8>> = q
+            .view()
+            .kv_entries(b"p/", ..b"p/2", KvOrder::Descending, 2)
+            .map_ok(|(key, _)| key)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(below_third, expected[3..]);
     }
 
     #[tokio::test]
@@ -997,9 +1043,12 @@ mod tests {
         assert_eq!(history.len(), 1);
         let value = r.kv_get(b"k/1").await.unwrap().unwrap();
         assert_eq!(value.as_ref(), b"v");
-        let kv_page = r.kv_scan(b"k/", .., 10).await.unwrap();
-        let entries: Vec<(Vec<u8>, Bytes)> =
-            r.kv_entries(b"k/", .., 1).try_collect().await.unwrap();
+        let kv_page = r.kv_scan(b"k/", .., KvOrder::Ascending, 10).await.unwrap();
+        let entries: Vec<(Vec<u8>, Bytes)> = r
+            .kv_entries(b"k/", .., KvOrder::Ascending, 1)
+            .try_collect()
+            .await
+            .unwrap();
         assert_eq!(kv_page.entries, entries);
         assert_eq!(entries.len(), 2);
         (

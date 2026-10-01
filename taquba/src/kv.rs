@@ -50,6 +50,17 @@ pub(crate) async fn kv_state_matches(
     })
 }
 
+/// The key order of a [`QueueView::kv_scan`](crate::QueueView::kv_scan)
+/// listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvOrder {
+    /// Ascending byte order of the keys.
+    Ascending,
+    /// Descending byte order of the keys, so a listing of time-ordered keys
+    /// starts at the latest.
+    Descending,
+}
+
 /// A range of keys within a prefix, as
 /// [`QueueView::kv_scan`](crate::QueueView::kv_scan) takes it. The standard
 /// range forms over any byte string implement it: `..`, `key..`, `..key`,
@@ -415,7 +426,11 @@ mod tests {
         }
         q.kv_put(b"config", b"c").await.unwrap();
 
-        let page = q.view().kv_scan(b"runs/", .., 3).await.unwrap();
+        let page = q
+            .view()
+            .kv_scan(b"runs/", .., KvOrder::Ascending, 3)
+            .await
+            .unwrap();
         assert_eq!(page.entries.len(), 3);
         assert_eq!(page.entries[0].0, b"runs/0");
         assert!(page.more);
@@ -423,18 +438,31 @@ mod tests {
         let last = page.entries[2].0.as_slice();
         let rest = q
             .view()
-            .kv_scan(b"runs/", (Bound::Excluded(last), Bound::Unbounded), 10)
+            .kv_scan(
+                b"runs/",
+                (Bound::Excluded(last), Bound::Unbounded),
+                KvOrder::Ascending,
+                10,
+            )
             .await
             .unwrap();
         assert_eq!(rest.entries.len(), 2);
         assert_eq!(rest.entries[1].0, b"runs/4");
         assert!(!rest.more);
 
-        let all = q.view().kv_scan(b"", .., 100).await.unwrap();
+        let all = q
+            .view()
+            .kv_scan(b"", .., KvOrder::Ascending, 100)
+            .await
+            .unwrap();
         assert_eq!(all.entries.len(), 6);
         assert_eq!(all.entries[0].0, b"config");
 
-        let empty = q.view().kv_scan(b"", .., 0).await.unwrap();
+        let empty = q
+            .view()
+            .kv_scan(b"", .., KvOrder::Ascending, 0)
+            .await
+            .unwrap();
         assert!(empty.entries.is_empty() && !empty.more);
 
         q.close().await.unwrap();
@@ -453,25 +481,45 @@ mod tests {
 
         // Each bound form, with a bound that is not a stored key.
         assert_eq!(
-            keys(q.view().kv_scan(b"runs/", b"runs/2".., 10).await.unwrap()),
+            keys(
+                q.view()
+                    .kv_scan(b"runs/", b"runs/2".., KvOrder::Ascending, 10)
+                    .await
+                    .unwrap()
+            ),
             [key(2), key(3), key(4)]
         );
         assert_eq!(
-            keys(q.view().kv_scan(b"runs/", b"runs/25".., 10).await.unwrap()),
+            keys(
+                q.view()
+                    .kv_scan(b"runs/", b"runs/25".., KvOrder::Ascending, 10)
+                    .await
+                    .unwrap()
+            ),
             [key(3), key(4)]
         );
         assert_eq!(
-            keys(q.view().kv_scan(b"runs/", ..b"runs/2", 10).await.unwrap()),
+            keys(
+                q.view()
+                    .kv_scan(b"runs/", ..b"runs/2", KvOrder::Ascending, 10)
+                    .await
+                    .unwrap()
+            ),
             [key(0), key(1)]
         );
         assert_eq!(
-            keys(q.view().kv_scan(b"runs/", ..=b"runs/2", 10).await.unwrap()),
+            keys(
+                q.view()
+                    .kv_scan(b"runs/", ..=b"runs/2", KvOrder::Ascending, 10)
+                    .await
+                    .unwrap()
+            ),
             [key(0), key(1), key(2)]
         );
         assert_eq!(
             keys(
                 q.view()
-                    .kv_scan(b"runs/", b"runs/1"..b"runs/3", 10)
+                    .kv_scan(b"runs/", b"runs/1"..b"runs/3", KvOrder::Ascending, 10)
                     .await
                     .unwrap()
             ),
@@ -481,7 +529,7 @@ mod tests {
         // A bound outside the prefix is before every key or after every key.
         assert_eq!(
             q.view()
-                .kv_scan(b"runs/", b"a".., 10)
+                .kv_scan(b"runs/", b"a".., KvOrder::Ascending, 10)
                 .await
                 .unwrap()
                 .entries
@@ -490,7 +538,7 @@ mod tests {
         );
         assert_eq!(
             q.view()
-                .kv_scan(b"runs/", ..b"z", 10)
+                .kv_scan(b"runs/", ..b"z", KvOrder::Ascending, 10)
                 .await
                 .unwrap()
                 .entries
@@ -499,7 +547,7 @@ mod tests {
         );
         assert!(
             q.view()
-                .kv_scan(b"runs/", b"z".., 10)
+                .kv_scan(b"runs/", b"z".., KvOrder::Ascending, 10)
                 .await
                 .unwrap()
                 .entries
@@ -507,7 +555,7 @@ mod tests {
         );
         assert!(
             q.view()
-                .kv_scan(b"runs/", ..b"a", 10)
+                .kv_scan(b"runs/", ..b"a", KvOrder::Ascending, 10)
                 .await
                 .unwrap()
                 .entries
@@ -517,19 +565,60 @@ mod tests {
         // A range without a key within it, including an inverted one.
         let inverted = q
             .view()
-            .kv_scan(b"runs/", b"runs/3"..b"runs/1", 10)
+            .kv_scan(b"runs/", b"runs/3"..b"runs/1", KvOrder::Ascending, 10)
             .await
             .unwrap();
         assert!(inverted.entries.is_empty() && !inverted.more);
         let point = (Bound::Excluded(b"runs/2"), Bound::Excluded(b"runs/2"));
         assert!(
             q.view()
-                .kv_scan(b"runs/", point, 10)
+                .kv_scan(b"runs/", point, KvOrder::Ascending, 10)
                 .await
                 .unwrap()
                 .entries
                 .is_empty()
         );
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn kv_scan_descending_reads_the_range_from_its_end() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        for i in 0..5u8 {
+            q.kv_put(&[b"runs/".as_slice(), &[b'0' + i]].concat(), &[i])
+                .await
+                .unwrap();
+        }
+        q.kv_put(b"config", b"c").await.unwrap();
+        let keys =
+            |page: KvPage| -> Vec<Vec<u8>> { page.entries.into_iter().map(|(k, _)| k).collect() };
+
+        let page = q
+            .view()
+            .kv_scan(b"runs/", b"runs/1".., KvOrder::Descending, 2)
+            .await
+            .unwrap();
+        assert!(page.more);
+        let first = keys(page);
+        assert_eq!(first, [b"runs/4".to_vec(), b"runs/3".to_vec()]);
+
+        // The page after it ends before the last key of the first page.
+        let rest = q
+            .view()
+            .kv_scan(
+                b"runs/",
+                (
+                    Bound::Included(b"runs/1".as_slice()),
+                    Bound::Excluded(b"runs/3".as_slice()),
+                ),
+                KvOrder::Descending,
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(!rest.more);
+        assert_eq!(keys(rest), [b"runs/2".to_vec(), b"runs/1".to_vec()]);
 
         q.close().await.unwrap();
     }
@@ -558,7 +647,11 @@ mod tests {
         .unwrap();
         q.kv_put(b"only", b"entry").await.unwrap();
 
-        let page = q.view().kv_scan(b"", .., 100).await.unwrap();
+        let page = q
+            .view()
+            .kv_scan(b"", .., KvOrder::Ascending, 100)
+            .await
+            .unwrap();
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].0, b"only");
 

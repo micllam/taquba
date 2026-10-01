@@ -305,8 +305,8 @@ replacement is never deleted by mistake, and `Queue::kv_compare_put` writes only
 if the key still has an expected value (or is still absent), the
 read-modify-write primitive that makes concurrent updates of one entry lose no
 writes. `QueueView::kv_scan` lists the entries with a key prefix within a key
-range, in pages, for enumerating live state and for exporting the namespace, and
-`QueueView::kv_entries` reads the same listing as one stream.
+range in either key order, in pages, for enumerating live state and for
+exporting the namespace, and `QueueView::kv_entries` streams the same listing.
 `Queue::commit_effects` applies a `SettlementEffects` (enqueues, KV writes and
 deletes) as one transaction without a job transition, for state that must move
 in one step when no transition of its own includes it.

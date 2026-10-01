@@ -315,6 +315,7 @@ mod tests {
     use super::*;
     use crate::error::Error;
     use crate::job::JobStatus;
+    use crate::kv::KvOrder;
     use crate::options::OpenOptions;
     use crate::queue::Queue;
     use slatedb::object_store::ObjectStoreExt;
@@ -354,7 +355,11 @@ mod tests {
                 .as_ref(),
             b"ok"
         );
-        let kv_page = reader.view().kv_scan(b"outcome/", .., 10).await.unwrap();
+        let kv_page = reader
+            .view()
+            .kv_scan(b"outcome/", .., KvOrder::Ascending, 10)
+            .await
+            .unwrap();
         assert_eq!(kv_page.entries.len(), 1);
 
         reader.close().await.unwrap();

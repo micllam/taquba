@@ -1455,7 +1455,7 @@ mod tests {
     async fn terminal_markers(queue: &Queue) -> Vec<(RunId, u64)> {
         let page = queue
             .view()
-            .kv_scan(TERMINAL_KV_PREFIX, .., 1_000)
+            .kv_scan(TERMINAL_KV_PREFIX, .., taquba::KvOrder::Ascending, 1_000)
             .await
             .unwrap();
         let index = ExpiryIndex::new(TERMINAL_KV_PREFIX);

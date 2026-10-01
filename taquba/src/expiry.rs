@@ -11,6 +11,7 @@ use tracing::warn;
 
 use crate::effects::SettlementEffects;
 use crate::error::Result;
+use crate::kv::KvOrder;
 use crate::queue::Queue;
 use crate::time_bound::TimeBound;
 
@@ -125,7 +126,12 @@ impl ExpiryIndex {
         };
         let mut removed = 0;
         let start = self.entry_key(scan.from(), &[]);
-        let mut entries = pin!(queue.view().kv_entries(&self.prefix, start.., PAGE_SIZE));
+        let mut entries = pin!(queue.view().kv_entries(
+            &self.prefix,
+            start..,
+            KvOrder::Ascending,
+            PAGE_SIZE
+        ));
         while let Some((key, _)) = entries.try_next().await? {
             let Some((at_ms, suffix)) = self.parse(&key) else {
                 warn!(key = %String::from_utf8_lossy(&key), "expiry index key without a time; deleted");
@@ -182,7 +188,11 @@ mod tests {
 
     /// The suffixes of the entries within `prefix`, in key order.
     async fn suffixes(q: &Queue, index: &ExpiryIndex, prefix: &[u8]) -> Vec<Vec<u8>> {
-        let page = q.view().kv_scan(prefix, .., 100).await.unwrap();
+        let page = q
+            .view()
+            .kv_scan(prefix, .., KvOrder::Ascending, 100)
+            .await
+            .unwrap();
         page.entries
             .iter()
             .map(|(key, _)| index.parse(key).unwrap().1.to_vec())
@@ -573,7 +583,7 @@ mod tests {
         assert_eq!((removed, calls), (0, 0));
         assert!(
             q.view()
-                .kv_scan(b"x/", .., 10)
+                .kv_scan(b"x/", .., KvOrder::Ascending, 10)
                 .await
                 .unwrap()
                 .entries

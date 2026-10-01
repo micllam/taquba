@@ -39,8 +39,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::TryStreamExt;
-use taquba::Queue;
 use taquba::object_store::{ObjectStore, ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
+use taquba::{KvOrder, Queue};
 use taquba_workflow::{
     RunId, RunOutcome, RunSpec, SignalOutcome, Step, StepError, StepOutcome, StepRunner,
     TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
@@ -175,7 +175,12 @@ async fn watch_once(
     store: &Arc<dyn ObjectStore>,
     runtime: &WorkflowRuntime<Dispatcher, ShutdownOnTermination>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut markers = std::pin::pin!(queue.view().kv_entries(PENDING_PREFIX, .., 64));
+    let mut markers = std::pin::pin!(queue.view().kv_entries(
+        PENDING_PREFIX,
+        ..,
+        KvOrder::Ascending,
+        64
+    ));
     while let Some((marker, reply_key)) = markers.try_next().await? {
         let path = Path::from(String::from_utf8_lossy(&reply_key).into_owned());
         match store.head(&path).await {

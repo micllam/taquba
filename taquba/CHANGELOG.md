@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The crate depends on slatedb 0.17.0, and the `object_store` re-export is
   object_store 0.14.2. A store written with 0.16.0 opens without a migration
   step.
+- `kv_scan` and `kv_entries` on `QueueView` take a `KvOrder`, so a listing of
+  time-ordered keys reads its latest entries in one page. Pass
+  `KvOrder::Ascending` after the range for the order of 0.14.0.
 
 <!-- vale off -->
 
