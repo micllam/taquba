@@ -4,8 +4,8 @@ One record per decision that constrains a future change.
 
 ## Conventions
 
-- A record is immutable once accepted. A decision that changes gets a new
-  record with a `Supersedes: ADR-NNNN` line, and the old one becomes
+- A record is immutable once accepted. A decision that changes gets a new record
+  with a `Supersedes: ADR-NNNN` line, and the old one becomes
   `Status: superseded by ADR-NNNN`.
 - A decision gets a record when it is significant or hard to reverse. A
   significant decision affects the structure, the non-functional qualities, the
