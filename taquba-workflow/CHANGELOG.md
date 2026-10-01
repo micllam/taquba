@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its terminal marker. 0.13 removed the group a window after the first
   marker, while the members of the later submission were active.
 
+<!-- vale off -->
+
 ## [0.13.0] - 2026-09-25
 
 ### Added
@@ -765,3 +767,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - 2026-05-11
 
 Initial release.
+
+<!-- vale on -->

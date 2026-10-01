@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that a caller read. A compare is a key with the expected state of that
   key: pass `&[(key, expected)]` in place of `key, expected`.
 
+<!-- vale off -->
+
 ## [0.14.0] - 2026-09-25
 
 ### Added
@@ -858,3 +860,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - 2026-05-01
 
 Initial release.
+
+<!-- vale on -->
