@@ -1,8 +1,7 @@
-//! The objects under one prefix of an object store, read and written
-//! with the absence tolerance every store of this crate shares: a
-//! missing object reads as `None` and deletes as already gone, because
-//! the retention sweep may remove any object at any time and every
-//! reader re-executes on absence.
+//! The objects within one prefix of an object store, read and written with the
+//! absence tolerance every store of this crate shares: a missing object reads
+//! as `None` and deletes as already gone, because the retention sweep can
+//! remove any object at any time and every reader re-executes on absence.
 
 use std::sync::Arc;
 
@@ -52,7 +51,7 @@ impl ObjectPrefix {
         Ok(())
     }
 
-    /// Delete the object at `path`; `Ok(false)` when none existed.
+    /// Delete the object at `path`. Returns `Ok(false)` when none existed.
     pub(crate) async fn delete(&self, path: &Path) -> Result<bool> {
         match self.store.delete(path).await {
             Ok(()) => Ok(true),

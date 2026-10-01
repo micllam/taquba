@@ -1,24 +1,22 @@
-//! Stored forms of the runtime's public types. Each `Durable*` type
-//! mirrors a public type and is what actually serializes, so the public
-//! type can evolve without changing the stored layout. Records are
-//! MessagePack maps with named fields, written through [`encode`] and
-//! read through [`decode`] or, for a record at one key of the queue's
-//! KV namespace, [`kv_record`].
+//! Stored forms of the runtime's public types. Each `Durable*` type mirrors a
+//! public type and serializes in its place, so the public type can evolve
+//! without changing the stored layout. Records are MessagePack maps with named
+//! fields, written through [`encode`] and read through [`decode`] or, for a
+//! record at one key of the queue's KV namespace, [`kv_record`].
 //!
-//! A record that fails to decode is treated in one of two ways, chosen
-//! by what its absence means to the reader, and each treatment has a
-//! function of its own. Where absence means that the work runs again, the reader
-//! calls [`decode_or_absent`], which logs the failure and reports the
-//! record as absent: a memo entry is recomputed, a step-output replay
-//! record re-executes the step, a run result record is reported as
-//! missing, and a member record skipped by the group listing is
-//! submitted again. Where absence is read as a fresh entity, the reader
-//! calls [`decode`] or [`kv_record`], and the failure propagates as
-//! [`Error::Deserialization`](crate::Error::Deserialization): the run
-//! record, the current-step pointer, the terminal record, a member
-//! record read on its own and the group manifest, whose absence starts
-//! a new run or group. A new reader calls one of these and does not
-//! deserialize a record directly.
+//! A record that fails to decode is treated in one of two ways, chosen by what
+//! its absence means to the reader, and each treatment has a function of its
+//! own. Where absence means that the work runs again, the reader calls
+//! [`decode_or_absent`], which logs the failure and reports the record as
+//! absent: a memo entry is recomputed, a step-output replay record re-executes
+//! the step, a run result record is reported as missing, and a member record
+//! skipped by the group listing is submitted again. Where absence is read as a
+//! fresh entity, the reader calls [`decode`] or [`kv_record`], and the failure
+//! propagates as [`Error::Deserialization`](crate::Error::Deserialization): the
+//! run record, the current-step pointer, the terminal record, a member record
+//! read on its own and the group manifest, whose absence starts a new run or
+//! group. A new reader calls one of these and does not deserialize a record
+//! directly.
 
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -31,22 +29,22 @@ use tracing::warn;
 
 use crate::error::Result;
 
-/// Encode one of the crate's own records as MessagePack with named
-/// fields. The record types here hold strings, bytes, integers and
-/// enumerations, whose encoding cannot fail.
+/// Encode one of the crate's own records as MessagePack with named fields. The
+/// record types here hold strings, bytes, integers and enumerations, whose
+/// encoding cannot fail.
 pub(crate) fn encode<T: Serialize>(record: &T) -> Vec<u8> {
     rmp_serde::to_vec_named(record).expect("a durable record encodes")
 }
 
-/// Decode one of the crate's own records. A record that does not decode
-/// is [`Error::Deserialization`](crate::Error::Deserialization).
+/// Decode one of the crate's own records. A record that does not decode is
+/// [`Error::Deserialization`](crate::Error::Deserialization).
 pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     Ok(rmp_serde::from_slice(bytes)?)
 }
 
-/// Decode a record whose absence means that the work runs again. A
-/// record that fails to decode is logged, as the `record` kind of the
-/// entity `id`, and reported as absent.
+/// Decode a record whose absence means that the work runs again. A record that
+/// fails to decode is logged, as the `record` kind of the entity `id`, and
+/// reported as absent.
 pub(crate) fn decode_or_absent<T: DeserializeOwned>(
     bytes: &[u8],
     record: &'static str,
@@ -61,8 +59,8 @@ pub(crate) fn decode_or_absent<T: DeserializeOwned>(
     }
 }
 
-/// The record at `key` of the queue's KV namespace, `None` when no
-/// value is stored there.
+/// The record at `key` of the queue's KV namespace, `None` when no value is
+/// stored there.
 pub(crate) async fn kv_record<T: DeserializeOwned>(
     view: &QueueView,
     key: &[u8],
@@ -85,13 +83,13 @@ use crate::terminal::{RunOutcome, TerminalStatus};
 /// request for the run's next step. Deleted with the settlement that terminates
 /// the run, staged in `terminate_collecting_effects`.
 ///
-/// `run_id` keeps the record self-describing for ad hoc operator
-/// inspection; `submitted_at_ms` is useful for ordering and stale-record
-/// auditing; `input_hash` is the SHA-256 of the original `spec.input` and
-/// powers the `Error::InputMismatch` check on duplicate submissions.
-/// `cancel_requested` is set by `WorkflowRuntime::cancel` on this key
-/// so that the write conflicts with the termination's delete of the
-/// record and a request can never outlive the run.
+/// `run_id` keeps the record self-describing for ad hoc operator inspection.
+/// `submitted_at_ms` is for ordering and stale-record auditing. `input_hash` is
+/// the SHA-256 of the original `spec.input` and powers the
+/// `Error::InputMismatch` check on duplicate submissions. `cancel_requested` is
+/// set by `WorkflowRuntime::cancel` on this key so that the write conflicts
+/// with the termination's delete of the record and a request can never outlive
+/// the run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DurableRunRecord {
     pub(crate) run_id: RunId,
@@ -100,12 +98,11 @@ pub(crate) struct DurableRunRecord {
     pub(crate) cancel_requested: bool,
 }
 
-/// Durable pointer from a run to the queue job currently representing
-/// it, kept beside the run record: written with the step-0 enqueue,
-/// rewritten in the settlement that enqueues each next step and deleted
-/// with the termination. It is what a duplicate submission known only
-/// from the durable record, or a reader outside the process, resolves a
-/// run's live job from.
+/// Durable pointer from a run to the queue job currently representing it, kept
+/// together with the run record: written with the step-0 enqueue, rewritten in
+/// the settlement that enqueues each next step and deleted with the
+/// termination. A duplicate submission known only from the durable record, or a
+/// reader outside the process, resolves a run's live job from it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DurableCurrentStep {
     pub(crate) step_number: u32,
@@ -228,17 +225,16 @@ impl From<DurableStepOutcome> for StepOutcome {
     }
 }
 
-/// Storage envelope for a step-output replay entry. `stored_at_ms`
-/// records when the outcome was persisted so a replayed delayed `Continue`
-/// can schedule the next step relative to the original settlement
-/// rather than the replay.
+/// Storage envelope for a step-output replay entry. `stored_at_ms` records when
+/// the outcome was persisted so a replayed delayed `Continue` can schedule the
+/// next step relative to the original settlement. The replay does not reset the
+/// delay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DurableStepOutcomeRecord {
     pub(crate) stored_at_ms: u64,
     pub(crate) outcome: DurableStepOutcome,
-    /// Effects staged through [`crate::EffectsHandle`] during the
-    /// recorded delivery, restored into the settlement when the outcome
-    /// is replayed.
+    /// Effects staged through [`crate::EffectsHandle`] during the recorded
+    /// delivery, restored into the settlement when the outcome is replayed.
     pub(crate) effects: StagedEffects,
 }
 
@@ -286,19 +282,19 @@ pub(crate) struct DurableTermination {
     pub(crate) input_hash: [u8; 32],
 }
 
-/// The durable member record of a grouped run, written under
+/// The durable member record of a grouped run, written at
 /// `workflow/groups/{group_id}/{key}` with the member's submission and
 /// rewritten in the settlement that terminates it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DurableMember {
     pub(crate) run_id: RunId,
-    /// The member's termination; `None` while it is active.
+    /// The member's termination, or `None` while it is active.
     pub(crate) terminated: Option<DurableTermination>,
 }
 
-/// Stored form of a [`RunOutcome`]: the payload of a terminal-notification
-/// job and the outcome half of the run result record, self-contained so
-/// both survive restarts and redeliveries.
+/// Stored form of a [`RunOutcome`]: the payload of a terminal-notification job
+/// and the outcome half of the run result record, self-contained so both
+/// persist across restarts and redeliveries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DurableRunOutcome {
     run_id: RunId,
@@ -335,10 +331,10 @@ impl From<DurableErrorKind> for StepErrorKind {
 }
 
 /// The run result record, stored in the run memo under
-/// [`RUN_RESULT_MEMO_KEY`](crate::memo::RUN_RESULT_MEMO_KEY) by the
-/// worker before the settlement that terminates the run: the committed
-/// outcome and the termination the record belongs to, equal to the
-/// terminal record written by the same settlement.
+/// [`RUN_RESULT_MEMO_KEY`](crate::memo::RUN_RESULT_MEMO_KEY) by the worker
+/// before the settlement that terminates the run: the committed outcome and the
+/// termination the record belongs to, equal to the terminal record written by
+/// the same settlement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DurableRunResult {
     pub(crate) termination: DurableTermination,
@@ -378,9 +374,9 @@ mod tests {
 
     #[test]
     fn payload_bytes_are_stored_as_binary_strings() {
-        // A binary string stores the bytes as they are, so the encoded
-        // record contains the payload as one contiguous window. An
-        // integer array prefixes every byte at or above `0x80`.
+        // A binary string stores the bytes as they are, so the encoded record
+        // contains the payload as one contiguous window. An integer array
+        // prefixes every byte at or above `0x80`.
         let payload: Vec<u8> = (0..=255).collect();
         let is_contiguous = |bytes: &[u8]| bytes.windows(payload.len()).any(|w| w == payload);
         assert!(is_contiguous(&encode(&DurableStepOutcome::Continue {

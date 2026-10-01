@@ -7,15 +7,15 @@
 //!   the run's final result.
 //!
 //! Each step is one full Rig `agent.prompt()` call. taquba-workflow's value
-//! here is *between-step durability*: if the worker crashes after step 0
-//! and before step 1, the research isn't lost: the next process resumes
-//! at step 1 from queue state.
+//! here is *between-step durability*: if the worker crashes after step 0 and
+//! before step 1, the research is not lost: the next process resumes at step 1
+//! from queue state.
 //!
-//! The submitted run carries the topic on the `topic` user header. The
-//! payload is used only for between-step state (the research findings as
-//! UTF-8 bytes after step 0).
+//! The submitted run includes the topic in the `topic` user header. The payload
+//! is used only for between-step state (the research findings as UTF-8 bytes
+//! after step 0).
 //!
-//! Picks the LLM provider from the environment:
+//! The example chooses the LLM provider from the environment:
 //!
 //! - `LLM_PROVIDER=anthropic` (default if `ANTHROPIC_API_KEY` is set):
 //!   uses `claude-haiku-4-5`.
@@ -46,8 +46,8 @@ use taquba_workflow::{
 };
 use tokio::sync::oneshot;
 
-/// Mocked "fact lookup" tool. A real version would hit a search API or
-/// vector store; for the example it returns hardcoded strings.
+/// Mocked "fact lookup" tool. It returns hardcoded strings where a real version
+/// queries a search API or a vector store.
 #[derive(Deserialize, Serialize)]
 struct LookupFact;
 
@@ -90,7 +90,7 @@ impl Tool for LookupFact {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        // Stub. Real impls would call out to a search/RAG backend.
+        // Stub. A real implementation calls a search or RAG backend.
         Ok(format!(
             "Stub fact about '{}': it is widely studied and has many surprising \
              properties that experts continue to investigate.",
@@ -102,11 +102,10 @@ impl Tool for LookupFact {
 const STEP_RESEARCH: u32 = 0;
 const STEP_WRITE: u32 = 1;
 
-// GPT-5-class reasoning models count *hidden* reasoning tokens against the
-// same budget as visible output, so a small `max_tokens` (e.g. 512) can be
-// fully consumed by reasoning before any text is emitted, leaving the
-// visible message empty. 4096 leaves comfortable headroom for both that
-// case and Claude Haiku.
+// GPT-5-class reasoning models count *hidden* reasoning tokens against the same
+// budget as visible output, so reasoning can consume a small `max_tokens` (such
+// as 512) before any text is emitted, and the visible message is then empty.
+// 4096 leaves comfortable headroom for both that case and Claude Haiku.
 const MAX_TOKENS: u64 = 4096;
 
 const RESEARCH_PREAMBLE: &str = "You are a researcher. Use the `lookup_fact` tool to gather information \
@@ -117,10 +116,10 @@ const WRITE_PREAMBLE: &str = "You are a technical writer. Given a topic and rese
      a polished one-paragraph summary aimed at a curious general audience. \
      Do not add facts beyond what is in the findings.";
 
-/// Pre-built clients for both supported providers. Each `run_step` picks one
-/// based on the `provider` field. Building agents per step (rather than
-/// reusing a built agent) is cheap: agents are config wrappers around the
-/// shared client.
+/// Pre-built clients for both supported providers. Each `run_step` chooses one
+/// based on the `provider` field and builds its agents per step. An agent is a
+/// config wrapper around the shared client, so building one does not create a
+/// client.
 enum Provider {
     Anthropic(anthropic::Client),
     Openai(openai::Client),

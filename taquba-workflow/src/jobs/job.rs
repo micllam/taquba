@@ -10,14 +10,14 @@ use crate::keys::hex_sha256;
 
 /// A unit of durable background work.
 ///
-/// Implement this trait to define a job type: the struct fields are the
-/// typed input, [`Output`](Self::Output) is the typed result, and
-/// [`run`](Self::run) is the work. The remaining methods have defaults that
-/// work without configuration; override them to customize idempotency, retry
-/// limits, and error classification.
+/// Implement this trait to define a job type: the struct fields are the typed
+/// input, [`Output`](Self::Output) is the typed result, and [`run`](Self::run)
+/// is the work. The remaining methods have defaults that work without
+/// configuration. Overriding them customises idempotency, retry limits and
+/// error classification.
 ///
-/// A `Job` must round-trip through [`serde`]: the runner serializes the
-/// input to enqueue it and the output to persist it. It must also be
+/// A `Job` must round-trip through [`serde`]: the runner serializes the input
+/// to enqueue it and the output to persist it. It must also be
 /// `Send + Sync + 'static` so the runner can dispatch it across worker tasks.
 ///
 /// # Example
@@ -61,32 +61,35 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
     ///
     /// Stored in a reserved header on every enqueued job so the runner can
     /// dispatch the opaque payload back to the right handler. Must be unique
-    /// across all job types registered on a single [`JobRunner`](crate::jobs::JobRunner),
-    /// and stable across releases; changing it strands in-flight jobs of the
-    /// old name in the dead-letter queue.
+    /// across all job types registered on a single
+    /// [`JobRunner`](crate::jobs::JobRunner), and stable across releases. A
+    /// change of the name sends in-flight jobs of the old name to the
+    /// dead-letter queue.
     const NAME: &'static str;
 
     /// The typed value produced by a successful run. Persisted to object
-    /// storage so it can be retrieved via [`JobHandle`](crate::jobs::JobHandle).
+    /// storage so it can be retrieved via
+    /// [`JobHandle`](crate::jobs::JobHandle).
     type Output: Serialize + DeserializeOwned + Send + 'static;
 
     /// The error type [`run`](Self::run) returns on failure.
     ///
     /// The error's [`Display`](std::fmt::Display) output is recorded as the
-    /// job's failure message; the error value itself is *not* persisted, so
-    /// callers awaiting the job see a [`JobError`](crate::jobs::JobError) carrying
-    /// the message and classification rather than this concrete type.
+    /// job's failure message. The error value itself is *not* persisted, so a
+    /// caller that awaits the job receives a
+    /// [`JobError`](crate::jobs::JobError) with the message and classification
+    /// in place of this concrete type.
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Execute the job.
     ///
     /// Return `Ok` to complete the job (its output is persisted and the queue
-    /// job is acked). Return `Err` to fail it; the error is passed to
-    /// [`classify`](Self::classify) to decide whether the job retries or is
-    /// dead-lettered.
+    /// job is acked). Return `Err` to fail it. The runner passes the error to
+    /// [`classify`](Self::classify), which decides whether the job retries or
+    /// is dead-lettered.
     ///
-    /// Handlers must be idempotent: taquba delivers at-least-once, so a job
-    /// may run more than once if a lease expires before it finishes.
+    /// Handlers must be idempotent: taquba delivers at-least-once, and a job
+    /// runs more than once if a lease expires before it finishes.
     fn run(
         &self,
         ctx: JobContext<'_>,
@@ -95,9 +98,9 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// An optional idempotency key for this job instance.
     ///
     /// When `Some`, a submission whose key matches an already-pending or
-    /// scheduled job is collapsed onto that existing job rather than creating
-    /// a new one; the returned [`JobHandle`](crate::jobs::JobHandle) points at the
-    /// original. The default is `None`: every submission runs.
+    /// scheduled job is collapsed onto that existing job, and the returned
+    /// [`JobHandle`](crate::jobs::JobHandle) points at the original. The
+    /// default is `None`: every submission runs.
     ///
     /// To opt in to hash-based deduplication, return
     /// [`payload_idempotency_key`] for this job.
@@ -114,10 +117,10 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
 
     /// Classify a failure from [`run`](Self::run) as transient or permanent.
     ///
-    /// The default treats every error as [`StepErrorKind::Transient`], so
-    /// jobs retry up to their attempt limit before being dead-lettered.
-    /// Override to send known-unrecoverable failures (validation errors,
-    /// auth failures) straight to the dead-letter queue.
+    /// The default treats every error as [`StepErrorKind::Transient`], so jobs
+    /// retry up to their attempt limit before being dead-lettered. Override to
+    /// send known-unrecoverable failures (validation errors, auth failures)
+    /// straight to the dead-letter queue.
     fn classify(&self, _error: &Self::Error) -> StepErrorKind {
         StepErrorKind::Transient
     }
@@ -126,12 +129,11 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
 /// Derive a stable idempotency key by hashing a job's serialized form.
 ///
 /// A convenience for jobs that want hash-based deduplication without
-/// hand-writing a key: return this from
-/// [`Job::idempotency_key`]. Two submissions of an identical job value
-/// collapse onto a single execution.
+/// hand-writing a key: return this from [`Job::idempotency_key`]. Two
+/// submissions of an identical job value collapse onto a single execution.
 ///
-/// This is opt-in by design: collapsing identical submissions silently
-/// discards intentional duplicate work, so it is never the default.
+/// This is opt-in by design: collapsing identical submissions silently discards
+/// intentional duplicate work, so it is never the default.
 ///
 /// ```
 /// # use serde::{Serialize, Deserialize};

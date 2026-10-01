@@ -23,8 +23,7 @@ use crate::keys::{RunId, hash_input};
 use crate::terminal::NoopTerminalHook;
 
 /// The payload of a job's run: the job's [`Job::NAME`], by which the step
-/// runner routes the run to the registered handler, and the serialized
-/// job.
+/// runner routes the run to the registered handler, and the serialized job.
 #[derive(Serialize, Deserialize)]
 struct JobPayload {
     name: String,
@@ -34,19 +33,18 @@ struct JobPayload {
 
 const DEFAULT_QUEUE_NAME: &str = "jobs";
 
-/// The run id of a job with an idempotency key: the hex SHA-256 digest of
-/// the key, so any key maps onto the character set a run id accepts.
+/// The run id of a job with an idempotency key: the hex SHA-256 digest of the
+/// key, so any key maps onto the character set a run id accepts.
 fn run_id_for_key(key: &str) -> RunId {
     RunId::digest(&[key.as_bytes()])
 }
 
-/// The runtime a job runs as one step of, shared by the runner and
-/// every [`JobHandle`]. Its terminal hook is [`NoopTerminalHook`], so a
-/// job does not enqueue a notification.
+/// The runtime a job runs as one step of, shared by the runner and every
+/// [`JobHandle`]. Its terminal hook is [`NoopTerminalHook`], so a job does not
+/// enqueue a notification.
 pub(crate) type JobRuntime = WorkflowRuntime<Dispatch, NoopTerminalHook>;
 
-/// The run payload of `job`: its [`Job::NAME`] and its serialized
-/// fields.
+/// The run payload of `job`: its [`Job::NAME`] and its serialized fields.
 pub(crate) fn job_payload<J: Job>(job: &J) -> Result<Vec<u8>> {
     Ok(rmp_serde::to_vec_named(&JobPayload {
         name: J::NAME.to_string(),
@@ -83,11 +81,10 @@ impl<J: Job> ErasedHandler for TypedHandler<J> {
     }
 }
 
-/// Run a single job of a known type: decode `input`, the serialized
-/// job carried in the step's payload, run it and encode its output as
-/// the step's result. An input that does not decode and an output that
-/// does not encode are permanent errors, since a retry cannot change
-/// either.
+/// Run a single job of a known type: decode `input`, the serialized job in the
+/// step's payload, run it and encode its output as the step's result. An input
+/// that does not decode and an output that does not encode are permanent
+/// errors, because a retry cannot change either.
 async fn run_typed<J: Job>(
     state: &State,
     step: &Step,
@@ -130,9 +127,9 @@ async fn run_typed<J: Job>(
     Ok(StepOutcome::Succeed { result })
 }
 
-/// The step runner of the workflow runtime: routes each run's single step
-/// to the handler registered for its job type, with the registered
-/// application state.
+/// The step runner of the workflow runtime: routes each run's single step to
+/// the handler registered for its job type, with the registered application
+/// state.
 pub(crate) struct Dispatch {
     handlers: HashMap<&'static str, Box<dyn ErasedHandler>>,
     state: State,
@@ -156,9 +153,9 @@ impl StepRunner for Dispatch {
 /// The orchestration service: submits jobs and spawns the worker that runs
 /// them. A clone shares the runtime (internally `Arc`).
 ///
-/// Build it with [`JobRunner::builder`], registering every job type on
-/// the builder, then [`spawn`](Self::spawn) the worker. Jobs can be
-/// submitted before or after spawning.
+/// Build it with [`JobRunner::builder`], registering every job type on the
+/// builder, then [`spawn`](Self::spawn) the worker. Jobs can be submitted
+/// before or after spawning.
 pub struct JobRunner {
     runtime: JobRuntime,
 }
@@ -177,9 +174,9 @@ impl JobRunner {
     ///
     /// `queue` accepts a `Queue` or an `Arc<Queue>`. `object_store` is
     /// typically the same `Arc<dyn ObjectStore>` passed to
-    /// [`Queue::open`](taquba::Queue::open); records are written under
-    /// [`JobRunnerBuilder::memo_prefix`], which must not overlap the path
-    /// the queue's SlateDB store was opened at when the two share a store.
+    /// [`Queue::open`](taquba::Queue::open). The runner writes its records to
+    /// [`JobRunnerBuilder::memo_prefix`], which must not overlap the path the
+    /// queue's SlateDB store was opened at when the two share a store.
     pub fn builder(
         queue: impl Into<Arc<Queue>>,
         object_store: Arc<dyn ObjectStore>,
@@ -194,18 +191,17 @@ impl JobRunner {
         self.submit_with(job, RunOptions::default()).await
     }
 
-    /// Submit a job with `options`: its headers, priority, attempt limit
-    /// and earliest run time. [`RunOptions::max_attempts_per_step`] takes
-    /// precedence over [`Job::max_attempts`]; the queue's limit applies
+    /// Submit a job with `options`: its headers, priority, attempt limit and
+    /// earliest run time. [`RunOptions::max_attempts_per_step`] takes
+    /// precedence over [`Job::max_attempts`], and the queue's limit applies
     /// when neither is set.
     pub async fn submit_with<J: Job>(&self, job: J, options: RunOptions) -> Result<JobHandle<J>> {
         let payload = job_payload(&job)?;
         let key = job.idempotency_key();
         let run_id = key.as_deref().map(run_id_for_key);
 
-        // A terminated job with this key is reported from its terminal
-        // record, which outlives the run record the workflow deletes at
-        // termination.
+        // A terminated job with this key is reported from its terminal record,
+        // which outlives the run record the workflow deletes at termination.
         if let Some(run_id) = &run_id
             && let Some(termination) = self.runtime.inner.core.view.terminal_record(run_id).await?
         {
@@ -256,9 +252,9 @@ impl JobRunner {
     /// Spawn the worker task and return a handle for graceful shutdown.
     ///
     /// The worker claims and runs jobs concurrently (up to the configured
-    /// limit) until either `shutdown` resolves or
-    /// [`RunnerHandle::shutdown`] is called. In-flight jobs are allowed to
-    /// finish. Every call spawns one more worker over the same queue.
+    /// limit) until either `shutdown` resolves or [`RunnerHandle::shutdown`] is
+    /// called. In-flight jobs are allowed to finish. Every call spawns one more
+    /// worker over the same queue.
     pub fn spawn<F>(&self, shutdown: F) -> RunnerHandle
     where
         F: Future<Output = ()> + Send + 'static,
@@ -360,15 +356,14 @@ impl JobRunnerBuilder {
         self
     }
 
-    /// Remove a job's memo, run result record and terminal record
-    /// `retention` after it reaches a terminal state. When unset
-    /// (default), records are retained indefinitely.
+    /// Remove a job's memo, run result record and terminal record `retention`
+    /// after it reaches a terminal state. When unset (default), records are
+    /// retained indefinitely.
     ///
     /// Once the records are removed, [`JobHandle::fetch_result`] for that job
-    /// returns `Ok(None)` and an idempotent re-submission of the same
-    /// payload runs the job again. Set the window to cover the longest gap
-    /// callers need between the original submission and an idempotent
-    /// re-submission.
+    /// returns `Ok(None)` and an idempotent re-submission of the same payload
+    /// runs the job again. Set the window to cover the longest gap callers need
+    /// between the original submission and an idempotent re-submission.
     ///
     /// [`JobHandle::fetch_result`]: crate::jobs::JobHandle::fetch_result
     pub fn retention(mut self, retention: Duration) -> Self {
@@ -376,24 +371,25 @@ impl JobRunnerBuilder {
         self
     }
 
-    /// Remove a job group's state (its manifest, member records and the
-    /// memo entries and run result records of its members) `retention`
-    /// after a [`JobGroup::results`] or [`JobGroup::join`] consumer
-    /// observed the last member's termination; see
-    /// [`WorkflowRuntimeBuilder::group_retention`](crate::WorkflowRuntimeBuilder::group_retention).
-    /// When unset (default), a group is retained until
-    /// [`JobGroup::forget`].
+    /// Remove a job group's state (its manifest, member records and the memo
+    /// entries and run result records of its members) `retention` after a
+    /// [`JobGroup::results`] or [`JobGroup::join`] consumer observed the last
+    /// member's termination. See
+    /// [`WorkflowRuntimeBuilder::group_retention`][group-retention]. When unset
+    /// (default), a group is retained until [`JobGroup::forget`].
     ///
     /// # Panics
     ///
     /// [`build`](Self::build) panics if `retention < 1ms`.
+    ///
+    /// [group-retention]: crate::WorkflowRuntimeBuilder::group_retention
     pub fn group_retention(mut self, retention: Duration) -> Self {
         self.group_retention = Some(retention);
         self
     }
 
-    /// Override the [`Clock`] the runner reads timestamps from. Defaults to
-    /// the queue's clock ([`Queue::clock`]).
+    /// Override the [`Clock`] the runner reads timestamps from. Defaults to the
+    /// queue's clock ([`Queue::clock`]).
     pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = Some(clock);
         self
@@ -598,8 +594,8 @@ mod tests {
         async fn run(&self, ctx: JobContext<'_>) -> std::result::Result<u32, TestError> {
             ctx.state::<Arc<AtomicU32>>().fetch_add(1, Ordering::SeqCst);
             if ctx.attempts == 1 {
-                // Past the lease under virtual time; later attempts return
-                // at once.
+                // Past the lease under virtual time. Later attempts return at
+                // once.
                 tokio::time::sleep(Duration::from_secs(300)).await;
             }
             Ok(ctx.attempts)
@@ -930,7 +926,7 @@ mod tests {
         clock.advance(Duration::from_secs(61));
         assert_eq!(runner.runtime.inner.core.sweep_once().await.unwrap(), 1);
 
-        // The re-submission finds no terminal record and runs the job
+        // The re-submission does not find a terminal record and runs the job
         // again under the same id.
         let second = runner.submit(CountedKeyed { n: 5 }).await.unwrap();
         assert!(second.newly_submitted());
@@ -950,8 +946,8 @@ mod tests {
             .register::<CountedKeyed>()
             .build();
 
-        // No worker: the cancellation of the pending step terminates
-        // the run without a run result record.
+        // No worker: the cancellation of the pending step terminates the run
+        // without a run result record.
         let first = runner.submit(CountedKeyed { n: 7 }).await.unwrap();
         assert!(runner.runtime.cancel(first.id()).await.unwrap());
         assert!(first.fetch_result().await.unwrap().is_none());
@@ -1046,8 +1042,8 @@ mod tests {
         let handle = runner.spawn(std::future::pending::<()>());
 
         let job = runner.submit(Adder { a: 11, b: 31 }).await.unwrap();
-        // Long enough for the worker to claim, run and ack the job before
-        // the wait starts.
+        // Long enough for the worker to claim, run and ack the job before the
+        // wait starts.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(matches!(
             job.status().await.unwrap().map(|s| s.state),
@@ -1122,7 +1118,7 @@ mod tests {
 
         let job = runner.submit(Reclaimable).await.unwrap();
 
-        // Past the worker's poll interval, so the first claim has happened.
+        // Past the worker's poll interval, so the worker made the first claim.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
@@ -1132,8 +1128,8 @@ mod tests {
         assert_eq!(attempt, 2);
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
 
-        // The first handler is still in its virtual sleep; a graceful
-        // shutdown would wait for it.
+        // A graceful shutdown waits for the first handler, which is still in
+        // its virtual sleep.
         drop(handle);
     }
 }

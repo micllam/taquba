@@ -1,9 +1,9 @@
 //! Submit a run that loops through several steps before completing.
 //!
 //! Each step parses its payload as `"<current>/<target>"`, increments the
-//! current value, and either returns `Continue` with the new state or
-//! `Complete` with the final value. The completion hook prints the result
-//! and the runtime shuts down.
+//! current value and either returns `Continue` with the new state or `Complete`
+//! with the final value. The completion hook prints the result and the runtime
+//! shuts down.
 //!
 //! Run with:
 //!
@@ -109,8 +109,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .poll_interval(Duration::from_millis(50))
     .build();
 
-    // Spawn the worker loop. It exits when `rx` resolves (fired by the hook
-    // on terminal status).
+    // Spawn the worker loop. It exits when `rx` resolves (fired by the hook on
+    // terminal status).
     let worker_runtime = runtime.clone();
     let worker_task = tokio::spawn(async move {
         worker_runtime

@@ -1,6 +1,7 @@
 # Changelog
 
-All notable changes to the `taquba-workflow` crate will be documented in this file.
+All notable changes to the `taquba-workflow` crate will be documented in this
+file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -10,28 +11,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `RunGroup::forget` and `JobGroup::forget` fail with the new
-  `Error::GroupActive` for a group with an active member, whose state stays,
-  and for a group whose member is submitted before the removal commits. 0.13
-  removed the member records, so the results of a later submission failed
-  with `MemberNotSubmitted`. Call `RunGroup::cancel` and read
-  `RunGroup::results` to the end before `forget`.
-- `RunSpec::effects` and `TerminalEffects::enqueue` reject an enqueue with
-  a header of the reserved `workflow.*` prefix, so a caller cannot enqueue
-  a job that a runtime reads as a step or a notification. Use another
-  header prefix.
-- `RunSpec::effects` and `TerminalEffects::enqueue` reject an enqueue to
-  the queue of the runtime with the new `Error::ReservedQueue`. 0.13
-  committed the job, and the worker dead-lettered it for the missing
-  `workflow.run_id` header. Submit a run, or enqueue to another queue.
-- `Error::ReservedHeaderInSubmit` becomes `Error::ReservedHeader`, because
-  it is also returned for the header of an enqueue. Rename the variant in
-  a match.
+  `Error::GroupActive` for a group with an active member (whose state stays) and
+  for a group whose member is submitted before the removal commits. 0.13 removed
+  the member records, so the results of a later submission failed with
+  `MemberNotSubmitted`. Call `RunGroup::cancel` and read `RunGroup::results` to
+  the end before `forget`.
+- `RunSpec::effects` and `TerminalEffects::enqueue` reject an enqueue with a
+  header of the reserved `workflow.*` prefix, so a caller cannot enqueue a job
+  that a runtime reads as a step or a notification. Use another header prefix.
+- `RunSpec::effects` and `TerminalEffects::enqueue` reject an enqueue to the
+  queue of the runtime with the new `Error::ReservedQueue`. 0.13 committed the
+  job, and the worker dead-lettered it for the missing `workflow.run_id` header.
+  Submit a run, or enqueue to another queue.
+- `Error::ReservedHeaderInSubmit` becomes `Error::ReservedHeader`, because it is
+  also returned for the header of an enqueue. Rename the variant in a match.
 
 ### Fixed
 
-- The group retention sweep retains a group that is submitted again after
-  its terminal marker. 0.13 removed the group a window after the first
-  marker, while the members of the later submission were active.
+- The group retention sweep retains a group that is submitted again after its
+  terminal marker. 0.13 removed the group a window after the first marker, while
+  the members of the later submission were active.
 
 <!-- vale off -->
 

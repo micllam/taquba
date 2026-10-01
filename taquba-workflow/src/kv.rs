@@ -18,9 +18,9 @@ use crate::error::Result;
 /// misses (for example a marker a crashed settlement never committed)
 /// re-executes work that must be idempotent downstream.
 ///
-/// The handle is cheap to clone and exposes no write or settlement
-/// operation. Use [`KvReadHandle::detached`] when constructing a
-/// [`Step`](crate::Step) in tests.
+/// A clone of the handle increments a reference count. The handle does not
+/// expose a write or settlement operation. Use [`KvReadHandle::detached`] when
+/// constructing a [`Step`](crate::Step) in tests.
 #[derive(Clone)]
 pub struct KvReadHandle {
     queue: Option<Arc<Queue>>,
@@ -36,9 +36,9 @@ impl std::fmt::Debug for KvReadHandle {
 }
 
 impl KvReadHandle {
-    /// Build a handle bound to no queue, for constructing a
-    /// [`Step`](crate::Step) in tests. [`get`](Self::get) on a detached
-    /// handle returns `Ok(None)` for every key.
+    /// Build a handle that is not bound to a queue, for constructing a
+    /// [`Step`](crate::Step) in tests. [`get`](Self::get) on a detached handle
+    /// returns `Ok(None)` for every key.
     pub fn detached() -> Self {
         Self { queue: None }
     }
@@ -47,13 +47,12 @@ impl KvReadHandle {
         Self { queue: Some(queue) }
     }
 
-    /// Read the committed value under `key` from the caller KV
-    /// namespace, `None` when no value exists.
+    /// Read the committed value under `key` from the caller KV namespace,
+    /// `None` when no value exists.
     ///
     /// # Errors
     ///
-    /// [`Error::Queue`](crate::Error::Queue) when the underlying read
-    /// fails.
+    /// [`Error::Queue`](crate::Error::Queue) when the underlying read fails.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         match &self.queue {
             Some(queue) => Ok(queue.view().kv_get(key).await?),

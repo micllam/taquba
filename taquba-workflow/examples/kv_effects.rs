@@ -4,18 +4,18 @@
 //! An order-processing run keeps a status row under
 //! `app/orders/{run_id}/status`:
 //!
-//!   - submission writes `received` in the same transaction as the
+//!   - Submission writes `received` in the same transaction as the
 //!     step-0 enqueue (`RunSpec::effects`), together with a pending
-//!     marker;
-//!   - the validation step stages `validated` through `Delivery::effects`,
+//!     marker.
+//!   - The validation step stages `validated` through `Delivery::effects`,
 //!     so the new status commits with the settlement that enqueues the
-//!     fulfilment step;
-//!   - the fulfilment step stages `fulfilled` and deletes the pending
+//!     fulfilment step.
+//!   - The fulfilment step stages `fulfilled` and deletes the pending
 //!     marker, both applied with the terminal acknowledgement.
 //!
-//! Every value read back below was written by a settlement transaction,
-//! so no crash point can leave the status row disagreeing with the
-//! run's actual state.
+//! Every value read back below was written by a settlement transaction, so no
+//! crash point can leave the status row disagreeing with the run's actual
+//! state.
 //!
 //! Run with:
 //!
@@ -46,13 +46,13 @@ struct OrderFlow;
 impl StepRunner for OrderFlow {
     async fn run_step(&self, step: &Step) -> Result<StepOutcome, StepError> {
         if step.step_number == 0 {
-            // Validation: the status update commits with the same
-            // transaction that enqueues the fulfilment step.
+            // Validation: the status update commits with the same transaction
+            // that enqueues the fulfilment step.
             step.effects.put(status_key(&step.run_id), "validated")?;
             Ok(StepOutcome::continue_now(step.payload.clone()))
         } else {
-            // Fulfilment: the final status and the marker delete are
-            // applied with the terminal acknowledgement.
+            // Fulfilment: the final status and the marker delete are applied
+            // with the terminal acknowledgement.
             step.effects.put(status_key(&step.run_id), "fulfilled")?;
             step.effects.delete(pending_key(&step.run_id))?;
             Ok(StepOutcome::Succeed {
@@ -87,8 +87,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .poll_interval(Duration::from_millis(50))
         .build();
 
-    // Submit before the worker starts, so the status row still reads
-    // `received` when printed below.
+    // Submit before the worker starts, so the status row still reads `received`
+    // when printed below.
     let run_id = "order-1001";
     runtime
         .submit(RunSpec {
@@ -112,9 +112,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
     });
 
-    // The hook runs as the worker of a notification job enqueued
-    // atomically with the terminal acknowledgement, so once the outcome
-    // arrives the final effects are already committed.
+    // The hook runs as the worker of a notification job enqueued atomically
+    // with the terminal acknowledgement, so once the outcome arrives the final
+    // effects are already committed.
     let outcome = outcomes.recv().await.expect("terminal outcome");
     println!("run terminated: {}", outcome.status);
 

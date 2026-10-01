@@ -1,31 +1,30 @@
-//! Per-step durable key-value store for memoizing within-step side
-//! effects, backed by object storage.
+//! Per-step durable key-value store for memoizing within-step side effects,
+//! backed by object storage.
 //!
 //! [`Memo`] makes within-step side effects retry-safe. Taquba delivers
-//! at-least-once, so a step may run more than once if its lease expires
-//! before ack; without a durable place to record intermediate results,
-//! expensive operations (LLM calls, paid external APIs, multi-step side
-//! effects) silently re-run on each retry.
+//! at-least-once, and a step runs more than once if its lease expires before
+//! the ack. Without a durable record of intermediate results, slow or paid
+//! operations (LLM calls, paid external APIs, multi-step side effects) re-run
+//! silently on each retry.
 //!
-//! Each per-step memo entry is keyed by `(run_id, step_number,
-//! user_key)`, so distinct steps and runs see independent namespaces; a
-//! run-scoped memo drops the step dimension and is shared by every step
-//! of its run. User keys are SHA-256-hashed before becoming
-//! object-store path segments so any string is a valid key regardless
-//! of length or characters.
+//! Each per-step memo entry uses `(run_id, step_number, user_key)` as its key,
+//! so distinct steps and runs see independent namespaces. A run-scoped memo
+//! drops the step dimension and is shared by every step of its run. User keys
+//! are SHA-256-hashed before becoming object-store path segments so any string
+//! is a valid key regardless of length or characters.
 //!
 //! # Layout
 //!
-//! [`MemoStore`] owns a single object-store prefix and partitions it into
-//! two sub-prefixes:
+//! [`MemoStore`] owns a single object-store prefix and partitions it into two
+//! sub-prefixes:
 //!
 //! - `<prefix>/memos/<run_id>/<step_number>/<sha256(user_key)>`: per-step
 //!   memo entries written by [`Memo::put`]. A content-addressed entry
-//!   ([`Memo::content_put`]) is stored under the user key
+//!   ([`Memo::content_put`]) is stored with the user key
 //!   `content:<sha256(msgpack(input))>`, so its path segment is the
 //!   digest of that key.
 //! - `<prefix>/memos/<run_id>/run/<sha256(user_key)>`: run-scoped memo
-//!   entries; the `run` segment sits beside the numeric step segments,
+//!   entries. The `run` segment is a sibling of the numeric step segments,
 //!   so [`MemoStore::clear_memos_for_run`] removes both kinds together.
 //! - `<prefix>/step-outputs/<run_id>/<step_number>/<sha256(step_payload)>`:
 //!   step-output replay entries written by the workflow runtime when
@@ -33,18 +32,18 @@
 //!
 //! # Reserved key
 //!
-//! [`RUN_RESULT_MEMO_KEY`] in a run-scoped memo holds the run result
-//! record the runtime writes; a handler's run memo must not use it.
+//! [`RUN_RESULT_MEMO_KEY`] is the key of the run result record that the runtime
+//! writes to a run-scoped memo. A handler's run memo must not use it.
 //!
 //! # Cleanup
 //!
-//! The [`Memo`] primitive has no lifecycle management of its own.
-//! [`MemoStore::clear_memos_for_run`] removes every memo entry and
-//! step-output replay entry for a given run. Deciding *which* runs are
-//! eligible is the caller's concern: the workflow runtime records a
-//! terminal marker for each finished run in the queue's key-value
-//! namespace, in the same transaction that settles the run, and its
-//! retention sweep pairs that marker with `clear_memos_for_run`.
+//! The [`Memo`] primitive does not manage its own lifecycle.
+//! [`MemoStore::clear_memos_for_run`] removes every memo entry and step-output
+//! replay entry for a given run. Deciding *which* runs are eligible is the
+//! caller's concern: the workflow runtime records a terminal marker for each
+//! finished run in the queue's key-value namespace, in the same transaction
+//! that settles the run, and its retention sweep pairs that marker with
+//! `clear_memos_for_run`.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -59,16 +58,15 @@ use crate::durable::decode_or_absent;
 use crate::error::{Error, Result};
 use crate::keys::{RunId, hex_sha256};
 
-/// Run-memo key of the run result record. Handlers receive the run
-/// memo as well, so the key is reserved and documented.
+/// Run-memo key of the run result record. Handlers receive the run memo as
+/// well, so the key is reserved and documented.
 pub(crate) const RUN_RESULT_MEMO_KEY: &str = "workflow.outcome";
 
-/// Backing store for [`Memo`] entries, parametrised by an
-/// [`ObjectStore`] and a path prefix. Builds per-step [`Memo`]
-/// views via [`MemoStore::new_memo`].
+/// Backing store for [`Memo`] entries, parametrised by an [`ObjectStore`] and a
+/// path prefix. Builds per-step [`Memo`] views via [`MemoStore::new_memo`].
 ///
-/// Owns the memo and step-output sub-prefixes; see the module docs for
-/// the path layout.
+/// Owns the memo and step-output sub-prefixes. The module docs describe the
+/// path layout.
 #[derive(Clone)]
 pub struct MemoStore {
     objects: ObjectPrefix,
@@ -76,8 +74,8 @@ pub struct MemoStore {
 
 impl std::fmt::Debug for MemoStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The object store doesn't implement Debug; show the prefix
-        // (the operationally interesting part) and elide the rest.
+        // The object store does not implement Debug. The output shows the
+        // prefix (the operationally interesting part) and elides the rest.
         f.debug_struct("MemoStore")
             .field("prefix", &self.objects.prefix())
             .finish_non_exhaustive()
@@ -85,11 +83,10 @@ impl std::fmt::Debug for MemoStore {
 }
 
 impl MemoStore {
-    /// Build a `MemoStore` over the given object store and path prefix.
-    /// Memo entries live under `<prefix>/memos/...` and step-output
-    /// replay entries under `<prefix>/step-outputs/...`; the prefix
-    /// should not overlap with the queue's SlateDB path or with any
-    /// other consumer of the same store.
+    /// Build a `MemoStore` over the given object store and path prefix. Memo
+    /// entries live under `<prefix>/memos/...` and step-output replay entries
+    /// under `<prefix>/step-outputs/...`. The prefix must not overlap with the
+    /// queue's SlateDB path or with any other consumer of the same store.
     pub fn new(store: Arc<dyn ObjectStore>, prefix: impl Into<String>) -> Self {
         Self {
             objects: ObjectPrefix::new(store, prefix),
@@ -101,17 +98,16 @@ impl MemoStore {
         Memo::new(self.clone(), run_id, MemoScope::Step(step_number))
     }
 
-    /// Build a [`Memo`] scoped to `run_id` as a whole, shared by every
-    /// step of the run.
+    /// Build a [`Memo`] scoped to `run_id` as a whole, shared by every step of
+    /// the run.
     pub fn new_run_memo(&self, run_id: &RunId) -> Memo {
         Memo::new(self.clone(), run_id, MemoScope::Run)
     }
 
     /// Delete every memo entry and runtime step-output replay entry for
     /// `run_id`. Returns the number of entries removed. Errors during
-    /// individual deletes are logged (best-effort cleanup) but do not
-    /// stop the sweep; an aggregated error is returned only if a list
-    /// operation fails.
+    /// individual deletes are logged (best-effort cleanup) but do not stop the
+    /// sweep. An aggregated error is returned only if a list operation fails.
     pub async fn clear_memos_for_run(&self, run_id: &RunId) -> Result<usize> {
         let memo_deleted = self
             .clear_prefix(run_id, self.memos_run_prefix(run_id), "memo")
@@ -199,16 +195,16 @@ impl MemoStore {
     }
 }
 
-/// The namespace a [`Memo`] is bound to within its run: one step, or
-/// the run as a whole.
+/// The namespace a [`Memo`] is bound to within its run: one step, or the run as
+/// a whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MemoScope {
     Step(u32),
     Run,
 }
 
-/// A view onto a [`MemoStore`] scoped to a `(run_id, step_number)`
-/// pair, or to a run as a whole.
+/// A view onto a [`MemoStore`] scoped to a `(run_id, step_number)` pair, or to
+/// a run as a whole.
 #[derive(Clone)]
 pub struct Memo {
     store: MemoStore,
@@ -230,8 +226,7 @@ impl Memo {
         &self.run_id
     }
 
-    /// The step number this memo is bound to; `None` for a run-scoped
-    /// memo.
+    /// The step number this memo is bound to, or `None` for a run-scoped memo.
     pub fn step_number(&self) -> Option<u32> {
         match self.scope {
             MemoScope::Step(step_number) => Some(step_number),
@@ -239,8 +234,8 @@ impl Memo {
         }
     }
 
-    /// Read a previously stored value for `key`, or `Ok(None)` if
-    /// none has been written.
+    /// Read the value stored for `key`, or `Ok(None)` if no value was written
+    /// for it.
     pub async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.store
             .objects
@@ -250,10 +245,10 @@ impl Memo {
 
     /// Store `value` for `key`, overwriting any prior value.
     ///
-    /// Overwrite is intentional: a retry that produces the same value
-    /// is idempotent. A retry that produces a *different* value
-    /// indicates the handler isn't perfectly idempotent; the memo
-    /// reflects whatever the most recent attempt wrote.
+    /// Overwrite is intentional: a retry that produces the same value is
+    /// idempotent. A retry that produces a *different* value indicates that the
+    /// handler is not fully idempotent, and the memo contains the value of the
+    /// most recent attempt.
     pub async fn put(&self, key: &str, value: &[u8]) -> Result<()> {
         self.store
             .objects
@@ -261,14 +256,13 @@ impl Memo {
             .await
     }
 
-    /// Return the value stored under `key`, or run `compute`, store its
-    /// value under `key` and return it.
+    /// Return the value stored under `key`, or run `compute`, store its value
+    /// under `key` and return it.
     ///
-    /// The value is encoded as MessagePack with named fields. An entry
-    /// that fails to decode as `R` is treated as absent: `compute` runs
-    /// and its value overwrites the entry. An error from `compute` is
-    /// returned without storing anything, so a later call runs `compute`
-    /// again.
+    /// The value is encoded as MessagePack with named fields. An entry that
+    /// fails to decode as `R` is treated as absent: `compute` runs and its
+    /// value overwrites the entry. An error from `compute` is returned without
+    /// storing anything, so a later call runs `compute` again.
     ///
     /// A side effect inside `compute` runs again when the process terminates
     /// after `compute` returns and before the value is stored.
@@ -306,16 +300,15 @@ impl Memo {
         self.memoized(&key, compute).await
     }
 
-    /// Derive the memo key for a content-addressed entry: `content:`
-    /// followed by the hex SHA-256 digest of `input` encoded as
-    /// MessagePack with named fields.
+    /// Derive the memo key for a content-addressed entry: `content:` followed
+    /// by the hex SHA-256 digest of `input` encoded as MessagePack with named
+    /// fields.
     ///
-    /// The key is stable only when `input` serializes
-    /// deterministically; types with unordered iteration, such as
-    /// `HashMap`, can serialize the same logical content into different
-    /// bytes and therefore different keys. If several logical
-    /// operations may receive identical inputs, include an operation
-    /// name in the serialized input.
+    /// The key is stable only when `input` serializes deterministically. Types
+    /// with unordered iteration, such as `HashMap`, can serialize the same
+    /// logical content into different bytes and therefore different keys. If
+    /// several logical operations can receive identical inputs, include an
+    /// operation name in the serialized input.
     pub fn content_key<T>(input: &T) -> Result<String>
     where
         T: Serialize + ?Sized,
@@ -324,8 +317,7 @@ impl Memo {
         Ok(format!("content:{}", hex_sha256(&[&bytes])))
     }
 
-    /// Read the memo entry stored under [`Self::content_key`] of
-    /// `input`.
+    /// Read the memo entry stored under [`Self::content_key`] of `input`.
     pub async fn content_get<T>(&self, input: &T) -> Result<Option<Vec<u8>>>
     where
         T: Serialize + ?Sized,
@@ -503,8 +495,8 @@ mod tests {
 
     #[tokio::test]
     async fn awkward_user_keys_round_trip() {
-        // Keys with `/`, spaces, and non-ASCII should all work because
-        // they're hashed before becoming a path segment.
+        // Keys with `/`, spaces and non-ASCII characters work because they are
+        // hashed before becoming a path segment.
         let memo = make_memo();
         let keys = [
             "",
@@ -679,9 +671,9 @@ mod tests {
 
     #[tokio::test]
     async fn instances_sharing_a_backing_store_see_the_same_entries() {
-        // Two MemoStores over the same object store + prefix yield
-        // memos that observe each other's writes -- the storage is
-        // the source of truth, not any in-memory state.
+        // Two MemoStores over the same object store + prefix yield memos that
+        // observe each other's writes. Each memo reads from the storage, which
+        // is the source of truth.
         let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let writer = MemoStore::new(backing.clone(), "memo").new_memo(&rid("run-1"), 0);
         let reader = MemoStore::new(backing, "memo").new_memo(&rid("run-1"), 0);

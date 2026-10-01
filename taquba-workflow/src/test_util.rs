@@ -14,8 +14,8 @@ pub(crate) fn rid(id: &str) -> RunId {
     RunId::new(id).unwrap()
 }
 
-/// A queue named `test` over an in-memory object store of its own,
-/// opened with `opts`.
+/// A queue named `test` over an in-memory object store of its own, opened with
+/// `opts`.
 pub(crate) async fn open_queue_with(opts: OpenOptions) -> (Arc<Queue>, Arc<dyn ObjectStore>) {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let queue = Arc::new(
@@ -31,8 +31,8 @@ pub(crate) async fn open_queue() -> (Arc<Queue>, Arc<dyn ObjectStore>) {
     open_queue_with(OpenOptions::default()).await
 }
 
-/// [`open_queue_with`] with a [`MockClock`] at `initial_ms` as the
-/// queue's clock.
+/// [`open_queue_with`] with a [`MockClock`] at `initial_ms` as the queue's
+/// clock.
 pub(crate) async fn open_queue_at_with(
     initial_ms: u64,
     opts: OpenOptions,
@@ -49,8 +49,8 @@ pub(crate) async fn open_queue_at(
     open_queue_at_with(initial_ms, OpenOptions::default()).await
 }
 
-/// Options with zero retry backoff and short reaper and scheduler
-/// intervals, for multi-attempt tests.
+/// Options with zero retry backoff and short reaper and scheduler intervals,
+/// for multi-attempt tests.
 pub(crate) fn fast_options() -> OpenOptions {
     OpenOptions::default()
         .default_queue_config(QueueConfig::default().retry_backoff_base(Duration::ZERO))

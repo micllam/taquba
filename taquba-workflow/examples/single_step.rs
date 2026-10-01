@@ -1,4 +1,4 @@
-//! Minimal one-step run: submit a payload, the runner echoes it back, the
+//! Minimal one-step run: submit a payload, the runner returns it unchanged, the
 //! completion hook prints the result and shuts the runtime down.
 //!
 //! Run with:

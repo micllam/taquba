@@ -40,9 +40,9 @@ Each rule identifies the code it applies to, whose docs describe the mechanism.
 ## Typed jobs and groups
 
 - **Typed jobs** (`jobs`). `jobs::handle::decode_end` is the one site that turns
-  a termination and an outcome into a typed result. A handler that submits
-  keeps a `JobRunner` in its state. Do not add `submit` to `JobContext`, a
-  queue job id to `JobHandle`, a second handler trait, an open-coded
-  decode-run-encode sequence or a runtime wrapper.
+  a termination and an outcome into a typed result. A handler that submits keeps
+  a `JobRunner` in its state. Do not add `submit` to `JobContext`, a queue job
+  id to `JobHandle`, a second handler trait, an open-coded decode-run-encode
+  sequence or a runtime wrapper.
 - **Run groups** (`group.rs`). Do not add a batch type, a second typed
   presentation, per-member settings or membership on the run record.

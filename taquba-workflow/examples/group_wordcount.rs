@@ -1,7 +1,7 @@
 //! A dependency-free job group: count the words in each document.
 //!
-//! Submits one job per document as a group, reads the results as they
-//! terminate and rolls the per-document counters up in the caller.
+//! Submits one job per document as a group, reads the results as they terminate
+//! and rolls the per-document counters up in the caller.
 //!
 //! Run with: `cargo run -p taquba-workflow --example group_wordcount`
 

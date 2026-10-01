@@ -1,21 +1,20 @@
 //! Crash recovery on a persistent store: run it, interrupt it, run it again.
 //!
 //! The run advances through three stages, each pausing long enough to be
-//! interrupted. A stage's output is committed before the next stage starts,
-//! and within a stage each unit of work is recorded in the step's memo store.
+//! interrupted. A stage's output is committed before the next stage starts, and
+//! within a stage each unit of work is recorded in the step's memo store.
 //!
-//! Run it, press Ctrl-C during any stage, then run it again. The second
-//! process resumes the same run rather than starting a new one: committed
-//! stages do not re-execute, the interrupted stage runs again with its
-//! attempt count raised and the units it had already completed are served
-//! from the memo store.
+//! Run it, press Ctrl-C during any stage, then run it again. The second process
+//! resumes the same run: committed stages do not re-execute, the interrupted
+//! stage runs again with its attempt count raised and the units it had already
+//! completed are read from the memo store.
 //!
 //! ```text
 //! cargo run -p taquba-workflow --example crash_resume
 //! ```
 //!
-//! State lives under `/tmp/taquba-crash-resume-example`. Remove that
-//! directory to discard a run and start over.
+//! State lives under `/tmp/taquba-crash-resume-example`. Remove that directory
+//! to discard a run and start over.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,7 +44,7 @@ impl StepRunner for Stages {
             .get(step.step_number as usize)
             .ok_or_else(|| StepError::permanent(format!("no stage {}", step.step_number)))?;
 
-        // The payload carries the stages committed so far.
+        // The payload contains the stages committed so far.
         let committed = String::from_utf8(step.payload.clone())
             .map_err(|e| StepError::permanent(format!("non-utf8 payload: {e}")))?;
 
@@ -131,11 +130,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(QUEUE_DIR)?;
     let store = Arc::new(LocalFileSystem::new_with_prefix(QUEUE_DIR)?);
 
-    // An interrupted step stays claimed until its lease expires and the
-    // reaper returns it to pending, so the lease sets the resume delay.
-    // Each interruption spends one delivery attempt, hence the raised
-    // max_attempts: the default of three dead-letters the run on a third
-    // Ctrl-C.
+    // An interrupted step stays claimed until its lease expires and the reaper
+    // returns it to pending, so the lease sets the resume delay. Each
+    // interruption spends one delivery attempt, hence the raised max_attempts:
+    // the default of three dead-letters the run on a third Ctrl-C.
     let queue = Arc::new(
         Queue::open_with_options(
             store.clone(),
@@ -163,8 +161,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .poll_interval(Duration::from_millis(200))
     .build();
 
-    // Submission is idempotent on the run id across restarts: a later
-    // process finds the durable run record and this call is a no-op.
+    // Submission is idempotent on the run id across restarts: a later process
+    // finds the durable run record and this call is a no-op.
     let outcome = runtime
         .submit(RunSpec {
             run_id: Some(RunId::new(RUN_ID)?),

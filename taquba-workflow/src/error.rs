@@ -5,13 +5,13 @@ use crate::keys::RunId;
 /// Errors returned by the runtime's submission and worker paths.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// A step job is missing the [`crate::HEADER_RUN_ID`] header.
-    /// Permanent: a misconfigured job will not become valid on retry.
+    /// A step job is missing the [`crate::HEADER_RUN_ID`] header. Permanent: a
+    /// misconfigured job will not become valid on retry.
     #[error("step job is missing header `{0}`")]
     MissingHeader(&'static str),
 
     /// A step job's [`crate::HEADER_STEP`] header is not a valid `u32`.
-    /// Permanent: header value won't change across retries.
+    /// Permanent: the header value does not change across retries.
     #[error("step job has invalid `{header}` header `{value}`")]
     InvalidStepHeader {
         /// Header name.
@@ -21,14 +21,14 @@ pub enum Error {
     },
 
     /// A header of a submission, or of an enqueue among the effects of a
-    /// caller, starts with the reserved `workflow.*` prefix. The runtime
-    /// owns that prefix. A caller must use another key.
+    /// caller, starts with the reserved `workflow.*` prefix. The runtime owns
+    /// that prefix. A caller must use another key.
     #[error("header `{0}` uses the reserved `workflow.*` prefix")]
     ReservedHeader(String),
 
-    /// A run id or group id is empty, longer than
-    /// [`crate::MAX_RUN_ID_LEN`] bytes or contains a character outside
-    /// `[A-Za-z0-9_-]`. See [`crate::RunId`].
+    /// A run id or group id is empty, longer than [`crate::MAX_RUN_ID_LEN`]
+    /// bytes or contains a character outside `[A-Za-z0-9_-]`. See
+    /// [`crate::RunId`].
     #[error("invalid run id `{run_id}`: {reason}")]
     InvalidRunId {
         /// The rejected run id.
@@ -37,11 +37,10 @@ pub enum Error {
         reason: &'static str,
     },
 
-    /// A re-submission of `run_id` carried `spec.input` bytes that differ
-    /// from the original submission's: the run is active, or it is a
-    /// typed job whose run result record is retained. Reusing a `run_id`
-    /// with new input is treated as a programmer error: pick a fresh
-    /// `run_id` for a new run.
+    /// A re-submission of `run_id` contained `spec.input` bytes that differ
+    /// from the original submission's: the run is active, or it is a typed job
+    /// whose run result record is retained. Reusing a `run_id` with new input
+    /// is treated as a programmer error: a new run requires a fresh `run_id`.
     #[error("run `{0}` exists with a different input; pick a fresh run_id")]
     InputMismatch(RunId),
 
@@ -52,29 +51,29 @@ pub enum Error {
     InconsistentRunState(RunId),
 
     /// An enqueue among the effects of a caller targets the queue of the
-    /// runtime. The runtime owns that queue, and a job reaches it through
-    /// a submission.
+    /// runtime. The runtime owns that queue, and a job reaches it through a
+    /// submission.
     #[error("enqueue targets the reserved queue `{0}` of the runtime")]
     ReservedQueue(String),
 
     /// A caller KV key passed via [`crate::RunSpec::effects`] or staged through
     /// an [`crate::EffectsHandle`] or a [`crate::TerminalEffects`] starts with
-    /// the reserved `workflow/` prefix.
-    /// The runtime owns that prefix. A caller must use another key.
+    /// the reserved `workflow/` prefix. The runtime owns that prefix. A caller
+    /// must use another key.
     #[error("kv key `{0}` uses the reserved `workflow/` prefix")]
     ReservedKvKey(String),
 
-    /// A key was staged through an [`crate::EffectsHandle`] for both a
-    /// write and a delete within one step. The combination has no defined
-    /// order in the settlement transaction and is rejected when the
-    /// second operation is staged.
+    /// A key was staged through an [`crate::EffectsHandle`] for both a write
+    /// and a delete within one step. The combination does not have a defined
+    /// order in the settlement transaction and is rejected when the second
+    /// operation is staged.
     #[error("kv key `{0}` is staged for both a write and a delete")]
     ConflictingKvEffect(String),
 
     /// An effect was staged through an [`crate::EffectsHandle`] or
-    /// [`crate::TerminalEffects`] clone after its delivery returned.
-    /// Effects are collected when the runner or hook returns; an effect
-    /// staged after that point cannot join the settlement.
+    /// [`crate::TerminalEffects`] clone after its delivery returned. Effects
+    /// are collected when the runner or hook returns. An effect staged after
+    /// that point cannot join the settlement.
     #[error("the effects handle is sealed; its delivery has returned")]
     EffectsSealed,
 
@@ -90,19 +89,17 @@ pub enum Error {
     #[error("serialization error: {0}")]
     Serialization(#[from] rmp_serde::encode::Error),
 
-    /// Deserializing a stored value, a typed input or a typed output
-    /// failed.
+    /// Deserializing a stored value, a typed input or a typed output failed.
     #[error("deserialization error: {0}")]
     Deserialization(#[from] rmp_serde::decode::Error),
 
-    /// A wait named a run the runtime has no record of: never
-    /// submitted, or terminated with no record retained.
+    /// A wait named a run that the runtime does not have a record of: the run
+    /// was never submitted, or it terminated and its record was not retained.
     #[error("run `{0}` not found")]
     RunNotFound(RunId),
 
-    /// A group operation waited on a member of the manifest that was
-    /// not submitted; [`RunGroup::resume`](crate::RunGroup::resume)
-    /// submits it.
+    /// A group operation waited on a member of the manifest that was not
+    /// submitted. [`RunGroup::resume`](crate::RunGroup::resume) submits it.
     #[error("member `{key}` of group `{group_id}` was not submitted")]
     MemberNotSubmitted {
         /// The group id.
@@ -115,25 +112,25 @@ pub enum Error {
     #[error("duplicate member key `{0}` in group")]
     DuplicateMemberKey(String),
 
-    /// A submission to an existing group supplied a different member
-    /// set than the group's manifest.
+    /// A submission to an existing group supplied a different member set than
+    /// the group's manifest.
     #[error("group `{0}` exists with a different member set")]
     GroupMismatch(RunId),
 
-    /// A group operation named a group with no manifest.
+    /// A group operation named a group that does not have a manifest.
     #[error("group `{0}` not found")]
     GroupNotFound(RunId),
 
-    /// [`RunGroup::forget`](crate::RunGroup::forget) was called for a
-    /// group with an active member.
+    /// [`RunGroup::forget`](crate::RunGroup::forget) was called for a group
+    /// with an active member.
     #[error("group `{0}` has an active member")]
     GroupActive(RunId),
 }
 
 impl Error {
-    /// True if retrying the operation will not change the outcome; callers
-    /// should fast-fail (e.g. dead-letter a step, mark a submission as
-    /// failed) rather than back off and try again.
+    /// True if retrying the operation will not change the outcome. A permanent
+    /// error calls for a fast failure, such as a dead-lettered step or a
+    /// submission marked as failed, without a backoff and retry.
     ///
     /// [`Self::Queue`] delegates to [`taquba::Error::is_permanent`].
     pub fn is_permanent(&self) -> bool {
@@ -162,8 +159,8 @@ impl Error {
 }
 
 /// The worker error reporting `err` from a step's delivery: a
-/// [`taquba::PermanentFailure`] for a permanent error, which
-/// dead-letters the step, and a retrying error otherwise.
+/// [`taquba::PermanentFailure`] (which dead-letters the step) for a permanent
+/// error and a retrying error otherwise.
 pub(crate) fn worker_error(err: impl Into<Error>) -> taquba::WorkerError {
     crate::runner::StepError::from(err.into()).into_worker_error()
 }

@@ -1,7 +1,6 @@
-//! Inner fan-out composing workflow steps with a job group: a workflow
-//! step submits one typed job per URL as the members of a group named
-//! after the step, joins their typed results and continues with the
-//! aggregate.
+//! Inner fan-out composing workflow steps with a job group: a workflow step
+//! submits one typed job per URL as the members of a group named after the
+//! step, joins their typed results and continues with the aggregate.
 //!
 //! - **Step 0 (`fetch`)**: submits one `FetchPage` job per URL in the
 //!   run input to the group `fetch-{run_id}`, joins every result and
@@ -9,14 +8,14 @@
 //! - **Step 1 (`report`)**: formats the aggregate into the run's final
 //!   result.
 //!
-//! The group keeps the fan-out safe under at-least-once delivery: a
-//! retry of step 0 submits the same group again, which runs only the
-//! members that did not succeed, and joins the recorded results of the
-//! rest without running them twice.
+//! The group keeps the fan-out safe under at-least-once delivery: a retry of
+//! step 0 submits the same group again, which runs only the members that did
+//! not succeed, and joins the recorded results of the rest without running them
+//! twice.
 //!
-//! Both layers consume one shared `Arc<Queue>`: the workflow runtime
-//! and the job runner are consumers of the same store, in the same
-//! process, on different logical queues.
+//! Both layers consume one shared `Arc<Queue>`: the workflow runtime and the
+//! job runner are consumers of the same store, in the same process, on
+//! different logical queues.
 //!
 //! ```text
 //! cargo run -p taquba-workflow --example fanout_jobs
@@ -35,8 +34,8 @@ use taquba_workflow::{
 };
 use tokio::sync::oneshot;
 
-/// Mocked page fetch. A real version would issue an HTTP request; the
-/// example derives a deterministic byte count from the URL.
+/// Mocked page fetch. The example derives a deterministic byte count from the
+/// URL where a real version issues an HTTP request.
 #[derive(Serialize, Deserialize)]
 struct FetchPage {
     url: String,
@@ -154,8 +153,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(InMemory::new());
     let queue = Arc::new(Queue::open(store.clone(), "fanout-demo").await?);
 
-    // Typed-jobs layer, sharing the queue with the workflow runtime
-    // below. The runner's dispatch worker runs until shutdown.
+    // Typed-jobs layer, sharing the queue with the workflow runtime below. The
+    // runner's dispatch worker runs until shutdown.
     let jobs = JobRunner::builder(queue.clone(), store.clone())
         .register::<FetchPage>()
         .build();

@@ -1,19 +1,20 @@
 //! Typed single-function jobs on the workflow runtime.
 //!
 //! A job is a function that runs reliably in the background: define a typed
-//! [`Job`], submit instances of it and receive the typed result. Each job
-//! runs as one workflow run with a single step, so durability, retries,
-//! idempotent submission, memoization and retention are the workflow
-//! runtime's, and this crate adds the function abstraction: typed inputs
-//! and outputs, a type registry, a typed view of the runtime's run result
-//! record and an awaitable handle.
+//! [`Job`], submit instances of it and receive the typed result. Each job runs
+//! as one workflow run with a single step, so durability, retries, idempotent
+//! submission, memoization and retention are the workflow runtime's, and this
+//! crate adds the function abstraction: typed inputs and outputs, a type
+//! registry, a typed view of the runtime's run result record and an awaitable
+//! handle.
 //!
 //! Use a job when the caller awaits a typed return value, and a
 //! [`StepRunner`](crate::StepRunner) directly when one entity moves through
-//! several durable steps with cancellation and a terminal hook. The word
-//! "job" names the typed function here; the queue job that delivers a step
-//! is [`Delivery::job_id`](crate::Delivery::job_id). Chaining jobs to model a
-//! multi-step process is a sign the work belongs in a workflow.
+//! several durable steps with cancellation and a terminal hook. The word "job"
+//! refers to the typed function here.
+//! [`Delivery::job_id`](crate::Delivery::job_id) identifies the queue job that
+//! delivers a step. Chaining jobs to model a multi-step process is a sign the
+//! work belongs in a workflow.
 //!
 //! # Quick start
 //!
@@ -71,79 +72,76 @@
 //!
 //! # Architecture
 //!
-//! Like the rest of the Taquba ecosystem, the runner is single-process:
-//! one [`JobRunner`] per process, owning a workflow runtime over one
-//! [`taquba::Queue`]. A submission becomes a workflow run whose input is
-//! the job's [`Job::NAME`] and its serialized fields, and whose single
-//! step routes by that name to the registered handler.
+//! Like the rest of the Taquba ecosystem, the runner is single-process: one
+//! [`JobRunner`] per process, owning a workflow runtime over one
+//! [`taquba::Queue`]. A submission becomes a workflow run whose input is the
+//! job's [`Job::NAME`] and its serialized fields, and whose single step routes
+//! by that name to the registered handler.
 //!
-//! A job's outcome is durable: the runtime writes the run result record
-//! (the serialized output, or the failure) to the run's memo in the object
-//! store before the settlement that terminates the run. Awaiting a
-//! [`JobHandle`] is in-process (it
-//! uses Taquba's in-process completion notification), but the outcome can
-//! be read back with [`JobHandle::fetch_result`] after a process restart.
+//! A job's outcome is durable: the runtime writes the run result record (the
+//! serialized output, or the failure) to the run's memo in the object store
+//! before the settlement that terminates the run. Awaiting a [`JobHandle`] is
+//! in-process (it uses Taquba's in-process completion notification), but the
+//! outcome can be read back with [`JobHandle::fetch_result`] after a process
+//! restart.
 //!
 //! Delivery is at-least-once, inherited from Taquba: **job handlers must be
-//! idempotent.** A retried attempt that runs after an earlier attempt
-//! already wrote a run result record overwrites it with the new attempt's
-//! outcome. The [`memo`](crate::Delivery::memo) gives a handler a durable
-//! memo for the results of expensive calls, so a retried attempt reads
-//! them back.
+//! idempotent.** A retried attempt that runs after an earlier attempt already
+//! wrote a run result record overwrites it with the new attempt's outcome. The
+//! [`memo`](crate::Delivery::memo) gives a handler a durable memo for the
+//! results of slow or billed calls, so a retried attempt reads them back.
 //!
-//! Run result records and memo entries are retained indefinitely by default;
-//! enable [`JobRunnerBuilder::retention`] (see [Retention]) to remove them
-//! on a schedule, or apply a lifecycle policy to the object-store prefix.
+//! Run result records and memo entries are retained indefinitely by default.
+//! With [`JobRunnerBuilder::retention`] (see [Retention]), the runtime removes
+//! them on a schedule. A lifecycle policy on the object-store prefix can remove
+//! them in its place.
 //!
 //! [Retention]: #retention
 //! [Idempotent submissions]: #idempotent-submissions
 //!
 //! # Idempotent submissions
 //!
-//! [`Job::idempotency_key`] collapses duplicate submissions to a single
-//! job. The key's SHA-256 digest is the job's id and its workflow run id.
+//! [`Job::idempotency_key`] collapses duplicate submissions to a single job.
+//! The key's SHA-256 digest is the job's id and its workflow run id.
 //!
 //! - **Before the original completes** (pending, scheduled or in flight):
 //!   a second submission with the same key returns a [`JobHandle`] to the
 //!   in-flight job, with [`JobHandle::newly_submitted`] `== false`. If the
 //!   payload differs from the original, the submission fails with
 //!   [`Error::InputMismatch`](crate::Error::InputMismatch). The check
-//!   survives process restarts: the
+//!   persists across process restarts: the
 //!   SHA-256 of the serialized payload is stored in the workflow's run
 //!   record, atomically with the enqueue.
-//! - **After the original terminates**: the terminal record holds the
+//! - **After the original terminates**: the terminal record contains the
 //!   same hash, so a re-submission with a matching payload returns a
 //!   handle to the recorded termination (success, failure or
 //!   cancellation) without running the job again, and a differing
 //!   payload fails with [`Error::InputMismatch`](crate::Error::InputMismatch).
 //!
-//! If [`JobRunnerBuilder::retention`] is configured and the terminal
-//! record has been removed, the re-submission runs the job again under
-//! the same id. Size the retention window to cover the longest gap
-//! callers need between the original submission and an idempotent
-//! re-submission.
+//! If [`JobRunnerBuilder::retention`] is configured and the runtime removed the
+//! terminal record, the re-submission runs the job again under the same id.
+//! Size the retention window to cover the longest gap callers need between the
+//! original submission and an idempotent re-submission.
 //!
 //! For jobs where "same input means same key" is the right semantics,
-//! [`payload_idempotency_key`] hashes the serialized payload directly.
-//! Custom keys are appropriate when the dedup identity is narrower than
-//! the full payload (for example `"email:{recipient}:{date}"`).
+//! [`payload_idempotency_key`] hashes the serialized payload directly. Custom
+//! keys are appropriate when the dedup identity is narrower than the full
+//! payload (for example `"email:{recipient}:{date}"`).
 //!
 //! # Job groups
 //!
 //! A [`JobGroup`] is a [`RunGroup`](crate::RunGroup) of jobs of one type:
-//! [`JobRunner::group`] names the group, [`JobGroup::submit`] writes its
-//! manifest and submits the members, and [`JobGroup::join`] waits for
-//! every member and returns the typed results in submission order.
-//! Members are identified within the group by key (the job's
-//! [`Job::idempotency_key`], or the positional `item-{i}`), and a
-//! member's job id is derived from the group id and its key. A second
-//! submission of the same set runs again every member that did not
-//! succeed, so a step that fans out re-submits its group on a retry and
-//! joins the recorded results of the members that completed.
-//! [`JobGroup::status`], [`JobGroup::cancel`] and [`JobGroup::forget`]
-//! are the run group's; [`JobRunnerBuilder::group_retention`] removes a
-//! group's state a window after a consumer observed its last
-//! termination.
+//! [`JobRunner::group`] identifies the group, [`JobGroup::submit`] writes its
+//! manifest and submits the members, and [`JobGroup::join`] waits for every
+//! member and returns the typed results in submission order. Members are
+//! identified within the group by key (the job's [`Job::idempotency_key`], or
+//! the positional `item-{i}`), and a member's job id is derived from the group
+//! id and its key. A second submission of the same set runs again every member
+//! that did not succeed, so a step that fans out re-submits its group on a
+//! retry and joins the recorded results of the members that completed.
+//! [`JobGroup::status`], [`JobGroup::cancel`] and [`JobGroup::forget`] delegate
+//! to the run group's methods. [`JobRunnerBuilder::group_retention`] removes a
+//! group's state a window after a consumer observed its last termination.
 //!
 //! ```ignore
 //! let group = runner.group::<FetchPage>(format!("fetch-{run_id}"))?;
@@ -156,9 +154,9 @@
 //! # Retention
 //!
 //! [`JobRunnerBuilder::retention`] removes a job's run result record and memo
-//! entries a configured window after the job reaches a terminal state,
-//! through the workflow runtime's memo retention. When the option is unset
-//! (default), records are retained indefinitely.
+//! entries a configured window after the job reaches a terminal state, through
+//! the workflow runtime's memo retention. When the option is unset (default),
+//! records are retained indefinitely.
 //!
 //! ```no_run
 //! # use std::sync::Arc;
@@ -174,22 +172,22 @@
 //! # let _ = runner; Ok(()) }
 //! ```
 //!
-//! Once a record is removed, [`JobHandle::fetch_result`] for that job
-//! returns `Ok(None)` and an idempotent re-submission of the same payload
-//! runs the job again (see [Idempotent submissions]).
+//! Once a record is removed, [`JobHandle::fetch_result`] for that job returns
+//! `Ok(None)` and an idempotent re-submission of the same payload runs the job
+//! again (see [Idempotent submissions]).
 //!
 //! # Time injection
 //!
-//! The runner inherits its clock from the queue ([`taquba::Queue::clock`]),
-//! so a [`taquba::MockClock`] passed to
-//! [`taquba::Queue::open_with_options`] virtualises time for retention as
-//! well. [`JobRunnerBuilder::clock`] overrides it.
+//! The runner inherits its clock from the queue ([`taquba::Queue::clock`]), so
+//! a [`taquba::MockClock`] passed to [`taquba::Queue::open_with_options`]
+//! virtualises time for retention as well. [`JobRunnerBuilder::clock`]
+//! overrides it.
 //!
 //! # Configuring the queue
 //!
 //! Per-queue retention ([`taquba::QueueConfig::keep_done_jobs`] and
 //! [`taquba::QueueConfig::dead_retention`]) is set on the [`taquba::Queue`]
-//! before it is handed to the runner. Choose an explicit name via
+//! before it is passed to the runner. Choose an explicit name via
 //! [`JobRunnerBuilder::queue_name`] and key
 //! [`taquba::OpenOptions::queue_configs`] on the same string.
 //!
@@ -215,37 +213,37 @@
 //! # The handler context
 //!
 //! [`JobContext`] gives a handler its registered application state and
-//! dereferences to the job's [`Delivery`](crate::Delivery): the job's
-//! identity and attempt count, the delivery's lease and cancellation
-//! token, a durable [`memo`](crate::Delivery::memo) for the results of
-//! expensive calls, staged KV effects ([`effects`](crate::Delivery::effects))
-//! applied atomically with the job's successful completion and committed
-//! KV reads ([`kv`](crate::Delivery::kv)). A handler that submits further
-//! jobs holds a [`JobRunner`] in its registered state.
+//! dereferences to the job's [`Delivery`](crate::Delivery): the job's identity
+//! and attempt count, the delivery's lease and cancellation token, a durable
+//! [`memo`](crate::Delivery::memo) for the results of slow or billed calls,
+//! staged KV effects ([`effects`](crate::Delivery::effects)) applied atomically
+//! with the job's successful completion and committed KV reads
+//! ([`kv`](crate::Delivery::kv)). A handler that submits further jobs keeps a
+//! [`JobRunner`] in its registered state.
 //!
 //! # Core types
 //!
 //! - [`Job`]: the trait defining a typed job (input fields, [`Job::Output`],
 //!   [`Job::Error`] and the [`Job::run`] body, plus hooks for idempotency,
 //!   attempt limits and error classification).
-//! - [`JobRunner`]: submits jobs and spawns the worker; job types are
-//!   registered on its builder.
+//! - [`JobRunner`]: submits jobs and spawns the worker. Its builder registers
+//!   the job types.
 //! - [`JobContext`]: the per-call context passed to [`Job::run`].
-//! - [`JobHandle`]: returned from [`JobRunner::submit`]; await it for the
-//!   typed result, or read its [`status`](JobHandle::status) and
-//!   [`fetch_result`](JobHandle::fetch_result).
+//! - [`JobHandle`]: returned from [`JobRunner::submit`]. Awaiting it yields the
+//!   typed result, and its [`status`](JobHandle::status) and
+//!   [`fetch_result`](JobHandle::fetch_result) read the durable state.
 //! - [`JobGroup`]: many jobs of one type submitted as one durable set and
 //!   joined together.
 //!
 //! # Retries and failure
 //!
 //! A job that returns `Err` is classified by [`Job::classify`] as
-//! [`StepErrorKind::Transient`](crate::StepErrorKind::Transient) (retried
-//! with backoff up to the attempt limit, then dead-lettered) or
-//! [`StepErrorKind::Permanent`](crate::StepErrorKind::Permanent)
-//! (dead-lettered on that attempt). Backoff is a queue-level Taquba setting; [`Job::max_attempts`]
-//! and per-submission [`RunOptions`](crate::RunOptions) cover the per-job
-//! settings.
+//! [`StepErrorKind::Transient`](crate::StepErrorKind::Transient) (retried with
+//! backoff up to the attempt limit, then dead-lettered) or
+//! [`StepErrorKind::Permanent`](crate::StepErrorKind::Permanent) (dead-lettered
+//! on that attempt). Backoff is a queue-level Taquba setting, and
+//! [`Job::max_attempts`] and per-submission [`RunOptions`](crate::RunOptions)
+//! cover the per-job settings.
 
 mod context;
 mod group;

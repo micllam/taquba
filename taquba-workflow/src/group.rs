@@ -1,9 +1,9 @@
-//! Run groups: a durable set of runs of one runtime, identified by a
-//! group id, whose membership is a manifest in the object store and
-//! whose per-member state is a record in the queue's KV namespace.
-//! [`RunGroup`] submits the members, yields their results, cancels them
-//! and removes the group's state; [`jobs::JobGroup`](crate::jobs::JobGroup)
-//! is its typed presentation.
+//! Run groups: a durable set of runs of one runtime, identified by a group id,
+//! whose membership is a manifest in the object store and whose per-member
+//! state is a record in the queue's KV namespace. [`RunGroup`] submits the
+//! members, yields their results, cancels them and removes the group's state.
+//! [`jobs::JobGroup`](crate::jobs::JobGroup) is the typed presentation of a run
+//! group.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -27,22 +27,22 @@ use crate::runtime::{RunOptions, RunSpec, RunTermination, RuntimeCore};
 use crate::sweep::{Clearable, Cleared};
 use crate::terminal::{RunOutcome, TerminalStatus};
 
-/// Member submissions and cancellations in flight at once. Each blocks
-/// on a durable commit, and concurrent commits share WAL flushes.
+/// Member submissions and cancellations in flight at once. Each blocks on a
+/// durable commit, and concurrent commits share WAL flushes.
 const SUBMIT_CONCURRENCY: usize = 32;
-/// Member records read per page, and members removed per transaction
-/// by [`GroupStore::remove`].
+/// Member records read per page, and members removed per transaction by
+/// [`GroupStore::remove`].
 const MEMBER_PAGE_SIZE: usize = 1000;
 
-/// The run id of the member `key` of group `group_id`: the hex SHA-256
-/// digest of `{group_id}/{key}`, so a key can contain characters a run
-/// id rejects and groups never share run state.
+/// The run id of the member `key` of group `group_id`: the hex SHA-256 digest
+/// of `{group_id}/{key}`. A key with characters that a run id rejects still
+/// maps to a valid run id, and groups never share run state.
 pub(crate) fn member_run_id(group_id: &RunId, key: &str) -> RunId {
     RunId::digest(&[group_id.as_bytes(), b"/", key.as_bytes()])
 }
 
-/// The group membership of a run, set on every step job of the run in
-/// the [`HEADER_GROUP`] and [`HEADER_GROUP_KEY`] headers.
+/// The group membership of a run, set on every step job of the run in the
+/// [`HEADER_GROUP`] and [`HEADER_GROUP_KEY`] headers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Membership {
     pub(crate) group_id: RunId,
@@ -82,8 +82,8 @@ impl Membership {
     }
 }
 
-/// One member of a [`RunGroup`]: its key, unique within the group, and
-/// the input of its run.
+/// One member of a [`RunGroup`]: the input of its run and its key, which is
+/// unique within the group.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupMember {
     /// The member's key.
@@ -99,8 +99,8 @@ pub(crate) struct Manifest {
     pub(crate) members: Vec<GroupMember>,
 }
 
-/// The durable state of a group, read from its manifest and member
-/// records by [`RunGroup::status`].
+/// The durable state of a group, read from its manifest and member records by
+/// [`RunGroup::status`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupStatus {
     /// The group id.
@@ -126,8 +126,9 @@ pub struct MemberResult {
     pub run_id: RunId,
     /// The member's last recorded termination.
     pub termination: RunTermination,
-    /// The member's committed outcome, read as [`WorkflowRuntime::outcome`](crate::WorkflowRuntime::outcome)
-    /// reads it; `None` for a member terminated without a worker.
+    /// The member's committed outcome, read as
+    /// [`WorkflowRuntime::outcome`](crate::WorkflowRuntime::outcome) reads it,
+    /// or `None` for a member terminated without a worker.
     pub outcome: Option<RunOutcome>,
 }
 
@@ -148,9 +149,8 @@ impl MemberState {
 }
 
 /// The durable state of groups: manifests under
-/// `<memo_prefix>/groups/<group_id>/manifest` in the object store and
-/// member records under `workflow/groups/<group_id>/` in the queue's KV
-/// namespace.
+/// `<memo_prefix>/groups/<group_id>/manifest` in the object store and member
+/// records under `workflow/groups/<group_id>/` in the queue's KV namespace.
 #[derive(Clone)]
 pub(crate) struct GroupStore {
     objects: ObjectPrefix,
@@ -201,8 +201,8 @@ impl GroupStore {
         durable::kv_record(self.queue.view(), &group_member_kv_key(group_id, key)).await
     }
 
-    /// Every member record of `group_id`, in key order. A record that
-    /// fails to decode is skipped.
+    /// Every member record of `group_id`, in key order. A record that fails to
+    /// decode is skipped.
     pub(crate) async fn members(&self, group_id: &RunId) -> Result<Vec<MemberState>> {
         let prefix = group_members_kv_prefix(group_id);
         let mut members = Vec::new();
@@ -221,9 +221,9 @@ impl GroupStore {
         Ok(members)
     }
 
-    /// Removes the state of `group_id`. Fails with
-    /// [`Error::GroupActive`] when a member is active, or when a member
-    /// is submitted before the removal commits.
+    /// Removes the state of `group_id`. Fails with [`Error::GroupActive`] when
+    /// a member is active, or when a member is submitted before the removal
+    /// commits.
     pub(crate) async fn forget(&self, group_id: &RunId) -> Result<()> {
         let removal = self.removal(group_id).await?;
         if removal.any_member(|member| member.terminated.is_none()) || !self.remove(removal).await?
@@ -233,9 +233,9 @@ impl GroupStore {
         Ok(())
     }
 
-    /// The state of `group_id` as one read of its manifest and its
-    /// member records: every member of the manifest, and every member
-    /// record without a member in the manifest.
+    /// The state of `group_id` as one read of its manifest and its member
+    /// records: every member of the manifest, and every member record without a
+    /// member in the manifest.
     async fn removal(&self, group_id: &RunId) -> Result<Removal> {
         let mut members = BTreeMap::new();
         if let Some(manifest) = self.read_manifest(group_id).await? {
@@ -276,15 +276,14 @@ impl GroupStore {
         })
     }
 
-    /// Remove the state that `removal` read: the member records and
-    /// the terminal record of every member of the manifest, then the
-    /// memo entries of those members and the manifest. A group without
-    /// a manifest has its member records removed and nothing else.
+    /// Remove the state that `removal` read: the member records and the
+    /// terminal record of every member of the manifest, then the memo entries
+    /// of those members and the manifest. A group without a manifest has its
+    /// member records removed and nothing else.
     ///
-    /// A transaction removes the KV state of [`MEMBER_PAGE_SIZE`]
-    /// members and compares the record of each with the state that
-    /// `removal` read. Returns `false` without a further removal when a
-    /// compare does not match.
+    /// A transaction removes the KV state of [`MEMBER_PAGE_SIZE`] members and
+    /// compares the record of each with the state that `removal` read. Returns
+    /// `false` without a further removal when a compare does not match.
     async fn remove(&self, removal: Removal) -> Result<bool> {
         let members: Vec<_> = removal.members.iter().collect();
         for page in members.chunks(MEMBER_PAGE_SIZE) {
@@ -326,13 +325,13 @@ struct RemovedMember {
     run_id: Option<RunId>,
     /// The stored bytes of the member record, `None` without a record.
     stored: Option<Bytes>,
-    /// The decoded member record, `None` without a record or for a
-    /// record that fails to decode.
+    /// The decoded member record, `None` without a record or for a record that
+    /// fails to decode.
     record: Option<DurableMember>,
 }
 
-/// The state of a group that [`GroupStore::remove`] removes, with the
-/// KV key of each member record.
+/// The state of a group that [`GroupStore::remove`] removes, with the KV key of
+/// each member record.
 struct Removal {
     group_id: RunId,
     members: BTreeMap<Vec<u8>, RemovedMember>,
@@ -351,9 +350,9 @@ impl Removal {
 impl Clearable for GroupStore {
     type Error = Error;
 
-    /// A member that is active, or that terminated after the marker,
-    /// belongs to a later submission of the group, whose marker
-    /// [`RunGroup::results`] writes.
+    /// A member that is active, or that terminated after the marker, belongs to
+    /// a later submission of the group, whose marker [`RunGroup::results`]
+    /// writes.
     async fn clear(&self, group_id: &RunId, marked_at_ms: u64) -> Result<Cleared> {
         let removal = self.removal(group_id).await?;
         let superseded = removal.any_member(|member| {
@@ -369,18 +368,18 @@ impl Clearable for GroupStore {
     }
 }
 
-/// A group of runs of one runtime, identified by a group id. Obtained
-/// from [`WorkflowRuntime::group`](crate::WorkflowRuntime::group) or [`WorkflowRuntime::new_group`](crate::WorkflowRuntime::new_group);
-/// cheap to clone.
+/// A group of runs of one runtime, identified by a group id. Obtained from
+/// [`WorkflowRuntime::group`](crate::WorkflowRuntime::group) or
+/// [`WorkflowRuntime::new_group`](crate::WorkflowRuntime::new_group). A clone
+/// copies an `Arc` and the group id.
 ///
-/// The group's members are identified by key. A member's run id is
-/// derived from the group id and its key, so the same input submitted
-/// to two groups runs twice, and a second [`submit`](Self::submit) of
-/// the group runs again every member that did not succeed. The group's
-/// membership is a durable manifest, so [`results`](Self::results),
-/// [`status`](Self::status), [`cancel`](Self::cancel) and
-/// [`forget`](Self::forget) answer after a restart and from any runtime
-/// over the same queue.
+/// The group's members are identified by key. A member's run id is derived from
+/// the group id and its key, so the same input submitted to two groups runs
+/// twice, and a second [`submit`](Self::submit) of the group runs again every
+/// member that did not succeed. The group's membership is a durable manifest,
+/// so [`results`](Self::results), [`status`](Self::status),
+/// [`cancel`](Self::cancel) and [`forget`](Self::forget) work after a restart
+/// and from any runtime over the same queue.
 #[derive(Clone)]
 pub struct RunGroup {
     runtime: Arc<RuntimeCore>,
@@ -405,7 +404,8 @@ impl RunGroup {
         &self.core().group_store
     }
 
-    /// The group's manifest; [`Error::GroupNotFound`] without one.
+    /// The group's manifest, or [`Error::GroupNotFound`] when the manifest is
+    /// absent.
     pub(crate) async fn manifest(&self) -> Result<Manifest> {
         self.store()
             .read_manifest(&self.id)
@@ -418,15 +418,14 @@ impl RunGroup {
         self.store().members(&self.id).await
     }
 
-    /// Submit `members` as the group's members. The first submission
-    /// writes the group's manifest; a later one with a different member
-    /// set is rejected with [`Error::GroupMismatch`], and one with the
-    /// same set submits every member whose last recorded termination is
-    /// not a success, so a group is re-submitted after a crash or to run
-    /// its failed members again. Two members with one key are rejected
-    /// with [`Error::DuplicateMemberKey`]. `options` applies to every
-    /// member. A submission that fails returns after the members
-    /// submitted so far.
+    /// Submit `members` as the group's members. The first submission writes the
+    /// group's manifest. A later submission with a different member set is
+    /// rejected with [`Error::GroupMismatch`], and a later submission with the
+    /// same set submits every member whose last recorded termination is not a
+    /// success, so a group is re-submitted after a crash or to run its failed
+    /// members again. Two members with one key are rejected with
+    /// [`Error::DuplicateMemberKey`]. `options` applies to every member. A
+    /// submission that fails returns after the members submitted so far.
     pub async fn submit(&self, members: Vec<GroupMember>, options: &RunOptions) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
         for member in &members {
@@ -449,9 +448,9 @@ impl RunGroup {
     }
 
     /// Submit the members of the group's manifest whose last recorded
-    /// termination is not a success: a member still active continues,
-    /// and the rest run. Returns [`Error::GroupNotFound`] for a group
-    /// never submitted. `options` applies as in [`submit`](Self::submit).
+    /// termination is not a success: a member still active continues, and the
+    /// rest run. Returns [`Error::GroupNotFound`] for a group never submitted.
+    /// `options` applies as in [`submit`](Self::submit).
     pub async fn resume(&self, options: &RunOptions) -> Result<()> {
         let manifest = self.manifest().await?;
         self.submit_members(manifest.members, options).await
@@ -493,12 +492,11 @@ impl RunGroup {
         Ok(())
     }
 
-    /// The members of the manifest as each one terminates, in
-    /// completion order; a member already terminated is yielded at
-    /// once. Every member must have been submitted. Once every member
-    /// has been yielded, the group's terminal marker is written, from
-    /// which the group retention sweep counts the window; a failed
-    /// marker write is logged.
+    /// The members of the manifest as each one terminates, in completion order.
+    /// A member already terminated is yielded at once. Every member must be
+    /// submitted before the call. After the last member is yielded, the group's
+    /// terminal marker is written, and the group retention sweep counts the
+    /// window from it. A failed marker write is logged.
     async fn terminations(&self) -> Result<impl Stream<Item = Result<MemberState>> + use<>> {
         let manifest = self.manifest().await?;
         let waits: FuturesUnordered<_> = manifest
@@ -525,8 +523,8 @@ impl RunGroup {
         Ok(waits.chain(marker))
     }
 
-    /// The members' results as each one terminates, in completion
-    /// order; a member already terminated is yielded at once. Returns
+    /// The members' results as each one terminates, in completion order. A
+    /// member already terminated is yielded at once. Returns
     /// [`Error::GroupNotFound`] for a group never submitted.
     pub async fn results(&self) -> Result<impl Stream<Item = Result<MemberResult>> + use<>> {
         let terminations = self.terminations().await?;
@@ -555,8 +553,8 @@ impl RunGroup {
         }))
     }
 
-    /// The group's durable state. Returns [`Error::GroupNotFound`] for a
-    /// group never submitted.
+    /// The group's durable state. Returns [`Error::GroupNotFound`] for a group
+    /// never submitted.
     pub async fn status(&self) -> Result<GroupStatus> {
         let manifest = self.manifest().await?;
         let mut status = GroupStatus {
@@ -579,8 +577,8 @@ impl RunGroup {
     }
 
     /// Request cancellation of every active member, as
-    /// [`WorkflowRuntime::cancel`](crate::WorkflowRuntime::cancel) does for one run. Returns the number
-    /// of members whose request was recorded.
+    /// [`WorkflowRuntime::cancel`](crate::WorkflowRuntime::cancel) does for one
+    /// run. Returns the number of members whose request was recorded.
     pub async fn cancel(&self) -> Result<usize> {
         let mut cancellations = stream::iter(
             self.members()
@@ -597,9 +595,9 @@ impl RunGroup {
         Ok(cancelled)
     }
 
-    /// Wait until the member `key` terminates and return its record.
-    /// Returns [`Error::MemberNotSubmitted`] for a member of the
-    /// manifest without a record.
+    /// Wait until the member `key` terminates and return its record. Returns
+    /// [`Error::MemberNotSubmitted`] for a member of the manifest without a
+    /// record.
     async fn wait_member(&self, key: &str) -> Result<DurableMember> {
         let member = |member: Option<DurableMember>| {
             member.ok_or_else(|| Error::MemberNotSubmitted {
@@ -613,8 +611,8 @@ impl RunGroup {
         }
         let run_id = member_run_id(&self.id, key);
         self.core().wait_run(&run_id).await?;
-        // The pointer and the member record change in one transaction,
-        // so the record of a run without a pointer is terminated.
+        // The pointer and the member record change in one transaction, so the
+        // record of a run without a pointer is terminated.
         let record = member(self.store().member(&self.id, key).await?)?;
         if record.terminated.is_none() {
             return Err(Error::InconsistentRunState(run_id));
@@ -622,8 +620,9 @@ impl RunGroup {
         Ok(record)
     }
 
-    /// Write the group's terminal marker; no marker is written without
-    /// [`WorkflowRuntimeBuilder::group_retention`](crate::WorkflowRuntimeBuilder::group_retention).
+    /// Write the group's terminal marker. No marker is written without
+    /// [`group_retention`](crate::WorkflowRuntimeBuilder::group_retention) on
+    /// the builder.
     async fn mark_terminated(&self) -> Result<()> {
         let core = self.core();
         if let Some(sweep) = &core.group_sweep {
@@ -633,13 +632,13 @@ impl RunGroup {
         Ok(())
     }
 
-    /// Remove the group's state: its manifest, member records and the
-    /// memo entries, run result records and terminal records of its
-    /// members. A later [`submit`](Self::submit) with the same id
-    /// starts from nothing. Returns [`Error::GroupActive`] for a group
-    /// with an active member, whose state stays, and for a group whose
-    /// member is submitted before the removal commits. A transaction
-    /// removes the records of 1,000 members.
+    /// Remove the group's state: its manifest, member records and the memo
+    /// entries, run result records and terminal records of its members. A later
+    /// [`submit`](Self::submit) with the same id starts from nothing. Returns
+    /// [`Error::GroupActive`] and keeps the group's state for a group with an
+    /// active member. It returns the same error for a group whose member is
+    /// submitted before the removal commits. A transaction removes the records
+    /// of 1,000 members.
     pub async fn forget(&self) -> Result<()> {
         self.store().forget(&self.id).await
     }
@@ -730,9 +729,8 @@ mod tests {
         );
         worker.shutdown().await.unwrap();
 
-        // The member runs again and the queue dead-letters it outside
-        // the worker, so reconciliation terminates it and no new record
-        // is written.
+        // The member runs again and the queue dead-letters it outside the
+        // worker, so reconciliation terminates it and no new record is written.
         clock.advance(Duration::from_secs(1));
         group
             .submit(vec![member("a")], &RunOptions::default())
@@ -865,8 +863,8 @@ mod tests {
             "a pending step is cancelled without a worker, so no result is recorded",
         );
 
-        // The cancelled member is submitted again; a member is grouped by
-        // its key, so a plain submission of the same run id is not.
+        // The cancelled member is submitted again. A member is grouped by its
+        // key, so a plain submission of the same run id is not.
         group
             .submit(vec![member("a")], &RunOptions::default())
             .await
@@ -953,8 +951,8 @@ mod tests {
         assert!(queue.view().kv_get(&first).await.unwrap().is_none());
         assert_eq!(group.status().await.unwrap().pending, 1);
 
-        // The member terminated after the second marker and its
-        // termination is not observed when that marker expires.
+        // The member terminated after the second marker and its termination is
+        // not observed when that marker expires.
         assert_eq!(group.cancel().await.unwrap(), 1);
         observe().await;
         clock.advance(Duration::from_millis(500));

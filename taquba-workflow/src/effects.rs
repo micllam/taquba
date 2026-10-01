@@ -7,32 +7,30 @@ use taquba::EnqueueRequest;
 use crate::error::{Error, Result};
 use crate::keys::{check_enqueue, check_kv_key};
 
-/// Application KV effects staged during a step, applied in the same
-/// transaction as the settlement that commits the step's outcome.
+/// Application KV effects staged during a step, applied in the same transaction
+/// as the settlement that commits the step's outcome.
 ///
 /// Obtained through [`Delivery::effects`](crate::Delivery::effects). Writes and
-/// deletes staged here are applied atomically with the acknowledgement
-/// of the [`StepOutcome`](crate::StepOutcome) the runner returns
-/// (`Continue`, `Succeed`, `Fail` and `Cancel`): either the settlement
-/// and every staged effect commit together or none of them do. Delivery
-/// is at-least-once, so a retried step stages its effects again and
-/// every staged value must be correct when applied more than once. No
-/// effects are applied when the runner returns a
-/// [`StepError`](crate::StepError) or when an external
-/// [`WorkflowRuntime::cancel`](crate::WorkflowRuntime::cancel)
-/// overrides the runner's outcome.
+/// deletes staged here are applied atomically with the acknowledgement of the
+/// [`StepOutcome`](crate::StepOutcome) the runner returns (`Continue`,
+/// `Succeed`, `Fail` and `Cancel`): either the settlement and every staged
+/// effect commit together or none of them do. Delivery is at-least-once, so a
+/// retried step stages its effects again and every staged value must be correct
+/// when applied more than once. No effects are applied when the runner returns
+/// a [`StepError`](crate::StepError) or when an external
+/// [`WorkflowRuntime::cancel`](crate::WorkflowRuntime::cancel) overrides the
+/// runner's outcome.
 ///
-/// Each operation is validated when it is staged: keys must not start
-/// with the reserved `workflow/` prefix
-/// ([`RESERVED_KV_PREFIX`](crate::RESERVED_KV_PREFIX)), values are
-/// capped at [`taquba::MAX_KV_VALUE_SIZE`] each (an effects set has no
-/// aggregate cap) and a key cannot be staged for both a write and a
-/// delete within one step. The handle is sealed once `run_step`
-/// returns; staging through a clone retained past that point returns
-/// [`Error::EffectsSealed`].
+/// Each operation is validated when it is staged: keys must not start with the
+/// reserved `workflow/` prefix
+/// ([`RESERVED_KV_PREFIX`](crate::RESERVED_KV_PREFIX)), values are capped at
+/// [`taquba::MAX_KV_VALUE_SIZE`] each (an effects set does not have an
+/// aggregate cap) and a key cannot be staged for both a write and a delete
+/// within one step. The handle is sealed once `run_step` returns. Staging
+/// through a clone retained past that point returns [`Error::EffectsSealed`].
 ///
-/// The handle is cheap to clone and clones share one accumulator. Use
-/// [`EffectsHandle::detached`] when constructing a
+/// A clone of the handle increments a reference count, and clones share one
+/// accumulator. Use [`EffectsHandle::detached`] when constructing a
 /// [`Step`](crate::Step) in tests.
 #[derive(Debug, Clone)]
 pub struct EffectsHandle {
@@ -84,9 +82,8 @@ impl EffectsState {
     }
 }
 
-/// Writes and deletes accumulated by an [`EffectsHandle`]. Stored in
-/// the step-output replay record so a replayed delivery applies the
-/// same effects.
+/// Writes and deletes accumulated by an [`EffectsHandle`]. Stored in the
+/// step-output replay record so a replayed delivery applies the same effects.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct StagedEffects {
     pub(crate) writes: HashMap<Vec<u8>, Vec<u8>>,
@@ -94,10 +91,10 @@ pub(crate) struct StagedEffects {
 }
 
 impl EffectsHandle {
-    /// Build a handle bound to no delivery, for constructing a
-    /// [`Step`](crate::Step) in tests. A detached handle accepts and
-    /// validates effects like a delivery-bound one, is never sealed and
-    /// its staged effects are never applied.
+    /// Build a handle that is not bound to a delivery, for constructing a
+    /// [`Step`](crate::Step) in tests. A detached handle accepts and validates
+    /// effects like a delivery-bound one, is never sealed and its staged
+    /// effects are never applied.
     pub fn detached() -> Self {
         Self::for_delivery()
     }
@@ -112,12 +109,11 @@ impl EffectsHandle {
     ///
     /// # Errors
     ///
-    /// [`Error::ReservedKvKey`] when `key` starts with the reserved
-    /// `workflow/` prefix, [`Error::Queue`] with
-    /// [`taquba::Error::KvValueTooLarge`] when `value` exceeds
-    /// [`taquba::MAX_KV_VALUE_SIZE`], [`Error::ConflictingKvEffect`]
-    /// when `key` is already staged for a delete and
-    /// [`Error::EffectsSealed`] when the step has returned.
+    /// [`Error::ReservedKvKey`] when `key` starts with the reserved `workflow/`
+    /// prefix, [`Error::Queue`] with [`taquba::Error::KvValueTooLarge`] when
+    /// `value` exceeds [`taquba::MAX_KV_VALUE_SIZE`],
+    /// [`Error::ConflictingKvEffect`] when `key` is already staged for a delete
+    /// and [`Error::EffectsSealed`] when the step returned.
     pub fn put(&self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Result<()> {
         self.inner.lock().unwrap().put(key.into(), value.into())
     }
@@ -126,38 +122,36 @@ impl EffectsHandle {
     ///
     /// # Errors
     ///
-    /// [`Error::ReservedKvKey`] when `key` starts with the reserved
-    /// `workflow/` prefix, [`Error::ConflictingKvEffect`] when `key` is
-    /// already staged for a write and [`Error::EffectsSealed`] when the
-    /// step has returned.
+    /// [`Error::ReservedKvKey`] when `key` starts with the reserved `workflow/`
+    /// prefix, [`Error::ConflictingKvEffect`] when `key` is already staged for
+    /// a write and [`Error::EffectsSealed`] when the step returned.
     pub fn delete(&self, key: impl Into<Vec<u8>>) -> Result<()> {
         self.inner.lock().unwrap().delete(key.into())
     }
 
-    /// Seal the handle and move out everything staged. An effect staged
-    /// after the seal could not join the settlement, so later staging
-    /// attempts return [`Error::EffectsSealed`].
+    /// Seal the handle and move out everything staged. An effect staged after
+    /// the seal cannot join the settlement, so later staging attempts return
+    /// [`Error::EffectsSealed`].
     pub(crate) fn seal_and_take(&self) -> StagedEffects {
         self.inner.lock().unwrap().seal_and_take()
     }
 }
 
 /// Effects staged by a [`TerminalHook`](crate::TerminalHook) during a
-/// notification delivery, applied in the same transaction as the
-/// notification job's acknowledgement.
+/// notification delivery, applied in the same transaction as the notification
+/// job's acknowledgement.
 ///
 /// Passed to
 /// [`TerminalHook::on_termination`](crate::TerminalHook::on_termination).
-/// Beyond the KV writes and deletes of [`EffectsHandle`] (validated by
-/// the same rules), a hook stages follow-up enqueues, so work driven by
-/// a run's termination is created atomically with the notification
-/// being acknowledged. Effects are applied only when the hook returns
-/// `Ok`; a retried hook stages its effects again.
+/// Beyond the KV writes and deletes of [`EffectsHandle`] (validated by the same
+/// rules), a hook stages follow-up enqueues, so work that a run's termination
+/// starts is created atomically with the notification being acknowledged.
+/// Effects are applied only when the hook returns `Ok`. A retried hook stages
+/// its effects again.
 ///
-/// The handle is sealed once the hook returns; staging through a clone
-/// retained past that point returns [`Error::EffectsSealed`]. Use
-/// [`TerminalEffects::detached`] when invoking a hook directly in
-/// tests.
+/// The handle is sealed once the hook returns. Staging through a clone retained
+/// past that point returns [`Error::EffectsSealed`]. Use
+/// [`TerminalEffects::detached`] when invoking a hook directly in tests.
 #[derive(Debug, Clone)]
 pub struct TerminalEffects {
     inner: Arc<Mutex<TerminalState>>,
@@ -172,20 +166,18 @@ struct TerminalState {
 }
 
 impl TerminalEffects {
-    /// Build a handle bound to no delivery, for invoking a
-    /// [`TerminalHook`](crate::TerminalHook) directly in tests. A
-    /// detached handle accepts and validates effects like a
-    /// delivery-bound one, is never sealed and its staged effects are
-    /// never applied. It does not belong to a runtime, so it accepts an
-    /// enqueue to every queue.
+    /// Build a handle that is not bound to a delivery, for invoking a
+    /// [`TerminalHook`](crate::TerminalHook) directly in tests. A detached
+    /// handle accepts and validates effects like a delivery-bound one, is never
+    /// sealed and its staged effects are never applied. It does not belong to a
+    /// runtime, so it accepts an enqueue to every queue.
     pub fn detached() -> Self {
         Self {
             inner: Arc::new(Mutex::new(TerminalState::default())),
         }
     }
 
-    /// A handle for a delivery of the runtime with the queue
-    /// `runtime_queue`.
+    /// A handle for a delivery of the runtime with the queue `runtime_queue`.
     pub(crate) fn for_delivery(runtime_queue: &str) -> Self {
         Self {
             inner: Arc::new(Mutex::new(TerminalState {
@@ -200,10 +192,10 @@ impl TerminalEffects {
     ///
     /// # Errors
     ///
-    /// [`Error::EffectsSealed`] when the hook has returned,
-    /// [`Error::ReservedHeader`] when a header of `request` starts with
-    /// the reserved `workflow.*` prefix and [`Error::ReservedQueue`]
-    /// when `request` targets the queue of the runtime.
+    /// [`Error::EffectsSealed`] when the hook returned,
+    /// [`Error::ReservedHeader`] when a header of `request` starts with the
+    /// reserved `workflow.*` prefix and [`Error::ReservedQueue`] when `request`
+    /// targets the queue of the runtime.
     pub fn enqueue(&self, request: EnqueueRequest) -> Result<()> {
         let mut state = self.inner.lock().unwrap();
         if state.kv.sealed {

@@ -1,8 +1,8 @@
 //! The worker path: how a claimed job is identified, run and settled.
-//! [`StepWorker`] is the [`Worker`] the runtime drives; a step job is
-//! parsed into a [`ClaimedStep`], run through the [`StepRunner`] and
-//! settled into the [`SettlementEffects`] of its outcome, and a
-//! terminal-notification job runs the [`TerminalHook`].
+//! [`StepWorker`] is the runtime's [`Worker`]. A step job is parsed into a
+//! [`ClaimedStep`], run through the [`StepRunner`] and settled into the
+//! [`SettlementEffects`] of its outcome, and a terminal-notification job runs
+//! the [`TerminalHook`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,8 +22,8 @@ use crate::runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepR
 use crate::runtime::{RuntimeInner, StepEnqueueOpts};
 use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
 
-/// The [`Worker`] of a runtime: every claimed job of the runtime's
-/// queue is processed by [`RuntimeInner::process_step`].
+/// The [`Worker`] of a runtime: every claimed job of the runtime's queue is
+/// processed by [`RuntimeInner::process_step`].
 pub(crate) struct StepWorker<R, H> {
     pub(crate) inner: Arc<RuntimeInner<R, H>>,
 }
@@ -38,10 +38,10 @@ impl<R: StepRunner + 'static, H: TerminalHook + 'static> Worker for StepWorker<R
     }
 }
 
-/// One claimed step job as the worker path identifies it: the run and
-/// step named by the job's reserved headers, the run's group membership
-/// when it has one, the submitter's headers with the reserved ones
-/// removed and the queue record itself.
+/// One claimed step job as the worker path identifies it: the run and step
+/// named by the job's reserved headers, the run's group membership when the run
+/// is in a group, the submitter's headers with the reserved ones removed and
+/// the queue record itself.
 pub(crate) struct ClaimedStep<'a> {
     pub(crate) run_id: RunId,
     pub(crate) step_number: u32,
@@ -52,9 +52,9 @@ pub(crate) struct ClaimedStep<'a> {
 }
 
 impl<'a> ClaimedStep<'a> {
-    /// Identify the claimed step from `job`'s headers. Fails, permanently,
-    /// for a job without the run id header, with a run id or group id
-    /// that is not valid or with a step header that is not a `u32`.
+    /// Identify the claimed step from `job`'s headers. Fails, permanently, for
+    /// a job without the run id header, with a run id or group id that is not
+    /// valid or with a step header that is not a `u32`.
     pub(crate) fn parse(job: &'a JobRecord) -> std::result::Result<Self, Error> {
         let run_id = RunId::new(
             job.headers
@@ -86,8 +86,8 @@ impl<'a> ClaimedStep<'a> {
     }
 
     /// The enqueue options of the run's next step: this step's priority,
-    /// attempt limit and group membership, so a run's per-step settings
-    /// and its membership hold across the step boundary.
+    /// attempt limit and group membership, so a run's per-step settings and its
+    /// membership hold across the step boundary.
     pub(crate) fn next_step_opts(&self) -> StepEnqueueOpts {
         StepEnqueueOpts {
             run_at: None,
@@ -97,8 +97,7 @@ impl<'a> ClaimedStep<'a> {
         }
     }
 
-    /// The reserved headers of the next step: the membership's, plus
-    /// `header`.
+    /// The reserved headers of the next step: the membership's, plus `header`.
     pub(crate) fn reserved_headers_with(
         &self,
         header: (&'static str, String),
@@ -142,18 +141,18 @@ impl<'a> ClaimedStep<'a> {
         self.outcome(TerminalStatus::Failed, None, Some(error))
     }
 
-    /// A `Cancelled` outcome of the run at this step; `reason` is
-    /// `None` for an external cancellation.
+    /// A `Cancelled` outcome of the run at this step, with `reason` `None` for
+    /// an external cancellation.
     pub(crate) fn cancelled(&self, reason: Option<String>) -> RunOutcome {
         self.outcome(TerminalStatus::Cancelled, None, reason)
     }
 }
 
 impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
-    /// The error a step returns for a failure that terminates its run:
-    /// the effects of the `Failed` termination on a [`FailWith`], so the
-    /// core applies them only with the dead-lettering settlement. The
-    /// run result record is written first; a failed write is logged.
+    /// The error a step returns for a failure that terminates its run: the
+    /// effects of the `Failed` termination on a [`FailWith`], so the core
+    /// applies them only with the dead-lettering settlement. The run result
+    /// record is written first, and a failed write is logged.
     pub(crate) async fn terminating_failure(
         &self,
         claimed: &ClaimedStep<'_>,
@@ -173,11 +172,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         FailWith::new(error.into_worker_error(), effects).into()
     }
 
-    /// Terminate the run of `claimed` with `outcome` from an acking
-    /// settlement: write the run result record, then build the
-    /// settlement effects. A failed write is a transient error, so the
-    /// step is delivered again. `error_kind` classifies a `Failed`
-    /// outcome.
+    /// Terminate the run of `claimed` with `outcome` from an acking settlement:
+    /// write the run result record, then build the settlement effects. A failed
+    /// write is a transient error, so the step is delivered again. `error_kind`
+    /// classifies a `Failed` outcome.
     async fn terminate_recorded(
         &self,
         claimed: &ClaimedStep<'_>,
@@ -195,11 +193,11 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .terminate_collecting_effects(&outcome, claimed, termination))
     }
 
-    /// Process a terminal-notification job: decode the committed
-    /// outcome and run the configured [`TerminalHook`] as the job's
-    /// worker. Effects the hook stages join this job's acknowledgement.
-    /// A transient hook error retries the job per the queue's backoff;
-    /// a permanent one dead-letters it.
+    /// Process a terminal-notification job: decode the committed outcome and
+    /// run the configured [`TerminalHook`] as the job's worker. Effects the
+    /// hook stages join this job's acknowledgement. A transient hook error
+    /// retries the job per the queue's backoff, and a permanent error
+    /// dead-letters it.
     async fn process_notification(
         &self,
         job: &JobRecord,
@@ -222,10 +220,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         }
     }
 
-    /// Process one claimed job of the runtime's queue: a notification
-    /// job runs the terminal hook; a step job is run through the
-    /// runner, or its stored outcome replayed, and settled with the
-    /// effects of the outcome.
+    /// Process one claimed job of the runtime's queue. A notification job runs
+    /// the terminal hook. A step job is run through the runner, or its stored
+    /// outcome is replayed, and the job is settled with the effects of the
+    /// outcome.
     pub(crate) async fn process_step(
         &self,
         job: &JobRecord,
@@ -251,8 +249,8 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .await
             .map_err(worker_error)?;
 
-        // A cancellation requested before this claim is recorded on the
-        // run record; the step is settled as cancelled without running.
+        // A cancellation requested before this claim is recorded on the run
+        // record, and the step is settled as cancelled without running.
         let record = self
             .core
             .view
@@ -268,11 +266,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             return Ok(effects);
         }
 
-        // A cancellation requested during the delivery fires the claim's
-        // token (`Queue::cancel`, and a re-claim from the job's persisted
-        // `cancel_requested`). The runner receives a child, so a runner
-        // firing its own token is not treated as an external
-        // cancellation below.
+        // A cancellation requested during the delivery fires the claim's token
+        // (`Queue::cancel`, and a re-claim from the job's persisted
+        // `cancel_requested`). The runner receives a child, so a runner firing
+        // its own token is not treated as an external cancellation below.
         let claim_cancel = lease.cancel_token().clone();
 
         let effects_handle = EffectsHandle::for_delivery();
@@ -311,15 +308,15 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             None => (self.runner.run_step(&step).await, None),
         };
 
-        // Sealed as soon as the runner has returned: an effect staged
-        // through a retained handle clone after this point could not
-        // join the settlement, so staging it errors.
+        // Sealed as soon as the runner returns. An effect staged through a
+        // retained handle clone after this point cannot join the settlement, so
+        // staging it errors.
         let staged = effects_handle.seal_and_take();
         let replayed_step_output = replayed.is_some();
         let caller_effects = replayed.unwrap_or(staged);
 
-        // A request that lands after this read is recorded on the run
-        // record and settles the next step before it runs.
+        // A request that lands after this read is recorded on the run record
+        // and settles the next step before it runs.
         let external_cancel = claim_cancel.is_cancelled();
 
         if self.core.step_output_replay
@@ -339,13 +336,12 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .await;
 
         // Durable signal entries scheduled for cleanup are deleted with the
-        // step's settlement; on retry paths they survive for redelivery.
+        // step's settlement. On retry paths they remain for redelivery.
         settled.map(|mut effects| {
             effects.kv_deletes.extend(signal_kv_deletes);
-            // The external-cancel override commits Cancelled in place of
-            // the runner's outcome; the staged effects describe that
-            // outcome and are discarded with it. A runner-issued Cancel
-            // keeps its effects.
+            // The external-cancel override commits Cancelled in place of the
+            // runner's outcome. The staged effects describe that outcome and
+            // are discarded with it. A runner-issued Cancel keeps its effects.
             if runner_cancelled || !external_cancel {
                 effects.kv_writes.extend(caller_effects.writes);
                 effects.kv_deletes.extend(caller_effects.deletes);
@@ -354,15 +350,15 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         })
     }
 
-    /// The settlement of `outcome` for `claimed`: the effects of the
-    /// run's transition on an acknowledging outcome, or the error that
-    /// retries or dead-letters the step.
+    /// The settlement of `outcome` for `claimed`: the effects of the run's
+    /// transition on an acknowledging outcome, or the error that retries or
+    /// dead-letters the step.
     ///
-    /// Cancellation precedence: a runner-issued [`StepOutcome::Cancel`]
-    /// wins and carries its reason on [`RunOutcome::error`]; otherwise
-    /// an external cancellation overrides whatever the runner returned,
-    /// including a transient retry and a permanent failure, with
-    /// `error: None` so consumers can distinguish the two.
+    /// Cancellation precedence: a runner-issued [`StepOutcome::Cancel`] wins,
+    /// with its reason on [`RunOutcome::error`]. Otherwise an external
+    /// cancellation overrides any outcome that the runner returned, including a
+    /// transient retry and a permanent failure, with `error: None` so consumers
+    /// can distinguish the two.
     async fn settle_outcome(
         &self,
         claimed: &ClaimedStep<'_>,
@@ -403,7 +399,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 self.terminate_recorded(claimed, claimed.succeeded(result), input_hash, None)
                     .await
             }
-            // A runner verdict: the step ran cleanly and is acknowledged;
+            // A runner decision: the step ran cleanly and is acknowledged, and
             // the run terminates as `Failed` without a dead-letter.
             Ok(StepOutcome::Fail { reason }) => {
                 self.terminate_recorded(

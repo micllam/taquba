@@ -13,11 +13,10 @@ use crate::keys::RunId;
 use crate::kv::KvReadHandle;
 use crate::memo::{Memo, MemoStore};
 
-/// The delivery a handler runs under: the identity of the run and of
-/// the queue job delivering it, the attempt count and the delivery's
-/// handles. [`Step`] and [`jobs::JobContext`](crate::jobs::JobContext)
-/// dereference to it. It holds handles only; no queue is reachable
-/// through it.
+/// The delivery a handler runs under: the identity of the run and of the queue
+/// job delivering it, the attempt count and the delivery's handles. [`Step`]
+/// and [`jobs::JobContext`](crate::jobs::JobContext) dereference to it. It
+/// contains handles only, and no queue is reachable through it.
 ///
 /// Constructed by the runtime. A test constructs one with
 /// [`Delivery::detached`] and assigns the fields it needs.
@@ -31,17 +30,16 @@ pub struct Delivery {
     pub headers: HashMap<String, String>,
     /// The Taquba job ID of this delivery, useful for tracing.
     pub job_id: String,
-    /// How many times Taquba has attempted this delivery. `1` on the
-    /// first attempt; `>1` after a lease expiry / nack retry.
+    /// The number of attempts Taquba made at this delivery, including this one:
+    /// `1` on the first attempt and `>1` after a lease expiry or a nack retry.
     pub attempts: u32,
     /// The attempt limit: a transient failure on the attempt numbered
     /// `max_attempts` ends the run.
     pub max_attempts: u32,
-    /// Cooperative cancellation signal for the run. The runtime cancels
-    /// this token when [`crate::WorkflowRuntime::cancel`] is called while
-    /// this delivery is in flight, so a long-running handler (e.g. an LLM
-    /// call, a slow HTTP request) can short-circuit instead of running to
-    /// completion. Typical use:
+    /// Cooperative cancellation signal for the run. The runtime cancels this
+    /// token when [`crate::WorkflowRuntime::cancel`] is called while this
+    /// delivery is in flight. A long-running handler, such as an LLM call or a
+    /// slow HTTP request, can watch it and return early. Typical use:
     ///
     /// ```ignore
     /// tokio::select! {
@@ -53,29 +51,27 @@ pub struct Delivery {
     /// ```
     ///
     /// Handlers that ignore the token remain correct: the runtime still
-    /// discards the outcome of a cancelled step and fires the terminal
-    /// hook with [`crate::TerminalStatus::Cancelled`]. Watching the token
-    /// only reduces cancellation latency for slow steps; it doesn't
-    /// change semantics.
+    /// discards the outcome of a cancelled step and fires the terminal hook
+    /// with [`crate::TerminalStatus::Cancelled`]. Watching the token only
+    /// reduces cancellation latency for slow steps and leaves the semantics
+    /// unchanged.
     ///
-    /// The token is a child of the claim's cancellation token. A
-    /// re-delivery of this step observes `is_cancelled() == true`
-    /// immediately, because the queue re-fires the claim's cancellation
-    /// token from the job's persisted cancellation. Cancelling this token
-    /// leaves the claim's token uncancelled, so the runtime does not treat
-    /// the step as externally cancelled.
+    /// The token is a child of the claim's cancellation token. A re-delivery of
+    /// this step observes `is_cancelled() == true` immediately, because the
+    /// queue re-fires the claim's cancellation token from the job's persisted
+    /// cancellation. Cancelling this token leaves the claim's token
+    /// uncancelled, so the runtime does not treat the step as externally
+    /// cancelled.
     pub cancel_token: CancellationToken,
     /// The lease handle of this delivery. A long-running handler calls
-    /// [`LeaseHandle::ensure_at_least`] at progress points (or once,
-    /// with a slow call's timeout, before issuing it) so the step is
-    /// not re-queued while it still runs. A detached handle's calls
-    /// succeed without effect.
+    /// [`LeaseHandle::ensure_at_least`] at progress points (or once, with a
+    /// slow call's timeout, before issuing it) so the step is not re-queued
+    /// while it still runs. A detached handle's calls succeed without effect.
     pub lease: LeaseHandle,
     /// Per-step durable key-value store, scoped to this step's
-    /// `(run_id, step_number)`. Use to memoize expensive within-step
-    /// side effects (LLM calls, paid APIs) so an at-least-once retry
-    /// of this step doesn't re-pay for work the prior attempt already
-    /// did:
+    /// `(run_id, step_number)`. It memoizes the slow or paid side effects of a
+    /// step, such as LLM calls and paid APIs, so that an at-least-once retry of
+    /// this step reuses the results of the prior attempt:
     ///
     /// ```ignore
     /// let response = match step.memo.get("llm").await? {
@@ -90,17 +86,17 @@ pub struct Delivery {
     ///
     /// See [`Memo`] for the full API.
     pub memo: Memo,
-    /// Run-scoped durable key-value store, shared by every step of the
-    /// run. Entries live beside the per-step [`Delivery::memo`] entries
-    /// and are removed with them when the run's retention expires. Use
-    /// it for values a later step reads back, such as an accumulating
-    /// journal; the durable channel for the next step's input is
-    /// [`StepOutcome::Continue`]'s payload.
+    /// Run-scoped durable key-value store, shared by every step of the run. Its
+    /// entries are stored together with the per-step [`Delivery::memo`] entries
+    /// and are removed with them when the run's retention expires. It is for
+    /// values that a later step reads back, such as an accumulating journal.
+    /// The durable channel for the next step's input is the payload of
+    /// [`StepOutcome::Continue`].
     pub run_memo: Memo,
-    /// Application KV effects for this step. Writes and deletes staged
-    /// here are applied in the same transaction as the settlement that
-    /// commits the returned outcome, so application state cannot
-    /// diverge from the run's transition on a crash:
+    /// Application KV effects for this step. Writes and deletes staged here are
+    /// applied in the same transaction as the settlement that commits the
+    /// returned outcome, so application state cannot diverge from the run's
+    /// transition on a crash:
     ///
     /// ```ignore
     /// step.effects.put(format!("app/runs/{}", step.run_id), b"done".to_vec())?;
@@ -127,15 +123,15 @@ pub struct Delivery {
 }
 
 impl Delivery {
-    /// Whether this attempt is the last: a transient [`StepError`]
-    /// returned from it dead-letters the step and ends the run.
+    /// Whether this attempt is the last: a transient [`StepError`] returned
+    /// from it dead-letters the step and ends the run.
     pub fn is_last_attempt(&self) -> bool {
         self.attempts >= self.max_attempts
     }
 
-    /// A delivery bound to no queue, for tests: run `detached`, attempt
-    /// 1 of 3, no headers, a new cancellation token, detached lease,
-    /// effects and KV handles, and memos over an in-memory object store.
+    /// A delivery without a queue, for tests: run `detached`, attempt 1 of 3,
+    /// empty headers, a new cancellation token, the detached lease, effects and
+    /// KV handles and memos over an in-memory object store.
     pub fn detached() -> Self {
         let run_id = RunId::new("detached").expect("a literal run id");
         let memo_store = MemoStore::new(Arc::new(InMemory::new()), "memo");
@@ -155,16 +151,17 @@ impl Delivery {
     }
 }
 
-/// A single step within a workflow run, handed to [`StepRunner::run_step`]:
-/// the [`Delivery`] it runs under, which it dereferences to, plus the
-/// step number, the step's payload and the signal that reached it.
+/// A single step within a workflow run, the argument of
+/// [`StepRunner::run_step`]: the [`Delivery`] it runs under, which it
+/// dereferences to, plus the step number, the step's payload and the signal
+/// that reached it.
 ///
-/// Mirrors [`taquba::JobRecord`]: the `payload` is opaque application bytes
-/// and `headers` carries user metadata you set at submission (reserved
+/// Mirrors [`taquba::JobRecord`]: the `payload` is opaque application bytes and
+/// `headers` contains the user metadata set at submission (reserved
 /// `workflow.*` keys are filtered out before the runner sees them).
 ///
-/// Constructed by the runtime. A test constructs one with
-/// [`Step::detached`] and assigns the fields it needs.
+/// Constructed by the runtime. A test constructs one with [`Step::detached`]
+/// and assigns the fields it needs.
 #[derive(Debug, Clone)]
 pub struct Step {
     /// The delivery this step runs under.
@@ -172,16 +169,16 @@ pub struct Step {
     /// Zero-based step number. Step 0 is always the first step of a run, with
     /// the original submission input as its `payload`.
     pub step_number: u32,
-    /// Application-defined bytes. For step 0 this is the submission `input`;
-    /// for later steps it is the bytes returned by the previous step's
+    /// Application-defined bytes. For step 0 this is the submission `input`,
+    /// and for a later step it is the bytes returned by the previous step's
     /// [`StepOutcome::Continue`].
     pub payload: Vec<u8>,
     /// The signal payload, when this step was reached through a
-    /// [`Trigger::OnSignal`] wait that a signal resolved: the previous
-    /// step continued with `OnSignal`, and a
-    /// [`crate::WorkflowRuntime::signal`] call for the correlation key
-    /// arrived before the timeout. `None` when the timeout elapsed first
-    /// and on every step not preceded by an `OnSignal` wait.
+    /// [`Trigger::OnSignal`] wait that a signal resolved: the previous step
+    /// continued with `OnSignal`, and a [`crate::WorkflowRuntime::signal`] call
+    /// for the correlation key arrived before the timeout. `None` when the
+    /// timeout elapsed first and on every step not preceded by an `OnSignal`
+    /// wait.
     pub signal: Option<Vec<u8>>,
 }
 
@@ -222,30 +219,29 @@ impl Step {
     }
 }
 
-/// When the next step of a run becomes claimable. Set on the `when`
-/// field of [`StepOutcome::Continue`].
+/// When the next step of a run becomes claimable. Set on the `when` field of
+/// [`StepOutcome::Continue`].
 #[derive(Debug, Clone)]
 pub enum Trigger {
     /// The next step is claimable immediately.
     Immediate,
     /// The next step is claimable `Duration` from now.
     After(Duration),
-    /// The next step is claimable when a signal for `correlation_key`
-    /// arrives via [`crate::WorkflowRuntime::signal`], or after `timeout`,
-    /// whichever comes first. The next step reads [`Step::signal`] to
-    /// distinguish the two: `Some(payload)` when a signal arrived, `None`
-    /// when the timeout elapsed first. A signal that arrived before this
-    /// step settled is consumed at settlement and the next step runs
-    /// immediately.
+    /// The next step is claimable when a signal for `correlation_key` arrives
+    /// via [`crate::WorkflowRuntime::signal`], or after `timeout`, whichever
+    /// comes first. The next step reads [`Step::signal`] to distinguish the
+    /// two: `Some(payload)` when a signal arrived, `None` when the timeout
+    /// elapsed first. A signal that arrived before this step settled is
+    /// consumed at settlement and the next step runs immediately.
     ///
-    /// One waiter per correlation key: registering a second waiter while
-    /// one is already waiting fails the step permanently. Choose keys
-    /// that are unique per waiter (e.g. include the run id).
+    /// One waiter per correlation key: registering a second waiter while one is
+    /// already waiting fails the step permanently. Choose keys that are unique
+    /// per waiter, for example by including the run id.
     OnSignal {
         /// Caller-chosen key the signaller addresses.
         correlation_key: String,
-        /// Upper bound on the wait; the next step runs with
-        /// [`Step::signal`] `None` when it elapses first.
+        /// Upper bound on the wait. When it elapses first, the next step runs
+        /// with [`Step::signal`] `None`.
         timeout: Duration,
     },
 }
@@ -253,51 +249,50 @@ pub enum Trigger {
 /// What the runner wants the runtime to do after this step.
 #[derive(Debug, Clone)]
 pub enum StepOutcome {
-    /// Run is not finished. Enqueue the next step with `payload` as its
-    /// bytes; `when` decides when it becomes claimable. The runtime
-    /// advances `step_number` by 1. The constructors
-    /// [`Self::continue_now`] and [`Self::continue_after`] build the
-    /// common forms.
+    /// Run is not finished. Enqueue the next step with `payload` as its bytes,
+    /// claimable at the time that `when` determines. The runtime advances
+    /// `step_number` by 1. The constructors [`Self::continue_now`] and
+    /// [`Self::continue_after`] build the common forms.
     Continue {
-        /// Bytes to hand to the next step's [`Step::payload`].
+        /// Bytes that become the next step's [`Step::payload`].
         payload: Vec<u8>,
         /// When the next step becomes claimable.
         when: Trigger,
     },
     /// The run is finished successfully. The runtime acks the step and fires
-    /// the configured terminal hook with
-    /// [`crate::TerminalStatus::Succeeded`] and `result` as the body.
+    /// the configured terminal hook with [`crate::TerminalStatus::Succeeded`]
+    /// and `result` as the body.
     Succeed {
-        /// Final result bytes handed to the terminal hook.
+        /// Final result bytes that the terminal hook receives.
         result: Vec<u8>,
     },
-    /// The run is finished as failed by the runner's verdict; the runner
-    /// ran to completion but the workflow's logical outcome is "no" (e.g.
-    /// a validation rule rejected the input, a policy check denied the
-    /// request, an agent decided the task can't be fulfilled). The runtime
-    /// acks the step and fires the terminal hook with
+    /// The run is finished as failed by the runner's decision. The runner ran
+    /// to completion, but the workflow's logical outcome is "no", such as when
+    /// a validation rule rejects the input, a policy check denies the request
+    /// or an agent decides that the task cannot be fulfilled. The runtime acks
+    /// the step and fires the terminal hook with
     /// [`crate::TerminalStatus::Failed`] and `reason` as the error.
     ///
-    /// Use this for *workflow-level* failures. For *infrastructure*
-    /// failures (network outage, downstream service down, etc.) return
-    /// `Err(StepError::transient)` or `Err(StepError::permanent)` instead;
-    /// those dead-letter the step so an operator can find it via
+    /// This variant is for *workflow-level* failures. An *infrastructure*
+    /// failure, such as a network outage or a downstream service that is down,
+    /// returns `Err(StepError::transient)` or `Err(StepError::permanent)`.
+    /// Those dead-letter the step so an operator can find it with
     /// [`taquba::QueueView::dead_jobs`]. `Fail` is a successful execution with
     /// a negative outcome and does not dead-letter.
     Fail {
         /// Human-readable reason recorded on [`crate::RunOutcome::error`].
         reason: String,
     },
-    /// The run is finished as cancelled by the runner. Use this when the
-    /// runner decides on its own that the workflow should stop early
-    /// without it being a logical failure (e.g. a downstream cancellation
-    /// signal arrived mid-step, the user-supplied input is now obsolete).
-    /// The runtime acks the step and fires the terminal hook with
+    /// The run is finished as cancelled by the runner. A runner returns it when
+    /// it decides on its own to stop the workflow early without a logical
+    /// failure, for example when a downstream cancellation signal arrived
+    /// mid-step or the user-supplied input is now obsolete. The runtime acks
+    /// the step and fires the terminal hook with
     /// [`crate::TerminalStatus::Cancelled`] and `reason` as the error.
     ///
     /// For *external* cancellation requested by another component in the
-    /// process, call [`crate::WorkflowRuntime::cancel`] instead; the
-    /// runtime translates that into the same `Cancelled` terminal state.
+    /// process, call [`crate::WorkflowRuntime::cancel`]. The runtime translates
+    /// that call into the same `Cancelled` terminal state.
     Cancel {
         /// Human-readable reason recorded on [`crate::RunOutcome::error`].
         reason: String,
@@ -305,7 +300,7 @@ pub enum StepOutcome {
 }
 
 impl StepOutcome {
-    /// Continue the run; the next step is claimable immediately.
+    /// Continue the run with the next step claimable immediately.
     pub fn continue_now(payload: Vec<u8>) -> Self {
         Self::Continue {
             payload,
@@ -313,7 +308,7 @@ impl StepOutcome {
         }
     }
 
-    /// Continue the run; the next step is claimable `delay` from now.
+    /// Continue the run with the next step claimable `delay` from now.
     pub fn continue_after(payload: Vec<u8>, delay: Duration) -> Self {
         Self::Continue {
             payload,
@@ -321,7 +316,7 @@ impl StepOutcome {
         }
     }
 
-    /// Continue the run; the next step is claimable when a signal for
+    /// Continue the run with the next step claimable when a signal for
     /// `correlation_key` arrives, or after `timeout` at the latest.
     pub fn continue_on_signal(
         payload: Vec<u8>,
@@ -367,8 +362,8 @@ impl StepError {
         }
     }
 
-    /// The worker error reporting this failure: a [`PermanentFailure`]
-    /// for a permanent one, a retrying error otherwise.
+    /// The worker error reporting this failure: a [`PermanentFailure`] for a
+    /// permanent one, a retrying error otherwise.
     pub(crate) fn into_worker_error(self) -> WorkerError {
         match self.kind {
             StepErrorKind::Permanent => PermanentFailure::new(self.message).into(),
@@ -397,28 +392,29 @@ impl From<crate::Error> for StepError {
     }
 }
 
-/// Whether a [`StepError`] should retry or fail the run.
+/// Whether a [`StepError`] retries the step or fails the run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepErrorKind {
     /// Retry per the queue's backoff policy until `max_attempts` is reached.
     Transient,
-    /// Dead-letter the step immediately; terminate the run as failed.
+    /// Dead-letter the step immediately and terminate the run as failed.
     Permanent,
 }
 
 /// User-implemented logic that advances a single workflow step.
 ///
 /// Implementations must be idempotent for the same `(run_id, step_number)`:
-/// Taquba is at-least-once, so a step can be claimed and processed more than
-/// once if a lease expires before the worker acks. Returning the same
-/// `StepOutcome` for the same input is the easiest way to satisfy this.
+/// Taquba is at-least-once, and a step is claimed and processed more than once
+/// if a lease expires before the worker acks. Returning the same `StepOutcome`
+/// for the same input is the easiest way to satisfy this.
 pub trait StepRunner: Send + Sync {
-    /// Process a single step of a workflow run. Return [`StepOutcome::Continue`]
-    /// to enqueue the next step, [`StepOutcome::Succeed`] to finish the run
-    /// successfully, [`StepOutcome::Fail`] to terminate the run as Failed by
-    /// runner verdict, [`StepOutcome::Cancel`] to terminate the run as
-    /// Cancelled by runner verdict, or `Err(StepError)` to retry /
-    /// dead-letter on infrastructure errors.
+    /// Process a single step of a workflow run. Return
+    /// [`StepOutcome::Continue`] to enqueue the next step,
+    /// [`StepOutcome::Succeed`] to finish the run successfully,
+    /// [`StepOutcome::Fail`] to terminate the run as Failed by runner decision,
+    /// [`StepOutcome::Cancel`] to terminate the run as Cancelled by runner
+    /// decision, or `Err(StepError)` to retry or dead-letter on infrastructure
+    /// errors.
     fn run_step(
         &self,
         step: &Step,

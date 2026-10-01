@@ -1,8 +1,8 @@
 // cargo run -p taquba-workflow --example typed_jobs
 //
-// Defines a single typed job (`Greet`), spins up a JobRunner backed by an
-// in-memory object store, submits a handful of jobs concurrently, and waits
-// for each typed result.
+// Defines a single typed job (`Greet`), starts a JobRunner backed by an
+// in-memory object store, submits a handful of jobs concurrently, and waits for
+// each typed result.
 
 use std::sync::Arc;
 
@@ -39,8 +39,8 @@ impl Job for Greet {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // In production swap InMemory for an S3 / GCS / Azure / local-disk store.
-    // The queue and the memo store can be the same handle (as here) or
-    // separate stores.
+    // The queue and the memo store can be the same handle (as here) or separate
+    // stores.
     let store = Arc::new(InMemory::new());
     let queue = Arc::new(Queue::open(store.clone(), "jobs-demo").await?);
 

@@ -1,17 +1,17 @@
 //! A document pipeline in three stages: extract fields, classify, validate.
 //!
-//! Each document is one job of a group, and the stages are memoized
-//! calls inside the job, so a retried document does not re-execute its
-//! completed stages.
+//! Each document is one job of a group, and the stages are memoized calls
+//! inside the job, so a retried document does not re-execute its completed
+//! stages.
 //!
 //! Demonstrated:
 //!
 //!   - Per-stage memoization: one document's classify stage fails
-//!     transiently on its first execution; the retry re-runs classify
+//!     transiently on its first execution, and the retry re-runs classify
 //!     only, with extract read from the memo. Stage-execution counters
 //!     printed at the end show this.
 //!   - Transient versus permanent failures: the transient classify
-//!     failure retries and succeeds; an empty document fails permanently
+//!     failure retries and succeeds, and an empty document fails permanently
 //!     at extract and is recorded as failed without retries.
 //!   - Counters across retries: the counters a stage returns with its
 //!     memoized value are read back on a retry, so the caller's rollup
@@ -63,8 +63,8 @@ enum DocError {
     Runtime(#[from] taquba_workflow::Error),
 }
 
-/// Stage-execution counters and the injected-failure flag, registered
-/// as handler state; a real pipeline does not need them.
+/// Stage-execution counters and the injected-failure flag, registered as
+/// handler state. A real pipeline does not need them.
 #[derive(Default)]
 struct Stages {
     extract_runs: AtomicUsize,
@@ -81,8 +81,8 @@ impl Job for ProcessDocument {
     async fn run(&self, ctx: JobContext<'_>) -> Result<ProcessedDocument, DocError> {
         let stages = ctx.state::<Arc<Stages>>();
 
-        // Stage 1: parse `KEY: value` lines into structured fields. The
-        // counter is memoized with the value, so a retry reads it back.
+        // Stage 1: parse `KEY: value` lines into structured fields. The counter
+        // is memoized with the value, so a retry reads it back.
         let (extracted, chars_extracted): (Extracted, usize) = ctx
             .memo
             .memoized("extract:v1", async {
@@ -91,9 +91,9 @@ impl Job for ProcessDocument {
             })
             .await?;
 
-        // Stage 2: classification represents an expensive external call.
-        // One document's first execution fails transiently to exercise
-        // the retry path; stage 1 is not recomputed on the retry.
+        // Stage 2: classification represents a slow, paid external call. One
+        // document's first execution fails transiently to exercise the retry
+        // path. Stage 1 is not recomputed on the retry.
         let (class, confidence, classify_calls): (String, f64, usize) = ctx
             .memo
             .memoized("classify:v1", async {
@@ -141,8 +141,8 @@ impl Job for ProcessDocument {
 
 fn extract(text: &str) -> Result<Extracted, DocError> {
     if text.trim().is_empty() {
-        // An empty document is empty on every retry; fail permanently so
-        // the document is recorded as failed without retries.
+        // An empty document is empty on every retry. Fail permanently so the
+        // document is recorded as failed without retries.
         return Err(DocError::Permanent("document is empty".into()));
     }
     let mut title = None;
@@ -231,7 +231,7 @@ fn sample_documents() -> Vec<ProcessDocument> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A short retry backoff so the injected transient failure is retried
-    // promptly; production deployments keep the default backoff.
+    // promptly. Production deployments keep the default backoff.
     let mut opts = OpenOptions::default();
     opts.queue_configs.insert(
         "docs".to_string(),

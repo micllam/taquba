@@ -11,29 +11,28 @@ pub enum TerminalStatus {
     /// The runner returned [`crate::StepOutcome::Succeed`].
     Succeeded,
     /// One of:
-    /// - the runner returned [`crate::StepOutcome::Fail`] (runner verdict);
-    /// - a step returned [`crate::StepError::permanent`];
-    /// - a step exhausted its transient-retry budget; or
-    /// - a step was dead-lettered outside the runner (its lease expired
-    ///   past the attempt limit, crash recovery at open, or a permanent
-    ///   runtime error before the runner ran) and the worker's
-    ///   reconciliation terminated the run with the queue record's
-    ///   last error.
+    /// - The runner returned [`crate::StepOutcome::Fail`] (a runner decision).
+    /// - A step returned [`crate::StepError::permanent`].
+    /// - A step reached its attempt limit with transient errors.
+    /// - A step was dead-lettered outside the runner, by a lease expiry past
+    ///   the attempt limit, by crash recovery at open or by a permanent runtime
+    ///   error before the runner ran. The worker's reconciliation then
+    ///   terminated the run with the queue record's last error.
     Failed,
     /// The run was cancelled. Either:
-    /// - [`crate::WorkflowRuntime::cancel`] was called for this run; or
-    /// - the runner returned [`crate::StepOutcome::Cancel`].
+    /// - [`crate::WorkflowRuntime::cancel`] was called for this run.
+    /// - The runner returned [`crate::StepOutcome::Cancel`].
     ///
     /// Like [`Self::Failed`] from `StepOutcome::Fail`, this is a clean
-    /// run-level outcome rather than an infrastructure error: the step is
+    /// run-level outcome and distinct from an infrastructure error: the step is
     /// acked and no dead-letter is produced.
     Cancelled,
 }
 
 impl TerminalStatus {
     /// Canonical lowercase identifier for this status, suitable for HTTP
-    /// headers, structured logs, and other wire-format use. Stable across
-    /// minor releases.
+    /// headers, structured logs and other wire-format use. Stable across minor
+    /// releases.
     pub fn as_str(&self) -> &'static str {
         match self {
             TerminalStatus::Succeeded => "succeeded",
@@ -65,7 +64,7 @@ pub struct RunOutcome {
     /// - When `status == Cancelled`: `Some(reason)` if the runner
     ///   returned [`crate::StepOutcome::Cancel`], or `None` if
     ///   cancellation came from [`crate::WorkflowRuntime::cancel`]
-    ///   (which takes no reason at the API level).
+    ///   (whose API does not accept a reason).
     /// - When `status == Succeeded`: always `None`.
     pub error: Option<String>,
     /// Submitter-supplied metadata, threaded through from
@@ -77,10 +76,9 @@ pub struct RunOutcome {
 
 /// User-implemented hook processing a run's termination.
 ///
-/// Termination is delivered as a queue job: the settlement that commits
-/// a run's terminal outcome atomically enqueues a **notification job**
-/// on the same queue, and the hook runs as that job's worker. The
-/// consequences:
+/// Termination is delivered as a queue job: the settlement that commits a run's
+/// terminal outcome atomically enqueues a **notification job** on the same
+/// queue, and the hook runs as that job's worker. The consequences:
 ///
 /// - The hook observes only outcomes that committed. A settlement that
 ///   loses its claim loses its notification with it, so a redelivered
@@ -97,35 +95,34 @@ pub struct RunOutcome {
 ///   the hook returns `Ok`.
 ///
 /// Runs terminated without an acknowledging settlement (an external
-/// cancellation of a pending step, a step that dead-letters) enqueue
-/// the notification job in the transaction of that transition, so it
-/// is created exactly once on every worker and cancellation path. A
-/// step the reaper dead-letters after its lease expires, or one
-/// dead-lettered during crash recovery at open, is reconciled by the
-/// worker, which terminates the run as failed and enqueues the
-/// notification in one transaction.
+/// cancellation of a pending step, a step that dead-letters) enqueue the
+/// notification job in the transaction of that transition, so it is created
+/// exactly once on every worker and cancellation path. A step the reaper
+/// dead-letters after its lease expires, or one dead-lettered during crash
+/// recovery at open, is reconciled by the worker, which terminates the run as
+/// failed and enqueues the notification in one transaction.
 pub trait TerminalHook: Send + Sync {
-    /// Process the termination of one run. `outcome` is the committed
-    /// terminal state; effects staged on `effects` commit with this
-    /// notification's acknowledgement.
+    /// Process the termination of one run. `outcome` is the committed terminal
+    /// state. Effects staged on `effects` commit with this notification's
+    /// acknowledgement.
     fn on_termination(
         &self,
         outcome: &RunOutcome,
         effects: &TerminalEffects,
     ) -> impl Future<Output = std::result::Result<(), StepError>> + Send;
 
-    /// Whether a notification job should be enqueued for `outcome`.
-    /// Consulted when the run terminates; returning `false` skips the
-    /// notification entirely, so [`Self::on_termination`] is never
-    /// called for that run. Defaults to `true`.
+    /// Whether a notification job is enqueued for `outcome`. Consulted when the
+    /// run terminates. A return value of `false` skips the notification
+    /// entirely, and [`Self::on_termination`] is never called for that run.
+    /// Defaults to `true`.
     fn observes(&self, outcome: &RunOutcome) -> bool {
         let _ = outcome;
         true
     }
 }
 
-/// A no-op terminal hook. Declares itself unobservant, so runs
-/// terminate without enqueueing a notification job.
+/// A no-op terminal hook. Declares itself unobservant, so runs terminate
+/// without enqueueing a notification job.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopTerminalHook;
 
@@ -149,23 +146,23 @@ mod webhook {
     use std::time::Duration;
     use taquba_webhooks::{WebhookRequest, webhook_enqueue_request};
 
-    /// Terminal hook that delivers an HTTP webhook via `taquba-webhooks`
-    /// when a run terminates.
+    /// Terminal hook that delivers an HTTP webhook via `taquba-webhooks` when a
+    /// run terminates.
     ///
-    /// The hook reads the target URL from the run's submission headers
-    /// under [`Self::URL_HEADER`] (default `"callback_url"`); runs
-    /// without that header enqueue no notification at all. The default
-    /// key intentionally avoids the reserved `workflow.*` prefix so
-    /// submitters can set it directly via [`crate::RunOptions::headers`].
+    /// The hook reads the target URL from the run's submission headers under
+    /// [`Self::URL_HEADER`] (default `"callback_url"`). Runs without that
+    /// header enqueue no notification at all. The default key intentionally
+    /// avoids the reserved `workflow.*` prefix so submitters can set it
+    /// directly via [`crate::RunOptions::headers`].
     ///
-    /// The webhook enqueue is staged as a notification effect, so the
-    /// delivery job is created exactly once, atomically with the
-    /// notification's acknowledgement.
+    /// The webhook enqueue is staged as a notification effect, so the delivery
+    /// job is created exactly once, atomically with the notification's
+    /// acknowledgement.
     ///
-    /// The webhook body is the raw `result` bytes for succeeded runs, and
-    /// the UTF-8 error message for failed runs. The run identifier and
-    /// terminal status are passed in the `Workflow-Run-Id` and
-    /// `Workflow-Run-Status` HTTP headers respectively.
+    /// The webhook body is the raw `result` bytes for succeeded runs, and the
+    /// UTF-8 error message for failed runs. The run identifier and terminal
+    /// status are passed in the `Workflow-Run-Id` and `Workflow-Run-Status`
+    /// HTTP headers respectively.
     pub struct WebhookTerminalHook {
         target_queue: String,
         url_header: String,
@@ -175,13 +172,12 @@ mod webhook {
     impl WebhookTerminalHook {
         /// Default header key the hook looks for on each [`RunOutcome`].
         /// Deliberately outside the reserved `workflow.*` prefix so submitters
-        /// can set it on [`crate::RunOptions::headers`] without being
-        /// rejected.
+        /// can set it on [`crate::RunOptions::headers`] without being rejected.
         pub const URL_HEADER: &'static str = "callback_url";
 
-        /// Build a hook that enqueues webhook deliveries onto
-        /// `target_queue`. The submitter sets a callback URL per run via
-        /// the [`Self::URL_HEADER`] header on [`crate::RunOptions::headers`].
+        /// Build a hook that enqueues webhook deliveries onto `target_queue`.
+        /// The submitter sets a callback URL per run via the
+        /// [`Self::URL_HEADER`] header on [`crate::RunOptions::headers`].
         pub fn new(target_queue: impl Into<String>) -> Self {
             Self {
                 target_queue: target_queue.into(),

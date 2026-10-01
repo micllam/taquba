@@ -1,13 +1,12 @@
 //! An agent loop with a durable approval gate, resumed across processes.
 //!
-//! An agent investigates a refund claim one turn per step, storing its
-//! state in the step payload; the loop decides how many steps the run
-//! takes. When the agent proposes a refund it returns
-//! `StepOutcome::continue_on_signal` and this process exits: the
-//! waiting run is a scheduled job in the store, so no process needs to
-//! run while the approval is pending. The decision arrives as a new
-//! invocation of this binary, which reopens the store, delivers the
-//! signal through its own runtime and resumes the run to completion.
+//! An agent investigates a refund claim one turn per step, storing its state in
+//! the step payload, and the loop decides how many steps the run takes. When
+//! the agent proposes a refund it returns `StepOutcome::continue_on_signal` and
+//! this process exits: the waiting run is a scheduled job in the store, so no
+//! process runs while the approval is pending. The decision arrives as a new
+//! invocation of this binary, which reopens the store, delivers the signal
+//! through its own runtime and resumes the run to completion.
 //!
 //! ```text
 //! cargo run -p taquba-workflow --example durable_approvals               # run until waiting
@@ -24,14 +23,14 @@
 //! - A decision delivered before the first plain invocation is buffered
 //!   (`SignalOutcome::Buffered`) and consumed when the waiter registers,
 //!   so the run never waits.
-//! - With no decision inside the timeout (five minutes), the next plain
+//! - Without a decision inside the timeout (five minutes), the next plain
 //!   invocation promotes the waiting step with `Step::signal == None`
 //!   and the run escalates.
 //!
-//! The timeout runs on wall clock through downtime. A run that waits
-//! longer than the timeout escalates at the next open, and a decision
-//! delivered after that is buffered under a correlation key no waiter
-//! will consume; the `clear` mode discards such a buffered decision.
+//! The timeout runs on wall clock through downtime. A run that waits longer
+//! than the timeout escalates at the next open, and a decision delivered after
+//! that is buffered for a correlation key no waiter will consume. The `clear`
+//! mode discards such a buffered decision.
 //!
 //! State lives under `/tmp/taquba-durable-approvals-example`. Remove the
 //! directory to discard the run and start over.
@@ -58,8 +57,8 @@ fn approval_key(run_id: &str) -> String {
     format!("approval:{run_id}")
 }
 
-/// The agent's working state, stored in the step payload. Each step is
-/// one turn, and the state decides what the turn does.
+/// The agent's working state, stored in the step payload. Each step is one
+/// turn, and the state decides what the turn does.
 #[derive(Serialize, Deserialize, Default)]
 struct AgentState {
     evidence: Vec<String>,
@@ -70,8 +69,8 @@ fn encode(state: &AgentState) -> Result<Vec<u8>, StepError> {
     serde_json::to_vec(state).map_err(|e| StepError::permanent(format!("state: {e}")))
 }
 
-/// One investigation turn. A real agent would call a model or a search
-/// tool here; the stub returns a fixed finding per turn.
+/// One investigation turn. The stub returns a fixed finding per turn where a
+/// real agent calls a model or a search tool.
 fn lookup_evidence(turn: usize) -> String {
     const FINDINGS: [&str; EVIDENCE_TURNS] = [
         "order 4021 was delivered 11 days late",
@@ -118,9 +117,8 @@ impl StepRunner for RefundAgent {
             }
         }
 
-        // The evidence is complete: propose a refund and hold the run
-        // until a decision arrives, because issuing the refund is
-        // irreversible.
+        // The evidence is complete: propose a refund and hold the run until a
+        // decision arrives, because issuing the refund is irreversible.
         let amount = 25 * state.evidence.len() as u32;
         state.proposal = Some(amount);
         println!(
@@ -135,10 +133,10 @@ impl StepRunner for RefundAgent {
     }
 }
 
-/// The irreversible effect, guarded by a memo key: a redelivered
-/// decision step observes the recorded refund and issues nothing. The
-/// guard is written after the effect, so a crash between the two can
-/// still replay the effect once.
+/// The irreversible effect, guarded by a memo key: a redelivered decision step
+/// observes the recorded refund and does not issue it again. The guard is
+/// written after the effect, so a crash between the two can still replay the
+/// effect once.
 async fn issue_refund(step: &Step, amount: u32) -> Result<(), StepError> {
     const KEY: &str = "refund-issued";
     if step.memo.get(KEY).await?.is_some() {
@@ -203,9 +201,9 @@ fn parse_mode() -> Result<Mode, String> {
     }
 }
 
-/// Resolves once the store holds only the waiting decision step. The
-/// initial delay lets the scheduler promote a wait whose timeout elapsed
-/// before this process started, so an overdue run escalates.
+/// Resolves once the store contains only the waiting decision step. The initial
+/// delay lets the scheduler promote a wait whose timeout elapsed before this
+/// process started, so an overdue run escalates.
 async fn awaiting_approval(queue: Arc<Queue>) {
     tokio::time::sleep(Duration::from_secs(2)).await;
     let mut stable = 0;

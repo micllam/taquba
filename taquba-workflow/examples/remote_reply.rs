@@ -1,12 +1,11 @@
-//! Remote work that replies through the bucket, with no inbound endpoint.
+//! Remote work that replies through the bucket, without an inbound endpoint.
 //!
-//! A step sends a request to a worker on another machine and waits for
-//! the reply with `StepOutcome::continue_on_signal`. The worker writes
-//! its reply as an object at a key the step chose, and a watcher task in
-//! this process turns the object's arrival into the signal that wakes
-//! the run. The remote worker therefore needs only a way to PUT one
-//! object (a presigned URL in production), and this process does not
-//! need a reachable port.
+//! A step sends a request to a worker on another machine and waits for the
+//! reply with `StepOutcome::continue_on_signal`. The worker writes its reply as
+//! an object at a key the step chose, and a watcher task in this process turns
+//! the object's arrival into the signal that wakes the run. The remote worker
+//! therefore needs only a way to PUT one object (a presigned URL in
+//! production), and this process does not need a reachable port.
 //!
 //! ```text
 //! cargo run -p taquba-workflow --example remote_reply
@@ -21,21 +20,20 @@
 //!   marker commits in the settlement that registers the waiter, so the
 //!   watcher never sees a marker without a waiter, and a step that fails
 //!   to settle does not leave a marker.
-//! - The watcher reads the pending markers, HEADs each reply key, and on
+//! - The watcher reads the pending markers, HEADs each reply key and on
 //!   a hit delivers the key as the signal payload and removes the
 //!   marker. It issues one HEAD per waiting run per poll and no LIST.
 //! - The next step reads the reply object at the key in `Step::signal`,
 //!   or escalates when the timeout elapsed first.
 //!
-//! No lease is held during the wait: the requesting step settles, and
-//! the waiting run is a scheduled job in the store, so the remote work
-//! can outlast this process. There is no waiter for a reply that arrives
-//! after the timeout, and its object stays in the bucket for a retention
-//! sweep.
+//! No lease is held during the wait: the requesting step settles, and the
+//! waiting run is a scheduled job in the store, so the remote work can outlast
+//! this process. There is no waiter for a reply that arrives after the timeout,
+//! and its object stays in the bucket for a retention sweep.
 //!
-//! The remote machine is simulated by a task that receives the request
-//! over a channel, works for two seconds and PUTs the reply into the same
-//! in-memory object store that the queue uses.
+//! The remote machine is simulated by a task that receives the request over a
+//! channel, works for two seconds and PUTs the reply into the same in-memory
+//! object store that the queue uses.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -142,9 +140,9 @@ impl Dispatcher {
     }
 }
 
-/// The machine on the other side: it receives a request, works, and
-/// PUTs the reply at the key it was given. In production this is any
-/// process with a presigned PUT URL for that key.
+/// The machine on the other side: it receives a request, performs the work and
+/// PUTs the reply at the key it was given. In production this is any process
+/// with a presigned PUT URL for that key.
 async fn remote_worker(mut requests: mpsc::Receiver<Request>, store: Arc<dyn ObjectStore>) {
     while let Some(request) = requests.recv().await {
         tokio::time::sleep(REMOTE_WORK).await;
@@ -157,8 +155,8 @@ async fn remote_worker(mut requests: mpsc::Receiver<Request>, store: Arc<dyn Obj
     }
 }
 
-/// Turns reply objects into signals. Each poll reads the pending markers
-/// and issues one HEAD per marker.
+/// Turns reply objects into signals. Each poll reads the pending markers and
+/// issues one HEAD per marker.
 async fn watch_replies(
     queue: Arc<Queue>,
     store: Arc<dyn ObjectStore>,
