@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use slatedb::config::DbReaderOptions;
-use slatedb::manifest::SsTableId;
 use slatedb::object_store::ObjectStore;
 use slatedb::{DbReader, DbReaderMode};
 
@@ -265,10 +264,10 @@ impl QueueReader {
         let manifest = &status.current_manifest;
         // L0 SSTs are written by the writer's memtable flusher, newest at the
         // front. Their ids embed the writer clock's timestamp.
-        let last_flush_at_ms = manifest.l0().front().and_then(|view| match view.sst.id {
-            SsTableId::Compacted(id) => Some(id.timestamp_ms()),
-            SsTableId::Wal(_) => None,
-        });
+        let last_flush_at_ms = manifest
+            .l0()
+            .front()
+            .map(|view| view.sst.id.value().timestamp_ms());
         StoreActivity {
             last_flush_at_ms,
             writer_epoch: manifest.writer_epoch(),
