@@ -19,9 +19,8 @@ A job is in exactly one of five states at any time.
 - **Claimed.** Held by a worker under a lease, the time bound on a claim.
 - **Done.** Acknowledged. The record is kept only on a queue configured to keep
   done jobs. On any other queue the ack removes it.
-- **Dead.** Out of attempts, or failed permanently. A job that enters this
-  state is dead-lettered. It stays for inspection until the dead retention
-  expires.
+- **Dead.** Out of attempts, or failed permanently. A job that enters this state
+  is dead-lettered. It stays for inspection until the dead retention expires.
 
 The moves between them:
 
@@ -58,20 +57,20 @@ The edges:
   before its time.
 - **Claim.** Increments `attempts`.
 - **Nack.** The job is held in `Scheduled` for the retry backoff while attempts
-  remain. The scheduler's promotion is therefore the retry mechanism as well
-  as the delay mechanism.
+  remain. The scheduler's promotion is therefore the retry mechanism as well as
+  the delay mechanism.
 - **Ack.** Enters `Done` only on a queue that keeps done jobs, and removes the
   record otherwise.
 - **Reaper, requeue at open.** A `Claimed` job returns to `Pending` without a
-  settlement when the reaper finds its lease expired, or when the queue
-  requeues it at open.
+  settlement when the reaper finds its lease expired, or when the queue requeues
+  it at open.
 
 Three properties of the lifecycle:
 
 - **Delivery is at-least-once.** A claim assigns a job to a worker, and the same
-  job can be assigned again after a failed attempt or an expired lease. A
-  worker must therefore be idempotent. Deliveries repeat until the job is
-  acknowledged or dead-lettered.
+  job can be assigned again after a failed attempt or an expired lease. A worker
+  must therefore be idempotent. Deliveries repeat until the job is acknowledged
+  or dead-lettered.
 - **A claim is held under a lease.** The reaper returns a job to `Pending` once
   its lease expires. [Claiming and settling](claiming.md) describes the claim
   and the lease.
@@ -80,8 +79,8 @@ Three properties of the lifecycle:
 
 ## The stored fields
 
-A job is stored as a single `JobRecord`, encoded as a MessagePack map with
-field names. MessagePack is compact, and the named fields keep a stored record
+A job is stored as a single `JobRecord`, encoded as a MessagePack map with field
+names. MessagePack is compact, and the named fields keep a stored record
 readable when the set of fields changes. The two byte fields, `payload` and
 `wake_payload`, are binary strings, so the record stores their bytes as they
 are.
@@ -91,8 +90,8 @@ The record contains:
 - **The caller's data:** `payload` and `headers`.
 - **The per-job settings,** resolved at enqueue from
   [`EnqueueOptions`][EnqueueOptions] against the queue's defaults: `priority`,
-  `max_attempts`, `run_at` for a scheduled job and `dedup_key`. The dedup key
-  is a caller key that deduplicates enqueues while the job waits, and the first
+  `max_attempts`, `run_at` for a scheduled job and `dedup_key`. The dedup key is
+  a caller key that deduplicates enqueues while the job waits, and the first
   claim clears it.
 - **The delivery record:** `attempts`, `claimed_at`, `last_error` and the
   terminal timestamps `completed_at` and `failed_at`.
@@ -116,14 +115,14 @@ Four pieces of state describe a job and are not in its record:
   The queue reads them per queue at the moment they are needed.
 - **The lifecycle status.** It is derived from the record's key, which
   [Key layout](key-layout.md#the-status-comes-from-the-key) covers.
-- **An offloaded payload.** Its bytes are in the payload store, described in
-  the section that follows.
+- **An offloaded payload.** Its bytes are in the payload store, described in the
+  section that follows.
 
 ## Payload offload
 
 A payload is stored in one of two places, decided at enqueue by its size. Below
-[`OpenOptions::payload_offload_threshold`][threshold] (256 KiB by default) it
-is stored in the record. Above it, the bytes are written to the payload object
+[`OpenOptions::payload_offload_threshold`][threshold] (256 KiB by default) it is
+stored in the record. Above it, the bytes are written to the payload object
 store and the record contains the object's name in `payload_ref`.
 
 ```text
@@ -146,8 +145,8 @@ offloaded payload
 The threshold exists because a record is rewritten on every transition. Each
 move between key spaces writes it again with its new key. An inline payload is
 part of that write, so a large one is written again at every step of the job's
-life. An offloaded payload is written once, and the transitions that follow
-move a small record.
+life. An offloaded payload is written once, and the transitions that follow move
+a small record.
 
 `JobRecord::stored_bytes` implements the split. Every record write goes through
 it, and it leaves the inline payload out when `payload_ref` is set.

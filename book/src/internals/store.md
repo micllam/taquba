@@ -1,10 +1,10 @@
 # The store
 
 Every job record, index and counter is in one SlateDB store. The store has one
-writer process at any time, and every worker is a task in that process.
-This chapter describes the parts of SlateDB's model that the other chapters
-rely on: writes and their durability, reads, transactions and deletes. SlateDB
-itself is documented at [slatedb.io](https://slatedb.io).
+writer process at any time, and every worker is a task in that process. This
+chapter describes the parts of SlateDB's model that the other chapters rely on:
+writes and their durability, reads, transactions and deletes. SlateDB itself is
+documented at [slatedb.io](https://slatedb.io).
 
 ## Writes
 
@@ -29,9 +29,9 @@ the SSTs they merge.
 
 ## Durability
 
-A write is durable once the flush that contains it completes. A memtable that
-is lost with the process is rebuilt at the next open from the flushed WAL. A
-write that the flush did not reach is lost with the memtable.
+A write is durable once the flush that contains it completes. A memtable that is
+lost with the process is rebuilt at the next open from the flushed WAL. A write
+that the flush did not reach is lost with the memtable.
 
 A commit can wait for the flush that makes its writes durable, or it can return
 as soon as the writes are in the memtable. The queue chooses per transition,
@@ -43,12 +43,12 @@ SlateDB offers three read forms:
 
 - **`get`** returns the value at one key.
 - **`scan`** returns the entries of an explicit key range, in key order.
-- **`scan_prefix`** returns the entries that share a byte prefix, in key
-  order, with an optional subrange inside the prefix.
+- **`scan_prefix`** returns the entries that share a byte prefix, in key order,
+  with an optional subrange inside the prefix.
 
 The queue uses `get` and `scan_prefix`.
 
-A read consults the memtable first and then the SSTs, newest first, and
+A read consults the memtable first and then the SSTs from newest to oldest. It
 stops at the first match:
 
 ```text
@@ -64,15 +64,15 @@ flush.
 
 Every job transition is a SlateDB transaction, which runs in three steps:
 
-- **Begin.** The transaction takes a snapshot, a fixed view of the store at
-  that instant, and every read in the transaction reads from it.
-- **Stage.** Its writes are collected in the transaction and are not visible
-  to any other read.
+- **Begin.** The transaction takes a snapshot, a fixed view of the store at that
+  instant, and every read in the transaction reads from it.
+- **Stage.** Its writes are collected in the transaction and are not visible to
+  any other read.
 - **Commit.** The store applies the staged writes as one batch, or rejects the
   transaction.
 
-The store rejects the commit when another transaction wrote one of the same
-keys after the snapshot was taken:
+The store rejects the commit when another transaction wrote one of the same keys
+after the snapshot was taken:
 
 ```text
 T1   begin ──── stage a write to K ─────────────────── commit: rejected
@@ -81,8 +81,8 @@ T2         begin ──── stage a write to K ──── commit: applied
      K changed after T1's snapshot, so T1 retries on a new one
 ```
 
-Only written keys count: a key that the transaction read and another
-transaction changed does not cause a conflict.
+Only written keys count: a key that the transaction read and another transaction
+changed does not cause a conflict.
 
 ## Deletes
 
@@ -103,9 +103,8 @@ delete K
 ```
 
 Compaction removes the value when it merges the two files, and removes the
-tombstone once it reaches the oldest sorted run. Until then a scan over a
-range of deleted keys reads every tombstone in it before it reaches a live
-key:
+tombstone once it reaches the oldest sorted run. Until then a scan over a range
+of deleted keys reads every tombstone in it before it reaches a live key:
 
 ```text
 scan from K1, before compaction

@@ -1,7 +1,8 @@
 # Preface
 
 This part of the book describes how taquba is built: the records it stores, the
-keys they are stored at and the mechanisms that move a job through its lifecycle.
+keys they are stored at and the mechanisms that move a job through its
+lifecycle.
 
 Everything described here is internal to the crates, and any minor release
 before 1.0 can change it. The stability guarantees apply to each crate's public
