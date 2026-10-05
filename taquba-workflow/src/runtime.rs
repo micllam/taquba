@@ -342,13 +342,8 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
         let memo_prefix = self
             .memo_prefix
             .unwrap_or_else(|| format!("{}-memo", self.queue_name));
-        let memo_store = MemoStore::new(self.object_store.clone(), memo_prefix.clone());
-        let group_store = GroupStore::new(
-            self.object_store,
-            memo_prefix,
-            memo_store.clone(),
-            self.queue.clone(),
-        );
+        let memo_store = MemoStore::new(self.object_store, memo_prefix);
+        let group_store = GroupStore::new(memo_store.clone(), self.queue.clone());
         let memo_sweep = self.memo_retention.map(|retention| {
             Arc::new(Sweep::new(
                 TERMINAL_KV_PREFIX,

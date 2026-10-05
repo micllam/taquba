@@ -1,5 +1,6 @@
 //! The read-only queries of a workflow store: the status and the outcome of a
-//! run, from the queue's KV namespace and the memo store the runtime writes to.
+//! run and the status of a run group, from the queue's KV namespace and the
+//! memo store the runtime writes to.
 
 use taquba::{JobRecord, JobStatus, QueueView};
 
@@ -7,10 +8,11 @@ use crate::durable::{
     self, DurableCurrentStep, DurableRunRecord, DurableRunResult, DurableTermination,
 };
 use crate::error::{Error, Result};
+use crate::group::{self, GroupStatus};
 use crate::keys::{RunId, outcome_kv_key, run_kv_key, step_kv_key};
 use crate::memo::{MemoStore, RUN_RESULT_MEMO_KEY};
 use crate::runtime::{RunResult, RunState, RunStatus, RunTermination};
-use crate::terminal::RunOutcome;
+use crate::terminal::{RunOutcome, TerminalStatus};
 
 /// The read-only queries of a workflow store, over a [`QueueView`] and the
 /// [`MemoStore`] the runtime writes to.
@@ -84,6 +86,32 @@ impl WorkflowView {
             .recorded_result(run_id)
             .await?
             .map(|result| result.outcome))
+    }
+
+    /// The status of the run group `group_id`: the members of its manifest,
+    /// counted by the state of their member records. It is `None` when the
+    /// manifest is absent, for a group never submitted or removed.
+    pub async fn group_status(&self, group_id: &RunId) -> Result<Option<GroupStatus>> {
+        let Some(manifest) = group::read_manifest(&self.memos, group_id).await? else {
+            return Ok(None);
+        };
+        let mut status = GroupStatus {
+            group_id: group_id.clone(),
+            total: manifest.members.len(),
+            pending: 0,
+            succeeded: 0,
+            failed: 0,
+            cancelled: 0,
+        };
+        for member in group::read_members(&self.queue, group_id).await? {
+            match member.status() {
+                None => status.pending += 1,
+                Some(TerminalStatus::Succeeded) => status.succeeded += 1,
+                Some(TerminalStatus::Failed) => status.failed += 1,
+                Some(TerminalStatus::Cancelled) => status.cancelled += 1,
+            }
+        }
+        Ok(Some(status))
     }
 
     /// The durable record of `run_id`, when the run is active.

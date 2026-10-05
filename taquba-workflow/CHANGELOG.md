@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `WorkflowView::group_status`: the member counts of a run group, so a process
+  without a runtime reads them through a `taquba::QueueReader`. It returns
+  `None` for an unknown group, where `RunGroup::status` fails with
+  `GroupNotFound`.
+
 ### Changed
 
 - `RunGroup::forget` and `JobGroup::forget` fail with the new

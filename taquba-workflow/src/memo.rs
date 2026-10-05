@@ -93,6 +93,12 @@ impl MemoStore {
         }
     }
 
+    /// The object store and prefix of the memo store, which the group manifests
+    /// share.
+    pub(crate) fn objects(&self) -> &ObjectPrefix {
+        &self.objects
+    }
+
     /// Build a [`Memo`] bound to `(run_id, step_number)`.
     pub fn new_memo(&self, run_id: &RunId, step_number: u32) -> Memo {
         Memo::new(self.clone(), run_id, MemoScope::Step(step_number))

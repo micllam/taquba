@@ -11,8 +11,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures_util::stream::{self, FuturesUnordered, Stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
-use taquba::object_store::{ObjectStore, path::Path};
-use taquba::{KvOrder, Queue, SettlementEffects};
+use taquba::object_store::path::Path;
+use taquba::{KvOrder, Queue, QueueView, SettlementEffects};
 use tracing::warn;
 
 use crate::blob::ObjectPrefix;
@@ -100,7 +100,7 @@ pub(crate) struct Manifest {
 }
 
 /// The durable state of a group, read from its manifest and member records by
-/// [`RunGroup::status`].
+/// [`WorkflowView::group_status`](crate::WorkflowView::group_status).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupStatus {
     /// The group id.
@@ -148,45 +148,64 @@ impl MemberState {
     }
 }
 
+/// The path of the manifest of `group_id`.
+fn manifest_path(objects: &ObjectPrefix, group_id: &RunId) -> Path {
+    objects.path(&format!("groups/{group_id}/manifest"))
+}
+
+/// The manifest of `group_id` in the object store of `memos`, when one exists.
+pub(crate) async fn read_manifest(memos: &MemoStore, group_id: &RunId) -> Result<Option<Manifest>> {
+    let objects = memos.objects();
+    match objects.get(&manifest_path(objects, group_id)).await? {
+        Some(bytes) => durable::decode(&bytes).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Every member record of `group_id`, in key order. A record that fails to
+/// decode is skipped.
+pub(crate) async fn read_members(queue: &QueueView, group_id: &RunId) -> Result<Vec<MemberState>> {
+    let prefix = group_members_kv_prefix(group_id);
+    let mut members = Vec::new();
+    let mut entries =
+        std::pin::pin!(queue.kv_entries(&prefix, .., KvOrder::Ascending, MEMBER_PAGE_SIZE));
+    while let Some((kv_key, value)) = entries.try_next().await? {
+        let key = String::from_utf8_lossy(&kv_key[prefix.len()..]).into_owned();
+        if let Some(record) = durable::decode_or_absent(
+            &value,
+            "group member record",
+            &format_args!("{group_id}/{key}"),
+        ) {
+            members.push(MemberState { key, record });
+        }
+    }
+    Ok(members)
+}
+
 /// The durable state of groups: manifests under
-/// `<memo_prefix>/groups/<group_id>/manifest` in the object store and member
-/// records under `workflow/groups/<group_id>/` in the queue's KV namespace.
+/// `<memo_prefix>/groups/<group_id>/manifest` in the object store of the memo
+/// store and member records under `workflow/groups/<group_id>/` in the queue's
+/// KV namespace.
 #[derive(Clone)]
 pub(crate) struct GroupStore {
-    objects: ObjectPrefix,
     memo_store: MemoStore,
     queue: Arc<Queue>,
 }
 
 impl GroupStore {
-    pub(crate) fn new(
-        store: Arc<dyn ObjectStore>,
-        prefix: impl Into<String>,
-        memo_store: MemoStore,
-        queue: Arc<Queue>,
-    ) -> Self {
-        Self {
-            objects: ObjectPrefix::new(store, prefix),
-            memo_store,
-            queue,
-        }
-    }
-
-    fn manifest_path(&self, group_id: &RunId) -> Path {
-        self.objects.path(&format!("groups/{group_id}/manifest"))
+    pub(crate) fn new(memo_store: MemoStore, queue: Arc<Queue>) -> Self {
+        Self { memo_store, queue }
     }
 
     pub(crate) async fn read_manifest(&self, group_id: &RunId) -> Result<Option<Manifest>> {
-        match self.objects.get(&self.manifest_path(group_id)).await? {
-            Some(bytes) => durable::decode(&bytes).map(Some),
-            None => Ok(None),
-        }
+        read_manifest(&self.memo_store, group_id).await
     }
 
     async fn write_manifest(&self, manifest: &Manifest) -> Result<()> {
-        self.objects
+        let objects = self.memo_store.objects();
+        objects
             .put(
-                &self.manifest_path(&manifest.group_id),
+                &manifest_path(objects, &manifest.group_id),
                 &durable::encode(manifest),
             )
             .await
@@ -201,28 +220,9 @@ impl GroupStore {
         durable::kv_record(self.queue.view(), &group_member_kv_key(group_id, key)).await
     }
 
-    /// Every member record of `group_id`, in key order. A record that fails to
-    /// decode is skipped.
+    /// Every member record of `group_id`, in key order.
     pub(crate) async fn members(&self, group_id: &RunId) -> Result<Vec<MemberState>> {
-        let prefix = group_members_kv_prefix(group_id);
-        let mut members = Vec::new();
-        let mut entries = std::pin::pin!(self.queue.view().kv_entries(
-            &prefix,
-            ..,
-            KvOrder::Ascending,
-            MEMBER_PAGE_SIZE
-        ));
-        while let Some((kv_key, value)) = entries.try_next().await? {
-            let key = String::from_utf8_lossy(&kv_key[prefix.len()..]).into_owned();
-            if let Some(record) = durable::decode_or_absent(
-                &value,
-                "group member record",
-                &format_args!("{group_id}/{key}"),
-            ) {
-                members.push(MemberState { key, record });
-            }
-        }
-        Ok(members)
+        read_members(self.queue.view(), group_id).await
     }
 
     /// Removes the state of `group_id`. Fails with [`Error::GroupActive`] when
@@ -320,8 +320,9 @@ impl GroupStore {
         for run_id in removal.members.values().filter_map(|m| m.run_id.as_ref()) {
             self.memo_store.clear_memos_for_run(run_id).await?;
         }
-        self.objects
-            .delete(&self.manifest_path(&removal.group_id))
+        let objects = self.memo_store.objects();
+        objects
+            .delete(&manifest_path(objects, &removal.group_id))
             .await?;
         Ok(true)
     }
@@ -561,27 +562,15 @@ impl RunGroup {
         }))
     }
 
-    /// The group's durable state. Returns [`Error::GroupNotFound`] for a group
-    /// never submitted.
+    /// The group's durable state, as
+    /// [`WorkflowView::group_status`](crate::WorkflowView::group_status) reads
+    /// it. Returns [`Error::GroupNotFound`] for a group never submitted.
     pub async fn status(&self) -> Result<GroupStatus> {
-        let manifest = self.manifest().await?;
-        let mut status = GroupStatus {
-            group_id: self.id.clone(),
-            total: manifest.members.len(),
-            pending: 0,
-            succeeded: 0,
-            failed: 0,
-            cancelled: 0,
-        };
-        for member in self.members().await? {
-            match member.status() {
-                None => status.pending += 1,
-                Some(TerminalStatus::Succeeded) => status.succeeded += 1,
-                Some(TerminalStatus::Failed) => status.failed += 1,
-                Some(TerminalStatus::Cancelled) => status.cancelled += 1,
-            }
-        }
-        Ok(status)
+        self.core()
+            .view
+            .group_status(&self.id)
+            .await?
+            .ok_or_else(|| Error::GroupNotFound(self.id.clone()))
     }
 
     /// Request cancellation of every active member, as
@@ -910,6 +899,37 @@ mod tests {
         assert!(group.members().await.unwrap().is_empty());
         assert!(matches!(
             group.manifest().await,
+            Err(Error::GroupNotFound(_))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_view_reads_the_group_status_of_the_runtime() {
+        let (queue, store) = open_queue().await;
+        let runtime = WorkflowRuntime::builder(queue, store.clone(), TwoSteps, NoopTerminalHook)
+            .memo_prefix("memo")
+            .build();
+        let group = runtime.group(rid("g"));
+        // The worker loop is not spawned, so both members stay pending.
+        group
+            .submit(vec![member("a"), member("b")], &RunOptions::default())
+            .await
+            .unwrap();
+
+        let reader = taquba::QueueReader::open(store.clone(), "test")
+            .await
+            .unwrap();
+        let view = crate::WorkflowView::new(reader.view().clone(), MemoStore::new(store, "memo"));
+        let status = view
+            .group_status(&rid("g"))
+            .await
+            .unwrap()
+            .expect("submitted");
+        assert_eq!((status.total, status.pending), (2, 2));
+        assert_eq!(status, group.status().await.unwrap());
+        assert!(view.group_status(&rid("unknown")).await.unwrap().is_none());
+        assert!(matches!(
+            runtime.group(rid("unknown")).status().await,
             Err(Error::GroupNotFound(_))
         ));
     }
