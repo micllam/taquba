@@ -107,7 +107,7 @@ impl TerminalHook for ShutdownOnTermination {
             TerminalStatus::Succeeded => println!(
                 "run {} succeeded after {} steps, result: {}",
                 outcome.run_id,
-                outcome.final_step + 1,
+                outcome.final_step.number + 1,
                 String::from_utf8_lossy(outcome.result.as_deref().unwrap_or(&[]))
             ),
             _ => println!(

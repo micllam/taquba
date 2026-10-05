@@ -287,7 +287,7 @@ impl TerminalHook for ShutdownOnComplete {
     ) -> std::result::Result<(), StepError> {
         println!(
             "\n=== run {} {} (final_step={}) ===",
-            outcome.run_id, outcome.status, outcome.final_step
+            outcome.run_id, outcome.status, outcome.final_step.number
         );
         if outcome.status == TerminalStatus::Failed
             && let Some(err) = &outcome.error

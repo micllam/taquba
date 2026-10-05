@@ -124,14 +124,14 @@
 //!
 //! [`WorkflowView::status`] reads the record, the pointer and the step's queue
 //! job into a [`RunStatus`] ([`RunState::Pending`], [`RunState::Running`] or
-//! [`RunState::Cancelling`], with the current step number and its job id).
-//! [`WorkflowRuntime::status`] reads through the runtime's view, so the status
-//! is available after a restart and from any runtime over the same queue. A
-//! process without a runtime builds a [`WorkflowView`] from a
+//! [`RunState::Cancelling`], with the current step as a [`StepRef`]: its number
+//! and its job id). [`WorkflowRuntime::status`] reads through the runtime's
+//! view, so the status is available after a restart and from any runtime over
+//! the same queue. A process without a runtime builds a [`WorkflowView`] from a
 //! `taquba::QueueReader` view and a [`MemoStore`] at the runtime's memo prefix.
 //! A terminated run reports [`RunState::Terminated`] with its status, error,
-//! error kind, final step, final job id and time of termination, read from the
-//! terminal record written with the terminating settlement, which
+//! error kind, final step with its job id and time of termination, read from
+//! the terminal record written with the terminating settlement, which
 //! [Memo retention](#memo-retention) removes with the run's memo entries.
 //!
 //! [`WorkflowRuntime::wait`] waits until a run terminates, following its
@@ -635,8 +635,8 @@ pub use kv::KvReadHandle;
 pub use memo::{Memo, MemoStore};
 pub use runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 pub use runtime::{
-    RunEnd, RunOptions, RunSpec, RunState, RunStatus, RunTermination, RunnerHandle, SubmitOutcome,
-    WorkflowRuntime, WorkflowRuntimeBuilder,
+    RunEnd, RunOptions, RunSpec, RunState, RunStatus, RunTermination, RunnerHandle, StepRef,
+    SubmitOutcome, WorkflowRuntime, WorkflowRuntimeBuilder,
 };
 pub use signal::SignalOutcome;
 #[cfg(feature = "webhooks")]

@@ -19,6 +19,7 @@ use crate::group::Membership;
 use crate::keys::{HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RESERVED_HEADER_PREFIX, RunId};
 use crate::kv::KvReadHandle;
 use crate::runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
+use crate::runtime::StepRef;
 use crate::runtime::{RuntimeInner, StepEnqueueOpts};
 use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
 
@@ -127,7 +128,10 @@ impl<'a> ClaimedStep<'a> {
             result,
             error,
             headers: self.headers.clone(),
-            final_step: self.step_number,
+            final_step: StepRef {
+                number: self.step_number,
+                job_id: self.job.id.clone(),
+            },
         }
     }
 
@@ -162,7 +166,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         let outcome = claimed.failed(error.message.clone());
         let termination = self
             .core
-            .termination(&outcome, claimed, Some(error.kind), input_hash);
+            .termination(&outcome, Some(error.kind), input_hash);
         if let Err(err) = self.core.store_run_result(&outcome, &termination).await {
             warn!(run_id = %claimed.run_id, "failed to write the run result record: {err}");
         }
@@ -183,9 +187,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         input_hash: [u8; 32],
         error_kind: Option<StepErrorKind>,
     ) -> std::result::Result<SettlementEffects, WorkerError> {
-        let termination = self
-            .core
-            .termination(&outcome, claimed, error_kind, input_hash);
+        let termination = self.core.termination(&outcome, error_kind, input_hash);
         self.core
             .store_run_result(&outcome, &termination)
             .await

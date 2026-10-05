@@ -80,7 +80,7 @@ impl TerminalHook for ShutdownOnComplete {
             "completion: run={} status={:?} final_step={} result={:?} trace={:?}",
             outcome.run_id,
             outcome.status,
-            outcome.final_step,
+            outcome.final_step.number,
             result,
             outcome.headers.get("trace_id"),
         );

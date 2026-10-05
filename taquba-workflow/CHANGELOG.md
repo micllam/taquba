@@ -45,13 +45,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `WebhookTerminalHook` stages its delivery in the settlement that terminates
   the run and does not enqueue a notification job, so a host that stops its
   worker on `wait` does not leave a delivery pending.
-- `RunStatus::job_id` and `RunTermination::final_job_id`: the queue job of the
-  current or final step of a run, so a reader passes the dead job of a
-  dead-lettered run to `taquba::QueueView::job_record` without a scan of the
-  queue. The terminal record and the member record store the job id, and a
-  record written by 0.13 fails to decode with `Error::Deserialization`: drain
-  the queue and let memo and group retention remove the records of 0.13 before
-  the upgrade.
+- `StepRef`: a step of a run with its queue job. `RunStatus::step` replaces
+  `current_step`, and `RunTermination::final_step` and `RunOutcome::final_step`
+  are a `StepRef`, so a reader passes the job of the current or final step, the
+  dead job of a dead-lettered run included, to `taquba::QueueView::job_record`
+  without a scan of the queue. Read `step.number` and `final_step.number` for
+  the step numbers. The terminal record, the member record, the run result
+  record and the notification payload store the job id, and a record written by
+  0.13 fails to decode: drain the queue and let memo and group retention remove
+  the records of 0.13 before the upgrade.
 
 ### Fixed
 

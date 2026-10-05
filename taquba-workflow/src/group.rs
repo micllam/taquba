@@ -663,7 +663,7 @@ mod tests {
 
     use super::*;
     use crate::runner::{Step, StepError, StepOutcome, StepRunner};
-    use crate::runtime::{RunSpec, WorkflowRuntime};
+    use crate::runtime::{RunSpec, StepRef, WorkflowRuntime};
     use crate::terminal::NoopTerminalHook;
     use crate::test_util::{open_queue, open_queue_at, rid};
 
@@ -787,7 +787,7 @@ mod tests {
             let outcome = m.outcome.as_ref().expect("the worker recorded the outcome");
             assert_eq!(outcome.run_id, m.run_id);
             assert_eq!(
-                outcome.final_step, 1,
+                outcome.final_step.number, 1,
                 "the member terminated at its second step"
             );
             assert_eq!(outcome.result.as_deref(), Some(b"1".as_slice()));
@@ -843,7 +843,7 @@ mod tests {
             .await
             .unwrap();
         let run_id = member_run_id(&rid("g"), "a");
-        let job_id = runtime.status(&run_id).await.unwrap().unwrap().job_id;
+        let job_id = runtime.status(&run_id).await.unwrap().unwrap().step.job_id;
         assert_eq!(group.cancel().await.unwrap(), 1);
         assert_eq!(group.cancel().await.unwrap(), 0, "no member is active");
 
@@ -856,8 +856,7 @@ mod tests {
                 status: TerminalStatus::Cancelled,
                 error: None,
                 error_kind: None,
-                final_step: 0,
-                final_job_id: job_id,
+                final_step: StepRef { number: 0, job_id },
                 terminated_at_ms: 10_000,
             }
         );

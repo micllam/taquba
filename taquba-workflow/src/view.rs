@@ -5,7 +5,7 @@
 use taquba::{JobRecord, JobStatus, QueueView};
 
 use crate::durable::{
-    self, DurableCurrentStep, DurableRunRecord, DurableRunResult, DurableTermination,
+    self, DurableRunRecord, DurableRunResult, DurableStepRef, DurableTermination,
 };
 use crate::error::{Error, Result};
 use crate::group::{self, GroupStatus};
@@ -63,8 +63,7 @@ impl WorkflowView {
         Ok(Some(RunStatus {
             run_id: run_id.clone(),
             state,
-            current_step: current.step_number,
-            job_id: current.job_id,
+            step: current.into(),
         }))
     }
 
@@ -125,7 +124,7 @@ impl WorkflowView {
     pub(crate) async fn current_step_if_active(
         &self,
         run_id: &RunId,
-    ) -> Result<Option<DurableCurrentStep>> {
+    ) -> Result<Option<DurableStepRef>> {
         durable::kv_record(&self.queue, &step_kv_key(run_id)).await
     }
 
@@ -139,7 +138,7 @@ impl WorkflowView {
     pub(crate) async fn current_job(
         &self,
         run_id: &RunId,
-    ) -> Result<Option<(DurableCurrentStep, JobRecord)>> {
+    ) -> Result<Option<(DurableStepRef, JobRecord)>> {
         let mut absent: Option<String> = None;
         loop {
             let Some(current) = self.current_step_if_active(run_id).await? else {
@@ -168,8 +167,7 @@ impl WorkflowView {
     async fn terminated_status(&self, run_id: &RunId) -> Result<Option<RunStatus>> {
         Ok(self.terminal_record(run_id).await?.map(|record| RunStatus {
             run_id: run_id.clone(),
-            current_step: record.final_step,
-            job_id: record.job_id.clone(),
+            step: record.final_step.clone().into(),
             state: RunState::Terminated(record.into()),
         }))
     }

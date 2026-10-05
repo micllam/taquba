@@ -74,6 +74,7 @@ pub(crate) async fn kv_record<T: DeserializeOwned>(
 use crate::effects::StagedEffects;
 use crate::keys::RunId;
 use crate::runner::{StepErrorKind, StepOutcome, Trigger};
+use crate::runtime::StepRef;
 use crate::terminal::{RunOutcome, TerminalStatus};
 
 /// Durable per-run record written atomically with the step-0 enqueue in
@@ -103,10 +104,28 @@ pub(crate) struct DurableRunRecord {
 /// the settlement that enqueues each next step and deleted with the
 /// termination. A duplicate submission known only from the durable record, or a
 /// reader outside the process, resolves a run's live job from it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct DurableCurrentStep {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DurableStepRef {
     pub(crate) step_number: u32,
     pub(crate) job_id: String,
+}
+
+impl From<&StepRef> for DurableStepRef {
+    fn from(step: &StepRef) -> Self {
+        Self {
+            step_number: step.number,
+            job_id: step.job_id.clone(),
+        }
+    }
+}
+
+impl From<DurableStepRef> for StepRef {
+    fn from(step: DurableStepRef) -> Self {
+        Self {
+            number: step.step_number,
+            job_id: step.job_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -277,9 +296,7 @@ pub(crate) struct DurableTermination {
     pub(crate) status: DurableTerminalStatus,
     pub(crate) error: Option<String>,
     pub(crate) error_kind: Option<DurableErrorKind>,
-    pub(crate) final_step: u32,
-    /// The queue job of the final step.
-    pub(crate) job_id: String,
+    pub(crate) final_step: DurableStepRef,
     pub(crate) terminated_at_ms: u64,
     pub(crate) input_hash: [u8; 32],
 }
@@ -305,7 +322,7 @@ pub(crate) struct DurableRunOutcome {
     result: Option<Vec<u8>>,
     error: Option<String>,
     headers: HashMap<String, String>,
-    final_step: u32,
+    final_step: DurableStepRef,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -351,7 +368,7 @@ impl From<&RunOutcome> for DurableRunOutcome {
             result: outcome.result.clone(),
             error: outcome.error.clone(),
             headers: outcome.headers.clone(),
-            final_step: outcome.final_step,
+            final_step: (&outcome.final_step).into(),
         }
     }
 }
@@ -364,7 +381,7 @@ impl From<DurableRunOutcome> for RunOutcome {
             result: outcome.result,
             error: outcome.error,
             headers: outcome.headers,
-            final_step: outcome.final_step,
+            final_step: outcome.final_step.into(),
         }
     }
 }
@@ -394,7 +411,10 @@ mod tests {
             result: Some(payload.clone()),
             error: None,
             headers: HashMap::new(),
-            final_step: 0,
+            final_step: DurableStepRef {
+                step_number: 0,
+                job_id: "job".to_string(),
+            },
         };
         let stored = encode(&outcome);
         assert!(is_contiguous(&stored));

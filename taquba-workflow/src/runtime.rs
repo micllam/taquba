@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 
 use crate::durable::{
-    self, DurableCurrentStep, DurableErrorKind, DurableRunOutcome, DurableRunRecord,
-    DurableRunResult, DurableStepOutcome, DurableStepOutcomeRecord, DurableTermination,
+    self, DurableErrorKind, DurableRunOutcome, DurableRunRecord, DurableRunResult,
+    DurableStepOutcome, DurableStepOutcomeRecord, DurableStepRef, DurableTermination,
 };
 use crate::effects::{StagedEffects, TerminalEffects};
 use crate::error::{Error, Result};
@@ -33,7 +33,7 @@ use crate::worker::{ClaimedStep, StepWorker};
 
 /// The encoded current-step pointer for `job_id` at `step_number`.
 fn current_step_bytes(step_number: u32, job_id: &str) -> Vec<u8> {
-    durable::encode(&DurableCurrentStep {
+    durable::encode(&DurableStepRef {
         step_number,
         job_id: job_id.to_string(),
     })
@@ -135,6 +135,16 @@ pub struct SubmitOutcome {
     pub job_id: String,
 }
 
+/// A step of a run, with the queue job of the step.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StepRef {
+    /// The zero-based step number.
+    pub number: u32,
+    /// The id of the step's queue job, which [`taquba::QueueView::job_record`]
+    /// reads while the queue retains the job.
+    pub job_id: String,
+}
+
 /// Status snapshot of a run, read from its durable state by
 /// [`WorkflowView::status`].
 #[derive(Debug, Clone)]
@@ -143,13 +153,8 @@ pub struct RunStatus {
     pub run_id: RunId,
     /// Lifecycle state of the run's current step, or its termination.
     pub state: RunState,
-    /// Step number of the run's current step, or of the final step of a
-    /// terminated run.
-    pub current_step: u32,
-    /// The queue job of the run's current step, or of the final step of a
-    /// terminated run, which [`taquba::QueueView::job_record`] reads while the
-    /// queue retains the job.
-    pub job_id: String,
+    /// The run's current step, or the final step of a terminated run.
+    pub step: StepRef,
 }
 
 /// Lifecycle state tracked in [`RunStatus::state`].
@@ -200,12 +205,9 @@ pub struct RunTermination {
     /// [`StepErrorKind::Permanent`] for a [`StepOutcome::Fail`] outcome. `None`
     /// for a success, a cancellation and a termination outside the worker.
     pub error_kind: Option<StepErrorKind>,
-    /// The number of the step whose settlement terminated the run.
-    pub final_step: u32,
-    /// The queue job of the final step, which [`taquba::QueueView::job_record`]
-    /// reads while the queue retains the job: the dead job of a run that a
-    /// dead-letter terminated.
-    pub final_job_id: String,
+    /// The step whose settlement terminated the run. Its job is the dead job of
+    /// a run that a dead-letter terminated.
+    pub final_step: StepRef,
     /// The runtime clock's time at the terminating settlement, as a Unix
     /// timestamp in milliseconds.
     pub terminated_at_ms: u64,
@@ -217,8 +219,7 @@ impl From<DurableTermination> for RunTermination {
             status: record.status.into(),
             error: record.error,
             error_kind: record.error_kind.map(Into::into),
-            final_step: record.final_step,
-            final_job_id: record.job_id,
+            final_step: record.final_step.into(),
             terminated_at_ms: record.terminated_at_ms,
         }
     }
@@ -879,7 +880,7 @@ impl RuntimeCore {
             // reason at the API level. The effects are built before the outcome
             // is known, and the queue applies them only on `Removed`.
             let outcome = claimed.cancelled(None);
-            let termination = self.termination(&outcome, &claimed, None, input_hash);
+            let termination = self.termination(&outcome, None, input_hash);
             let effects = self.terminate_collecting_effects(&outcome, &claimed, termination);
             match self.queue.cancel_with(&job.id, effects).await?.0 {
                 taquba::CancelOutcome::Removed | taquba::CancelOutcome::Requested => {
@@ -985,7 +986,7 @@ impl RuntimeCore {
                 .clone()
                 .unwrap_or_else(|| "step dead-lettered outside the worker".to_string());
             let outcome = claimed.failed(error);
-            let termination = self.termination(&outcome, &claimed, None, record.input_hash);
+            let termination = self.termination(&outcome, None, record.input_hash);
             let effects = self.terminate_collecting_effects(&outcome, &claimed, termination);
             self.queue.commit_effects(effects).await?;
             warn!(run_id = %run_id, step_number = claimed.step_number, job_id = %job.id, "terminated a run whose step was dead-lettered outside the worker");
@@ -1041,7 +1042,7 @@ impl RuntimeCore {
     }
 
     /// The current-step pointer of a run whose durable record exists.
-    pub(crate) async fn current_step(&self, run_id: &RunId) -> Result<DurableCurrentStep> {
+    pub(crate) async fn current_step(&self, run_id: &RunId) -> Result<DurableStepRef> {
         self.view
             .current_step_if_active(run_id)
             .await?
@@ -1098,12 +1099,11 @@ impl RuntimeCore {
         }))
     }
 
-    /// The termination of `outcome`'s run at the clock's current time, by the
-    /// settlement of `terminal_step`. `input_hash` is the run record's.
+    /// The termination of `outcome`'s run at the clock's current time.
+    /// `input_hash` is the run record's.
     pub(crate) fn termination(
         &self,
         outcome: &RunOutcome,
-        terminal_step: &ClaimedStep<'_>,
         error_kind: Option<StepErrorKind>,
         input_hash: [u8; 32],
     ) -> DurableTermination {
@@ -1111,8 +1111,7 @@ impl RuntimeCore {
             status: outcome.status.into(),
             error: outcome.error.clone(),
             error_kind: error_kind.map(DurableErrorKind::from),
-            final_step: outcome.final_step,
-            job_id: terminal_step.job.id.clone(),
+            final_step: (&outcome.final_step).into(),
             terminated_at_ms: self.clock.now_ms(),
             input_hash,
         }
@@ -1623,7 +1622,7 @@ mod tests {
         assert_eq!(outcome.run_id, handle.run_id);
         assert_eq!(outcome.status, TerminalStatus::Succeeded);
         assert_eq!(outcome.result.as_deref(), Some(b"done".as_slice()));
-        assert_eq!(outcome.final_step, 0);
+        assert_eq!(outcome.final_step.number, 0);
         assert_eq!(
             terminal_status_of(&runtime, &handle.run_id).await,
             Some(TerminalStatus::Succeeded),
@@ -1674,7 +1673,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome.run_id, handle.run_id);
-        assert_eq!(outcome.final_step, 2);
+        assert_eq!(outcome.final_step.number, 2);
         assert_eq!(outcome.status, TerminalStatus::Succeeded);
         assert_eq!(outcome.result.as_deref(), Some(b"final".as_slice()));
         assert_eq!(outcome.headers.get("trace_id").unwrap(), "abc-123");
@@ -1687,7 +1686,7 @@ mod tests {
                 "the worker writes the run result record before the terminating settlement",
             );
         assert_eq!(recorded.status, TerminalStatus::Succeeded);
-        assert_eq!(recorded.final_step, 2);
+        assert_eq!(recorded.final_step.number, 2);
         assert_eq!(recorded.result.as_deref(), Some(b"final".as_slice()));
         assert_eq!(recorded.headers, outcome.headers);
 
@@ -1740,7 +1739,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(outcome.run_id, handle.run_id);
-        assert_eq!(outcome.final_step, 1);
+        assert_eq!(outcome.final_step.number, 1);
         assert_eq!(outcome.status, TerminalStatus::Succeeded);
 
         let _ = shutdown.send(());
@@ -2534,7 +2533,7 @@ mod tests {
             .unwrap()
             .expect("status");
         assert_eq!(s.state, RunState::Running);
-        assert_eq!(s.current_step, 0);
+        assert_eq!(s.step.number, 0);
 
         // A's worker is in the at-capacity select-loop. Signal shutdown first,
         // then open the gate so step 0 finishes processing inside drain mode (A
@@ -2561,7 +2560,7 @@ mod tests {
         assert_eq!(outcome.run_id, handle.run_id);
         assert_eq!(outcome.status, TerminalStatus::Succeeded);
         assert_eq!(outcome.result.as_deref(), Some(b"resumed".as_slice()));
-        assert_eq!(outcome.final_step, 1);
+        assert_eq!(outcome.final_step.number, 1);
 
         let _ = shutdown_b.send(());
     }
@@ -2996,7 +2995,7 @@ mod tests {
 
         let outcome = rx.recv().await.unwrap();
         assert_eq!(outcome.status, TerminalStatus::Cancelled);
-        assert_eq!(outcome.final_step, 1);
+        assert_eq!(outcome.final_step.number, 1);
         assert_eq!(
             terminal_status_of(&runtime, &handle.run_id).await,
             Some(outcome.status)
@@ -3043,7 +3042,7 @@ mod tests {
             .unwrap()
             .expect("active");
         assert_eq!(status.state, RunState::Pending);
-        assert_eq!(status.job_id, handle.job_id);
+        assert_eq!(status.step.job_id, handle.job_id);
 
         let was_cancelled = runtime.cancel(&handle.run_id).await.unwrap();
         assert!(was_cancelled);
@@ -3054,14 +3053,16 @@ mod tests {
                 status: TerminalStatus::Cancelled,
                 error: None,
                 error_kind: None,
-                final_step: 0,
-                final_job_id: handle.job_id.clone(),
+                final_step: StepRef {
+                    number: 0,
+                    job_id: handle.job_id.clone(),
+                },
                 terminated_at_ms: 10_000,
             }),
             "the terminal record commits with the removal",
         );
-        assert_eq!(status.current_step, 0);
-        assert_eq!(status.job_id, handle.job_id);
+        assert_eq!(status.step.number, 0);
+        assert_eq!(status.step.job_id, handle.job_id);
         assert!(
             runtime.outcome(&handle.run_id).await.unwrap().is_none(),
             "no worker terminated the run, so no run result record exists",
@@ -3139,7 +3140,7 @@ mod tests {
         assert_eq!(through_reader.run_id, handle.run_id);
         assert_eq!(through_reader.state, RunState::Pending);
         assert_eq!(through_reader.state, through_runtime.state);
-        assert_eq!(through_reader.current_step, through_runtime.current_step);
+        assert_eq!(through_reader.step.number, through_runtime.step.number);
         assert!(view.outcome(&handle.run_id).await.unwrap().is_none());
         assert!(view.status(&rid("unknown")).await.unwrap().is_none());
 
@@ -3157,8 +3158,10 @@ mod tests {
                 status: TerminalStatus::Cancelled,
                 error: None,
                 error_kind: None,
-                final_step: 0,
-                final_job_id: handle.job_id.clone(),
+                final_step: StepRef {
+                    number: 0,
+                    job_id: handle.job_id.clone(),
+                },
                 terminated_at_ms: 10_000,
             }),
         );
@@ -4573,7 +4576,7 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.run_id, "hung");
         assert_eq!(outcome.status, TerminalStatus::Failed);
-        assert_eq!(outcome.final_step, 0);
+        assert_eq!(outcome.final_step.number, 0);
         assert_eq!(
             queue
                 .view()
@@ -4661,11 +4664,11 @@ mod tests {
             .unwrap();
         let outcome = end.outcome.expect("the worker recorded the outcome");
         assert_eq!(
-            (outcome.final_step, outcome.result.as_deref()),
+            (outcome.final_step.number, outcome.result.as_deref()),
             (1, Some(b"done".as_slice()))
         );
         assert_eq!(
-            (end.termination.status, end.termination.final_step),
+            (end.termination.status, end.termination.final_step.number),
             (TerminalStatus::Succeeded, 1)
         );
 
@@ -4810,8 +4813,10 @@ mod tests {
                 status: TerminalStatus::Failed,
                 error: Some("hung".into()),
                 error_kind: None,
-                final_step: 0,
-                final_job_id: claim.id.clone(),
+                final_step: StepRef {
+                    number: 0,
+                    job_id: claim.id.clone(),
+                },
                 terminated_at_ms: 10_000,
             },
             "the termination is read from the terminal record",

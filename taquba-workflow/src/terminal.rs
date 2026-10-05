@@ -4,6 +4,7 @@ use std::future::Future;
 use crate::effects::TerminalEffects;
 use crate::keys::RunId;
 use crate::runner::StepError;
+use crate::runtime::StepRef;
 
 /// Terminal state of a workflow run, passed to a [`TerminalHook`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,8 +71,8 @@ pub struct RunOutcome {
     /// Submitter-supplied metadata, threaded through from
     /// [`crate::RunOptions::headers`].
     pub headers: HashMap<String, String>,
-    /// Step number of the step that produced the terminal outcome (zero-based).
-    pub final_step: u32,
+    /// The step that produced the terminal outcome.
+    pub final_step: StepRef,
 }
 
 /// User-implemented hook processing a run's termination.
