@@ -3,7 +3,8 @@
 //! A schedule pairs a named cron expression with a payload. When the
 //! expression's firing time arrives, the scheduler enqueues the payload onto a
 //! Taquba queue. The scheduler runs in one process and sleeps until the next
-//! firing, without polling on a fixed interval.
+//! firing, waking at least once a second to read the queue's clock. A wake
+//! without a due firing does not read from the store.
 //!
 //! # Quick start
 //!
@@ -222,6 +223,9 @@ pub const RESERVED_KV_PREFIX: &str = "cron/";
 /// queue with the dedup key of a firing suppresses that firing, so an
 /// application must not enqueue to that queue with a dedup key of this prefix.
 pub const RESERVED_DEDUP_PREFIX: &str = "cron:";
+
+/// Longest sleep of the run loop between two reads of the queue's clock.
+const MAX_SLEEP: Duration = Duration::from_secs(1);
 
 /// Delay before a schedule under backfill retries a failed enqueue.
 const ENQUEUE_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -692,10 +696,11 @@ impl CronScheduler {
     /// Run the scheduler until `shutdown` resolves.
     ///
     /// Sleeps until the soonest next firing across all entries, enqueues one
-    /// due firing per entry, then recomputes. No fixed-quantum polling. A
-    /// replay under backfill continues at the next tick, so `shutdown` and a
-    /// change through a [`ScheduleHandle`] take effect between two firings of
-    /// the replay.
+    /// due firing per entry, then recomputes. A sleep lasts at most a second,
+    /// so a firing is late by at most a second after a forward step of the
+    /// queue's clock or a suspension of the host. A replay under backfill
+    /// continues at the next tick, so `shutdown` and a change through a
+    /// [`ScheduleHandle`] take effect between two firings of the replay.
     pub async fn run<F>(mut self, shutdown: F) -> Result<()>
     where
         F: std::future::Future<Output = ()>,
@@ -715,7 +720,12 @@ impl CronScheduler {
                     "all registered cron expressions are unsatisfiable; scheduler will not fire any jobs"
                 );
             }
-            let sleep_for = soonest.map(|at| (at - self.now()).to_std().unwrap_or(Duration::ZERO));
+            let sleep_for = soonest.map(|at| {
+                (at - self.now())
+                    .to_std()
+                    .unwrap_or(Duration::ZERO)
+                    .min(MAX_SLEEP)
+            });
             let timer = async {
                 match sleep_for {
                     Some(duration) => sleep(duration).await,
@@ -1755,6 +1765,33 @@ mod tests {
             pending_fire_ms(&q, "out").await,
             vec![ms(t0() + minutes(1))]
         );
+
+        stop.send(()).unwrap();
+        run.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_fires_within_a_second_of_a_forward_step_of_the_clock() {
+        let (q, clock) = mock_clock_queue(t0() + Duration::from_secs(1)).await;
+        let s = CronScheduler::new(q.clone());
+        s.handle()
+            .schedule(Schedule::new(
+                "hourly",
+                "0 * * * *".parse().unwrap(),
+                "out",
+                b"x".to_vec(),
+            ))
+            .unwrap();
+        let (stop, shutdown) = tokio::sync::oneshot::channel::<()>();
+        let run = tokio::spawn(s.run(async {
+            let _ = shutdown.await;
+        }));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // The next firing is an hour ahead, and the clock steps there at once.
+        clock.advance(Duration::from_secs(3600));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(q.view().stats("out").await.unwrap().pending, 1);
 
         stop.send(()).unwrap();
         run.await.unwrap().unwrap();

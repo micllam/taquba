@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the dedup keys of its jobs. An application must not enqueue to the queue of a
   schedule with a dedup key of the `cron:` prefix.
 
+### Changed
+
+- The scheduler sleeps at most a second between two reads of the queue's clock,
+  so a firing is late by at most a second after a forward step of the clock or a
+  suspension of the host. 0.11 slept for the whole span to the next firing, and
+  the firing was late by the duration of the step or the suspension.
+
 <!-- vale off -->
 
 ## [0.11.0] - 2026-09-25

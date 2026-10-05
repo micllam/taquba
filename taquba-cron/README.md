@@ -13,8 +13,9 @@ queue.
 
 A schedule pairs a named cron expression with a payload. When the expression's
 firing time arrives, the scheduler enqueues the payload onto a Taquba queue. The
-scheduler runs in one process and sleeps until the next firing, without polling
-on a fixed interval.
+scheduler runs in one process and sleeps until the next firing, waking at least
+once a second to read the queue's clock. A wake without a due firing does not
+read from the store.
 
 ## Install
 
