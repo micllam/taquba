@@ -142,7 +142,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )
     .max_concurrent_steps(max_concurrent_steps)
-    .build();
+    .build()
+    .unwrap();
 
     // Worker: runs until every submitted run is terminated.
     let worker = {

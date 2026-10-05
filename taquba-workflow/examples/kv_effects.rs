@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, mut outcomes) = tokio::sync::mpsc::unbounded_channel();
     let runtime = WorkflowRuntime::builder(queue.clone(), store, OrderFlow, CollectOutcomes { tx })
         .poll_interval(Duration::from_millis(50))
-        .build();
+        .build()?;
 
     // Submit before the worker starts, so the status row still reads `received`
     // when printed below.

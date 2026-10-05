@@ -77,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(InMemory::new());
     let queue = Arc::new(Queue::open(store.clone(), "demo").await?);
 
-    let runtime = WorkflowRuntime::builder(queue, store, EchoRunner, NoopTerminalHook).build();
+    let runtime = WorkflowRuntime::builder(queue, store, EchoRunner, NoopTerminalHook).build()?;
     let worker = runtime.clone();
     tokio::spawn(async move { worker.run(std::future::pending::<()>()).await });
 

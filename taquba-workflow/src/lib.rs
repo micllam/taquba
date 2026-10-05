@@ -52,7 +52,7 @@
 //! let store = Arc::new(InMemory::new());
 //! let queue = Arc::new(Queue::open(store.clone(), "demo").await?);
 //!
-//! let runtime = WorkflowRuntime::builder(queue, store, EchoRunner, NoopTerminalHook).build();
+//! let runtime = WorkflowRuntime::builder(queue, store, EchoRunner, NoopTerminalHook).build()?;
 //!
 //! let worker = runtime.spawn(std::future::pending::<()>());
 //!
@@ -498,7 +498,7 @@
 //! ```ignore
 //! let runtime = WorkflowRuntime::builder(queue, store, runner, hook)
 //!     .memo_retention(Duration::from_secs(24 * 60 * 60))
-//!     .build();
+//!     .build()?;
 //! ```
 //!
 //! Every settlement that commits a terminal outcome (`Succeeded`, `Failed` or
@@ -545,7 +545,7 @@
 //! let clock = MockClock::new(1_700_000_000_000);
 //! let opts = OpenOptions::default().clock(Arc::new(clock.clone()));
 //! let queue = Queue::open_with_options(store.clone(), "db", opts).await?;
-//! let runtime = WorkflowRuntime::builder(queue, store, runner, hook).build();
+//! let runtime = WorkflowRuntime::builder(queue, store, runner, hook).build()?;
 //! // `runtime` reads the same clock as `queue`.
 //! ```
 //!

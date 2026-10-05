@@ -320,7 +320,7 @@ async fn main() -> Result<()> {
         },
     )
     .max_concurrent_steps(2)
-    .build();
+    .build()?;
 
     let worker_runtime = runtime.clone();
     let worker_task = tokio::spawn(async move {

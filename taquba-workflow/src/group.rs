@@ -701,8 +701,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_result_record_of_an_earlier_termination_is_not_reported_for_a_re_run_member() {
         let (queue, store, clock) = open_queue_at(10_000).await;
-        let runtime =
-            WorkflowRuntime::builder(queue.clone(), store, Rejecting, NoopTerminalHook).build();
+        let runtime = WorkflowRuntime::builder(queue.clone(), store, Rejecting, NoopTerminalHook)
+            .build()
+            .unwrap();
         let group = runtime.group(rid("g"));
         group
             .submit(vec![member("a")], &RunOptions::default())
@@ -756,7 +757,8 @@ mod tests {
         let (queue, store) = open_queue().await;
         let runtime = WorkflowRuntime::builder(queue.clone(), store, TwoSteps, NoopTerminalHook)
             .poll_interval(Duration::from_millis(10))
-            .build();
+            .build()
+            .unwrap();
         let group = runtime.group(rid("g"));
         group
             .submit(vec![member("a"), member("b")], &RunOptions::default())
@@ -802,8 +804,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_run_options_apply_to_every_member() {
         let (queue, store) = open_queue().await;
-        let runtime =
-            WorkflowRuntime::builder(queue.clone(), store, TwoSteps, NoopTerminalHook).build();
+        let runtime = WorkflowRuntime::builder(queue.clone(), store, TwoSteps, NoopTerminalHook)
+            .build()
+            .unwrap();
         let group = runtime.group(rid("g"));
         let options = RunOptions {
             priority: Some(3),
@@ -831,8 +834,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_group_cancellation_records_the_member_cancelled() {
         let (queue, store, _clock) = open_queue_at(10_000).await;
-        let runtime =
-            WorkflowRuntime::builder(queue.clone(), store, TwoSteps, NoopTerminalHook).build();
+        let runtime = WorkflowRuntime::builder(queue.clone(), store, TwoSteps, NoopTerminalHook)
+            .build()
+            .unwrap();
         let group = runtime.group(rid("g"));
         group
             .submit(vec![member("a")], &RunOptions::default())
@@ -881,7 +885,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn forget_refuses_a_group_with_an_active_member() {
         let (queue, store) = open_queue().await;
-        let runtime = WorkflowRuntime::builder(queue, store, TwoSteps, NoopTerminalHook).build();
+        let runtime = WorkflowRuntime::builder(queue, store, TwoSteps, NoopTerminalHook)
+            .build()
+            .unwrap();
         let group = runtime.group(rid("g"));
         group
             .submit(vec![member("a")], &RunOptions::default())
@@ -908,7 +914,8 @@ mod tests {
         let (queue, store) = open_queue().await;
         let runtime = WorkflowRuntime::builder(queue, store.clone(), TwoSteps, NoopTerminalHook)
             .memo_prefix("memo")
-            .build();
+            .build()
+            .unwrap();
         let group = runtime.group(rid("g"));
         // The worker loop is not spawned, so both members stay pending.
         group
@@ -937,7 +944,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_removal_does_not_apply_after_a_later_submission() {
         let (queue, store) = open_queue().await;
-        let runtime = WorkflowRuntime::builder(queue, store, TwoSteps, NoopTerminalHook).build();
+        let runtime = WorkflowRuntime::builder(queue, store, TwoSteps, NoopTerminalHook)
+            .build()
+            .unwrap();
         let group = runtime.group(rid("g"));
         let options = RunOptions::default();
         group.submit(vec![member("a")], &options).await.unwrap();
@@ -955,7 +964,8 @@ mod tests {
         let (queue, store, clock) = open_queue_at(10_000).await;
         let runtime = WorkflowRuntime::builder(queue.clone(), store, TwoSteps, NoopTerminalHook)
             .group_retention(Duration::from_secs(1))
-            .build();
+            .build()
+            .unwrap();
         let group = runtime.group(rid("g"));
         let sweep = runtime.inner.core.group_sweep.as_ref().unwrap();
         let options = RunOptions::default();
@@ -999,7 +1009,8 @@ mod tests {
         let runtime =
             WorkflowRuntime::builder(queue.clone(), store.clone(), TwoSteps, NoopTerminalHook)
                 .group_retention(Duration::from_secs(1))
-                .build();
+                .build()
+                .unwrap();
         let group = runtime.group(rid("g"));
         group
             .submit(vec![member("a")], &RunOptions::default())

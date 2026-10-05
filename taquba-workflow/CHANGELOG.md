@@ -32,6 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Submit a run, or enqueue to another queue.
 - `Error::ReservedHeaderInSubmit` becomes `Error::ReservedHeader`, because it is
   also returned for the header of an enqueue. Rename the variant in a match.
+- `WorkflowRuntimeBuilder::build` returns `Result` and fails with the error of
+  the new `TerminalHook::check_runtime`, which checks a hook's configuration
+  against the runtime's queue. `WebhookTerminalHook` fails with
+  `Error::ReservedQueue` when its target queue is the runtime's queue, where
+  0.13 dead-lettered the notification of each run. Add `?` to each call of
+  `build`.
 
 ### Fixed
 

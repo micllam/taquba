@@ -330,7 +330,21 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     }
 
     /// Finalise the builder.
-    pub fn build(self) -> WorkflowRuntime<R, H>
+    ///
+    /// # Errors
+    ///
+    /// The error of [`TerminalHook::check_runtime`] for the configured queue
+    /// name.
+    pub fn build(self) -> Result<WorkflowRuntime<R, H>>
+    where
+        H: 'static,
+    {
+        self.terminal_hook.check_runtime(&self.queue_name)?;
+        Ok(self.assemble())
+    }
+
+    /// The runtime of this configuration, without the check of the hook.
+    pub(crate) fn assemble(self) -> WorkflowRuntime<R, H>
     where
         H: 'static,
     {
@@ -1525,7 +1539,8 @@ mod tests {
             RenewingRunner { queue, tx },
             ChannelHook { tx: hook_tx },
         )
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         runtime
@@ -1564,7 +1579,8 @@ mod tests {
             }]),
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let handle = runtime
@@ -1609,7 +1625,8 @@ mod tests {
             ]),
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let handle = runtime
@@ -1668,7 +1685,8 @@ mod tests {
             ]),
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let handle = runtime
@@ -1767,7 +1785,8 @@ mod tests {
             },
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
         (runtime, observed, rx)
     }
 
@@ -2167,7 +2186,8 @@ mod tests {
             FixedRunner::new(Err(StepError::permanent("nope"))),
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
         runtime
             .submit(RunSpec {
                 input: b"x".to_vec(),
@@ -2208,7 +2228,8 @@ mod tests {
             ScriptedRunner::new(vec![]),
             NoopTerminalHook,
         )
-        .build();
+        .build()
+        .unwrap();
         // No worker loop runs, so the step stays queued and the run is active
         // for every later submit.
         let spec = |input: &[u8], key: &[u8]| RunSpec {
@@ -2253,7 +2274,8 @@ mod tests {
             )]),
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(first.clone());
         let submitted = first
             .submit(RunSpec {
@@ -2285,7 +2307,8 @@ mod tests {
             ScriptedRunner::new(vec![]),
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
         let duplicate = second
             .submit(RunSpec {
                 run_id: Some(rid("durable")),
@@ -2325,8 +2348,9 @@ mod tests {
 
         let t0 = 1_700_000_000_000;
         let (queue, store, clock) = open_queue_at(t0).await;
-        let runtime =
-            WorkflowRuntime::builder(queue.clone(), store, Echo, NoopTerminalHook).build();
+        let runtime = WorkflowRuntime::builder(queue.clone(), store, Echo, NoopTerminalHook)
+            .build()
+            .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         runtime
@@ -2380,7 +2404,8 @@ mod tests {
             Recording(seen.clone()),
             NoopTerminalHook,
         )
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let outcome = runtime
@@ -2404,8 +2429,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn concurrent_submits_of_one_run_admit_one_and_reject_a_changed_input() {
         let (queue, store) = open_queue().await;
-        let runtime =
-            WorkflowRuntime::builder(queue, store.clone(), PauseRunner, NoopTerminalHook).build();
+        let runtime = WorkflowRuntime::builder(queue, store.clone(), PauseRunner, NoopTerminalHook)
+            .build()
+            .unwrap();
         let spec = |input: &[u8]| RunSpec {
             run_id: Some(rid("raced")),
             input: input.to_vec(),
@@ -2453,7 +2479,8 @@ mod tests {
         let runtime_a =
             WorkflowRuntime::builder(queue.clone(), store.clone(), runner, NoopTerminalHook)
                 .max_concurrent_steps(1)
-                .build();
+                .build()
+                .unwrap();
 
         let (shutdown_a_tx, shutdown_a_rx) = oneshot::channel::<()>();
         let worker_a = {
@@ -2497,7 +2524,8 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime_b =
             WorkflowRuntime::builder(queue, store.clone(), CompleteOnStep1, ChannelHook { tx })
-                .build();
+                .build()
+                .unwrap();
         let shutdown_b = spawn_runtime(runtime_b.clone());
 
         let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -2535,7 +2563,8 @@ mod tests {
             NoopTerminalHook,
         )
         .step_output_replay()
-        .build();
+        .build()
+        .unwrap();
 
         runtime
             .submit(RunSpec {
@@ -2604,7 +2633,8 @@ mod tests {
             NoopTerminalHook,
         )
         .step_output_replay()
-        .build();
+        .build()
+        .unwrap();
 
         runtime
             .submit(RunSpec {
@@ -2666,7 +2696,8 @@ mod tests {
             ChannelHook { tx },
         )
         .step_output_replay()
-        .build();
+        .build()
+        .unwrap();
 
         runtime
             .submit(RunSpec {
@@ -2737,7 +2768,8 @@ mod tests {
             ChannelHook { tx },
         )
         .memo_retention(Duration::from_secs(60))
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let handle = runtime
@@ -2810,7 +2842,8 @@ mod tests {
             }]),
             ChannelHook { tx: tx_a },
         )
-        .build();
+        .build()
+        .unwrap();
 
         let handle = before
             .submit(RunSpec {
@@ -2835,7 +2868,8 @@ mod tests {
             }]),
             ChannelHook { tx: tx_b },
         )
-        .build();
+        .build()
+        .unwrap();
         assert_eq!(
             after.status(&handle.run_id).await.unwrap().map(|s| s.state),
             Some(RunState::Cancelling),
@@ -2888,7 +2922,8 @@ mod tests {
             ]),
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
 
         let handle = runtime
             .submit(RunSpec {
@@ -2958,7 +2993,8 @@ mod tests {
             ChannelHook { tx },
         )
         .memo_retention(Duration::from_secs(60))
-        .build();
+        .build()
+        .unwrap();
         // Note: deliberately do NOT spawn the worker loop, so the submitted
         // step stays Pending in the queue while we cancel it.
 
@@ -3063,7 +3099,8 @@ mod tests {
             NoopTerminalHook,
         )
         .memo_prefix("memo")
-        .build();
+        .build()
+        .unwrap();
         // The worker loop is not spawned, so the step stays pending.
         let handle = runtime.submit(RunSpec::default()).await.unwrap();
 
@@ -3110,7 +3147,8 @@ mod tests {
         .await;
         let runtime = WorkflowRuntime::builder(queue, store, UnreachableRunner, NoopTerminalHook)
             .memo_prefix("memo")
-            .build();
+            .build()
+            .unwrap();
         let handle = runtime
             .submit(RunSpec {
                 input: vec![7u8; 512],
@@ -3146,7 +3184,8 @@ mod tests {
             runner,
             ChannelHook { tx: hook_tx },
         )
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let handle = runtime
@@ -3244,7 +3283,8 @@ mod tests {
             },
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let handle = runtime
@@ -3296,7 +3336,8 @@ mod tests {
             }]),
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let handle = runtime
@@ -3370,8 +3411,9 @@ mod tests {
 
         let (queue, store) = open_queue_with(fast_options()).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime =
-            WorkflowRuntime::builder(queue, store, MemoRetryRunner, ChannelHook { tx }).build();
+        let runtime = WorkflowRuntime::builder(queue, store, MemoRetryRunner, ChannelHook { tx })
+            .build()
+            .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         runtime
@@ -3414,7 +3456,8 @@ mod tests {
             ChannelHook { tx },
         )
         .memo_retention(Duration::from_secs(60))
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let handle = runtime
@@ -3450,7 +3493,8 @@ mod tests {
             ScriptedRunner::new(vec![]),
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
 
         let err = runtime
             .submit(RunSpec {
@@ -3530,7 +3574,8 @@ mod tests {
             ScriptedRunner::new(vec![]),
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
         let index = ExpiryIndex::new(b"app/expiry/".to_vec());
         queue.kv_put(b"app/stale", b"1").await.unwrap();
         // An entry at 9_000 sets the bound of the index, so a pass reads the
@@ -3574,7 +3619,8 @@ mod tests {
             ChannelHook { tx },
         )
         .memo_retention(Duration::from_secs(60))
-        .build();
+        .build()
+        .unwrap();
 
         let memos = MemoStore::new(store, "workflow-steps-memo");
         memos
@@ -3617,7 +3663,8 @@ mod tests {
         let runtime =
             WorkflowRuntime::builder(queue.clone(), store.clone(), runner, ChannelHook { tx })
                 .memo_retention(Duration::from_secs(60))
-                .build();
+                .build()
+                .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let handle = runtime
@@ -3702,7 +3749,8 @@ mod tests {
             ChannelHook { tx },
         )
         .memo_retention(Duration::from_secs(60))
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let handle = runtime
@@ -3789,7 +3837,8 @@ mod tests {
             ChannelHook { tx },
         )
         .memo_retention(Duration::from_secs(60))
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let handle = runtime
@@ -3833,7 +3882,8 @@ mod tests {
             ChannelHook { tx },
         )
         .memo_retention(Duration::from_secs(1))
-        .build();
+        .build()
+        .unwrap();
 
         let memos = MemoStore::new(store, "workflow-steps-memo");
         let sweep = runtime.inner.core.memo_sweep.as_ref().unwrap();
@@ -3872,7 +3922,8 @@ mod tests {
             NoopTerminalHook,
         )
         .memo_retention(Duration::from_secs(1))
-        .build();
+        .build()
+        .unwrap();
         let spec = RunSpec {
             run_id: Some(rid("shared")),
             input: b"x".to_vec(),
@@ -3957,7 +4008,8 @@ mod tests {
         )
         .memo_retention(Duration::from_millis(200))
         .poll_interval(Duration::from_millis(10))
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let handle = runtime
@@ -4024,7 +4076,8 @@ mod tests {
             ChannelHook { tx },
         )
         .memo_retention(Duration::from_millis(100))
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let memos = MemoStore::new(store.clone(), "workflow-steps-memo");
@@ -4113,7 +4166,8 @@ mod tests {
             ]),
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         runtime
@@ -4177,7 +4231,8 @@ mod tests {
             },
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         runtime
@@ -4216,8 +4271,9 @@ mod tests {
 
         let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime =
-            WorkflowRuntime::builder(queue, store, JournalRunner, ChannelHook { tx }).build();
+        let runtime = WorkflowRuntime::builder(queue, store, JournalRunner, ChannelHook { tx })
+            .build()
+            .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         runtime
@@ -4249,7 +4305,8 @@ mod tests {
             })]),
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let handle = runtime
@@ -4305,7 +4362,8 @@ mod tests {
             SelfCancellingRunner,
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         runtime
@@ -4338,7 +4396,8 @@ mod tests {
             })]),
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let handle = runtime
@@ -4397,7 +4456,8 @@ mod tests {
             },
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let handle = runtime
@@ -4448,7 +4508,8 @@ mod tests {
         let runtime =
             WorkflowRuntime::builder(queue.clone(), store, PauseRunner, ChannelHook { tx })
                 .poll_interval(Duration::from_millis(10))
-                .build();
+                .build()
+                .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let submitted = runtime
@@ -4549,7 +4610,8 @@ mod tests {
             ]),
             NoopTerminalHook,
         )
-        .build();
+        .build()
+        .unwrap();
         assert!(matches!(
             runtime.wait(&rid("absent")).await,
             Err(Error::RunNotFound(id)) if id == "absent"
@@ -4595,7 +4657,8 @@ mod tests {
             })),
             NoopTerminalHook,
         )
-        .build();
+        .build()
+        .unwrap();
         let spec = RunSpec {
             run_id: Some(rid("again")),
             input: b"x".to_vec(),
@@ -4643,7 +4706,8 @@ mod tests {
         let (queue, store, _clock) = open_queue_at(10_000).await;
         let runtime =
             WorkflowRuntime::builder(queue.clone(), store, UnreachableRunner, NoopTerminalHook)
-                .build();
+                .build()
+                .unwrap();
         let spec = RunSpec {
             run_id: Some(rid("again")),
             input: b"x".to_vec(),
@@ -4672,7 +4736,8 @@ mod tests {
         let runtime =
             WorkflowRuntime::builder(queue.clone(), store, UnreachableRunner, NoopTerminalHook)
                 .poll_interval(Duration::from_millis(10))
-                .build();
+                .build()
+                .unwrap();
         runtime
             .submit(RunSpec {
                 run_id: Some(rid("hung")),
@@ -4734,7 +4799,8 @@ mod tests {
         let (queue, store) = open_queue().await;
         let runtime =
             WorkflowRuntime::builder(queue.clone(), store, UnreachableRunner, NoopTerminalHook)
-                .build();
+                .build()
+                .unwrap();
         let submitted = runtime
             .submit(RunSpec {
                 run_id: Some(rid("torn")),
@@ -4793,7 +4859,8 @@ mod tests {
             },
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let group = runtime.group(rid("g"));
@@ -4874,7 +4941,8 @@ mod tests {
             NoopTerminalHook,
         )
         .step_output_replay()
-        .build();
+        .build()
+        .unwrap();
 
         queue.kv_put(b"app/stale", b"old").await.unwrap();
         runtime
@@ -4969,7 +5037,8 @@ mod tests {
             },
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
 
         runtime
             .submit(RunSpec {
@@ -5069,7 +5138,8 @@ mod tests {
             ScriptedRunner::new(vec![StepOutcome::Succeed { result: Vec::new() }]),
             EffectHook,
         )
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         runtime
@@ -5127,7 +5197,8 @@ mod tests {
                 calls: calls.clone(),
             },
         )
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         runtime
@@ -5154,7 +5225,8 @@ mod tests {
             ScriptedRunner::new(vec![StepOutcome::Succeed { result: Vec::new() }]),
             NoopTerminalHook,
         )
-        .build();
+        .build()
+        .unwrap();
         runtime
             .submit(RunSpec {
                 input: Vec::new(),
@@ -5185,6 +5257,22 @@ mod tests {
 
     #[cfg(feature = "webhooks")]
     #[tokio::test(start_paused = true)]
+    async fn a_webhook_hook_that_targets_the_runtime_queue_fails_the_build() {
+        use crate::terminal::WebhookTerminalHook;
+
+        let (queue, store) = open_queue().await;
+        let built = WorkflowRuntime::builder(
+            queue,
+            store,
+            UnreachableRunner,
+            WebhookTerminalHook::new("workflow-steps"),
+        )
+        .build();
+        assert!(matches!(built, Err(Error::ReservedQueue(q)) if q == "workflow-steps"));
+    }
+
+    #[cfg(feature = "webhooks")]
+    #[tokio::test(start_paused = true)]
     async fn the_webhook_hook_stages_its_delivery_as_a_notification_effect() {
         use crate::terminal::WebhookTerminalHook;
 
@@ -5200,7 +5288,8 @@ mod tests {
             ]),
             WebhookTerminalHook::new("callbacks"),
         )
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         runtime
@@ -5284,7 +5373,8 @@ mod tests {
             },
             ChannelHook { tx },
         )
-        .build();
+        .build()
+        .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         runtime

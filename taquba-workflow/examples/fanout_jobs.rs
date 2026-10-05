@@ -169,7 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             shutdown: tokio::sync::Mutex::new(Some(tx)),
         },
     )
-    .build();
+    .build()?;
 
     let worker_runtime = runtime.clone();
     let worker_task = tokio::spawn(async move {

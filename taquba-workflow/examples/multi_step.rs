@@ -107,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .max_concurrent_steps(4)
     .poll_interval(Duration::from_millis(50))
-    .build();
+    .build()?;
 
     // Spawn the worker loop. It exits when `rx` resolves (fired by the hook on
     // terminal status).

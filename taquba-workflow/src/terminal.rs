@@ -119,6 +119,14 @@ pub trait TerminalHook: Send + Sync {
         let _ = outcome;
         true
     }
+
+    /// Check the hook's configuration against a runtime with the queue
+    /// `runtime_queue`. [`WorkflowRuntimeBuilder::build`](crate::WorkflowRuntimeBuilder::build)
+    /// fails with the error. Defaults to `Ok`.
+    fn check_runtime(&self, runtime_queue: &str) -> crate::Result<()> {
+        let _ = runtime_queue;
+        Ok(())
+    }
 }
 
 /// A no-op terminal hook. Declares itself unobservant, so runs terminate
@@ -143,6 +151,7 @@ impl TerminalHook for NoopTerminalHook {
 #[cfg(feature = "webhooks")]
 mod webhook {
     use super::{RunOutcome, StepError, TerminalEffects, TerminalHook, TerminalStatus};
+    use crate::error::Error;
     use std::time::Duration;
     use taquba_webhooks::{WebhookRequest, webhook_enqueue_request};
 
@@ -230,6 +239,15 @@ mod webhook {
 
         fn observes(&self, outcome: &RunOutcome) -> bool {
             outcome.headers.contains_key(&self.url_header)
+        }
+
+        /// Fails with [`Error::ReservedQueue`] when the target queue is the
+        /// queue of the runtime.
+        fn check_runtime(&self, runtime_queue: &str) -> crate::Result<()> {
+            if self.target_queue == runtime_queue {
+                return Err(Error::ReservedQueue(self.target_queue.clone()));
+            }
+            Ok(())
         }
     }
 }

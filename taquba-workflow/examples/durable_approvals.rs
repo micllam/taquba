@@ -242,7 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )
     .poll_interval(Duration::from_millis(200))
-    .build();
+    .build()?;
 
     match mode {
         Mode::Clear => {

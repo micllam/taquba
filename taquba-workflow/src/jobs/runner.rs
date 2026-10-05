@@ -423,7 +423,8 @@ impl JobRunnerBuilder {
             builder = builder.group_retention(retention);
         }
         JobRunner {
-            runtime: builder.build(),
+            // The check of `NoopTerminalHook` accepts every runtime.
+            runtime: builder.assemble(),
         }
     }
 }

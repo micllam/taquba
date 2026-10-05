@@ -159,7 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )
     .poll_interval(Duration::from_millis(200))
-    .build();
+    .build()?;
 
     // Submission is idempotent on the run id across restarts: a later process
     // finds the durable run record and this call is a no-op.
