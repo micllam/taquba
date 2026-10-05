@@ -137,17 +137,17 @@ impl EffectsHandle {
     }
 }
 
-/// Effects staged by a [`TerminalHook`](crate::TerminalHook) during a
-/// notification delivery, applied in the same transaction as the notification
-/// job's acknowledgement.
+/// Effects staged by a [`TerminalHook`](crate::TerminalHook). Effects staged in
+/// [`TerminalHook::stage_effects`](crate::TerminalHook::stage_effects) are
+/// applied in the settlement that terminates the run, and effects staged in
+/// [`TerminalHook::on_termination`](crate::TerminalHook::on_termination) in the
+/// same transaction as the notification job's acknowledgement.
 ///
-/// Passed to
-/// [`TerminalHook::on_termination`](crate::TerminalHook::on_termination).
 /// Beyond the KV writes and deletes of [`EffectsHandle`] (validated by the same
 /// rules), a hook stages follow-up enqueues, so work that a run's termination
-/// starts is created atomically with the notification being acknowledged.
-/// Effects are applied only when the hook returns `Ok`. A retried hook stages
-/// its effects again.
+/// starts is created atomically with the termination or with the notification's
+/// acknowledgement. The effects of `on_termination` are applied only when it
+/// returns `Ok`, and a retried `on_termination` stages its effects again.
 ///
 /// The handle is sealed once the hook returns. Staging through a clone retained
 /// past that point returns [`Error::EffectsSealed`]. Use

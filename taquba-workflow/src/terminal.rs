@@ -76,9 +76,13 @@ pub struct RunOutcome {
 
 /// User-implemented hook processing a run's termination.
 ///
-/// Termination is delivered as a queue job: the settlement that commits a run's
-/// terminal outcome atomically enqueues a **notification job** on the same
-/// queue, and the hook runs as that job's worker. The consequences:
+/// A hook acts at two points. [`Self::stage_effects`] stages effects into the
+/// settlement that terminates the run, and [`Self::on_termination`] runs after
+/// that commit, as the worker of a notification job. [`Self::observes`] decides
+/// whether the notification job is enqueued.
+///
+/// The settlement that commits a run's terminal outcome atomically enqueues the
+/// **notification job** on the same queue. The consequences:
 ///
 /// - The hook observes only outcomes that committed. A settlement that
 ///   loses its claim loses its notification with it, so a redelivered
@@ -90,9 +94,9 @@ pub struct RunOutcome {
 ///   `max_attempts`. A transient error ([`StepError::transient`]) retries the
 ///   notification job per the queue's backoff up to `max_attempts`. A permanent
 ///   error dead-letters it, where [`taquba::QueueView::dead_jobs`] finds it.
-/// - Effects staged on the [`TerminalEffects`] handle are applied in
-///   the same transaction as the notification's acknowledgement when
-///   the hook returns `Ok`.
+/// - Effects that [`Self::on_termination`] stages on its [`TerminalEffects`]
+///   handle are applied in the same transaction as the notification's
+///   acknowledgement when it returns `Ok`.
 ///
 /// Runs terminated without an acknowledging settlement (an external
 /// cancellation of a pending step, a step that dead-letters) enqueue the
@@ -127,6 +131,18 @@ pub trait TerminalHook: Send + Sync {
         let _ = runtime_queue;
         Ok(())
     }
+
+    /// Stage effects that commit in the settlement that terminates the run of
+    /// `outcome`, on every termination path: the worker's settlement, an
+    /// external cancellation and the reconciliation of a step dead-lettered
+    /// outside the worker. A settlement that fails calls the method again at
+    /// the redelivery of the step, so it must stage from `outcome` alone and
+    /// stage the same effects for the same outcome. A staging error of
+    /// `effects` is a programming error: the hook logs it and drops the effect,
+    /// and the run terminates. Defaults to staging nothing.
+    fn stage_effects(&self, outcome: &RunOutcome, effects: &TerminalEffects) {
+        let _ = (outcome, effects);
+    }
 }
 
 /// A no-op terminal hook. Declares itself unobservant, so runs terminate
@@ -154,19 +170,21 @@ mod webhook {
     use crate::error::Error;
     use std::time::Duration;
     use taquba_webhooks::{WebhookRequest, webhook_enqueue_request};
+    use tracing::error;
 
     /// Terminal hook that delivers an HTTP webhook via `taquba-webhooks` when a
     /// run terminates.
     ///
     /// The hook reads the target URL from the run's submission headers under
-    /// [`Self::URL_HEADER`] (default `"callback_url"`). Runs without that
-    /// header enqueue no notification at all. The default key intentionally
-    /// avoids the reserved `workflow.*` prefix so submitters can set it
-    /// directly via [`crate::RunOptions::headers`].
+    /// [`Self::URL_HEADER`] (default `"callback_url"`). A run without that
+    /// header does not enqueue a delivery. The default key intentionally avoids
+    /// the reserved `workflow.*` prefix so submitters can set it directly via
+    /// [`crate::RunOptions::headers`].
     ///
-    /// The webhook enqueue is staged as a notification effect, so the delivery
-    /// job is created exactly once, atomically with the notification's
-    /// acknowledgement.
+    /// The webhook enqueue is staged in the settlement that terminates the run,
+    /// so the delivery job is created exactly once and atomically with the
+    /// termination. No notification job is enqueued. A hook whose target is the
+    /// runtime's own queue fails the build of the runtime.
     ///
     /// The webhook body is the raw `result` bytes for succeeded runs, and the
     /// UTF-8 error message for failed runs. The run identifier and terminal
@@ -212,11 +230,19 @@ mod webhook {
     impl TerminalHook for WebhookTerminalHook {
         async fn on_termination(
             &self,
-            outcome: &RunOutcome,
-            effects: &TerminalEffects,
+            _outcome: &RunOutcome,
+            _effects: &TerminalEffects,
         ) -> std::result::Result<(), StepError> {
+            Ok(())
+        }
+
+        fn observes(&self, _outcome: &RunOutcome) -> bool {
+            false
+        }
+
+        fn stage_effects(&self, outcome: &RunOutcome, effects: &TerminalEffects) {
             let Some(url) = outcome.headers.get(&self.url_header) else {
-                return Ok(());
+                return;
             };
             let mut req = WebhookRequest::new(url)
                 .header("Workflow-Run-Id", outcome.run_id.as_str())
@@ -231,14 +257,9 @@ mod webhook {
                 }
             };
             let request = webhook_enqueue_request(&self.target_queue, req, body);
-            effects
-                .enqueue(request)
-                .map_err(|e| StepError::permanent(e.to_string()))?;
-            Ok(())
-        }
-
-        fn observes(&self, outcome: &RunOutcome) -> bool {
-            outcome.headers.contains_key(&self.url_header)
+            if let Err(err) = effects.enqueue(request) {
+                error!(run_id = %outcome.run_id, error = %err, "dropped the webhook delivery of a terminated run");
+            }
         }
 
         /// Fails with [`Error::ReservedQueue`] when the target queue is the

@@ -566,12 +566,20 @@
 //! ([`StepError::transient`]) retries the notification per the queue's backoff
 //! up to the terminal step's `max_attempts`. A permanent error dead-letters it.
 //!
-//! The hook stages effects on a [`TerminalEffects`] handle: KV writes and
-//! deletes plus follow-up enqueues, applied in the same transaction as the
+//! `on_termination` stages effects on a [`TerminalEffects`] handle: KV writes
+//! and deletes plus follow-up enqueues, applied in the same transaction as the
 //! notification's acknowledgement. [`TerminalHook::observes`] (default `true`)
 //! is consulted when a run terminates. When it returns `false`, the runtime
 //! skips the notification job for that run. [`NoopTerminalHook`] does not
 //! observe any run, so runs terminate without a notification job.
+//!
+//! [`TerminalHook::stage_effects`] (default: none) stages effects on a
+//! [`TerminalEffects`] handle that commit in the settlement that terminates the
+//! run, on every termination path below. A failed settlement calls it again at
+//! the redelivery of the step, so it must stage from the outcome alone. It does
+//! not return a result, so a hook must log a staging error, and the effect is
+//! dropped. A hook that only stages effects returns `false` from `observes`,
+//! and its runs terminate without a notification job.
 //!
 //! Runs terminated without an acknowledging settlement (an external
 //! cancellation of a pending step, a step that dead-letters) settle their
@@ -587,10 +595,11 @@
 //! transaction.
 //!
 //! `WebhookTerminalHook` (enabled by the `webhooks` feature) delivers HTTP
-//! callbacks via `taquba-webhooks`, staging the delivery enqueue as a
-//! notification effect so it is created exactly once with the acknowledgement.
-//! Set the per-run URL on [`RunOptions::headers`]`["callback_url"]`. Runs
-//! without that header enqueue no notification.
+//! callbacks via `taquba-webhooks`. It stages the delivery enqueue through
+//! [`TerminalHook::stage_effects`], so the delivery is created exactly once
+//! with the termination and no notification job is enqueued. Set the per-run
+//! URL on [`RunOptions::headers`]`["callback_url"]`. Runs without that header
+//! enqueue no delivery.
 //!
 //! [Taquba]: https://docs.rs/taquba
 

@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without a runtime reads them through a `taquba::QueueReader`. It returns
   `None` for an unknown group, where `RunGroup::status` fails with
   `GroupNotFound`.
+- `TerminalHook::stage_effects`: effects that commit in the settlement that
+  terminates a run, on every termination path, so a hook that only writes
+  records does not need a notification job. Return `false` from `observes` in
+  such a hook.
 
 ### Changed
 
@@ -38,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Error::ReservedQueue` when its target queue is the runtime's queue, where
   0.13 dead-lettered the notification of each run. Add `?` to each call of
   `build`.
+- `WebhookTerminalHook` stages its delivery in the settlement that terminates
+  the run and does not enqueue a notification job, so a host that stops its
+  worker on `wait` does not leave a delivery pending.
 
 ### Fixed
 

@@ -16,7 +16,7 @@ use crate::durable::{
     self, DurableCurrentStep, DurableErrorKind, DurableRunOutcome, DurableRunRecord,
     DurableRunResult, DurableStepOutcome, DurableStepOutcomeRecord, DurableTermination,
 };
-use crate::effects::StagedEffects;
+use crate::effects::{StagedEffects, TerminalEffects};
 use crate::error::{Error, Result};
 use crate::group::{GroupStore, Membership, RunGroup, pending_member, terminated_member};
 use crate::keys::{
@@ -349,10 +349,6 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
         H: 'static,
     {
         let terminal_hook = Arc::new(self.terminal_hook);
-        let observes: Arc<dyn Fn(&RunOutcome) -> bool + Send + Sync> = {
-            let hook = terminal_hook.clone();
-            Arc::new(move |outcome| hook.observes(outcome))
-        };
         let memo_prefix = self
             .memo_prefix
             .unwrap_or_else(|| format!("{}-memo", self.queue_name));
@@ -387,7 +383,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
             group_sweep,
             step_output_replay: self.step_output_replay,
             clock: self.clock,
-            observes,
+            terminal_staging: terminal_hook.clone(),
         };
         let inner = RuntimeInner {
             runner: self.runner,
@@ -465,9 +461,26 @@ pub(crate) struct RuntimeCore {
     /// Time source. Defaults to the queue's clock. A test can substitute a
     /// [`MockClock`](taquba::MockClock) to virtualise time.
     pub(crate) clock: Arc<dyn Clock>,
-    /// [`TerminalHook::observes`] of the runtime's hook, which decides whether
-    /// a termination enqueues a notification job.
-    observes: Arc<dyn Fn(&RunOutcome) -> bool + Send + Sync>,
+    /// The synchronous methods of the runtime's hook, which stage the effects
+    /// of a termination and decide whether it enqueues a notification job.
+    terminal_staging: Arc<dyn TerminalStaging>,
+}
+
+/// The synchronous methods of a [`TerminalHook`], held by [`RuntimeCore`]
+/// without the hook's type.
+trait TerminalStaging: Send + Sync {
+    fn observes(&self, outcome: &RunOutcome) -> bool;
+    fn stage_effects(&self, outcome: &RunOutcome, effects: &TerminalEffects);
+}
+
+impl<H: TerminalHook> TerminalStaging for H {
+    fn observes(&self, outcome: &RunOutcome) -> bool {
+        TerminalHook::observes(self, outcome)
+    }
+
+    fn stage_effects(&self, outcome: &RunOutcome, effects: &TerminalEffects) {
+        TerminalHook::stage_effects(self, outcome, effects);
+    }
 }
 
 impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
@@ -871,7 +884,8 @@ impl RuntimeCore {
     /// Settle a run into its terminal state: return the deletes of the durable
     /// run record and the current-step pointer, the writes of the terminal
     /// record and the terminal marker (when memo retention is enabled), the
-    /// write of the member record (when the run is a group member) and the
+    /// write of the member record (when the run is a group member), the effects
+    /// that the hook stages through [`TerminalHook::stage_effects`] and the
     /// terminal-notification enqueue (when the hook observes this outcome) as
     /// [`SettlementEffects`] for the settlement transaction. The notification
     /// job's payload is the committed outcome and the configured
@@ -890,27 +904,27 @@ impl RuntimeCore {
         termination: DurableTermination,
     ) -> SettlementEffects {
         let terminated_at_ms = termination.terminated_at_ms;
-        let kv_deletes = vec![run_kv_key(&outcome.run_id), step_kv_key(&outcome.run_id)];
-        let mut kv_writes = HashMap::new();
-        kv_writes.insert(
+        let staging = TerminalEffects::for_delivery(&self.queue_name);
+        self.terminal_staging.stage_effects(outcome, &staging);
+        let mut effects = staging.seal_into_settlement();
+        effects
+            .kv_deletes
+            .extend([run_kv_key(&outcome.run_id), step_kv_key(&outcome.run_id)]);
+        effects.kv_writes.insert(
             outcome_kv_key(&outcome.run_id),
             durable::encode(&termination),
         );
         if let Some(membership) = &terminal_step.membership {
-            kv_writes.insert(
+            effects.kv_writes.insert(
                 membership.kv_key(),
                 durable::encode(&terminated_member(&outcome.run_id, termination)),
             );
         }
-        let enqueues = if (self.observes)(outcome) {
-            vec![self.notification_enqueue_request(outcome, Some(terminal_step.job))]
-        } else {
-            Vec::new()
-        };
-        let effects = SettlementEffects::default()
-            .enqueues(enqueues)
-            .kv_writes(kv_writes)
-            .kv_deletes(kv_deletes);
+        if self.terminal_staging.observes(outcome) {
+            effects
+                .enqueues
+                .push(self.notification_enqueue_request(outcome, Some(terminal_step.job)));
+        }
         match &self.memo_sweep {
             Some(sweep) => sweep.mark(effects, &outcome.run_id, terminated_at_ms),
             None => effects,
@@ -5255,6 +5269,96 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn staged_hook_effects_commit_on_every_termination_path() {
+        /// Stages a record of each termination and does not observe an outcome.
+        struct StagingHook;
+
+        impl TerminalHook for StagingHook {
+            async fn on_termination(
+                &self,
+                _: &RunOutcome,
+                _: &TerminalEffects,
+            ) -> std::result::Result<(), StepError> {
+                unreachable!("the hook observes no outcome")
+            }
+
+            fn observes(&self, _: &RunOutcome) -> bool {
+                false
+            }
+
+            fn stage_effects(&self, outcome: &RunOutcome, effects: &TerminalEffects) {
+                effects
+                    .put(
+                        format!("app/terminated/{}", outcome.run_id),
+                        outcome.status.as_str(),
+                    )
+                    .unwrap();
+            }
+        }
+
+        let (queue, store) = open_queue().await;
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            ScriptedRunner::new(vec![StepOutcome::Succeed { result: Vec::new() }]),
+            StagingHook,
+        )
+        .build()
+        .unwrap();
+        let spec = |id: &str| RunSpec {
+            run_id: Some(rid(id)),
+            input: Vec::new(),
+            ..Default::default()
+        };
+
+        // The worker's settlement.
+        runtime.submit(spec("settled")).await.unwrap();
+        let job = queue
+            .claim("workflow-steps", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let effects = runtime
+            .inner
+            .process_step(&job, &LeaseHandle::detached())
+            .await
+            .unwrap();
+        queue.ack_with(&job, effects).await.unwrap();
+
+        // An external cancellation of a pending step.
+        runtime.submit(spec("cancelled")).await.unwrap();
+        assert!(runtime.cancel(&rid("cancelled")).await.unwrap());
+
+        // The reconciliation of a step dead-lettered outside the worker.
+        runtime.submit(spec("dead")).await.unwrap();
+        let job = queue
+            .claim("workflow-steps", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        queue.dead_letter(&job, "hung").await.unwrap();
+        assert_eq!(runtime.inner.core.reconcile_dead_steps().await.unwrap(), 1);
+
+        for (id, status) in [
+            ("settled", "succeeded"),
+            ("cancelled", "cancelled"),
+            ("dead", "failed"),
+        ] {
+            let key = format!("app/terminated/{id}");
+            let value = queue.view().kv_get(key.as_bytes()).await.unwrap();
+            assert_eq!(value.as_deref(), Some(status.as_bytes()), "run {id}");
+        }
+        assert!(
+            queue
+                .claim("workflow-steps", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_none(),
+            "no notification job is enqueued"
+        );
+    }
+
     #[cfg(feature = "webhooks")]
     #[tokio::test(start_paused = true)]
     async fn a_webhook_hook_that_targets_the_runtime_queue_fails_the_build() {
@@ -5273,25 +5377,20 @@ mod tests {
 
     #[cfg(feature = "webhooks")]
     #[tokio::test(start_paused = true)]
-    async fn the_webhook_hook_stages_its_delivery_as_a_notification_effect() {
+    async fn the_webhook_hook_stages_its_delivery_in_the_terminating_settlement() {
         use crate::terminal::WebhookTerminalHook;
 
         let (queue, store) = open_queue().await;
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store,
-            ScriptedRunner::new(vec![
-                StepOutcome::Succeed {
-                    result: b"payload".to_vec(),
-                },
-                StepOutcome::Succeed { result: Vec::new() },
-            ]),
+            ScriptedRunner::new(vec![StepOutcome::Succeed {
+                result: b"payload".to_vec(),
+            }]),
             WebhookTerminalHook::new("callbacks"),
         )
         .build()
         .unwrap();
-        let shutdown = spawn_runtime(runtime.clone());
-
         runtime
             .submit(RunSpec {
                 run_id: Some(rid("with-callback")),
@@ -5307,17 +5406,23 @@ mod tests {
             })
             .await
             .unwrap();
+        let job = queue
+            .claim("workflow-steps", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let effects = runtime
+            .inner
+            .process_step(&job, &LeaseHandle::detached())
+            .await
+            .unwrap();
+        queue.ack_with(&job, effects).await.unwrap();
 
-        let webhook = loop {
-            if let Some(job) = queue
-                .claim("callbacks", Duration::from_secs(30))
-                .await
-                .unwrap()
-            {
-                break job;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
+        let webhook = queue
+            .claim("callbacks", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .expect("the delivery committed with the termination");
         assert_eq!(webhook.payload.as_slice(), b"payload");
         assert_eq!(
             webhook.headers.get("webhook.url").unwrap(),
@@ -5327,26 +5432,14 @@ mod tests {
             webhook.headers.get("http.Workflow-Run-Status").unwrap(),
             "succeeded"
         );
-
-        // A run without a callback header does not enqueue a notification.
-        runtime
-            .submit(RunSpec {
-                run_id: Some(rid("without-callback")),
-                input: Vec::new(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        wait_for_drained(&queue).await;
         assert!(
             queue
-                .claim("callbacks", Duration::from_secs(30))
+                .claim("workflow-steps", Duration::from_secs(30))
                 .await
                 .unwrap()
-                .is_none()
+                .is_none(),
+            "no notification job is enqueued"
         );
-
-        let _ = shutdown.send(());
     }
 
     #[tokio::test(start_paused = true)]
