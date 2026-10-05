@@ -38,7 +38,7 @@
 //   `curl -s -X POST localhost:3000/jobs/<id>/cancel`
 //
 // This is a recipe to copy and adapt. It is not a production admin plane, and
-// it lacks authentication, TLS and rate limiting. Because a store is
+// it does not have authentication, TLS or rate limiting. Because a store is
 // single-writer, an admin surface that mutates state (requeue, cancel) must
 // live inside the process that owns the queue, as it does here.
 

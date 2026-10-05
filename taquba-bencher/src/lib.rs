@@ -55,9 +55,10 @@ pub fn store_from_env(latency_ms: u64) -> Result<Arc<dyn ObjectStore>, Box<dyn s
         );
     }
     let url = url::Url::parse(&raw)?;
-    // object_store's config keys are lowercase versions of the provider env var
-    // names. The prefix filter keeps unrelated env vars whose lowercase form is
-    // also a valid config key (TOKEN, ENDPOINT) out of the store configuration.
+    // object_store's config keys are lower-case versions of the provider env
+    // var names. The prefix filter keeps unrelated env vars whose lower-case
+    // form is also a valid config key (TOKEN, ENDPOINT) out of the store
+    // configuration.
     let options = std::env::vars().filter_map(|(key, value)| {
         let key = key.to_ascii_lowercase();
         (key.starts_with("aws_") || key.starts_with("google_") || key.starts_with("azure_"))

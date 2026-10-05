@@ -157,7 +157,7 @@ pub(crate) fn hash_input(input: &[u8]) -> [u8; 32] {
     Sha256::digest(input).into()
 }
 
-/// The lowercase hex SHA-256 digest of `parts` concatenated.
+/// The lower-case hex SHA-256 digest of `parts` concatenated.
 pub(crate) fn hex_sha256(parts: &[&[u8]]) -> String {
     use sha2::{Digest, Sha256};
     use std::fmt::Write;
@@ -212,8 +212,8 @@ impl RunId {
         Self(ulid::Ulid::new().to_string())
     }
 
-    /// The id that is the lowercase hex SHA-256 digest of `parts` concatenated,
-    /// valid by construction.
+    /// The id that is the lower-case hex SHA-256 digest of `parts`
+    /// concatenated, valid by construction.
     pub(crate) fn digest(parts: &[&[u8]]) -> Self {
         Self(hex_sha256(parts))
     }

@@ -3218,7 +3218,7 @@ mod tests {
         // A runner that watches `step.cancel_token` short-circuits long
         // after-claim work as soon as `WorkflowRuntime::cancel` is called.
         // Without the token, step duration bounds the cancellation latency.
-        // With it, the runner returns essentially immediately. The test pins
+        // With it, the runner returns essentially immediately. The test checks
         // this with a step that otherwise sleeps for 30 seconds. If the token
         // does not fire, the test times out.
         struct CooperativeRunner {

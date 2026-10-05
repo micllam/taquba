@@ -30,7 +30,7 @@ pub enum TerminalStatus {
 }
 
 impl TerminalStatus {
-    /// Canonical lowercase identifier for this status, suitable for HTTP
+    /// Canonical lower-case identifier for this status, suitable for HTTP
     /// headers, structured logs and other wire-format use. Stable across minor
     /// releases.
     pub fn as_str(&self) -> &'static str {

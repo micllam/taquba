@@ -196,7 +196,8 @@ mod imp {
             description: &str,
             labels: &[(&str, &str)],
         ) -> Arc<dyn UpDownCounterFn> {
-            // `metrics` lacks an up-down counter, so map it onto a gauge.
+            // `metrics` does not have an up-down counter, so map it onto a
+            // gauge.
             let name = name.to_string();
             metrics::describe_gauge!(name.clone(), description.to_string());
             Arc::new(UpDownCounterHandle(metrics::gauge!(

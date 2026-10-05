@@ -732,7 +732,8 @@ mod tests {
         q.ack(&kept_job).await.unwrap();
         q.ack(&transient_job).await.unwrap();
 
-        // The "transient" queue lacks a retention: ack dropped the record.
+        // The "transient" queue does not have a retention: ack dropped the
+        // record.
         assert!(
             q.view().get_job(&transient_id).await.unwrap().is_none(),
             "queues without keep_done_jobs must drop on ack"

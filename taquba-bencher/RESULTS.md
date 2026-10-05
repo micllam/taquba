@@ -16,9 +16,9 @@ the version and environment that produced it.
   rerun it.
 - **The commit is the provenance anchor.** This crate is unpublished and does
   not have a version of its own. Because it and `taquba` move together in one
-  repo, the entry's commit pins everything at once: taquba's source, the bench
-  code and the bench's default parameters. Two entries are comparable only if
-  the bench code did not change between their commits.
+  repo, the entry's commit records everything at once: taquba's source, the
+  bench code and the bench's default parameters. Two entries are comparable only
+  if the bench code did not change between their commits.
 - **A changed benchmark starts a new series.** When a bench's workload, defaults
   or what it measures changes in a way that affects its numbers, note the change
   in the next entry. Treat that bench's earlier entries as a closed series, and

@@ -61,11 +61,11 @@ pub enum KvOrder {
     Descending,
 }
 
-/// A range of keys within a prefix, as
-/// [`QueueView::kv_scan`](crate::QueueView::kv_scan) takes it. The standard
-/// range forms over any byte string implement it: `..`, `key..`, `..key`,
-/// `..=key`, `a..b` and `a..=b`. A pair of [`Bound`]s implements it, which is
-/// the form of an exclusive start.
+/// A range of keys within a prefix, for the `range` parameter of
+/// [`QueueView::kv_scan`](crate::QueueView::kv_scan). The standard range forms
+/// over any byte string implement it: `..`, `key..`, `..key`, `..=key`, `a..b`
+/// and `a..=b`. A pair of [`Bound`]s implements it, which is the form of an
+/// exclusive start.
 pub trait KvRange {
     /// The lower bound of the range.
     fn start_bound(&self) -> Bound<&[u8]>;
