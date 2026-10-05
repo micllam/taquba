@@ -153,8 +153,9 @@ each next step and identifies the queue job that `SubmitOutcome::job_id` reports
 for a duplicate. Both are removed when the run reaches a terminal state.
 
 `WorkflowView::status` reads the record, the pointer and the step's queue job
-into a `RunStatus` (`Pending`, `Running` or `Cancelling`, with the current step
-as a `StepRef`: its number and its job id). `WorkflowRuntime::status` reads
+into a `RunStatus`: the lifecycle position of the current step (`Pending`,
+`Scheduled`, `Waiting`, `Running`, `Cancelling` or `DeadLettered`) and the step
+as a `StepRef`, its number and its job id. `WorkflowRuntime::status` reads
 through the runtime's view, so the status is available after a restart and from
 any runtime over the same queue. A process without a runtime builds a
 `WorkflowView` from a `QueueReader` view and a `MemoStore` at the runtime's memo

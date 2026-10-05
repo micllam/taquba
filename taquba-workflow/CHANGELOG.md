@@ -54,6 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record and the notification payload store the job id, and a record written by
   0.13 fails to decode: drain the queue and let memo and group retention remove
   the records of 0.13 before the upgrade.
+- `RunState::Scheduled`, `RunState::Waiting` and `RunState::DeadLettered`:
+  `status` reports a delayed step, a step that waits for a signal and a step
+  that the queue dead-lettered outside the worker, which 0.13 reported as
+  `Pending`. A dead-lettered step takes precedence over a cancellation request:
+  `cancel` returns `false` for the run, and the reconciliation of the worker
+  terminates it as `Failed`. Add the three variants to a match on `RunState`.
 
 ### Fixed
 

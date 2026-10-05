@@ -160,14 +160,31 @@ pub struct RunStatus {
 /// Lifecycle state tracked in [`RunStatus::state`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunState {
-    /// A step job exists in the queue but has not yet been claimed.
+    /// The current step's job is ready for a worker to claim.
     Pending,
+    /// The current step's job becomes claimable at `run_at_ms`, a Unix
+    /// timestamp in milliseconds: a step after a [`Trigger::After`] delay, or a
+    /// retry after a transient error.
+    Scheduled {
+        /// The time from which a worker can claim the job.
+        run_at_ms: u64,
+    },
+    /// The current step is waiting for a signal under `correlation_key`
+    /// ([`Trigger::OnSignal`]), and becomes claimable at `timeout_at_ms`
+    /// without one.
+    Waiting {
+        /// The key that [`WorkflowRuntime::signal`] delivers to.
+        correlation_key: String,
+        /// The end of the wait without a signal, as a Unix timestamp in
+        /// milliseconds.
+        timeout_at_ms: u64,
+    },
     /// A step is currently being processed by a worker.
     Running,
     /// [`WorkflowRuntime::cancel`] was called for this run and the run has not
     /// yet terminated. Reported until the in-flight step returns and the
-    /// runtime settles the run as [`crate::TerminalStatus::Cancelled`]. After
-    /// that, [`WorkflowRuntime::status`] returns `None`.
+    /// runtime settles the run as [`crate::TerminalStatus::Cancelled`], which
+    /// [`Self::Terminated`] reports.
     ///
     /// Only set by external cancellation. A pure runner-issued
     /// [`crate::StepOutcome::Cancel`] (without an external `cancel()` call)
@@ -175,6 +192,12 @@ pub enum RunState {
     /// `Cancelling`: a runner-issued cancel is observed when `run_step`
     /// returns, and the run terminates at that point.
     Cancelling,
+    /// The queue dead-lettered the current step's job outside the worker: a
+    /// lease that expired past the attempt limit, or a claim dead-lettered by
+    /// crash recovery at open. The reconciliation of the worker terminates the
+    /// run as [`crate::TerminalStatus::Failed`], and
+    /// [`WorkflowRuntime::cancel`] returns `false` for the run.
+    DeadLettered,
     /// The run reached a terminal state. Reported from the run's terminal
     /// record, written with the terminating settlement and removed with the
     /// run's memo entries by the memo sweep under
@@ -1730,6 +1753,12 @@ mod tests {
         );
         let stats = queue.view().stats("workflow-steps").await.unwrap();
         assert_eq!(stats.scheduled, 1);
+        assert_eq!(
+            runtime.status(&handle.run_id).await.unwrap().unwrap().state,
+            RunState::Scheduled {
+                run_at_ms: initial + 60_000
+            }
+        );
 
         advance(&clock, Duration::from_secs(61)).await;
         queue.promote_scheduled_now().await.unwrap();
@@ -1821,7 +1850,7 @@ mod tests {
             signal_probe_runtime(queue.clone(), store, "order-1", Duration::from_secs(3600));
         let shutdown = spawn_runtime(runtime.clone());
 
-        runtime
+        let handle = runtime
             .submit(RunSpec {
                 input: Vec::new(),
                 ..Default::default()
@@ -1829,6 +1858,13 @@ mod tests {
             .await
             .unwrap();
         wait_for_scheduled(&queue, 1).await;
+        assert_eq!(
+            runtime.status(&handle.run_id).await.unwrap().unwrap().state,
+            RunState::Waiting {
+                correlation_key: "order-1".to_string(),
+                timeout_at_ms: 1_700_000_000_000 + 3_600_000,
+            }
+        );
 
         let outcome = runtime.signal("order-1", b"paid".to_vec()).await.unwrap();
         assert_eq!(outcome, SignalOutcome::Delivered);
@@ -4792,6 +4828,11 @@ mod tests {
         assert!(
             !runtime.cancel(&rid("hung")).await.unwrap(),
             "the request is not honoured"
+        );
+        assert_eq!(
+            runtime.status(&rid("hung")).await.unwrap().unwrap().state,
+            RunState::DeadLettered,
+            "the dead step takes precedence over the cancellation request"
         );
         assert!(
             runtime

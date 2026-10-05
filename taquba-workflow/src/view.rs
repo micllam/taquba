@@ -9,7 +9,7 @@ use crate::durable::{
 };
 use crate::error::{Error, Result};
 use crate::group::{self, GroupStatus};
-use crate::keys::{RunId, outcome_kv_key, run_kv_key, step_kv_key};
+use crate::keys::{HEADER_SIGNAL_WAIT, RunId, outcome_kv_key, run_kv_key, step_kv_key};
 use crate::memo::{MemoStore, RUN_RESULT_MEMO_KEY};
 use crate::runtime::{RunResult, RunState, RunStatus, RunTermination};
 use crate::terminal::{RunOutcome, TerminalStatus};
@@ -39,7 +39,8 @@ impl WorkflowView {
     /// [`RunState::Terminated`] until the memo sweep removes its terminal
     /// record, and a run that is unknown or swept is `None`. A run with a
     /// pending cancellation request reports [`RunState::Cancelling`] at every
-    /// lifecycle position of its step, until the run terminates.
+    /// lifecycle position of its step except a dead-lettered step, until the
+    /// run terminates.
     ///
     /// When a second read returns the current-step pointer with its job still
     /// absent, the call fails with [`Error::InconsistentRunState`]. The runtime
@@ -53,12 +54,12 @@ impl WorkflowView {
         let Some((current, job)) = self.current_job(run_id).await? else {
             return self.terminated_status(run_id).await;
         };
-        let state = if record.cancel_requested {
-            RunState::Cancelling
-        } else if job.status == JobStatus::Claimed {
-            RunState::Running
-        } else {
-            RunState::Pending
+        let state = match job.status {
+            JobStatus::Dead => RunState::DeadLettered,
+            _ if record.cancel_requested => RunState::Cancelling,
+            JobStatus::Claimed => RunState::Running,
+            JobStatus::Scheduled => scheduled_state(&job),
+            JobStatus::Pending | JobStatus::Done => RunState::Pending,
         };
         Ok(Some(RunStatus {
             run_id: run_id.clone(),
@@ -217,5 +218,19 @@ impl WorkflowView {
                 },
             ),
         )
+    }
+}
+
+/// The state of a run whose current step's job is scheduled: a wait for a
+/// signal when the job has the [`HEADER_SIGNAL_WAIT`] header, a delay
+/// otherwise.
+fn scheduled_state(job: &JobRecord) -> RunState {
+    let run_at_ms = job.run_at.unwrap_or_default();
+    match job.headers.get(HEADER_SIGNAL_WAIT) {
+        Some(correlation_key) => RunState::Waiting {
+            correlation_key: correlation_key.clone(),
+            timeout_at_ms: run_at_ms,
+        },
+        None => RunState::Scheduled { run_at_ms },
     }
 }

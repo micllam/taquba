@@ -123,11 +123,13 @@
 //! when the run reaches a terminal state.
 //!
 //! [`WorkflowView::status`] reads the record, the pointer and the step's queue
-//! job into a [`RunStatus`] ([`RunState::Pending`], [`RunState::Running`] or
-//! [`RunState::Cancelling`], with the current step as a [`StepRef`]: its number
-//! and its job id). [`WorkflowRuntime::status`] reads through the runtime's
-//! view, so the status is available after a restart and from any runtime over
-//! the same queue. A process without a runtime builds a [`WorkflowView`] from a
+//! job into a [`RunStatus`]: the lifecycle position of the current step
+//! ([`RunState::Pending`], [`RunState::Scheduled`], [`RunState::Waiting`],
+//! [`RunState::Running`], [`RunState::Cancelling`] or
+//! [`RunState::DeadLettered`]) and the step as a [`StepRef`], its number and
+//! its job id. [`WorkflowRuntime::status`] reads through the runtime's view, so
+//! the status is available after a restart and from any runtime over the same
+//! queue. A process without a runtime builds a [`WorkflowView`] from a
 //! `taquba::QueueReader` view and a [`MemoStore`] at the runtime's memo prefix.
 //! A terminated run reports [`RunState::Terminated`] with its status, error,
 //! error kind, final step with its job id and time of termination, read from
