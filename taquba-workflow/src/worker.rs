@@ -162,7 +162,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         let outcome = claimed.failed(error.message.clone());
         let termination = self
             .core
-            .termination(&outcome, Some(error.kind), input_hash);
+            .termination(&outcome, claimed, Some(error.kind), input_hash);
         if let Err(err) = self.core.store_run_result(&outcome, &termination).await {
             warn!(run_id = %claimed.run_id, "failed to write the run result record: {err}");
         }
@@ -183,7 +183,9 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         input_hash: [u8; 32],
         error_kind: Option<StepErrorKind>,
     ) -> std::result::Result<SettlementEffects, WorkerError> {
-        let termination = self.core.termination(&outcome, error_kind, input_hash);
+        let termination = self
+            .core
+            .termination(&outcome, claimed, error_kind, input_hash);
         self.core
             .store_run_result(&outcome, &termination)
             .await

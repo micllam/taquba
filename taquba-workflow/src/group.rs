@@ -843,6 +843,7 @@ mod tests {
             .await
             .unwrap();
         let run_id = member_run_id(&rid("g"), "a");
+        let job_id = runtime.status(&run_id).await.unwrap().unwrap().job_id;
         assert_eq!(group.cancel().await.unwrap(), 1);
         assert_eq!(group.cancel().await.unwrap(), 0, "no member is active");
 
@@ -856,6 +857,7 @@ mod tests {
                 error: None,
                 error_kind: None,
                 final_step: 0,
+                final_job_id: job_id,
                 terminated_at_ms: 10_000,
             }
         );

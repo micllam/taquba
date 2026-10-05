@@ -146,6 +146,10 @@ pub struct RunStatus {
     /// Step number of the run's current step, or of the final step of a
     /// terminated run.
     pub current_step: u32,
+    /// The queue job of the run's current step, or of the final step of a
+    /// terminated run, which [`taquba::QueueView::job_record`] reads while the
+    /// queue retains the job.
+    pub job_id: String,
 }
 
 /// Lifecycle state tracked in [`RunStatus::state`].
@@ -198,6 +202,10 @@ pub struct RunTermination {
     pub error_kind: Option<StepErrorKind>,
     /// The number of the step whose settlement terminated the run.
     pub final_step: u32,
+    /// The queue job of the final step, which [`taquba::QueueView::job_record`]
+    /// reads while the queue retains the job: the dead job of a run that a
+    /// dead-letter terminated.
+    pub final_job_id: String,
     /// The runtime clock's time at the terminating settlement, as a Unix
     /// timestamp in milliseconds.
     pub terminated_at_ms: u64,
@@ -210,6 +218,7 @@ impl From<DurableTermination> for RunTermination {
             error: record.error,
             error_kind: record.error_kind.map(Into::into),
             final_step: record.final_step,
+            final_job_id: record.job_id,
             terminated_at_ms: record.terminated_at_ms,
         }
     }
@@ -870,7 +879,7 @@ impl RuntimeCore {
             // reason at the API level. The effects are built before the outcome
             // is known, and the queue applies them only on `Removed`.
             let outcome = claimed.cancelled(None);
-            let termination = self.termination(&outcome, None, input_hash);
+            let termination = self.termination(&outcome, &claimed, None, input_hash);
             let effects = self.terminate_collecting_effects(&outcome, &claimed, termination);
             match self.queue.cancel_with(&job.id, effects).await?.0 {
                 taquba::CancelOutcome::Removed | taquba::CancelOutcome::Requested => {
@@ -976,7 +985,7 @@ impl RuntimeCore {
                 .clone()
                 .unwrap_or_else(|| "step dead-lettered outside the worker".to_string());
             let outcome = claimed.failed(error);
-            let termination = self.termination(&outcome, None, record.input_hash);
+            let termination = self.termination(&outcome, &claimed, None, record.input_hash);
             let effects = self.terminate_collecting_effects(&outcome, &claimed, termination);
             self.queue.commit_effects(effects).await?;
             warn!(run_id = %run_id, step_number = claimed.step_number, job_id = %job.id, "terminated a run whose step was dead-lettered outside the worker");
@@ -1089,11 +1098,12 @@ impl RuntimeCore {
         }))
     }
 
-    /// The termination of `outcome`'s run at the clock's current time.
-    /// `input_hash` is the run record's.
+    /// The termination of `outcome`'s run at the clock's current time, by the
+    /// settlement of `terminal_step`. `input_hash` is the run record's.
     pub(crate) fn termination(
         &self,
         outcome: &RunOutcome,
+        terminal_step: &ClaimedStep<'_>,
         error_kind: Option<StepErrorKind>,
         input_hash: [u8; 32],
     ) -> DurableTermination {
@@ -1102,6 +1112,7 @@ impl RuntimeCore {
             error: outcome.error.clone(),
             error_kind: error_kind.map(DurableErrorKind::from),
             final_step: outcome.final_step,
+            job_id: terminal_step.job.id.clone(),
             terminated_at_ms: self.clock.now_ms(),
             input_hash,
         }
@@ -3032,6 +3043,7 @@ mod tests {
             .unwrap()
             .expect("active");
         assert_eq!(status.state, RunState::Pending);
+        assert_eq!(status.job_id, handle.job_id);
 
         let was_cancelled = runtime.cancel(&handle.run_id).await.unwrap();
         assert!(was_cancelled);
@@ -3043,11 +3055,13 @@ mod tests {
                 error: None,
                 error_kind: None,
                 final_step: 0,
+                final_job_id: handle.job_id.clone(),
                 terminated_at_ms: 10_000,
             }),
             "the terminal record commits with the removal",
         );
         assert_eq!(status.current_step, 0);
+        assert_eq!(status.job_id, handle.job_id);
         assert!(
             runtime.outcome(&handle.run_id).await.unwrap().is_none(),
             "no worker terminated the run, so no run result record exists",
@@ -3144,6 +3158,7 @@ mod tests {
                 error: None,
                 error_kind: None,
                 final_step: 0,
+                final_job_id: handle.job_id.clone(),
                 terminated_at_ms: 10_000,
             }),
         );
@@ -4796,6 +4811,7 @@ mod tests {
                 error: Some("hung".into()),
                 error_kind: None,
                 final_step: 0,
+                final_job_id: claim.id.clone(),
                 terminated_at_ms: 10_000,
             },
             "the termination is read from the terminal record",

@@ -64,6 +64,7 @@ impl WorkflowView {
             run_id: run_id.clone(),
             state,
             current_step: current.step_number,
+            job_id: current.job_id,
         }))
     }
 
@@ -168,6 +169,7 @@ impl WorkflowView {
         Ok(self.terminal_record(run_id).await?.map(|record| RunStatus {
             run_id: run_id.clone(),
             current_step: record.final_step,
+            job_id: record.job_id.clone(),
             state: RunState::Terminated(record.into()),
         }))
     }

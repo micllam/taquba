@@ -278,6 +278,8 @@ pub(crate) struct DurableTermination {
     pub(crate) error: Option<String>,
     pub(crate) error_kind: Option<DurableErrorKind>,
     pub(crate) final_step: u32,
+    /// The queue job of the final step.
+    pub(crate) job_id: String,
     pub(crate) terminated_at_ms: u64,
     pub(crate) input_hash: [u8; 32],
 }
