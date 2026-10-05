@@ -120,6 +120,13 @@ cargo add taquba --features gcp    # Google Cloud Storage
 cargo add taquba --features azure  # Azure Blob
 ```
 
+`open_url` opens the store of a URL such as `s3://bucket/prefix` and returns it
+with the path that the URL gives within the store. It takes the provider options
+from the variables whose name starts with `AWS_`, `GOOGLE_` or `AZURE_`, so
+`taquba::open_url(&url, std::env::vars())` configures the store from the
+environment, and a variable of another program, such as `TOKEN`, stays out of
+the configuration.
+
 The optional `metrics` feature emits queue health metrics (throughput, dead rate
 and claim/ack/enqueue latency histograms) through the
 [`metrics`](https://docs.rs/metrics) facade. The crate does not pull in an

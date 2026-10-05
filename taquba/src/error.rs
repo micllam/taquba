@@ -126,6 +126,28 @@ pub enum Error {
         /// The empty store path.
         path: String,
     },
+
+    /// [`crate::open_url`] could not open a store from the URL.
+    #[error("invalid store URL `{url}`: {source}")]
+    InvalidStoreUrl {
+        /// The URL as passed.
+        url: String,
+        /// Why the URL was rejected.
+        #[source]
+        source: StoreUrlError,
+    },
+}
+
+/// The cause of an [`Error::InvalidStoreUrl`].
+#[derive(Debug, Error)]
+pub enum StoreUrlError {
+    /// The URL does not parse.
+    #[error("{0}")]
+    Url(#[source] url::ParseError),
+    /// The object store rejected the URL: its scheme is unknown or requires a
+    /// backend feature that is not enabled, or the provider rejected an option.
+    #[error("{0}")]
+    Store(#[source] slatedb::object_store::Error),
 }
 
 impl Error {
@@ -150,7 +172,8 @@ impl Error {
             | Self::InvalidId { .. }
             | Self::DuplicateJobId { .. }
             | Self::InvalidQueueName { .. }
-            | Self::PayloadMissing { .. } => true,
+            | Self::PayloadMissing { .. }
+            | Self::InvalidStoreUrl { .. } => true,
             Self::Storage(_) | Self::PayloadStore(_) | Self::StoreNotInitialized { .. } => false,
         }
     }
@@ -179,5 +202,12 @@ mod tests {
             .is_permanent()
         );
         assert!(Error::DuplicateJobId { id: "job-1".into() }.is_permanent());
+        assert!(
+            Error::InvalidStoreUrl {
+                url: "x".into(),
+                source: StoreUrlError::Url(url::ParseError::EmptyHost),
+            }
+            .is_permanent()
+        );
     }
 }

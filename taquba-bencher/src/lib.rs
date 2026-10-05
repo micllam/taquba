@@ -5,10 +5,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use taquba::object_store::ObjectStore;
 use taquba::object_store::memory::InMemory;
 use taquba::object_store::prefix::PrefixStore;
 use taquba::object_store::throttle::{ThrottleConfig, ThrottledStore};
-use taquba::object_store::{ObjectStore, parse_url_opts};
 
 mod counting;
 pub use counting::CountingStore;
@@ -54,17 +54,7 @@ pub fn store_from_env(latency_ms: u64) -> Result<Arc<dyn ObjectStore>, Box<dyn s
                 .into(),
         );
     }
-    let url = url::Url::parse(&raw)?;
-    // object_store's config keys are lower-case versions of the provider env
-    // var names. The prefix filter keeps unrelated env vars whose lower-case
-    // form is also a valid config key (TOKEN, ENDPOINT) out of the store
-    // configuration.
-    let options = std::env::vars().filter_map(|(key, value)| {
-        let key = key.to_ascii_lowercase();
-        (key.starts_with("aws_") || key.starts_with("google_") || key.starts_with("azure_"))
-            .then_some((key, value))
-    });
-    let (store, path) = parse_url_opts(&url, options)?;
+    let (store, path) = taquba::open_url(&raw, std::env::vars())?;
     // Each run goes to a unique prefix so concurrent or repeated runs do not
     // collide. STORE_PREFIX overrides it with a fixed value, which lets several
     // processes (such as cold_start's build and measure phases) share one

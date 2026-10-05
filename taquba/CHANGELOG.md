@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SlateDB's compactor and garbage collector, so a store maintained outside the
   process opens without them. Both default to `true`, and an existing open is
   unchanged.
+- `open_url`: the object store of a URL with the path that the URL gives, with
+  the provider options from the variables whose name starts with `AWS_`,
+  `GOOGLE_` or `AZURE_`. A URL that does not open fails with the new
+  `Error::InvalidStoreUrl`, whose `StoreUrlError` source is the parse error of
+  the URL or the error of the object store.
 
 ### Changed
 

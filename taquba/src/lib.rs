@@ -401,6 +401,13 @@
 //! cargo add taquba --features azure  # Azure Blob
 //! ```
 //!
+//! [`open_url`] opens the store of a URL such as `s3://bucket/prefix` and
+//! returns it with the path that the URL gives within the store. It takes the
+//! provider options from the variables whose name starts with `AWS_`, `GOOGLE_`
+//! or `AZURE_`, so `taquba::open_url(&url, std::env::vars())` configures the
+//! store from the environment, and a variable of another program, such as
+//! `TOKEN`, stays out of the configuration.
+//!
 //! The optional `metrics` feature emits queue health metrics (throughput, dead
 //! rate and claim/ack/enqueue latency histograms) through the
 //! [`metrics`](https://docs.rs/metrics) facade. The crate does not pull in an
@@ -443,6 +450,7 @@ mod reader;
 mod reaper;
 mod scheduler;
 mod stats;
+mod store_url;
 #[cfg(test)]
 mod test_util;
 mod time_bound;
@@ -456,7 +464,7 @@ pub mod worker;
 
 pub use clock::{Clock, MockClock, SystemClock};
 pub use effects::{EnqueueRequest, SettlementEffects};
-pub use error::{Error, Result};
+pub use error::{Error, Result, StoreUrlError};
 pub use expiry::{Expired, ExpiryIndex};
 pub use history::{AttemptOutcome, JobAttempt};
 pub use job::{Claim, JobRecord, JobStatus};
@@ -474,6 +482,7 @@ pub use queue::{
 };
 pub use reader::{QueueReader, ReaderMode, ReaderOptions};
 pub use stats::QueueStats;
+pub use store_url::open_url;
 pub use view::QueueView;
 pub use worker::{
     FailWith, PermanentFailure, Worker, WorkerError, WorkerHandle, run_worker,
