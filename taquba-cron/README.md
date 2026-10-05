@@ -121,8 +121,8 @@ The watermark records a position in the occurrence sequence and is independent
 of the expression. After an expression change, the scheduler replays the missed
 occurrences of the new expression after the watermark. The watermark stays in
 the KV namespace after its schedule is removed, and
-`CronScheduler::clear_watermark` deletes it. Keys with the `cron/` prefix of the
-KV namespace are reserved for this crate.
+`CronScheduler::clear_watermark` deletes it. Keys with the prefix
+`RESERVED_KV_PREFIX` (`cron/`) of the KV namespace are reserved for this crate.
 
 ## Changes while the scheduler runs
 

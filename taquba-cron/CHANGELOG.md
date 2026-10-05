@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `RESERVED_KV_PREFIX` and `RESERVED_DEDUP_PREFIX`: the prefix `cron/` of the
+  keys that the scheduler writes to the KV namespace and the prefix `cron:` of
+  the dedup keys of its jobs. An application must not enqueue to the queue of a
+  schedule with a dedup key of the `cron:` prefix.
+
 <!-- vale off -->
 
 ## [0.11.0] - 2026-09-25

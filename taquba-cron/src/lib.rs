@@ -98,8 +98,9 @@
 //! independent of the expression. After an expression change, the scheduler
 //! replays the missed occurrences of the new expression after the watermark.
 //! The watermark stays in the KV namespace after its schedule is removed, and
-//! [`CronScheduler::clear_watermark`] deletes it. Keys with the `cron/` prefix
-//! of the KV namespace are reserved for this crate.
+//! [`CronScheduler::clear_watermark`] deletes it. Keys with the prefix
+//! [`RESERVED_KV_PREFIX`] (`cron/`) of the KV namespace are reserved for this
+//! crate.
 //!
 //! # Changes while the scheduler runs
 //!
@@ -213,8 +214,14 @@ pub const PREVIOUS_FIRE_MS_HEADER: &str = "cron.previous_fire_ms";
 /// [`Error::ReservedHeader`].
 pub const RESERVED_HEADER_PREFIX: &str = "cron.";
 
-/// Prefix of every watermark key in the queue's KV namespace.
-const WATERMARK_PREFIX: &str = "cron/watermark/";
+/// Prefix of the keys reserved for this crate in the queue's KV namespace.
+pub const RESERVED_KV_PREFIX: &str = "cron/";
+
+/// Prefix of the dedup keys of the jobs that the scheduler enqueues:
+/// `cron:{name}:{fire_time_ms}`. A pending or scheduled job of a schedule's
+/// queue with the dedup key of a firing suppresses that firing, so an
+/// application must not enqueue to that queue with a dedup key of this prefix.
+pub const RESERVED_DEDUP_PREFIX: &str = "cron:";
 
 /// Delay before a schedule under backfill retries a failed enqueue.
 const ENQUEUE_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -223,7 +230,7 @@ const ENQUEUE_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// `cron/watermark/{name}`. The value is the last enqueued firing time as a
 /// decimal Unix timestamp in milliseconds.
 pub fn watermark_key(name: &str) -> Vec<u8> {
-    format!("{WATERMARK_PREFIX}{name}").into_bytes()
+    format!("{RESERVED_KV_PREFIX}watermark/{name}").into_bytes()
 }
 
 fn parse_watermark(value: &[u8]) -> Option<DateTime<Utc>> {
@@ -874,7 +881,10 @@ impl CronScheduler {
             );
         }
         let opts = EnqueueOptions::default()
-            .dedup_key(Some(format!("cron:{}:{}", entry.name, fire_ms)))
+            .dedup_key(Some(format!(
+                "{RESERVED_DEDUP_PREFIX}{}:{}",
+                entry.name, fire_ms
+            )))
             .headers(headers)
             .priority(entry.priority)
             .max_attempts(entry.max_attempts);
