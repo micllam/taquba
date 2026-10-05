@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use taquba::EnqueueRequest;
+use taquba::{EnqueueRequest, SettlementEffects};
 
 use crate::error::{Error, Result};
 use crate::keys::{check_enqueue, check_kv_key};
@@ -224,11 +224,15 @@ impl TerminalEffects {
         self.inner.lock().unwrap().kv.delete(key.into())
     }
 
-    /// Seal the handle and move out everything staged.
-    pub(crate) fn seal_and_take(&self) -> (StagedEffects, Vec<EnqueueRequest>) {
+    /// Seal the handle and move out everything staged, as the effects of a
+    /// settlement.
+    pub(crate) fn seal_into_settlement(&self) -> SettlementEffects {
         let mut state = self.inner.lock().unwrap();
         let staged = state.kv.seal_and_take();
-        (staged, std::mem::take(&mut state.enqueues))
+        SettlementEffects::default()
+            .enqueues(std::mem::take(&mut state.enqueues))
+            .kv_writes(staged.writes)
+            .kv_deletes(staged.deletes.into_iter().collect())
     }
 }
 
@@ -326,10 +330,10 @@ mod tests {
                 options: Default::default(),
             })
             .unwrap();
-        let (staged, enqueues) = handle.seal_and_take();
-        assert_eq!(staged.writes.len(), 1);
-        assert_eq!(staged.deletes.len(), 1);
-        assert_eq!(enqueues.len(), 1);
+        let staged = handle.seal_into_settlement();
+        assert_eq!(staged.kv_writes.len(), 1);
+        assert_eq!(staged.kv_deletes.len(), 1);
+        assert_eq!(staged.enqueues.len(), 1);
         assert!(matches!(handle.put("c", "v"), Err(Error::EffectsSealed)));
         assert!(matches!(handle.delete("c"), Err(Error::EffectsSealed)));
         assert!(matches!(

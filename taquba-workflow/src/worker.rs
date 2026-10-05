@@ -210,12 +210,9 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .into();
         let effects = TerminalEffects::for_delivery(&self.core.queue_name);
         let result = self.terminal_hook.on_termination(&outcome, &effects).await;
-        let (staged, enqueues) = effects.seal_and_take();
+        let staged = effects.seal_into_settlement();
         match result {
-            Ok(()) => Ok(SettlementEffects::default()
-                .enqueues(enqueues)
-                .kv_writes(staged.writes)
-                .kv_deletes(staged.deletes.into_iter().collect())),
+            Ok(()) => Ok(staged),
             Err(err) => Err(err.into_worker_error()),
         }
     }
