@@ -1,5 +1,5 @@
 //! Background tasks of an open queue: a spawned task with a shutdown signal,
-//! and the periodic tick every such task runs on.
+//! and the periodic tick of a task that runs on an interval.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -29,28 +29,24 @@ impl<P: Periodic> Periodic for Arc<P> {
 }
 
 /// A spawned task stopped by [`BackgroundTask::stop`]. The task is given a
-/// [`Ticker`] and runs until the ticker reports shutdown, which dropping the
-/// handle also signals.
+/// [`Shutdown`] and must end once it is signalled, which dropping the handle
+/// also does.
 pub(crate) struct BackgroundTask<T = ()> {
     shutdown: watch::Sender<bool>,
     handle: JoinHandle<T>,
 }
 
 impl<T: Send + 'static> BackgroundTask<T> {
-    /// Spawn `run` with a ticker firing every `interval`.
-    pub(crate) fn spawn<F, Fut>(interval: Duration, run: F) -> Self
+    /// Spawn `run` with its shutdown signal.
+    pub(crate) fn spawn<F, Fut>(run: F) -> Self
     where
-        F: FnOnce(Ticker) -> Fut,
+        F: FnOnce(Shutdown) -> Fut,
         Fut: Future<Output = T> + Send + 'static,
     {
         let (shutdown, receiver) = watch::channel(false);
-        let ticker = Ticker {
-            interval,
-            shutdown: receiver,
-        };
         Self {
             shutdown,
-            handle: tokio::spawn(run(ticker)),
+            handle: tokio::spawn(run(Shutdown(receiver))),
         }
     }
 
@@ -72,7 +68,8 @@ impl BackgroundTask {
     /// Spawn `task` so that its [`Periodic::step`] runs once per `interval`
     /// until shutdown.
     pub(crate) fn spawn_periodic<P: Periodic>(interval: Duration, task: P) -> BackgroundTask {
-        BackgroundTask::spawn(interval, |mut ticker| async move {
+        BackgroundTask::spawn(move |shutdown| async move {
+            let mut ticker = Ticker::new(interval, shutdown);
             while ticker.tick().await {
                 if let Err(e) = task.step().await {
                     warn!("{} error: {e}", P::NAME);
@@ -83,19 +80,33 @@ impl BackgroundTask {
     }
 }
 
+/// The shutdown signal of a [`BackgroundTask`].
+pub(crate) struct Shutdown(watch::Receiver<bool>);
+
+impl Shutdown {
+    /// Wait until shutdown is signalled or the [`BackgroundTask`] is dropped.
+    pub(crate) async fn signalled(&mut self) {
+        let _ = self.0.wait_for(|stop| *stop).await;
+    }
+}
+
 /// The periodic tick of a background task.
 pub(crate) struct Ticker {
     interval: Duration,
-    shutdown: watch::Receiver<bool>,
+    shutdown: Shutdown,
 }
 
 impl Ticker {
+    pub(crate) fn new(interval: Duration, shutdown: Shutdown) -> Self {
+        Self { interval, shutdown }
+    }
+
     /// Wait for the next tick. Returns `false` once shutdown is signalled or
     /// the [`BackgroundTask`] is dropped, which ends the task's loop.
     pub(crate) async fn tick(&mut self) -> bool {
         tokio::select! {
             _ = tokio::time::sleep(self.interval) => true,
-            _ = self.shutdown.changed() => false,
+            _ = self.shutdown.signalled() => false,
         }
     }
 }
@@ -117,7 +128,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stop_returns_the_output_after_the_current_tick() {
-        let task = BackgroundTask::spawn(Duration::from_secs(1), |mut ticker| async move {
+        let task = BackgroundTask::spawn(|shutdown| async move {
+            let mut ticker = Ticker::new(Duration::from_secs(1), shutdown);
             let mut ticks = 0u32;
             while ticker.tick().await {
                 ticks += 1;
@@ -132,9 +144,9 @@ mod tests {
     async fn dropping_the_handle_stops_the_task() {
         let dropped = Arc::new(AtomicBool::new(false));
         let guard = SetOnDrop(dropped.clone());
-        let task = BackgroundTask::spawn(Duration::from_secs(1), |mut ticker| async move {
+        let task = BackgroundTask::spawn(|mut shutdown| async move {
             let _guard = guard;
-            while ticker.tick().await {}
+            shutdown.signalled().await;
         });
         tokio::task::yield_now().await;
         assert!(!dropped.load(Ordering::SeqCst));

@@ -235,6 +235,14 @@ progressing while the process lives. A job interrupted this way consumes one
 attempt at its next claim, so `max_attempts` also counts hard restarts of a long
 job.
 
+A second process that opens the store fences this one, and its open re-queues
+the jobs claimed here. Once the store closes, by a fence or otherwise, the queue
+fires the cancellation token of every claim and refuses each renewal with
+`ClaimLost`. Cancellation is cooperative: a handler that ignores its token
+continues to run while the successor delivers the same job, until its settlement
+fails. SlateDB detects a fence at the next write of the fenced process or at its
+next manifest poll, whichever comes first. The poll runs every second.
+
 A worker can implement `Worker::process_with_effects` in place of
 `Worker::process` to return `SettlementEffects`: follow-up enqueues and caller
 KV changes the loop applies atomically with the job's acknowledgement via

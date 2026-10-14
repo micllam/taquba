@@ -32,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `kv_scan` and `kv_entries` on `QueueView` take a `KvOrder`, so a listing of
   time-ordered keys reads its latest entries in one page. Pass
   `KvOrder::Ascending` after the range for the order of 0.14.0.
+- Once its store closes, `Queue` fires each claim's token and fails each renewal
+  with `ClaimLost`, so a watching handler stops at a fence. A handler that
+  ignores its token must watch it to stop before its settlement fails.
 
 <!-- vale off -->
 

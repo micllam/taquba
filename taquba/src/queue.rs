@@ -9,7 +9,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, instrument, warn};
 use ulid::Ulid;
 
-use crate::background::BackgroundTask;
+use crate::background::{BackgroundTask, Ticker};
 use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
 use crate::completion::{CompletionWaiters, Registration};
@@ -208,6 +208,8 @@ pub(crate) fn backoff_delay(attempts: u32, base: Duration, max: Duration) -> Dur
 /// - **Liveness heartbeat**, when [`OpenOptions::liveness_heartbeat`] is
 ///   set: commits a beat that a [`QueueReader`](crate::QueueReader) reads
 ///   from another process.
+/// - **Close watcher**: once the store closes, fires the cancellation token of
+///   every claim and fails later renewals with [`Error::ClaimLost`].
 ///
 /// # Concurrency
 ///
@@ -227,6 +229,7 @@ pub struct Queue {
     /// returns the task so `close` can commit the closing beat with the task's
     /// counter.
     heartbeat: Option<BackgroundTask<crate::liveness::HeartbeatTask>>,
+    close_watcher: BackgroundTask,
 }
 
 /// Outcome of [`Queue::wait_for_completion`].
@@ -341,6 +344,9 @@ impl Queue {
             payload_store,
             id_gen: std::sync::Mutex::new(ulid::Generator::new()),
         });
+        let close_watcher = BackgroundTask::spawn(|shutdown| {
+            crate::queue_core::watch_store_close(core.clone(), shutdown)
+        });
         crate::claim_cursor::restore_cursor_state(&core).await?;
         // A claimed record found at open belongs to a process that no longer
         // owns the store, so its claim is void and the job is re-queued
@@ -363,7 +369,9 @@ impl Queue {
         let heartbeat = match opts.liveness_heartbeat {
             Some(interval) => {
                 let task = crate::liveness::HeartbeatTask::start(core.clone(), interval).await?;
-                Some(BackgroundTask::spawn(interval, |ticker| task.run(ticker)))
+                Some(BackgroundTask::spawn(move |shutdown| {
+                    task.run(Ticker::new(interval, shutdown))
+                }))
             }
             None => None,
         };
@@ -375,6 +383,7 @@ impl Queue {
             scheduler_task,
             metrics_sampler,
             heartbeat,
+            close_watcher,
         })
     }
 
@@ -1367,9 +1376,10 @@ impl Queue {
     /// without a durable write. The claim is unchanged and stays valid for
     /// settlement, and [`Self::lease_expiry`] reports the current value.
     ///
-    /// Fails with [`Error::ClaimLost`] once the claim ended or the reaper began
-    /// re-queuing the expired lease. Fails with [`Error::CancelRequested`] once
-    /// [`Self::cancel`] was called on the job, and the lease then expires.
+    /// Fails with [`Error::ClaimLost`] once the claim ended, the reaper began
+    /// re-queuing the expired lease or the store closed. Fails with
+    /// [`Error::CancelRequested`] once [`Self::cancel`] was called on the job,
+    /// and the lease then expires.
     ///
     /// This method is for callers that call [`Self::claim`] /
     /// [`Self::claim_batch`] directly and hold the [`Claim`]. Inside a
@@ -1379,14 +1389,12 @@ impl Queue {
     #[instrument(skip(self, claim), fields(queue = %claim.queue, job_id = %claim.id))]
     pub fn renew_lease(&self, claim: &Claim, extension: Duration) -> Result<u64> {
         let job = claim.job();
-        if claim.cancel_token().is_cancelled() {
-            return Err(Error::CancelRequested);
-        }
         let new_expiry = self.now_ms() + extension.as_millis() as u64;
         if self.core.lease_registry.renew(
             &job.queue,
             &job.id,
             claim.claim_id(),
+            claim.cancel_token(),
             new_expiry,
             Renewal::Set,
         )? {
@@ -1748,6 +1756,7 @@ impl Queue {
             warn!("persisting the claim-scan state failed: {e}");
         }
         self.core.db.close().await?;
+        self.close_watcher.stop().await;
         Ok(())
     }
 }

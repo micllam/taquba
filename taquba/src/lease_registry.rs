@@ -30,6 +30,11 @@
 //! does not order them. The mark closes the race between a renewal and a
 //! requeue already under way. A failed reap leaves its entry marked and in
 //! place for the next tick.
+//!
+//! Every lease is lost once the store closes, because every settlement then
+//! fails. The queue closes the registry at the store's first close reason,
+//! including a fence by a second writer. Closing fires every entry's token, and
+//! a closed registry refuses every renewal with [`Error::ClaimLost`].
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -75,6 +80,8 @@ struct Inner {
     /// Expiry-ordered view of `by_job`. Every mutation updates both under one
     /// lock, and the tuple is unique because a job has at most one lease.
     by_expiry: BTreeSet<(u64, QueueName, String)>,
+    /// Set by [`LeaseRegistry::close`] and never cleared.
+    closed: bool,
 }
 
 /// Claimed jobs' leases. The registry uses the job as its key and orders the
@@ -127,18 +134,29 @@ impl LeaseRegistry {
     }
 
     /// Apply `expires_at` to the lease per `mode`. Returns whether the expiry
-    /// changed. Fails with [`Error::ClaimLost`] when the job does not have a
-    /// lease, the lease belongs to a different claim or the reaper already took
-    /// the entry as due. A failure leaves the registry unchanged.
+    /// changed. Fails with [`Error::ClaimLost`] when the registry is closed,
+    /// the job does not have a lease, the lease belongs to a different claim or
+    /// the reaper already took the entry as due. Otherwise fails with
+    /// [`Error::CancelRequested`] when the claim's token `cancel` fired. A
+    /// failure leaves the registry unchanged.
     pub(crate) fn renew(
         &self,
         queue: &QueueName,
         id: &str,
         claim_id: u64,
+        cancel: &CancellationToken,
         expires_at: u64,
         mode: Renewal,
     ) -> Result<bool> {
         let mut inner = self.lock();
+        // Checked under the lock that `close` takes to set the mark, so a token
+        // fired by `close` is never reported as a cancellation.
+        if inner.closed {
+            return Err(Error::ClaimLost);
+        }
+        if cancel.is_cancelled() {
+            return Err(Error::CancelRequested);
+        }
         let key = (queue.clone(), id.to_string());
         let old_expires = match inner.by_job.get(&key) {
             Some(e) if e.claim_id == claim_id && !e.reaping => e.expires_at,
@@ -189,6 +207,20 @@ impl LeaseRegistry {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Mark the registry closed and fire every entry's cancellation token.
+    /// Entries stay in the registry.
+    pub(crate) fn close(&self) {
+        let tokens: Vec<CancellationToken> = {
+            let mut inner = self.lock();
+            inner.closed = true;
+            inner.by_job.values().map(|e| e.cancel.clone()).collect()
+        };
+        // Fired outside the lock, as in `cancel`.
+        for token in tokens {
+            token.cancel();
         }
     }
 
@@ -262,6 +294,16 @@ impl LeaseRegistry {
 mod tests {
     use super::*;
 
+    fn renew_set(
+        registry: &LeaseRegistry,
+        id: &str,
+        claim_id: u64,
+        expires_at: u64,
+    ) -> Result<bool> {
+        let live = CancellationToken::new();
+        registry.renew(&qn("q"), id, claim_id, &live, expires_at, Renewal::Set)
+    }
+
     #[test]
     fn take_due_returns_expired_entries_soonest_first_and_leaves_them_in_place() {
         let registry = LeaseRegistry::new();
@@ -280,14 +322,14 @@ mod tests {
         let registry = LeaseRegistry::new();
         registry.insert(&qn("q"), "a", 100, 1, CancellationToken::new());
         assert!(registry.take_due(99).is_empty());
-        assert!(registry.renew(&qn("q"), "a", 1, 200, Renewal::Set).is_ok());
+        assert!(renew_set(&registry, "a", 1, 200).is_ok());
     }
 
     #[test]
     fn a_renewal_moves_the_entry_in_expiry_order() {
         let registry = LeaseRegistry::new();
         registry.insert(&qn("q"), "a", 10, 1, CancellationToken::new());
-        assert!(registry.renew(&qn("q"), "a", 1, 40, Renewal::Set).is_ok());
+        assert!(renew_set(&registry, "a", 1, 40).is_ok());
 
         assert!(registry.take_due(10).is_empty());
         let due = registry.take_due(40);
@@ -299,10 +341,7 @@ mod tests {
     fn a_renewal_to_an_unchanged_expiry_keeps_the_entry() {
         let registry = LeaseRegistry::new();
         registry.insert(&qn("q"), "a", 10, 1, CancellationToken::new());
-        assert_eq!(
-            registry.renew(&qn("q"), "a", 1, 10, Renewal::Set).ok(),
-            Some(false)
-        );
+        assert_eq!(renew_set(&registry, "a", 1, 10).ok(), Some(false));
         assert!(registry.contains(&qn("q"), "a", 10));
         assert_eq!(registry.take_due(10).len(), 1);
     }
@@ -311,15 +350,11 @@ mod tests {
     fn renewal_is_refused_for_a_stale_claim_id_and_for_a_marked_entry() {
         let registry = LeaseRegistry::new();
         registry.insert(&qn("q"), "a", 10, 1, CancellationToken::new());
-        assert!(registry.renew(&qn("q"), "a", 2, 40, Renewal::Set).is_err());
-        assert!(
-            registry
-                .renew(&qn("q"), "missing", 1, 40, Renewal::Set)
-                .is_err()
-        );
+        assert!(renew_set(&registry, "a", 2, 40).is_err());
+        assert!(renew_set(&registry, "missing", 1, 40).is_err());
 
         assert_eq!(registry.take_due(10).len(), 1);
-        assert!(registry.renew(&qn("q"), "a", 1, 40, Renewal::Set).is_err());
+        assert!(renew_set(&registry, "a", 1, 40).is_err());
     }
 
     #[test]
@@ -671,6 +706,37 @@ mod tests {
         );
 
         q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_fence_fires_every_token_and_refuses_renewal_with_claim_lost() {
+        let store = make_store();
+        let first = Queue::open(store.clone(), "test").await.unwrap();
+        first.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let claim = first
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let lease = first.lease_handle(&claim);
+
+        let second = Queue::open(store, "test").await.unwrap();
+        // A write takes the WAL path to the fence, which does not wait for the
+        // manifest poll. The failed write returns after the store reported the
+        // close, so the watcher fires the token at the next await.
+        assert!(first.enqueue("work", b"late".to_vec()).await.is_err());
+        lease.cancel_token().cancelled().await;
+        assert!(matches!(
+            lease.ensure_at_least(Duration::from_secs(60)),
+            Err(Error::ClaimLost)
+        ));
+        assert!(matches!(
+            first.renew_lease(&claim, Duration::from_secs(60)),
+            Err(Error::ClaimLost)
+        ));
+
+        let _ = first.close().await;
+        second.close().await.unwrap();
     }
 
     #[tokio::test]

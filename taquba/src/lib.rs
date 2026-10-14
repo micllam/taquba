@@ -376,6 +376,8 @@
 //! - **Liveness heartbeat** - commits a beat readable by a [`QueueReader`]
 //!   from another process, only when [`OpenOptions::liveness_heartbeat`]
 //!   is set.
+//! - **Close watcher** - once the store closes, fires the cancellation token
+//!   of every claim and fails later lease renewals.
 //!
 //! SlateDB's compactor and garbage collector run in the same process unless
 //! [`OpenOptions::in_process_compactor`] or
@@ -386,6 +388,15 @@
 //! stops progressing while the process lives. A job interrupted this way
 //! consumes one attempt at its next claim, so `max_attempts` also counts hard
 //! restarts of a long job.
+//!
+//! A second process that opens the store fences this one, and its open
+//! re-queues the jobs claimed here. Once the store closes, by a fence or
+//! otherwise, the queue fires the cancellation token of every claim and refuses
+//! each renewal with [`Error::ClaimLost`]. Cancellation is cooperative: a
+//! handler that ignores its token continues to run while the successor delivers
+//! the same job, until its settlement fails. SlateDB detects a fence at the
+//! next write of the fenced process or at its next manifest poll, whichever
+//! comes first. The poll runs every second.
 //!
 //! Call [`Queue::close`] for a clean shutdown. It stops both tasks and flushes
 //! the underlying SlateDB instance.

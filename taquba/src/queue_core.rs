@@ -6,8 +6,10 @@ use std::sync::Arc;
 use std::future::Future;
 
 use bytes::Bytes;
-use slatedb::{Db, DbTransaction};
+use slatedb::{CloseReason, Db, DbTransaction};
+use tracing::{debug, error, warn};
 
+use crate::background::Shutdown;
 use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
 use crate::completion::CompletionWaiters;
@@ -156,4 +158,27 @@ impl QueueCore {
         })
         .await
     }
+}
+
+/// Close the lease registry of `core` once the store reports a close reason.
+/// Returns without effect when `shutdown` is signalled first.
+pub(crate) async fn watch_store_close(core: Arc<QueueCore>, mut shutdown: Shutdown) {
+    let mut status = core.db.subscribe();
+    let reason = tokio::select! {
+        // A close that precedes the shutdown signal is still applied.
+        biased;
+        status = status.wait_for(|s| s.close_reason.is_some()) => match status {
+            Ok(status) => status.close_reason,
+            Err(_) => return,
+        },
+        _ = shutdown.signalled() => return,
+    };
+    match reason {
+        Some(CloseReason::Clean) => debug!("store closed; in-flight claims are lost"),
+        Some(CloseReason::Fenced) => {
+            warn!("another process opened this store as its writer; in-flight claims are lost")
+        }
+        other => error!("store closed ({other:?}); in-flight claims are lost"),
+    }
+    core.lease_registry.close();
 }

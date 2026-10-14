@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::clock::Clock;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::keys::QueueName;
 use crate::lease_registry::{LeaseRegistry, Renewal};
 
@@ -76,7 +76,9 @@ impl LeaseHandle {
     /// The delivery's cooperative cancellation token, fired by
     /// [`crate::Queue::cancel`] while the delivery's claim on the job is live,
     /// and already fired when the job was re-claimed with
-    /// [`crate::JobRecord::cancel_requested`] persisted.
+    /// [`crate::JobRecord::cancel_requested`] persisted. Also fired when the
+    /// queue's store closes for any reason, including a fence by a second
+    /// writer.
     ///
     /// A handler can `select!` on it to stop early and return as usual.
     pub fn cancel_token(&self) -> &CancellationToken {
@@ -92,18 +94,16 @@ impl LeaseHandle {
     /// slow call, give the call a timeout and pass that timeout here before
     /// issuing it, so the lease covers the call.
     ///
-    /// Fails with [`Error::ClaimLost`] once the claim ends or the reaper begins
-    /// re-queuing the expired lease. The handler must then stop working on the
-    /// delivery, because another claim can already own the job. Fails with
-    /// [`Error::CancelRequested`] once cancellation of the job is requested,
-    /// and does not extend the lease.
+    /// Fails with [`crate::Error::ClaimLost`] once the claim ends, the reaper
+    /// begins re-queuing the expired lease or the queue's store closes. The
+    /// handler must then stop working on the delivery, because the job might
+    /// already be owned by another claim. Fails with
+    /// [`crate::Error::CancelRequested`] once cancellation of the job is
+    /// requested, and does not extend the lease.
     pub fn ensure_at_least(&self, remaining: Duration) -> Result<()> {
         let Some(inner) = &self.inner else {
             return Ok(());
         };
-        if self.cancel.is_cancelled() {
-            return Err(Error::CancelRequested);
-        }
         let needed = inner.clock.now_ms()
             + remaining.as_millis() as u64
             + SETTLEMENT_MARGIN.as_millis() as u64;
@@ -111,6 +111,7 @@ impl LeaseHandle {
             &inner.queue,
             &inner.id,
             inner.claim_id,
+            &self.cancel,
             needed,
             Renewal::Extend,
         )? {
@@ -138,6 +139,7 @@ impl std::fmt::Debug for LeaseHandle {
 mod tests {
     use super::*;
     use crate::clock::MockClock;
+    use crate::error::Error;
     use crate::test_util::qn;
 
     #[test]

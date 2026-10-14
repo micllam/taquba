@@ -140,7 +140,7 @@ Each field of the entry has its writer and its reader:
 | --- | --- | --- |
 | expiry | The claim sets it, and renewal extends it. | The reaper, which takes the entries that are due, soonest first, through a second index of the entries, ordered by expiry. |
 | claim id | The claim sets it. | Settlement, which compares it with the claim id in the `Claim` and refuses the settlement when the two differ. |
-| cancellation token | The claim creates it. | `Queue::cancel` fires it, and the worker stops early when it fires. |
+| cancellation token | The claim creates it. | `Queue::cancel` and a close of the store fire it, and the worker stops early when it fires. |
 | reaping mark | The reaper sets it when the entry is due. | Renewal, which refuses a marked entry. |
 
 The reaper marks each due entry and leaves it in place. Renewal and the reaper
@@ -168,6 +168,27 @@ about that entry:
 
 The second rule makes the registry lag the store. Between an ending commit and
 its removal, the entry still refers to a claim that already ended.
+
+## When the store closes
+
+Every lease is lost once the store closes, because every settlement then fails.
+The store closes in three cases:
+
+- Another process opened the store as its writer and fenced this one.
+- A SlateDB task panicked.
+- `Queue::close` closed the store cleanly.
+
+A background task of the queue watches the store's status. At the first close
+reason, it marks the registry closed and fires the token of every entry. A
+closed registry refuses each renewal with `Error::ClaimLost`, before it checks
+for a requested cancel, so the error tells the worker that the job might already
+be owned by another claim.
+
+Cancellation is cooperative, so a worker that ignores its token continues to run
+until its settlement fails. Meanwhile, the process that fenced this one has
+re-queued the job at open and can deliver it again. SlateDB detects the fence at
+the next write of the fenced process or at its next manifest poll, whichever
+comes first. The poll runs every second.
 
 [claim-method]: https://docs.rs/taquba/latest/taquba/struct.Queue.html#method.claim
 [claim_batch]: https://docs.rs/taquba/latest/taquba/struct.Queue.html#method.claim_batch

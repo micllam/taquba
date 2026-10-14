@@ -32,10 +32,11 @@ pub enum Error {
     InvalidState,
 
     /// A settlement or lease operation found no claim under the record it was
-    /// given: the lease expired and the reaper requeued the job, or the job was
-    /// settled already. Retrying with the same record cannot succeed, and a
-    /// redelivered attempt settles the job. A record taken before a lease
-    /// renewal is not stale, because the renewal leaves the claim id unchanged.
+    /// given: the lease expired and the reaper requeued the job, the job was
+    /// settled already or the store closed. Retrying with the same record
+    /// cannot succeed, and a redelivered attempt settles the job. A record
+    /// taken before a lease renewal is not stale, because the renewal leaves
+    /// the claim id unchanged.
     #[error("job claim is no longer held")]
     ClaimLost,
 
