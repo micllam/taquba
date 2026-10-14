@@ -1,0 +1,7 @@
+# Only a taquba release becomes the latest GitHub release.
+[workspace]
+git_release_latest = false
+
+[[package]]
+name = "taquba"
+git_release_latest = true
