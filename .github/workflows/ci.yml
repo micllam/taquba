@@ -4,6 +4,7 @@ on:
   push:
     branches: [master]
   pull_request:
+  workflow_call:
 
 # Supersede an in-flight run when a newer commit lands on the same ref.
 concurrency:
