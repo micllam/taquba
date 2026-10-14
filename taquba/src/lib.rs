@@ -379,6 +379,9 @@
 //! - **Close watcher** - once the store closes, fires the cancellation token
 //!   of every claim and fails later lease renewals.
 //!
+//! Every background task ends once the store closes for any reason, including a
+//! fence by a second writer.
+//!
 //! SlateDB's compactor and garbage collector run in the same process unless
 //! [`OpenOptions::in_process_compactor`] or
 //! [`OpenOptions::in_process_garbage_collector`] is `false`.

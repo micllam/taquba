@@ -196,7 +196,7 @@ pub(crate) fn backoff_delay(attempts: u32, base: Duration, max: Duration) -> Dur
 ///
 /// # Background tasks
 ///
-/// Background tasks run while the queue is open:
+/// Background tasks run while the queue and its store are open:
 ///
 /// - **Reaper**: re-queues or dead-letters jobs whose lease expired and runs
 ///   the done and dead-letter retention sweeps
@@ -345,7 +345,7 @@ impl Queue {
             id_gen: std::sync::Mutex::new(ulid::Generator::new()),
             closed: tokio_util::sync::CancellationToken::new(),
         });
-        let close_watcher = BackgroundTask::spawn(|shutdown| {
+        let close_watcher = BackgroundTask::spawn(&core.closed, |shutdown| {
             crate::queue_core::watch_store_close(core.clone(), shutdown)
         });
         crate::claim_cursor::restore_cursor_state(&core).await?;
@@ -354,15 +354,21 @@ impl Queue {
         // immediately. Runs after `restore_cursor_state` so each re-queued
         // job's pending insert is recorded against the restored bound.
         core.requeue_interrupted_claims().await?;
-        let reaper_task =
-            BackgroundTask::spawn_periodic(opts.reaper_interval, Reaper::new(core.clone()));
-        let scheduler_task =
-            BackgroundTask::spawn_periodic(opts.scheduler_interval, Scheduler::new(core.clone()));
+        let reaper_task = BackgroundTask::spawn_periodic(
+            &core.closed,
+            opts.reaper_interval,
+            Reaper::new(core.clone()),
+        );
+        let scheduler_task = BackgroundTask::spawn_periodic(
+            &core.closed,
+            opts.scheduler_interval,
+            Scheduler::new(core.clone()),
+        );
 
         #[cfg(feature = "metrics")]
         let metrics_sampler = opts.metrics_sample_interval.map(|interval| {
             let sampler = crate::metrics_sampler::MetricsSampler::new(core.clone());
-            BackgroundTask::spawn_periodic(interval, sampler)
+            BackgroundTask::spawn_periodic(&core.closed, interval, sampler)
         });
         #[cfg(not(feature = "metrics"))]
         let metrics_sampler: Option<BackgroundTask> = None;
@@ -370,7 +376,7 @@ impl Queue {
         let heartbeat = match opts.liveness_heartbeat {
             Some(interval) => {
                 let task = crate::liveness::HeartbeatTask::start(core.clone(), interval).await?;
-                Some(BackgroundTask::spawn(move |shutdown| {
+                Some(BackgroundTask::spawn(&core.closed, move |shutdown| {
                     task.run(Ticker::new(interval, shutdown))
                 }))
             }
@@ -1800,6 +1806,30 @@ mod tests {
         assert_eq!(q.clock().now_ms(), 1_700_000_060_000);
 
         q.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fence_ends_the_background_tasks() {
+        let store = make_store();
+        let opts = OpenOptions {
+            liveness_heartbeat: Some(Duration::from_secs(1)),
+            ..OpenOptions::default()
+        };
+        let first = Queue::open_with_options(store.clone(), "test", opts)
+            .await
+            .unwrap();
+
+        let second = Queue::open(store, "test").await.unwrap();
+        assert!(first.enqueue("work", b"late".to_vec()).await.is_err());
+        first.store_closed().await;
+        // Paused time advances only once every task is idle, so a task that
+        // ends at the close has ended when the sleep ends.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(first.reaper_task.is_finished());
+        assert!(first.scheduler_task.is_finished());
+        assert!(first.heartbeat.as_ref().unwrap().is_finished());
+        assert!(first.close_watcher.is_finished());
+        second.close().await.unwrap();
     }
 
     #[tokio::test]

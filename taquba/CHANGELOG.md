@@ -42,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Queue::claim` and `claim_batch` fail with the store's error once the store
   closes, so a worker loop on an idle fenced queue returns. A caller that polls
   an empty queue must stop on that error.
+- The background tasks of a `Queue` end once its store closes, so a fenced
+  process logs the close once and stops logging a failure at every tick. A
+  process must reopen the store to resume its work.
 
 <!-- vale off -->
 

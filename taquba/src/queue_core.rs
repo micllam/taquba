@@ -166,7 +166,7 @@ impl QueueCore {
 
 /// Fire `closed` and close the lease registry of `core` once the store reports
 /// a close reason. Returns without effect when `shutdown` is signalled first.
-pub(crate) async fn watch_store_close(core: Arc<QueueCore>, mut shutdown: Shutdown) {
+pub(crate) async fn watch_store_close(core: Arc<QueueCore>, shutdown: Shutdown) {
     let mut status = core.db.subscribe();
     let reason = tokio::select! {
         // A close that precedes the shutdown signal is still applied.

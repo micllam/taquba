@@ -5,8 +5,8 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, warn};
 
 use crate::error::Result;
@@ -30,30 +30,31 @@ impl<P: Periodic> Periodic for Arc<P> {
 
 /// A spawned task stopped by [`BackgroundTask::stop`]. The task is given a
 /// [`Shutdown`] and must end once it is signalled, which dropping the handle
-/// also does.
+/// and a cancel of the task's parent token also do.
 pub(crate) struct BackgroundTask<T = ()> {
-    shutdown: watch::Sender<bool>,
+    shutdown: DropGuard,
     handle: JoinHandle<T>,
 }
 
 impl<T: Send + 'static> BackgroundTask<T> {
-    /// Spawn `run` with its shutdown signal.
-    pub(crate) fn spawn<F, Fut>(run: F) -> Self
+    /// Spawn `run` with a shutdown signal that is a child of `parent`.
+    pub(crate) fn spawn<F, Fut>(parent: &CancellationToken, run: F) -> Self
     where
         F: FnOnce(Shutdown) -> Fut,
         Fut: Future<Output = T> + Send + 'static,
     {
-        let (shutdown, receiver) = watch::channel(false);
+        let token = parent.child_token();
+        let handle = tokio::spawn(run(Shutdown(token.clone())));
         Self {
-            shutdown,
-            handle: tokio::spawn(run(Shutdown(receiver))),
+            shutdown: token.drop_guard(),
+            handle,
         }
     }
 
     /// Signal shutdown and wait for the task to finish. Returns its output, or
     /// `None` when the task panicked.
     pub(crate) async fn stop(self) -> Option<T> {
-        let _ = self.shutdown.send(true);
+        self.shutdown.disarm().cancel();
         match self.handle.await {
             Ok(output) => Some(output),
             Err(e) => {
@@ -62,13 +63,22 @@ impl<T: Send + 'static> BackgroundTask<T> {
             }
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
 }
 
 impl BackgroundTask {
     /// Spawn `task` so that its [`Periodic::step`] runs once per `interval`
     /// until shutdown.
-    pub(crate) fn spawn_periodic<P: Periodic>(interval: Duration, task: P) -> BackgroundTask {
-        BackgroundTask::spawn(move |shutdown| async move {
+    pub(crate) fn spawn_periodic<P: Periodic>(
+        parent: &CancellationToken,
+        interval: Duration,
+        task: P,
+    ) -> BackgroundTask {
+        BackgroundTask::spawn(parent, move |shutdown| async move {
             let mut ticker = Ticker::new(interval, shutdown);
             while ticker.tick().await {
                 if let Err(e) = task.step().await {
@@ -81,12 +91,13 @@ impl BackgroundTask {
 }
 
 /// The shutdown signal of a [`BackgroundTask`].
-pub(crate) struct Shutdown(watch::Receiver<bool>);
+pub(crate) struct Shutdown(CancellationToken);
 
 impl Shutdown {
-    /// Wait until shutdown is signalled or the [`BackgroundTask`] is dropped.
-    pub(crate) async fn signalled(&mut self) {
-        let _ = self.0.wait_for(|stop| *stop).await;
+    /// Wait until shutdown is signalled, the [`BackgroundTask`] is dropped or
+    /// the parent token is cancelled.
+    pub(crate) async fn signalled(&self) {
+        self.0.cancelled().await
     }
 }
 
@@ -101,8 +112,8 @@ impl Ticker {
         Self { interval, shutdown }
     }
 
-    /// Wait for the next tick. Returns `false` once shutdown is signalled or
-    /// the [`BackgroundTask`] is dropped, which ends the task's loop.
+    /// Wait for the next tick. Returns `false` once shutdown is signalled,
+    /// which ends the task's loop.
     pub(crate) async fn tick(&mut self) -> bool {
         tokio::select! {
             _ = tokio::time::sleep(self.interval) => true,
@@ -128,7 +139,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stop_returns_the_output_after_the_current_tick() {
-        let task = BackgroundTask::spawn(|shutdown| async move {
+        let task = BackgroundTask::spawn(&CancellationToken::new(), |shutdown| async move {
             let mut ticker = Ticker::new(Duration::from_secs(1), shutdown);
             let mut ticks = 0u32;
             while ticker.tick().await {
@@ -144,7 +155,7 @@ mod tests {
     async fn dropping_the_handle_stops_the_task() {
         let dropped = Arc::new(AtomicBool::new(false));
         let guard = SetOnDrop(dropped.clone());
-        let task = BackgroundTask::spawn(|mut shutdown| async move {
+        let task = BackgroundTask::spawn(&CancellationToken::new(), |shutdown| async move {
             let _guard = guard;
             shutdown.signalled().await;
         });

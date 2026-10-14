@@ -113,10 +113,9 @@ impl HeartbeatRecord {
     }
 }
 
-/// Background task committing one beat per interval while the queue is open. A
-/// failed beat is logged at error level and counted. The task continues,
-/// because a fencing failure also fails the queue's own writes and those
-/// surface to callers.
+/// Background task committing one beat per interval while the queue and its
+/// store are open. A failed beat is logged at error level and counted, and the
+/// task continues.
 pub(crate) struct HeartbeatTask {
     core: Arc<QueueCore>,
     interval: Duration,
