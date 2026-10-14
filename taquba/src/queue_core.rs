@@ -7,6 +7,7 @@ use std::future::Future;
 
 use bytes::Bytes;
 use slatedb::{CloseReason, Db, DbTransaction};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::background::Shutdown;
@@ -67,6 +68,9 @@ pub(crate) struct QueueCore {
     /// must increase with enqueue order, including inside one millisecond. One
     /// generator per store suffices: a store has a single writer process.
     pub(crate) id_gen: std::sync::Mutex<ulid::Generator>,
+    /// Fired by [`watch_store_close`] once the store closes, before the lease
+    /// registry closes, so a claim's fired token never precedes it.
+    pub(crate) closed: CancellationToken,
 }
 
 impl QueueCore {
@@ -160,8 +164,8 @@ impl QueueCore {
     }
 }
 
-/// Close the lease registry of `core` once the store reports a close reason.
-/// Returns without effect when `shutdown` is signalled first.
+/// Fire `closed` and close the lease registry of `core` once the store reports
+/// a close reason. Returns without effect when `shutdown` is signalled first.
 pub(crate) async fn watch_store_close(core: Arc<QueueCore>, mut shutdown: Shutdown) {
     let mut status = core.db.subscribe();
     let reason = tokio::select! {
@@ -180,5 +184,6 @@ pub(crate) async fn watch_store_close(core: Arc<QueueCore>, mut shutdown: Shutdo
         }
         other => error!("store closed ({other:?}); in-flight claims are lost"),
     }
+    core.closed.cancel();
     core.lease_registry.close();
 }

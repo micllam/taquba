@@ -187,6 +187,11 @@ pub trait Worker: Send + Sync {
 /// bounds it. A killed process is recovered at the next open, where every
 /// claimed job is requeued immediately and its next claim consumes one attempt.
 ///
+/// Once the store closes for any reason, including a fence by a second writer,
+/// the loop drops the in-flight `process` future without a settlement and
+/// returns the store's error. The handler stops at its next await point.
+/// Blocking code and a task that the handler spawned continue to run.
+///
 /// `poll_interval` is the maximum time the loop will wait on an empty queue
 /// before re-checking. In-process inserts wake the loop immediately via the
 /// queue-scoped notify (one waiting worker per inserted job), so this only
@@ -217,9 +222,8 @@ where
     loop {
         match queue_handle.claim_next(queue).await? {
             Some(job) => {
-                // Process is uncancellable: no select around it. Even if
-                // shutdown was signalled while we were claiming, we finish the
-                // job we just took the lease on.
+                // Shutdown does not interrupt `process`, so a job claimed while
+                // shutdown was signalled still finishes.
                 process_and_settle(queue_handle, queue, worker, job).await;
                 if check_shutdown(shutdown.as_mut()) {
                     debug!(queue = queue, "worker shutdown requested");
@@ -229,12 +233,14 @@ where
             None => {
                 // Empty queue: wait for new work, the poll timeout or shutdown.
                 // This is the only point where shutdown can interrupt the loop.
+                // A closed store fails the next claim.
                 tokio::select! {
                     biased;
                     _ = &mut shutdown => {
                         debug!(queue = queue, "worker shutdown requested");
                         return Ok(());
                     }
+                    _ = queue_handle.store_closed() => {}
                     _ = queue_handle.wait_for_jobs_on(queue, poll_interval) => {}
                 }
             }
@@ -256,7 +262,7 @@ where
 ///
 /// Claim errors propagate and terminate the loop. Settlement failures and
 /// panics inside spawned tasks are logged but do not terminate the loop.
-/// [`run_worker`] describes the [`Error::ClaimLost`] case.
+/// [`run_worker`] describes the [`Error::ClaimLost`] case and a closed store.
 pub async fn run_worker_concurrent<W, F>(
     queue_handle: &Arc<Queue>,
     queue: &str,
@@ -305,6 +311,7 @@ where
             tokio::select! {
                 biased;
                 _ = &mut shutdown => break 'main,
+                _ = queue_handle.store_closed() => {}
                 _ = queue_handle.wait_for_jobs_on(queue, poll_interval) => {}
             }
             continue;
@@ -345,7 +352,8 @@ fn note_task_result(queue: &str, result: std::result::Result<(), tokio::task::Jo
 /// dead-letter). A settlement failure affects one job and does not stop the
 /// loop. A [`Error::ClaimLost`] means the job outlived its lease and the reaper
 /// requeued it, so the redelivered attempt settles it. Any other settlement
-/// failure leaves the claim to the reaper.
+/// failure leaves the claim to the reaper. A close of the store drops `process`
+/// and skips the settlement.
 async fn process_and_settle<W: Worker>(
     queue_handle: &Queue,
     queue: &str,
@@ -354,7 +362,20 @@ async fn process_and_settle<W: Worker>(
 ) {
     let job_id = claim.id.clone();
     let lease = queue_handle.lease_handle(&claim);
-    let settlement = match worker.process_with_effects(claim.job(), &lease).await {
+    let outcome = tokio::select! {
+        biased;
+        _ = queue_handle.store_closed() => None,
+        outcome = worker.process_with_effects(claim.job(), &lease) => Some(outcome),
+    };
+    let Some(outcome) = outcome else {
+        warn!(
+            queue = queue,
+            job_id = %job_id,
+            "store closed during processing; the job was dropped without a settlement"
+        );
+        return;
+    };
+    let settlement = match outcome {
         Ok(effects) => queue_handle.ack_with(&claim, effects).await.map(|_| ()),
         Err(e) => {
             let (error, effects) = match e.downcast::<FailWith>() {
@@ -1069,6 +1090,79 @@ mod tests {
 
         q.ack(&job).await.unwrap();
         q.close().await.unwrap();
+    }
+
+    struct StallingWorker {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    impl Worker for StallingWorker {
+        async fn process(
+            &self,
+            _job: &JobRecord,
+            _lease: &LeaseHandle,
+        ) -> std::result::Result<(), WorkerError> {
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fence_drops_the_in_flight_process_and_ends_the_loop() {
+        let store = make_store();
+        let first = Queue::open(store.clone(), "test").await.unwrap();
+        first.enqueue("work", b"payload".to_vec()).await.unwrap();
+        let worker = StallingWorker {
+            started: Arc::new(tokio::sync::Notify::new()),
+        };
+        let poll = Duration::from_secs(60);
+        let mut run = pin!(run_worker(
+            &first,
+            "work",
+            &worker,
+            poll,
+            std::future::pending()
+        ));
+        tokio::select! {
+            _ = &mut run => panic!("the loop ended before the fence"),
+            _ = worker.started.notified() => {}
+        }
+
+        let second = Queue::open(store, "test").await.unwrap();
+        // The handler ignores its token, and a write of the first queue reports
+        // the fence.
+        assert!(first.enqueue("work", b"late".to_vec()).await.is_err());
+        assert!(run.await.is_err());
+        second.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fence_ends_an_idle_loop_before_its_poll() {
+        let store = make_store();
+        let first = Queue::open(store.clone(), "test").await.unwrap();
+        let worker = StallingWorker {
+            started: Arc::new(tokio::sync::Notify::new()),
+        };
+        let poll = Duration::from_secs(3600);
+        let mut run = pin!(run_worker(
+            &first,
+            "work",
+            &worker,
+            poll,
+            std::future::pending()
+        ));
+        // Paused time advances only once every task is idle, so the loop waits
+        // on the empty queue when the sleep ends.
+        tokio::select! {
+            _ = &mut run => panic!("the loop ended before the fence"),
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+
+        let second = Queue::open(store, "test").await.unwrap();
+        assert!(first.enqueue("work", b"late".to_vec()).await.is_err());
+        let ended = tokio::time::timeout(Duration::from_secs(60), run).await;
+        assert!(matches!(ended, Ok(Err(_))));
+        second.close().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

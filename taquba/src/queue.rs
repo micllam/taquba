@@ -343,6 +343,7 @@ impl Queue {
             completion_waiters: Arc::new(CompletionWaiters::default()),
             payload_store,
             id_gen: std::sync::Mutex::new(ulid::Generator::new()),
+            closed: tokio_util::sync::CancellationToken::new(),
         });
         let close_watcher = BackgroundTask::spawn(|shutdown| {
             crate::queue_core::watch_store_close(core.clone(), shutdown)
@@ -433,6 +434,12 @@ impl Queue {
             claim.claim_id(),
             claim.cancel_token().clone(),
         )
+    }
+
+    /// Wait until the store closes for any reason, including a fence by a
+    /// second writer.
+    pub(crate) async fn store_closed(&self) {
+        self.core.closed.cancelled().await
     }
 
     /// Look up the configured `keep_done_jobs` retention for a queue. `None`
@@ -809,7 +816,8 @@ impl Queue {
     /// share one lease with one start instant. Size batches so the lease covers
     /// processing the whole batch, or renew leases as the batch progresses.
     /// Returns an empty `Vec` when the queue is empty and fewer than `max_jobs`
-    /// jobs when the queue runs out.
+    /// jobs when the queue runs out. Fails with the store's error once the
+    /// store closes for any reason, including a fence by a second writer.
     ///
     /// One batch costs one claim-lock hold, one transaction and one commit
     /// regardless of size, so a fetcher that claims batches and dispatches jobs
@@ -828,6 +836,11 @@ impl Queue {
         let queue = QueueName::new(queue)?;
         if max_jobs == 0 {
             return Ok(Vec::new());
+        }
+        // The empty checks report from in-process state, which outlives a close
+        // of the store. A transaction reports the close.
+        if self.core.closed.is_cancelled() {
+            drop(self.core.db.begin(IsolationLevel::Snapshot).await?);
         }
         // Empty check before taking the claim lock: a queue known to be empty
         // is reported from in-process state, without contention with claims
@@ -1787,6 +1800,26 @@ mod tests {
         assert_eq!(q.clock().now_ms(), 1_700_000_060_000);
 
         q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_claim_on_a_fenced_empty_queue_fails() {
+        let store = make_store();
+        let first = Queue::open(store.clone(), "test").await.unwrap();
+        // The empty claim records the queue as known empty.
+        assert!(
+            first
+                .claim("work", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let second = Queue::open(store, "test").await.unwrap();
+        assert!(first.enqueue("other", b"late".to_vec()).await.is_err());
+        first.store_closed().await;
+        assert!(first.claim("work", Duration::from_secs(30)).await.is_err());
+        second.close().await.unwrap();
     }
 
     #[tokio::test]

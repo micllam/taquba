@@ -184,11 +184,14 @@ closed registry refuses each renewal with `Error::ClaimLost`, before it checks
 for a requested cancel, so the error tells the worker that the job might already
 be owned by another claim.
 
-Cancellation is cooperative, so a worker that ignores its token continues to run
-until its settlement fails. Meanwhile, the process that fenced this one has
-re-queued the job at open and can deliver it again. SlateDB detects the fence at
-the next write of the fenced process or at its next manifest poll, whichever
-comes first. The poll runs every second.
+The worker loops drop the `process` future of each in-flight job at the close,
+so a handler stops at its next await point. Blocking code and a task that the
+handler spawned continue to run, as does a caller that claims directly and
+ignores its token. Meanwhile, the process that fenced this one has re-queued the
+job at open and can deliver it again.
+
+SlateDB detects the fence at the next write of the fenced process or at its next
+manifest poll, whichever comes first. The poll runs every second.
 
 [claim-method]: https://docs.rs/taquba/latest/taquba/struct.Queue.html#method.claim
 [claim_batch]: https://docs.rs/taquba/latest/taquba/struct.Queue.html#method.claim_batch

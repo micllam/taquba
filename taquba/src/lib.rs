@@ -129,9 +129,9 @@
 //!
 //! Pass any future as the shutdown signal, such as `tokio::signal::ctrl_c()` or
 //! a oneshot. Shutdown is honoured at safe points: between jobs and during idle
-//! waits. In-flight jobs always finish, so leases are never abandoned to the
-//! reaper. The drain does not have an internal bound, so the process
-//! supervisor's kill timeout bounds a restart.
+//! waits. In-flight jobs always finish at shutdown, so leases are never
+//! abandoned to the reaper. The drain does not have an internal bound, so the
+//! process supervisor's kill timeout bounds a restart.
 //!
 //! Settlement failures do not stop the loop: when a job outlives its lease and
 //! the reaper requeues it, the late acknowledgement fails with
@@ -390,13 +390,16 @@
 //! restarts of a long job.
 //!
 //! A second process that opens the store fences this one, and its open
-//! re-queues the jobs claimed here. Once the store closes, by a fence or
-//! otherwise, the queue fires the cancellation token of every claim and refuses
-//! each renewal with [`Error::ClaimLost`]. Cancellation is cooperative: a
-//! handler that ignores its token continues to run while the successor delivers
-//! the same job, until its settlement fails. SlateDB detects a fence at the
-//! next write of the fenced process or at its next manifest poll, whichever
-//! comes first. The poll runs every second.
+//! re-queues the jobs claimed here. SlateDB detects the fence at the next write
+//! of the fenced process or at its next manifest poll, whichever comes first.
+//! The poll runs every second.
+//!
+//! Once the store closes, by a fence or otherwise, the queue fires the
+//! cancellation token of every claim and refuses each renewal with
+//! [`Error::ClaimLost`]. The worker loops drop the `process` future of each
+//! in-flight job without a settlement and return the store's error. A handler
+//! stops at its next await point, and blocking code or a task that it spawned
+//! continues to run.
 //!
 //! Call [`Queue::close`] for a clean shutdown. It stops both tasks and flushes
 //! the underlying SlateDB instance.

@@ -33,8 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time-ordered keys reads its latest entries in one page. Pass
   `KvOrder::Ascending` after the range for the order of 0.14.0.
 - Once its store closes, `Queue` fires each claim's token and fails each renewal
-  with `ClaimLost`, so a watching handler stops at a fence. A handler that
-  ignores its token must watch it to stop before its settlement fails.
+  with `ClaimLost`, so a watching handler stops at a fence. A caller that claims
+  directly and ignores its token must watch it to stop before its settlement
+  fails.
+- `run_worker` and `run_worker_concurrent` drop in-flight `process` futures once
+  the store closes, so a handler stops at its next await point. A handler must
+  tolerate a stop at an await point, which a crash of its process also requires.
+- `Queue::claim` and `claim_batch` fail with the store's error once the store
+  closes, so a worker loop on an idle fenced queue returns. A caller that polls
+  an empty queue must stop on that error.
 
 <!-- vale off -->
 
