@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-14
+
 ### Added
 
 - `WorkflowView::group_status`: the member counts of a run group, so a process
@@ -60,6 +62,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Pending`. A dead-lettered step takes precedence over a cancellation request:
   `cancel` returns `false` for the run, and the reconciliation of the worker
   terminates it as `Failed`. Add the three variants to a match on `RunState`.
+- Raised the minimum `taquba` requirement to 0.15 and, for the `webhooks`
+  feature, the `taquba-webhooks` requirement to 0.11.
 
 ### Fixed
 

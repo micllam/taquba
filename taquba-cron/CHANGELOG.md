@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-14
+
 ### Added
 
 - `RESERVED_KV_PREFIX` and `RESERVED_DEDUP_PREFIX`: the prefix `cron/` of the
@@ -20,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a firing is late by at most a second after a forward step of the clock or a
   suspension of the host. 0.11 slept for the whole span to the next firing, and
   the firing was late by the duration of the step or the suspension.
+- Raised the minimum `taquba` requirement to 0.15.
 
 <!-- vale off -->
 
