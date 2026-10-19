@@ -13,17 +13,6 @@ use crate::txn::{
     Attempt, ClaimEnd, Durability, retry, stage_claim_end, stage_to_pending, take_claim,
 };
 
-/// The committed outcome of [`QueueCore::settle_claim`]'s transaction.
-struct SettledClaim<'e> {
-    /// The record as written.
-    job: JobRecord,
-    end: ClaimEnd<'e>,
-    /// The pending key when the job returned to pending.
-    pending_key: Option<Vec<u8>>,
-    /// The effects' results, or `None` when the transition discarded them.
-    results: Option<Vec<EnqueueResult>>,
-}
-
 impl QueueCore {
     /// The settlement of a claim. The effects are prepared once before the
     /// retry loop. Every iteration fences the claim, chooses the transition
@@ -41,7 +30,7 @@ impl QueueCore {
         let claim_id = claim.claim_id();
         let (queue, id) = (&claim.queue, claim.id.as_str());
 
-        let settled: Result<SettledClaim<'e>> = {
+        let mut settled = {
             let (prepared, end_for) = (&prepared, &end_for);
             retry(&self.db, Durability::Awaited, |txn| async move {
                 // The returned record is the base for the written record. The
@@ -58,29 +47,14 @@ impl QueueCore {
                 Ok(Attempt::Commit(txn, (job, end, pending_key, staged)))
             })
             .await
-        }
-        .map(|(job, end, pending_key, staged)| SettledClaim {
-            job,
-            end,
-            pending_key,
-            results: staged.map(|s| self.note_staged_effects(s)),
-        });
+        };
 
-        self.finish_effects(
-            prepared,
-            settled.as_ref().ok().and_then(|s| s.results.as_deref()),
-        )
-        .await;
-        let settled = settled?;
-        self.finish_claim_end(
-            &settled.job,
-            &settled.end,
-            claim_id,
-            settled.pending_key.as_deref(),
-            Some(claim),
-        )
-        .await;
-        Ok((settled.job, settled.results))
+        let staged = settled.as_mut().ok().and_then(|(.., staged)| staged.take());
+        let results = self.finish_effects(prepared, staged).await;
+        let (job, end, pending_key, _) = settled?;
+        self.finish_claim_end(&job, &end, claim_id, pending_key.as_deref(), Some(claim))
+            .await;
+        Ok((job, results))
     }
 
     /// Move the dead-letter job `id` back to pending with a reset attempt

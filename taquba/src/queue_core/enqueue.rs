@@ -1,7 +1,7 @@
 //! The transitions of [`QueueCore`] that write a new job, or commit settlement
 //! effects without a job transition.
 
-use crate::effects::{PreparedEffects, PreparedJob, SettlementEffects};
+use crate::effects::{PreparedEffects, PreparedJob, SettlementEffects, StagedEffects};
 use crate::error::Result;
 use crate::keys::user_scoped_key;
 use crate::kv::kv_state_matches;
@@ -23,7 +23,7 @@ impl QueueCore {
             .iter()
             .map(|(key, expected)| (user_scoped_key(key), *expected))
             .collect();
-        let committed = {
+        let mut committed = {
             let (prepared, compares) = (&prepared, &compares);
             retry(&self.db, Durability::Awaited, |txn| async move {
                 for (scoped, expected) in compares {
@@ -36,17 +36,10 @@ impl QueueCore {
                 Ok(Attempt::Commit(txn, Some(staged)))
             })
             .await
-        }
-        .map(|staged| staged.map(|staged| self.note_staged_effects(staged)));
-        self.finish_effects(
-            prepared,
-            committed
-                .as_ref()
-                .ok()
-                .and_then(|results| results.as_deref()),
-        )
-        .await;
-        committed
+        };
+        let staged = committed.as_mut().ok().and_then(Option::take);
+        let results = self.finish_effects(prepared, staged).await;
+        committed.map(|_| results)
     }
 
     /// Persist a prepared [`JobRecord`](crate::JobRecord) with its prepared
@@ -70,32 +63,30 @@ impl QueueCore {
             Ok(()) => self.write_job_txn(&prepared, &effects).await,
             Err(err) => Err(err),
         };
+        let (outcome, staged) = match written {
+            Ok(Ok((id, staged))) => (Ok(EnqueueResult::New(id)), Some(staged)),
+            Ok(Err(existing)) => (Ok(EnqueueResult::AlreadyEnqueued(existing)), None),
+            Err(err) => (Err(err), None),
+        };
         // A payload object is live only when a new record committed. On a dedup
         // downgrade or an error the record does not exist, so remove the object
         // written above.
-        if !matches!(written, Ok(Ok(_))) {
+        if staged.is_none() {
             self.payload_store.delete_for(&prepared.job).await;
         }
-        let results = match &written {
-            Ok(Ok((_, results))) => Some(results.as_slice()),
-            _ => None,
-        };
-        self.finish_effects(effects, results).await;
-        written.map(|written| match written {
-            Ok((id, results)) => (EnqueueResult::New(id), results),
-            Err(already_enqueued) => (EnqueueResult::AlreadyEnqueued(already_enqueued), Vec::new()),
-        })
+        let results = self.finish_effects(effects, staged).await;
+        outcome.map(|outcome| (outcome, results.unwrap_or_default()))
     }
 
     /// The transaction loop of [`Self::write_job`], after any payload offload.
-    /// The inner `Ok` is the id of the new job with the results of the effects'
-    /// enqueues, and the inner `Err` is the id of the pending or scheduled job
-    /// that a dedup key matched, as `stage_job_writes` reports it.
+    /// The inner `Ok` is the id of the new job with the staged effects, and the
+    /// inner `Err` is the id of the pending or scheduled job that a dedup key
+    /// matched, as `stage_job_writes` reports it.
     async fn write_job_txn(
         &self,
         prepared: &PreparedJob,
         effects: &PreparedEffects,
-    ) -> Result<std::result::Result<(String, Vec<EnqueueResult>), String>> {
+    ) -> Result<std::result::Result<(String, StagedEffects), String>> {
         let timer = crate::obs::start();
         let written = retry(&self.db, Durability::Awaited, |txn| async move {
             let staged = match self.stage_job_writes(&txn, prepared).await? {
@@ -112,7 +103,7 @@ impl QueueCore {
         Ok(written.map(|(staged, staged_effects)| {
             crate::obs::enqueue_committed(&staged.queue, timer);
             self.note_staged_job(&staged);
-            (staged.id, self.note_staged_effects(staged_effects))
+            (staged.id, staged_effects)
         }))
     }
 }

@@ -252,32 +252,33 @@ impl QueueCore {
         }
     }
 
-    /// Release prepared effects once their settlement ends: delete the payload
-    /// objects of follow-up jobs that no committed record points at. `results`
-    /// aligns index-wise with the prepared jobs: an
-    /// [`EnqueueResult::AlreadyEnqueued`] entry marks a dedup downgrade whose
-    /// object is unreferenced. `None` means that a follow-up record did not
+    /// End the lifecycle of prepared effects once their settlement ends, on
+    /// every branch of every settlement path. `staged` contains the effects
+    /// that a committed transaction staged, and `None` means that they did not
     /// commit (the settlement failed or took a branch that discards the
-    /// effects), so every offloaded object is deleted. Every settlement path
-    /// ends with this call, on every branch.
+    /// effects). Committed effects are recorded and their expiry entries noted
+    /// on the indexes, and the payload object of an enqueue downgraded by a
+    /// dedup hit is deleted. Without a commit, every offloaded object is
+    /// deleted. Returns the enqueue results of the committed effects.
     pub(crate) async fn finish_effects(
         &self,
         prepared: PreparedEffects,
-        results: Option<&[EnqueueResult]>,
-    ) {
-        match results {
-            Some(results) => {
-                for (prepared, result) in prepared.prepared_jobs.iter().zip(results) {
-                    if matches!(result, EnqueueResult::AlreadyEnqueued(_)) {
-                        self.payload_store.delete_for(&prepared.job).await;
-                    }
-                }
-                for (index, at_ms) in &prepared.expiry_entries {
-                    index.written(*at_ms);
-                }
+        staged: Option<StagedEffects>,
+    ) -> Option<Vec<EnqueueResult>> {
+        let Some(staged) = staged else {
+            self.discard_prepared(&prepared.prepared_jobs).await;
+            return None;
+        };
+        let results = self.note_staged_effects(staged);
+        for (prepared, result) in prepared.prepared_jobs.iter().zip(&results) {
+            if matches!(result, EnqueueResult::AlreadyEnqueued(_)) {
+                self.payload_store.delete_for(&prepared.job).await;
             }
-            None => self.discard_prepared(&prepared.prepared_jobs).await,
         }
+        for (index, at_ms) in &prepared.expiry_entries {
+            index.written(*at_ms);
+        }
+        Some(results)
     }
 
     /// Validate `effects` and prepare them for staging: size-check the KV
@@ -318,7 +319,7 @@ impl QueueCore {
     /// inside every iteration of the settlement's retry loop. A dedup hit
     /// downgrades that enqueue to [`EnqueueResult::AlreadyEnqueued`] without
     /// affecting the rest. After the transaction commits, the caller passes the
-    /// result to [`Self::note_staged_effects`].
+    /// result to [`Self::finish_effects`].
     pub(crate) async fn stage_effects(
         &self,
         txn: &DbTransaction,
@@ -351,7 +352,7 @@ impl QueueCore {
     /// results. The jobs are grouped by queue: each queue's pending inserts are
     /// recorded once, with the smallest pending key and their count, and
     /// counted as enqueued once.
-    pub(crate) fn note_staged_effects(&self, staged: StagedEffects) -> Vec<EnqueueResult> {
+    fn note_staged_effects(&self, staged: StagedEffects) -> Vec<EnqueueResult> {
         let mut by_queue: BTreeMap<&QueueName, QueueInserts<'_>> = BTreeMap::new();
         for staged_job in &staged.jobs {
             let inserts = by_queue.entry(&staged_job.queue).or_default();
