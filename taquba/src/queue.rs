@@ -13,14 +13,11 @@ use crate::background::{BackgroundTask, Ticker};
 use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
 use crate::completion::{CompletionWaiters, Registration};
-use crate::effects::{EnqueueRequest, PreparedEffects, PreparedJob, SettlementEffects};
+use crate::effects::{EnqueueRequest, PreparedEffects, SettlementEffects};
 use crate::error::{Error, Result};
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{Claim, JobRecord, JobStatus};
-use crate::keys::{
-    QueueName, claimed_key, dedup_index_key, job_index_key, pending_prefix, user_scoped_key,
-};
-use crate::kv::kv_state_matches;
+use crate::keys::{QueueName, claimed_key, dedup_index_key, job_index_key, pending_prefix};
 use crate::lease_registry::{LeaseRegistry, Renewal};
 use crate::options::{EnqueueOptions, OpenOptions, QueueConfig};
 use crate::payload_store::PayloadStore;
@@ -507,7 +504,8 @@ impl Queue {
         opts: EnqueueOptions,
     ) -> Result<String> {
         let prepared = self.core.prepare_job_record(queue, payload, opts)?;
-        self.write_job(prepared, PreparedEffects::default())
+        self.core
+            .write_job(prepared, PreparedEffects::default())
             .await
             .map(|(result, _)| result.into_id())
     }
@@ -560,7 +558,7 @@ impl Queue {
     ) -> Result<(EnqueueResult, Vec<EnqueueResult>)> {
         let prepared = self.core.prepare_job_record(queue, payload, opts)?;
         let effects = self.core.prepare_effects(effects).await?;
-        self.write_job(prepared, effects).await
+        self.core.write_job(prepared, effects).await
     }
 
     /// Apply `effects` as one transaction without a job transition: the
@@ -577,7 +575,7 @@ impl Queue {
     /// transition of its own, such as reconciling the state of a job the reaper
     /// dead-lettered.
     pub async fn commit_effects(&self, effects: SettlementEffects) -> Result<Vec<EnqueueResult>> {
-        let committed = self.commit_effects_where(effects, &[]).await?;
+        let committed = self.core.commit_effects_where(effects, &[]).await?;
         Ok(committed.expect("a commit without a compare is unconditional"))
     }
 
@@ -598,47 +596,7 @@ impl Queue {
         compares: &[(&[u8], Option<&[u8]>)],
         effects: SettlementEffects,
     ) -> Result<Option<Vec<EnqueueResult>>> {
-        self.commit_effects_where(effects, compares).await
-    }
-
-    /// Body of `commit_effects` and `kv_compare_commit`: the transaction loop
-    /// over the prepared effects, with every compare of `compares` (a key and
-    /// its expected state) tested first.
-    async fn commit_effects_where(
-        &self,
-        effects: SettlementEffects,
-        compares: &[(&[u8], Option<&[u8]>)],
-    ) -> Result<Option<Vec<EnqueueResult>>> {
-        let prepared = self.core.prepare_effects(effects).await?;
-        let compares: Vec<_> = compares
-            .iter()
-            .map(|(key, expected)| (user_scoped_key(key), *expected))
-            .collect();
-        let committed = {
-            let (prepared, compares) = (&prepared, &compares);
-            retry(&self.core.db, Durability::Awaited, |txn| async move {
-                for (scoped, expected) in compares {
-                    if !kv_state_matches(&txn, scoped, *expected).await? {
-                        txn.rollback();
-                        return Ok(Attempt::Abort(None));
-                    }
-                }
-                let staged = self.core.stage_effects(&txn, prepared).await?;
-                Ok(Attempt::Commit(txn, Some(staged)))
-            })
-            .await
-        }
-        .map(|staged| staged.map(|staged| self.core.note_staged_effects(staged)));
-        self.core
-            .finish_effects(
-                prepared,
-                committed
-                    .as_ref()
-                    .ok()
-                    .and_then(|results| results.as_deref()),
-            )
-            .await;
-        committed
+        self.core.commit_effects_where(effects, compares).await
     }
 
     /// Fetch the offloaded payloads of `jobs` concurrently. The slowest object
@@ -651,72 +609,6 @@ impl Queue {
             futures_util::future::join_all(jobs.iter_mut().map(|c| store.materialize(c.job_mut())))
                 .await;
         fetched.into_iter().collect()
-    }
-
-    /// Persist a prepared [`JobRecord`] with its prepared `effects` in a single
-    /// transaction, checking the dedup index and, for a caller-supplied id, the
-    /// job index. Retries on transaction conflict.
-    ///
-    /// Returns [`EnqueueResult::AlreadyEnqueued`] without the effects if
-    /// `job.dedup_key` is set and a pending or scheduled job with the same
-    /// dedup key already exists. Returns [`Error::DuplicateJobId`] if
-    /// `id_override` was used and the id is already indexed. Otherwise writes
-    /// the record, the job index, the dedup index (when set) and the effects,
-    /// and returns [`EnqueueResult::New`] with the results of the effects'
-    /// enqueues. Every branch ends with [`QueueCore::finish_effects`].
-    async fn write_job(
-        &self,
-        mut prepared: PreparedJob,
-        effects: PreparedEffects,
-    ) -> Result<(EnqueueResult, Vec<EnqueueResult>)> {
-        let written = match self.core.payload_store.offload(&mut prepared.job).await {
-            Ok(()) => self.write_job_txn(&prepared, &effects).await,
-            Err(err) => Err(err),
-        };
-        // A payload object is live only when a new record committed. On a dedup
-        // downgrade or an error the record does not exist, so remove the object
-        // written above.
-        if !matches!(written, Ok(Ok(_))) {
-            self.core.payload_store.delete_for(&prepared.job).await;
-        }
-        let results = match &written {
-            Ok(Ok((_, results))) => Some(results.as_slice()),
-            _ => None,
-        };
-        self.core.finish_effects(effects, results).await;
-        written.map(|written| match written {
-            Ok((id, results)) => (EnqueueResult::New(id), results),
-            Err(already_enqueued) => (EnqueueResult::AlreadyEnqueued(already_enqueued), Vec::new()),
-        })
-    }
-
-    /// The transaction loop of [`Self::write_job`], after any payload offload.
-    /// The inner `Ok` is the id of the new job with the results of the effects'
-    /// enqueues, and the inner `Err` is the id of the pending or scheduled job
-    /// that a dedup key matched, as `stage_job_writes` reports it.
-    async fn write_job_txn(
-        &self,
-        prepared: &PreparedJob,
-        effects: &PreparedEffects,
-    ) -> Result<std::result::Result<(String, Vec<EnqueueResult>), String>> {
-        let timer = crate::obs::start();
-        let written = retry(&self.core.db, Durability::Awaited, |txn| async move {
-            let staged = match self.core.stage_job_writes(&txn, prepared).await? {
-                Ok(staged) => staged,
-                Err(already_enqueued) => {
-                    txn.rollback();
-                    return Ok(Attempt::Abort(Err(already_enqueued)));
-                }
-            };
-            let staged_effects = self.core.stage_effects(&txn, effects).await?;
-            Ok(Attempt::Commit(txn, Ok((staged, staged_effects))))
-        })
-        .await?;
-        Ok(written.map(|(staged, staged_effects)| {
-            crate::obs::enqueue_committed(&staged.queue, timer);
-            self.core.note_staged_job(&staged);
-            (staged.id, self.core.note_staged_effects(staged_effects))
-        }))
     }
 
     /// Claim the next pending job using the configured default lease duration.
