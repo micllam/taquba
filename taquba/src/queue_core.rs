@@ -26,6 +26,7 @@ use crate::txn::{Attempt, Durability, get_indexed_job, retry};
 use crate::view::QueueView;
 
 mod claim;
+mod control;
 mod enqueue;
 mod settle;
 
