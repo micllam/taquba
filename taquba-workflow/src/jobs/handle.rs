@@ -1,13 +1,14 @@
 use std::future::{Future, IntoFuture};
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{RunId, RunOutcome, RunStatus, RunTermination, StepErrorKind, TerminalStatus};
 use thiserror::Error;
 
 use crate::jobs::job::Job;
-use crate::jobs::runner::JobRuntime;
+use crate::runtime::RuntimeCore;
 use crate::{Error, Result};
 
 /// The logical failure outcome of a job that did not succeed.
@@ -57,7 +58,7 @@ pub enum JoinError {
 /// object storage after a restart.
 pub struct JobHandle<J: Job> {
     id: RunId,
-    runtime: JobRuntime,
+    core: Arc<RuntimeCore>,
     newly_submitted: bool,
     _marker: PhantomData<fn() -> J>,
 }
@@ -66,7 +67,7 @@ impl<J: Job> Clone for JobHandle<J> {
     fn clone(&self) -> Self {
         Self {
             id: self.id.clone(),
-            runtime: self.runtime.clone(),
+            core: self.core.clone(),
             newly_submitted: self.newly_submitted,
             _marker: PhantomData,
         }
@@ -74,10 +75,10 @@ impl<J: Job> Clone for JobHandle<J> {
 }
 
 impl<J: Job> JobHandle<J> {
-    pub(crate) fn new(id: RunId, runtime: JobRuntime, newly_submitted: bool) -> Self {
+    pub(crate) fn new(id: RunId, core: Arc<RuntimeCore>, newly_submitted: bool) -> Self {
         Self {
             id,
-            runtime,
+            core,
             newly_submitted,
             _marker: PhantomData,
         }
@@ -109,7 +110,7 @@ impl<J: Job> JobHandle<J> {
     ///
     /// [`JobRunnerBuilder::retention`]: super::JobRunnerBuilder::retention
     pub async fn status(&self) -> Result<Option<RunStatus>> {
-        self.runtime.status(&self.id).await
+        self.core.view.status(&self.id).await
     }
 
     /// Read the job's persisted result without waiting.
@@ -121,14 +122,7 @@ impl<J: Job> JobHandle<J> {
     ///
     /// Reads from object storage, so it works across process restarts.
     pub async fn fetch_result(&self) -> Result<Option<std::result::Result<J::Output, JobError>>> {
-        match self
-            .runtime
-            .inner
-            .core
-            .view
-            .recorded_result(&self.id)
-            .await?
-        {
+        match self.core.view.recorded_result(&self.id).await? {
             None => Ok(None),
             Some(result) => decode_end::<J>(result.termination, Some(result.outcome)).map(Some),
         }
@@ -139,7 +133,7 @@ impl<J: Job> JobHandle<J> {
     /// Waits indefinitely. Use [`join_timeout`](Self::join_timeout) to bound
     /// the wait.
     pub async fn join(&self) -> Result<std::result::Result<J::Output, JobError>> {
-        let end = self.runtime.wait(&self.id).await?;
+        let end = self.core.wait(&self.id).await?;
         decode_end::<J>(end.termination, end.outcome)
     }
 
@@ -158,7 +152,7 @@ impl<J: Job> JobHandle<J> {
         &self,
         timeout: Duration,
     ) -> Result<Option<std::result::Result<J::Output, JobError>>> {
-        match self.runtime.wait_timeout(&self.id, timeout).await? {
+        match self.core.wait_timeout(&self.id, timeout).await? {
             None => Ok(None),
             Some(end) => decode_end::<J>(end.termination, end.outcome).map(Some),
         }

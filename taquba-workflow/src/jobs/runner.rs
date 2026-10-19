@@ -39,11 +39,6 @@ fn run_id_for_key(key: &str) -> RunId {
     RunId::digest(&[key.as_bytes()])
 }
 
-/// The runtime a job runs as one step of, shared by the runner and every
-/// [`JobHandle`]. Its terminal hook is [`NoopTerminalHook`], so a job does not
-/// enqueue a notification.
-pub(crate) type JobRuntime = WorkflowRuntime<Dispatch, NoopTerminalHook>;
-
 /// The run payload of `job`: its [`Job::NAME`] and its serialized fields.
 pub(crate) fn job_payload<J: Job>(job: &J) -> Result<Vec<u8>> {
     Ok(rmp_serde::to_vec_named(&JobPayload {
@@ -157,7 +152,9 @@ impl StepRunner for Dispatch {
 /// builder, then [`spawn`](Self::spawn) the worker. Jobs can be submitted
 /// before or after spawning.
 pub struct JobRunner {
-    runtime: JobRuntime,
+    /// The runtime a job runs as one step of. Its terminal hook is
+    /// [`NoopTerminalHook`], so a job does not enqueue a notification.
+    runtime: WorkflowRuntime<Dispatch, NoopTerminalHook>,
 }
 
 impl Clone for JobRunner {
@@ -209,7 +206,11 @@ impl JobRunner {
                 return Err(crate::Error::InputMismatch(run_id.clone()));
             }
             tracing::debug!(job_id = %run_id, job_type = J::NAME, "submit matched a terminated job");
-            return Ok(JobHandle::new(run_id.clone(), self.runtime.clone(), false));
+            return Ok(JobHandle::new(
+                run_id.clone(),
+                self.runtime.inner.core.clone(),
+                false,
+            ));
         }
 
         let outcome = self
@@ -234,7 +235,7 @@ impl JobRunner {
         );
         Ok(JobHandle::new(
             outcome.run_id,
-            self.runtime.clone(),
+            self.runtime.inner.core.clone(),
             outcome.newly_submitted,
         ))
     }
