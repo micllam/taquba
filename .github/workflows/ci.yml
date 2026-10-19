@@ -33,7 +33,7 @@ jobs:
           shared-key: lint
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
-      - run: cargo doc --workspace --all-features --no-deps --locked
+      - run: cargo doc --workspace --all-features --no-deps --document-private-items --locked
         env:
           RUSTDOCFLAGS: -D warnings
 
