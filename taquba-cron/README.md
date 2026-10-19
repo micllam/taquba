@@ -68,7 +68,7 @@ use std::collections::HashMap;
 use taquba_cron::Schedule;
 
 let schedule = Schedule::new("hook", "0 9 * * *".parse()?, "hooks", b"ping".to_vec())
-    .headers(HashMap::from([("target_url".into(), "https://example.com/hook".into())]))
+    .headers(HashMap::from([("webhook.url".into(), "https://example.com/hook".into())]))
     .priority(Some(taquba::PRIORITY_HIGH))
     .max_attempts(Some(10));
 ```
