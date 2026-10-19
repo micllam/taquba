@@ -219,7 +219,6 @@ pub(crate) fn backoff_delay(attempts: u32, base: Duration, max: Duration) -> Dur
 /// processes.
 pub struct Queue {
     pub(crate) core: Arc<QueueCore>,
-    view: QueueView,
     reaper_task: BackgroundTask,
     scheduler_task: BackgroundTask,
     /// `Some` only when built with the `metrics` feature and
@@ -333,6 +332,7 @@ impl Queue {
         }
         let db = Arc::new(builder.build().await?);
         let core = Arc::new(QueueCore {
+            view: QueueView::new(Handle::Writer(db.clone()), payload_store.clone()),
             db,
             clock: opts.clock,
             configs: QueueConfigs::new(opts.default_queue_config, opts.queue_configs),
@@ -384,7 +384,6 @@ impl Queue {
         };
 
         Ok(Self {
-            view: QueueView::new(Handle::Writer(core.db.clone()), core.payload_store.clone()),
             core,
             reaper_task,
             scheduler_task,
@@ -397,7 +396,7 @@ impl Queue {
     /// The writer's live view of the store: the read-only queries, with a write
     /// visible to the next read.
     pub fn view(&self) -> &QueueView {
-        &self.view
+        &self.core.view
     }
 
     /// Current time as a Unix timestamp in milliseconds, as read from this

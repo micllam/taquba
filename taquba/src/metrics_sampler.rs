@@ -15,16 +15,13 @@ use crate::error::Result;
 use crate::job::JobRecord;
 use crate::keys::{QueueName, pending_prefix};
 use crate::queue_core::QueueCore;
-use crate::view::{Handle, QueueView};
 pub(crate) struct MetricsSampler {
     core: Arc<QueueCore>,
-    view: QueueView,
 }
 
 impl MetricsSampler {
     pub(crate) fn new(core: Arc<QueueCore>) -> Self {
-        let view = QueueView::new(Handle::Writer(core.db.clone()), core.payload_store.clone());
-        Self { core, view }
+        Self { core }
     }
 }
 
@@ -32,13 +29,14 @@ impl Periodic for MetricsSampler {
     const NAME: &'static str = "metrics sampler";
 
     async fn step(&self) -> Result<()> {
-        sample(&self.core, &self.view).await
+        sample(&self.core).await
     }
 }
 
 /// Read each queue's depth and oldest-pending age once and set the gauges.
-async fn sample(core: &QueueCore, view: &QueueView) -> Result<()> {
+async fn sample(core: &QueueCore) -> Result<()> {
     let db = core.db.as_ref();
+    let view = &core.view;
     let now = core.now_ms();
     for queue in view.list_queues().await? {
         // A name parsed from a stored key is within the bound.

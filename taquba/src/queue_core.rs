@@ -23,6 +23,7 @@ use crate::queue::WaitOutcome;
 use crate::time_bound::TimeBound;
 use crate::txn::ClaimEnd;
 use crate::txn::{Attempt, Durability, get_indexed_job, retry};
+use crate::view::QueueView;
 
 /// The per-queue configurations of an open queue: a default and the overrides,
 /// with the queue name as their key.
@@ -64,6 +65,9 @@ pub(crate) struct QueueCore {
     pub(crate) lease_registry: LeaseRegistry,
     pub(crate) completion_waiters: Arc<CompletionWaiters>,
     pub(crate) payload_store: Arc<PayloadStore>,
+    /// The writer's live view of the store, which
+    /// [`Queue::view`](crate::Queue::view) returns.
+    pub(crate) view: QueueView,
     /// Source of job ids. Pending keys sort by id within a priority, so ids
     /// must increase with enqueue order, including inside one millisecond. One
     /// generator per store suffices: a store has a single writer process.
