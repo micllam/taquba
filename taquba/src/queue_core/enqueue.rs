@@ -7,7 +7,7 @@ use crate::keys::user_scoped_key;
 use crate::kv::kv_state_matches;
 use crate::queue::EnqueueResult;
 use crate::queue_core::QueueCore;
-use crate::txn::{Attempt, Durability, retry};
+use crate::txn::{Attempt, Durability};
 
 impl QueueCore {
     /// Body of `commit_effects` and `kv_compare_commit`: the transaction loop
@@ -25,15 +25,14 @@ impl QueueCore {
             .collect();
         let mut committed = {
             let (prepared, compares) = (&prepared, &compares);
-            retry(&self.db, Durability::Awaited, |txn| async move {
+            self.retry(Durability::Awaited, |mut txn| async move {
                 for (scoped, expected) in compares {
                     if !kv_state_matches(&txn, scoped, *expected).await? {
-                        txn.rollback();
-                        return Ok(Attempt::Abort(None));
+                        return Ok((txn, Attempt::Abort(None)));
                     }
                 }
-                let staged = self.stage_effects(&txn, prepared).await?;
-                Ok(Attempt::Commit(txn, Some(staged)))
+                let staged = self.stage_effects(&mut txn, prepared).await?;
+                Ok((txn, Attempt::Commit(Some(staged))))
             })
             .await
         };
@@ -88,18 +87,18 @@ impl QueueCore {
         effects: &PreparedEffects,
     ) -> Result<std::result::Result<(String, StagedEffects), String>> {
         let timer = crate::obs::start();
-        let written = retry(&self.db, Durability::Awaited, |txn| async move {
-            let staged = match self.stage_job_writes(&txn, prepared).await? {
-                Ok(staged) => staged,
-                Err(already_enqueued) => {
-                    txn.rollback();
-                    return Ok(Attempt::Abort(Err(already_enqueued)));
-                }
-            };
-            let staged_effects = self.stage_effects(&txn, effects).await?;
-            Ok(Attempt::Commit(txn, Ok((staged, staged_effects))))
-        })
-        .await?;
+        let written = self
+            .retry(Durability::Awaited, |mut txn| async move {
+                let staged = match self.stage_job_writes(&mut txn, prepared).await? {
+                    Ok(staged) => staged,
+                    Err(already_enqueued) => {
+                        return Ok((txn, Attempt::Abort(Err(already_enqueued))));
+                    }
+                };
+                let staged_effects = self.stage_effects(&mut txn, effects).await?;
+                Ok((txn, Attempt::Commit(Ok((staged, staged_effects)))))
+            })
+            .await?;
         Ok(written.map(|(staged, staged_effects)| {
             crate::obs::enqueue_committed(&staged.queue, timer);
             self.note_staged_job(&staged);

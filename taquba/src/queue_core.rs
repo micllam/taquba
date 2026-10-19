@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::future::Future;
 
 use bytes::Bytes;
-use slatedb::{CloseReason, Db, DbTransaction};
+use slatedb::{CloseReason, Db};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
@@ -22,7 +22,7 @@ use crate::payload_store::PayloadStore;
 use crate::queue::WaitOutcome;
 use crate::time_bound::TimeBound;
 use crate::txn::ClaimEnd;
-use crate::txn::{Attempt, Durability, get_indexed_job, retry};
+use crate::txn::{Attempt, Durability, Txn, get_indexed_job};
 use crate::view::QueueView;
 
 mod claim;
@@ -90,33 +90,19 @@ impl QueueCore {
     }
 
     /// Complete a claim-ending transition after its commit. It removes the
-    /// lease entry, fenced on `claim_id`, records the pending insert, deletes
-    /// the payload object of a done job whose record was not kept and delivers
-    /// a terminal outcome to the job's completion waiters. The delivered record
-    /// includes its payload inline, taken from `claim` when one is given and
-    /// otherwise fetched from the payload store, only when the job has waiters.
+    /// lease entry, fenced on `claim_id`, deletes the payload object of a done
+    /// job whose record was not kept and delivers a terminal outcome to the
+    /// job's completion waiters. The delivered record includes its payload
+    /// inline, taken from `claim` when one is given and otherwise fetched from
+    /// the payload store, only when the job has waiters.
     pub(crate) async fn finish_claim_end(
         &self,
         job: &JobRecord,
         end: &ClaimEnd<'_>,
         claim_id: u64,
-        pending_key: Option<&[u8]>,
         claim: Option<&Claim>,
     ) {
         self.lease_registry.remove(&job.queue, &job.id, claim_id);
-        if let Some(key) = pending_key {
-            self.claim_cursor.note_pending_insert(&job.queue, key);
-        }
-        if job.status == JobStatus::Scheduled
-            && let Some(run_at) = job.run_at
-        {
-            self.scheduled_bound.lower(run_at);
-        }
-        if let ClaimEnd::Done { keep: true } = end
-            && let Some(completed_at) = job.completed_at
-        {
-            self.done_bound.lower(completed_at);
-        }
         if let ClaimEnd::Done { keep: false } = end {
             self.payload_store.delete_for(job).await;
         }
@@ -158,14 +144,13 @@ impl QueueCore {
         transition: F,
     ) -> Result<T>
     where
-        F: Fn(DbTransaction, Bytes, JobRecord) -> Fut,
-        Fut: Future<Output = Result<Attempt<T>>>,
+        F: Fn(Txn, Bytes, JobRecord) -> Fut,
+        Fut: Future<Output = Result<(Txn, Attempt<T>)>>,
     {
         let (missing, transition) = (&missing, &transition);
-        retry(&self.db, durability, |txn| async move {
+        self.retry(durability, |txn| async move {
             let Some((_, current_key, job)) = get_indexed_job(&txn, id).await? else {
-                txn.rollback();
-                return missing().map(Attempt::Abort);
+                return Ok((txn, Attempt::Abort(missing()?)));
             };
             transition(txn, current_key, job).await
         })

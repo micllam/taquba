@@ -175,13 +175,6 @@ impl ClaimCursor {
             .is_some_and(QueueClaimState::known_empty)
     }
 
-    /// Record one committed pending insert. See [`Self::note_pending_inserts`]
-    /// for the semantics, including why this must be called after the insert's
-    /// transaction commits.
-    pub(crate) fn note_pending_insert(&self, queue: &QueueName, new_key: &[u8]) {
-        self.note_pending_inserts(queue, new_key, 1);
-    }
-
     /// Record `count` committed pending inserts whose smallest key is
     /// `min_key`: bump the epoch, revoking any emptiness recorded against an
     /// earlier one, update the scan state so no claim can miss the key, and
@@ -414,7 +407,7 @@ mod tests {
 
         assert!(state.begin_claim("q").known_empty);
 
-        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-1");
+        state.note_pending_inserts(&qn("q"), b"pending:q:00000000:job-1", 1);
         assert!(!state.begin_claim("q").known_empty);
     }
 
@@ -422,7 +415,7 @@ mod tests {
     fn insert_between_begin_and_mark_revokes_emptiness() {
         let state = ClaimCursor::new();
         let scan = state.begin_claim("q");
-        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-1");
+        state.note_pending_inserts(&qn("q"), b"pending:q:00000000:job-1", 1);
         state.mark_empty(&qn("q"), &scan);
 
         assert!(!state.begin_claim("q").known_empty);
@@ -456,13 +449,13 @@ mod tests {
             &scan,
         );
 
-        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-9");
+        state.note_pending_inserts(&qn("q"), b"pending:q:00000000:job-9", 1);
         assert_eq!(
             state.begin_claim("q").scan_from,
             scan_from(b"pending:q:00000000:job-5", false),
         );
 
-        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-3");
+        state.note_pending_inserts(&qn("q"), b"pending:q:00000000:job-3", 1);
         assert_eq!(
             state.begin_claim("q").scan_from,
             scan_from(b"pending:q:00000000:job-3", true),
@@ -479,7 +472,7 @@ mod tests {
             &scan,
         );
 
-        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-5");
+        state.note_pending_inserts(&qn("q"), b"pending:q:00000000:job-5", 1);
         assert_eq!(
             state.begin_claim("q").scan_from,
             scan_from(b"pending:q:00000000:job-5", true),
@@ -492,7 +485,7 @@ mod tests {
         let scan = state.begin_claim("q");
         state.mark_empty(&qn("q"), &scan);
 
-        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-1");
+        state.note_pending_inserts(&qn("q"), b"pending:q:00000000:job-1", 1);
         assert_eq!(
             state.begin_claim("q").scan_from,
             scan_from(b"pending:q:00000000:job-1", true),
@@ -502,7 +495,7 @@ mod tests {
     #[test]
     fn insert_with_unknown_bound_keeps_the_front_scan_fallback() {
         let state = ClaimCursor::new();
-        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-1");
+        state.note_pending_inserts(&qn("q"), b"pending:q:00000000:job-1", 1);
         assert!(state.begin_claim("q").scan_from.is_none());
     }
 
@@ -520,7 +513,7 @@ mod tests {
         // commits. It sorts after the bound, so it does not move it, but it
         // sorts below the keys the claim is about to advance past.
         let observed = state.begin_claim("q");
-        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-3");
+        state.note_pending_inserts(&qn("q"), b"pending:q:00000000:job-3", 1);
         state.advance(
             &qn("q"),
             Bytes::from_static(b"pending:q:00000000:job-5"),
@@ -544,7 +537,7 @@ mod tests {
         );
 
         let observed = state.begin_claim("q");
-        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-3");
+        state.note_pending_inserts(&qn("q"), b"pending:q:00000000:job-3", 1);
         state.advance(
             &qn("q"),
             Bytes::from_static(b"pending:q:00000000:job-5"),
@@ -577,7 +570,7 @@ mod tests {
         // reaper requeues it at its original key before the claim's bound
         // update runs.
         let observed = state.begin_claim("q");
-        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-5");
+        state.note_pending_inserts(&qn("q"), b"pending:q:00000000:job-5", 1);
         state.advance(
             &qn("q"),
             Bytes::from_static(b"pending:q:00000000:job-5"),
@@ -601,7 +594,7 @@ mod tests {
         );
 
         let observed = state.begin_claim("q");
-        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-9");
+        state.note_pending_inserts(&qn("q"), b"pending:q:00000000:job-9", 1);
         state.advance(
             &qn("q"),
             Bytes::from_static(b"pending:q:00000000:job-5"),
@@ -622,7 +615,7 @@ mod tests {
         // While it runs, a reaper requeue inserts a key that sorts below the
         // keys the claim will advance past.
         let observed = state.begin_claim("q");
-        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-1");
+        state.note_pending_inserts(&qn("q"), b"pending:q:00000000:job-1", 1);
         state.advance(
             &qn("q"),
             Bytes::from_static(b"pending:q:00000000:job-5"),
@@ -665,7 +658,7 @@ mod tests {
             },
         );
 
-        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-1");
+        state.note_pending_inserts(&qn("q"), b"pending:q:00000000:job-1", 1);
         let scan = state.begin_claim("q");
         assert!(!scan.known_empty);
         assert_eq!(scan.scan_from, scan_from(b"pending:q:00000000:job-1", true));
@@ -704,7 +697,7 @@ mod tests {
         );
 
         let observed = state.begin_claim("q");
-        state.note_pending_insert(&qn("q"), b"pending:q:00000000:job-3");
+        state.note_pending_inserts(&qn("q"), b"pending:q:00000000:job-3", 1);
         state.advance(
             &qn("q"),
             Bytes::from_static(b"pending:q:00000000:job-7"),

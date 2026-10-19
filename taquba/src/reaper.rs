@@ -14,9 +14,7 @@ use crate::job::{JobRecord, JobStatus};
 use crate::keys::{KeyTag, claimed_key, parse_key_timestamp, tag_prefix};
 use crate::lease_registry::DueLease;
 use crate::queue_core::QueueCore;
-use crate::txn::{
-    Attempt, ClaimEnd, Commit, Durability, commit, retry, stage_claim_end, stage_remove,
-};
+use crate::txn::{Attempt, ClaimEnd, Commit, Durability, commit, stage_claim_end, stage_remove};
 
 /// Target bytes fetched per object-store request by the recovery and retention
 /// scans.
@@ -142,7 +140,7 @@ impl QueueCore {
         // own transaction, so a commit that awaits the flush serialises the
         // sweep at one job per flush interval. A commit lost in a crash is
         // redone by the requeue of claimed records at the next open.
-        let reaped = retry(&self.db, Durability::Deferred, |txn| async move {
+        let reaped = self.retry(Durability::Deferred, |mut txn| async move {
             // A settlement removes the entry after its commit. When the entry
             // is gone or belongs to a new claim, the reap aborts. The check
             // runs after the transaction begins: a claim transition the check
@@ -153,10 +151,7 @@ impl QueueCore {
             // which the store does not distinguish from the old claim's.
             match registry.current(queue, id) {
                 Some((_, current)) if current == claim_id => {}
-                _ => {
-                    txn.rollback();
-                    return Ok(Attempt::Abort(None));
-                }
+                _ => return Ok((txn, Attempt::Abort(None))),
             }
 
             // An entry without a claimed record is the residue of a claim whose
@@ -164,22 +159,20 @@ impl QueueCore {
             // whose entry removal did not run yet. Neither case leaves a claim
             // to recover, so the entry is dropped.
             let Some(raw) = txn.get(claimed_key_bytes).await? else {
-                txn.rollback();
                 registry.remove(queue, id, claim_id);
                 debug!(queue = %queue, job_id = %id, "dropped lease entry with no claimed record");
-                return Ok(Attempt::Abort(None));
+                return Ok((txn, Attempt::Abort(None)));
             };
 
             let mut job = JobRecord::decode(claimed_key_bytes, &raw)?;
             txn.delete(claimed_key_bytes)?;
             let end = unsettled_claim_end(&job, AttemptOutcome::LeaseExpired, "lease expired");
-            let pending_key = stage_claim_end(&txn, &mut job, &end, self.now_ms())?;
-            Ok(Attempt::Commit(txn, Some((job, end, pending_key))))
+            stage_claim_end(&mut txn, &mut job, &end, self.now_ms())?;
+            Ok((txn, Attempt::Commit(Some((job, end)))))
         })
         .await?;
-        if let Some((job, end, pending_key)) = reaped {
-            self.finish_claim_end(&job, &end, claim_id, pending_key.as_deref(), None)
-                .await;
+        if let Some((job, end)) = reaped {
+            self.finish_claim_end(&job, &end, claim_id, None).await;
             if end.is_terminal() {
                 crate::obs::dead_lettered(&job.queue);
             } else {
@@ -196,8 +189,9 @@ impl QueueCore {
     /// Attempts count claims, so `max_attempts` still bounds a crash-looping
     /// job.
     ///
-    /// Runs after the claim cursor is restored, and notes each re-queued job's
-    /// pending key, which sorts before the restored clean-close bound.
+    /// Runs after the claim cursor is restored, so the commit of each requeue
+    /// notes its pending key, which sorts before the restored clean-close
+    /// bound.
     pub(crate) async fn requeue_interrupted_claims(&self) -> Result<()> {
         let mut interrupted: Vec<JobRecord> = Vec::new();
         let mut iter = self
@@ -214,25 +208,23 @@ impl QueueCore {
         }
         drop(iter);
 
-        for mut job in interrupted {
-            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
-            txn.delete(claimed_key(&job.queue, &job.id))?;
-            let end = unsettled_claim_end(
-                &job,
-                AttemptOutcome::Interrupted,
-                "claim interrupted by process exit",
-            );
-            let pending_key = stage_claim_end(&txn, &mut job, &end, self.now_ms())?;
+        for job in &interrupted {
             // The commit does not await WAL durability: a commit that awaits
             // the flush serialises the open at one job per flush interval. A
             // requeue lost in a crash is redone by the next open from the
-            // claimed record it left in place. Nothing else writes at open, so
-            // a commit error surfaces to the caller and fails the open.
-            txn.commit().await?;
-            if let Some(pending_key) = pending_key {
-                self.claim_cursor
-                    .note_pending_insert(&job.queue, &pending_key);
-            }
+            // claimed record it left in place. A storage error fails the open.
+            self.retry(Durability::Deferred, |mut txn| async move {
+                let mut job = job.clone();
+                txn.delete(claimed_key(&job.queue, &job.id))?;
+                let end = unsettled_claim_end(
+                    &job,
+                    AttemptOutcome::Interrupted,
+                    "claim interrupted by process exit",
+                );
+                stage_claim_end(&mut txn, &mut job, &end, self.now_ms())?;
+                Ok((txn, Attempt::Commit(())))
+            })
+            .await?;
         }
         Ok(())
     }

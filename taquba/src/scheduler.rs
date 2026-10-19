@@ -9,7 +9,7 @@ use crate::error::Result;
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{KeyTag, parse_key_timestamp, tag_prefix};
 use crate::queue_core::QueueCore;
-use crate::txn::{Attempt, Durability, retry, stage_to_pending};
+use crate::txn::{Attempt, Durability, stage_to_pending};
 
 pub(crate) struct Scheduler {
     core: Arc<QueueCore>,
@@ -79,20 +79,20 @@ impl QueueCore {
         // the next tick re-promotes it: the rewrite is idempotent. Any later
         // durable commit flushes preceding WAL entries, so a job's
         // post-promotion history is never durable without the promotion itself.
-        let promoted = retry(&self.db, Durability::Deferred, |txn| async move {
-            let Some(raw) = txn.get(scheduled_key_bytes).await? else {
-                // Already promoted by a concurrent call, so the attempt aborts.
-                txn.rollback();
-                return Ok(Attempt::Abort(None));
-            };
-            let mut job = JobRecord::decode(scheduled_key_bytes, &raw)?;
-            txn.delete(scheduled_key_bytes)?;
-            let pending = stage_to_pending(&txn, &mut job, JobStatus::Scheduled)?;
-            Ok(Attempt::Commit(txn, Some((job, pending))))
-        })
-        .await?;
-        if let Some((job, pending)) = promoted {
-            self.claim_cursor.note_pending_insert(&job.queue, &pending);
+        let promoted = self
+            .retry(Durability::Deferred, |mut txn| async move {
+                let Some(raw) = txn.get(scheduled_key_bytes).await? else {
+                    // Already promoted by a concurrent call, so the attempt
+                    // aborts.
+                    return Ok((txn, Attempt::Abort(None)));
+                };
+                let mut job = JobRecord::decode(scheduled_key_bytes, &raw)?;
+                txn.delete(scheduled_key_bytes)?;
+                stage_to_pending(&mut txn, &mut job, JobStatus::Scheduled)?;
+                Ok((txn, Attempt::Commit(Some(job))))
+            })
+            .await?;
+        if let Some(job) = promoted {
             debug!(
                 queue = %job.queue,
                 job_id = %job.id,

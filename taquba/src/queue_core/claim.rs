@@ -15,7 +15,7 @@ use crate::keys::{QueueName, dedup_index_key, pending_prefix};
 use crate::queue::ClaimOutcome;
 use crate::queue_core::QueueCore;
 use crate::stats::update_stats;
-use crate::txn::{Attempt, Commit, Durability, commit, put_job_record};
+use crate::txn::{Attempt, Commit, Durability};
 
 /// Generate a claim id. A ULID's low 64 bits fall inside its 80-bit random
 /// component, so claim ids are distinct across claims of the same job. The
@@ -84,7 +84,7 @@ impl QueueCore {
             if scan.known_empty {
                 return Ok(Vec::new());
             }
-            let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+            let mut txn = self.begin().await?;
 
             let mut candidates = Vec::new();
             // Set when the scan ran out of pending keys before filling the
@@ -164,7 +164,7 @@ impl QueueCore {
                 let dedup_key_to_release = job.dedup_key.take();
                 let claim_id = new_claim_id();
                 txn.delete(&kv.key)?;
-                put_job_record(&txn, &job)?;
+                txn.put_job(&job)?;
                 // A cancellation requested during an earlier claim of the job
                 // is persisted on the record and fires this claim's token
                 // immediately.
@@ -201,7 +201,7 @@ impl QueueCore {
             // recovers: a claim lost with the unflushed WAL leaves the job
             // pending, and a durable one is requeued at open. The only
             // difference is that the durable claim consumed an attempt.
-            match commit(txn, Durability::Deferred).await? {
+            match self.commit(txn, Durability::Deferred).await? {
                 Commit::Committed => {
                     self.claim_cursor.advance(queue, last_pending_key, &scan);
                     if drained {
@@ -243,11 +243,10 @@ impl QueueCore {
                 id,
                 Durability::Deferred,
                 || Ok(Err(ClaimOutcome::NotFound)),
-                |txn, current_key, mut job| async move {
+                |mut txn, current_key, mut job| async move {
                     let from = job.status;
                     if !matches!(from, JobStatus::Pending | JobStatus::Scheduled) {
-                        txn.rollback();
-                        return Ok(Attempt::Abort(Err(ClaimOutcome::NotClaimable)));
+                        return Ok((txn, Attempt::Abort(Err(ClaimOutcome::NotClaimable))));
                     }
                     let now = self.now_ms();
                     job.status = JobStatus::Claimed;
@@ -259,7 +258,7 @@ impl QueueCore {
                     let dedup_key_to_release = job.dedup_key.take();
                     let claim_id = new_claim_id();
                     txn.delete(&current_key)?;
-                    put_job_record(&txn, &job)?;
+                    txn.put_job(&job)?;
                     let cancel = tokio_util::sync::CancellationToken::new();
                     if job.cancel_requested {
                         cancel.cancel();
@@ -278,7 +277,7 @@ impl QueueCore {
                         txn.delete(dedup_index_key(&job.queue, dk))?;
                     }
                     update_stats(&txn, &job.queue, &[(from, -1), (JobStatus::Claimed, 1)])?;
-                    Ok(Attempt::Commit(txn, Ok(Claim::new(job, claim_id, cancel))))
+                    Ok((txn, Attempt::Commit(Ok(Claim::new(job, claim_id, cancel)))))
                 },
             )
             .await?;

@@ -12,7 +12,7 @@ use slatedb::DbTransaction;
 use crate::error::{Error, Result};
 use crate::keys::user_scoped_key;
 use crate::queue::Queue;
-use crate::txn::{Attempt, Durability, retry};
+use crate::txn::{Attempt, Durability};
 
 /// Maximum size of a single value in the user KV namespace.
 ///
@@ -243,15 +243,15 @@ impl Queue {
         write: impl Fn(&DbTransaction, &[u8]) -> std::result::Result<(), slatedb::Error>,
     ) -> Result<bool> {
         let (scoped, write) = (&user_scoped_key(key), &write);
-        retry(&self.core.db, Durability::Awaited, |txn| async move {
-            if !kv_state_matches(&txn, scoped, expected).await? {
-                txn.rollback();
-                return Ok(Attempt::Abort(false));
-            }
-            write(&txn, scoped)?;
-            Ok(Attempt::Commit(txn, true))
-        })
-        .await
+        self.core
+            .retry(Durability::Awaited, |txn| async move {
+                if !kv_state_matches(&txn, scoped, expected).await? {
+                    return Ok((txn, Attempt::Abort(false)));
+                }
+                write(&txn, scoped)?;
+                Ok((txn, Attempt::Commit(true)))
+            })
+            .await
     }
 }
 

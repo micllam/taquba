@@ -9,9 +9,7 @@ use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{Claim, JobRecord, JobStatus};
 use crate::queue::EnqueueResult;
 use crate::queue_core::QueueCore;
-use crate::txn::{
-    Attempt, ClaimEnd, Durability, retry, stage_claim_end, stage_to_pending, take_claim,
-};
+use crate::txn::{Attempt, ClaimEnd, Durability, stage_claim_end, stage_to_pending, take_claim};
 
 impl QueueCore {
     /// The settlement of a claim. The effects are prepared once before the
@@ -32,27 +30,27 @@ impl QueueCore {
 
         let mut settled = {
             let (prepared, end_for) = (&prepared, &end_for);
-            retry(&self.db, Durability::Awaited, |txn| async move {
+            self.retry(Durability::Awaited, |mut txn| async move {
                 // The returned record is the base for the written record. The
                 // claim's copy predates a cancel committed during the delivery.
                 let mut job = take_claim(&txn, &self.lease_registry, queue, id, claim_id).await?;
                 let now = self.now_ms();
                 let end = end_for(&job, now);
-                let pending_key = stage_claim_end(&txn, &mut job, &end, now)?;
+                stage_claim_end(&mut txn, &mut job, &end, now)?;
                 let staged = if end.is_terminal() {
-                    Some(self.stage_effects(&txn, prepared).await?)
+                    Some(self.stage_effects(&mut txn, prepared).await?)
                 } else {
                     None
                 };
-                Ok(Attempt::Commit(txn, (job, end, pending_key, staged)))
+                Ok((txn, Attempt::Commit((job, end, staged))))
             })
             .await
         };
 
         let staged = settled.as_mut().ok().and_then(|(.., staged)| staged.take());
         let results = self.finish_effects(prepared, staged).await;
-        let (job, end, pending_key, _) = settled?;
-        self.finish_claim_end(&job, &end, claim_id, pending_key.as_deref(), Some(claim))
+        let (job, end, _) = settled?;
+        self.finish_claim_end(&job, &end, claim_id, Some(claim))
             .await;
         Ok((job, results))
     }
@@ -61,14 +59,13 @@ impl QueueCore {
     /// count, as [`Queue::requeue_dead_job`](crate::Queue::requeue_dead_job)
     /// documents.
     pub(crate) async fn requeue_dead_job(&self, id: &str) -> Result<()> {
-        let (job, pending): (JobRecord, Vec<u8>) = self
+        let job: JobRecord = self
             .transition_by_id(
                 id,
                 Durability::Awaited,
                 || Err(Error::JobNotFound(id.to_string())),
-                |txn, current_key, mut job| async move {
+                |mut txn, current_key, mut job| async move {
                     if job.status != JobStatus::Dead {
-                        txn.rollback();
                         return Err(Error::InvalidState);
                     }
                     txn.delete(&current_key)?;
@@ -79,7 +76,7 @@ impl QueueCore {
                     // Revival clears any prior cancel request: the operator
                     // chose to start this job afresh.
                     job.cancel_requested = false;
-                    let pending = stage_to_pending(&txn, &mut job, JobStatus::Dead)?;
+                    stage_to_pending(&mut txn, &mut job, JobStatus::Dead)?;
                     // The history is kept across the revival. The marker
                     // separates entries recorded before it from the reset
                     // attempt counter.
@@ -94,11 +91,10 @@ impl QueueCore {
                             error: None,
                         },
                     )?;
-                    Ok(Attempt::Commit(txn, (job, pending)))
+                    Ok((txn, Attempt::Commit(job)))
                 },
             )
             .await?;
-        self.claim_cursor.note_pending_insert(&job.queue, &pending);
         debug!(queue = %job.queue, job_id = %job.id, "dead job re-queued");
         Ok(())
     }

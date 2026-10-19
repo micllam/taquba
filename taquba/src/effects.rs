@@ -5,7 +5,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use slatedb::DbTransaction;
 use tracing::debug;
 use ulid::Ulid;
 
@@ -18,7 +17,7 @@ use crate::options::EnqueueOptions;
 use crate::queue::{EnqueueResult, validate_id_override};
 use crate::queue_core::QueueCore;
 use crate::stats::update_stats;
-use crate::txn::put_job_record;
+use crate::txn::Txn;
 
 /// One enqueue contained in [`SettlementEffects`].
 #[derive(Debug, Clone)]
@@ -143,30 +142,11 @@ pub(crate) struct StagedEffects {
     pub(crate) jobs: Vec<StagedJob>,
 }
 
-/// One queue's share of a staged set: what [`QueueCore::note_staged_effects`]
-/// records for the queue after the commit.
-#[derive(Default)]
-struct QueueInserts<'a> {
-    /// Staged jobs on the queue, pending and scheduled.
-    enqueued: u64,
-    /// Staged jobs in the pending key space.
-    pending: usize,
-    /// The smallest pending key among them.
-    min_pending_key: Option<&'a [u8]>,
-}
-
 /// Identity of a job staged by [`QueueCore::stage_job_writes`], retained for
-/// the cursor note and the counter that follow the commit.
+/// the counter that follows the commit.
 pub(crate) struct StagedJob {
     pub(crate) id: String,
     pub(crate) queue: QueueName,
-    /// `Some` when the job is written to the pending key space, in which case
-    /// the commit must be followed by a cursor insert note, which also wakes a
-    /// waiting worker.
-    pub(crate) pending_key: Option<Vec<u8>>,
-    /// `Some` when the job is written to the scheduled key space, in which case
-    /// the commit must be followed by a lowering of the scheduled bound.
-    pub(crate) run_at: Option<u64>,
 }
 
 impl QueueCore {
@@ -315,7 +295,7 @@ impl QueueCore {
     /// result to [`Self::finish_effects`].
     pub(crate) async fn stage_effects(
         &self,
-        txn: &DbTransaction,
+        txn: &mut Txn,
         prepared: &PreparedEffects,
     ) -> Result<StagedEffects> {
         let mut staged = Vec::with_capacity(prepared.prepared_jobs.len());
@@ -341,35 +321,16 @@ impl QueueCore {
         })
     }
 
-    /// Record the staged jobs after the commit and return their enqueue
-    /// results. The jobs are grouped by queue: each queue's pending inserts are
-    /// recorded once, with the smallest pending key and their count, and
-    /// counted as enqueued once.
+    /// Count the staged jobs as enqueued after the commit, with one count per
+    /// queue. Returns their enqueue results.
     fn note_staged_effects(&self, staged: StagedEffects) -> Vec<EnqueueResult> {
-        let mut by_queue: BTreeMap<&QueueName, QueueInserts<'_>> = BTreeMap::new();
+        let mut by_queue: BTreeMap<&QueueName, u64> = BTreeMap::new();
         for staged_job in &staged.jobs {
-            let inserts = by_queue.entry(&staged_job.queue).or_default();
-            inserts.enqueued += 1;
-            if let Some(pending_key) = &staged_job.pending_key {
-                inserts.pending += 1;
-                if inserts
-                    .min_pending_key
-                    .is_none_or(|min| pending_key.as_slice() < min)
-                {
-                    inserts.min_pending_key = Some(pending_key);
-                }
-            }
-            if let Some(run_at) = staged_job.run_at {
-                self.scheduled_bound.lower(run_at);
-            }
+            *by_queue.entry(&staged_job.queue).or_default() += 1;
             debug!(queue = %staged_job.queue, job_id = %staged_job.id, "job enqueued");
         }
-        for (queue, inserts) in by_queue {
-            if let Some(min_key) = inserts.min_pending_key {
-                self.claim_cursor
-                    .note_pending_inserts(queue, min_key, inserts.pending);
-            }
-            crate::obs::enqueued(queue, inserts.enqueued);
+        for (queue, enqueued) in by_queue {
+            crate::obs::enqueued(queue, enqueued);
         }
         staged.results
     }
@@ -382,7 +343,7 @@ impl QueueCore {
     /// [`Self::note_staged_job`].
     pub(crate) async fn stage_job_writes(
         &self,
-        txn: &DbTransaction,
+        txn: &mut Txn,
         prepared: &PreparedJob,
     ) -> Result<std::result::Result<StagedJob, String>> {
         let PreparedJob {
@@ -405,7 +366,7 @@ impl QueueCore {
             return Err(Error::DuplicateJobId { id: job.id.clone() });
         }
 
-        let key = put_job_record(txn, job)?;
+        txn.put_job(job)?;
         if let Some(ref dkey) = dkey {
             txn.put(dkey, job.id.as_bytes())?;
         }
@@ -414,23 +375,11 @@ impl QueueCore {
         Ok(Ok(StagedJob {
             id: job.id.clone(),
             queue: job.queue.clone(),
-            pending_key: matches!(job.status, JobStatus::Pending).then_some(key),
-            run_at: job.run_at.filter(|_| job.status == JobStatus::Scheduled),
         }))
     }
 
-    /// The work that follows the commit of one staged job. A Pending job is
-    /// recorded on the claim cursor, and the record wakes a waiting worker. A
-    /// Scheduled job lowers the scheduled bound to its `run_at`. Every staged
-    /// job is counted as enqueued here, whichever transaction committed it.
+    /// Count one staged job as enqueued after the commit.
     pub(crate) fn note_staged_job(&self, staged: &StagedJob) {
-        if let Some(ref pending_key) = staged.pending_key {
-            self.claim_cursor
-                .note_pending_insert(&staged.queue, pending_key);
-        }
-        if let Some(run_at) = staged.run_at {
-            self.scheduled_bound.lower(run_at);
-        }
         crate::obs::enqueued(&staged.queue, 1);
         debug!(queue = %staged.queue, job_id = %staged.id, "job enqueued");
     }

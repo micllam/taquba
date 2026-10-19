@@ -75,11 +75,11 @@ impl QueueCore {
             id,
             Durability::Awaited,
             || Ok(Cancelled::Uncommitted(CancelOutcome::NotFound)),
-            |txn, current_key, mut job| async move {
+            |mut txn, current_key, mut job| async move {
                 let cancelled = match job.status {
                     JobStatus::Pending | JobStatus::Scheduled => {
                         stage_remove(&txn, &current_key, &job)?;
-                        let staged = self.stage_effects(&txn, prepared).await?;
+                        let staged = self.stage_effects(&mut txn, prepared).await?;
                         Cancelled::Removed { job, staged }
                     }
                     JobStatus::Claimed => {
@@ -87,12 +87,10 @@ impl QueueCore {
                             // The flag is already persisted. The token is fired
                             // again, because a re-claim after the first request
                             // has a fresh token.
-                            txn.rollback();
                             self.lease_registry.cancel(&job.queue, id);
                             debug!(job_id = %id, "cancel re-requested on claimed job");
-                            return Ok(Attempt::Abort(Cancelled::Uncommitted(
-                                CancelOutcome::Requested,
-                            )));
+                            let requested = Cancelled::Uncommitted(CancelOutcome::Requested);
+                            return Ok((txn, Attempt::Abort(requested)));
                         }
                         job.cancel_requested = true;
                         let value = job.stored_bytes()?;
@@ -100,13 +98,11 @@ impl QueueCore {
                         Cancelled::Requested { job }
                     }
                     JobStatus::Done | JobStatus::Dead => {
-                        txn.rollback();
-                        return Ok(Attempt::Abort(Cancelled::Uncommitted(
-                            CancelOutcome::NotFound,
-                        )));
+                        let not_found = Cancelled::Uncommitted(CancelOutcome::NotFound);
+                        return Ok((txn, Attempt::Abort(not_found)));
                     }
                 };
-                Ok(Attempt::Commit(txn, cancelled))
+                Ok((txn, Attempt::Commit(cancelled)))
             },
         )
         .await
@@ -121,27 +117,25 @@ impl QueueCore {
     ) -> Result<WakeOutcome> {
         // `Err` is an outcome reached without a commit.
         let wake_payload = &wake_payload;
-        let woken: std::result::Result<(JobRecord, Vec<u8>), WakeOutcome> = self
+        let woken: std::result::Result<JobRecord, WakeOutcome> = self
             .transition_by_id(
                 id,
                 Durability::Awaited,
                 || Ok(Err(WakeOutcome::NotFound)),
-                |txn, current_key, mut job| async move {
+                |mut txn, current_key, mut job| async move {
                     if job.status != JobStatus::Scheduled {
-                        txn.rollback();
-                        return Ok(Attempt::Abort(Err(WakeOutcome::NotScheduled)));
+                        return Ok((txn, Attempt::Abort(Err(WakeOutcome::NotScheduled))));
                     }
                     txn.delete(&current_key)?;
                     job.woken_at = Some(self.now_ms());
                     job.wake_payload = wake_payload.clone();
-                    let pending = stage_to_pending(&txn, &mut job, JobStatus::Scheduled)?;
-                    Ok(Attempt::Commit(txn, Ok((job, pending))))
+                    stage_to_pending(&mut txn, &mut job, JobStatus::Scheduled)?;
+                    Ok((txn, Attempt::Commit(Ok(job))))
                 },
             )
             .await?;
         match woken {
-            Ok((job, pending)) => {
-                self.claim_cursor.note_pending_insert(&job.queue, &pending);
+            Ok(job) => {
                 debug!(job_id = %id, queue = %job.queue, "scheduled job woken");
                 Ok(WakeOutcome::Woken)
             }

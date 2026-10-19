@@ -1,8 +1,10 @@
 //! Transaction helpers shared by the queue, reaper and scheduler.
+use std::collections::BTreeMap;
 use std::future::Future;
+use std::ops::Deref;
 
 use bytes::Bytes;
-use slatedb::{Db, DbTransaction, IsolationLevel};
+use slatedb::{DbTransaction, IsolationLevel};
 
 use tracing::{debug, warn};
 
@@ -11,15 +13,73 @@ use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{QueueName, attempt_history_key, claimed_key, dedup_index_key, job_index_key};
 use crate::lease_registry::LeaseRegistry;
+use crate::queue_core::QueueCore;
 use crate::stats::update_stats;
 
-/// Write `job` at its [`JobRecord::stored_key`] and repoint its index entry to
-/// that key. Returns the key.
-pub(crate) fn put_job_record(txn: &DbTransaction, job: &JobRecord) -> Result<Vec<u8>> {
-    let key = job.stored_key();
-    txn.put(&key, job.stored_bytes()?)?;
-    txn.put(job_index_key(&job.id), &key)?;
-    Ok(key)
+/// A store transaction that notes, for every job record it writes, the process
+/// state that the commit updates. [`QueueCore::commit`] applies the notes once
+/// the transaction commits. A transaction that is dropped, rolled back or in
+/// conflict discards them.
+pub(crate) struct Txn {
+    txn: DbTransaction,
+    notes: CommitNotes,
+}
+
+/// The process state that the record writes of a [`Txn`] update.
+#[derive(Default)]
+struct CommitNotes {
+    /// Per queue, the smallest pending key written and the count of pending
+    /// records written, for the claim cursor.
+    pending: BTreeMap<QueueName, (Vec<u8>, usize)>,
+    /// The earliest `run_at` of a scheduled record written.
+    scheduled: Option<u64>,
+    /// The earliest `completed_at` of a done record written.
+    done: Option<u64>,
+}
+
+impl Deref for Txn {
+    type Target = DbTransaction;
+
+    fn deref(&self) -> &DbTransaction {
+        &self.txn
+    }
+}
+
+impl Txn {
+    /// Write `job` at its [`JobRecord::stored_key`], repoint its index entry to
+    /// that key and note the record for the commit.
+    pub(crate) fn put_job(&mut self, job: &JobRecord) -> Result<()> {
+        let key = job.stored_key();
+        self.txn.put(&key, job.stored_bytes()?)?;
+        self.txn.put(job_index_key(&job.id), &key)?;
+        self.note_written(job, &key);
+        Ok(())
+    }
+
+    /// Note the record `job`, written at `key`, for the commit.
+    fn note_written(&mut self, job: &JobRecord, key: &[u8]) {
+        let notes = &mut self.notes;
+        let earliest = |bound: &mut Option<u64>, at: Option<u64>| {
+            if let Some(at) = at {
+                *bound = Some(bound.map_or(at, |b| b.min(at)));
+            }
+        };
+        match job.status {
+            JobStatus::Pending => {
+                let (min_key, count) = notes
+                    .pending
+                    .entry(job.queue.clone())
+                    .or_insert_with(|| (key.to_vec(), 0));
+                if key < min_key.as_slice() {
+                    *min_key = key.to_vec();
+                }
+                *count += 1;
+            }
+            JobStatus::Scheduled => earliest(&mut notes.scheduled, job.run_at),
+            JobStatus::Done => earliest(&mut notes.done, job.completed_at),
+            JobStatus::Claimed | JobStatus::Dead => {}
+        }
+    }
 }
 
 /// Resolve a job id through its index entry within `txn`: returns the index
@@ -96,8 +156,9 @@ pub(crate) enum Commit {
     Conflict,
 }
 
-/// Commit `txn`. A transaction conflict is reported as [`Commit::Conflict`],
-/// and a storage failure is returned as an error.
+/// Commit `txn`, a store transaction without job record writes. A transaction
+/// conflict is reported as [`Commit::Conflict`], and a storage failure is
+/// returned as an error.
 pub(crate) async fn commit(txn: DbTransaction, durability: Durability) -> Result<Commit> {
     match txn.commit().await {
         Ok(handle) => {
@@ -111,37 +172,66 @@ pub(crate) async fn commit(txn: DbTransaction, durability: Durability) -> Result
     }
 }
 
-/// The result of one attempt of a body run by [`retry`].
+/// The decision of one attempt of a body run by [`QueueCore::retry`], which the
+/// body returns with its transaction.
 pub(crate) enum Attempt<T> {
     /// Commit the transaction, then return the value.
-    Commit(DbTransaction, T),
-    /// Return the value without a commit. The body drops or rolls back the
-    /// transaction before it returns this.
+    Commit(T),
+    /// Return the value without a commit. Dropping the transaction rolls it
+    /// back.
     Abort(T),
 }
 
-/// Run `body` against a fresh `Snapshot` transaction until its commit does not
-/// conflict. A [`Commit::Conflict`] begins a new transaction and runs `body`
-/// again against fresh state. An [`Attempt::Abort`] returns the value without a
-/// commit. `body` takes the transaction by value and returns it in
-/// [`Attempt::Commit`], so its future does not borrow from the call and is
-/// `Send` wherever its captures are.
-pub(crate) async fn retry<T, F, Fut>(db: &Db, durability: Durability, body: F) -> Result<T>
-where
-    F: Fn(DbTransaction) -> Fut,
-    Fut: Future<Output = Result<Attempt<T>>>,
-{
-    loop {
-        let txn = db.begin(IsolationLevel::Snapshot).await?;
-        match body(txn).await? {
-            Attempt::Abort(value) => return Ok(value),
-            Attempt::Commit(txn, value) => match commit(txn, durability).await? {
-                Commit::Committed => return Ok(value),
-                Commit::Conflict => {
-                    debug!("transaction conflict, retrying against fresh state");
-                    continue;
-                }
-            },
+impl QueueCore {
+    /// Begin a `Snapshot` transaction of the store.
+    pub(crate) async fn begin(&self) -> Result<Txn> {
+        Ok(Txn {
+            txn: self.db.begin(IsolationLevel::Snapshot).await?,
+            notes: CommitNotes::default(),
+        })
+    }
+
+    /// Commit `txn` as [`commit`] does, then apply its notes when it committed.
+    pub(crate) async fn commit(&self, txn: Txn, durability: Durability) -> Result<Commit> {
+        let Txn { txn, notes } = txn;
+        let outcome = commit(txn, durability).await?;
+        if outcome == Commit::Committed {
+            for (queue, (min_key, count)) in &notes.pending {
+                self.claim_cursor
+                    .note_pending_inserts(queue, min_key, *count);
+            }
+            if let Some(run_at) = notes.scheduled {
+                self.scheduled_bound.lower(run_at);
+            }
+            if let Some(completed_at) = notes.done {
+                self.done_bound.lower(completed_at);
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Run `body` against a fresh transaction until its commit does not
+    /// conflict. A [`Commit::Conflict`] begins a new transaction and runs
+    /// `body` again against fresh state. An [`Attempt::Abort`] drops the
+    /// transaction and returns the value. `body` takes the transaction by value
+    /// and returns it with its decision, so its future does not borrow from the
+    /// call and is `Send` wherever its captures are.
+    pub(crate) async fn retry<T, F, Fut>(&self, durability: Durability, body: F) -> Result<T>
+    where
+        F: Fn(Txn) -> Fut,
+        Fut: Future<Output = Result<(Txn, Attempt<T>)>>,
+    {
+        loop {
+            match body(self.begin().await?).await? {
+                (_, Attempt::Abort(value)) => return Ok(value),
+                (txn, Attempt::Commit(value)) => match self.commit(txn, durability).await? {
+                    Commit::Committed => return Ok(value),
+                    Commit::Conflict => {
+                        debug!("transaction conflict, retrying against fresh state");
+                        continue;
+                    }
+                },
+            }
         }
     }
 }
@@ -150,12 +240,7 @@ where
 /// rewritten at its dead key with `error` as its last error, a `DeadLettered`
 /// attempt is appended and the stats are adjusted. The caller stages the
 /// deletion of the claimed key before the call.
-fn stage_dead_letter(
-    txn: &DbTransaction,
-    job: &mut JobRecord,
-    now: u64,
-    error: &str,
-) -> Result<()> {
+fn stage_dead_letter(txn: &mut Txn, job: &mut JobRecord, now: u64, error: &str) -> Result<()> {
     let claimed_at = job.claimed_at.take();
     job.status = JobStatus::Dead;
     job.last_error = Some(error.to_string());
@@ -171,7 +256,7 @@ fn stage_dead_letter(
             error: Some(error.to_string()),
         },
     )?;
-    put_job_record(txn, job)?;
+    txn.put_job(job)?;
     update_stats(
         txn,
         &job.queue,
@@ -188,18 +273,13 @@ fn stage_dead_letter(
 }
 
 /// Stage the move of a job into the pending key space from the state `from`,
-/// whose record the caller already staged for deletion. Returns the pending
-/// key, which the caller reports to the claim cursor after the commit.
-pub(crate) fn stage_to_pending(
-    txn: &DbTransaction,
-    job: &mut JobRecord,
-    from: JobStatus,
-) -> Result<Vec<u8>> {
+/// whose record the caller already staged for deletion.
+pub(crate) fn stage_to_pending(txn: &mut Txn, job: &mut JobRecord, from: JobStatus) -> Result<()> {
     job.status = JobStatus::Pending;
     job.run_at = None;
-    let pending = put_job_record(txn, job)?;
+    txn.put_job(job)?;
     update_stats(txn, &job.queue, &[(JobStatus::Pending, 1), (from, -1)])?;
-    Ok(pending)
+    Ok(())
 }
 
 /// The transition that ends a claim, chosen by the settling path from the
@@ -249,14 +329,13 @@ pub(crate) fn stage_remove(txn: &DbTransaction, current_key: &[u8], job: &JobRec
 
 /// Stage the transition that ends a claim. Before the call, the caller reads
 /// the stored record and stages the deletion of its claimed key. On return
-/// `job` is the record as written. Returns the pending key when the job
-/// returned to pending, for the caller to record after the commit.
+/// `job` is the record as written.
 pub(crate) fn stage_claim_end(
-    txn: &DbTransaction,
+    txn: &mut Txn,
     job: &mut JobRecord,
     end: &ClaimEnd<'_>,
     now: u64,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<()> {
     match *end {
         ClaimEnd::Done { keep } => {
             if keep {
@@ -273,7 +352,7 @@ pub(crate) fn stage_claim_end(
                         error: None,
                     },
                 )?;
-                put_job_record(txn, job)?;
+                txn.put_job(job)?;
                 update_stats(txn, &job.queue, &[(JobStatus::Claimed, -1)])?;
             } else {
                 // The removal stages the claimed key's deletion a second time.
@@ -283,7 +362,7 @@ pub(crate) fn stage_claim_end(
                 job.completed_at = Some(now);
             }
             update_stats(txn, &job.queue, &[(JobStatus::Done, 1)])?;
-            Ok(None)
+            Ok(())
         }
         ClaimEnd::Retry {
             run_at,
@@ -305,20 +384,19 @@ pub(crate) fn stage_claim_end(
                     error: error.map(str::to_string),
                 },
             )?;
-            let pending = match run_at {
-                None => Some(stage_to_pending(txn, job, JobStatus::Claimed)?),
+            match run_at {
+                None => stage_to_pending(txn, job, JobStatus::Claimed)?,
                 Some(run_at) => {
                     job.status = JobStatus::Scheduled;
                     job.run_at = Some(run_at);
-                    put_job_record(txn, job)?;
+                    txn.put_job(job)?;
                     update_stats(
                         txn,
                         &job.queue,
                         &[(JobStatus::Claimed, -1), (JobStatus::Scheduled, 1)],
                     )?;
-                    None
                 }
-            };
+            }
             debug!(
                 queue = %job.queue,
                 job_id = %job.id,
@@ -327,11 +405,42 @@ pub(crate) fn stage_claim_end(
                 run_at,
                 "job returned to the queue"
             );
-            Ok(pending)
+            Ok(())
         }
-        ClaimEnd::Dead { error } => {
-            stage_dead_letter(txn, job, now, error)?;
-            Ok(None)
-        }
+        ClaimEnd::Dead { error } => stage_dead_letter(txn, job, now, error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::*;
+
+    #[tokio::test]
+    async fn a_commit_applies_the_notes_of_its_record_writes_and_a_drop_discards_them() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let core = &q.core;
+        // An empty claim records the queue as known empty, until a pending
+        // insert is noted.
+        assert!(
+            q.claim("work", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let job = JobRecord::new_pending("j".into(), qn("work"), b"p".to_vec(), 3, 0, 1);
+
+        let mut txn = core.begin().await.unwrap();
+        txn.put_job(&job).unwrap();
+        drop(txn);
+        assert!(core.claim_cursor.known_empty("work"));
+
+        let mut txn = core.begin().await.unwrap();
+        txn.put_job(&job).unwrap();
+        let outcome = core.commit(txn, Durability::Awaited).await.unwrap();
+        assert_eq!(outcome, Commit::Committed);
+        assert!(!core.claim_cursor.known_empty("work"));
+
+        q.close().await.unwrap();
     }
 }
