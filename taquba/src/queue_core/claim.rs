@@ -11,7 +11,7 @@ use ulid::Ulid;
 
 use crate::error::Result;
 use crate::job::{Claim, JobRecord, JobStatus};
-use crate::keys::{QueueName, claimed_key, dedup_index_key, job_index_key, pending_prefix};
+use crate::keys::{QueueName, dedup_index_key, pending_prefix};
 use crate::queue::ClaimOutcome;
 use crate::queue_core::QueueCore;
 use crate::stats::update_stats;
@@ -163,11 +163,8 @@ impl QueueCore {
                 // to a *different* job, which corrupts the dedup invariant.
                 let dedup_key_to_release = job.dedup_key.take();
                 let claim_id = new_claim_id();
-                let claimed = claimed_key(&job.queue, &job.id);
-                let value = job.stored_bytes()?;
-
                 txn.delete(&kv.key)?;
-                put_job_record(&txn, &claimed, &job_index_key(&job.id), &value)?;
+                put_job_record(&txn, &job)?;
                 // A cancellation requested during an earlier claim of the job
                 // is persisted on the record and fires this claim's token
                 // immediately.
@@ -261,14 +258,8 @@ impl QueueCore {
                     // cannot release another job's index entry.
                     let dedup_key_to_release = job.dedup_key.take();
                     let claim_id = new_claim_id();
-                    let value = job.stored_bytes()?;
                     txn.delete(&current_key)?;
-                    put_job_record(
-                        &txn,
-                        &claimed_key(&job.queue, &job.id),
-                        &job_index_key(&job.id),
-                        &value,
-                    )?;
+                    put_job_record(&txn, &job)?;
                     let cancel = tokio_util::sync::CancellationToken::new();
                     if job.cancel_requested {
                         cancel.cancel();

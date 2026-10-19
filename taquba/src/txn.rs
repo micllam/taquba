@@ -9,27 +9,17 @@ use tracing::{debug, warn};
 use crate::error::{Error, Result};
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{JobRecord, JobStatus};
-use crate::keys::{
-    QueueName, attempt_history_key, claimed_key, dead_key, dedup_index_key, done_key,
-    job_index_key, pending_key, scheduled_key,
-};
+use crate::keys::{QueueName, attempt_history_key, claimed_key, dedup_index_key, job_index_key};
 use crate::lease_registry::LeaseRegistry;
 use crate::stats::update_stats;
 
-/// Write a job record at `key` and repoint its index entry to `key`.
-///
-/// `index_key` must be [`crate::keys::job_index_key`] of the record's job id.
-/// `value` is the record serialized with
-/// [`JobRecord::stored_bytes`](crate::JobRecord::stored_bytes).
-pub(crate) fn put_job_record(
-    txn: &DbTransaction,
-    key: &[u8],
-    index_key: &[u8],
-    value: &[u8],
-) -> Result<()> {
-    txn.put(key, value)?;
-    txn.put(index_key, key)?;
-    Ok(())
+/// Write `job` at its [`JobRecord::stored_key`] and repoint its index entry to
+/// that key. Returns the key.
+pub(crate) fn put_job_record(txn: &DbTransaction, job: &JobRecord) -> Result<Vec<u8>> {
+    let key = job.stored_key();
+    txn.put(&key, job.stored_bytes()?)?;
+    txn.put(job_index_key(&job.id), &key)?;
+    Ok(key)
 }
 
 /// Resolve a job id through its index entry within `txn`: returns the index
@@ -181,13 +171,7 @@ fn stage_dead_letter(
             error: Some(error.to_string()),
         },
     )?;
-    let value = job.stored_bytes()?;
-    put_job_record(
-        txn,
-        &dead_key(&job.queue, &job.id),
-        &job_index_key(&job.id),
-        &value,
-    )?;
+    put_job_record(txn, job)?;
     update_stats(
         txn,
         &job.queue,
@@ -213,9 +197,7 @@ pub(crate) fn stage_to_pending(
 ) -> Result<Vec<u8>> {
     job.status = JobStatus::Pending;
     job.run_at = None;
-    let pending = pending_key(&job.queue, job.priority, &job.id);
-    let value = job.stored_bytes()?;
-    put_job_record(txn, &pending, &job_index_key(&job.id), &value)?;
+    let pending = put_job_record(txn, job)?;
     update_stats(txn, &job.queue, &[(JobStatus::Pending, 1), (from, -1)])?;
     Ok(pending)
 }
@@ -291,13 +273,7 @@ pub(crate) fn stage_claim_end(
                         error: None,
                     },
                 )?;
-                let value = job.stored_bytes()?;
-                put_job_record(
-                    txn,
-                    &done_key(now, &job.queue, &job.id),
-                    &job_index_key(&job.id),
-                    &value,
-                )?;
+                put_job_record(txn, job)?;
                 update_stats(txn, &job.queue, &[(JobStatus::Claimed, -1)])?;
             } else {
                 // The removal stages the claimed key's deletion a second time.
@@ -334,13 +310,7 @@ pub(crate) fn stage_claim_end(
                 Some(run_at) => {
                     job.status = JobStatus::Scheduled;
                     job.run_at = Some(run_at);
-                    let value = job.stored_bytes()?;
-                    put_job_record(
-                        txn,
-                        &scheduled_key(&job.queue, run_at, &job.id),
-                        &job_index_key(&job.id),
-                        &value,
-                    )?;
+                    put_job_record(txn, job)?;
                     update_stats(
                         txn,
                         &job.queue,

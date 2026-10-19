@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::keys::{KeyTag, QueueName};
+use crate::keys::{KeyTag, QueueName, claimed_key, dead_key, done_key, pending_key, scheduled_key};
 
 /// A single job stored in a Taquba queue.
 ///
@@ -269,6 +269,26 @@ impl JobRecord {
         Ok(job)
     }
 
+    /// The key the record is stored under, in the key space of its state:
+    /// [`Self::decode`] reads the state back from it. A scheduled record must
+    /// have a `run_at` and a done record a `completed_at`.
+    pub(crate) fn stored_key(&self) -> Vec<u8> {
+        let (queue, id) = (&self.queue, self.id.as_str());
+        match self.status {
+            JobStatus::Pending => pending_key(queue, self.priority, id),
+            JobStatus::Scheduled => {
+                let run_at = self.run_at.expect("a scheduled record has a run_at");
+                scheduled_key(queue, run_at, id)
+            }
+            JobStatus::Claimed => claimed_key(queue, id),
+            JobStatus::Done => {
+                let completed_at = self.completed_at.expect("a done record has a completed_at");
+                done_key(completed_at, queue, id)
+            }
+            JobStatus::Dead => dead_key(queue, id),
+        }
+    }
+
     /// Serialize the record in its stored form: when the payload is offloaded
     /// ([`Self::payload_ref`] is `Some`), the inline payload is excluded so
     /// state transitions never rewrite payload bytes. Every record write
@@ -390,5 +410,23 @@ mod tests {
         let pending = JobRecord::decode(&pending_key(&qn("q"), 0, "j"), &bytes).unwrap();
         assert_eq!(pending.status, JobStatus::Pending);
         assert!(JobRecord::decode(&job_index_key("j"), &bytes).is_err());
+    }
+
+    #[test]
+    fn decode_reads_the_status_back_from_the_stored_key() {
+        for status in [
+            JobStatus::Pending,
+            JobStatus::Scheduled,
+            JobStatus::Claimed,
+            JobStatus::Done,
+            JobStatus::Dead,
+        ] {
+            let mut job = record();
+            job.status = status;
+            job.run_at = Some(10);
+            job.completed_at = Some(20);
+            let decoded = JobRecord::decode(&job.stored_key(), &job.stored_bytes().unwrap());
+            assert_eq!(decoded.unwrap().status, status);
+        }
     }
 }

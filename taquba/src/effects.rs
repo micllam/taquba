@@ -12,9 +12,7 @@ use ulid::Ulid;
 use crate::error::{Error, Result};
 use crate::expiry::ExpiryIndex;
 use crate::job::{JobRecord, JobStatus};
-use crate::keys::{
-    QueueName, dedup_index_key, job_index_key, pending_key, scheduled_key, user_scoped_key,
-};
+use crate::keys::{QueueName, dedup_index_key, job_index_key, user_scoped_key};
 use crate::kv::validate_kv_value_size;
 use crate::options::EnqueueOptions;
 use crate::queue::{EnqueueResult, validate_id_override};
@@ -117,11 +115,10 @@ impl SettlementEffects {
     }
 }
 
-/// A job record prepared by [`QueueCore::prepare_job_record`], paired with its
-/// primary key, awaiting staging into a transaction.
+/// A job record prepared by [`QueueCore::prepare_job_record`], awaiting staging
+/// into a transaction.
 pub(crate) struct PreparedJob {
     pub(crate) job: JobRecord,
-    pub(crate) key: Vec<u8>,
     pub(crate) id_override_used: bool,
 }
 
@@ -186,8 +183,8 @@ impl QueueCore {
     }
 
     /// Resolve [`EnqueueOptions`] against the queue's defaults and build the
-    /// [`JobRecord`] + its primary key. Shared by every path that writes a new
-    /// record. The paths diverge only in how they persist the prepared record.
+    /// [`JobRecord`]. Shared by every path that writes a new record. The paths
+    /// diverge only in how they persist the prepared record.
     pub(crate) fn prepare_job_record(
         &self,
         queue: &str,
@@ -216,21 +213,17 @@ impl QueueCore {
             None => (self.next_job_id(), false),
         };
 
-        let (status, key) = match run_at {
-            Some(ms) => (JobStatus::Scheduled, scheduled_key(&queue, ms, &id)),
-            None => (JobStatus::Pending, pending_key(&queue, priority, &id)),
-        };
-
         let mut job =
             JobRecord::new_pending(id, queue, payload, max_attempts, priority, self.now_ms());
         job.headers = opts.headers;
-        job.status = status;
+        if run_at.is_some() {
+            job.status = JobStatus::Scheduled;
+        }
         job.run_at = run_at;
         job.dedup_key = opts.dedup_key;
 
         Ok(PreparedJob {
             job,
-            key,
             id_override_used,
         })
     }
@@ -394,7 +387,6 @@ impl QueueCore {
     ) -> Result<std::result::Result<StagedJob, String>> {
         let PreparedJob {
             job,
-            key,
             id_override_used,
         } = prepared;
         let dkey = job
@@ -413,8 +405,7 @@ impl QueueCore {
             return Err(Error::DuplicateJobId { id: job.id.clone() });
         }
 
-        let value = job.stored_bytes()?;
-        put_job_record(txn, key, &job_index_key(&job.id), &value)?;
+        let key = put_job_record(txn, job)?;
         if let Some(ref dkey) = dkey {
             txn.put(dkey, job.id.as_bytes())?;
         }
@@ -423,7 +414,7 @@ impl QueueCore {
         Ok(Ok(StagedJob {
             id: job.id.clone(),
             queue: job.queue.clone(),
-            pending_key: matches!(job.status, JobStatus::Pending).then(|| key.clone()),
+            pending_key: matches!(job.status, JobStatus::Pending).then_some(key),
             run_at: job.run_at.filter(|_| job.status == JobStatus::Scheduled),
         }))
     }
