@@ -175,13 +175,13 @@ in-process completion notification, so it runs in the process that runs the
 worker. `WorkflowView::run_end` reads the end of a terminated run without a
 wait, also in a process without a runtime.
 
-`WorkflowRuntime::outcome` returns the committed `RunOutcome` of a terminated
-run (its result or error, the submitter's headers and the final step) from the
-run result record the worker writes to the run's memo, at the reserved key
-`workflow.outcome`, before every terminating settlement it performs. A run
-terminated without a worker (a cancellation of a pending step, a step
-dead-lettered outside the worker) does not have a record. The record is removed
-with the run's memo entries by the memo sweep.
+The committed `RunOutcome` of a `RunEnd` (the run's result or error, the
+submitter's headers and the final step) is read from the run result record the
+worker writes to the run's memo, at the reserved key `workflow.outcome`, before
+every terminating settlement it performs. A run terminated without a worker (a
+cancellation of a pending step, a step dead-lettered outside the worker) does
+not have a record. The record is removed with the run's memo entries by the memo
+sweep.
 
 ## Cancellation
 

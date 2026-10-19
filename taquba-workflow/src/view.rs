@@ -68,23 +68,14 @@ impl WorkflowView {
         }))
     }
 
-    /// The committed outcome of a terminated run, read from its run result
-    /// record: the result the runner returned or the error that ended the run,
-    /// with the submitter's headers and the final step. The record is written
-    /// by the worker that terminates the run before the terminating settlement
-    /// and is removed with the run's memo entries. It is `None` for a run that
-    /// is unknown, still active or was terminated without a worker (a
-    /// cancellation of a pending step, a dead-letter outside the worker), whose
-    /// status [`Self::status`] reports.
-    pub async fn outcome(&self, run_id: &RunId) -> Result<Option<RunOutcome>> {
-        Ok(self.run_end(run_id).await?.and_then(|end| end.outcome))
-    }
-
     /// The end of a terminated run, as
     /// [`WorkflowRuntime::wait`](crate::WorkflowRuntime::wait) reports it: the
-    /// termination from its terminal record, with the outcome that
-    /// [`Self::outcome`] reports. It is `None` for a run that is unknown, still
-    /// active or swept.
+    /// termination from its terminal record, with the committed outcome from
+    /// its run result record. The worker that terminates the run writes the
+    /// record before the terminating settlement, so the outcome is `None` for a
+    /// run terminated without a worker (a cancellation of a pending step, a
+    /// dead-letter outside the worker). The end is `None` for a run that is
+    /// unknown, still active or swept.
     pub async fn run_end(&self, run_id: &RunId) -> Result<Option<RunEnd>> {
         let Some(termination) = self.terminal_record(run_id).await? else {
             return Ok(None);

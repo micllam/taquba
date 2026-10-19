@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   input, until memo retention removes the terminal record of the run. To run an
   input again, submit it under a new run id.
 
+### Removed
+
+- `WorkflowView::outcome` and `WorkflowRuntime::outcome`, whose `None` did not
+  distinguish an active run from a run terminated without a recorded outcome.
+  Read `RunEnd::outcome` from `WorkflowView::run_end` in their place.
+
 ### Fixed
 
 - `RunGroup::submit` and `RunGroup::resume` rerun failed or cancelled members

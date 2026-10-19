@@ -154,9 +154,8 @@ pub struct MemberResult {
     pub run_id: RunId,
     /// The member's last recorded termination.
     pub termination: RunTermination,
-    /// The member's committed outcome, read as
-    /// [`WorkflowRuntime::outcome`](crate::WorkflowRuntime::outcome) reads it,
-    /// or `None` for a member terminated without a worker.
+    /// The member's committed outcome, as [`RunEnd::outcome`](crate::RunEnd)
+    /// reports it, or `None` for a member terminated without a worker.
     pub outcome: Option<RunOutcome>,
 }
 

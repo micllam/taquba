@@ -246,8 +246,9 @@ impl From<DurableTermination> for RunTermination {
 pub struct RunEnd {
     /// The run's termination, from its terminal record.
     pub termination: RunTermination,
-    /// The committed outcome, when the worker that terminated the run recorded
-    /// one, as [`WorkflowRuntime::outcome`] describes.
+    /// The committed outcome: the result the runner returned or the error that
+    /// ended the run, with the submitter's headers and the final step. It is
+    /// `None` when the worker that terminated the run did not record one.
     pub outcome: Option<RunOutcome>,
 }
 
@@ -571,11 +572,6 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// available after a restart and from any runtime over the same queue.
     pub async fn status(&self, run_id: &RunId) -> Result<Option<RunStatus>> {
         self.inner.core.view.status(run_id).await
-    }
-
-    /// [`WorkflowView::outcome`] through the runtime's view.
-    pub async fn outcome(&self, run_id: &RunId) -> Result<Option<RunOutcome>> {
-        self.inner.core.view.outcome(run_id).await
     }
 
     /// Wait until the run `run_id` terminates and report its end. The wait
@@ -1683,10 +1679,13 @@ mod tests {
         assert!(!outcome.headers.contains_key(HEADER_RUN_ID));
         assert!(!outcome.headers.contains_key(HEADER_STEP));
 
-        let recorded =
-            runtime.outcome(&handle.run_id).await.unwrap().expect(
-                "the worker writes the run result record before the terminating settlement",
-            );
+        let recorded = runtime
+            .view()
+            .run_end(&handle.run_id)
+            .await
+            .unwrap()
+            .and_then(|end| end.outcome)
+            .expect("the worker writes the run result record before the terminating settlement");
         assert_eq!(recorded.status, TerminalStatus::Succeeded);
         assert_eq!(recorded.final_step.number, 2);
         assert_eq!(recorded.result.as_deref(), Some(b"final".as_slice()));
@@ -3078,8 +3077,9 @@ mod tests {
         );
         assert_eq!(status.step.number, 0);
         assert_eq!(status.step.job_id, handle.job_id);
+        let end = runtime.view().run_end(&handle.run_id).await.unwrap();
         assert!(
-            runtime.outcome(&handle.run_id).await.unwrap().is_none(),
+            end.expect("terminal record").outcome.is_none(),
             "no worker terminated the run, so no run result record exists",
         );
         assert!(
@@ -3156,7 +3156,7 @@ mod tests {
         assert_eq!(through_reader.state, RunState::Pending);
         assert_eq!(through_reader.state, through_runtime.state);
         assert_eq!(through_reader.step.number, through_runtime.step.number);
-        assert!(view.outcome(&handle.run_id).await.unwrap().is_none());
+        assert!(view.run_end(&handle.run_id).await.unwrap().is_none());
         assert!(view.status(&rid("unknown")).await.unwrap().is_none());
 
         assert!(runtime.cancel(&handle.run_id).await.unwrap());
@@ -3832,7 +3832,13 @@ mod tests {
             ),
             "the terminal record commits with the dead-letter and carries the error kind",
         );
-        let recorded = runtime.outcome(&handle.run_id).await.unwrap().unwrap();
+        let recorded = runtime
+            .view()
+            .run_end(&handle.run_id)
+            .await
+            .unwrap()
+            .and_then(|end| end.outcome)
+            .unwrap();
         assert_eq!(recorded.status, TerminalStatus::Failed);
         assert_eq!(recorded.error.as_deref(), Some("nope"));
 
