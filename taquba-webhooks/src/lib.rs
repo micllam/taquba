@@ -266,27 +266,6 @@ mod tests {
     use std::sync::Arc;
     use taquba::object_store::memory::InMemory;
 
-    #[test]
-    fn build_request_packs_request_into_headers() {
-        let request = WebhookRequest::new("https://example.com/hook")
-            .method("PUT")
-            .header("Content-Type", "application/json")
-            .timeout(Duration::from_secs(15));
-
-        let req = webhook_enqueue_request("webhooks", request, b"body".to_vec());
-
-        assert_eq!(req.queue, "webhooks");
-        assert_eq!(req.payload, b"body");
-        let headers = &req.options.headers;
-        assert_eq!(headers.get(HEADER_URL).unwrap(), "https://example.com/hook");
-        assert_eq!(headers.get(HEADER_METHOD).unwrap(), "PUT");
-        assert_eq!(headers.get(HEADER_TIMEOUT_MS).unwrap(), "15000");
-        assert_eq!(
-            headers.get("http.Content-Type").unwrap(),
-            "application/json"
-        );
-    }
-
     #[tokio::test]
     async fn enqueue_packs_request_into_headers() {
         let q = Queue::open(Arc::new(InMemory::new()), "test")
@@ -303,6 +282,7 @@ mod tests {
             .unwrap();
         let job = q.view().get_job(&id).await.unwrap().expect("job exists");
 
+        assert_eq!(job.queue, "webhooks");
         assert_eq!(job.payload, b"body");
         assert_eq!(
             job.headers.get(HEADER_URL).unwrap(),

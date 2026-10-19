@@ -189,27 +189,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn effective_timeout_defaults_when_no_header_is_present() {
-        let headers = HashMap::new();
+    fn effective_timeout_is_the_header_or_the_default() {
+        let mut headers = HashMap::new();
         assert_eq!(
             effective_timeout(&headers, DEFAULT_TIMEOUT).unwrap(),
             DEFAULT_TIMEOUT
         );
-    }
 
-    #[test]
-    fn effective_timeout_prefers_the_header_override() {
-        let mut headers = HashMap::new();
         headers.insert(HEADER_TIMEOUT_MS.to_string(), "15000".to_string());
         assert_eq!(
             effective_timeout(&headers, DEFAULT_TIMEOUT).unwrap(),
             Duration::from_millis(15_000)
         );
-    }
 
-    #[test]
-    fn effective_timeout_rejects_a_non_numeric_header() {
-        let mut headers = HashMap::new();
         headers.insert(HEADER_TIMEOUT_MS.to_string(), "soon".to_string());
         assert!(matches!(
             effective_timeout(&headers, DEFAULT_TIMEOUT),
