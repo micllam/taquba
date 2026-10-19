@@ -73,7 +73,25 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// concurrently falls back to the buffer and reaches it no later than its
     /// timeout.
     pub async fn signal(&self, correlation_key: &str, payload: Vec<u8>) -> Result<SignalOutcome> {
-        let queue = &self.inner.core.queue;
+        self.inner.core.signal(correlation_key, payload).await
+    }
+
+    /// Discard the buffered signal for `correlation_key`, if one exists.
+    /// Returns `true` when a buffered signal was removed.
+    pub async fn clear_signal(&self, correlation_key: &str) -> Result<bool> {
+        self.inner.core.clear_signal(correlation_key).await
+    }
+}
+
+impl RuntimeCore {
+    /// Deliver a signal for `correlation_key`, as [`WorkflowRuntime::signal`]
+    /// documents.
+    pub(crate) async fn signal(
+        &self,
+        correlation_key: &str,
+        payload: Vec<u8>,
+    ) -> Result<SignalOutcome> {
+        let queue = &self.queue;
         let buf_key = signal_buf_kv_key(correlation_key);
         // Buffer first, durably: a waiter registering concurrently reads the
         // buffer at its settlement, so the signal is never lost even if the
@@ -110,23 +128,20 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         Ok(SignalOutcome::Buffered)
     }
 
-    /// Discard the buffered signal for `correlation_key`, if one exists.
-    /// Returns `true` when a buffered signal was removed.
-    pub async fn clear_signal(&self, correlation_key: &str) -> Result<bool> {
-        let queue = &self.inner.core.queue;
+    /// Discard the buffered signal for `correlation_key`, as
+    /// [`WorkflowRuntime::clear_signal`] documents.
+    pub(crate) async fn clear_signal(&self, correlation_key: &str) -> Result<bool> {
         let buf_key = signal_buf_kv_key(correlation_key);
         loop {
-            let Some(current) = queue.view().kv_get(&buf_key).await? else {
+            let Some(current) = self.queue.view().kv_get(&buf_key).await? else {
                 return Ok(false);
             };
-            if queue.kv_compare_delete(&buf_key, &current).await? {
+            if self.queue.kv_compare_delete(&buf_key, &current).await? {
                 return Ok(true);
             }
         }
     }
-}
 
-impl RuntimeCore {
     /// Build the effects that advance the run of `claimed` to a step that waits
     /// for a signal for `correlation_key`. When a buffered signal already
     /// exists it is consumed: the next step is enqueued immediately, the
