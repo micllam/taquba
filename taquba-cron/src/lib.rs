@@ -1088,22 +1088,12 @@ mod tests {
                 b"x".to_vec(),
             ))
             .unwrap();
-        match s.handle().schedule(Schedule::new(
+        // A second handle registers into the name set of the same scheduler.
+        let result = s.handle().schedule(Schedule::new(
             "once",
             "0 10 * * *".parse().unwrap(),
             "reports2",
             b"y".to_vec(),
-        )) {
-            Err(Error::DuplicateName(name)) => assert_eq!(name, "once"),
-            Err(other) => panic!("expected DuplicateName, got {other:?}"),
-            Ok(_) => panic!("expected DuplicateName"),
-        }
-        // A handle registers into the name set of its scheduler.
-        let result = s.handle().schedule(Schedule::new(
-            "once",
-            "0 11 * * *".parse().unwrap(),
-            "reports3",
-            b"z".to_vec(),
         ));
         assert!(matches!(result, Err(Error::DuplicateName(name)) if name == "once"));
     }
