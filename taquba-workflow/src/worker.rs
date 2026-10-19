@@ -34,7 +34,7 @@ impl<R: StepRunner + 'static, H: TerminalHook + 'static> Worker for StepWorker<R
         &self,
         job: &JobRecord,
         lease: &LeaseHandle,
-    ) -> std::result::Result<SettlementEffects, WorkerError> {
+    ) -> Result<SettlementEffects, WorkerError> {
         self.inner.process_step(job, lease).await
     }
 }
@@ -56,7 +56,7 @@ impl<'a> ClaimedStep<'a> {
     /// Identify the claimed step from `job`'s headers. Fails, permanently, for
     /// a job without the run id header, with a run id or group id that is not
     /// valid or with a step header that is not a `u32`.
-    pub(crate) fn parse(job: &'a JobRecord) -> std::result::Result<Self, Error> {
+    pub(crate) fn parse(job: &'a JobRecord) -> Result<Self, Error> {
         let run_id = RunId::new(
             job.headers
                 .get(HEADER_RUN_ID)
@@ -182,7 +182,7 @@ impl RuntimeCore {
         outcome: RunOutcome,
         input_hash: [u8; 32],
         error_kind: Option<StepErrorKind>,
-    ) -> std::result::Result<SettlementEffects, WorkerError> {
+    ) -> Result<SettlementEffects, WorkerError> {
         let termination = self.termination(&outcome, error_kind, input_hash);
         self.store_run_result(&outcome, &termination)
             .await
@@ -202,10 +202,10 @@ impl RuntimeCore {
     async fn settle_outcome(
         &self,
         claimed: &ClaimedStep<'_>,
-        outcome: std::result::Result<StepOutcome, StepError>,
+        outcome: Result<StepOutcome, StepError>,
         external_cancel: bool,
         input_hash: [u8; 32],
-    ) -> std::result::Result<SettlementEffects, WorkerError> {
+    ) -> Result<SettlementEffects, WorkerError> {
         match outcome {
             Ok(StepOutcome::Cancel { reason }) => {
                 self.terminate_recorded(claimed, claimed.cancelled(Some(reason)), input_hash, None)
@@ -268,7 +268,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     async fn process_notification(
         &self,
         job: &JobRecord,
-    ) -> std::result::Result<SettlementEffects, WorkerError> {
+    ) -> Result<SettlementEffects, WorkerError> {
         let outcome: RunOutcome = durable::decode::<DurableRunOutcome>(&job.payload)
             .map_err(|err| {
                 warn!(job_id = %job.id, error = %err, "terminal notification has a malformed payload");
@@ -292,7 +292,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         &self,
         job: &JobRecord,
         lease: &LeaseHandle,
-    ) -> std::result::Result<SettlementEffects, WorkerError> {
+    ) -> Result<SettlementEffects, WorkerError> {
         if job.headers.contains_key(HEADER_TERMINAL) {
             return self.process_notification(job).await;
         }
