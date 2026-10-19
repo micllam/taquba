@@ -556,7 +556,7 @@ impl RunGroup {
                     key: member.key,
                     run_id: member.record.run_id,
                     termination,
-                    outcome: outcome.map(|result| result.outcome),
+                    outcome,
                 })
             }
         }))

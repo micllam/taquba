@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::{RunId, RunOutcome, RunStatus, RunTermination, StepErrorKind, TerminalStatus};
+use crate::{RunEnd, RunId, RunOutcome, RunStatus, RunTermination, StepErrorKind, TerminalStatus};
 use thiserror::Error;
 
 use crate::jobs::job::Job;
@@ -121,9 +121,12 @@ impl<J: Job> JobHandle<J> {
     ///
     /// Reads from object storage, so it works across process restarts.
     pub async fn fetch_result(&self) -> Result<Option<std::result::Result<J::Output, JobError>>> {
-        match self.core.view.recorded_result(&self.id).await? {
-            None => Ok(None),
-            Some(result) => decode_end::<J>(result.termination, Some(result.outcome)).map(Some),
+        match self.core.view.recorded_end(&self.id).await? {
+            Some(RunEnd {
+                termination,
+                outcome: Some(outcome),
+            }) => decode_end::<J>(termination, Some(outcome)).map(Some),
+            _ => Ok(None),
         }
     }
 

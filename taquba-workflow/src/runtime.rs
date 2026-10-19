@@ -205,14 +205,6 @@ pub enum RunState {
     Terminated(RunTermination),
 }
 
-/// A run result record as read back: the committed outcome and the termination
-/// the record belongs to.
-#[derive(Debug, Clone)]
-pub(crate) struct RunResult {
-    pub(crate) termination: RunTermination,
-    pub(crate) outcome: RunOutcome,
-}
-
 /// The committed terminal outcome of a run, as [`RunState::Terminated`] reports
 /// it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,7 +240,8 @@ impl From<DurableTermination> for RunTermination {
     }
 }
 
-/// The end of a run, as [`WorkflowRuntime::wait`] reports it.
+/// The end of a run, as [`WorkflowRuntime::wait`] and [`WorkflowView::run_end`]
+/// report it.
 #[derive(Debug, Clone)]
 pub struct RunEnd {
     /// The run's termination, from its terminal record.
@@ -1078,7 +1071,7 @@ impl RuntimeCore {
     pub(crate) async fn wait_run(&self, run_id: &RunId) -> Result<Option<RunEnd>> {
         loop {
             let Some((current, _)) = self.view.current_job(run_id).await? else {
-                return self.run_end(run_id).await;
+                return self.view.recorded_end(run_id).await;
             };
             match self.queue.wait_for_completion(&current.job_id).await? {
                 // `NotFound`: the job settled between the two reads, and the
@@ -1100,25 +1093,6 @@ impl RuntimeCore {
                 }
             }
         }
-    }
-
-    /// The end of the terminated run `run_id` from its terminal record and the
-    /// run result record of that termination, or `None` when the terminal
-    /// record is absent.
-    async fn run_end(&self, run_id: &RunId) -> Result<Option<RunEnd>> {
-        let Some(termination) = self.view.terminal_record(run_id).await? else {
-            return Ok(None);
-        };
-        let termination = RunTermination::from(termination);
-        let outcome = self
-            .view
-            .run_result_of(run_id, &termination)
-            .await?
-            .map(|result| result.outcome);
-        Ok(Some(RunEnd {
-            termination,
-            outcome,
-        }))
     }
 
     /// The termination of `outcome`'s run at the clock's current time.
@@ -3187,19 +3161,24 @@ mod tests {
             .await
             .unwrap()
             .expect("terminal record");
-        assert_eq!(
-            status.state,
-            RunState::Terminated(RunTermination {
-                status: TerminalStatus::Cancelled,
-                error: None,
-                error_kind: None,
-                final_step: StepRef {
-                    number: 0,
-                    job_id: handle.job_id.clone(),
-                },
-                terminated_at_ms: 10_000,
-            }),
-        );
+        let termination = RunTermination {
+            status: TerminalStatus::Cancelled,
+            error: None,
+            error_kind: None,
+            final_step: StepRef {
+                number: 0,
+                job_id: handle.job_id.clone(),
+            },
+            terminated_at_ms: 10_000,
+        };
+        assert_eq!(status.state, RunState::Terminated(termination.clone()));
+        let end = view
+            .run_end(&handle.run_id)
+            .await
+            .unwrap()
+            .expect("terminal record");
+        assert_eq!(end.termination, termination);
+        assert!(end.outcome.is_none(), "no worker terminated the run");
     }
 
     #[tokio::test(start_paused = true)]
@@ -4753,6 +4732,15 @@ mod tests {
         assert!(runtime.submit(spec).await.unwrap().newly_submitted);
         assert!(
             runtime.outcome(&rid("again")).await.unwrap().is_none(),
+            "the run is active"
+        );
+        assert!(
+            runtime
+                .view()
+                .run_end(&rid("again"))
+                .await
+                .unwrap()
+                .is_none(),
             "the run is active"
         );
         assert!(runtime.cancel(&rid("again")).await.unwrap());

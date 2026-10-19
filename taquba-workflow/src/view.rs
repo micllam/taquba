@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::group::{self, GroupStatus};
 use crate::keys::{HEADER_SIGNAL_WAIT, RunId, outcome_kv_key, run_kv_key, step_kv_key};
 use crate::memo::{MemoStore, RUN_RESULT_MEMO_KEY};
-use crate::runtime::{RunResult, RunState, RunStatus, RunTermination};
+use crate::runtime::{RunEnd, RunState, RunStatus, RunTermination};
 use crate::terminal::{RunOutcome, TerminalStatus};
 
 /// The read-only queries of a workflow store, over a [`QueueView`] and the
@@ -80,13 +80,19 @@ impl WorkflowView {
     /// the earlier run's record in place until its own termination overwrites
     /// it, and such a record is not reported.
     pub async fn outcome(&self, run_id: &RunId) -> Result<Option<RunOutcome>> {
+        Ok(self.run_end(run_id).await?.and_then(|end| end.outcome))
+    }
+
+    /// The end of a terminated run, as
+    /// [`WorkflowRuntime::wait`](crate::WorkflowRuntime::wait) reports it: the
+    /// termination from its terminal record, with the outcome that
+    /// [`Self::outcome`] reports. It is `None` for a run that is unknown, still
+    /// active or swept.
+    pub async fn run_end(&self, run_id: &RunId) -> Result<Option<RunEnd>> {
         if self.current_step_if_active(run_id).await?.is_some() {
             return Ok(None);
         }
-        Ok(self
-            .recorded_result(run_id)
-            .await?
-            .map(|result| result.outcome))
+        self.recorded_end(run_id).await
     }
 
     /// The status of the run group `group_id`: the members of its manifest,
@@ -173,35 +179,32 @@ impl WorkflowView {
         }))
     }
 
-    /// The run result record of the termination `run_id`'s terminal record
-    /// describes, or `None` when no terminal record remains or the worker that
-    /// terminated the run wrote no record.
-    pub(crate) async fn recorded_result(&self, run_id: &RunId) -> Result<Option<RunResult>> {
-        match self.terminal_record(run_id).await? {
-            Some(termination) => self.run_result_of(run_id, &termination.into()).await,
-            None => Ok(None),
-        }
+    /// The end that the terminal record of `run_id` describes, or `None` when
+    /// no terminal record remains. A re-submission of the run id can be active
+    /// while the terminal record of the earlier run remains.
+    pub(crate) async fn recorded_end(&self, run_id: &RunId) -> Result<Option<RunEnd>> {
+        let Some(termination) = self.terminal_record(run_id).await? else {
+            return Ok(None);
+        };
+        let termination = RunTermination::from(termination);
+        let outcome = self.run_result_of(run_id, &termination).await?;
+        Ok(Some(RunEnd {
+            termination,
+            outcome,
+        }))
     }
 
-    /// The run result record of `run_id` when it belongs to `termination`. A
-    /// record outlives a re-submission of the run id until the next termination
-    /// overwrites it, and a record written before a settlement that did not
-    /// commit outlives the termination that followed, so a record of another
-    /// termination is not reported.
+    /// The outcome in the run result record of `run_id` when the record belongs
+    /// to `termination`. A record outlives a re-submission of the run id until
+    /// the next termination overwrites it, and a record written before a
+    /// settlement that did not commit outlives the termination that followed,
+    /// so a record of another termination is not reported. A record that fails
+    /// to decode is treated as absent.
     pub(crate) async fn run_result_of(
         &self,
         run_id: &RunId,
         termination: &RunTermination,
-    ) -> Result<Option<RunResult>> {
-        Ok(self
-            .run_result(run_id)
-            .await?
-            .filter(|result| result.termination == *termination))
-    }
-
-    /// The run result record of `run_id`, whichever termination it belongs to.
-    /// A record that fails to decode is treated as absent.
-    async fn run_result(&self, run_id: &RunId) -> Result<Option<RunResult>> {
+    ) -> Result<Option<RunOutcome>> {
         let Some(bytes) = self
             .memos
             .new_run_memo(run_id)
@@ -211,12 +214,11 @@ impl WorkflowView {
             return Ok(None);
         };
         Ok(
-            durable::decode_or_absent::<DurableRunResult>(&bytes, "run result record", run_id).map(
-                |record| RunResult {
-                    termination: record.termination.into(),
-                    outcome: record.outcome.into(),
-                },
-            ),
+            durable::decode_or_absent::<DurableRunResult>(&bytes, "run result record", run_id)
+                .and_then(|record| {
+                    (RunTermination::from(record.termination) == *termination)
+                        .then(|| record.outcome.into())
+                }),
         )
     }
 }

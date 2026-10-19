@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `WorkflowView::run_end`: the `RunEnd` of a terminated run, which
+  `WorkflowRuntime::wait` reports, so a process without a runtime reads it
+  through a `taquba::QueueReader`. It returns `None` for an active run.
+
 ## [0.14.0] - 2026-10-14
 
 ### Added

@@ -170,7 +170,8 @@ record and the committed outcome, when the worker that terminated the run
 recorded one. A run already terminated is reported at once, and
 `WorkflowRuntime::wait_timeout` bounds the wait. The wait relies on the queue's
 in-process completion notification, so it runs in the process that runs the
-worker.
+worker. `WorkflowView::run_end` reads the end of a terminated run without a
+wait, also in a process without a runtime.
 
 `WorkflowRuntime::outcome` returns the committed `RunOutcome` of a terminated
 run (its result or error, the submitter's headers and the final step) from the
