@@ -19,7 +19,7 @@ use crate::jobs::context::{JobContext, State};
 use crate::jobs::group::JobGroup;
 use crate::jobs::handle::JobHandle;
 use crate::jobs::job::Job;
-use crate::keys::{RunId, hash_input};
+use crate::keys::RunId;
 use crate::terminal::NoopTerminalHook;
 
 /// The payload of a job's run: the job's [`Job::NAME`], by which the step
@@ -196,23 +196,6 @@ impl JobRunner {
         let payload = job_payload(&job)?;
         let key = job.idempotency_key();
         let run_id = key.as_deref().map(run_id_for_key);
-
-        // A terminated job with this key is reported from its terminal record,
-        // which outlives the run record the workflow deletes at termination.
-        if let Some(run_id) = &run_id
-            && let Some(termination) = self.runtime.inner.core.view.terminal_record(run_id).await?
-        {
-            if termination.input_hash != hash_input(&payload) {
-                return Err(crate::Error::InputMismatch(run_id.clone()));
-            }
-            tracing::debug!(job_id = %run_id, job_type = J::NAME, "submit matched a terminated job");
-            return Ok(JobHandle::new(
-                run_id.clone(),
-                self.runtime.inner.core.clone(),
-                false,
-            ));
-        }
-
         let outcome = self
             .runtime
             .submit(RunSpec {

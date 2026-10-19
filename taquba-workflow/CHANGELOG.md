@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `WorkflowRuntime::wait` reports, so a process without a runtime reads it
   through a `taquba::QueueReader`. It returns `None` for an active run.
 
+### Changed
+
+- `WorkflowRuntime::submit` of a terminated run id reports the terminated run
+  with `newly_submitted = false`, or fails with `InputMismatch` for another
+  input, until memo retention removes the terminal record of the run. To run an
+  input again, submit it under a new run id.
+
 ### Fixed
 
 - `RunGroup::submit` and `RunGroup::resume` rerun failed or cancelled members

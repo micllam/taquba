@@ -278,6 +278,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..Default::default()
                 })
                 .await?;
+            if !outcome.newly_submitted
+                && let Some(end) = runtime.view().run_end(&outcome.run_id).await?
+            {
+                println!(
+                    "run {} already ended as {}; remove {QUEUE_DIR} to start over",
+                    outcome.run_id, end.termination.status
+                );
+                return Ok(());
+            }
             if outcome.newly_submitted {
                 println!("submitted run {}", outcome.run_id);
             } else {

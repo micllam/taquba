@@ -75,10 +75,7 @@ impl WorkflowView {
     /// and is removed with the run's memo entries. It is `None` for a run that
     /// is unknown, still active or was terminated without a worker (a
     /// cancellation of a pending step, a dead-letter outside the worker), whose
-    /// status [`Self::status`] reports. A record belongs to the termination its
-    /// terminal record describes: a re-submission of a terminated run id leaves
-    /// the earlier run's record in place until its own termination overwrites
-    /// it, and such a record is not reported.
+    /// status [`Self::status`] reports.
     pub async fn outcome(&self, run_id: &RunId) -> Result<Option<RunOutcome>> {
         Ok(self.run_end(run_id).await?.and_then(|end| end.outcome))
     }
@@ -89,10 +86,15 @@ impl WorkflowView {
     /// [`Self::outcome`] reports. It is `None` for a run that is unknown, still
     /// active or swept.
     pub async fn run_end(&self, run_id: &RunId) -> Result<Option<RunEnd>> {
-        if self.current_step_if_active(run_id).await?.is_some() {
+        let Some(termination) = self.terminal_record(run_id).await? else {
             return Ok(None);
-        }
-        self.recorded_end(run_id).await
+        };
+        let termination = RunTermination::from(termination);
+        let outcome = self.run_result_of(run_id, &termination).await?;
+        Ok(Some(RunEnd {
+            termination,
+            outcome,
+        }))
     }
 
     /// The status of the run group `group_id`: the members of its manifest,
@@ -179,27 +181,11 @@ impl WorkflowView {
         }))
     }
 
-    /// The end that the terminal record of `run_id` describes, or `None` when
-    /// no terminal record remains. A re-submission of the run id can be active
-    /// while the terminal record of the earlier run remains.
-    pub(crate) async fn recorded_end(&self, run_id: &RunId) -> Result<Option<RunEnd>> {
-        let Some(termination) = self.terminal_record(run_id).await? else {
-            return Ok(None);
-        };
-        let termination = RunTermination::from(termination);
-        let outcome = self.run_result_of(run_id, &termination).await?;
-        Ok(Some(RunEnd {
-            termination,
-            outcome,
-        }))
-    }
-
     /// The outcome in the run result record of `run_id` when the record belongs
-    /// to `termination`. A record outlives a re-submission of the run id until
-    /// the next termination overwrites it, and a record written before a
-    /// settlement that did not commit outlives the termination that followed,
-    /// so a record of another termination is not reported. A record that fails
-    /// to decode is treated as absent.
+    /// to `termination`. A record written before a settlement that did not
+    /// commit outlives the termination that followed, so a record of another
+    /// termination is not reported. A record that fails to decode is treated as
+    /// absent.
     pub(crate) async fn run_result_of(
         &self,
         run_id: &RunId,

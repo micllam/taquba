@@ -109,18 +109,20 @@
 //! applied with the enqueue. The returned [`SubmitOutcome`] identifies the run
 //! and the queue job that currently represents it.
 //!
-//! `submit` is idempotent on `(run_id, input)`. A re-submission of an active
-//! run with the same input is a no-op and the returned [`SubmitOutcome`] has
-//! `newly_submitted = false`. A re-submission with a different input is
-//! rejected with [`Error::InputMismatch`]. Duplicates are caught by a durable
-//! per-run record written atomically with the step-0 enqueue (via
-//! [`taquba::Queue::enqueue_with_effects`]), so they are caught across process
-//! restarts, even after step 0 is claimed and its dedup key is released. The
-//! record contains a SHA-256 of the original input for the mismatch check. A
-//! current-step pointer under `workflow/steps/` is written with it, rewritten
-//! in the settlement that enqueues each next step and identifies the queue job
-//! that [`SubmitOutcome::job_id`] reports for a duplicate. Both are removed
-//! when the run reaches a terminal state.
+//! `submit` is idempotent on `(run_id, input)`. A re-submission of an active or
+//! terminated run with the same input is a no-op and the returned
+//! [`SubmitOutcome`] has `newly_submitted = false`. A re-submission with a
+//! different input is rejected with [`Error::InputMismatch`]. Duplicates are
+//! caught by a durable per-run record written atomically with the step-0
+//! enqueue (via [`taquba::Queue::enqueue_with_effects`]), so they are caught
+//! across process restarts, even after step 0 is claimed and its dedup key is
+//! released. The record contains a SHA-256 of the original input for the
+//! mismatch check. A current-step pointer under `workflow/steps/` is written
+//! with it, rewritten in the settlement that enqueues each next step and
+//! identifies the queue job that [`SubmitOutcome::job_id`] reports for a
+//! duplicate. Both are removed when the run reaches a terminal state, and the
+//! terminal record of the run catches a re-submission from then until [Memo
+//! retention](#memo-retention) removes it.
 //!
 //! [`WorkflowView::status`] reads the record, the pointer and the step's queue
 //! job into a [`RunStatus`]: the lifecycle position of the current step
@@ -150,10 +152,8 @@
 //! step) from the run result record the worker writes to the run's memo, at the
 //! reserved key `workflow.outcome`, before every terminating settlement it
 //! performs. A run terminated without a worker (a cancellation of a pending
-//! step, a step dead-lettered outside the worker) does not have a record. A
-//! record belongs to the termination the run's terminal record describes, so a
-//! re-submission of a terminated run id does not report the earlier run's
-//! record. The record is removed with the run's memo entries by the memo sweep.
+//! step, a step dead-lettered outside the worker) does not have a record. The
+//! record is removed with the run's memo entries by the memo sweep.
 //!
 //! # Cancellation
 //!
@@ -519,15 +519,11 @@
 //! marker. A pass before a marker can be expired does not read the index, so a
 //! run's state is removed within a poll interval of the end of its window.
 //!
-//! Because the sweep selects runs by their terminal markers and a terminated
-//! run never resumes, the entries of an in-flight run are not removed, with one
-//! exception: entries are addressed by run id, and a terminated run releases
-//! its id, so a second run submitted under that id shares the first run's
-//! entries, and the first run's marker can expire against them while the second
-//! run is still executing. The second run re-executes the affected steps.
-//! Deletion is unguarded because every reader tolerates absence: a step that
-//! finds an entry absent re-executes the work, as a redelivery does under
-//! at-least-once delivery.
+//! The sweep selects runs by their terminal markers, and a run id identifies
+//! one run until the sweep removes its terminal record, so the entries of an
+//! in-flight run are not removed. Deletion is unguarded because every reader
+//! tolerates absence: a step that finds an entry absent re-executes the work,
+//! as a redelivery does under at-least-once delivery.
 //!
 //! Other cleanup policies (selective retention, sweeps run by another process)
 //! can be built on [`taquba::QueueView::kv_scan`] over that prefix and

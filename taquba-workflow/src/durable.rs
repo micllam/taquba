@@ -289,7 +289,7 @@ impl From<DurableTerminalStatus> for TerminalStatus {
 /// final step and the SHA-256 of the run's input: the terminal record under
 /// `workflow/outcomes/{run_id}`, written in the settlement that terminates the
 /// run and read by [`WorkflowView::status`](crate::WorkflowView::status) once
-/// the run record is gone and by a typed re-submission after completion, the
+/// the run record is gone and by a re-submission after the termination, the
 /// termination half of a member record and the termination a run result record
 /// belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

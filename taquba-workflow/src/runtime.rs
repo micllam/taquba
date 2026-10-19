@@ -92,11 +92,10 @@ pub struct RunSpec {
     /// re-submitting the same `run_id` while the run is active returns the
     /// existing job and does not create a duplicate.
     ///
-    /// A terminated run releases its id for re-submission. The second run
-    /// shares the first run's memo and step-output entries, so it resumes from
-    /// them. Under [`WorkflowRuntimeBuilder::memo_retention`], the first run's
-    /// marker expires against those shared entries even while the second run is
-    /// executing. The second run then re-executes the affected steps.
+    /// A run id identifies one run until
+    /// [`WorkflowRuntimeBuilder::memo_retention`] removes the terminal record
+    /// of the run, so a re-submission of a terminated run reports that run.
+    /// Without memo retention a run id identifies one run permanently.
     pub run_id: Option<RunId>,
     /// Bytes that the runner receives as the first step's payload.
     pub input: Vec<u8>,
@@ -118,20 +117,21 @@ pub struct RunSpec {
 
 /// Outcome of [`WorkflowRuntime::submit`].
 ///
-/// `submit` is idempotent on `run_id`: re-submitting an active run is a no-op
-/// and the returned `SubmitOutcome` has `newly_submitted = false`.
+/// `submit` is idempotent on `run_id`: re-submitting an active or terminated
+/// run is a no-op and the returned `SubmitOutcome` has
+/// `newly_submitted = false`.
 #[derive(Debug, Clone)]
 pub struct SubmitOutcome {
     /// The run's identifier (generated if the spec did not include one).
     pub run_id: RunId,
     /// `true` if this call enqueued a new run. `false` if a run with this id
-    /// was already active (its durable run record exists) and this call was a
-    /// no-op. Call [`WorkflowRuntime::status`] for the run's current state when
-    /// needed.
+    /// exists (its durable run record or its terminal record) and this call was
+    /// a no-op. Call [`WorkflowRuntime::status`] for the run's current state
+    /// when needed.
     pub newly_submitted: bool,
     /// The id of the queue job currently representing the run: its first step
-    /// for a new submission, and the step the run reached for a duplicate, read
-    /// from the run's durable current-step pointer.
+    /// for a new submission, the step an active run reached, read from its
+    /// durable current-step pointer, and the final step of a terminated run.
     pub job_id: String,
 }
 
@@ -551,12 +551,12 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// Submit a new run. Enqueues step 0 with payload `spec.input`.
     ///
     /// Idempotent on `(run_id, spec.input)`: if a run with the same id is
-    /// already active (its durable run record in Taquba's user KV namespace
-    /// exists, whichever process submitted it) and `spec.input` matches the
-    /// original submission, this call is a no-op and the returned
-    /// [`SubmitOutcome`] has `newly_submitted = false`. A re-submission of an
-    /// active `run_id` with a *different* input is rejected with
-    /// [`Error::InputMismatch`]. A new run requires a fresh `run_id`.
+    /// active or terminated (its durable run record or its terminal record in
+    /// Taquba's user KV namespace exists, whichever process submitted it) and
+    /// `spec.input` matches the original submission, this call is a no-op and
+    /// the returned [`SubmitOutcome`] has `newly_submitted = false`. A
+    /// re-submission of such a `run_id` with a *different* input is rejected
+    /// with [`Error::InputMismatch`]. A new run requires a fresh `run_id`.
     pub async fn submit(&self, spec: RunSpec) -> Result<SubmitOutcome> {
         self.inner.core.submit(spec).await
     }
@@ -783,8 +783,8 @@ impl RuntimeCore {
             newly_submitted: false,
             job_id,
         };
-        let check_input = |existing: DurableRunRecord| {
-            if existing.input_hash == input_hash {
+        let check_input = |existing: [u8; 32]| {
+            if existing == input_hash {
                 Ok(())
             } else {
                 Err(Error::InputMismatch(run_id.clone()))
@@ -792,9 +792,15 @@ impl RuntimeCore {
         };
 
         if let Some(existing) = self.view.run_record(run_id).await? {
-            check_input(existing)?;
+            check_input(existing.input_hash)?;
             let current = self.current_step(run_id).await?;
             return Ok(duplicate(current.job_id));
+        }
+        // A termination deletes the run record and writes the terminal record
+        // in one commit, so the terminal record is read second.
+        if let Some(termination) = self.view.terminal_record(run_id).await? {
+            check_input(termination.input_hash)?;
+            return Ok(duplicate(termination.final_step.job_id));
         }
 
         let opts = StepEnqueueOpts {
@@ -837,7 +843,7 @@ impl RuntimeCore {
             // store this runtime did not write, reported as a duplicate.
             EnqueueResult::AlreadyEnqueued(existing) => {
                 if let Some(record) = self.view.run_record(run_id).await? {
-                    check_input(record)?;
+                    check_input(record.input_hash)?;
                 }
                 return Ok(duplicate(existing));
             }
@@ -1071,7 +1077,7 @@ impl RuntimeCore {
     pub(crate) async fn wait_run(&self, run_id: &RunId) -> Result<Option<RunEnd>> {
         loop {
             let Some((current, _)) = self.view.current_job(run_id).await? else {
-                return self.view.recorded_end(run_id).await;
+                return self.view.run_end(run_id).await;
             };
             match self.queue.wait_for_completion(&current.job_id).await? {
                 // `NotFound`: the job settled between the two reads, and the
@@ -3957,11 +3963,11 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_re_submitted_run_shares_its_entries_until_the_first_run_expires() {
+    async fn a_terminated_run_keeps_its_run_id_until_the_memo_sweep_removes_it() {
         let (queue, store, clock) = open_queue_at(10_000).await;
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
-            store.clone(),
+            store,
             FixedRunner::new(Ok(StepOutcome::Succeed {
                 result: b"done".to_vec(),
             })),
@@ -3971,11 +3977,11 @@ mod tests {
         .build()
         .unwrap();
         let spec = RunSpec {
-            run_id: Some(rid("shared")),
+            run_id: Some(rid("once")),
             input: b"x".to_vec(),
             ..Default::default()
         };
-        runtime.submit(spec.clone()).await.unwrap();
+        let first = runtime.submit(spec.clone()).await.unwrap();
         let claim = queue
             .claim("workflow-steps", Duration::from_secs(30))
             .await
@@ -3987,36 +3993,22 @@ mod tests {
             .await
             .unwrap();
         queue.ack_with(&claim, effects).await.unwrap();
-        let memos = MemoStore::new(store, "workflow-steps-memo");
-        memos
-            .new_memo(&rid("shared"), 0)
-            .put("k", b"v")
-            .await
-            .unwrap();
 
-        assert!(runtime.submit(spec).await.unwrap().newly_submitted);
-        assert_eq!(
-            memos.new_memo(&rid("shared"), 0).get("k").await.unwrap(),
-            Some(b"v".to_vec()),
-            "the second run reads the first run's entry",
-        );
+        let again = runtime.submit(spec.clone()).await.unwrap();
+        assert!(!again.newly_submitted, "the terminal record answers");
+        assert_eq!(again.job_id, first.job_id, "the job of the final step");
+        let other = RunSpec {
+            input: b"y".to_vec(),
+            ..spec.clone()
+        };
+        assert!(matches!(
+            runtime.submit(other).await,
+            Err(Error::InputMismatch(id)) if id == "once"
+        ));
 
-        // The first run's marker expires while the second run is active.
-        clock.advance(Duration::from_secs(2));
+        clock.advance(Duration::from_secs(1));
         assert_eq!(runtime.inner.core.sweep_once().await.unwrap(), 1);
-        assert_eq!(
-            memos.new_memo(&rid("shared"), 0).get("k").await.unwrap(),
-            None
-        );
-        assert_eq!(
-            runtime
-                .status(&rid("shared"))
-                .await
-                .unwrap()
-                .map(|s| s.state),
-            Some(RunState::Pending),
-            "the second run is still active",
-        );
+        assert!(runtime.submit(spec).await.unwrap().newly_submitted);
     }
 
     /// Yield up to `iters` times waiting for `cond` to become true. Used in
@@ -4623,9 +4615,14 @@ mod tests {
         );
         let _ = shutdown.send(());
 
-        // The run id is submitted again while the dead job is retained: the
-        // pass identifies a dead-letter outside the worker by the current
-        // step's job, so the new run is left alone.
+        // The test removes the terminal record as the memo sweep does. The run
+        // id is then submitted again while the dead job is retained: the pass
+        // identifies a dead-letter outside the worker by the current step's
+        // job, so the new run is left alone.
+        queue
+            .kv_delete(&outcome_kv_key(&rid("hung")))
+            .await
+            .unwrap();
         let again = runtime
             .submit(RunSpec {
                 run_id: Some(rid("hung")),
@@ -4693,8 +4690,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_result_record_of_an_earlier_run_is_not_reported_for_a_re_submitted_run_id() {
-        let (queue, store, clock) = open_queue_at(10_000).await;
+    async fn a_result_record_of_a_settlement_that_did_not_commit_is_not_reported() {
+        let (queue, store, _clock) = open_queue_at(10_000).await;
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store,
@@ -4705,55 +4702,37 @@ mod tests {
         )
         .build()
         .unwrap();
-        let spec = RunSpec {
-            run_id: Some(rid("again")),
-            input: b"x".to_vec(),
-            ..Default::default()
-        };
-        runtime.submit(spec.clone()).await.unwrap();
+        runtime
+            .submit(RunSpec {
+                run_id: Some(rid("r")),
+                input: b"x".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         let claim = queue
             .claim("workflow-steps", Duration::from_secs(30))
             .await
             .unwrap()
             .unwrap();
-        let effects = runtime
+        // The worker writes the run result record before its settlement. The
+        // settlement does not commit, and the queue dead-letters the step.
+        runtime
             .inner
             .process_step(&claim, &LeaseHandle::detached())
             .await
             .unwrap();
-        queue.ack_with(&claim, effects).await.unwrap();
-        let first = runtime.wait(&rid("again")).await.unwrap();
-        assert_eq!(first.termination.status, TerminalStatus::Succeeded);
-        assert!(first.outcome.is_some());
+        let record = runtime.inner.core.memo_store.new_run_memo(&rid("r"));
+        assert!(record.get(RUN_RESULT_MEMO_KEY).await.unwrap().is_some());
+        queue.dead_letter(&claim, "hung").await.unwrap();
+        assert_eq!(runtime.inner.core.reconcile_dead_steps().await.unwrap(), 1);
 
-        // The run id is submitted again: the earlier run's records remain until
-        // the new run's termination overwrites them.
-        clock.advance(Duration::from_secs(1));
-        assert!(runtime.submit(spec).await.unwrap().newly_submitted);
-        assert!(
-            runtime.outcome(&rid("again")).await.unwrap().is_none(),
-            "the run is active"
-        );
-        assert!(
-            runtime
-                .view()
-                .run_end(&rid("again"))
-                .await
-                .unwrap()
-                .is_none(),
-            "the run is active"
-        );
-        assert!(runtime.cancel(&rid("again")).await.unwrap());
-        let end = runtime.wait(&rid("again")).await.unwrap();
-        assert_eq!(
-            (end.termination.status, end.termination.terminated_at_ms),
-            (TerminalStatus::Cancelled, 11_000)
-        );
+        let end = runtime.view().run_end(&rid("r")).await.unwrap().unwrap();
+        assert_eq!(end.termination.status, TerminalStatus::Failed);
         assert!(
             end.outcome.is_none(),
-            "no worker terminated the new run, so the earlier run's record is not its outcome"
+            "the record belongs to the settlement that did not commit"
         );
-        assert!(runtime.outcome(&rid("again")).await.unwrap().is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -4773,6 +4752,12 @@ mod tests {
         let end = runtime.wait(&rid("again")).await.unwrap();
         assert_eq!(end.termination.status, TerminalStatus::Cancelled);
 
+        // The test removes the terminal record as the memo sweep does, so the
+        // run id starts a new run.
+        queue
+            .kv_delete(&outcome_kv_key(&rid("again")))
+            .await
+            .unwrap();
         assert!(runtime.submit(spec).await.unwrap().newly_submitted);
         let record = runtime
             .view()
