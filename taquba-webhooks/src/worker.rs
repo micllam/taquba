@@ -185,8 +185,14 @@ async fn deliver(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use axum::{Router, extract::Path, http::StatusCode, routing::post};
+    use taquba::{Queue, object_store::memory::InMemory};
+    use tokio::net::TcpListener;
 
     use super::*;
+    use crate::{WebhookRequest, enqueue_webhook};
 
     #[test]
     fn effective_timeout_is_the_header_or_the_default() {
@@ -207,5 +213,42 @@ mod tests {
             effective_timeout(&headers, DEFAULT_TIMEOUT),
             Err(Error::InvalidTimeout(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn deliver_classifies_the_response_status() {
+        // The receiver returns the status in the request path.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/{status}",
+            post(|Path(status): Path<u16>| async move { StatusCode::from_u16(status).unwrap() }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let queue = Queue::open(Arc::new(InMemory::new()), "test")
+            .await
+            .unwrap();
+        let worker = WebhookWorker::new();
+        for (status, expected) in [
+            (200, "delivered"),
+            (404, "permanent"),
+            (408, "retryable"),
+            (429, "retryable"),
+            (500, "retryable"),
+        ] {
+            let request = WebhookRequest::new(format!("http://{addr}/{status}"));
+            enqueue_webhook(&queue, "webhooks", request, Vec::new())
+                .await
+                .unwrap();
+            let claim = queue.claim_next("webhooks").await.unwrap().unwrap();
+            let outcome = match deliver(&worker, &claim, &queue.lease_handle(&claim)).await {
+                Ok(()) => "delivered",
+                Err(Error::PermanentDelivery(_)) => "permanent",
+                Err(Error::Delivery(_)) => "retryable",
+                Err(e) => panic!("status {status}: unexpected error {e}"),
+            };
+            assert_eq!(outcome, expected, "status {status}");
+        }
     }
 }
