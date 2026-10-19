@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `WorkflowRuntime::wait` reports, so a process without a runtime reads it
   through a `taquba::QueueReader`. It returns `None` for an active run.
 
+### Fixed
+
+- `RunGroup::submit` and `RunGroup::resume` rerun failed or cancelled members
+  under a new run id, with step outputs and memo entries apart from those of the
+  earlier run. A caller that keeps a member's run id reads the id of a later run
+  from `MemberResult::run_id`.
+
 ## [0.14.0] - 2026-10-14
 
 ### Added

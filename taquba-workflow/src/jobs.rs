@@ -136,12 +136,13 @@
 //! member and returns the typed results in submission order. Members are
 //! identified within the group by key (the job's [`Job::idempotency_key`], or
 //! the positional `item-{i}`), and a member's job id is derived from the group
-//! id and its key. A second submission of the same set runs again every member
-//! that did not succeed, so a step that fans out re-submits its group on a
-//! retry and joins the recorded results of the members that completed.
-//! [`JobGroup::status`], [`JobGroup::cancel`] and [`JobGroup::forget`] delegate
-//! to the run group's methods. [`JobRunnerBuilder::group_retention`] removes a
-//! group's state a window after a consumer observed its last termination.
+//! id, its key and its count of earlier runs. A second submission of the same
+//! set runs again every member that did not succeed, so a step that fans out
+//! re-submits its group on a retry and joins the recorded results of the
+//! members that completed. [`JobGroup::status`], [`JobGroup::cancel`] and
+//! [`JobGroup::forget`] delegate to the run group's methods.
+//! [`JobRunnerBuilder::group_retention`] removes a group's state a window after
+//! a consumer observed its last termination.
 //!
 //! ```ignore
 //! let group = runner.group::<FetchPage>(format!("fetch-{run_id}"))?;

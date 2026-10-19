@@ -345,8 +345,9 @@ each member's `MemberResult` (its termination and, when a worker recorded one,
 its `RunOutcome`) as it terminates, `RunGroup::cancel` cancels every active
 member and `RunGroup::status` counts the members by state. A process without a
 runtime reads the same counts with `WorkflowView::group_status`. A member's run
-id is derived from the group id and its key, so groups never share run state. A
-second submission of the same set, or `RunGroup::resume` from the manifest
+id is derived from the group id, its key and its count of earlier runs, so
+groups never share run state and a run never shares the state of an earlier run.
+A second submission of the same set, or `RunGroup::resume` from the manifest
 alone, runs again only the members that did not succeed, which is how a step
 that fans out stays safe under a retry and how a batch of inputs is run again
 after a partial failure.

@@ -34,11 +34,44 @@ const SUBMIT_CONCURRENCY: usize = 32;
 /// [`GroupStore::remove`].
 const MEMBER_PAGE_SIZE: usize = 1000;
 
-/// The run id of the member `key` of group `group_id`: the hex SHA-256 digest
-/// of `{group_id}/{key}`. A key with characters that a run id rejects still
+/// The run id of run `rerun` of the member `key` of group `group_id`. The id of
+/// run 0 is the hex SHA-256 digest of `{group_id}/{key}`, and a later run
+/// appends `-r{rerun}` to it. A key with characters that a run id rejects still
 /// maps to a valid run id, and groups never share run state.
-pub(crate) fn member_run_id(group_id: &RunId, key: &str) -> RunId {
-    RunId::digest(&[group_id.as_bytes(), b"/", key.as_bytes()])
+pub(crate) fn member_run_id(group_id: &RunId, key: &str, rerun: u32) -> RunId {
+    let first = RunId::digest(&[group_id.as_bytes(), b"/", key.as_bytes()]);
+    if rerun == 0 {
+        return first;
+    }
+    RunId::new(format!("{}-r{rerun}", first.as_str()))
+        .expect("a digest with a rerun suffix is a valid run id")
+}
+
+/// The rerun number of the member run `run_id` that [`member_run_id`] derived.
+fn rerun_of(run_id: &RunId) -> u32 {
+    run_id
+        .rsplit_once("-r")
+        .and_then(|(_, rerun)| rerun.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The run id under which a submission runs the member `key` with the member
+/// record `record`: run 0 without a record, the run of an active member and the
+/// next run after a termination that is not a success. It is `None` after a
+/// success.
+fn submission_run_id(group_id: &RunId, key: &str, record: Option<&DurableMember>) -> Option<RunId> {
+    let Some(record) = record else {
+        return Some(member_run_id(group_id, key, 0));
+    };
+    match &record.terminated {
+        None => Some(record.run_id.clone()),
+        Some(termination)
+            if TerminalStatus::from(termination.status) == TerminalStatus::Succeeded =>
+        {
+            None
+        }
+        Some(_) => Some(member_run_id(group_id, key, rerun_of(&record.run_id) + 1)),
+    }
 }
 
 /// The group membership of a run, set on every step job of the run in the
@@ -74,11 +107,6 @@ impl Membership {
     /// The KV key of this member's record.
     pub(crate) fn kv_key(&self) -> Vec<u8> {
         group_member_kv_key(&self.group_id, &self.key)
-    }
-
-    /// The run id of this member.
-    pub(crate) fn run_id(&self) -> RunId {
-        member_run_id(&self.group_id, &self.key)
     }
 }
 
@@ -122,7 +150,7 @@ pub struct GroupStatus {
 pub struct MemberResult {
     /// The member's key.
     pub key: String,
-    /// The run id of the member's run.
+    /// The run id of the member's last run.
     pub run_id: RunId,
     /// The member's last recorded termination.
     pub termination: RunTermination,
@@ -247,7 +275,7 @@ impl GroupStore {
                 members.insert(
                     group_member_kv_key(group_id, &member.key),
                     RemovedMember {
-                        run_id: Some(member_run_id(group_id, &member.key)),
+                        key: Some(member.key),
                         stored: None,
                         record: None,
                     },
@@ -271,7 +299,7 @@ impl GroupStore {
                 ),
             );
             let member = members.entry(key).or_insert(RemovedMember {
-                run_id: None,
+                key: None,
                 stored: None,
                 record: None,
             });
@@ -285,9 +313,9 @@ impl GroupStore {
     }
 
     /// Remove the state that `removal` read: the member records and the
-    /// terminal record of every member of the manifest, then the memo entries
-    /// of those members and the manifest. A group without a manifest has its
-    /// member records removed and nothing else.
+    /// terminal record of every run of every member of the manifest, then the
+    /// memo entries of those runs and the manifest. A group without a manifest
+    /// has its member records removed and nothing else.
     ///
     /// A transaction removes the KV state of [`MEMBER_PAGE_SIZE`] members and
     /// compares the record of each with the state that `removal` read. Returns
@@ -301,7 +329,8 @@ impl GroupStore {
                 .collect();
             let outcomes = page
                 .iter()
-                .filter_map(|(_, member)| member.run_id.as_ref().map(outcome_kv_key));
+                .flat_map(|(_, member)| member.run_ids(&removal.group_id))
+                .map(|run_id| outcome_kv_key(&run_id));
             let records = page
                 .iter()
                 .filter(|(_, member)| member.stored.is_some())
@@ -317,8 +346,10 @@ impl GroupStore {
                 return Ok(false);
             }
         }
-        for run_id in removal.members.values().filter_map(|m| m.run_id.as_ref()) {
-            self.memo_store.clear_memos_for_run(run_id).await?;
+        for member in removal.members.values() {
+            for run_id in member.run_ids(&removal.group_id) {
+                self.memo_store.clear_memos_for_run(&run_id).await?;
+            }
         }
         let objects = self.memo_store.objects();
         objects
@@ -330,13 +361,30 @@ impl GroupStore {
 
 /// One member of a [`Removal`].
 struct RemovedMember {
-    /// The member's run id, for a member of the manifest.
-    run_id: Option<RunId>,
+    /// The member's key, for a member of the manifest.
+    key: Option<String>,
     /// The stored bytes of the member record, `None` without a record.
     stored: Option<Bytes>,
     /// The decoded member record, `None` without a record or for a record that
     /// fails to decode.
     record: Option<DurableMember>,
+}
+
+impl RemovedMember {
+    /// The run ids of a member of the manifest of `group_id`, from run 0 to the
+    /// run that its record names.
+    fn run_ids(&self, group_id: &RunId) -> Vec<RunId> {
+        let Some(key) = &self.key else {
+            return Vec::new();
+        };
+        let last = self
+            .record
+            .as_ref()
+            .map_or(0, |record| rerun_of(&record.run_id));
+        (0..=last)
+            .map(|rerun| member_run_id(group_id, key, rerun))
+            .collect()
+    }
 }
 
 /// The state of a group that [`GroupStore::remove`] removes, with the KV key of
@@ -383,10 +431,11 @@ impl Clearable for GroupStore {
 /// copies an `Arc` and the group id.
 ///
 /// The group's members are identified by key. A member's run id is derived from
-/// the group id and its key, so the same input submitted to two groups runs
-/// twice, and a second [`submit`](Self::submit) of the group runs again every
-/// member that did not succeed. The group's membership is a durable manifest,
-/// so [`results`](Self::results), [`status`](Self::status),
+/// the group id, its key and its count of earlier runs, so the same input
+/// submitted to two groups runs twice. A second [`submit`](Self::submit) of the
+/// group runs every member that did not succeed again under a new run id, which
+/// does not share the state of the earlier run. The group's membership is a
+/// durable manifest, so [`results`](Self::results), [`status`](Self::status),
 /// [`cancel`](Self::cancel) and [`forget`](Self::forget) work after a restart
 /// and from any runtime over the same queue.
 #[derive(Clone)]
@@ -466,19 +515,17 @@ impl RunGroup {
     }
 
     async fn submit_members(&self, members: Vec<GroupMember>, options: &RunOptions) -> Result<()> {
-        let succeeded: std::collections::HashSet<String> = self
+        let records: HashMap<String, DurableMember> = self
             .members()
             .await?
             .into_iter()
-            .filter(|member| member.status() == Some(TerminalStatus::Succeeded))
-            .map(|member| member.key)
+            .map(|member| (member.key, member.record))
             .collect();
-        let mut submissions = stream::iter(
-            members
-                .into_iter()
-                .filter(|member| !succeeded.contains(&member.key)),
-        )
-        .map(|member| async move {
+        let mut submissions = stream::iter(members.into_iter().filter_map(|member| {
+            let run_id = submission_run_id(&self.id, &member.key, records.get(&member.key))?;
+            Some((member, run_id))
+        }))
+        .map(|(member, run_id)| async move {
             let membership = Membership {
                 group_id: self.id.clone(),
                 key: member.key,
@@ -487,7 +534,7 @@ impl RunGroup {
                 .submit_member(
                     &membership,
                     RunSpec {
-                        run_id: Some(membership.run_id()),
+                        run_id: Some(run_id),
                         input: member.input,
                         options: options.clone(),
                         effects: SettlementEffects::default(),
@@ -606,7 +653,7 @@ impl RunGroup {
         if record.terminated.is_some() {
             return Ok(record);
         }
-        let run_id = member_run_id(&self.id, key);
+        let run_id = record.run_id;
         self.core().wait_run(&run_id).await?;
         // The pointer and the member record change in one transaction, so the
         // record of a run without a pointer is terminated.
@@ -659,6 +706,7 @@ pub(crate) fn terminated_member(run_id: &RunId, termination: DurableTermination)
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
     use super::*;
@@ -689,66 +737,60 @@ mod tests {
         }
     }
 
-    /// Fails permanently.
-    struct Rejecting;
+    /// Fails each run, and counts the runs.
+    struct Failing(Arc<AtomicU32>);
 
-    impl StepRunner for Rejecting {
+    impl StepRunner for Failing {
         async fn run_step(&self, _: &Step) -> std::result::Result<StepOutcome, StepError> {
-            Err(StepError::permanent("rejected"))
+            let run = self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(StepOutcome::Fail {
+                reason: format!("run {run}"),
+            })
+        }
+    }
+
+    #[test]
+    fn rerun_of_reads_the_rerun_number_of_a_member_run_id() {
+        for rerun in [0, 1, 12] {
+            assert_eq!(rerun_of(&member_run_id(&rid("g"), "a/b", rerun)), rerun);
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_result_record_of_an_earlier_termination_is_not_reported_for_a_re_run_member() {
-        let (queue, store, clock) = open_queue_at(10_000).await;
-        let runtime = WorkflowRuntime::builder(queue.clone(), store, Rejecting, NoopTerminalHook)
-            .build()
-            .unwrap();
+    async fn a_member_run_again_does_not_replay_the_step_outputs_of_its_earlier_run() {
+        let (queue, store) = open_queue().await;
+        let runs = Arc::new(AtomicU32::new(0));
+        let runtime =
+            WorkflowRuntime::builder(queue, store, Failing(runs.clone()), NoopTerminalHook)
+                .step_output_replay()
+                .build()
+                .unwrap();
         let group = runtime.group(rid("g"));
-        group
-            .submit(vec![member("a")], &RunOptions::default())
-            .await
-            .unwrap();
         let worker = runtime.spawn(std::future::pending::<()>());
-        let first: Vec<MemberResult> = tokio::time::timeout(Duration::from_secs(10), async {
-            group.results().await.unwrap().try_collect().await
-        })
-        .await
-        .expect("results finished in time")
-        .unwrap();
-        assert_eq!(first[0].termination.error.as_deref(), Some("rejected"));
-        assert_eq!(
-            first[0].termination.error_kind,
-            Some(crate::StepErrorKind::Permanent)
-        );
-        assert!(
-            first[0].outcome.is_some(),
-            "the worker recorded the failure"
-        );
+        let mut results = Vec::new();
+        for _ in 0..2 {
+            group
+                .submit(vec![member("a")], &RunOptions::default())
+                .await
+                .unwrap();
+            let mut member: Vec<MemberResult> =
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    group.results().await.unwrap().try_collect().await
+                })
+                .await
+                .expect("results finished in time")
+                .unwrap();
+            results.push(member.remove(0));
+        }
         worker.shutdown().await.unwrap();
 
-        // The member runs again and the queue dead-letters it outside the
-        // worker, so reconciliation terminates it and no new record is written.
-        clock.advance(Duration::from_secs(1));
-        group
-            .submit(vec![member("a")], &RunOptions::default())
-            .await
-            .unwrap();
-        let claim = queue
-            .claim("workflow-steps", Duration::from_secs(60))
-            .await
-            .unwrap()
-            .unwrap();
-        queue.dead_letter(&claim, "hung").await.unwrap();
-        assert_eq!(runtime.inner.core.reconcile_dead_steps().await.unwrap(), 1);
-
-        let second: Vec<MemberResult> = group.results().await.unwrap().try_collect().await.unwrap();
-        assert_eq!(second[0].termination.error.as_deref(), Some("hung"));
-        assert_eq!(second[0].termination.error_kind, None);
-        assert_eq!(second[0].termination.terminated_at_ms, 11_000);
-        assert!(
-            second[0].outcome.is_none(),
-            "the first termination's record does not belong to the second",
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        assert_eq!(results[0].run_id, member_run_id(&rid("g"), "a", 0));
+        assert_eq!(results[1].run_id, member_run_id(&rid("g"), "a", 1));
+        assert_eq!(results[1].termination.error.as_deref(), Some("run 1"));
+        assert_eq!(
+            results[1].outcome.as_ref().and_then(|o| o.error.as_deref()),
+            Some("run 1"),
         );
     }
 
@@ -767,7 +809,7 @@ mod tests {
         let pending = group.members().await.unwrap();
         assert_eq!(pending.len(), 2);
         assert!(pending.iter().all(|m| m.status().is_none()));
-        assert_eq!(pending[0].record.run_id, member_run_id(&rid("g"), "a"));
+        assert_eq!(pending[0].record.run_id, member_run_id(&rid("g"), "a", 0));
 
         assert!(matches!(
             group.submit(vec![member("a"), member("a")], &RunOptions::default()).await,
@@ -842,7 +884,7 @@ mod tests {
             .submit(vec![member("a")], &RunOptions::default())
             .await
             .unwrap();
-        let run_id = member_run_id(&rid("g"), "a");
+        let run_id = member_run_id(&rid("g"), "a", 0);
         let job_id = runtime.status(&run_id).await.unwrap().unwrap().step.job_id;
         assert_eq!(group.cancel().await.unwrap(), 1);
         assert_eq!(group.cancel().await.unwrap(), 0, "no member is active");
@@ -865,16 +907,19 @@ mod tests {
             "a pending step is cancelled without a worker, so no result is recorded",
         );
 
-        // The cancelled member is submitted again. A member is grouped by its
-        // key, so a plain submission of the same run id is not.
+        // The cancelled member runs again under the next run id, and a plain
+        // submission of that run id finds the member's run active.
         group
             .submit(vec![member("a")], &RunOptions::default())
             .await
             .unwrap();
-        assert!(group.members().await.unwrap()[0].status().is_none());
+        let members = group.members().await.unwrap();
+        assert!(members[0].status().is_none());
+        let rerun_id = member_run_id(&rid("g"), "a", 1);
+        assert_eq!(members[0].record.run_id, rerun_id);
         let plain = runtime
             .submit(RunSpec {
-                run_id: Some(run_id.clone()),
+                run_id: Some(rerun_id),
                 input: b"a".to_vec(),
                 ..Default::default()
             })
@@ -1005,7 +1050,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_group_sweep_removes_the_members_records_with_the_group() {
+    async fn the_group_sweep_removes_the_records_of_every_run_of_a_member() {
         let (queue, store, clock) = open_queue_at(10_000).await;
         let runtime =
             WorkflowRuntime::builder(queue.clone(), store.clone(), TwoSteps, NoopTerminalHook)
@@ -1013,31 +1058,37 @@ mod tests {
                 .build()
                 .unwrap();
         let group = runtime.group(rid("g"));
-        group
-            .submit(vec![member("a")], &RunOptions::default())
-            .await
-            .unwrap();
-        let run_id = member_run_id(&rid("g"), "a");
-        assert_eq!(group.cancel().await.unwrap(), 1);
         let memos = crate::memo::MemoStore::new(store, "workflow-steps-memo");
-        memos.new_run_memo(&run_id).put("k", b"v").await.unwrap();
-        let results: Vec<MemberResult> =
-            group.results().await.unwrap().try_collect().await.unwrap();
-        assert_eq!(results.len(), 1);
+        // The second submission runs the cancelled member again under the next
+        // run id.
+        let run_ids = [
+            member_run_id(&rid("g"), "a", 0),
+            member_run_id(&rid("g"), "a", 1),
+        ];
+        for run_id in &run_ids {
+            group
+                .submit(vec![member("a")], &RunOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(group.cancel().await.unwrap(), 1);
+            memos.new_run_memo(run_id).put("k", b"v").await.unwrap();
+            let results: Vec<MemberResult> =
+                group.results().await.unwrap().try_collect().await.unwrap();
+            assert_eq!(results[0].run_id, *run_id);
+            assert!(
+                queue
+                    .view()
+                    .kv_get(&outcome_kv_key(run_id))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
         let sweep = runtime.inner.core.group_sweep.as_ref().unwrap();
         let marker = sweep.marker_key(&rid("g"), 10_000);
         assert!(
             queue.view().kv_get(&marker).await.unwrap().is_some(),
             "the marker is written when the last termination is observed"
-        );
-        let terminal_record = outcome_kv_key(&run_id);
-        assert!(
-            queue
-                .view()
-                .kv_get(&terminal_record)
-                .await
-                .unwrap()
-                .is_some()
         );
 
         clock.advance(Duration::from_millis(999));
@@ -1054,26 +1105,21 @@ mod tests {
             group.manifest().await,
             Err(Error::GroupNotFound(_))
         ));
-        assert!(
-            queue
-                .view()
-                .kv_get(&terminal_record)
-                .await
-                .unwrap()
-                .is_none(),
-            "the member's terminal record is removed with the group"
-        );
-        assert!(
-            memos
-                .new_run_memo(&run_id)
-                .get("k")
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            runtime.status(&run_id).await.unwrap().is_none(),
-            "nothing of the member remains"
-        );
+        for run_id in &run_ids {
+            assert!(
+                queue
+                    .view()
+                    .kv_get(&outcome_kv_key(run_id))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the terminal record of every run is removed with the group"
+            );
+            assert!(memos.new_run_memo(run_id).get("k").await.unwrap().is_none());
+            assert!(
+                runtime.status(run_id).await.unwrap().is_none(),
+                "nothing of the member remains"
+            );
+        }
     }
 }
