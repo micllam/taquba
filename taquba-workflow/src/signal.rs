@@ -20,7 +20,7 @@ use crate::keys::{
     signal_wait_kv_key,
 };
 use crate::runner::{StepError, StepRunner};
-use crate::runtime::{RuntimeCore, RuntimeInner, StepEnqueueOpts, WorkflowRuntime};
+use crate::runtime::{RuntimeCore, StepEnqueueOpts, WorkflowRuntime};
 use crate::terminal::TerminalHook;
 use crate::worker::ClaimedStep;
 
@@ -126,7 +126,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     }
 }
 
-impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
+impl RuntimeCore {
     /// Build the effects that advance the run of `claimed` to a step that waits
     /// for a signal for `correlation_key`. When a buffered signal already
     /// exists it is consumed: the next step is enqueued immediately, the
@@ -149,14 +149,13 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         // index entry (its job no longer scheduled) is overwritten. The
         // rejection terminates the run as a permanent step error does.
         if let Some(existing) = self
-            .core
             .queue
             .view()
             .kv_get(&wait_key)
             .await
             .map_err(worker_error)?
             && let Ok(existing_id) = std::str::from_utf8(&existing)
-            && let Ok(Some(job)) = self.core.queue.view().job_record(existing_id).await
+            && let Ok(Some(job)) = self.queue.view().job_record(existing_id).await
             && job.status == JobStatus::Scheduled
         {
             let message =
@@ -168,7 +167,6 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
 
         let buf_key = signal_buf_kv_key(correlation_key);
         match self
-            .core
             .queue
             .view()
             .kv_get(&buf_key)
@@ -185,7 +183,6 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                     signal_delivered_kv_key(&claimed.run_id, claimed.step_number + 1);
                 let buffered = buffered.to_vec();
                 let mut effects = self
-                    .core
                     .advance_with_kv(claimed, payload, opts, |_| {
                         HashMap::from([(delivered_key, buffered)])
                     })
@@ -195,13 +192,12 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             }
             None => {
                 let opts = StepEnqueueOpts {
-                    run_at: Some(self.core.run_at_after(timeout)),
+                    run_at: Some(self.run_at_after(timeout)),
                     reserved_headers: claimed
                         .reserved_headers_with((HEADER_SIGNAL_WAIT, correlation_key.to_string())),
                     ..claimed.next_step_opts()
                 };
                 let effects = self
-                    .core
                     .advance_with_kv(claimed, payload, opts, |job_id| {
                         HashMap::from([(wait_key, job_id.as_bytes().to_vec())])
                     })
@@ -210,9 +206,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             }
         }
     }
-}
 
-impl RuntimeCore {
     /// Resolve the signal delivery for a claimed step job: the payload to
     /// expose on [`Step::signal`](crate::Step::signal) and the durable signal
     /// entries to delete with the step's settlement.

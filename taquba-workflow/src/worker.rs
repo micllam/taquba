@@ -20,7 +20,7 @@ use crate::keys::{HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RESERVED_HEADER_P
 use crate::kv::KvReadHandle;
 use crate::runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 use crate::runtime::StepRef;
-use crate::runtime::{RuntimeInner, StepEnqueueOpts};
+use crate::runtime::{RuntimeCore, RuntimeInner, StepEnqueueOpts};
 use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
 
 /// The [`Worker`] of a runtime: every claimed job of the runtime's queue is
@@ -152,7 +152,7 @@ impl<'a> ClaimedStep<'a> {
     }
 }
 
-impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
+impl RuntimeCore {
     /// The error a step returns for a failure that terminates its run: the
     /// effects of the `Failed` termination on a [`FailWith`], so the core
     /// applies them only with the dead-lettering settlement. The run result
@@ -164,15 +164,11 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         input_hash: [u8; 32],
     ) -> WorkerError {
         let outcome = claimed.failed(error.message.clone());
-        let termination = self
-            .core
-            .termination(&outcome, Some(error.kind), input_hash);
-        if let Err(err) = self.core.store_run_result(&outcome, &termination).await {
+        let termination = self.termination(&outcome, Some(error.kind), input_hash);
+        if let Err(err) = self.store_run_result(&outcome, &termination).await {
             warn!(run_id = %claimed.run_id, "failed to write the run result record: {err}");
         }
-        let effects = self
-            .core
-            .terminate_collecting_effects(&outcome, claimed, termination);
+        let effects = self.terminate_collecting_effects(&outcome, claimed, termination);
         FailWith::new(error.into_worker_error(), effects).into()
     }
 
@@ -187,16 +183,83 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         input_hash: [u8; 32],
         error_kind: Option<StepErrorKind>,
     ) -> std::result::Result<SettlementEffects, WorkerError> {
-        let termination = self.core.termination(&outcome, error_kind, input_hash);
-        self.core
-            .store_run_result(&outcome, &termination)
+        let termination = self.termination(&outcome, error_kind, input_hash);
+        self.store_run_result(&outcome, &termination)
             .await
             .map_err(worker_error)?;
-        Ok(self
-            .core
-            .terminate_collecting_effects(&outcome, claimed, termination))
+        Ok(self.terminate_collecting_effects(&outcome, claimed, termination))
     }
 
+    /// The settlement of `outcome` for `claimed`: the effects of the run's
+    /// transition on an acknowledging outcome, or the error that retries or
+    /// dead-letters the step.
+    ///
+    /// Cancellation precedence: a runner-issued [`StepOutcome::Cancel`] wins,
+    /// with its reason on [`RunOutcome::error`]. Otherwise an external
+    /// cancellation overrides any outcome that the runner returned, including a
+    /// transient retry and a permanent failure, with `error: None` so consumers
+    /// can distinguish the two.
+    async fn settle_outcome(
+        &self,
+        claimed: &ClaimedStep<'_>,
+        outcome: std::result::Result<StepOutcome, StepError>,
+        external_cancel: bool,
+        input_hash: [u8; 32],
+    ) -> std::result::Result<SettlementEffects, WorkerError> {
+        match outcome {
+            Ok(StepOutcome::Cancel { reason }) => {
+                self.terminate_recorded(claimed, claimed.cancelled(Some(reason)), input_hash, None)
+                    .await
+            }
+            _ if external_cancel => {
+                self.terminate_recorded(claimed, claimed.cancelled(None), input_hash, None)
+                    .await
+            }
+            Ok(StepOutcome::Continue { payload, when }) => match when {
+                Trigger::Immediate => Ok(self
+                    .advance(claimed, payload, claimed.next_step_opts())
+                    .await),
+                Trigger::After(delay) => {
+                    let opts = StepEnqueueOpts {
+                        run_at: Some(self.run_at_after(delay)),
+                        ..claimed.next_step_opts()
+                    };
+                    Ok(self.advance(claimed, payload, opts).await)
+                }
+                Trigger::OnSignal {
+                    correlation_key,
+                    timeout,
+                } => {
+                    self.advance_on_signal(claimed, payload, &correlation_key, timeout, input_hash)
+                        .await
+                }
+            },
+            Ok(StepOutcome::Succeed { result }) => {
+                self.terminate_recorded(claimed, claimed.succeeded(result), input_hash, None)
+                    .await
+            }
+            // A runner decision: the step ran cleanly and is acknowledged, and
+            // the run terminates as `Failed` without a dead-letter.
+            Ok(StepOutcome::Fail { reason }) => {
+                self.terminate_recorded(
+                    claimed,
+                    claimed.failed(reason),
+                    input_hash,
+                    Some(StepErrorKind::Permanent),
+                )
+                .await
+            }
+            // A permanent error, or a transient one on the last attempt,
+            // dead-letters the step and terminates the run.
+            Err(err) if err.kind == StepErrorKind::Permanent || claimed.job.is_last_attempt() => {
+                Err(self.terminating_failure(claimed, err, input_hash).await)
+            }
+            Err(err) => Err(err.into_worker_error()),
+        }
+    }
+}
+
+impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
     /// Process a terminal-notification job: decode the committed outcome and
     /// run the configured [`TerminalHook`] as the job's worker. Effects the
     /// hook stages join this job's acknowledgement. A transient hook error
@@ -261,6 +324,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .ok_or_else(|| worker_error(Error::InconsistentRunState(run_id.clone())))?;
         if record.cancel_requested {
             let mut effects = self
+                .core
                 .terminate_recorded(&claimed, claimed.cancelled(None), record.input_hash, None)
                 .await?;
             effects.kv_deletes.extend(signal_kv_deletes);
@@ -333,6 +397,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
 
         let runner_cancelled = matches!(outcome, Ok(StepOutcome::Cancel { .. }));
         let settled = self
+            .core
             .settle_outcome(&claimed, outcome, external_cancel, record.input_hash)
             .await;
 
@@ -349,74 +414,5 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             }
             effects
         })
-    }
-
-    /// The settlement of `outcome` for `claimed`: the effects of the run's
-    /// transition on an acknowledging outcome, or the error that retries or
-    /// dead-letters the step.
-    ///
-    /// Cancellation precedence: a runner-issued [`StepOutcome::Cancel`] wins,
-    /// with its reason on [`RunOutcome::error`]. Otherwise an external
-    /// cancellation overrides any outcome that the runner returned, including a
-    /// transient retry and a permanent failure, with `error: None` so consumers
-    /// can distinguish the two.
-    async fn settle_outcome(
-        &self,
-        claimed: &ClaimedStep<'_>,
-        outcome: std::result::Result<StepOutcome, StepError>,
-        external_cancel: bool,
-        input_hash: [u8; 32],
-    ) -> std::result::Result<SettlementEffects, WorkerError> {
-        match outcome {
-            Ok(StepOutcome::Cancel { reason }) => {
-                self.terminate_recorded(claimed, claimed.cancelled(Some(reason)), input_hash, None)
-                    .await
-            }
-            _ if external_cancel => {
-                self.terminate_recorded(claimed, claimed.cancelled(None), input_hash, None)
-                    .await
-            }
-            Ok(StepOutcome::Continue { payload, when }) => match when {
-                Trigger::Immediate => Ok(self
-                    .core
-                    .advance(claimed, payload, claimed.next_step_opts())
-                    .await),
-                Trigger::After(delay) => {
-                    let opts = StepEnqueueOpts {
-                        run_at: Some(self.core.run_at_after(delay)),
-                        ..claimed.next_step_opts()
-                    };
-                    Ok(self.core.advance(claimed, payload, opts).await)
-                }
-                Trigger::OnSignal {
-                    correlation_key,
-                    timeout,
-                } => {
-                    self.advance_on_signal(claimed, payload, &correlation_key, timeout, input_hash)
-                        .await
-                }
-            },
-            Ok(StepOutcome::Succeed { result }) => {
-                self.terminate_recorded(claimed, claimed.succeeded(result), input_hash, None)
-                    .await
-            }
-            // A runner decision: the step ran cleanly and is acknowledged, and
-            // the run terminates as `Failed` without a dead-letter.
-            Ok(StepOutcome::Fail { reason }) => {
-                self.terminate_recorded(
-                    claimed,
-                    claimed.failed(reason),
-                    input_hash,
-                    Some(StepErrorKind::Permanent),
-                )
-                .await
-            }
-            // A permanent error, or a transient one on the last attempt,
-            // dead-letters the step and terminates the run.
-            Err(err) if err.kind == StepErrorKind::Permanent || claimed.job.is_last_attempt() => {
-                Err(self.terminating_failure(claimed, err, input_hash).await)
-            }
-            Err(err) => Err(err.into_worker_error()),
-        }
     }
 }
