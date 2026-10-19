@@ -9,6 +9,7 @@ use slatedb::{DbTransaction, IsolationLevel};
 use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
+use crate::expiry::ExpiryIndex;
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{QueueName, attempt_history_key, claimed_key, dedup_index_key, job_index_key};
@@ -16,16 +17,16 @@ use crate::lease_registry::LeaseRegistry;
 use crate::queue_core::QueueCore;
 use crate::stats::update_stats;
 
-/// A store transaction that notes, for every job record it writes, the process
-/// state that the commit updates. [`QueueCore::commit`] applies the notes once
-/// the transaction commits. A transaction that is dropped, rolled back or in
-/// conflict discards them.
+/// A store transaction that notes, for every job record and expiry entry it
+/// writes and every job it enqueues, the process state that the commit updates.
+/// [`QueueCore::commit`] applies the notes once the transaction commits. A
+/// transaction that is dropped, rolled back or in conflict discards them.
 pub(crate) struct Txn {
     txn: DbTransaction,
     notes: CommitNotes,
 }
 
-/// The process state that the record writes of a [`Txn`] update.
+/// The process state that the writes of a [`Txn`] update.
 #[derive(Default)]
 struct CommitNotes {
     /// Per queue, the smallest pending key written and the count of pending
@@ -35,6 +36,10 @@ struct CommitNotes {
     scheduled: Option<u64>,
     /// The earliest `completed_at` of a done record written.
     done: Option<u64>,
+    /// The expiry entries written, for the bounds of their indexes.
+    expiry: Vec<(ExpiryIndex, u64)>,
+    /// The new jobs, as their queue and id, for the enqueue counter.
+    enqueued: Vec<(QueueName, String)>,
 }
 
 impl Deref for Txn {
@@ -54,6 +59,18 @@ impl Txn {
         self.txn.put(job_index_key(&job.id), &key)?;
         self.note_written(job, &key);
         Ok(())
+    }
+
+    /// Note the entry of `index` at `at_ms`, written in this transaction.
+    pub(crate) fn note_expiry_entry(&mut self, index: &ExpiryIndex, at_ms: u64) {
+        self.notes.expiry.push((index.clone(), at_ms));
+    }
+
+    /// Note the new job `job`, written in this transaction.
+    pub(crate) fn note_enqueued(&mut self, job: &JobRecord) {
+        self.notes
+            .enqueued
+            .push((job.queue.clone(), job.id.clone()));
     }
 
     /// Note the record `job`, written at `key`, for the commit.
@@ -205,6 +222,17 @@ impl QueueCore {
             }
             if let Some(completed_at) = notes.done {
                 self.done_bound.lower(completed_at);
+            }
+            for (index, at_ms) in &notes.expiry {
+                index.written(*at_ms);
+            }
+            let mut enqueued: BTreeMap<&QueueName, u64> = BTreeMap::new();
+            for (queue, id) in &notes.enqueued {
+                *enqueued.entry(queue).or_default() += 1;
+                debug!(queue = %queue, job_id = %id, "job enqueued");
+            }
+            for (queue, count) in enqueued {
+                crate::obs::enqueued(queue, count);
             }
         }
         Ok(outcome)

@@ -1,7 +1,7 @@
 //! The transitions of [`QueueCore`] that write a new job, or commit settlement
 //! effects without a job transition.
 
-use crate::effects::{PreparedEffects, PreparedJob, SettlementEffects, StagedEffects};
+use crate::effects::{PreparedEffects, PreparedJob, SettlementEffects};
 use crate::error::Result;
 use crate::keys::user_scoped_key;
 use crate::kv::kv_state_matches;
@@ -78,31 +78,30 @@ impl QueueCore {
     }
 
     /// The transaction loop of [`Self::write_job`], after any payload offload.
-    /// The inner `Ok` is the id of the new job with the staged effects, and the
-    /// inner `Err` is the id of the pending or scheduled job that a dedup key
-    /// matched, as `stage_job_writes` reports it.
+    /// The inner `Ok` is the id of the new job with the enqueue results of the
+    /// effects, and the inner `Err` is the id of the pending or scheduled job
+    /// that a dedup key matched, as `stage_job_writes` reports it.
     async fn write_job_txn(
         &self,
         prepared: &PreparedJob,
         effects: &PreparedEffects,
-    ) -> Result<std::result::Result<(String, StagedEffects), String>> {
+    ) -> Result<std::result::Result<(String, Vec<EnqueueResult>), String>> {
         let timer = crate::obs::start();
         let written = self
             .retry(Durability::Awaited, |mut txn| async move {
-                let staged = match self.stage_job_writes(&mut txn, prepared).await? {
-                    Ok(staged) => staged,
+                let id = match self.stage_job_writes(&mut txn, prepared).await? {
+                    Ok(id) => id,
                     Err(already_enqueued) => {
                         return Ok((txn, Attempt::Abort(Err(already_enqueued))));
                     }
                 };
-                let staged_effects = self.stage_effects(&mut txn, effects).await?;
-                Ok((txn, Attempt::Commit(Ok((staged, staged_effects)))))
+                let results = self.stage_effects(&mut txn, effects).await?;
+                Ok((txn, Attempt::Commit(Ok((id, results)))))
             })
             .await?;
-        Ok(written.map(|(staged, staged_effects)| {
-            crate::obs::enqueue_committed(&staged.queue, timer);
-            self.note_staged_job(&staged);
-            (staged.id, staged_effects)
-        }))
+        if written.is_ok() {
+            crate::obs::enqueue_committed(&prepared.job.queue, timer);
+        }
+        Ok(written)
     }
 }

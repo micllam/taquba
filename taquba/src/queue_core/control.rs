@@ -3,7 +3,7 @@
 
 use tracing::debug;
 
-use crate::effects::{PreparedEffects, SettlementEffects, StagedEffects};
+use crate::effects::{PreparedEffects, SettlementEffects};
 use crate::error::Result;
 use crate::job::{JobRecord, JobStatus};
 use crate::queue::{CancelOutcome, EnqueueResult, WaitOutcome, WakeOutcome};
@@ -12,10 +12,11 @@ use crate::txn::{Attempt, Durability, stage_remove, stage_to_pending};
 
 /// What the cancel transaction did.
 enum Cancelled {
-    /// The pending or scheduled job was removed, and the effects were staged.
+    /// The pending or scheduled job was removed, and the effects were staged
+    /// with these enqueue results.
     Removed {
         job: JobRecord,
-        staged: StagedEffects,
+        results: Vec<EnqueueResult>,
     },
     /// The cancellation of the claimed job was recorded on its record.
     Requested { job: JobRecord },
@@ -33,10 +34,8 @@ impl QueueCore {
     ) -> Result<(CancelOutcome, Vec<EnqueueResult>)> {
         let prepared = self.prepare_effects(effects).await?;
         match self.cancel_txn(id, &prepared).await {
-            Ok(Cancelled::Removed { job, staged }) => {
-                // The effects are recorded before the waiters of the job are
-                // woken.
-                let results = self.finish_effects(prepared, Some(staged)).await;
+            Ok(Cancelled::Removed { job, results }) => {
+                let results = self.finish_effects(prepared, Some(results)).await;
                 // Fired on the Removed path as well: the worker of a claim the
                 // reaper requeued just before this call can still observe the
                 // token. That claim's end removes the entry.
@@ -79,8 +78,8 @@ impl QueueCore {
                 let cancelled = match job.status {
                     JobStatus::Pending | JobStatus::Scheduled => {
                         stage_remove(&txn, &current_key, &job)?;
-                        let staged = self.stage_effects(&mut txn, prepared).await?;
-                        Cancelled::Removed { job, staged }
+                        let results = self.stage_effects(&mut txn, prepared).await?;
+                        Cancelled::Removed { job, results }
                     }
                     JobStatus::Claimed => {
                         if job.cancel_requested {

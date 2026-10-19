@@ -2,10 +2,9 @@
 //! validation, payload offload before the transaction, staging inside it and
 //! the work that follows its commit.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::time::Duration;
 
-use tracing::debug;
 use ulid::Ulid;
 
 use crate::error::{Error, Result};
@@ -133,22 +132,6 @@ pub(crate) struct PreparedEffects {
     pub(crate) expiry_entries: Vec<(ExpiryIndex, u64)>,
 }
 
-/// Effects staged into a settlement transaction by
-/// [`QueueCore::stage_effects`], retained for the work that follows the commit.
-pub(crate) struct StagedEffects {
-    /// One result per prepared enqueue, in order.
-    pub(crate) results: Vec<EnqueueResult>,
-    /// The enqueues that staged a new record.
-    pub(crate) jobs: Vec<StagedJob>,
-}
-
-/// Identity of a job staged by [`QueueCore::stage_job_writes`], retained for
-/// the counter that follows the commit.
-pub(crate) struct StagedJob {
-    pub(crate) id: String,
-    pub(crate) queue: QueueName,
-}
-
 impl QueueCore {
     /// Generate a job id. Ids increase with call order and take their timestamp
     /// from the queue's clock.
@@ -226,30 +209,25 @@ impl QueueCore {
     }
 
     /// End the lifecycle of prepared effects once their settlement ends, on
-    /// every branch of every settlement path. `staged` contains the effects
-    /// that a committed transaction staged, and `None` means that they did not
-    /// commit (the settlement failed or took a branch that discards the
-    /// effects). Committed effects are recorded and their expiry entries noted
-    /// on the indexes, and the payload object of an enqueue downgraded by a
-    /// dedup hit is deleted. Without a commit, every offloaded object is
-    /// deleted. Returns the enqueue results of the committed effects.
+    /// every branch of every settlement path. `results` contains the enqueue
+    /// results of effects that a committed transaction staged, and `None` means
+    /// that they did not commit (the settlement failed or took a branch that
+    /// discards the effects). The payload object of an enqueue downgraded by a
+    /// dedup hit is deleted, and without a commit every offloaded object is
+    /// deleted. Returns `results`.
     pub(crate) async fn finish_effects(
         &self,
         prepared: PreparedEffects,
-        staged: Option<StagedEffects>,
+        results: Option<Vec<EnqueueResult>>,
     ) -> Option<Vec<EnqueueResult>> {
-        let Some(staged) = staged else {
+        let Some(results) = results else {
             self.discard_prepared(&prepared.prepared_jobs).await;
             return None;
         };
-        let results = self.note_staged_effects(staged);
         for (prepared, result) in prepared.prepared_jobs.iter().zip(&results) {
             if matches!(result, EnqueueResult::AlreadyEnqueued(_)) {
                 self.payload_store.delete_for(&prepared.job).await;
             }
-        }
-        for (index, at_ms) in &prepared.expiry_entries {
-            index.written(*at_ms);
         }
         Some(results)
     }
@@ -288,26 +266,23 @@ impl QueueCore {
         })
     }
 
-    /// Add prepared effects to a caller-owned settlement transaction. Called
-    /// inside every iteration of the settlement's retry loop. A dedup hit
-    /// downgrades that enqueue to [`EnqueueResult::AlreadyEnqueued`] without
-    /// affecting the rest. After the transaction commits, the caller passes the
-    /// result to [`Self::finish_effects`].
+    /// Add prepared effects to a caller-owned settlement transaction, and
+    /// return one enqueue result per prepared enqueue, in order. Called inside
+    /// every iteration of the settlement's retry loop. A dedup hit downgrades
+    /// that enqueue to [`EnqueueResult::AlreadyEnqueued`] without affecting the
+    /// rest. After the settlement ends, the caller passes the results to
+    /// [`Self::finish_effects`].
     pub(crate) async fn stage_effects(
         &self,
         txn: &mut Txn,
         prepared: &PreparedEffects,
-    ) -> Result<StagedEffects> {
-        let mut staged = Vec::with_capacity(prepared.prepared_jobs.len());
+    ) -> Result<Vec<EnqueueResult>> {
         let mut results = Vec::with_capacity(prepared.prepared_jobs.len());
         for prepared_job in &prepared.prepared_jobs {
-            match self.stage_job_writes(txn, prepared_job).await? {
-                Ok(staged_job) => {
-                    results.push(EnqueueResult::New(staged_job.id.clone()));
-                    staged.push(staged_job);
-                }
-                Err(existing) => results.push(EnqueueResult::AlreadyEnqueued(existing)),
-            }
+            results.push(match self.stage_job_writes(txn, prepared_job).await? {
+                Ok(id) => EnqueueResult::New(id),
+                Err(existing) => EnqueueResult::AlreadyEnqueued(existing),
+            });
         }
         for (k, v) in &prepared.kv_writes {
             txn.put(user_scoped_key(k), v)?;
@@ -315,37 +290,22 @@ impl QueueCore {
         for k in &prepared.kv_deletes {
             txn.delete(user_scoped_key(k))?;
         }
-        Ok(StagedEffects {
-            results,
-            jobs: staged,
-        })
-    }
-
-    /// Count the staged jobs as enqueued after the commit, with one count per
-    /// queue. Returns their enqueue results.
-    fn note_staged_effects(&self, staged: StagedEffects) -> Vec<EnqueueResult> {
-        let mut by_queue: BTreeMap<&QueueName, u64> = BTreeMap::new();
-        for staged_job in &staged.jobs {
-            *by_queue.entry(&staged_job.queue).or_default() += 1;
-            debug!(queue = %staged_job.queue, job_id = %staged_job.id, "job enqueued");
+        for (index, at_ms) in &prepared.expiry_entries {
+            txn.note_expiry_entry(index, *at_ms);
         }
-        for (queue, enqueued) in by_queue {
-            crate::obs::enqueued(queue, enqueued);
-        }
-        staged.results
+        Ok(results)
     }
 
     /// Add one prepared job's writes (record, job index, dedup index, stats
-    /// delta) to a caller-owned transaction. Returns `Ok(Err(existing_id))` on
-    /// a dedup hit, in which case no writes were added and the caller decides
-    /// whether to roll back. The outer `Err` is reserved for real failures.
-    /// After the transaction commits, the caller must pass the staged value to
-    /// [`Self::note_staged_job`].
+    /// delta) to a caller-owned transaction and return the job's id. Returns
+    /// `Ok(Err(existing_id))` on a dedup hit, in which case no writes were
+    /// added and the caller decides whether to roll back. The outer `Err` is
+    /// reserved for real failures.
     pub(crate) async fn stage_job_writes(
         &self,
         txn: &mut Txn,
         prepared: &PreparedJob,
-    ) -> Result<std::result::Result<StagedJob, String>> {
+    ) -> Result<std::result::Result<String, String>> {
         let PreparedJob {
             job,
             id_override_used,
@@ -371,17 +331,8 @@ impl QueueCore {
             txn.put(dkey, job.id.as_bytes())?;
         }
         update_stats(txn, &job.queue, &[(job.status, 1)])?;
-
-        Ok(Ok(StagedJob {
-            id: job.id.clone(),
-            queue: job.queue.clone(),
-        }))
-    }
-
-    /// Count one staged job as enqueued after the commit.
-    pub(crate) fn note_staged_job(&self, staged: &StagedJob) {
-        crate::obs::enqueued(&staged.queue, 1);
-        debug!(queue = %staged.queue, job_id = %staged.id, "job enqueued");
+        txn.note_enqueued(job);
+        Ok(Ok(job.id.clone()))
     }
 }
 
