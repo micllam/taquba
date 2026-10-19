@@ -25,6 +25,7 @@ use crate::txn::ClaimEnd;
 use crate::txn::{Attempt, Durability, get_indexed_job, retry};
 use crate::view::QueueView;
 
+mod claim;
 mod enqueue;
 
 /// The per-queue configurations of an open queue: a default and the overrides,

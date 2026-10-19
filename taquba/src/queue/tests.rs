@@ -1,3 +1,5 @@
+use ulid::Ulid;
+
 use super::*;
 use crate::EnqueueRequest;
 use crate::expiry::{Expired, ExpiryIndex};
