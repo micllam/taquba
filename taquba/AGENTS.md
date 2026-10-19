@@ -37,7 +37,8 @@ Each rule identifies the code it applies to, whose docs describe the mechanism.
   `PermanentFailure`, a transient-to-permanent conversion in a runtime or a
   per-queue `DeadLetterHook`.
 - **Claim ends** (`txn.rs`). A new claim-ending path goes through
-  `txn::stage_claim_end` and `QueueCore::finish_claim_end`. `txn::retry` is the
-  one retry loop. Do not re-propose a body that borrows the transaction.
+  `Txn::stage_claim_end` and `QueueCore::finish_claim_end`. A new transaction
+  loop uses `QueueCore::retry`. Do not re-propose a body that borrows the
+  transaction.
 - **Spawned loops.** Do not hold a loop run as a Tokio task through a token and
   `JoinHandle` pair. Use `WorkerHandle`.

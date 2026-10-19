@@ -6,10 +6,10 @@ use tracing::debug;
 
 use crate::background::Periodic;
 use crate::error::Result;
-use crate::job::{JobRecord, JobStatus};
+use crate::job::JobRecord;
 use crate::keys::{KeyTag, parse_key_timestamp, tag_prefix};
 use crate::queue_core::QueueCore;
-use crate::txn::{Attempt, Durability, stage_to_pending};
+use crate::txn::{Attempt, Durability};
 
 pub(crate) struct Scheduler {
     core: Arc<QueueCore>,
@@ -87,8 +87,7 @@ impl QueueCore {
                     return Ok((txn, Attempt::Abort(None)));
                 };
                 let mut job = JobRecord::decode(scheduled_key_bytes, &raw)?;
-                txn.delete(scheduled_key_bytes)?;
-                stage_to_pending(&mut txn, &mut job, JobStatus::Scheduled)?;
+                txn.stage_to_pending(scheduled_key_bytes, &mut job)?;
                 Ok((txn, Attempt::Commit(Some(job))))
             })
             .await?;

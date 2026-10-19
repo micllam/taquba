@@ -8,7 +8,7 @@ use crate::error::Result;
 use crate::job::{JobRecord, JobStatus};
 use crate::queue::{CancelOutcome, EnqueueResult, WaitOutcome, WakeOutcome};
 use crate::queue_core::QueueCore;
-use crate::txn::{Attempt, Durability, stage_remove, stage_to_pending};
+use crate::txn::{Attempt, Durability};
 
 /// What the cancel transaction did.
 enum Cancelled {
@@ -77,7 +77,7 @@ impl QueueCore {
             |mut txn, current_key, mut job| async move {
                 let cancelled = match job.status {
                     JobStatus::Pending | JobStatus::Scheduled => {
-                        stage_remove(&txn, &current_key, &job)?;
+                        txn.stage_remove(&current_key, &job)?;
                         let results = self.stage_effects(&mut txn, prepared).await?;
                         Cancelled::Removed { job, results }
                     }
@@ -92,8 +92,7 @@ impl QueueCore {
                             return Ok((txn, Attempt::Abort(requested)));
                         }
                         job.cancel_requested = true;
-                        let value = job.stored_bytes()?;
-                        txn.put(&current_key, &value)?;
+                        txn.move_job(&current_key, &job)?;
                         Cancelled::Requested { job }
                     }
                     JobStatus::Done | JobStatus::Dead => {
@@ -125,10 +124,9 @@ impl QueueCore {
                     if job.status != JobStatus::Scheduled {
                         return Ok((txn, Attempt::Abort(Err(WakeOutcome::NotScheduled))));
                     }
-                    txn.delete(&current_key)?;
                     job.woken_at = Some(self.now_ms());
                     job.wake_payload = wake_payload.clone();
-                    stage_to_pending(&mut txn, &mut job, JobStatus::Scheduled)?;
+                    txn.stage_to_pending(&current_key, &mut job)?;
                     Ok((txn, Attempt::Commit(Ok(job))))
                 },
             )

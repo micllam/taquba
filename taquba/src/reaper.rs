@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use slatedb::IsolationLevel;
 use slatedb::config::ScanOptions;
 use tracing::{debug, warn};
 
@@ -14,7 +13,7 @@ use crate::job::{JobRecord, JobStatus};
 use crate::keys::{KeyTag, claimed_key, parse_key_timestamp, tag_prefix};
 use crate::lease_registry::DueLease;
 use crate::queue_core::QueueCore;
-use crate::txn::{Attempt, ClaimEnd, Commit, Durability, commit, stage_claim_end, stage_remove};
+use crate::txn::{Attempt, ClaimEnd, Commit, Durability};
 
 /// Target bytes fetched per object-store request by the recovery and retention
 /// scans.
@@ -165,9 +164,8 @@ impl QueueCore {
             };
 
             let mut job = JobRecord::decode(claimed_key_bytes, &raw)?;
-            txn.delete(claimed_key_bytes)?;
             let end = unsettled_claim_end(&job, AttemptOutcome::LeaseExpired, "lease expired");
-            stage_claim_end(&mut txn, &mut job, &end, self.now_ms())?;
+            txn.stage_claim_end(&mut job, &end, self.now_ms())?;
             Ok((txn, Attempt::Commit(Some((job, end)))))
         })
         .await?;
@@ -215,13 +213,12 @@ impl QueueCore {
             // claimed record it left in place. A storage error fails the open.
             self.retry(Durability::Deferred, |mut txn| async move {
                 let mut job = job.clone();
-                txn.delete(claimed_key(&job.queue, &job.id))?;
                 let end = unsettled_claim_end(
                     &job,
                     AttemptOutcome::Interrupted,
                     "claim interrupted by process exit",
                 );
-                stage_claim_end(&mut txn, &mut job, &end, self.now_ms())?;
+                txn.stage_claim_end(&mut job, &end, self.now_ms())?;
                 Ok((txn, Attempt::Commit(())))
             })
             .await?;
@@ -340,12 +337,12 @@ impl QueueCore {
     /// orphaned object, never a live record whose payload is gone. Returns
     /// `false` when a conflict left the record in place.
     async fn sweep_victim(&self, key: &[u8], job: &JobRecord) -> Result<bool> {
-        let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+        let mut txn = self.begin().await?;
         let existed = txn.get(key).await?.is_some();
         if existed {
-            stage_remove(&txn, key, job)?;
+            txn.stage_remove(key, job)?;
         }
-        match commit(txn, Durability::Deferred).await? {
+        match self.commit(txn, Durability::Deferred).await? {
             Commit::Committed => {}
             Commit::Conflict => return Ok(false),
         }

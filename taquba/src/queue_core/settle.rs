@@ -9,7 +9,7 @@ use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{Claim, JobRecord, JobStatus};
 use crate::queue::EnqueueResult;
 use crate::queue_core::QueueCore;
-use crate::txn::{Attempt, ClaimEnd, Durability, stage_claim_end, stage_to_pending, take_claim};
+use crate::txn::{Attempt, ClaimEnd, Durability, take_claim};
 
 impl QueueCore {
     /// The settlement of a claim. The effects are prepared once before the
@@ -36,7 +36,7 @@ impl QueueCore {
                 let mut job = take_claim(&txn, &self.lease_registry, queue, id, claim_id).await?;
                 let now = self.now_ms();
                 let end = end_for(&job, now);
-                stage_claim_end(&mut txn, &mut job, &end, now)?;
+                txn.stage_claim_end(&mut job, &end, now)?;
                 let staged = if end.is_terminal() {
                     Some(self.stage_effects(&mut txn, prepared).await?)
                 } else {
@@ -68,7 +68,6 @@ impl QueueCore {
                     if job.status != JobStatus::Dead {
                         return Err(Error::InvalidState);
                     }
-                    txn.delete(&current_key)?;
                     job.attempts = 0;
                     job.last_error = None;
                     job.claimed_at = None;
@@ -76,7 +75,7 @@ impl QueueCore {
                     // Revival clears any prior cancel request: the operator
                     // chose to start this job afresh.
                     job.cancel_requested = false;
-                    stage_to_pending(&mut txn, &mut job, JobStatus::Dead)?;
+                    txn.stage_to_pending(&current_key, &mut job)?;
                     // The history is kept across the revival. The marker
                     // separates entries recorded before it from the reset
                     // attempt counter.

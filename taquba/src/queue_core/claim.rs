@@ -14,7 +14,6 @@ use crate::job::{Claim, JobRecord, JobStatus};
 use crate::keys::{QueueName, dedup_index_key, pending_prefix};
 use crate::queue::ClaimOutcome;
 use crate::queue_core::QueueCore;
-use crate::stats::update_stats;
 use crate::txn::{Attempt, Commit, Durability};
 
 /// Generate a claim id. A ULID's low 64 bits fall inside its 80-bit random
@@ -163,8 +162,7 @@ impl QueueCore {
                 // to a *different* job, which corrupts the dedup invariant.
                 let dedup_key_to_release = job.dedup_key.take();
                 let claim_id = new_claim_id();
-                txn.delete(&kv.key)?;
-                txn.put_job(&job)?;
+                txn.move_job(&kv.key, &job)?;
                 // A cancellation requested during an earlier claim of the job
                 // is persisted on the record and fires this claim's token
                 // immediately.
@@ -189,12 +187,6 @@ impl QueueCore {
                 }
                 jobs.push(Claim::new(job, claim_id, cancel));
             }
-            let count = jobs.len() as i64;
-            update_stats(
-                &txn,
-                queue,
-                &[(JobStatus::Pending, -count), (JobStatus::Claimed, count)],
-            )?;
 
             // Claims commit without awaiting WAL durability. The claimed state
             // only matters across a restart, where either version of it
@@ -244,8 +236,7 @@ impl QueueCore {
                 Durability::Deferred,
                 || Ok(Err(ClaimOutcome::NotFound)),
                 |mut txn, current_key, mut job| async move {
-                    let from = job.status;
-                    if !matches!(from, JobStatus::Pending | JobStatus::Scheduled) {
+                    if !matches!(job.status, JobStatus::Pending | JobStatus::Scheduled) {
                         return Ok((txn, Attempt::Abort(Err(ClaimOutcome::NotClaimable))));
                     }
                     let now = self.now_ms();
@@ -257,8 +248,7 @@ impl QueueCore {
                     // cannot release another job's index entry.
                     let dedup_key_to_release = job.dedup_key.take();
                     let claim_id = new_claim_id();
-                    txn.delete(&current_key)?;
-                    txn.put_job(&job)?;
+                    txn.move_job(&current_key, &job)?;
                     let cancel = tokio_util::sync::CancellationToken::new();
                     if job.cancel_requested {
                         cancel.cancel();
@@ -276,7 +266,6 @@ impl QueueCore {
                     if let Some(dk) = dedup_key_to_release.as_deref() {
                         txn.delete(dedup_index_key(&job.queue, dk))?;
                     }
-                    update_stats(&txn, &job.queue, &[(from, -1), (JobStatus::Claimed, 1)])?;
                     Ok((txn, Attempt::Commit(Ok(Claim::new(job, claim_id, cancel)))))
                 },
             )

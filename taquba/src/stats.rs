@@ -86,24 +86,20 @@ fn read_i64_le(bytes: &[u8]) -> std::result::Result<i64, ()> {
     bytes.try_into().map(i64::from_le_bytes).map_err(|_| ())
 }
 
-/// Apply stat deltas for a single operation within an existing transaction.
+/// Merge `delta` into the counter of `status` of `queue` within `txn`.
 pub(crate) fn update_stats(
     txn: &DbTransaction,
     queue: &QueueName,
-    deltas: &[(JobStatus, i64)],
+    status: JobStatus,
+    delta: i64,
 ) -> Result<()> {
-    for (status, delta) in deltas {
-        if *delta != 0 {
-            let key = stats_key(queue, metric_name(*status));
-            txn.merge(&key, (*delta).to_le_bytes())?;
-            // Counter merges are commutative, so two transactions merging the
-            // same stats key do not actually conflict. Without this, every
-            // job-state transition on a queue contends on the same handful of
-            // stats keys and transaction-conflict retries dominate claim
-            // latency under concurrency.
-            txn.unmark_write([key.as_slice()])?;
-        }
-    }
+    let key = stats_key(queue, metric_name(status));
+    txn.merge(&key, delta.to_le_bytes())?;
+    // Counter merges are commutative, so two transactions merging the same
+    // stats key do not actually conflict. Without this, every job-state
+    // transition on a queue contends on the same handful of stats keys and
+    // transaction-conflict retries dominate claim latency under concurrency.
+    txn.unmark_write([key.as_slice()])?;
     Ok(())
 }
 

@@ -1,5 +1,5 @@
 //! Transaction helpers shared by the queue, reaper and scheduler.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::ops::Deref;
 
@@ -12,7 +12,9 @@ use crate::error::{Error, Result};
 use crate::expiry::ExpiryIndex;
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{JobRecord, JobStatus};
-use crate::keys::{QueueName, attempt_history_key, claimed_key, dedup_index_key, job_index_key};
+use crate::keys::{
+    KeyTag, QueueName, attempt_history_key, claimed_key, dedup_index_key, job_index_key,
+};
 use crate::lease_registry::LeaseRegistry;
 use crate::queue_core::QueueCore;
 use crate::stats::update_stats;
@@ -21,9 +23,14 @@ use crate::stats::update_stats;
 /// writes and every job it enqueues, the process state that the commit updates.
 /// [`QueueCore::commit`] applies the notes once the transaction commits. A
 /// transaction that is dropped, rolled back or in conflict discards them.
+///
+/// The transaction counts the state change of every job it inserts, moves or
+/// removes. [`QueueCore::commit`] writes the counters in the commit.
 pub(crate) struct Txn {
     txn: DbTransaction,
     notes: CommitNotes,
+    /// The change of each counter, by queue and state.
+    stats: HashMap<(QueueName, JobStatus), i64>,
 }
 
 /// The process state that the writes of a [`Txn`] update.
@@ -51,13 +58,47 @@ impl Deref for Txn {
 }
 
 impl Txn {
-    /// Write `job` at its [`JobRecord::stored_key`], repoint its index entry to
-    /// that key and note the record for the commit.
-    pub(crate) fn put_job(&mut self, job: &JobRecord) -> Result<()> {
+    /// Write the new job `job` and its index entry, and note it for the enqueue
+    /// counter.
+    pub(crate) fn insert_job(&mut self, job: &JobRecord) -> Result<()> {
+        self.put_job(&job.stored_key(), job)?;
+        self.count_move(&job.queue, None, Some(job.status));
+        self.notes
+            .enqueued
+            .push((job.queue.clone(), job.id.clone()));
+        Ok(())
+    }
+
+    /// Move `job` from its record at `from` to its record at
+    /// [`JobRecord::stored_key`], and repoint its index entry to that key.
+    pub(crate) fn move_job(&mut self, from: &[u8], job: &JobRecord) -> Result<()> {
         let key = job.stored_key();
-        self.txn.put(&key, job.stored_bytes()?)?;
-        self.txn.put(job_index_key(&job.id), &key)?;
-        self.note_written(job, &key);
+        if from == key.as_slice() {
+            // The index entry already points to the key.
+            self.txn.put(&key, job.stored_bytes()?)?;
+            self.note_written(job, &key);
+            return Ok(());
+        }
+        self.txn.delete(from)?;
+        self.put_job(&key, job)?;
+        self.count_move(&job.queue, Some(key_status(from)), Some(job.status));
+        Ok(())
+    }
+
+    /// Stage the removal of a job's last record, stored at `key`: the record,
+    /// its job index entry, its attempt history and, when the job has a dedup
+    /// key, the dedup index entry. A `job` in the done state counts a
+    /// completion. Every path that removes a job's last record stages it here,
+    /// so the history shares the record's lifetime by construction.
+    pub(crate) fn stage_remove(&mut self, key: &[u8], job: &JobRecord) -> Result<()> {
+        self.txn.delete(key)?;
+        self.txn.delete(job_index_key(&job.id))?;
+        self.txn.delete(attempt_history_key(&job.id))?;
+        if let Some(dedup_key) = &job.dedup_key {
+            self.txn.delete(dedup_index_key(&job.queue, dedup_key))?;
+        }
+        let completed = (job.status == JobStatus::Done).then_some(JobStatus::Done);
+        self.count_move(&job.queue, Some(key_status(key)), completed);
         Ok(())
     }
 
@@ -66,11 +107,30 @@ impl Txn {
         self.notes.expiry.push((index.clone(), at_ms));
     }
 
-    /// Note the new job `job`, written in this transaction.
-    pub(crate) fn note_enqueued(&mut self, job: &JobRecord) {
-        self.notes
-            .enqueued
-            .push((job.queue.clone(), job.id.clone()));
+    /// Write `job` at `key`, repoint its index entry to that key and note the
+    /// record for the commit.
+    fn put_job(&mut self, key: &[u8], job: &JobRecord) -> Result<()> {
+        self.txn.put(key, job.stored_bytes()?)?;
+        self.txn.put(job_index_key(&job.id), key)?;
+        self.note_written(job, key);
+        Ok(())
+    }
+
+    /// Count the move of a job of `queue` from the state `from` to the state
+    /// `to`, where `None` is the absence of a record. The `Done` counter counts
+    /// completions: a job that enters the done state increments it with or
+    /// without a record. A job that leaves the done state does not decrement
+    /// it.
+    fn count_move(&mut self, queue: &QueueName, from: Option<JobStatus>, to: Option<JobStatus>) {
+        if from == to {
+            return;
+        }
+        if let Some(from) = from.filter(|from| *from != JobStatus::Done) {
+            *self.stats.entry((queue.clone(), from)).or_default() -= 1;
+        }
+        if let Some(to) = to {
+            *self.stats.entry((queue.clone(), to)).or_default() += 1;
+        }
     }
 
     /// Note the record `job`, written at `key`, for the commit.
@@ -97,6 +157,13 @@ impl Txn {
             JobStatus::Claimed | JobStatus::Dead => {}
         }
     }
+}
+
+/// The state of the job record stored at `key`.
+fn key_status(key: &[u8]) -> JobStatus {
+    KeyTag::of(key)
+        .and_then(KeyTag::job_status)
+        .expect("a job record key")
 }
 
 /// Resolve a job id through its index entry within `txn`: returns the index
@@ -173,10 +240,9 @@ pub(crate) enum Commit {
     Conflict,
 }
 
-/// Commit `txn`, a store transaction without job record writes. A transaction
-/// conflict is reported as [`Commit::Conflict`], and a storage failure is
-/// returned as an error.
-pub(crate) async fn commit(txn: DbTransaction, durability: Durability) -> Result<Commit> {
+/// Commit `txn`. A transaction conflict is reported as [`Commit::Conflict`],
+/// and a storage failure is returned as an error.
+async fn commit(txn: DbTransaction, durability: Durability) -> Result<Commit> {
     match txn.commit().await {
         Ok(handle) => {
             if let (Durability::Awaited, Some(handle)) = (durability, handle) {
@@ -205,12 +271,19 @@ impl QueueCore {
         Ok(Txn {
             txn: self.db.begin(IsolationLevel::Snapshot).await?,
             notes: CommitNotes::default(),
+            stats: HashMap::new(),
         })
     }
 
-    /// Commit `txn` as [`commit`] does, then apply its notes when it committed.
+    /// Write the counters of `txn` and commit it as [`commit`] does, then apply
+    /// its notes when it committed.
     pub(crate) async fn commit(&self, txn: Txn, durability: Durability) -> Result<Commit> {
-        let Txn { txn, notes } = txn;
+        let Txn { txn, notes, stats } = txn;
+        for ((queue, status), delta) in &stats {
+            if *delta != 0 {
+                update_stats(&txn, queue, *status, *delta)?;
+            }
+        }
         let outcome = commit(txn, durability).await?;
         if outcome == Commit::Committed {
             for (queue, (min_key, count)) in &notes.pending {
@@ -264,52 +337,6 @@ impl QueueCore {
     }
 }
 
-/// Stage the transition of a claimed job to the dead-letter set: the record is
-/// rewritten at its dead key with `error` as its last error, a `DeadLettered`
-/// attempt is appended and the stats are adjusted. The caller stages the
-/// deletion of the claimed key before the call.
-fn stage_dead_letter(txn: &mut Txn, job: &mut JobRecord, now: u64, error: &str) -> Result<()> {
-    let claimed_at = job.claimed_at.take();
-    job.status = JobStatus::Dead;
-    job.last_error = Some(error.to_string());
-    job.failed_at = Some(now);
-    append_attempt(
-        txn,
-        &job.id,
-        &JobAttempt {
-            attempt: job.attempts,
-            claimed_at,
-            recorded_at: now,
-            outcome: AttemptOutcome::DeadLettered,
-            error: Some(error.to_string()),
-        },
-    )?;
-    txn.put_job(job)?;
-    update_stats(
-        txn,
-        &job.queue,
-        &[(JobStatus::Claimed, -1), (JobStatus::Dead, 1)],
-    )?;
-    warn!(
-        queue = %job.queue,
-        job_id = %job.id,
-        attempts = job.attempts,
-        error,
-        "job dead-lettered"
-    );
-    Ok(())
-}
-
-/// Stage the move of a job into the pending key space from the state `from`,
-/// whose record the caller already staged for deletion.
-pub(crate) fn stage_to_pending(txn: &mut Txn, job: &mut JobRecord, from: JobStatus) -> Result<()> {
-    job.status = JobStatus::Pending;
-    job.run_at = None;
-    txn.put_job(job)?;
-    update_stats(txn, &job.queue, &[(JobStatus::Pending, 1), (from, -1)])?;
-    Ok(())
-}
-
 /// The transition that ends a claim, chosen by the settling path from the
 /// stored record read inside its transaction.
 pub(crate) enum ClaimEnd<'a> {
@@ -336,41 +363,32 @@ impl ClaimEnd<'_> {
     }
 }
 
-/// Stage the removal of a job's last record, stored at `current_key`: the
-/// record, its job index entry, its attempt history and, when the job has a
-/// dedup key, the dedup index entry. The counter of the job's status is
-/// decremented, except the `Done` counter, which counts completions and is
-/// cumulative. Every path that removes a job's last record stages it here, so
-/// the history shares the record's lifetime by construction.
-pub(crate) fn stage_remove(txn: &DbTransaction, current_key: &[u8], job: &JobRecord) -> Result<()> {
-    txn.delete(current_key)?;
-    txn.delete(job_index_key(&job.id))?;
-    txn.delete(attempt_history_key(&job.id))?;
-    if let Some(dedup_key) = &job.dedup_key {
-        txn.delete(dedup_index_key(&job.queue, dedup_key))?;
+impl Txn {
+    /// Move `job` from its record at `from` into the pending key space.
+    pub(crate) fn stage_to_pending(&mut self, from: &[u8], job: &mut JobRecord) -> Result<()> {
+        job.status = JobStatus::Pending;
+        job.run_at = None;
+        self.move_job(from, job)
     }
-    if job.status != JobStatus::Done {
-        update_stats(txn, &job.queue, &[(job.status, -1)])?;
-    }
-    Ok(())
-}
 
-/// Stage the transition that ends a claim. Before the call, the caller reads
-/// the stored record and stages the deletion of its claimed key. On return
-/// `job` is the record as written.
-pub(crate) fn stage_claim_end(
-    txn: &mut Txn,
-    job: &mut JobRecord,
-    end: &ClaimEnd<'_>,
-    now: u64,
-) -> Result<()> {
-    match *end {
-        ClaimEnd::Done { keep } => {
-            if keep {
+    /// Stage the transition that ends the claim of `job`, the stored claimed
+    /// record. On return `job` is the record as written.
+    pub(crate) fn stage_claim_end(
+        &mut self,
+        job: &mut JobRecord,
+        end: &ClaimEnd<'_>,
+        now: u64,
+    ) -> Result<()> {
+        let from = claimed_key(&job.queue, &job.id);
+        match *end {
+            ClaimEnd::Done { keep } => {
                 job.status = JobStatus::Done;
                 job.completed_at = Some(now);
+                if !keep {
+                    return self.stage_remove(&from, job);
+                }
                 append_attempt(
-                    txn,
+                    self,
                     &job.id,
                     &JobAttempt {
                         attempt: job.attempts,
@@ -380,62 +398,84 @@ pub(crate) fn stage_claim_end(
                         error: None,
                     },
                 )?;
-                txn.put_job(job)?;
-                update_stats(txn, &job.queue, &[(JobStatus::Claimed, -1)])?;
-            } else {
-                // The removal stages the claimed key's deletion a second time.
-                // The write set records the key once.
-                stage_remove(txn, &claimed_key(&job.queue, &job.id), job)?;
-                job.status = JobStatus::Done;
-                job.completed_at = Some(now);
+                self.move_job(&from, job)
             }
-            update_stats(txn, &job.queue, &[(JobStatus::Done, 1)])?;
-            Ok(())
-        }
-        ClaimEnd::Retry {
-            run_at,
-            outcome,
-            error,
-        } => {
-            let claimed_at = job.claimed_at.take();
-            if let Some(error) = error {
-                job.last_error = Some(error.to_string());
-            }
-            append_attempt(
-                txn,
-                &job.id,
-                &JobAttempt {
-                    attempt: job.attempts,
-                    claimed_at,
-                    recorded_at: now,
-                    outcome,
-                    error: error.map(str::to_string),
-                },
-            )?;
-            match run_at {
-                None => stage_to_pending(txn, job, JobStatus::Claimed)?,
-                Some(run_at) => {
-                    job.status = JobStatus::Scheduled;
-                    job.run_at = Some(run_at);
-                    txn.put_job(job)?;
-                    update_stats(
-                        txn,
-                        &job.queue,
-                        &[(JobStatus::Claimed, -1), (JobStatus::Scheduled, 1)],
-                    )?;
-                }
-            }
-            debug!(
-                queue = %job.queue,
-                job_id = %job.id,
-                attempts = job.attempts,
-                outcome = ?outcome,
+            ClaimEnd::Retry {
                 run_at,
-                "job returned to the queue"
-            );
-            Ok(())
+                outcome,
+                error,
+            } => {
+                let claimed_at = job.claimed_at.take();
+                if let Some(error) = error {
+                    job.last_error = Some(error.to_string());
+                }
+                append_attempt(
+                    self,
+                    &job.id,
+                    &JobAttempt {
+                        attempt: job.attempts,
+                        claimed_at,
+                        recorded_at: now,
+                        outcome,
+                        error: error.map(str::to_string),
+                    },
+                )?;
+                match run_at {
+                    None => self.stage_to_pending(&from, job)?,
+                    Some(run_at) => {
+                        job.status = JobStatus::Scheduled;
+                        job.run_at = Some(run_at);
+                        self.move_job(&from, job)?;
+                    }
+                }
+                debug!(
+                    queue = %job.queue,
+                    job_id = %job.id,
+                    attempts = job.attempts,
+                    outcome = ?outcome,
+                    run_at,
+                    "job returned to the queue"
+                );
+                Ok(())
+            }
+            ClaimEnd::Dead { error } => self.stage_dead_letter(&from, job, now, error),
         }
-        ClaimEnd::Dead { error } => stage_dead_letter(txn, job, now, error),
+    }
+
+    /// Move the claimed job `job` from its record at `from` to the dead-letter
+    /// set, with `error` as its last error, and append a `DeadLettered`
+    /// attempt.
+    fn stage_dead_letter(
+        &mut self,
+        from: &[u8],
+        job: &mut JobRecord,
+        now: u64,
+        error: &str,
+    ) -> Result<()> {
+        let claimed_at = job.claimed_at.take();
+        job.status = JobStatus::Dead;
+        job.last_error = Some(error.to_string());
+        job.failed_at = Some(now);
+        append_attempt(
+            self,
+            &job.id,
+            &JobAttempt {
+                attempt: job.attempts,
+                claimed_at,
+                recorded_at: now,
+                outcome: AttemptOutcome::DeadLettered,
+                error: Some(error.to_string()),
+            },
+        )?;
+        self.move_job(from, job)?;
+        warn!(
+            queue = %job.queue,
+            job_id = %job.id,
+            attempts = job.attempts,
+            error,
+            "job dead-lettered"
+        );
+        Ok(())
     }
 }
 
@@ -459,12 +499,12 @@ mod tests {
         let job = JobRecord::new_pending("j".into(), qn("work"), b"p".to_vec(), 3, 0, 1);
 
         let mut txn = core.begin().await.unwrap();
-        txn.put_job(&job).unwrap();
+        txn.insert_job(&job).unwrap();
         drop(txn);
         assert!(core.claim_cursor.known_empty("work"));
 
         let mut txn = core.begin().await.unwrap();
-        txn.put_job(&job).unwrap();
+        txn.insert_job(&job).unwrap();
         let outcome = core.commit(txn, Durability::Awaited).await.unwrap();
         assert_eq!(outcome, Commit::Committed);
         assert!(!core.claim_cursor.known_empty("work"));

@@ -15,7 +15,6 @@ use crate::kv::validate_kv_value_size;
 use crate::options::EnqueueOptions;
 use crate::queue::{EnqueueResult, validate_id_override};
 use crate::queue_core::QueueCore;
-use crate::stats::update_stats;
 use crate::txn::Txn;
 
 /// One enqueue contained in [`SettlementEffects`].
@@ -326,12 +325,10 @@ impl QueueCore {
             return Err(Error::DuplicateJobId { id: job.id.clone() });
         }
 
-        txn.put_job(job)?;
+        txn.insert_job(job)?;
         if let Some(ref dkey) = dkey {
             txn.put(dkey, job.id.as_bytes())?;
         }
-        update_stats(txn, &job.queue, &[(job.status, 1)])?;
-        txn.note_enqueued(job);
         Ok(Ok(job.id.clone()))
     }
 }

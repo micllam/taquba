@@ -163,7 +163,7 @@ the only property a claim must preserve.
 
 ## Settlement
 
-A settlement ends the claim and writes the outcome. `txn::stage_claim_end`
+A settlement ends the claim and writes the outcome. `Txn::stage_claim_end`
 writes the record at the done, scheduled or dead key, as the outcome requires.
 
 The commit waits for the WAL flush, because a settlement lost with an unflushed
