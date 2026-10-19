@@ -470,7 +470,7 @@ pub(crate) struct RuntimeInner<R, H> {
 /// The control half of a runtime: the queue, the stores and the settings, with
 /// every operation that reads or settles run state without invoking the runner
 /// or the hook. It is not generic over the runner and hook types, so the
-/// worker, [`WorkflowRuntime`] and [`RunGroup`](crate::RunGroup) share it.
+/// worker, [`WorkflowRuntime`] and [`RunGroup`] share it.
 pub(crate) struct RuntimeCore {
     pub(crate) queue: Arc<Queue>,
     pub(crate) view: WorkflowView,
@@ -613,9 +613,8 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// failed. The request reaches a run after a restart and from any runtime
     /// over the same queue.
     ///
-    /// The run terminates as
-    /// [`TerminalStatus::Cancelled`](crate::TerminalStatus::Cancelled) and its
-    /// notification job is enqueued for the terminal hook:
+    /// The run terminates as [`TerminalStatus::Cancelled`] and its notification
+    /// job is enqueued for the terminal hook:
     ///
     /// - **Pending / scheduled step**: the queued step job is removed
     ///   and the notification enqueued in one transaction before this

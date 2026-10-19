@@ -93,8 +93,7 @@ impl<J: Job> JobHandle<J> {
 
     /// True if the call that produced this handle submitted a new job, and
     /// false if the call matched an in-flight or completed submission with the
-    /// same [`Job::idempotency_key`](crate::jobs::Job::idempotency_key) and
-    /// payload.
+    /// same [`Job::idempotency_key`] and payload.
     ///
     /// For submissions without an `idempotency_key`, the value is always
     /// `true`. The value reflects the call that returned this handle and does

@@ -6,9 +6,8 @@ use tracing::debug;
 
 use crate::{Error, HEADER_METHOD, HEADER_TIMEOUT_MS, HEADER_URL, HTTP_HEADER_PREFIX};
 
-/// Upper bound on a delivery when neither the job's
-/// [`HEADER_TIMEOUT_MS`](crate::HEADER_TIMEOUT_MS) header nor
-/// [`WebhookWorker::with_default_timeout`] sets one.
+/// Upper bound on a delivery when neither the job's [`HEADER_TIMEOUT_MS`]
+/// header nor [`WebhookWorker::with_default_timeout`] sets one.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// HTTP-based webhook delivery worker. Implements [`taquba::Worker`] so it
@@ -19,12 +18,12 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// [`reqwest::Client`]) and chain the optional builder methods.
 ///
 /// Every delivery is bounded: the request timeout is the job's
-/// [`HEADER_TIMEOUT_MS`](crate::HEADER_TIMEOUT_MS) header when present,
-/// otherwise the worker's default ([`DEFAULT_TIMEOUT`] unless overridden with
-/// [`Self::with_default_timeout`]). The timeout is applied per request and
-/// takes precedence over a timeout configured on the [`reqwest::Client`].
-/// Before sending, the worker extends the job's lease to cover the timeout, so
-/// a slow receiver does not cause the job to be re-queued mid-delivery.
+/// [`HEADER_TIMEOUT_MS`] header when present, otherwise the worker's default
+/// ([`DEFAULT_TIMEOUT`] unless overridden with [`Self::with_default_timeout`]).
+/// The timeout is applied per request and takes precedence over a timeout
+/// configured on the [`reqwest::Client`]. Before sending, the worker extends
+/// the job's lease to cover the timeout, so a slow receiver does not cause the
+/// job to be re-queued mid-delivery.
 pub struct WebhookWorker {
     client: reqwest::Client,
     delivery_id_header: Option<String>,
@@ -47,8 +46,7 @@ impl WebhookWorker {
     }
 
     /// Override the request timeout applied to jobs that declare no
-    /// [`HEADER_TIMEOUT_MS`](crate::HEADER_TIMEOUT_MS) header. Defaults to
-    /// [`DEFAULT_TIMEOUT`].
+    /// [`HEADER_TIMEOUT_MS`] header. Defaults to [`DEFAULT_TIMEOUT`].
     pub fn with_default_timeout(mut self, timeout: Duration) -> Self {
         self.default_timeout = timeout;
         self

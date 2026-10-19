@@ -117,7 +117,7 @@ impl SettlementEffects {
     }
 }
 
-/// A job record prepared by [`Queue::prepare_job_record`], paired with its
+/// A job record prepared by [`QueueCore::prepare_job_record`], paired with its
 /// primary key, awaiting staging into a transaction.
 pub(crate) struct PreparedJob {
     pub(crate) job: JobRecord,
@@ -125,8 +125,9 @@ pub(crate) struct PreparedJob {
     pub(crate) id_override_used: bool,
 }
 
-/// [`SettlementEffects`] validated and prepared by [`Queue::prepare_effects`],
-/// awaiting staging into a settlement transaction.
+/// [`SettlementEffects`] validated and prepared by
+/// [`QueueCore::prepare_effects`], awaiting staging into a settlement
+/// transaction.
 #[derive(Default)]
 pub(crate) struct PreparedEffects {
     pub(crate) prepared_jobs: Vec<PreparedJob>,
@@ -136,8 +137,8 @@ pub(crate) struct PreparedEffects {
     pub(crate) expiry_entries: Vec<(ExpiryIndex, u64)>,
 }
 
-/// Effects staged into a settlement transaction by [`Queue::stage_effects`],
-/// retained for the work that follows the commit.
+/// Effects staged into a settlement transaction by
+/// [`QueueCore::stage_effects`], retained for the work that follows the commit.
 pub(crate) struct StagedEffects {
     /// One result per prepared enqueue, in order.
     pub(crate) results: Vec<EnqueueResult>,
@@ -157,8 +158,8 @@ struct QueueInserts<'a> {
     min_pending_key: Option<&'a [u8]>,
 }
 
-/// Identity of a job staged by [`Queue::stage_job_writes`], retained for the
-/// cursor note and the counter that follow the commit.
+/// Identity of a job staged by [`QueueCore::stage_job_writes`], retained for
+/// the cursor note and the counter that follow the commit.
 pub(crate) struct StagedJob {
     pub(crate) id: String,
     pub(crate) queue: QueueName,

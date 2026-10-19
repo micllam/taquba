@@ -162,20 +162,19 @@ impl Default for ReaderOptions {
 /// writer process, so the reader does not offer a lease view, and a claimed
 /// record can belong to a process that no longer runs.
 ///
-/// [`Error::PayloadMissing`](crate::Error::PayloadMissing) from a reader can be
-/// transient: a job removal deletes the payload object after its record, so a
-/// reader whose view still contains the record can find the object gone. The
-/// condition clears once the view advances past the removal, bounded by the
-/// reader's lag.
+/// [`Error::PayloadMissing`] from a reader can be transient: a job removal
+/// deletes the payload object after its record, so a reader whose view still
+/// contains the record can find the object gone. The condition clears once the
+/// view advances past the removal, bounded by the reader's lag.
 ///
 /// # Compatibility and failure modes
 ///
 /// Reader and writer must run the same taquba minor version: the on-disk layout
 /// can change between minors, and the store does not record a layout version.
 /// Opening a reader against a path that a writer never created fails with
-/// [`Error::StoreNotInitialized`](crate::Error::StoreNotInitialized). A health
-/// check racing the first deployment must expect that error. A path with an
-/// unreadable manifest fails with [`Error::Storage`](crate::Error::Storage).
+/// [`Error::StoreNotInitialized`]. A health check racing the first deployment
+/// must expect that error. A path with an unreadable manifest fails with
+/// [`Error::Storage`].
 ///
 /// # Observable outcomes
 ///
