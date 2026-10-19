@@ -9,6 +9,9 @@ readme = "README.md"
 # Internal benchmarking crate; never published.
 publish = false
 
+[lints]
+workspace = true
+
 [features]
 # Forward the cloud backends so STORE_URL can address them, e.g.
 # `STORE_URL=s3://... cargo bench -p taquba-bencher --features aws ...`.

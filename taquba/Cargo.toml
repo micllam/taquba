@@ -10,6 +10,9 @@ readme = "README.md"
 keywords = ["queue", "task", "worker", "slatedb"]
 exclude = ["AGENTS.md", "CLAUDE.md"]
 
+[lints]
+workspace = true
+
 [features]
 # No backend is enabled by default; the in-memory and local-disk stores work
 # without any feature.

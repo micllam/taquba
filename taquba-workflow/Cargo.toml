@@ -10,6 +10,9 @@ readme = "README.md"
 keywords = ["queue", "workflow", "agent", "durable", "taquba"]
 exclude = ["AGENTS.md", "CLAUDE.md"]
 
+[lints]
+workspace = true
+
 [features]
 default = []
 # Enables the WebhookTerminalHook helper that fires HTTP terminal-state

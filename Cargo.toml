@@ -13,6 +13,9 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/micllam/taquba"
 
+[workspace.lints.clippy]
+mod_module_files = "warn"
+
 [workspace.dependencies]
 taquba = { path = "taquba", version = "0.15.0" }
 taquba-webhooks = { path = "taquba-webhooks", version = "0.11.0" }
