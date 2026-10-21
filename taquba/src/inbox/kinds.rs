@@ -2,11 +2,11 @@
 
 use serde_json::json;
 
+use crate::effects::EnqueueRequest;
 use crate::error::{Error, Result};
 use crate::inbox::entry::{CancelEntry, EnqueueEntry, InboxKind, SignalEntry};
 use crate::inbox::record::{Applied, InboxOutcome, InboxRecordHandle};
 use crate::inbox::{InboxEntry, InboxState};
-use crate::options::EnqueueOptions;
 use crate::queue::{CancelOutcome, EnqueueResult};
 use crate::queue_core::QueueCore;
 use crate::queue_core::signal::stage_signal;
@@ -83,22 +83,15 @@ impl QueueCore {
         if !inbox.allows(&entry.queue) {
             return Ok(outside_allow_list(&entry.queue));
         }
-        let opts = EnqueueOptions {
-            max_attempts: entry.max_attempts,
-            priority: entry.priority,
-            run_at: entry
-                .run_at
-                .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)),
-            dedup_key: entry.dedup_key,
-            headers: entry.headers,
-            id_override: entry.job_id,
-            signal_key: None,
+        let request = EnqueueRequest::from(entry);
+        let prepared = match rejected_or_failed(self.prepare_job_record(
+            &request.queue,
+            request.payload,
+            request.options,
+        ))? {
+            Ok(prepared) => prepared,
+            Err(rejected) => return Ok(rejected),
         };
-        let prepared =
-            match rejected_or_failed(self.prepare_job_record(&entry.queue, entry.payload, opts))? {
-                Ok(prepared) => prepared,
-                Err(rejected) => return Ok(rejected),
-            };
         let outcome = json!({ "job_id": prepared.job.id, "new": true });
         let effects = self.prepare_effects(record.effects(outcome)).await?;
         match rejected_or_failed(self.write_job(prepared, effects).await)? {

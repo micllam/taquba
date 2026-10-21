@@ -2,10 +2,13 @@
 //! and the validation of the kind and id segments of an entry's path.
 
 use std::collections::HashMap;
+use std::time::{Duration, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use crate::effects::EnqueueRequest;
 use crate::error::{Error, Result};
+use crate::options::EnqueueOptions;
 
 /// Maximum byte length of an inbox entry id and of a kind name.
 pub const MAX_INBOX_ID_LEN: usize = 64;
@@ -69,6 +72,9 @@ pub struct EnqueueEntry {
     /// [`EnqueueOptions::id_override`](crate::EnqueueOptions::id_override).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_id: Option<String>,
+    /// [`EnqueueOptions::signal_key`](crate::EnqueueOptions::signal_key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_key: Option<String>,
 }
 
 impl EnqueueEntry {
@@ -78,6 +84,47 @@ impl EnqueueEntry {
             queue: queue.into(),
             payload: payload.into(),
             ..Self::default()
+        }
+    }
+}
+
+/// The entry of `request`. A `run_at` before the Unix epoch becomes 0.
+impl From<EnqueueRequest> for EnqueueEntry {
+    fn from(request: EnqueueRequest) -> Self {
+        let options = request.options;
+        Self {
+            queue: request.queue,
+            payload: request.payload,
+            headers: options.headers,
+            run_at: options.run_at.map(|at| {
+                at.duration_since(UNIX_EPOCH)
+                    .map_or(0, |since| since.as_millis() as u64)
+            }),
+            priority: options.priority,
+            max_attempts: options.max_attempts,
+            dedup_key: options.dedup_key,
+            job_id: options.id_override,
+            signal_key: options.signal_key,
+        }
+    }
+}
+
+impl From<EnqueueEntry> for EnqueueRequest {
+    fn from(entry: EnqueueEntry) -> Self {
+        Self {
+            queue: entry.queue,
+            payload: entry.payload,
+            options: EnqueueOptions {
+                max_attempts: entry.max_attempts,
+                priority: entry.priority,
+                run_at: entry
+                    .run_at
+                    .map(|ms| UNIX_EPOCH + Duration::from_millis(ms)),
+                dedup_key: entry.dedup_key,
+                headers: entry.headers,
+                id_override: entry.job_id,
+                signal_key: entry.signal_key,
+            },
         }
     }
 }
@@ -206,5 +253,29 @@ mod tests {
         let decoded: SignalEntry = serde_json::from_value(body).unwrap();
         assert_eq!(decoded.payload, vec![0, 255, 10]);
         assert!(serde_json::from_str::<SignalEntry>(r#"{"key":"k","payload":"@@"}"#).is_err());
+    }
+
+    #[test]
+    fn an_enqueue_request_converts_to_an_entry_and_back_unchanged() {
+        let request = EnqueueRequest {
+            queue: "work".to_string(),
+            payload: b"p".to_vec(),
+            options: EnqueueOptions {
+                max_attempts: Some(3),
+                priority: Some(1),
+                run_at: Some(UNIX_EPOCH + Duration::from_millis(1_700_000_000_123)),
+                dedup_key: Some("d".to_string()),
+                headers: HashMap::from([("h".to_string(), "v".to_string())]),
+                id_override: Some("j".to_string()),
+                signal_key: Some("k".to_string()),
+            },
+        };
+        let back = EnqueueRequest::from(EnqueueEntry::from(request.clone()));
+        assert_eq!(back.queue, request.queue);
+        assert_eq!(back.payload, request.payload);
+        assert_eq!(
+            format!("{:?}", back.options),
+            format!("{:?}", request.options)
+        );
     }
 }
