@@ -15,6 +15,7 @@ use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
 use crate::completion::CompletionWaiters;
 use crate::error::Result;
+use crate::inbox::InboxState;
 use crate::job::{Claim, JobRecord, JobStatus};
 use crate::lease_registry::LeaseRegistry;
 use crate::options::QueueConfig;
@@ -81,6 +82,9 @@ pub(crate) struct QueueCore {
     /// Fired by [`watch_store_close`] once the store closes, before the lease
     /// registry closes, so a claim's fired token never precedes it.
     pub(crate) closed: CancellationToken,
+    /// The inbox, when [`OpenOptions::inbox`](crate::OpenOptions::inbox) is
+    /// set.
+    pub(crate) inbox: Option<InboxState>,
 }
 
 impl QueueCore {

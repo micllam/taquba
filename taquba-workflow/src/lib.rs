@@ -256,6 +256,21 @@
 //! starts. See `examples/remote_reply.rs` for a runnable version with the
 //! pending-marker layout the watcher reads.
 //!
+//! # The inbox
+//!
+//! Another process submits and cancels runs through the inbox of the queue
+//! ([`taquba::OpenOptions::inbox`]). [`WorkflowRuntimeBuilder::inbox_kinds`]
+//! registers the kinds `workflow.submit` and `workflow.cancel` for the
+//! runtime's queue name, whose entries are [`SubmitEntry`] and
+//! [`CancelRunEntry`], sent with a [`taquba::InboxSender`]. An entry identifies
+//! the runtime by its `queue` field, [`DEFAULT_QUEUE_NAME`] by default, so each
+//! runtime over a queue receives its own entries. A submission commits its run
+//! record with the inbox record, and a cancellation commits the inbox record
+//! with the removal of the queued step. A signal from another process is the
+//! core kind `signal` ([`taquba::SignalEntry`]). The outcome of an entry is
+//! read through [`taquba::QueueView::inbox_record`] of a
+//! [`taquba::QueueReader`].
+//!
 //! # Application KV effects
 //!
 //! Application state that describes a run (a status row, a progress marker, an
@@ -610,6 +625,7 @@ mod durable;
 mod effects;
 mod error;
 mod group;
+mod inbox;
 pub mod jobs;
 mod keys;
 mod kv;
@@ -627,6 +643,7 @@ mod worker;
 pub use effects::{EffectsHandle, TerminalEffects};
 pub use error::{Error, Result};
 pub use group::{GroupMember, GroupStatus, MemberResult, RunGroup};
+pub use inbox::{CancelRunEntry, SubmitEntry};
 pub use keys::{
     HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, MAX_RUN_ID_LEN, RESERVED_HEADER_PREFIX,
     RESERVED_KV_PREFIX, RunId,
@@ -635,8 +652,8 @@ pub use kv::KvReadHandle;
 pub use memo::{Memo, MemoStore};
 pub use runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 pub use runtime::{
-    RunEnd, RunOptions, RunSpec, RunState, RunStatus, RunTermination, RunnerHandle, StepRef,
-    SubmitOutcome, WorkflowRuntime, WorkflowRuntimeBuilder,
+    DEFAULT_QUEUE_NAME, RunEnd, RunOptions, RunSpec, RunState, RunStatus, RunTermination,
+    RunnerHandle, StepRef, SubmitOutcome, WorkflowRuntime, WorkflowRuntimeBuilder,
 };
 #[cfg(feature = "webhooks")]
 pub use terminal::WebhookTerminalHook;

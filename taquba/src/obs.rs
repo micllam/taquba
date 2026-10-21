@@ -23,6 +23,11 @@
 //! - `taquba_lease_renewals_total{queue}`: lease renewals on claimed jobs.
 //! - `taquba_heartbeat_failures_total`: liveness heartbeat commits that
 //!   failed. The metric is store-level, so it does not have a `queue` label.
+//! - `taquba_inbox_entries_applied_total{kind}` /
+//!   `taquba_inbox_entries_rejected_total{kind}`: inbox entries applied, and
+//!   entries rejected with a record of the reason.
+//! - `taquba_inbox_pass_failures_total`: inbox passes that ended with an
+//!   error. Store-level, without a label.
 //! - `taquba_enqueue_duration_seconds{queue}` /
 //!   `taquba_claim_duration_seconds{queue}` /
 //!   `taquba_ack_duration_seconds{queue}`: per-operation latency histograms.
@@ -77,6 +82,18 @@ mod imp {
         metrics::describe_counter!(
             "taquba_heartbeat_failures_total",
             "Liveness heartbeat commits that failed"
+        );
+        metrics::describe_counter!(
+            "taquba_inbox_entries_applied_total",
+            "Inbox entries applied"
+        );
+        metrics::describe_counter!(
+            "taquba_inbox_entries_rejected_total",
+            "Inbox entries rejected with a record of the reason"
+        );
+        metrics::describe_counter!(
+            "taquba_inbox_pass_failures_total",
+            "Inbox passes that ended with an error"
         );
         metrics::describe_histogram!(
             "taquba_enqueue_duration_seconds",
@@ -138,6 +155,20 @@ mod imp {
 
     pub(crate) fn heartbeat_failed() {
         metrics::counter!("taquba_heartbeat_failures_total").increment(1);
+    }
+
+    pub(crate) fn inbox_applied(kind: &str) {
+        metrics::counter!("taquba_inbox_entries_applied_total", "kind" => kind.to_owned())
+            .increment(1);
+    }
+
+    pub(crate) fn inbox_rejected(kind: &str) {
+        metrics::counter!("taquba_inbox_entries_rejected_total", "kind" => kind.to_owned())
+            .increment(1);
+    }
+
+    pub(crate) fn inbox_pass_failed() {
+        metrics::counter!("taquba_inbox_pass_failures_total").increment(1);
     }
 
     pub(crate) fn set_depth(queue: &str, pending: i64, claimed: i64) {
@@ -290,6 +321,12 @@ mod imp {
     pub(crate) fn renewed(_queue: &str) {}
     #[inline]
     pub(crate) fn heartbeat_failed() {}
+
+    pub(crate) fn inbox_applied(_kind: &str) {}
+
+    pub(crate) fn inbox_rejected(_kind: &str) {}
+
+    pub(crate) fn inbox_pass_failed() {}
 }
 
 pub(crate) use imp::*;

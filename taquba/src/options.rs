@@ -8,6 +8,7 @@ use std::time::Duration;
 use slatedb::object_store::ObjectStore;
 
 use crate::clock::{Clock, default_clock};
+use crate::inbox::InboxOptions;
 
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(30);
@@ -241,6 +242,12 @@ pub struct OpenOptions {
     /// A store whose compactor runs outside the process must be opened with
     /// `false`: a fenced in-process compactor closes the writer.
     pub in_process_compactor: bool,
+    /// The inbox, through which another process enqueues, cancels and signals.
+    /// `None` (the default) opens the queue without an inbox, and an idle
+    /// writer then makes the requests of the store alone. The writer runs a
+    /// pass of the inbox at open, and a failed pass fails the open. See
+    /// [`InboxOptions`].
+    pub inbox: Option<InboxOptions>,
     /// Whether the writer process runs SlateDB's garbage collector, which
     /// removes the manifest versions, WAL files and SST files that are
     /// unreachable from the current manifest and its checkpoints. Defaults to
@@ -363,6 +370,13 @@ impl OpenOptions {
         self.in_process_garbage_collector = in_process_garbage_collector;
         self
     }
+
+    /// Set [`Self::inbox`].
+    #[must_use]
+    pub fn inbox(mut self, inbox: impl Into<Option<InboxOptions>>) -> Self {
+        self.inbox = inbox.into();
+        self
+    }
 }
 
 impl Default for OpenOptions {
@@ -382,6 +396,7 @@ impl Default for OpenOptions {
             wal_object_store: None,
             in_process_compactor: true,
             in_process_garbage_collector: true,
+            inbox: None,
         }
     }
 }

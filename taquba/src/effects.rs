@@ -9,6 +9,7 @@ use ulid::Ulid;
 
 use crate::error::{Error, Result};
 use crate::expiry::ExpiryIndex;
+use crate::inbox::record::InboxRecord;
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{QueueName, dedup_index_key, job_index_key, user_scoped_key};
 use crate::kv::validate_kv_value_size;
@@ -65,6 +66,9 @@ pub struct SettlementEffects {
     /// The signal key and the payload of every signal added with
     /// [`Self::signal`].
     pub(crate) signals: Vec<(String, Vec<u8>)>,
+    /// The id and the record of an inbox entry, added by
+    /// [`InboxRecordHandle`](crate::InboxRecordHandle).
+    pub(crate) inbox_record: Option<(String, InboxRecord)>,
 }
 
 impl SettlementEffects {
@@ -147,6 +151,7 @@ pub(crate) struct PreparedEffects {
     /// Recorded on their indexes once the effects apply.
     pub(crate) expiry_entries: Vec<(ExpiryIndex, u64)>,
     pub(crate) signals: Vec<(String, Vec<u8>)>,
+    pub(crate) inbox_record: Option<(String, InboxRecord)>,
 }
 
 impl QueueCore {
@@ -298,6 +303,7 @@ impl QueueCore {
             kv_deletes: effects.kv_deletes,
             expiry_entries: effects.expiry_entries,
             signals: effects.signals,
+            inbox_record: effects.inbox_record,
         })
     }
 
@@ -331,6 +337,9 @@ impl QueueCore {
         let now = self.now_ms();
         for (key, payload) in &prepared.signals {
             stage_signal(txn, key, payload.clone(), now).await?;
+        }
+        if let Some((id, record)) = &prepared.inbox_record {
+            txn.stage_inbox_record(id, record).await?;
         }
         Ok(results)
     }

@@ -11,10 +11,11 @@ use tracing::{debug, warn};
 use crate::error::{Error, Result};
 use crate::expiry::ExpiryIndex;
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
+use crate::inbox::record::InboxRecord;
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{
-    KeyTag, QueueName, attempt_history_key, claimed_key, dedup_index_key, job_index_key,
-    signal_waiter_key,
+    KeyTag, QueueName, attempt_history_key, claimed_key, dedup_index_key, inbox_expiry_key,
+    inbox_record_key, job_index_key, signal_waiter_key,
 };
 use crate::lease_registry::LeaseRegistry;
 use crate::queue_core::QueueCore;
@@ -48,6 +49,8 @@ struct CommitNotes {
     expiry: Vec<(ExpiryIndex, u64)>,
     /// The new jobs, as their queue and id, for the enqueue counter.
     enqueued: Vec<(QueueName, String)>,
+    /// The earliest `applied_at` of an inbox record written.
+    inbox: Option<u64>,
 }
 
 impl Deref for Txn {
@@ -128,6 +131,26 @@ impl Txn {
     /// Note the entry of `index` at `at_ms`, written in this transaction.
     pub(crate) fn note_expiry_entry(&mut self, index: &ExpiryIndex, at_ms: u64) {
         self.notes.expiry.push((index.clone(), at_ms));
+    }
+
+    /// Write the inbox record `record` of the entry `id` and its expiry entry,
+    /// and note the record for the bound of the inbox expiry key space. A
+    /// record at the id fails the call with [`Error::InboxAlreadyApplied`].
+    pub(crate) async fn stage_inbox_record(
+        &mut self,
+        id: &str,
+        record: &InboxRecord,
+    ) -> Result<()> {
+        let key = inbox_record_key(id);
+        if self.txn.get(&key).await?.is_some() {
+            return Err(Error::InboxAlreadyApplied { id: id.to_string() });
+        }
+        self.txn.put(key, rmp_serde::to_vec_named(record)?)?;
+        self.txn
+            .put(inbox_expiry_key(record.applied_at_ms, id), Vec::new())?;
+        let at = record.applied_at_ms;
+        self.notes.inbox = Some(self.notes.inbox.map_or(at, |b| b.min(at)));
+        Ok(())
     }
 
     /// Write `job` at `key`, repoint its index entry to that key and note the
@@ -321,6 +344,9 @@ impl QueueCore {
             }
             for (index, at_ms) in &notes.expiry {
                 index.written(*at_ms);
+            }
+            if let (Some(applied_at), Some(inbox)) = (notes.inbox, &self.inbox) {
+                inbox.bound.lower(applied_at);
             }
             let mut enqueued: BTreeMap<&QueueName, u64> = BTreeMap::new();
             for (queue, id) in &notes.enqueued {

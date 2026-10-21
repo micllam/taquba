@@ -14,6 +14,7 @@ use crate::completion::{CompletionWaiters, Registration};
 use crate::effects::{EnqueueRequest, PreparedEffects, SettlementEffects};
 use crate::error::{Error, Result};
 use crate::history::AttemptOutcome;
+use crate::inbox::{Inbox, InboxHandler, InboxRegistration, InboxState};
 use crate::job::{Claim, JobRecord, JobStatus};
 use crate::keys::QueueName;
 use crate::lease_registry::{LeaseRegistry, Renewal};
@@ -192,6 +193,9 @@ pub(crate) fn backoff_delay(attempts: u32, base: Duration, max: Duration) -> Dur
 /// - **Liveness heartbeat**, when [`OpenOptions::liveness_heartbeat`] is
 ///   set: commits a beat that a [`QueueReader`](crate::QueueReader) reads
 ///   from another process.
+/// - **Inbox**, when [`OpenOptions::inbox`] is set: applies the entries that
+///   another process sent
+///   ([`InboxOptions::interval`](crate::InboxOptions::interval)).
 /// - **Close watcher**: once the store closes, fires the cancellation token of
 ///   every claim and fails later renewals with [`Error::ClaimLost`].
 ///
@@ -205,6 +209,8 @@ pub struct Queue {
     pub(crate) core: Arc<QueueCore>,
     reaper_task: BackgroundTask,
     scheduler_task: BackgroundTask,
+    /// `Some` only when `OpenOptions::inbox` was set.
+    inbox_task: Option<BackgroundTask>,
     /// `Some` only when built with the `metrics` feature and
     /// `OpenOptions::metrics_sample_interval` was set.
     metrics_sampler: Option<BackgroundTask>,
@@ -288,7 +294,7 @@ impl Queue {
         if !opts.in_process_garbage_collector {
             settings.garbage_collector_options = None;
         }
-        let mut builder = Db::builder(path, object_store)
+        let mut builder = Db::builder(path, object_store.clone())
             .with_merge_operator(Arc::new(QueueMergeOperator))
             .with_settings(settings);
         if let Some(wal_object_store) = opts.wal_object_store {
@@ -303,6 +309,11 @@ impl Queue {
         for queue in opts.queue_configs.keys() {
             QueueName::new(queue.as_str())?;
         }
+        let inbox_interval = opts.inbox.as_ref().map(|inbox| inbox.interval);
+        let inbox = opts
+            .inbox
+            .map(|inbox| InboxState::new(inbox, &object_store, path))
+            .transpose()?;
         let db = Arc::new(builder.build().await?);
         let core = Arc::new(QueueCore {
             view: QueueView::new(Handle::Writer(db.clone()), payload_store.clone()),
@@ -317,6 +328,7 @@ impl Queue {
             payload_store,
             id_gen: std::sync::Mutex::new(ulid::Generator::new()),
             closed: tokio_util::sync::CancellationToken::new(),
+            inbox,
         });
         let close_watcher = BackgroundTask::spawn(&core.closed, |shutdown| {
             crate::queue_core::watch_store_close(core.clone(), shutdown)
@@ -327,6 +339,10 @@ impl Queue {
         // immediately. Runs after `restore_cursor_state` so each re-queued
         // job's pending insert is recorded against the restored bound.
         core.requeue_interrupted_claims().await?;
+        // The first pass precedes the scheduler, so a signal that arrived
+        // during downtime wakes a waiter whose timeout passed in the same
+        // window before the scheduler promotes it.
+        core.inbox_pass().await?;
         let reaper_task = BackgroundTask::spawn_periodic(
             &core.closed,
             opts.reaper_interval,
@@ -337,6 +353,9 @@ impl Queue {
             opts.scheduler_interval,
             Scheduler::new(core.clone()),
         );
+        let inbox_task = inbox_interval.map(|interval| {
+            BackgroundTask::spawn_periodic(&core.closed, interval, Inbox::new(core.clone()))
+        });
 
         #[cfg(feature = "metrics")]
         let metrics_sampler = opts.metrics_sample_interval.map(|interval| {
@@ -360,10 +379,49 @@ impl Queue {
             core,
             reaper_task,
             scheduler_task,
+            inbox_task,
             metrics_sampler,
             heartbeat,
             close_watcher,
         })
+    }
+
+    /// Register `handler` for the inbox kind `kind`, so a pass applies the
+    /// entries of the kind through it. The registration lasts while the
+    /// returned [`InboxRegistration`] lives. A kind is `[a-z][a-z0-9._-]*` of
+    /// at most [`MAX_INBOX_ID_LEN`](crate::MAX_INBOX_ID_LEN) bytes.
+    ///
+    /// Fails with [`Error::InboxNotConfigured`] on a queue opened without
+    /// [`OpenOptions::inbox`], and with [`Error::InboxKindTaken`] for a core
+    /// kind or a kind with a live registration.
+    pub fn register_inbox_handler<H: InboxHandler>(
+        &self,
+        kind: &str,
+        handler: H,
+    ) -> Result<InboxRegistration> {
+        self.core.register_inbox_handler(kind, None, handler)
+    }
+
+    /// Register `handler` for the entries of the inbox kind `kind` whose body
+    /// contains the string `value` at `field`, so each instance of a layer
+    /// applies the entries that identify it, as the core kinds identify a
+    /// queue. An entry of the kind with another string at the field, or without
+    /// one, waits for a registration for its value. A kind with a registration
+    /// for a value accepts further registrations with the same field and other
+    /// values, and refuses a registration of the whole kind.
+    ///
+    /// Fails as [`Self::register_inbox_handler`] fails, and with
+    /// [`Error::InboxKindTaken`] for a value with a live registration or a
+    /// field that differs from the field of the kind.
+    pub fn register_inbox_handler_for<H: InboxHandler>(
+        &self,
+        kind: &str,
+        field: &str,
+        value: &str,
+        handler: H,
+    ) -> Result<InboxRegistration> {
+        self.core
+            .register_inbox_handler(kind, Some((field, value)), handler)
     }
 
     /// The writer's live view of the store: the read-only queries, with a write
@@ -1153,6 +1211,13 @@ impl Queue {
         self.core.promote_due_jobs().await
     }
 
+    /// Run one pass over the inbox now, as the inbox task runs it on its
+    /// interval. A queue opened without [`OpenOptions::inbox`] returns without
+    /// a request.
+    pub async fn apply_inbox_now(&self) -> Result<()> {
+        self.core.inbox_pass().await
+    }
+
     /// Shut down the background reaper and scheduler, persist each queue's
     /// claim-scan state, then close the underlying database.
     ///
@@ -1164,11 +1229,20 @@ impl Queue {
     /// committed best-effort as well, so readers can distinguish this close
     /// from a writer that stopped committing beats.
     pub async fn close(self) -> Result<()> {
-        tokio::join!(self.reaper_task.stop(), self.scheduler_task.stop(), async {
-            if let Some(sampler) = self.metrics_sampler {
-                sampler.stop().await;
+        tokio::join!(
+            self.reaper_task.stop(),
+            self.scheduler_task.stop(),
+            async {
+                if let Some(inbox) = self.inbox_task {
+                    inbox.stop().await;
+                }
+            },
+            async {
+                if let Some(sampler) = self.metrics_sampler {
+                    sampler.stop().await;
+                }
             }
-        });
+        );
         if let Some(heartbeat) = self.heartbeat
             && let Some(task) = heartbeat.stop().await
         {

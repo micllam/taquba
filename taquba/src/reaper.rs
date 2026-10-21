@@ -9,8 +9,11 @@ use tracing::{debug, warn};
 use crate::background::Periodic;
 use crate::error::{Error, Result};
 use crate::history::AttemptOutcome;
+use crate::inbox::InboxState;
 use crate::job::{JobRecord, JobStatus};
-use crate::keys::{KeyTag, claimed_key, parse_key_timestamp, tag_prefix};
+use crate::keys::{
+    KeyTag, claimed_key, inbox_record_key, parse_inbox_expiry_id, parse_key_timestamp, tag_prefix,
+};
 use crate::lease_registry::DueLease;
 use crate::queue_core::QueueCore;
 use crate::txn::{Attempt, ClaimEnd, Commit, Durability};
@@ -18,6 +21,9 @@ use crate::txn::{Attempt, ClaimEnd, Commit, Durability};
 /// Target bytes fetched per object-store request by the recovery and retention
 /// scans.
 const SWEEP_READ_AHEAD_BYTES: usize = 256 * 1024;
+
+/// Inbox records deleted per transaction by the inbox retention sweep.
+const INBOX_SWEEP_BATCH: usize = 256;
 
 /// [`ScanOptions`] for the recovery and retention scans. Both read their key
 /// prefix sequentially in a single pass, so each fetch reads a large contiguous
@@ -71,6 +77,11 @@ impl Periodic for Reaper {
                 .await
         {
             warn!("dead retention sweep error: {e}");
+        }
+        if let Some(inbox) = &core.inbox
+            && let Err(e) = core.sweep_inbox_records(inbox).await
+        {
+            warn!("inbox record retention sweep error: {e}");
         }
         reaped
     }
@@ -321,6 +332,58 @@ impl QueueCore {
         if let Some(scan) = scan {
             scan.complete();
         }
+        Ok(())
+    }
+
+    /// Delete the inbox records whose retention window ended, with their expiry
+    /// entries. The expiry keys lead with `applied_at`, so the scan runs from
+    /// the bound of the inbox and ends at the first key newer than
+    /// `now - retention`. The deletes commit in transactions of at most
+    /// [`INBOX_SWEEP_BATCH`] records, without awaiting WAL durability: a commit
+    /// lost in a crash leaves the records for the next sweep.
+    pub(crate) async fn sweep_inbox_records(&self, inbox: &InboxState) -> Result<()> {
+        let now = self.now_ms();
+        let retention_ms = u64::try_from(inbox.retention.as_millis()).unwrap_or(u64::MAX);
+        let Some(mut scan) = inbox.bound.begin(now, retention_ms) else {
+            return Ok(());
+        };
+        let start = Bytes::copy_from_slice(&scan.from().to_be_bytes());
+        let mut iter = self
+            .db
+            .scan_prefix_with_options(
+                tag_prefix(KeyTag::InboxExpiry),
+                (Bound::Included(start), Bound::Unbounded),
+                &sweep_scan_options(),
+            )
+            .await?;
+        let mut expired: Vec<(Vec<u8>, u64)> = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            let Some(applied_at) = parse_key_timestamp(&kv.key, KeyTag::InboxExpiry) else {
+                continue;
+            };
+            if !scan.due(applied_at) {
+                scan.retain(applied_at);
+                break;
+            }
+            expired.push((kv.key.to_vec(), applied_at));
+        }
+        drop(iter);
+
+        for batch in expired.chunks(INBOX_SWEEP_BATCH) {
+            let txn = self.begin().await?;
+            for (key, _) in batch {
+                txn.delete(key)?;
+                if let Some(id) = parse_inbox_expiry_id(key) {
+                    txn.delete(inbox_record_key(id))?;
+                }
+            }
+            if self.commit(txn, Durability::Deferred).await? == Commit::Conflict {
+                for (_, applied_at) in batch {
+                    scan.retain(*applied_at);
+                }
+            }
+        }
+        scan.complete();
         Ok(())
     }
 

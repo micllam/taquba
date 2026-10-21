@@ -3207,6 +3207,7 @@ version = "0.15.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "futures-core",
  "futures-util",

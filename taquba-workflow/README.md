@@ -277,6 +277,20 @@ the requesting step settles before the remote work starts. See
 [`examples/remote_reply.rs`](examples/remote_reply.rs) for a runnable version
 with the pending-marker layout the watcher reads.
 
+## The inbox
+
+Another process submits and cancels runs through the inbox of the queue
+(`taquba::OpenOptions::inbox`). `WorkflowRuntimeBuilder::inbox_kinds` registers
+the kinds `workflow.submit` and `workflow.cancel` for the runtime's queue name,
+whose entries are `SubmitEntry` and `CancelRunEntry`, sent with a
+`taquba::InboxSender`. An entry identifies the runtime by its `queue` field,
+`DEFAULT_QUEUE_NAME` by default, so each runtime over a queue receives its own
+entries. A submission commits its run record with the inbox record, and a
+cancellation commits the inbox record with the removal of the queued step. A
+signal from another process is the core kind `signal` (`taquba::SignalEntry`).
+The outcome of an entry is read through `taquba::QueueView::inbox_record` of a
+`taquba::QueueReader`.
+
 ## Application KV effects
 
 Application state that describes a run (a status row, a progress marker, an

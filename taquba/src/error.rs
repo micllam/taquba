@@ -156,6 +156,69 @@ pub enum Error {
         #[source]
         source: StoreUrlError,
     },
+
+    /// The inbox object store reported a failure while listing, reading,
+    /// writing or deleting an entry. See [`crate::OpenOptions::inbox`].
+    #[error("inbox store error: {0}")]
+    InboxStore(#[source] slatedb::object_store::Error),
+
+    /// An inbox kind name is outside `[a-z][a-z0-9._-]*` or over 64 bytes.
+    #[error("invalid inbox kind `{kind}`: {reason}")]
+    InvalidInboxKind {
+        /// The rejected kind.
+        kind: String,
+        /// Why it was rejected.
+        reason: &'static str,
+    },
+
+    /// [`crate::Queue::register_inbox_handler`] named a core kind or a kind
+    /// with a live registration, or
+    /// [`crate::Queue::register_inbox_handler_for`] named a value with a live
+    /// registration or a field that differs from the field of the kind.
+    #[error("inbox kind `{kind}` is taken{}", value.as_deref().map(|v| format!(" for `{v}`")).unwrap_or_default())]
+    InboxKindTaken {
+        /// The kind.
+        kind: String,
+        /// The value of the scope, `None` for a registration of the whole kind.
+        value: Option<String>,
+    },
+
+    /// [`crate::Queue::register_inbox_handler`] was called on a queue opened
+    /// without [`crate::OpenOptions::inbox`].
+    #[error("the queue was opened without an inbox")]
+    InboxNotConfigured,
+
+    /// An [`crate::InboxHandler`] reported [`crate::Applied::Committed`] for an
+    /// entry without a record. The pass stops at the entry.
+    #[error("inbox entry `{id}` was reported committed without a record")]
+    InboxRecordMissing {
+        /// The id of the entry.
+        id: String,
+    },
+
+    /// A transaction would write the record of the inbox entry `id`, and a
+    /// record exists. The transaction is aborted, and the pass treats the entry
+    /// as applied.
+    #[error("inbox entry `{id}` is already applied")]
+    InboxAlreadyApplied {
+        /// The id of the entry.
+        id: String,
+    },
+
+    /// An [`crate::InboxHandler`] failed. The pass stops at the entry, and the
+    /// next pass applies it again.
+    #[error("inbox handler of kind `{kind}` failed: {source}")]
+    InboxHandler {
+        /// The kind of the entry.
+        kind: String,
+        /// The error of the handler.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// [`crate::InboxSender`] could not encode an entry as JSON.
+    #[error("inbox entry encoding error: {0}")]
+    InboxEncoding(#[source] serde_json::Error),
 }
 
 /// The cause of an [`Error::InvalidStoreUrl`].
@@ -177,8 +240,9 @@ impl Error {
     /// [`Self::Storage`] is conservatively treated as transient, as is
     /// [`Self::StoreNotInitialized`]: a health check racing the first
     /// deployment observes it until the writer creates the store, and a later
-    /// retry can succeed. The remaining variants report incorrect usage or
-    /// malformed data, which retrying cannot change.
+    /// retry can succeed. [`Self::InboxHandler`] is transient, because the next
+    /// pass applies the entry again. The remaining variants report incorrect
+    /// usage or malformed data, which retrying cannot change.
     pub fn is_permanent(&self) -> bool {
         match self {
             Self::Serialization(_)
@@ -195,8 +259,18 @@ impl Error {
             | Self::SignalWaiterExists { .. }
             | Self::InvalidQueueName { .. }
             | Self::PayloadMissing { .. }
-            | Self::InvalidStoreUrl { .. } => true,
-            Self::Storage(_) | Self::PayloadStore(_) | Self::StoreNotInitialized { .. } => false,
+            | Self::InvalidStoreUrl { .. }
+            | Self::InvalidInboxKind { .. }
+            | Self::InboxKindTaken { .. }
+            | Self::InboxNotConfigured
+            | Self::InboxRecordMissing { .. }
+            | Self::InboxAlreadyApplied { .. }
+            | Self::InboxEncoding(_) => true,
+            Self::Storage(_)
+            | Self::PayloadStore(_)
+            | Self::StoreNotInitialized { .. }
+            | Self::InboxStore(_)
+            | Self::InboxHandler { .. } => false,
         }
     }
 }

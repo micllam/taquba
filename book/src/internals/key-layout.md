@@ -12,6 +12,7 @@ All of the queue's state is in one store:
 - Per-queue counters.
 - The writer heartbeat.
 - The signal waiter index and the signal buffer.
+- The inbox records and their expiry index.
 - The caller's own KV namespace.
 
 The encoding meets three requirements, and the sections that follow describe how
@@ -76,7 +77,7 @@ internal key space.
 
 ## The key spaces
 
-Fourteen key spaces, all defined on `KeyTag`. The `Fields` column lists what
+Sixteen key spaces, all defined on `KeyTag`. The `Fields` column lists what
 follows the two-byte header.
 
 | Space | Byte | Fields | Value |
@@ -94,6 +95,8 @@ follows the two-byte header.
 | `Heartbeat` | `0x0B` | none, one key per store | the writer's last heartbeat |
 | `SignalWaiter` | `0x0C` | signal key bytes | the id of the scheduled job waiting at the key |
 | `SignalBuffer` | `0x0D` | signal key bytes | the payload of a signal without a waiter |
+| `InboxRecord` | `0x0E` | inbox entry id | the `InboxRecord` of an applied entry |
+| `InboxExpiry` | `0x0F` | `applied_at` `u64` BE, inbox entry id | empty |
 | `User` | `0xFF` | caller bytes, no version byte | the caller's value |
 
 A job record is therefore stored at exactly one of the first five keys at any
@@ -131,12 +134,14 @@ A record's status is derived from the key space its key belongs to:
 
 The field a scan orders by comes first.
 
-`Scheduled` and `Done` lead with a timestamp. The scheduler (`promote_due_jobs`,
-[scheduler.rs][scheduler]) and the done retention sweep (`sweep_expired`,
-[reaper.rs][reaper]) each read one global range in time order. Each exits at the
-first key past its cutoff. Each keeps in memory the earliest timestamp of a live
-key of its space, lowered after every commit that writes one, so a pass does not
-read until a key can be due and starts its read at that key.
+`Scheduled`, `Done` and `InboxExpiry` lead with a timestamp. The scheduler
+(`promote_due_jobs`, [scheduler.rs][scheduler]), the done retention sweep
+(`sweep_expired`, [reaper.rs][reaper]) and the inbox record sweep
+(`sweep_inbox_records`, [reaper.rs][reaper]) each read one global range in time
+order. Each exits at the first key past its cutoff. Each keeps in memory the
+earliest timestamp of a live key of its space, lowered after every commit that
+writes one, so a pass does not read until a key can be due and starts its read
+at that key.
 
 `Pending`, `Claimed` and `Dead` lead with the queue name, so the claim scan and
 `list_jobs` ([view.rs][view]) read one queue's range. `Pending` is ordered by
@@ -152,12 +157,13 @@ and the stats space by `list_queues`, which discovers queue names from it. A
 queue's own counters are point gets.
 
 `JobIndex`, `AttemptHistory`, `Dedup`, `Heartbeat`, `SignalWaiter`,
-`SignalBuffer` and `User` are reached by point lookup, so their keys contain
-only what identifies the record. That is a job id for the first two, a queue
-plus dedup key for `Dedup` and the signal key for the two signal spaces. The
-single heartbeat key ends at the header, and a `User` key has the caller's own
-bytes. A point lookup reads one exact key, so a prefix relation between two keys
-of those key spaces does not affect its result.
+`SignalBuffer`, `InboxRecord` and `User` are reached by point lookup, so their
+keys contain only what identifies the record. That is a job id for the first
+two, a queue plus dedup key for `Dedup`, the signal key for the two signal
+spaces and the entry id for `InboxRecord`. The single heartbeat key ends at the
+header, and a `User` key has the caller's own bytes. A point lookup reads one
+exact key, so a prefix relation between two keys of those key spaces does not
+affect its result.
 
 A scheduled job with a signal key is indexed in `SignalWaiter` at the key for as
 long as it is scheduled. `Txn::move_job` and `Txn::stage_remove` ([txn.rs][txn])

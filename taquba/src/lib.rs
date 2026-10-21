@@ -365,6 +365,35 @@
 //! job ids at submit), and the reader's [`QueueView::kv_get`] /
 //! [`QueueView::kv_scan`] read them from any process.
 //!
+//! # Requests from another process
+//!
+//! Another process can send a request as an entry: a JSON object at a versioned
+//! path with the inbox prefix, which is outside the store. The writer applies
+//! each entry in one transaction of the store that also records the entry.
+//! [`OpenOptions::inbox`] opens the queue with an inbox, at `"{path}-inbox"` by
+//! default, and the writer lists it at open and once per
+//! [`InboxOptions::interval`]. An [`InboxSender`] writes an entry at
+//! `{path}/v1/{kind}/{id}`: [`EnqueueEntry`] enqueues a job on a queue of
+//! [`InboxOptions::queues`], [`CancelEntry`] cancels a job and [`SignalEntry`]
+//! delivers a signal. A layer registers a kind of its own with
+//! [`Queue::register_inbox_handler`], or one handler per instance of the layer
+//! with [`Queue::register_inbox_handler_for`], selected by a field of the body
+//! as the core kinds select a queue.
+//!
+//! The writer applies the entries of a pass in id order, commits an
+//! [`InboxRecord`] at the id in the transaction of the entry's effect and
+//! deletes the object. An entry whose record exists is deleted without an
+//! effect, so an entry sent twice applies once within
+//! [`InboxOptions::record_retention`]. [`QueueView::inbox_record`] reads the
+//! outcome from the writer or a [`QueueReader`]. A malformed entry, or one for
+//! a queue outside the allow-list, is recorded as rejected with the reason. An
+//! error ends the pass at its entry, and the next pass starts again there.
+//!
+//! The inbox is one-way: a sender observes the outcome through a reader, and
+//! only the writer commits. A sender in another language writes the JSON body
+//! itself, with a bytes field in base64. A sender without a [`QueueReader`],
+//! which is a Rust type, cannot read the outcome of its entry.
+//!
 //! # Background tasks
 //!
 //! [`Queue::open`] spawns background tokio tasks for the lifetime of the
@@ -379,6 +408,8 @@
 //! - **Liveness heartbeat** - commits a beat readable by a [`QueueReader`]
 //!   from another process, only when [`OpenOptions::liveness_heartbeat`]
 //!   is set.
+//! - **Inbox** - applies the entries sent from another process, only when
+//!   [`OpenOptions::inbox`] is set (interval: [`InboxOptions::interval`]).
 //! - **Close watcher** - once the store closes, fires the cancellation token
 //!   of every claim and fails later lease renewals.
 //!
@@ -453,6 +484,7 @@ mod effects;
 mod error;
 mod expiry;
 mod history;
+mod inbox;
 mod job;
 mod keys;
 mod kv;
@@ -488,6 +520,15 @@ pub use effects::{EnqueueRequest, SettlementEffects};
 pub use error::{Error, Result, StoreUrlError};
 pub use expiry::{Expired, ExpiryIndex};
 pub use history::{AttemptOutcome, JobAttempt};
+pub use inbox::entry::{
+    CancelEntry, EnqueueEntry, InboxKind, MAX_INBOX_ID_LEN, SignalEntry, inbox_bytes,
+};
+pub use inbox::record::{Applied, InboxOutcome, InboxRecord, InboxRecordHandle};
+pub use inbox::sender::InboxSender;
+pub use inbox::{
+    DEFAULT_INBOX_INTERVAL, DEFAULT_INBOX_RECORD_RETENTION, InboxEntry, InboxHandler,
+    InboxHandlerError, InboxOptions, InboxRegistration, default_inbox_path,
+};
 pub use job::{Claim, JobRecord, JobStatus};
 pub use keys::{MAX_QUEUE_NAME_LEN, QueueName};
 pub use kv::{KvOrder, KvPage, KvRange, MAX_KV_VALUE_SIZE};

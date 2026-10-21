@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through a `taquba::QueueReader`. It returns `None` for an active run.
 - `TerminalEffects::signal`: a signal to the run waiting at a key, committed in
   the settlement that terminates a run or acknowledges its notification.
+- `WorkflowRuntimeBuilder::inbox_kinds`: the inbox kinds `workflow.submit` and
+  `workflow.cancel` for the runtime's queue name, with the entry types
+  `SubmitEntry` and `CancelRunEntry`, so another process submits and cancels
+  runs through a `taquba::InboxSender`. An entry identifies the runtime by its
+  `queue` field, `DEFAULT_QUEUE_NAME` by default.
 
 ### Changed
 

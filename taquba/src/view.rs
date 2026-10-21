@@ -13,11 +13,12 @@ use slatedb::{Db, DbIterator, DbReader, IsolationLevel, IterationOrder};
 
 use crate::error::{Error, Result};
 use crate::history::{JobAttempt, decode_history};
+use crate::inbox::record::InboxRecord;
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{
     KeyTag, QueueName, attempt_history_key, claimed_prefix, dead_key, dead_prefix, heartbeat_key,
-    job_index_key, parse_stats_key, pending_prefix, signal_waiter_key, stats_key, tag_prefix,
-    user_scoped_key,
+    inbox_record_key, job_index_key, parse_stats_key, pending_prefix, signal_waiter_key, stats_key,
+    tag_prefix, user_scoped_key,
 };
 use crate::kv::{KvOrder, KvPage, KvRange};
 use crate::liveness::{HeartbeatRecord, WriterHeartbeat};
@@ -356,6 +357,16 @@ impl QueueView {
             .await?
             .is_some_and(|(_, job)| job.status == JobStatus::Scheduled);
         Ok(waiting.then_some(id))
+    }
+
+    /// The record of the applied inbox entry `id`, or `None` when the entry was
+    /// not applied or its record was swept after
+    /// [`InboxOptions::record_retention`](crate::InboxOptions::record_retention).
+    pub async fn inbox_record(&self, id: &str) -> Result<Option<InboxRecord>> {
+        match self.handle.get(&inbox_record_key(id)).await? {
+            Some(bytes) => Ok(Some(rmp_serde::from_slice(&bytes)?)),
+            None => Ok(None),
+        }
     }
 
     /// The stored liveness beat in its public form, or `None` when no writer

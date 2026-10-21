@@ -19,6 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Error::SignalWaiterExists`, and a key without `run_at` with
   `Error::InvalidSignalKey`. The key layout gains the `SignalWaiter` and
   `SignalBuffer` spaces, and a store written with 0.15.0 opens without a drain.
+- The inbox: `OpenOptions::inbox` with `InboxOptions` opens the queue with a
+  prefix of objects that the writer applies once each, through which another
+  process enqueues, cancels and signals. `InboxSender` writes an entry
+  (`EnqueueEntry`, `CancelEntry`, `SignalEntry` or a type of a layer that
+  implements `InboxKind`), `Queue::register_inbox_handler` registers an
+  `InboxHandler` for a kind of a layer, `Queue::register_inbox_handler_for`
+  registers one for the entries of the kind with a value at a field of the body,
+  `QueueView::inbox_record` reads the `InboxRecord` of an applied entry,
+  `Queue::apply_inbox_now` runs a pass and `default_inbox_path` is the path of
+  an inbox opened without `InboxOptions::path`. The key layout gains the
+  `InboxRecord` and `InboxExpiry` spaces, and the crate depends on serde_json
+  and base64. See ADR-0005.
 
 ### Changed
 

@@ -14,6 +14,11 @@ jobs in `.github/workflows/ci.yml`. Run `vale sync` after a clone.
   [ADR-0002](docs/decisions/0002-at-least-once-delivery.md).
 - **State.** Design the key layout before adding durable state. Do not add a
   durable copy of the lease without a consumer outside the writing process.
+- **Ingress.** A request from outside the process enters through the inbox, and
+  only the writer commits it. Do not add a reply path or a second channel. See
+  [ADR-0005](docs/decisions/0005-bucket-inbox.md).
+- **Signals.** The signal wait is the queue's. Do not add a waiter index, a
+  signal buffer or a delivered record in a layer.
 
 ## Versioning
 

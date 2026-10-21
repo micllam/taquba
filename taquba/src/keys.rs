@@ -18,7 +18,9 @@
 //!
 //! A scheduled job with a signal key is indexed in `SignalWaiter` at the key,
 //! and a signal without a live waiter is held in `SignalBuffer` at the key.
-//! Both spaces are reached by point lookup.
+//! Both spaces are reached by point lookup. An applied inbox entry has its
+//! record in `InboxRecord` at its id, and `InboxExpiry` leads with the time of
+//! the application so the retention sweep performs one scan with an early exit.
 //!
 //! A claimed job occupies one key: `Claimed` contains the record at a key
 //! stable for the life of the claim. The lease itself, the current expiry and
@@ -194,6 +196,14 @@ pub(crate) enum KeyTag {
     /// that arrived without a live waiter, consumed by the enqueue of the next
     /// job with the key or discarded by [`crate::Queue::clear_signal`].
     SignalBuffer = 0x0D,
+    /// `[tag, ver, inbox entry id]`. The value is the [`crate::InboxRecord`] of
+    /// an applied inbox entry, written in the transaction of the entry's effect
+    /// and deleted by the retention sweep.
+    InboxRecord = 0x0E,
+    /// `[tag, ver, applied_at u64 BE, inbox entry id]`, with an empty value.
+    /// Written with the inbox record, and read by the retention sweep in time
+    /// order.
+    InboxExpiry = 0x0F,
     /// `[tag, caller bytes]`, without a version byte. Caller bytes are opaque.
     User = 0xFF,
 }
@@ -220,6 +230,8 @@ impl KeyTag {
             0x0B => KeyTag::Heartbeat,
             0x0C => KeyTag::SignalWaiter,
             0x0D => KeyTag::SignalBuffer,
+            0x0E => KeyTag::InboxRecord,
+            0x0F => KeyTag::InboxExpiry,
             0xFF => KeyTag::User,
             _ => return None,
         })
@@ -242,6 +254,8 @@ impl KeyTag {
             | KeyTag::Heartbeat
             | KeyTag::SignalWaiter
             | KeyTag::SignalBuffer
+            | KeyTag::InboxRecord
+            | KeyTag::InboxExpiry
             | KeyTag::User => None,
         }
     }
@@ -368,6 +382,28 @@ pub(crate) fn signal_waiter_key(signal_key: &str) -> Vec<u8> {
 
 pub(crate) fn signal_buffer_key(signal_key: &str) -> Vec<u8> {
     signal_key_in(KeyTag::SignalBuffer, signal_key)
+}
+
+pub(crate) fn inbox_record_key(id: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(2 + id.len());
+    k.extend_from_slice(&header(KeyTag::InboxRecord));
+    k.extend_from_slice(id.as_bytes());
+    k
+}
+
+pub(crate) fn inbox_expiry_key(applied_at: u64, id: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(2 + 8 + id.len());
+    k.extend_from_slice(&header(KeyTag::InboxExpiry));
+    k.extend_from_slice(&applied_at.to_be_bytes());
+    k.extend_from_slice(id.as_bytes());
+    k
+}
+
+/// Parse the entry id from an inbox expiry key. Returns `None` when the key is
+/// not a current-version inbox expiry key or is malformed.
+pub(crate) fn parse_inbox_expiry_id(key: &[u8]) -> Option<&str> {
+    let rest = key.strip_prefix(header(KeyTag::InboxExpiry).as_slice())?;
+    std::str::from_utf8(rest.get(8..)?).ok()
 }
 
 pub(crate) fn stats_key(queue: &QueueName, metric: &str) -> Vec<u8> {
@@ -519,6 +555,18 @@ mod tests {
     }
 
     #[test]
+    fn inbox_expiry_key_leads_with_the_time_and_parses_back() {
+        let key = inbox_expiry_key(1_700_000_000_123, "entry-1");
+        assert_eq!(
+            parse_key_timestamp(&key, KeyTag::InboxExpiry),
+            Some(1_700_000_000_123)
+        );
+        assert_eq!(parse_inbox_expiry_id(&key), Some("entry-1"));
+        assert_eq!(parse_inbox_expiry_id(&inbox_record_key("entry-1")), None);
+        assert_eq!(parse_inbox_expiry_id(&key[..6]), None);
+    }
+
+    #[test]
     fn every_tag_is_recovered_from_its_byte() {
         for tag in KeyTag::iter() {
             assert_eq!(KeyTag::of(&[tag.id(), 0]), Some(tag));
@@ -543,6 +591,8 @@ mod tests {
             heartbeat_key(),
             signal_waiter_key("id"),
             signal_buffer_key("id"),
+            inbox_record_key("id"),
+            inbox_expiry_key(1, "id"),
             user_scoped_key(b"id"),
         ];
         for (i, a) in keys.iter().enumerate() {
