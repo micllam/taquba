@@ -300,10 +300,10 @@ disagreeing. Two surfaces:
 
 - `RunSpec::effects`: a `taquba::SettlementEffects` applied atomically with the
   step-0 enqueue. A duplicate submission drops its effects.
-- `Delivery::effects`: an `EffectsHandle` that stages writes and deletes during
-  a step. Everything staged is applied in the settlement transaction that
-  commits the outcome the runner returned, whichever outcome that is
-  (`Continue`, `Succeed`, `Fail` or `Cancel`).
+- `Delivery::effects`: an `EffectsHandle` that stages writes, deletes and
+  enqueues during a step. Everything staged is applied in the settlement
+  transaction that commits the outcome the runner returned, whichever outcome
+  that is (`Continue`, `Succeed`, `Fail` or `Cancel`).
 
 ```rust,ignore
 // Inside StepRunner::run_step: the outcome record commits with the
@@ -322,8 +322,9 @@ Semantics:
   outcome. A runner-issued `StepOutcome::Cancel` keeps its effects.
 - Operations are validated as they are staged: the `workflow/` prefix
   (`RESERVED_KV_PREFIX`) is reserved for the runtime, values are capped at
-  `taquba::MAX_KV_VALUE_SIZE` and a key cannot be staged for both a write and a
-  delete within one step.
+  `taquba::MAX_KV_VALUE_SIZE`, a key cannot be staged for both a write and a
+  delete within one step, and an enqueue to the queue of the runtime or with a
+  `workflow.*` header is rejected.
 - With `WorkflowRuntimeBuilder::step_output_replay` enabled, the replay record
   stores the staged effects with the outcome, so a replayed delivery applies
   them without invoking the runner.

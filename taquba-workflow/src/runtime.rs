@@ -4193,6 +4193,13 @@ mod tests {
             step.effects
                 .put(format!("app/step-{}", step.step_number), b"done".to_vec())
                 .map_err(|e| StepError::permanent(e.to_string()))?;
+            step.effects
+                .enqueue(EnqueueRequest {
+                    queue: "app-requests".to_string(),
+                    payload: step.step_number.to_string().into_bytes(),
+                    options: EnqueueOptions::default(),
+                })
+                .map_err(|e| StepError::permanent(e.to_string()))?;
             self.script.lock().unwrap().remove(0)
         }
     }
@@ -4228,6 +4235,7 @@ mod tests {
         assert_eq!(outcome.status, TerminalStatus::Succeeded);
         assert_eq!(wait_for_kv(&queue, b"app/step-0").await, b"done");
         assert_eq!(wait_for_kv(&queue, b"app/step-1").await, b"done");
+        assert_eq!(queue.view().stats("app-requests").await.unwrap().pending, 2);
 
         let _ = shutdown.send(());
     }
@@ -4980,6 +4988,13 @@ mod tests {
                 step.effects
                     .delete(b"app/stale".to_vec())
                     .map_err(|e| StepError::transient(e.to_string()))?;
+                step.effects
+                    .enqueue(EnqueueRequest {
+                        queue: "app-requests".to_string(),
+                        payload: b"request".to_vec(),
+                        options: EnqueueOptions::default(),
+                    })
+                    .map_err(|e| StepError::transient(e.to_string()))?;
                 Ok(StepOutcome::continue_now(b"step1".to_vec()))
             }
         }
@@ -5044,6 +5059,13 @@ mod tests {
             Some(&b"v".to_vec())
         );
         assert!(effects.kv_deletes.contains(&b"app/stale".to_vec()));
+        let replayed: Vec<_> = effects
+            .enqueues
+            .iter()
+            .filter(|request| request.queue == "app-requests")
+            .collect();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].payload, b"request");
         queue.ack_with(&job, effects).await.unwrap();
         assert_eq!(
             queue

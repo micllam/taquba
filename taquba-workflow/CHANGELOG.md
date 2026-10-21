@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SubmitEntry` and `CancelRunEntry`, so another process submits and cancels
   runs through a `taquba::InboxSender`. An entry identifies the runtime by its
   `queue` field, `DEFAULT_QUEUE_NAME` by default.
+- `EffectsHandle::enqueue`: a step stages an enqueue that commits with its
+  settlement.
 
 ### Changed
 

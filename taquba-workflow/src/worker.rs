@@ -321,7 +321,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         // its own token is not treated as an external cancellation below.
         let claim_cancel = lease.cancel_token().clone();
 
-        let effects_handle = EffectsHandle::for_delivery();
+        let effects_handle = EffectsHandle::for_delivery(&self.core.queue_name);
         let step = Step {
             delivery: Delivery {
                 run_id: run_id.clone(),
@@ -390,8 +390,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             // runner's outcome. The staged effects describe that outcome and
             // are discarded with it. A runner-issued Cancel keeps its effects.
             if runner_cancelled || !external_cancel {
-                effects.kv_writes.extend(caller_effects.writes);
-                effects.kv_deletes.extend(caller_effects.deletes);
+                caller_effects.add_to(&mut effects);
             }
             effects
         })

@@ -2,24 +2,24 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use taquba::{EnqueueRequest, SettlementEffects};
+use taquba::{EnqueueEntry, EnqueueRequest, SettlementEffects};
 
 use crate::error::{Error, Result};
 use crate::keys::{check_enqueue, check_kv_key};
 
-/// Application KV effects staged during a step, applied in the same transaction
-/// as the settlement that commits the step's outcome.
+/// Application KV effects and enqueues staged during a step, applied in the
+/// same transaction as the settlement that commits the step's outcome.
 ///
-/// Obtained through [`Delivery::effects`](crate::Delivery::effects). Writes and
-/// deletes staged here are applied atomically with the acknowledgement of the
-/// [`StepOutcome`](crate::StepOutcome) the runner returns (`Continue`,
-/// `Succeed`, `Fail` and `Cancel`): either the settlement and every staged
-/// effect commit together or none of them do. Delivery is at-least-once, so a
-/// retried step stages its effects again and every staged value must be correct
-/// when applied more than once. No effects are applied when the runner returns
-/// a [`StepError`](crate::StepError) or when an external
-/// [`WorkflowRuntime::cancel`](crate::WorkflowRuntime::cancel) overrides the
-/// runner's outcome.
+/// Obtained through [`Delivery::effects`](crate::Delivery::effects). Writes,
+/// deletes and enqueues staged here are applied atomically with the
+/// acknowledgement of the [`StepOutcome`](crate::StepOutcome) the runner
+/// returns (`Continue`, `Succeed`, `Fail` and `Cancel`): either the settlement
+/// and every staged effect commit together or none of them do. Delivery is
+/// at-least-once, so a retried step stages its effects again and every staged
+/// value must be correct when applied more than once. No effects are applied
+/// when the runner returns a [`StepError`](crate::StepError) or when an
+/// external [`WorkflowRuntime::cancel`](crate::WorkflowRuntime::cancel)
+/// overrides the runner's outcome.
 ///
 /// Each operation is validated when it is staged: keys must not start with the
 /// reserved `workflow/` prefix
@@ -41,9 +41,20 @@ pub struct EffectsHandle {
 struct EffectsState {
     staged: StagedEffects,
     sealed: bool,
+    /// The queue of the runtime, `None` for a detached handle.
+    runtime_queue: Option<String>,
 }
 
 impl EffectsState {
+    /// The state of a handle for a delivery of the runtime with the queue
+    /// `runtime_queue`.
+    fn for_delivery(runtime_queue: &str) -> Self {
+        Self {
+            runtime_queue: Some(runtime_queue.to_string()),
+            ..Self::default()
+        }
+    }
+
     fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         self.check_key(&key)?;
         if value.len() > taquba::MAX_KV_VALUE_SIZE {
@@ -74,6 +85,15 @@ impl EffectsState {
         Ok(())
     }
 
+    fn enqueue(&mut self, request: EnqueueRequest) -> Result<()> {
+        if self.sealed {
+            return Err(Error::EffectsSealed);
+        }
+        check_enqueue(&request, self.runtime_queue.as_deref())?;
+        self.staged.enqueues.push(request.into());
+        Ok(())
+    }
+
     fn check_key(&self, key: &[u8]) -> Result<()> {
         if self.sealed {
             return Err(Error::EffectsSealed);
@@ -82,12 +102,25 @@ impl EffectsState {
     }
 }
 
-/// Writes and deletes accumulated by an [`EffectsHandle`]. Stored in the
-/// step-output replay record so a replayed delivery applies the same effects.
+/// Writes, deletes and enqueues accumulated by an [`EffectsHandle`]. Stored in
+/// the step-output replay record so a replayed delivery applies the same
+/// effects.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct StagedEffects {
     pub(crate) writes: HashMap<Vec<u8>, Vec<u8>>,
     pub(crate) deletes: HashSet<Vec<u8>>,
+    pub(crate) enqueues: Vec<EnqueueEntry>,
+}
+
+impl StagedEffects {
+    /// Add the staged effects to `effects`.
+    pub(crate) fn add_to(self, effects: &mut SettlementEffects) {
+        effects.kv_writes.extend(self.writes);
+        effects.kv_deletes.extend(self.deletes);
+        effects
+            .enqueues
+            .extend(self.enqueues.into_iter().map(EnqueueRequest::from));
+    }
 }
 
 impl EffectsHandle {
@@ -96,12 +129,15 @@ impl EffectsHandle {
     /// effects like a delivery-bound one, is never sealed and its staged
     /// effects are never applied.
     pub fn detached() -> Self {
-        Self::for_delivery()
-    }
-
-    pub(crate) fn for_delivery() -> Self {
         Self {
             inner: Arc::new(Mutex::new(EffectsState::default())),
+        }
+    }
+
+    /// A handle for a delivery of the runtime with the queue `runtime_queue`.
+    pub(crate) fn for_delivery(runtime_queue: &str) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(EffectsState::for_delivery(runtime_queue))),
         }
     }
 
@@ -127,6 +163,18 @@ impl EffectsHandle {
     /// a write and [`Error::EffectsSealed`] when the step returned.
     pub fn delete(&self, key: impl Into<Vec<u8>>) -> Result<()> {
         self.inner.lock().unwrap().delete(key.into())
+    }
+
+    /// Stage an enqueue, committed in the settlement of the step.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::EffectsSealed`] when the step returned,
+    /// [`Error::ReservedHeader`] when a header of `request` starts with the
+    /// reserved `workflow.*` prefix and [`Error::ReservedQueue`] when `request`
+    /// targets the queue of the runtime.
+    pub fn enqueue(&self, request: EnqueueRequest) -> Result<()> {
+        self.inner.lock().unwrap().enqueue(request)
     }
 
     /// Seal the handle and move out everything staged. An effect staged after
@@ -265,6 +313,7 @@ fn display_key(key: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use taquba::EnqueueOptions;
 
     #[test]
     fn staging_validates_keys_values_and_conflicts() {
@@ -292,11 +341,28 @@ mod tests {
             handle.put("b", "v"),
             Err(Error::ConflictingKvEffect(_))
         ));
+        let request = |queue: &str, header: &str| EnqueueRequest {
+            queue: queue.to_string(),
+            payload: Vec::new(),
+            options: EnqueueOptions::default()
+                .headers(HashMap::from([(header.to_string(), String::new())])),
+        };
+        let bound = EffectsHandle::for_delivery("workflow-steps");
+        assert!(matches!(
+            bound.enqueue(request("workflow-steps", "h")),
+            Err(Error::ReservedQueue(_))
+        ));
+        assert!(matches!(
+            bound.enqueue(request("other", "workflow.x")),
+            Err(Error::ReservedHeader(_))
+        ));
+        bound.enqueue(request("other", "h")).unwrap();
+        handle.enqueue(request("workflow-steps", "h")).unwrap();
     }
 
     #[test]
     fn a_clone_stages_into_the_shared_accumulator_until_the_seal() {
-        let handle = EffectsHandle::for_delivery();
+        let handle = EffectsHandle::for_delivery("workflow-steps");
         let clone = handle.clone();
         clone.put("a", "v").unwrap();
         clone.delete("b").unwrap();
@@ -305,6 +371,12 @@ mod tests {
         assert!(staged.deletes.contains(b"b".as_slice()));
         assert!(matches!(clone.put("c", "v"), Err(Error::EffectsSealed)));
         assert!(matches!(clone.delete("c"), Err(Error::EffectsSealed)));
+        let request = EnqueueRequest {
+            queue: "other".to_string(),
+            payload: Vec::new(),
+            options: EnqueueOptions::default(),
+        };
+        assert!(matches!(clone.enqueue(request), Err(Error::EffectsSealed)));
     }
 
     #[test]
