@@ -185,11 +185,15 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
+  # Audits the resolution a consumer gets, since no lockfile is published.
   advisories:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve every dependency to its newest compatible version
+        run: cargo update
       # A prebuilt binary.
       - uses: taiki-e/install-action@v2
         with:
