@@ -15,7 +15,7 @@
 //!
 //! - The reply key is `replies/{run_id}/{step}`, so a step delivered
 //!   twice issues two requests whose replies overwrite each other.
-//! - The step stages a pending marker, `remote/pending/{correlation_key}`
+//! - The step stages a pending marker, `remote/pending/{signal_key}`
 //!   with the reply key as its value, through `Delivery::effects`. The
 //!   marker commits in the settlement that registers the waiter, so the
 //!   watcher never sees a marker without a waiter, and a step that fails
@@ -40,10 +40,10 @@ use std::time::Duration;
 
 use futures_util::TryStreamExt;
 use taquba::object_store::{ObjectStore, ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
-use taquba::{KvOrder, Queue};
+use taquba::{KvOrder, Queue, SignalOutcome};
 use taquba_workflow::{
-    RunId, RunOutcome, RunSpec, SignalOutcome, Step, StepError, StepOutcome, StepRunner,
-    TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
+    RunId, RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects,
+    TerminalHook, TerminalStatus, WorkflowRuntime,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -53,14 +53,14 @@ const WATCH_INTERVAL: Duration = Duration::from_millis(500);
 const REMOTE_WORK: Duration = Duration::from_secs(2);
 const PENDING_PREFIX: &[u8] = b"remote/pending/";
 
-/// Correlation key of the wait a step registers for its reply.
-fn correlation_key(run_id: &str, step_number: u32) -> String {
+/// Signal key of the wait a step registers for its reply.
+fn signal_key(run_id: &str, step_number: u32) -> String {
     format!("remote:{run_id}:{step_number}")
 }
 
-/// KV key of the pending marker for a correlation key.
-fn pending_marker(correlation_key: &str) -> Vec<u8> {
-    [PENDING_PREFIX, correlation_key.as_bytes()].concat()
+/// KV key of the pending marker for a signal key.
+fn pending_marker(signal_key: &str) -> Vec<u8> {
+    [PENDING_PREFIX, signal_key.as_bytes()].concat()
 }
 
 /// Object key of the reply for a step, deterministic per run and step.
@@ -93,7 +93,7 @@ impl Dispatcher {
     async fn dispatch(&self, step: &Step) -> Result<StepOutcome, StepError> {
         let text = String::from_utf8_lossy(&step.payload).into_owned();
         let reply_key = reply_key(&step.run_id, step.step_number);
-        let key = correlation_key(&step.run_id, step.step_number);
+        let key = signal_key(&step.run_id, step.step_number);
         println!(
             "[step {}] sending {text:?}; reply expected at {reply_key}",
             step.step_number
@@ -157,14 +157,10 @@ async fn remote_worker(mut requests: mpsc::Receiver<Request>, store: Arc<dyn Obj
 
 /// Turns reply objects into signals. Each poll reads the pending markers and
 /// issues one HEAD per marker.
-async fn watch_replies(
-    queue: Arc<Queue>,
-    store: Arc<dyn ObjectStore>,
-    runtime: WorkflowRuntime<Dispatcher, ShutdownOnTermination>,
-) {
+async fn watch_replies(queue: Arc<Queue>, store: Arc<dyn ObjectStore>) {
     loop {
         tokio::time::sleep(WATCH_INTERVAL).await;
-        if let Err(e) = watch_once(&queue, &store, &runtime).await {
+        if let Err(e) = watch_once(&queue, &store).await {
             println!("[watcher] pass failed: {e}");
         }
     }
@@ -173,7 +169,6 @@ async fn watch_replies(
 async fn watch_once(
     queue: &Queue,
     store: &Arc<dyn ObjectStore>,
-    runtime: &WorkflowRuntime<Dispatcher, ShutdownOnTermination>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut markers = std::pin::pin!(queue.view().kv_entries(
         PENDING_PREFIX,
@@ -189,11 +184,11 @@ async fn watch_once(
             Err(e) => return Err(e.into()),
         }
         let key = String::from_utf8_lossy(&marker[PENDING_PREFIX.len()..]).into_owned();
-        match runtime.signal(&key, reply_key.to_vec()).await? {
+        match queue.signal(&key, reply_key.to_vec()).await? {
             SignalOutcome::Delivered => println!("[watcher] {path} arrived; woke {key}"),
             SignalOutcome::Buffered => {
                 println!("[watcher] {path} arrived after the wait ended; discarding the signal");
-                runtime.clear_signal(&key).await?;
+                queue.clear_signal(&key).await?;
             }
         }
         queue.kv_delete(&marker).await?;
@@ -253,7 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .build()?;
 
     tokio::spawn(remote_worker(inbox, store.clone()));
-    tokio::spawn(watch_replies(queue.clone(), store, runtime.clone()));
+    tokio::spawn(watch_replies(queue.clone(), store));
 
     let outcome = runtime
         .submit(RunSpec {

@@ -22,6 +22,7 @@ use crate::payload_store::PayloadStore;
 use crate::queue_core::{QueueConfigs, QueueCore};
 use crate::reaper::Reaper;
 use crate::scheduler::Scheduler;
+use crate::signal::SignalOutcome;
 use crate::stats::QueueMergeOperator;
 use crate::time_bound::TimeBound;
 use crate::txn::ClaimEnd;
@@ -1078,6 +1079,35 @@ impl Queue {
         wake_payload: Option<Vec<u8>>,
     ) -> Result<WakeOutcome> {
         self.core.wake_scheduled(id, wake_payload).await
+    }
+
+    /// Deliver a signal to the job waiting at `key`, or buffer it.
+    ///
+    /// A scheduled job enqueued with [`EnqueueOptions::signal_key`] set to
+    /// `key` moves to pending before its `run_at`, as [`Self::wake_scheduled`]
+    /// moves it, with `payload` on [`JobRecord::wake_payload`], and the call
+    /// returns [`SignalOutcome::Delivered`]. Without such a job the payload is
+    /// buffered at the key and the call returns [`SignalOutcome::Buffered`].
+    /// The next job enqueued with the key consumes the buffer and is written to
+    /// pending with the payload on its record. One signal is buffered per key,
+    /// and a second signal before consumption replaces the first. A buffered
+    /// signal persists until a job consumes it or [`Self::clear_signal`]
+    /// discards it.
+    ///
+    /// The transition commits in one transaction with the registration of a
+    /// waiter, so a signal and a concurrent enqueue with the key observe one
+    /// order: the enqueue consumes the buffer, or the signal wakes the job.
+    /// [`SettlementEffects::signal`] stages the same transition inside a
+    /// settlement. The commit is durable before the call returns.
+    pub async fn signal(&self, key: &str, payload: Vec<u8>) -> Result<SignalOutcome> {
+        self.core.signal(key, payload).await
+    }
+
+    /// Discard the signal buffered at `key`. Returns `true` when a buffered
+    /// signal was removed, and `false` when none was buffered. The commit is
+    /// durable before the call returns `true`.
+    pub async fn clear_signal(&self, key: &str) -> Result<bool> {
+        self.core.clear_signal(key).await
     }
 
     /// Enqueue multiple jobs atomically in a single transaction.

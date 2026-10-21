@@ -175,10 +175,9 @@ pub struct Step {
     pub payload: Vec<u8>,
     /// The signal payload, when this step was reached through a
     /// [`Trigger::OnSignal`] wait that a signal resolved: the previous step
-    /// continued with `OnSignal`, and a [`crate::WorkflowRuntime::signal`] call
-    /// for the correlation key arrived before the timeout. `None` when the
-    /// timeout elapsed first and on every step not preceded by an `OnSignal`
-    /// wait.
+    /// continued with `OnSignal`, and a [`taquba::Queue::signal`] call for the
+    /// signal key arrived before the timeout. `None` when the timeout elapsed
+    /// first and on every step not preceded by an `OnSignal` wait.
     pub signal: Option<Vec<u8>>,
 }
 
@@ -227,19 +226,21 @@ pub enum Trigger {
     Immediate,
     /// The next step is claimable `Duration` from now.
     After(Duration),
-    /// The next step is claimable when a signal for `correlation_key` arrives
-    /// via [`crate::WorkflowRuntime::signal`], or after `timeout`, whichever
-    /// comes first. The next step reads [`Step::signal`] to distinguish the
-    /// two: `Some(payload)` when a signal arrived, `None` when the timeout
-    /// elapsed first. A signal that arrived before this step settled is
-    /// consumed at settlement and the next step runs immediately.
+    /// The next step is claimable when a signal for `signal_key` arrives via
+    /// [`taquba::Queue::signal`], or after `timeout`, whichever comes first.
+    /// The next step reads [`Step::signal`] to distinguish the two:
+    /// `Some(payload)` when a signal arrived, `None` when the timeout elapsed
+    /// first. A signal that arrived before this step settled is consumed at
+    /// settlement and the next step runs immediately.
     ///
-    /// One waiter per correlation key: registering a second waiter while one is
-    /// already waiting fails the step permanently. Choose keys that are unique
-    /// per waiter, for example by including the run id.
+    /// One waiter per signal key: registering a second waiter while one is
+    /// already waiting fails the step permanently. A key is unique per wait,
+    /// such as a key with the run id in it: the queue keeps a buffered signal
+    /// until a waiter consumes it, so a stale signal at a reused key reaches
+    /// the next waiter at it.
     OnSignal {
         /// Caller-chosen key the signaller addresses.
-        correlation_key: String,
+        signal_key: String,
         /// Upper bound on the wait. When it elapses first, the next step runs
         /// with [`Step::signal`] `None`.
         timeout: Duration,
@@ -317,16 +318,16 @@ impl StepOutcome {
     }
 
     /// Continue the run with the next step claimable when a signal for
-    /// `correlation_key` arrives, or after `timeout` at the latest.
+    /// `signal_key` arrives, or after `timeout` at the latest.
     pub fn continue_on_signal(
         payload: Vec<u8>,
-        correlation_key: impl Into<String>,
+        signal_key: impl Into<String>,
         timeout: Duration,
     ) -> Self {
         Self::Continue {
             payload,
             when: Trigger::OnSignal {
-                correlation_key: correlation_key.into(),
+                signal_key: signal_key.into(),
                 timeout,
             },
         }

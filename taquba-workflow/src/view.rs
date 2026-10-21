@@ -9,7 +9,7 @@ use crate::durable::{
 };
 use crate::error::{Error, Result};
 use crate::group::{self, GroupStatus};
-use crate::keys::{HEADER_SIGNAL_WAIT, RunId, outcome_kv_key, run_kv_key, step_kv_key};
+use crate::keys::{RunId, outcome_kv_key, run_kv_key, step_kv_key};
 use crate::memo::{MemoStore, RUN_RESULT_MEMO_KEY};
 use crate::runtime::{RunEnd, RunState, RunStatus, RunTermination};
 use crate::terminal::{RunOutcome, TerminalStatus};
@@ -201,13 +201,12 @@ impl WorkflowView {
 }
 
 /// The state of a run whose current step's job is scheduled: a wait for a
-/// signal when the job has the [`HEADER_SIGNAL_WAIT`] header, a delay
-/// otherwise.
+/// signal when the job has a signal key, a delay otherwise.
 fn scheduled_state(job: &JobRecord) -> RunState {
     let run_at_ms = job.run_at.unwrap_or_default();
-    match job.headers.get(HEADER_SIGNAL_WAIT) {
-        Some(correlation_key) => RunState::Waiting {
-            correlation_key: correlation_key.clone(),
+    match &job.signal_key {
+        Some(signal_key) => RunState::Waiting {
+            signal_key: signal_key.clone(),
             timeout_at_ms: run_at_ms,
         },
         None => RunState::Scheduled { run_at_ms },

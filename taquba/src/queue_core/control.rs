@@ -92,7 +92,7 @@ impl QueueCore {
                             return Ok((txn, Attempt::Abort(requested)));
                         }
                         job.cancel_requested = true;
-                        txn.move_job(&current_key, &job)?;
+                        txn.move_job(&current_key, &mut job)?;
                         Cancelled::Requested { job }
                     }
                     JobStatus::Done | JobStatus::Dead => {

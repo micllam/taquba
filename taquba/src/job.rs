@@ -85,6 +85,14 @@ pub struct JobRecord {
     /// transitions, so a worker observes it on every delivery of the job.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
     pub wake_payload: Option<Vec<u8>>,
+    /// The signal key the job waits at, set from
+    /// [`EnqueueOptions::signal_key`](crate::EnqueueOptions::signal_key).
+    /// `Some` only while `status == Scheduled`: a signal to the key
+    /// ([`Queue::signal`](crate::Queue::signal)) moves the job to pending with
+    /// [`Self::woken_at`] and [`Self::wake_payload`] set, and the key leaves
+    /// the record with the scheduled state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_key: Option<String>,
     /// Priority bucket. Lower numbers are claimed first. See
     /// [`PRIORITY_HIGH`](crate::PRIORITY_HIGH),
     /// [`PRIORITY_NORMAL`](crate::PRIORITY_NORMAL), and
@@ -247,6 +255,7 @@ impl JobRecord {
             run_at: None,
             woken_at: None,
             wake_payload: None,
+            signal_key: None,
             priority,
             last_error: None,
             dedup_key: None,
@@ -321,6 +330,7 @@ impl JobRecord {
             run_at: self.run_at,
             woken_at: self.woken_at,
             wake_payload: self.wake_payload.clone(),
+            signal_key: self.signal_key.clone(),
             priority: self.priority,
             last_error: self.last_error.clone(),
             dedup_key: self.dedup_key.clone(),

@@ -80,14 +80,6 @@ pub(crate) fn check_effects(effects: &SettlementEffects, runtime_queue: &str) ->
 /// [`TerminalHook`](crate::TerminalHook).
 pub const HEADER_TERMINAL: &str = "workflow.terminal";
 
-/// Header key marking a step job as a signal waiter. The value is the
-/// correlation key the waiter is registered under.
-pub const HEADER_SIGNAL_WAIT: &str = "workflow.signal_wait";
-/// Header key marking a step job whose signal was already consumed at the
-/// previous step's settlement. The payload is read from the durable delivered
-/// record.
-pub const HEADER_SIGNAL_DELIVERED: &str = "workflow.signal_delivered";
-
 /// Header key identifying the group a run is a member of, set on every step job
 /// of a grouped run.
 pub const HEADER_GROUP: &str = "workflow.group";
@@ -109,19 +101,6 @@ pub(crate) const RUN_KV_PREFIX: &[u8] = b"workflow/runs/";
 /// enqueue, rewritten with every advance and deleted with the run's
 /// termination.
 pub(crate) const STEP_KV_PREFIX: &[u8] = b"workflow/steps/";
-
-/// Prefix for the durable waiter index: `correlation key -> job id` of the step
-/// job waiting on that key.
-pub(crate) const SIGNAL_WAIT_KV_PREFIX: &[u8] = b"workflow/signal-wait/";
-
-/// Prefix for the durable signal buffer: `correlation key -> payload` of a
-/// signal that arrived while no waiter was registered.
-pub(crate) const SIGNAL_BUF_KV_PREFIX: &[u8] = b"workflow/signal-buf/";
-
-/// Prefix for the durable delivered record: `(run id, step) -> payload` of a
-/// signal consumed on the waiter's behalf, read when that step is claimed and
-/// deleted with its settlement.
-pub(crate) const SIGNAL_DELIVERED_KV_PREFIX: &[u8] = b"workflow/signal-delivered/";
 
 /// Prefix of the terminal markers of runs, read by the memo retention sweep:
 /// entries of a [`taquba::ExpiryIndex`] with the run id as the suffix.
@@ -314,21 +293,6 @@ pub(crate) fn outcome_kv_key(run_id: &RunId) -> Vec<u8> {
     prefixed(OUTCOME_KV_PREFIX, run_id)
 }
 
-pub(crate) fn signal_wait_kv_key(correlation_key: &str) -> Vec<u8> {
-    prefixed(SIGNAL_WAIT_KV_PREFIX, correlation_key)
-}
-
-pub(crate) fn signal_buf_kv_key(correlation_key: &str) -> Vec<u8> {
-    prefixed(SIGNAL_BUF_KV_PREFIX, correlation_key)
-}
-
-pub(crate) fn signal_delivered_kv_key(run_id: &RunId, step_number: u32) -> Vec<u8> {
-    prefixed(
-        SIGNAL_DELIVERED_KV_PREFIX,
-        &format!("{run_id}/{step_number}"),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,9 +302,6 @@ mod tests {
         for prefix in [
             RUN_KV_PREFIX,
             STEP_KV_PREFIX,
-            SIGNAL_WAIT_KV_PREFIX,
-            SIGNAL_BUF_KV_PREFIX,
-            SIGNAL_DELIVERED_KV_PREFIX,
             TERMINAL_KV_PREFIX,
             OUTCOME_KV_PREFIX,
             GROUP_KV_PREFIX,

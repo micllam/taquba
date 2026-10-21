@@ -88,6 +88,25 @@ pub enum Error {
         id: String,
     },
 
+    /// A [`crate::EnqueueOptions::signal_key`] is empty or was supplied without
+    /// a `run_at`. The enqueue is rejected before any state is written.
+    #[error("invalid signal key `{key}`: {reason}")]
+    InvalidSignalKey {
+        /// The rejected key.
+        key: String,
+        /// Why it was rejected.
+        reason: &'static str,
+    },
+
+    /// An enqueue with a [`crate::EnqueueOptions::signal_key`] found a
+    /// scheduled job waiting at the key. One waiter per key: the enqueue is
+    /// rejected without a write, and the effects of the enqueue do not apply.
+    #[error("a job is waiting at signal key `{key}`")]
+    SignalWaiterExists {
+        /// The key with a live waiter.
+        key: String,
+    },
+
     /// A queue name failed validation. Queue names are limited to
     /// [`crate::MAX_QUEUE_NAME_LEN`] bytes by the key encoding and are rejected
     /// at the API boundary before any state is written.
@@ -172,6 +191,8 @@ impl Error {
             | Self::ConflictingKvEffect { .. }
             | Self::InvalidId { .. }
             | Self::DuplicateJobId { .. }
+            | Self::InvalidSignalKey { .. }
+            | Self::SignalWaiterExists { .. }
             | Self::InvalidQueueName { .. }
             | Self::PayloadMissing { .. }
             | Self::InvalidStoreUrl { .. } => true,
@@ -203,6 +224,14 @@ mod tests {
             .is_permanent()
         );
         assert!(Error::DuplicateJobId { id: "job-1".into() }.is_permanent());
+        assert!(
+            Error::InvalidSignalKey {
+                key: String::new(),
+                reason: "empty",
+            }
+            .is_permanent()
+        );
+        assert!(Error::SignalWaiterExists { key: "k".into() }.is_permanent());
         assert!(
             Error::InvalidStoreUrl {
                 url: "x".into(),

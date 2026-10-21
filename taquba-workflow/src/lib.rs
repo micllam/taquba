@@ -75,7 +75,7 @@
 //!
 //! | Outcome | Effect |
 //! |---|---|
-//! | [`StepOutcome::Continue`]` { payload, when }` | Enqueue the next step. `when` (a [`Trigger`]) decides when it becomes claimable: [`Trigger::Immediate`], [`Trigger::After`]`(delay)` or [`Trigger::OnSignal`]` { correlation_key, timeout }`. Constructors: [`StepOutcome::continue_now`], [`StepOutcome::continue_after`], [`StepOutcome::continue_on_signal`]. |
+//! | [`StepOutcome::Continue`]` { payload, when }` | Enqueue the next step. `when` (a [`Trigger`]) decides when it becomes claimable: [`Trigger::Immediate`], [`Trigger::After`]`(delay)` or [`Trigger::OnSignal`]` { signal_key, timeout }`. Constructors: [`StepOutcome::continue_now`], [`StepOutcome::continue_after`], [`StepOutcome::continue_on_signal`]. |
 //! | [`StepOutcome::Succeed`]` { result }` | Ack, and the terminal hook observes [`TerminalStatus::Succeeded`]. |
 //! | [`StepOutcome::Fail`]` { reason }` | Ack, and the terminal hook observes [`TerminalStatus::Failed`]. A failure decided by the runner: no dead-letter. |
 //! | [`StepOutcome::Cancel`]` { reason }` | Ack, and the terminal hook observes [`TerminalStatus::Cancelled`]. A cancellation decided by the runner: no dead-letter. |
@@ -201,10 +201,10 @@
 //!
 //! A step can pause the rest of its run until an external event. Returning
 //! [`StepOutcome::continue_on_signal`] (a [`Trigger::OnSignal`]) defers the
-//! next step until a signal for the chosen correlation key arrives via
-//! [`WorkflowRuntime::signal`], or until the timeout elapses. The next step
-//! reads [`Step::signal`]: `Some(payload)` when a signal arrived, `None` when
-//! the timeout fired. The natural fit is a run that waits for an approval, a
+//! next step until a signal for the chosen signal key arrives via
+//! [`taquba::Queue::signal`], or until the timeout elapses. The next step reads
+//! [`Step::signal`]: `Some(payload)` when a signal arrived, `None` when the
+//! timeout fired. The natural fit is a run that waits for an approval, a
 //! webhook callback or another run's completion, with the timeout as the
 //! escalation path.
 //!
@@ -217,31 +217,31 @@
 //!     Duration::from_secs(7 * 24 * 3600),
 //! ))
 //!
-//! // In the webhook handler (same process):
-//! match runtime.signal(&format!("payment:{order_id}"), body).await? {
+//! // In the webhook handler:
+//! match queue.signal(&format!("payment:{order_id}"), body).await? {
 //!     SignalOutcome::Delivered => { /* a waiting run was woken */ }
 //!     SignalOutcome::Buffered => { /* held for the next waiter */ }
 //! }
 //! ```
 //!
 //! Signals are durable in both directions. The waiting step is a scheduled job
-//! in the store, so the wait persists across restarts and does not occupy a
-//! worker while pending. A signal without a registered waiter is buffered
-//! durably for its correlation key and consumed by the next waiter registered
-//! for it, so a signal that arrives before its waiter is not lost.
-//! [`WorkflowRuntime::clear_signal`] discards a buffered signal that is no
-//! longer wanted. A waiting run resumes under the runner hosted by the resuming
-//! process, so a runner changed while the run waits is the caller's
-//! compatibility concern.
+//! in the store, indexed at the key through [`taquba::JobRecord::signal_key`],
+//! so the wait persists across restarts and does not occupy a worker while
+//! pending. A signal without a registered waiter is buffered durably at its key
+//! and consumed by the next waiter registered for it, so a signal that arrives
+//! before its waiter is not lost. [`taquba::Queue::clear_signal`] discards a
+//! buffered signal that is no longer wanted. A waiting run resumes under the
+//! runner hosted by the resuming process, so a runner changed while the run
+//! waits is the caller's compatibility concern.
 //!
 //! Delivery follows the crate's at-least-once model: the woken step can be
 //! redelivered and observes the same [`Step::signal`] value on every attempt.
-//! One buffered signal is held per correlation key, and a second signal before
-//! consumption replaces the first. One waiter is allowed per correlation key.
+//! One buffered signal is held per signal key, and a second signal before
+//! consumption replaces the first. One waiter is allowed per signal key.
 //! Registering a second one fails that run, so choose keys unique to the waiter
-//! (include the run id if uniqueness is uncertain). Signals are scoped to the
-//! store: the signaller is the same process that hosts the runtime, per the
-//! single-process design.
+//! (include the run id if uniqueness is uncertain). A terminal hook stages a
+//! signal to another run with [`TerminalEffects::signal`], committed with the
+//! termination.
 //!
 //! See `examples/durable_approvals.rs` for a runnable approval flow covering
 //! all three delivery paths (signal, timeout and buffered) across process
@@ -628,8 +628,8 @@ pub use effects::{EffectsHandle, TerminalEffects};
 pub use error::{Error, Result};
 pub use group::{GroupMember, GroupStatus, MemberResult, RunGroup};
 pub use keys::{
-    HEADER_RUN_ID, HEADER_SIGNAL_DELIVERED, HEADER_SIGNAL_WAIT, HEADER_STEP, HEADER_TERMINAL,
-    MAX_RUN_ID_LEN, RESERVED_HEADER_PREFIX, RESERVED_KV_PREFIX, RunId,
+    HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, MAX_RUN_ID_LEN, RESERVED_HEADER_PREFIX,
+    RESERVED_KV_PREFIX, RunId,
 };
 pub use kv::KvReadHandle;
 pub use memo::{Memo, MemoStore};
@@ -638,7 +638,6 @@ pub use runtime::{
     RunEnd, RunOptions, RunSpec, RunState, RunStatus, RunTermination, RunnerHandle, StepRef,
     SubmitOutcome, WorkflowRuntime, WorkflowRuntimeBuilder,
 };
-pub use signal::SignalOutcome;
 #[cfg(feature = "webhooks")]
 pub use terminal::WebhookTerminalHook;
 pub use terminal::{NoopTerminalHook, RunOutcome, TerminalHook, TerminalStatus};

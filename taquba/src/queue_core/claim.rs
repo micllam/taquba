@@ -162,7 +162,7 @@ impl QueueCore {
                 // to a *different* job, which corrupts the dedup invariant.
                 let dedup_key_to_release = job.dedup_key.take();
                 let claim_id = new_claim_id();
-                txn.move_job(&kv.key, &job)?;
+                txn.move_job(&kv.key, &mut job)?;
                 // A cancellation requested during an earlier claim of the job
                 // is persisted on the record and fires this claim's token
                 // immediately.
@@ -248,7 +248,7 @@ impl QueueCore {
                     // cannot release another job's index entry.
                     let dedup_key_to_release = job.dedup_key.take();
                     let claim_id = new_claim_id();
-                    txn.move_job(&current_key, &job)?;
+                    txn.move_job(&current_key, &mut job)?;
                     let cancel = tokio_util::sync::CancellationToken::new();
                     if job.cancel_requested {
                         cancel.cancel();

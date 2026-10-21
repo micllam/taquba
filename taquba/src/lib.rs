@@ -100,6 +100,9 @@
 //! - Scheduled jobs become pending at their `run_at`, or earlier via the
 //!   targeted [`Queue::wake_scheduled`], which can attach bytes the worker
 //!   observes on delivery.
+//! - A scheduled job enqueued with [`EnqueueOptions::signal_key`] waits at the
+//!   key: [`Queue::signal`] wakes it with a payload, or buffers the signal for
+//!   the next job enqueued with the key.
 //! - Bounded dead-letter retention with paginated inspection.
 //!
 //! # Worker loop
@@ -466,6 +469,7 @@ mod queue_core;
 mod reader;
 mod reaper;
 mod scheduler;
+mod signal;
 mod stats;
 mod store_url;
 #[cfg(test)]
@@ -498,6 +502,7 @@ pub use queue::{
     WakeOutcome,
 };
 pub use reader::{QueueReader, ReaderMode, ReaderOptions};
+pub use signal::SignalOutcome;
 pub use stats::QueueStats;
 pub use store_url::open_url;
 pub use view::QueueView;

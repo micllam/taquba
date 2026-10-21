@@ -29,8 +29,8 @@
 //!
 //! The timeout runs on wall clock through downtime. A run that waits longer
 //! than the timeout escalates at the next open, and a decision delivered after
-//! that is buffered for a correlation key no waiter will consume. The `clear`
-//! mode discards such a buffered decision.
+//! that is buffered at a signal key no waiter will consume. The `clear` mode
+//! discards such a buffered decision.
 //!
 //! State lives under `/tmp/taquba-durable-approvals-example`. Remove the
 //! directory to discard the run and start over.
@@ -39,11 +39,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use taquba::Queue;
 use taquba::object_store::local::LocalFileSystem;
+use taquba::{Queue, SignalOutcome};
 use taquba_workflow::{
-    RunId, RunOutcome, RunSpec, SignalOutcome, Step, StepError, StepOutcome, StepRunner,
-    TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
+    RunId, RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects,
+    TerminalHook, TerminalStatus, WorkflowRuntime,
 };
 use tokio::sync::oneshot;
 
@@ -52,7 +52,7 @@ const RUN_ID: &str = "refund-claim-4021";
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const EVIDENCE_TURNS: usize = 3;
 
-/// Correlation key for the run's approval signal.
+/// Signal key of the run's approval.
 fn approval_key(run_id: &str) -> String {
     format!("approval:{run_id}")
 }
@@ -246,13 +246,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match mode {
         Mode::Clear => {
-            if runtime.clear_signal(&approval_key(RUN_ID)).await? {
+            if queue.clear_signal(&approval_key(RUN_ID)).await? {
                 println!("discarded a buffered decision");
             } else {
                 println!("no buffered decision to discard");
             }
         }
-        Mode::Decide(payload) => match runtime.signal(&approval_key(RUN_ID), payload).await? {
+        Mode::Decide(payload) => match queue.signal(&approval_key(RUN_ID), payload).await? {
             SignalOutcome::Delivered => {
                 println!("decision delivered; resuming the run");
                 runtime

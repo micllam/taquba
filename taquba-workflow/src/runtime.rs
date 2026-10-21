@@ -59,6 +59,8 @@ pub(crate) struct StepEnqueueOpts {
     pub(crate) priority: Option<u32>,
     /// Per-step `max_attempts` override.
     pub(crate) max_attempts: Option<u32>,
+    /// The signal key the step waits at until `run_at`.
+    pub(crate) signal_key: Option<String>,
     /// Additional runtime-owned reserved headers for the step job.
     pub(crate) reserved_headers: Vec<(&'static str, String)>,
 }
@@ -169,12 +171,12 @@ pub enum RunState {
         /// The time from which a worker can claim the job.
         run_at_ms: u64,
     },
-    /// The current step is waiting for a signal under `correlation_key`
+    /// The current step is waiting for a signal at `signal_key`
     /// ([`Trigger::OnSignal`]), and becomes claimable at `timeout_at_ms`
     /// without one.
     Waiting {
-        /// The key that [`WorkflowRuntime::signal`] delivers to.
-        correlation_key: String,
+        /// The key that [`taquba::Queue::signal`] delivers to.
+        signal_key: String,
         /// The end of the wait without a signal, as a Unix timestamp in
         /// milliseconds.
         timeout_at_ms: u64,
@@ -803,6 +805,7 @@ impl RuntimeCore {
             run_at: spec.options.run_at,
             priority: spec.options.priority,
             max_attempts: spec.options.max_attempts_per_step,
+            signal_key: None,
             reserved_headers: membership
                 .map(Membership::reserved_headers)
                 .unwrap_or_default(),
@@ -1184,7 +1187,8 @@ impl RuntimeCore {
                 .priority(opts.priority)
                 .max_attempts(opts.max_attempts)
                 .dedup_key(Some(format!("{DEDUP_PREFIX}{run_id}:{step_number}")))
-                .id_override(Some(job_id.clone())),
+                .id_override(Some(job_id.clone()))
+                .signal_key(opts.signal_key),
         };
         (request, job_id)
     }
@@ -1320,10 +1324,9 @@ mod tests {
     use crate::durable::DurableMember;
     use crate::effects::{EffectsHandle, TerminalEffects};
     use crate::group::GroupMember;
+    use crate::keys::TERMINAL_KV_PREFIX;
     use crate::keys::group_member_kv_key;
-    use crate::keys::{TERMINAL_KV_PREFIX, signal_buf_kv_key, signal_wait_kv_key};
     use crate::runner::{Step, StepError};
-    use crate::signal::SignalOutcome;
     use crate::terminal::NoopTerminalHook;
     use crate::terminal::TerminalStatus;
     use crate::test_util::{
@@ -1335,7 +1338,7 @@ mod tests {
     use taquba::object_store::ObjectStoreExt;
     use taquba::object_store::memory::InMemory;
     use taquba::{Expired, ExpiryIndex};
-    use taquba::{LeaseHandle, MockClock, OpenOptions, QueueConfig, QueueReader};
+    use taquba::{LeaseHandle, MockClock, OpenOptions, QueueConfig, QueueReader, SignalOutcome};
     use tokio::sync::oneshot;
 
     /// Recording terminal hook backed by an mpsc channel.
@@ -1754,10 +1757,10 @@ mod tests {
 
     type ObservedSignals = Arc<StdMutex<Vec<Option<Vec<u8>>>>>;
 
-    /// Two-step runner: step 0 continues with a signal wait on
-    /// `correlation_key`, step 1 records [`Step::signal`] and succeeds.
+    /// Two-step runner: step 0 continues with a signal wait at `signal_key`,
+    /// step 1 records [`Step::signal`] and succeeds.
     struct SignalProbe {
-        correlation_key: String,
+        signal_key: String,
         timeout: Duration,
         observed: ObservedSignals,
     }
@@ -1767,7 +1770,7 @@ mod tests {
             if step.step_number == 0 {
                 Ok(StepOutcome::continue_on_signal(
                     Vec::new(),
-                    self.correlation_key.clone(),
+                    self.signal_key.clone(),
                     self.timeout,
                 ))
             } else {
@@ -1797,7 +1800,7 @@ mod tests {
     fn signal_probe_runtime(
         queue: Arc<Queue>,
         store: Arc<dyn taquba::object_store::ObjectStore>,
-        correlation_key: &str,
+        signal_key: &str,
         timeout: Duration,
     ) -> (
         WorkflowRuntime<SignalProbe, ChannelHook>,
@@ -1810,7 +1813,7 @@ mod tests {
             queue,
             store,
             SignalProbe {
-                correlation_key: correlation_key.to_string(),
+                signal_key: signal_key.to_string(),
                 timeout,
                 observed: observed.clone(),
             },
@@ -1839,12 +1842,12 @@ mod tests {
         assert_eq!(
             runtime.status(&handle.run_id).await.unwrap().unwrap().state,
             RunState::Waiting {
-                correlation_key: "order-1".to_string(),
+                signal_key: "order-1".to_string(),
                 timeout_at_ms: 1_700_000_000_000 + 3_600_000,
             }
         );
 
-        let outcome = runtime.signal("order-1", b"paid".to_vec()).await.unwrap();
+        let outcome = queue.signal("order-1", b"paid".to_vec()).await.unwrap();
         assert_eq!(outcome, SignalOutcome::Delivered);
 
         // The run completes without the timeout elapsing on the mock clock.
@@ -1857,24 +1860,8 @@ mod tests {
             observed.lock().unwrap().as_slice(),
             &[Some(b"paid".to_vec())]
         );
-
-        // Both durable signal entries are consumed.
-        assert!(
-            queue
-                .view()
-                .kv_get(&signal_wait_kv_key("order-1"))
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            queue
-                .view()
-                .kv_get(&signal_buf_kv_key("order-1"))
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert_eq!(queue.view().signal_waiter("order-1").await.unwrap(), None);
+        assert!(!queue.clear_signal("order-1").await.unwrap());
 
         let _ = shutdown.send(());
     }
@@ -1944,7 +1931,7 @@ mod tests {
             signal_probe_runtime(queue.clone(), store, "approval", Duration::from_secs(3600));
         let shutdown = spawn_runtime(runtime.clone());
 
-        let delivery = runtime
+        let delivery = queue
             .signal("approval", b"approved".to_vec())
             .await
             .unwrap();
@@ -1987,15 +1974,7 @@ mod tests {
             .unwrap();
         assert_eq!(terminal.status, TerminalStatus::Succeeded);
         assert_eq!(observed.lock().unwrap().as_slice(), &[None]);
-
-        assert!(
-            queue
-                .view()
-                .kv_get(&signal_wait_kv_key("order-2"))
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert_eq!(queue.view().signal_waiter("order-2").await.unwrap(), None);
 
         let _ = shutdown.send(());
     }
@@ -2008,11 +1987,11 @@ mod tests {
         let shutdown = spawn_runtime(runtime.clone());
 
         assert_eq!(
-            runtime.signal("order-3", b"first".to_vec()).await.unwrap(),
+            queue.signal("order-3", b"first".to_vec()).await.unwrap(),
             SignalOutcome::Buffered
         );
         assert_eq!(
-            runtime.signal("order-3", b"second".to_vec()).await.unwrap(),
+            queue.signal("order-3", b"second".to_vec()).await.unwrap(),
             SignalOutcome::Buffered
         );
 
@@ -2035,39 +2014,9 @@ mod tests {
             observed.lock().unwrap().as_slice(),
             &[Some(b"second".to_vec())]
         );
-
-        assert!(
-            queue
-                .view()
-                .kv_get(&signal_buf_kv_key("order-3"))
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(!queue.clear_signal("order-3").await.unwrap());
 
         let _ = shutdown.send(());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn clear_signal_discards_buffered_signal() {
-        let (queue, store, _clock) = open_queue_at(1_700_000_000_000).await;
-        let (runtime, _observed, _rx) =
-            signal_probe_runtime(queue.clone(), store, "order-5", Duration::from_secs(60));
-
-        assert_eq!(
-            runtime.signal("order-5", b"stale".to_vec()).await.unwrap(),
-            SignalOutcome::Buffered
-        );
-        assert!(runtime.clear_signal("order-5").await.unwrap());
-        assert!(!runtime.clear_signal("order-5").await.unwrap());
-        assert!(
-            queue
-                .view()
-                .kv_get(&signal_buf_kv_key("order-5"))
-                .await
-                .unwrap()
-                .is_none()
-        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2136,45 +2085,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn buffered_signal_missed_by_the_wake_is_delivered_at_timeout() {
-        let (queue, store, clock) = open_queue_at(1_700_000_000_000).await;
-        let (runtime, observed, mut rx) =
-            signal_probe_runtime(queue.clone(), store, "order-7", Duration::from_secs(60));
-        let shutdown = spawn_runtime(runtime.clone());
-
-        runtime
-            .submit(RunSpec {
-                input: Vec::new(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        wait_for_scheduled(&queue, 1).await;
-
-        // A signal that was buffered without winning the wake (written directly
-        // to simulate the settling-registration window).
-        queue
-            .kv_put(&signal_buf_kv_key("order-7"), b"late")
-            .await
-            .unwrap();
-
-        advance(&clock, Duration::from_secs(61)).await;
-        queue.promote_scheduled_now().await.unwrap();
-
-        let terminal = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(terminal.status, TerminalStatus::Succeeded);
-        assert_eq!(
-            observed.lock().unwrap().as_slice(),
-            &[Some(b"late".to_vec())]
-        );
-
-        let _ = shutdown.send(());
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn cancelled_waiter_leaves_no_live_index_for_the_next_signal() {
         let (queue, store, _clock) = open_queue_at(1_700_000_000_000).await;
         let (runtime, _observed, mut rx) =
@@ -2197,18 +2107,11 @@ mod tests {
             .unwrap();
         assert_eq!(terminal.status, TerminalStatus::Cancelled);
 
-        // The signal finds only a stale index entry, removes it and buffers.
+        // The cancellation ended the wait, so the signal is buffered.
+        assert_eq!(queue.view().signal_waiter("order-8").await.unwrap(), None);
         assert_eq!(
-            runtime.signal("order-8", b"orphan".to_vec()).await.unwrap(),
+            queue.signal("order-8", b"orphan".to_vec()).await.unwrap(),
             SignalOutcome::Buffered
-        );
-        assert!(
-            queue
-                .view()
-                .kv_get(&signal_wait_kv_key("order-8"))
-                .await
-                .unwrap()
-                .is_none()
         );
 
         let _ = shutdown.send(());

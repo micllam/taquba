@@ -21,6 +21,7 @@ use crate::kv::KvReadHandle;
 use crate::runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 use crate::runtime::StepRef;
 use crate::runtime::{RuntimeCore, RuntimeInner, StepEnqueueOpts};
+use crate::signal::step_signal;
 use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
 
 /// The [`Worker`] of a runtime: every claimed job of the runtime's queue is
@@ -94,18 +95,9 @@ impl<'a> ClaimedStep<'a> {
             run_at: None,
             priority: Some(self.job.priority),
             max_attempts: Some(self.job.max_attempts),
+            signal_key: None,
             reserved_headers: self.reserved_headers_with_none(),
         }
-    }
-
-    /// The reserved headers of the next step: the membership's, plus `header`.
-    pub(crate) fn reserved_headers_with(
-        &self,
-        header: (&'static str, String),
-    ) -> Vec<(&'static str, String)> {
-        let mut headers = self.reserved_headers_with_none();
-        headers.push(header);
-        headers
     }
 
     fn reserved_headers_with_none(&self) -> Vec<(&'static str, String)> {
@@ -227,10 +219,10 @@ impl RuntimeCore {
                     Ok(self.advance(claimed, payload, opts).await)
                 }
                 Trigger::OnSignal {
-                    correlation_key,
+                    signal_key,
                     timeout,
                 } => {
-                    self.advance_on_signal(claimed, payload, &correlation_key, timeout, input_hash)
+                    self.advance_on_signal(claimed, payload, &signal_key, timeout, input_hash)
                         .await
                 }
             },
@@ -307,12 +299,6 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         let run_id = &claimed.run_id;
         let step_number = claimed.step_number;
 
-        let (step_signal, signal_kv_deletes) = self
-            .core
-            .resolve_step_signal(job, run_id, step_number)
-            .await
-            .map_err(worker_error)?;
-
         // A cancellation requested before this claim is recorded on the run
         // record, and the step is settled as cancelled without running.
         let record = self
@@ -323,12 +309,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .map_err(worker_error)?
             .ok_or_else(|| worker_error(Error::InconsistentRunState(run_id.clone())))?;
         if record.cancel_requested {
-            let mut effects = self
+            return self
                 .core
                 .terminate_recorded(&claimed, claimed.cancelled(None), record.input_hash, None)
-                .await?;
-            effects.kv_deletes.extend(signal_kv_deletes);
-            return Ok(effects);
+                .await;
         }
 
         // A cancellation requested during the delivery fires the claim's token
@@ -354,7 +338,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             },
             step_number,
             payload: job.payload.clone(),
-            signal: step_signal,
+            signal: step_signal(job),
         };
 
         let replayed = if self.core.step_output_replay {
@@ -401,10 +385,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .settle_outcome(&claimed, outcome, external_cancel, record.input_hash)
             .await;
 
-        // Durable signal entries scheduled for cleanup are deleted with the
-        // step's settlement. On retry paths they remain for redelivery.
         settled.map(|mut effects| {
-            effects.kv_deletes.extend(signal_kv_deletes);
             // The external-cancel override commits Cancelled in place of the
             // runner's outcome. The staged effects describe that outcome and
             // are discarded with it. A runner-issued Cancel keeps its effects.

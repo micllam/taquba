@@ -161,6 +161,8 @@ pub struct TerminalEffects {
 struct TerminalState {
     kv: EffectsState,
     enqueues: Vec<EnqueueRequest>,
+    /// The signal key and the payload of every staged signal.
+    signals: Vec<(String, Vec<u8>)>,
     /// The queue of the runtime, `None` for a detached handle.
     runtime_queue: Option<String>,
 }
@@ -206,6 +208,22 @@ impl TerminalEffects {
         Ok(())
     }
 
+    /// Stage a signal to `signal_key` with `payload`, delivered to the run
+    /// waiting at the key or buffered, as [`taquba::Queue::signal`] does, in
+    /// the transaction of the settlement.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::EffectsSealed`] when the hook returned.
+    pub fn signal(&self, signal_key: impl Into<String>, payload: impl Into<Vec<u8>>) -> Result<()> {
+        let mut state = self.inner.lock().unwrap();
+        if state.kv.sealed {
+            return Err(Error::EffectsSealed);
+        }
+        state.signals.push((signal_key.into(), payload.into()));
+        Ok(())
+    }
+
     /// Stage a write of `value` under `key` in the caller KV namespace.
     ///
     /// # Errors
@@ -229,10 +247,14 @@ impl TerminalEffects {
     pub(crate) fn seal_into_settlement(&self) -> SettlementEffects {
         let mut state = self.inner.lock().unwrap();
         let staged = state.kv.seal_and_take();
-        SettlementEffects::default()
+        let mut effects = SettlementEffects::default()
             .enqueues(std::mem::take(&mut state.enqueues))
             .kv_writes(staged.writes)
-            .kv_deletes(staged.deletes.into_iter().collect())
+            .kv_deletes(staged.deletes.into_iter().collect());
+        for (signal_key, payload) in std::mem::take(&mut state.signals) {
+            effects = effects.signal(signal_key, payload);
+        }
+        effects
     }
 }
 

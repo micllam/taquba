@@ -14,6 +14,7 @@ use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{
     KeyTag, QueueName, attempt_history_key, claimed_key, dedup_index_key, job_index_key,
+    signal_waiter_key,
 };
 use crate::lease_registry::LeaseRegistry;
 use crate::queue_core::QueueCore;
@@ -70,8 +71,13 @@ impl Txn {
     }
 
     /// Move `job` from its record at `from` to its record at
-    /// [`JobRecord::stored_key`], and repoint its index entry to that key.
-    pub(crate) fn move_job(&mut self, from: &[u8], job: &JobRecord) -> Result<()> {
+    /// [`JobRecord::stored_key`], and repoint its index entry to that key. A
+    /// job that leaves the scheduled state leaves its signal wait: the waiter
+    /// index entry is deleted and the key is cleared from the record.
+    pub(crate) fn move_job(&mut self, from: &[u8], job: &mut JobRecord) -> Result<()> {
+        if job.status != JobStatus::Scheduled {
+            self.end_signal_wait(from, job)?;
+        }
         let key = job.stored_key();
         if from == key.as_slice() {
             // The index entry already points to the key.
@@ -86,10 +92,11 @@ impl Txn {
     }
 
     /// Stage the removal of a job's last record, stored at `key`: the record,
-    /// its job index entry, its attempt history and, when the job has a dedup
-    /// key, the dedup index entry. A `job` in the done state counts a
-    /// completion. Every path that removes a job's last record stages it here,
-    /// so the history shares the record's lifetime by construction.
+    /// its job index entry, its attempt history, the waiter index entry of a
+    /// scheduled job with a signal key and, when the job has a dedup key, the
+    /// dedup index entry. A `job` in the done state counts a completion. Every
+    /// path that removes a job's last record stages it here, so the history
+    /// shares the record's lifetime by construction.
     pub(crate) fn stage_remove(&mut self, key: &[u8], job: &JobRecord) -> Result<()> {
         self.txn.delete(key)?;
         self.txn.delete(job_index_key(&job.id))?;
@@ -97,8 +104,24 @@ impl Txn {
         if let Some(dedup_key) = &job.dedup_key {
             self.txn.delete(dedup_index_key(&job.queue, dedup_key))?;
         }
+        if key_status(key) == JobStatus::Scheduled
+            && let Some(signal_key) = &job.signal_key
+        {
+            self.txn.delete(signal_waiter_key(signal_key))?;
+        }
         let completed = (job.status == JobStatus::Done).then_some(JobStatus::Done);
         self.count_move(&job.queue, Some(key_status(key)), completed);
+        Ok(())
+    }
+
+    /// End the signal wait of `job`, stored at `from`, when it is a scheduled
+    /// job with a signal key: delete the waiter index entry and clear the key.
+    fn end_signal_wait(&mut self, from: &[u8], job: &mut JobRecord) -> Result<()> {
+        if key_status(from) == JobStatus::Scheduled
+            && let Some(signal_key) = job.signal_key.take()
+        {
+            self.txn.delete(signal_waiter_key(&signal_key))?;
+        }
         Ok(())
     }
 

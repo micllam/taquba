@@ -29,6 +29,7 @@ mod claim;
 mod control;
 mod enqueue;
 mod settle;
+pub(crate) mod signal;
 
 /// The per-queue configurations of an open queue: a default and the overrides,
 /// with the queue name as their key.

@@ -155,7 +155,7 @@ pub(crate) enum DurableTrigger {
     Immediate,
     After(DurableDuration),
     OnSignal {
-        correlation_key: String,
+        signal_key: String,
         timeout: DurableDuration,
     },
 }
@@ -166,10 +166,10 @@ impl From<&Trigger> for DurableTrigger {
             Trigger::Immediate => Self::Immediate,
             Trigger::After(delay) => Self::After((*delay).into()),
             Trigger::OnSignal {
-                correlation_key,
+                signal_key,
                 timeout,
             } => Self::OnSignal {
-                correlation_key: correlation_key.clone(),
+                signal_key: signal_key.clone(),
                 timeout: (*timeout).into(),
             },
         }
@@ -182,10 +182,10 @@ impl From<DurableTrigger> for Trigger {
             DurableTrigger::Immediate => Self::Immediate,
             DurableTrigger::After(delay) => Self::After(delay.into()),
             DurableTrigger::OnSignal {
-                correlation_key,
+                signal_key,
                 timeout,
             } => Self::OnSignal {
-                correlation_key,
+                signal_key,
                 timeout: timeout.into(),
             },
         }

@@ -1,279 +1,59 @@
-//! Durable signal delivery: one buffered signal per correlation key, held in
-//! three key spaces of the caller KV namespace. The waiter index maps a
-//! correlation key to the step job scheduled to wait on it, the buffer contains
-//! a signal that arrived while no waiter was registered and the delivered
-//! record stores a consumed payload under `(run id, step)` so a redelivered
-//! step observes the same signal. Registration consumes a buffered signal at
-//! the previous step's settlement. Delivery to a registered waiter wakes its
-//! scheduled job. A waiter promoted by its timeout consumes the buffer at claim
-//! time.
+//! The signal wait of a step: the next step of a run is enqueued with a signal
+//! key and the timeout as its `run_at`, so the queue indexes it as the waiter
+//! at the key, and the step that runs next reads the signal from its job
+//! record.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
-use taquba::{JobRecord, JobStatus, Queue, SettlementEffects, WorkerError};
-use tracing::{debug, warn};
+use taquba::{JobRecord, JobStatus, SettlementEffects, WorkerError};
 
-use crate::error::{Result, worker_error};
-use crate::keys::{
-    HEADER_SIGNAL_DELIVERED, HEADER_SIGNAL_WAIT, RunId, signal_buf_kv_key, signal_delivered_kv_key,
-    signal_wait_kv_key,
-};
-use crate::runner::{StepError, StepRunner};
-use crate::runtime::{RuntimeCore, StepEnqueueOpts, WorkflowRuntime};
-use crate::terminal::TerminalHook;
+use crate::error::worker_error;
+use crate::runner::StepError;
+use crate::runtime::{RuntimeCore, StepEnqueueOpts};
 use crate::worker::ClaimedStep;
 
-/// Outcome of [`WorkflowRuntime::signal`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SignalOutcome {
-    /// A waiter was registered for the correlation key and is now woken. Its
-    /// step runs next with [`Step::signal`](crate::Step::signal) set to the
-    /// payload.
-    Delivered,
-    /// No waiter was woken. The signal is buffered durably under the
-    /// correlation key and is consumed by the next waiter registered for it, or
-    /// discarded by [`WorkflowRuntime::clear_signal`].
-    Buffered,
-}
-
-/// Number of waiter-index reads [`WorkflowRuntime::signal`] performs before
-/// concluding no waiter exists, and the pause between them. A registration
-/// settling concurrently becomes visible within one acknowledgement commit,
-/// which these reads cover.
-const SIGNAL_WAIT_READ_ATTEMPTS: u32 = 10;
-const SIGNAL_WAIT_READ_INTERVAL: Duration = Duration::from_millis(25);
-
-/// Remove the signal entry at `key` if it still contains `expected`. A failed
-/// removal is logged and otherwise ignored: the entry is residue that the next
-/// resolution of its key overwrites or drops.
-async fn remove_entry(queue: &Queue, key: &[u8], expected: &[u8]) {
-    if let Err(err) = queue.kv_compare_delete(key, expected).await {
-        debug!(key = %String::from_utf8_lossy(key), "signal entry removal failed: {err}");
-    }
-}
-
-impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
-    /// Deliver a signal for `correlation_key`, waking the run waiting on it via
-    /// [`Trigger::OnSignal`](crate::Trigger::OnSignal).
-    ///
-    /// When a waiter is registered and still waiting, its next step is promoted
-    /// immediately and observes `payload` on
-    /// [`Step::signal`](crate::Step::signal), and the call returns
-    /// [`SignalOutcome::Delivered`]. Otherwise the signal is buffered durably
-    /// with the correlation key, and the next waiter registered for it consumes
-    /// the buffered payload at its registration. The call then returns
-    /// [`SignalOutcome::Buffered`].
-    ///
-    /// One buffered signal is held per correlation key: a second signal before
-    /// consumption replaces the first. A buffered signal persists until a
-    /// waiter consumes it or [`Self::clear_signal`] discards it. The buffer
-    /// write is durable before the call returns, so a signal is never lost once
-    /// this call returns. Delivery to a waiter whose registration is settling
-    /// concurrently falls back to the buffer and reaches it no later than its
-    /// timeout.
-    pub async fn signal(&self, correlation_key: &str, payload: Vec<u8>) -> Result<SignalOutcome> {
-        self.inner.core.signal(correlation_key, payload).await
-    }
-
-    /// Discard the buffered signal for `correlation_key`, if one exists.
-    /// Returns `true` when a buffered signal was removed.
-    pub async fn clear_signal(&self, correlation_key: &str) -> Result<bool> {
-        self.inner.core.clear_signal(correlation_key).await
-    }
+/// The signal that reached the step job `job`: the payload of the signal when a
+/// signal woke the job, and `None` when the job became pending any other way.
+pub(crate) fn step_signal(job: &JobRecord) -> Option<Vec<u8>> {
+    job.woken_at
+        .map(|_| job.wake_payload.clone().unwrap_or_default())
 }
 
 impl RuntimeCore {
-    /// Deliver a signal for `correlation_key`, as [`WorkflowRuntime::signal`]
-    /// documents.
-    pub(crate) async fn signal(
-        &self,
-        correlation_key: &str,
-        payload: Vec<u8>,
-    ) -> Result<SignalOutcome> {
-        let queue = &self.queue;
-        let buf_key = signal_buf_kv_key(correlation_key);
-        // Buffer first, durably: a waiter registering concurrently reads the
-        // buffer at its settlement, so the signal is never lost even if the
-        // waiter index is not yet visible below.
-        queue.kv_put(&buf_key, &payload).await?;
-
-        let wait_key = signal_wait_kv_key(correlation_key);
-        for attempt in 0..SIGNAL_WAIT_READ_ATTEMPTS {
-            if attempt > 0 {
-                tokio::time::sleep(SIGNAL_WAIT_READ_INTERVAL).await;
-            }
-            let Some(waiter) = queue.view().kv_get(&wait_key).await? else {
-                continue;
-            };
-            let Ok(job_id) = std::str::from_utf8(&waiter).map(str::to_string) else {
-                remove_entry(queue, &wait_key, &waiter).await;
-                return Ok(SignalOutcome::Buffered);
-            };
-            return match queue.wake_scheduled(&job_id, Some(payload.clone())).await? {
-                taquba::WakeOutcome::Woken => {
-                    remove_entry(queue, &buf_key, &payload).await;
-                    remove_entry(queue, &wait_key, &waiter).await;
-                    Ok(SignalOutcome::Delivered)
-                }
-                taquba::WakeOutcome::NotScheduled | taquba::WakeOutcome::NotFound => {
-                    // Stale index entry: the waiter was already promoted or its
-                    // run was cancelled. Remove the entry. The signal stays
-                    // buffered.
-                    remove_entry(queue, &wait_key, &waiter).await;
-                    Ok(SignalOutcome::Buffered)
-                }
-            };
-        }
-        Ok(SignalOutcome::Buffered)
-    }
-
-    /// Discard the buffered signal for `correlation_key`, as
-    /// [`WorkflowRuntime::clear_signal`] documents.
-    pub(crate) async fn clear_signal(&self, correlation_key: &str) -> Result<bool> {
-        let buf_key = signal_buf_kv_key(correlation_key);
-        loop {
-            let Some(current) = self.queue.view().kv_get(&buf_key).await? else {
-                return Ok(false);
-            };
-            if self.queue.kv_compare_delete(&buf_key, &current).await? {
-                return Ok(true);
-            }
-        }
-    }
-
     /// Build the effects that advance the run of `claimed` to a step that waits
-    /// for a signal for `correlation_key`. When a buffered signal already
-    /// exists it is consumed: the next step is enqueued immediately, the
-    /// payload is recorded under the durable delivered key and the buffer entry
-    /// is deleted, all in the acknowledgement transaction. Otherwise the next
-    /// step is scheduled `timeout` from now and the waiter index entry joins
-    /// the same transaction.
+    /// for a signal at `signal_key` until `timeout` from now. The queue
+    /// registers the step as the waiter at the key in the acknowledgement
+    /// transaction, or writes it to pending with a signal buffered at the key.
+    /// A live waiter at the key fails the run as a permanent step error does.
     pub(crate) async fn advance_on_signal(
         &self,
         claimed: &ClaimedStep<'_>,
         payload: Vec<u8>,
-        correlation_key: &str,
+        signal_key: &str,
         timeout: Duration,
         input_hash: [u8; 32],
     ) -> std::result::Result<SettlementEffects, WorkerError> {
-        let wait_key = signal_wait_kv_key(correlation_key);
-
-        // One waiter per correlation key: a registration while a live waiter is
-        // at the key is rejected. The check reads current state, and a stale
-        // index entry (its job no longer scheduled) is overwritten. The
-        // rejection terminates the run as a permanent step error does.
+        // One waiter per key. The check reads current state so the run fails
+        // cleanly, and a registration that races it fails at the settlement.
         if let Some(existing) = self
             .queue
             .view()
-            .kv_get(&wait_key)
+            .signal_waiter(signal_key)
             .await
             .map_err(worker_error)?
-            && let Ok(existing_id) = std::str::from_utf8(&existing)
-            && let Ok(Some(job)) = self.queue.view().job_record(existing_id).await
+            && let Ok(Some(job)) = self.queue.view().job_record(&existing).await
             && job.status == JobStatus::Scheduled
         {
-            let message =
-                format!("a waiter is already registered for correlation key `{correlation_key}`");
+            let message = format!("a waiter is already registered at signal key `{signal_key}`");
             return Err(self
                 .terminating_failure(claimed, StepError::permanent(message), input_hash)
                 .await);
         }
-
-        let buf_key = signal_buf_kv_key(correlation_key);
-        match self
-            .queue
-            .view()
-            .kv_get(&buf_key)
-            .await
-            .map_err(worker_error)?
-        {
-            Some(buffered) => {
-                let opts = StepEnqueueOpts {
-                    reserved_headers: claimed
-                        .reserved_headers_with((HEADER_SIGNAL_DELIVERED, "1".to_string())),
-                    ..claimed.next_step_opts()
-                };
-                let delivered_key =
-                    signal_delivered_kv_key(&claimed.run_id, claimed.step_number + 1);
-                let buffered = buffered.to_vec();
-                let mut effects = self
-                    .advance_with_kv(claimed, payload, opts, |_| {
-                        HashMap::from([(delivered_key, buffered)])
-                    })
-                    .await;
-                effects.kv_deletes.push(buf_key);
-                Ok(effects)
-            }
-            None => {
-                let opts = StepEnqueueOpts {
-                    run_at: Some(self.run_at_after(timeout)),
-                    reserved_headers: claimed
-                        .reserved_headers_with((HEADER_SIGNAL_WAIT, correlation_key.to_string())),
-                    ..claimed.next_step_opts()
-                };
-                let effects = self
-                    .advance_with_kv(claimed, payload, opts, |job_id| {
-                        HashMap::from([(wait_key, job_id.as_bytes().to_vec())])
-                    })
-                    .await;
-                Ok(effects)
-            }
-        }
-    }
-
-    /// Resolve the signal delivery for a claimed step job: the payload to
-    /// expose on [`Step::signal`](crate::Step::signal) and the durable signal
-    /// entries to delete with the step's settlement.
-    pub(crate) async fn resolve_step_signal(
-        &self,
-        job: &JobRecord,
-        run_id: &RunId,
-        step_number: u32,
-    ) -> Result<(Option<Vec<u8>>, Vec<Vec<u8>>)> {
-        if job.headers.contains_key(HEADER_SIGNAL_DELIVERED) {
-            let delivered_key = signal_delivered_kv_key(run_id, step_number);
-            let payload = self
-                .queue
-                .view()
-                .kv_get(&delivered_key)
-                .await?
-                .map(|b| b.to_vec());
-            if payload.is_none() {
-                warn!(run_id = %run_id, step_number, "delivered signal record is missing");
-            }
-            return Ok((payload, vec![delivered_key]));
-        }
-
-        let Some(correlation_key) = job.headers.get(HEADER_SIGNAL_WAIT) else {
-            return Ok((None, Vec::new()));
+        let opts = StepEnqueueOpts {
+            run_at: Some(self.run_at_after(timeout)),
+            signal_key: Some(signal_key.to_string()),
+            ..claimed.next_step_opts()
         };
-        let wait_key = signal_wait_kv_key(correlation_key);
-        remove_entry(&self.queue, &wait_key, job.id.as_bytes()).await;
-
-        if job.woken_at.is_some() {
-            // A signal promoted this job early. The payload is on the job
-            // record, so redelivery of this step observes it again.
-            return Ok((job.wake_payload.clone(), Vec::new()));
-        }
-
-        // The timeout promoted this job. The delivered record contains the
-        // buffered signal when a prior attempt of this step consumed it.
-        let delivered_key = signal_delivered_kv_key(run_id, step_number);
-        if let Some(prior) = self.queue.view().kv_get(&delivered_key).await? {
-            return Ok((Some(prior.to_vec()), vec![delivered_key]));
-        }
-        // A signal buffered after this waiter's settlement read of the buffer,
-        // without winning the wake, is consumed here and delivered to this
-        // step. The delivery is recorded before the buffer is consumed, so a
-        // retry of this step observes the same signal.
-        let buf_key = signal_buf_kv_key(correlation_key);
-        if let Some(buffered) = self.queue.view().kv_get(&buf_key).await? {
-            let buffered = buffered.to_vec();
-            self.queue.kv_put(&delivered_key, &buffered).await?;
-            remove_entry(&self.queue, &buf_key, &buffered).await;
-            return Ok((Some(buffered), vec![delivered_key]));
-        }
-        Ok((None, Vec::new()))
+        Ok(self.advance(claimed, payload, opts).await)
     }
 }

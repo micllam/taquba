@@ -52,9 +52,10 @@ The edges:
 
 - **Enqueue.** A job with `run_at` set enters at `Scheduled`, and every other
   job at `Pending`.
-- **Scheduler, early wake.** The scheduler promotes a job at its `run_at`. An
-  early wake is a caller's request, through `wake_scheduled`, to promote it
-  before its time.
+- **Scheduler, early wake, signal.** The scheduler promotes a job at its
+  `run_at`. An early wake is a caller's request, through `wake_scheduled`, to
+  promote it before its time. A signal to the key a scheduled job waits at,
+  through `Queue::signal`, promotes it with the signal's payload.
 - **Claim.** Increments `attempts`.
 - **Nack.** The job is held in `Scheduled` for the retry backoff while attempts
   remain. The scheduler's promotion is therefore the retry mechanism as well as
@@ -90,9 +91,9 @@ The record contains:
 - **The caller's data:** `payload` and `headers`.
 - **The per-job settings,** resolved at enqueue from
   [`EnqueueOptions`][EnqueueOptions] against the queue's defaults: `priority`,
-  `max_attempts`, `run_at` for a scheduled job and `dedup_key`. The dedup key is
-  a caller key that deduplicates enqueues while the job waits, and the first
-  claim clears it.
+  `max_attempts`, `run_at` for a scheduled job, `signal_key` for a scheduled job
+  that waits at a key, and `dedup_key`. The dedup key is a caller key that
+  deduplicates enqueues while the job waits, and the first claim clears it.
 - **The delivery record:** `attempts`, `claimed_at`, `last_error` and the
   terminal timestamps `completed_at` and `failed_at`.
 
@@ -173,7 +174,7 @@ unchanged. These are the fields a transition sets:
 - **A nack** clears `claimed_at` and records `last_error`.
 - **A dead-letter** clears `claimed_at`, records `last_error` and sets
   `failed_at`.
-- **An early wake** sets `woken_at` and attaches `wake_payload`.
+- **An early wake or a signal** sets `woken_at` and attaches `wake_payload`.
 - **A cancel** of a claimed job sets `cancel_requested`.
 - **[`Queue::requeue_dead_job`][requeue]** resets `attempts`, `last_error`,
   `claimed_at`, `failed_at` and `cancel_requested`, so the revived job starts
@@ -191,10 +192,14 @@ because their value means something after the transition that set it:
 - **`cancel_requested`** stays set, so a job re-claimed after a lease expires
   begins with its cancellation token already fired.
 
-One field is removed on purpose. `dedup_key` leaves the record at the first
+Two fields are removed on purpose. `dedup_key` leaves the record at the first
 claim, which frees the key for a new job as soon as this one starts running.
 [The dedup key](claiming.md#the-dedup-key) describes the index and why the
-record drops the key.
+record drops the key. `signal_key` leaves the record in the transaction that
+moves the job out of the scheduled state, so the record of a retry that
+re-enters the state does not contain the key, and a signal to the key reaches
+the next job that waits at it. [Scan order](key-layout.md#scan-order) describes
+the waiter index.
 
 [JobRecord]: https://docs.rs/taquba/latest/taquba/struct.JobRecord.html
 [EnqueueOptions]: https://docs.rs/taquba/latest/taquba/struct.EnqueueOptions.html

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `EnqueueOptions::signal_key`: a scheduled job waits at a signal key, stored in
+  `JobRecord::signal_key` while the job is scheduled, and `Queue::signal` wakes
+  it with a payload before its `run_at` or buffers the signal for the next job
+  enqueued with the key. `Queue::clear_signal` discards a buffered signal,
+  `SettlementEffects::signal` stages a signal in a settlement,
+  `QueueView::signal_waiter` reads the waiter at a key and `SignalOutcome`
+  reports a delivery. An enqueue with the key of a live waiter fails with
+  `Error::SignalWaiterExists`, and a key without `run_at` with
+  `Error::InvalidSignalKey`. The key layout gains the `SignalWaiter` and
+  `SignalBuffer` spaces, and a store written with 0.15.0 opens without a drain.
+
+### Changed
+
+- `SettlementEffects` has a private field, so a caller constructs it with
+  `SettlementEffects::default()` and the builder methods. Replace a struct
+  literal with `..SettlementEffects::default()` or the setters.
+
 ## [0.15.0] - 2026-10-14
 
 ### Added

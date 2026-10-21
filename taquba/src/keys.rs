@@ -16,6 +16,10 @@
 //! The dead retention sweep is the exception: it scans the whole `Dead` space
 //! and reads the age from each record.
 //!
+//! A scheduled job with a signal key is indexed in `SignalWaiter` at the key,
+//! and a signal without a live waiter is held in `SignalBuffer` at the key.
+//! Both spaces are reached by point lookup.
+//!
 //! A claimed job occupies one key: `Claimed` contains the record at a key
 //! stable for the life of the claim. The lease itself, the current expiry and
 //! the claim id, is process state kept in `crate::lease_registry` and never
@@ -182,6 +186,14 @@ pub(crate) enum KeyTag {
     /// [`crate::OpenOptions::liveness_heartbeat`] interval and read through
     /// [`crate::QueueReader::writer_heartbeat`].
     Heartbeat = 0x0B,
+    /// `[tag, ver, signal key bytes]`. The value is the id of the scheduled job
+    /// waiting at the signal key. Written with the job and deleted in the
+    /// transaction that moves the job out of the scheduled state.
+    SignalWaiter = 0x0C,
+    /// `[tag, ver, signal key bytes]`. The value is the payload of a signal
+    /// that arrived without a live waiter, consumed by the enqueue of the next
+    /// job with the key or discarded by [`crate::Queue::clear_signal`].
+    SignalBuffer = 0x0D,
     /// `[tag, caller bytes]`, without a version byte. Caller bytes are opaque.
     User = 0xFF,
 }
@@ -206,6 +218,8 @@ impl KeyTag {
             0x09 => KeyTag::Stats,
             0x0A => KeyTag::AttemptHistory,
             0x0B => KeyTag::Heartbeat,
+            0x0C => KeyTag::SignalWaiter,
+            0x0D => KeyTag::SignalBuffer,
             0xFF => KeyTag::User,
             _ => return None,
         })
@@ -226,6 +240,8 @@ impl KeyTag {
             | KeyTag::Stats
             | KeyTag::AttemptHistory
             | KeyTag::Heartbeat
+            | KeyTag::SignalWaiter
+            | KeyTag::SignalBuffer
             | KeyTag::User => None,
         }
     }
@@ -337,6 +353,21 @@ pub(crate) fn cursor_key(queue: &QueueName) -> Vec<u8> {
 
 pub(crate) fn heartbeat_key() -> Vec<u8> {
     header(KeyTag::Heartbeat).to_vec()
+}
+
+fn signal_key_in(tag: KeyTag, signal_key: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(2 + signal_key.len());
+    k.extend_from_slice(&header(tag));
+    k.extend_from_slice(signal_key.as_bytes());
+    k
+}
+
+pub(crate) fn signal_waiter_key(signal_key: &str) -> Vec<u8> {
+    signal_key_in(KeyTag::SignalWaiter, signal_key)
+}
+
+pub(crate) fn signal_buffer_key(signal_key: &str) -> Vec<u8> {
+    signal_key_in(KeyTag::SignalBuffer, signal_key)
 }
 
 pub(crate) fn stats_key(queue: &QueueName, metric: &str) -> Vec<u8> {
@@ -510,6 +541,8 @@ mod tests {
             cursor_key(&qn("q")),
             stats_key(&qn("q"), "m"),
             heartbeat_key(),
+            signal_waiter_key("id"),
+            signal_buffer_key("id"),
             user_scoped_key(b"id"),
         ];
         for (i, a) in keys.iter().enumerate() {

@@ -28,6 +28,9 @@ separate state layer (typically Postgres).
 - Scheduled jobs, dedup keys, custom priority/attempts.
 - Targeted early wake of a scheduled job (`Queue::wake_scheduled`), with
   optional attached bytes the worker observes on delivery.
+- Signal keys: a scheduled job enqueued with `EnqueueOptions::signal_key` waits
+  at the key, and `Queue::signal` wakes it with a payload or buffers the signal
+  for the next job enqueued with the key.
 - Exponential retry backoff on `nack`.
 - Bounded dead-letter retention with paginated inspection.
 - Atomic batch enqueue.
