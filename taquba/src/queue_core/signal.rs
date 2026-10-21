@@ -4,9 +4,9 @@
 use tracing::debug;
 
 use crate::error::Result;
+use crate::queue::SignalOutcome;
 use crate::queue_core::QueueCore;
 use crate::queue_core::control::stage_wake;
-use crate::signal::SignalOutcome;
 use crate::txn::{Attempt, Durability, Txn};
 
 /// Stage a signal to the job `job_id` with `payload` at `now` in `txn`: the
@@ -45,8 +45,7 @@ impl QueueCore {
 #[cfg(test)]
 mod tests {
     use crate::error::Error;
-    use crate::queue::ClaimOutcome;
-    use crate::signal::SignalOutcome;
+    use crate::queue::{ClaimOutcome, SignalOutcome};
     use crate::test_util::*;
 
     const INITIAL: u64 = 1_700_000_000_000;

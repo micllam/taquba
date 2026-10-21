@@ -1,13 +1,16 @@
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use slatedb::object_store::{ObjectStoreExt, PutPayload, path::Path};
 
 use super::*;
 use crate::error::Error;
 use crate::inbox::entry::{CancelEntry, EnqueueEntry, SignalEntry};
+use crate::inbox::record::InboxOutcome;
 use crate::inbox::sender::InboxSender;
-use crate::queue::{CancelOutcome, Queue};
+use crate::queue::{CancelOutcome, EnqueueResult, Queue, SignalOutcome};
 use crate::reader::QueueReader;
 use crate::test_util::*;
 
@@ -63,17 +66,29 @@ async fn an_entry_is_applied_once_with_a_record_and_its_object_deleted() {
     let job = q.claim("work", LEASE).await.unwrap().unwrap();
     assert_eq!(job.payload, b"hello");
     assert_eq!(object_count(&store, "test-inbox/v1/enqueue").await, 0);
-    let record = q.view().inbox_record(&id).await.unwrap().unwrap();
+    let record = q
+        .view()
+        .inbox_record::<EnqueueEntry>(&id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(record.applied_at_ms, INITIAL);
     assert_eq!(
         record.outcome,
-        InboxOutcome::Applied(json!({ "job_id": job.id, "new": true }))
+        InboxOutcome::Applied(EnqueueResult::New(job.id.clone()))
     );
 
     // The record is read from another process, and an entry sent again with the
     // id is deleted without an effect.
     let reader = QueueReader::open(store.clone(), "test").await.unwrap();
-    assert_eq!(reader.view().inbox_record(&id).await.unwrap(), Some(record));
+    assert_eq!(
+        reader
+            .view()
+            .inbox_record::<EnqueueEntry>(&id)
+            .await
+            .unwrap(),
+        Some(record)
+    );
     reader.close().await.unwrap();
     sender(&store)
         .send_with_id(&id, &EnqueueEntry::new("work", b"again"))
@@ -108,7 +123,11 @@ async fn entries_apply_in_id_order_across_kinds() {
 #[tokio::test]
 async fn a_malformed_or_disallowed_entry_is_rejected_with_a_record() {
     let store = make_store();
-    let q = open(&store, &MockClock::new(INITIAL)).await;
+    let q = Arc::new(open(&store, &MockClock::new(INITIAL)).await);
+    let registration = q
+        .register_inbox_handler(Probe::<Numbered>::of_kind(&q, Report::Commit))
+        .unwrap();
+    put_raw(&store, "numbered", "bad-number", br#"{"n": "x"}"#).await;
     put_raw(&store, "enqueue", "bad-json", b"not json").await;
     put_raw(&store, "enqueue", "bad-shape", br#"{"queue": 1}"#).await;
     sender(&store)
@@ -128,7 +147,12 @@ async fn a_malformed_or_disallowed_entry_is_rejected_with_a_record() {
 
     q.apply_inbox_now().await.unwrap();
     for id in ["bad-json", "bad-shape", "other-queue", "bad-id"] {
-        let record = q.view().inbox_record(id).await.unwrap().unwrap();
+        let record = q
+            .view()
+            .inbox_record::<EnqueueEntry>(id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             matches!(record.outcome, InboxOutcome::Rejected(_)),
             "{id}: {:?}",
@@ -138,7 +162,18 @@ async fn a_malformed_or_disallowed_entry_is_rejected_with_a_record() {
     assert_eq!(object_count(&store, "test-inbox/v1/enqueue").await, 0);
     assert_eq!(q.view().stats("work").await.unwrap().pending, 0);
     assert_eq!(q.view().stats("other").await.unwrap().pending, 0);
-    q.close().await.unwrap();
+    // A body of a registered kind that does not decode never reaches the
+    // handler.
+    let record = q
+        .view()
+        .inbox_record::<Numbered>("bad-number")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(record.outcome, InboxOutcome::Rejected(_)));
+    assert!(q.view().kv_get(b"seen/bad-number").await.unwrap().is_none());
+    drop(registration);
+    close(q).await;
 }
 
 #[tokio::test]
@@ -182,51 +217,98 @@ enum Report {
     Twice,
 }
 
-/// A handler that reports an entry as `report` says, and fails the first call
-/// after `fail_once` is set.
-struct Probe {
+/// The kind `custom`, with any JSON body.
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+struct Custom(serde_json::Value);
+
+impl InboxKind for Custom {
+    const KIND: &'static str = "custom";
+    type Outcome = serde_json::Value;
+}
+
+/// The kind `numbered`, whose body has a number at `n`.
+#[derive(Serialize, Deserialize)]
+struct Numbered {
+    n: u32,
+}
+
+impl InboxKind for Numbered {
+    const KIND: &'static str = "numbered";
+    type Outcome = serde_json::Value;
+}
+
+/// A kind named after a core kind.
+#[derive(Serialize, Deserialize)]
+struct CoreNamed;
+
+impl InboxKind for CoreNamed {
+    const KIND: &'static str = "enqueue";
+    type Outcome = serde_json::Value;
+}
+
+/// A kind whose name is outside the form of a kind name.
+#[derive(Serialize, Deserialize)]
+struct BadlyNamed;
+
+impl InboxKind for BadlyNamed {
+    const KIND: &'static str = "Custom";
+    type Outcome = serde_json::Value;
+}
+
+/// A handler of the kind `K` that reports an entry as `report` says, and fails
+/// the first call after `fail_once` is set.
+struct Probe<K = Custom> {
     queue: Arc<Queue>,
     report: Report,
     fail_once: AtomicBool,
+    kind: PhantomData<fn() -> K>,
 }
 
 impl Probe {
     fn new(queue: &Arc<Queue>, report: Report) -> Self {
+        Self::of_kind(queue, report)
+    }
+}
+
+impl<K> Probe<K> {
+    fn of_kind(queue: &Arc<Queue>, report: Report) -> Self {
         Self {
             queue: queue.clone(),
             report,
             fail_once: AtomicBool::new(false),
+            kind: PhantomData,
         }
     }
 }
 
-impl InboxHandler for Probe {
+impl<K: InboxKind<Outcome = serde_json::Value>> InboxHandler for Probe<K> {
+    type Kind = K;
+
     async fn apply(
         &self,
-        entry: &InboxEntry,
-        record: &InboxRecordHandle,
-    ) -> std::result::Result<Applied, InboxHandlerError> {
+        entry: K,
+        record: &InboxRecordHandle<serde_json::Value>,
+    ) -> std::result::Result<Applied<serde_json::Value>, InboxHandlerError> {
         if self.fail_once.swap(false, Ordering::SeqCst) {
             return Err("transient".into());
         }
-        let outcome = json!({ "seen": entry.id });
+        let outcome = json!({ "seen": record.id() });
         match self.report {
             Report::Commit => {
                 let effects = record
-                    .effects(outcome)
-                    .kv_put(format!("seen/{}", entry.id), entry.body.to_string());
+                    .effects(&outcome)?
+                    .kv_put(format!("seen/{}", record.id()), serde_json::to_vec(&entry)?);
                 self.queue.commit_effects(effects).await?;
                 Ok(Applied::Committed)
             }
             Report::Separately => Ok(Applied::Separately(InboxOutcome::Applied(outcome))),
             Report::Forget => Ok(Applied::Committed),
             Report::Twice => {
-                self.queue
-                    .commit_effects(record.effects(outcome.clone()))
-                    .await?;
+                self.queue.commit_effects(record.effects(&outcome)?).await?;
                 let again = self
                     .queue
-                    .commit_effects(record.effects(json!({ "seen": "again" })))
+                    .commit_effects(record.effects(&json!({ "seen": "again" }))?)
                     .await
                     .unwrap_err();
                 Err(again.into())
@@ -251,15 +333,20 @@ async fn an_entry_of_an_unregistered_kind_waits_for_its_handler() {
     put_raw(&store, "custom", "c1", br#"{"n": 1}"#).await;
     q.apply_inbox_now().await.unwrap();
     assert_eq!(object_count(&store, "test-inbox/v1/custom").await, 1);
-    assert_eq!(q.view().inbox_record("c1").await.unwrap(), None);
+    assert_eq!(q.view().inbox_record::<Custom>("c1").await.unwrap(), None);
 
     let registration = q
-        .register_inbox_handler("custom", Probe::new(&q, Report::Commit))
+        .register_inbox_handler(Probe::new(&q, Report::Commit))
         .unwrap();
     q.apply_inbox_now().await.unwrap();
     assert_eq!(object_count(&store, "test-inbox/v1/custom").await, 0);
     assert_eq!(
-        q.view().inbox_record("c1").await.unwrap().unwrap().outcome,
+        q.view()
+            .inbox_record::<Custom>("c1")
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome,
         InboxOutcome::Applied(json!({ "seen": "c1" }))
     );
     assert_eq!(
@@ -270,15 +357,15 @@ async fn an_entry_of_an_unregistered_kind_waits_for_its_handler() {
     // A kind with a live registration, a core kind and an invalid kind are
     // refused.
     assert!(matches!(
-        q.register_inbox_handler("custom", Probe::new(&q, Report::Commit)),
+        q.register_inbox_handler(Probe::new(&q, Report::Commit)),
         Err(Error::InboxKindTaken { value: None, .. })
     ));
     assert!(matches!(
-        q.register_inbox_handler("enqueue", Probe::new(&q, Report::Commit)),
+        q.register_inbox_handler(Probe::<CoreNamed>::of_kind(&q, Report::Commit)),
         Err(Error::InboxKindTaken { .. })
     ));
     assert!(matches!(
-        q.register_inbox_handler("Custom", Probe::new(&q, Report::Commit)),
+        q.register_inbox_handler(Probe::<BadlyNamed>::of_kind(&q, Report::Commit)),
         Err(Error::InvalidInboxKind { .. })
     ));
 
@@ -289,12 +376,17 @@ async fn an_entry_of_an_unregistered_kind_waits_for_its_handler() {
     q.apply_inbox_now().await.unwrap();
     assert_eq!(object_count(&store, "test-inbox/v1/custom").await, 1);
     let registration = q
-        .register_inbox_handler("custom", Probe::new(&q, Report::Separately))
+        .register_inbox_handler(Probe::new(&q, Report::Separately))
         .unwrap();
     q.apply_inbox_now().await.unwrap();
     assert_eq!(object_count(&store, "test-inbox/v1/custom").await, 0);
     assert_eq!(
-        q.view().inbox_record("c2").await.unwrap().unwrap().outcome,
+        q.view()
+            .inbox_record::<Custom>("c2")
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome,
         InboxOutcome::Applied(json!({ "seen": "c2" }))
     );
     drop(registration);
@@ -306,10 +398,10 @@ async fn a_scoped_registration_serves_the_entries_that_name_its_value() {
     let store = make_store();
     let q = Arc::new(open(&store, &MockClock::new(INITIAL)).await);
     let to_a = q
-        .register_inbox_handler_for("custom", "target", "a", Probe::new(&q, Report::Commit))
+        .register_inbox_handler_for("target", "a", Probe::new(&q, Report::Commit))
         .unwrap();
     let to_b = q
-        .register_inbox_handler_for("custom", "target", "b", Probe::new(&q, Report::Separately))
+        .register_inbox_handler_for("target", "b", Probe::new(&q, Report::Separately))
         .unwrap();
     put_raw(&store, "custom", "to-a", br#"{"target": "a"}"#).await;
     put_raw(&store, "custom", "to-b", br#"{"target": "b"}"#).await;
@@ -320,7 +412,7 @@ async fn a_scoped_registration_serves_the_entries_that_name_its_value() {
     assert!(q.view().kv_get(b"seen/to-a").await.unwrap().is_some());
     assert_eq!(
         q.view()
-            .inbox_record("to-b")
+            .inbox_record::<Custom>("to-b")
             .await
             .unwrap()
             .unwrap()
@@ -330,20 +422,20 @@ async fn a_scoped_registration_serves_the_entries_that_name_its_value() {
     assert!(q.view().kv_get(b"seen/to-b").await.unwrap().is_none());
     // The entries without a handler for their value wait.
     assert_eq!(object_count(&store, "test-inbox/v1/custom").await, 2);
-    assert_eq!(q.view().inbox_record("to-c").await.unwrap(), None);
+    assert_eq!(q.view().inbox_record::<Custom>("to-c").await.unwrap(), None);
 
     // A value with a registration, another field and the whole kind are refused
     // while a scoped registration lives.
     assert!(matches!(
-        q.register_inbox_handler_for("custom", "target", "a", Probe::new(&q, Report::Commit)),
+        q.register_inbox_handler_for("target", "a", Probe::new(&q, Report::Commit)),
         Err(Error::InboxKindTaken { ref value, .. }) if value.as_deref() == Some("a")
     ));
     assert!(matches!(
-        q.register_inbox_handler_for("custom", "other", "z", Probe::new(&q, Report::Commit)),
+        q.register_inbox_handler_for("other", "z", Probe::new(&q, Report::Commit)),
         Err(Error::InboxKindTaken { ref value, .. }) if value.as_deref() == Some("z")
     ));
     assert!(matches!(
-        q.register_inbox_handler("custom", Probe::new(&q, Report::Commit)),
+        q.register_inbox_handler(Probe::new(&q, Report::Commit)),
         Err(Error::InboxKindTaken { value: None, .. })
     ));
 
@@ -352,11 +444,17 @@ async fn a_scoped_registration_serves_the_entries_that_name_its_value() {
     drop(to_a);
     drop(to_b);
     let whole = q
-        .register_inbox_handler("custom", Probe::new(&q, Report::Separately))
+        .register_inbox_handler(Probe::new(&q, Report::Separately))
         .unwrap();
     q.apply_inbox_now().await.unwrap();
     assert_eq!(object_count(&store, "test-inbox/v1/custom").await, 0);
-    assert!(q.view().inbox_record("none").await.unwrap().is_some());
+    assert!(
+        q.view()
+            .inbox_record::<Custom>("none")
+            .await
+            .unwrap()
+            .is_some()
+    );
     drop(whole);
     close(q).await;
 }
@@ -365,7 +463,7 @@ async fn a_scoped_registration_serves_the_entries_that_name_its_value() {
 async fn a_queue_without_an_inbox_refuses_a_registration() {
     let q = Arc::new(Queue::open(make_store(), "test").await.unwrap());
     assert!(matches!(
-        q.register_inbox_handler("custom", Probe::new(&q, Report::Commit)),
+        q.register_inbox_handler(Probe::new(&q, Report::Commit)),
         Err(Error::InboxNotConfigured)
     ));
     q.apply_inbox_now().await.unwrap();
@@ -378,7 +476,7 @@ async fn a_failed_entry_ends_the_pass_and_the_next_pass_starts_at_it() {
     let q = Arc::new(open(&store, &MockClock::new(INITIAL)).await);
     let probe = Probe::new(&q, Report::Commit);
     probe.fail_once.store(true, Ordering::SeqCst);
-    let registration = q.register_inbox_handler("custom", probe).unwrap();
+    let registration = q.register_inbox_handler(probe).unwrap();
     put_raw(&store, "custom", "a", b"{}").await;
     put_raw(&store, "custom", "b", b"{}").await;
 
@@ -386,12 +484,15 @@ async fn a_failed_entry_ends_the_pass_and_the_next_pass_starts_at_it() {
     assert!(matches!(err, Error::InboxHandler { ref kind, .. } if kind == "custom"));
     assert!(!err.is_permanent());
     assert_eq!(object_count(&store, "test-inbox/v1/custom").await, 2);
-    assert_eq!(q.view().inbox_record("a").await.unwrap(), None);
+    assert_eq!(q.view().inbox_record::<Custom>("a").await.unwrap(), None);
 
     q.apply_inbox_now().await.unwrap();
     assert_eq!(object_count(&store, "test-inbox/v1/custom").await, 0);
     for id in ["a", "b"] {
-        assert!(q.view().inbox_record(id).await.unwrap().is_some(), "{id}");
+        assert!(
+            q.view().inbox_record::<Custom>(id).await.unwrap().is_some(),
+            "{id}"
+        );
     }
     drop(registration);
     close(q).await;
@@ -402,7 +503,7 @@ async fn a_second_record_of_an_entry_aborts_its_commit_and_the_first_stands() {
     let store = make_store();
     let q = Arc::new(open(&store, &MockClock::new(INITIAL)).await);
     let registration = q
-        .register_inbox_handler("custom", Probe::new(&q, Report::Twice))
+        .register_inbox_handler(Probe::new(&q, Report::Twice))
         .unwrap();
     put_raw(&store, "custom", "a", b"{}").await;
 
@@ -410,11 +511,20 @@ async fn a_second_record_of_an_entry_aborts_its_commit_and_the_first_stands() {
     q.apply_inbox_now().await.unwrap();
     assert_eq!(object_count(&store, "test-inbox/v1/custom").await, 0);
     assert_eq!(
-        q.view().inbox_record("a").await.unwrap().unwrap().outcome,
+        q.view()
+            .inbox_record::<Custom>("a")
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome,
         InboxOutcome::Applied(json!({ "seen": "a" }))
     );
     let err = q
-        .commit_effects(InboxRecordHandle::new("a".to_string(), INITIAL).effects(json!({})))
+        .commit_effects(
+            InboxRecordHandle::<serde_json::Value>::new("a".to_string(), INITIAL)
+                .effects(&json!({}))
+                .unwrap(),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, Error::InboxAlreadyApplied { ref id } if id == "a"));
@@ -444,7 +554,7 @@ async fn a_handler_that_forgets_the_record_stops_the_pass() {
     let store = make_store();
     let q = Arc::new(open(&store, &MockClock::new(INITIAL)).await);
     let registration = q
-        .register_inbox_handler("custom", Probe::new(&q, Report::Forget))
+        .register_inbox_handler(Probe::new(&q, Report::Forget))
         .unwrap();
     put_raw(&store, "custom", "a", b"{}").await;
     put_raw(&store, "custom", "b", b"{}").await;
@@ -486,20 +596,27 @@ async fn the_cancel_kind_removes_a_queued_job_and_records_the_other_outcomes() {
     let outcome = |id: &str| {
         let q = &q;
         let id = id.to_string();
-        async move { q.view().inbox_record(&id).await.unwrap().unwrap().outcome }
+        async move {
+            q.view()
+                .inbox_record::<CancelEntry>(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .outcome
+        }
     };
     assert_eq!(
         outcome("queued").await,
-        InboxOutcome::Applied(json!({ "outcome": "removed" }))
+        InboxOutcome::Applied(CancelOutcome::Removed)
     );
     assert!(q.view().get_job(&queued).await.unwrap().is_none());
     assert_eq!(
         outcome("claimed").await,
-        InboxOutcome::Applied(json!({ "outcome": "requested" }))
+        InboxOutcome::Applied(CancelOutcome::Requested)
     );
     assert_eq!(
         outcome("missing").await,
-        InboxOutcome::Applied(json!({ "outcome": "not_found" }))
+        InboxOutcome::Applied(CancelOutcome::NotFound)
     );
     assert!(matches!(outcome("other").await, InboxOutcome::Rejected(_)));
     assert_eq!(q.view().stats("other").await.unwrap().pending, 1);
@@ -536,21 +653,21 @@ async fn the_signal_kind_wakes_a_waiter_or_records_that_none_waits() {
     assert_eq!(woken.wake_payload.as_deref(), Some(b"go".as_slice()));
     assert_eq!(
         q.view()
-            .inbox_record("to-waiter")
+            .inbox_record::<SignalEntry>("to-waiter")
             .await
             .unwrap()
             .unwrap()
             .outcome,
-        InboxOutcome::Applied(json!({ "outcome": "delivered" }))
+        InboxOutcome::Applied(SignalOutcome::Delivered)
     );
     assert_eq!(
         q.view()
-            .inbox_record("to-nobody")
+            .inbox_record::<SignalEntry>("to-nobody")
             .await
             .unwrap()
             .unwrap()
             .outcome,
-        InboxOutcome::Applied(json!({ "outcome": "not_waiting" }))
+        InboxOutcome::Applied(SignalOutcome::NotWaiting)
     );
     q.close().await.unwrap();
 }
@@ -617,11 +734,20 @@ async fn an_expired_record_is_swept_and_its_id_applies_again() {
 
     clock.advance(retention - Duration::from_millis(1));
     tokio::time::sleep(reaper_interval * 2).await;
-    assert!(q.view().inbox_record("once").await.unwrap().is_some());
+    assert!(
+        q.view()
+            .inbox_record::<EnqueueEntry>("once")
+            .await
+            .unwrap()
+            .is_some()
+    );
 
     clock.advance(Duration::from_millis(1));
     tokio::time::sleep(reaper_interval * 2).await;
-    assert_eq!(q.view().inbox_record("once").await.unwrap(), None);
+    assert_eq!(
+        q.view().inbox_record::<EnqueueEntry>("once").await.unwrap(),
+        None
+    );
     assert!(
         q.core
             .db

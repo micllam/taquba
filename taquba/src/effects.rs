@@ -9,7 +9,7 @@ use ulid::Ulid;
 
 use crate::error::{Error, Result};
 use crate::expiry::ExpiryIndex;
-use crate::inbox::record::InboxRecord;
+use crate::inbox::record::StagedRecord;
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{QueueName, dedup_index_key, job_index_key, user_scoped_key};
 use crate::kv::validate_kv_value_size;
@@ -60,9 +60,9 @@ pub struct SettlementEffects {
     pub kv_deletes: Vec<Vec<u8>>,
     /// The index and the time of every entry added with [`Self::expiry_entry`].
     pub expiry_entries: Vec<(ExpiryIndex, u64)>,
-    /// The id and the record of an inbox entry, added by
+    /// The encoded record of an inbox entry, added by
     /// [`InboxRecordHandle`](crate::InboxRecordHandle).
-    pub(crate) inbox_record: Option<(String, InboxRecord)>,
+    pub(crate) inbox_record: Option<StagedRecord>,
 }
 
 impl SettlementEffects {
@@ -136,7 +136,7 @@ pub(crate) struct PreparedEffects {
     pub(crate) kv_deletes: Vec<Vec<u8>>,
     /// Recorded on their indexes once the effects apply.
     pub(crate) expiry_entries: Vec<(ExpiryIndex, u64)>,
-    pub(crate) inbox_record: Option<(String, InboxRecord)>,
+    pub(crate) inbox_record: Option<StagedRecord>,
 }
 
 impl QueueCore {
@@ -306,8 +306,8 @@ impl QueueCore {
         for (index, at_ms) in &prepared.expiry_entries {
             txn.note_expiry_entry(index, *at_ms);
         }
-        if let Some((id, record)) = &prepared.inbox_record {
-            txn.stage_inbox_record(id, record).await?;
+        if let Some(record) = &prepared.inbox_record {
+            txn.stage_inbox_record(record).await?;
         }
         Ok(results)
     }

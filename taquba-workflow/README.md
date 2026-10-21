@@ -189,7 +189,7 @@ sweep.
 The request is recorded on the run's durable record, so it persists across a
 restart and reaches the run from any runtime over the same queue. While
 termination is in flight, `status` reports `RunState::Cancelling`. It returns
-`Ok(false)` if the run is unknown or already terminal.
+`CancelRunOutcome::NotActive` if the run is unknown or already terminal.
 
 - If the current step is pending or scheduled, the queued step job is removed
   and the run's notification job is enqueued before the call returns.
@@ -283,8 +283,8 @@ whose entries are `SubmitEntry` and `CancelRunEntry`, sent with a
 entries. A submission commits its run record with the inbox record, and a
 cancellation commits the inbox record with the removal of the queued step. A
 signal from another process is the core kind `signal` (`taquba::SignalEntry`).
-The outcome of an entry is read through `taquba::QueueView::inbox_record` of a
-`taquba::QueueReader`.
+The outcome of an entry, its `SubmitOutcome` or `CancelRunOutcome`, is read
+through `taquba::QueueView::inbox_record` of a `taquba::QueueReader`.
 
 ## Application KV effects
 

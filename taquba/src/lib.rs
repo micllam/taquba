@@ -384,9 +384,11 @@
 //! deletes the object. An entry whose record exists is deleted without an
 //! effect, so an entry sent twice applies once within
 //! [`InboxOptions::record_retention`]. [`QueueView::inbox_record`] reads the
-//! outcome from the writer or a [`QueueReader`]. A malformed entry, or one for
-//! a queue outside the allow-list, is recorded as rejected with the reason. An
-//! error ends the pass at its entry, and the next pass starts again there.
+//! outcome from the writer or a [`QueueReader`], as the [`InboxKind::Outcome`]
+//! of the kind: the [`EnqueueResult`], [`CancelOutcome`] or [`SignalOutcome`]
+//! of a core kind. A malformed entry, or one for a queue outside the
+//! allow-list, is recorded as rejected with the reason. An error ends the pass
+//! at its entry, and the next pass starts again there.
 //!
 //! The inbox is one-way: a sender observes the outcome through a reader, and
 //! only the writer commits. A sender in another language writes the JSON body
@@ -500,7 +502,6 @@ mod queue_core;
 mod reader;
 mod reaper;
 mod scheduler;
-mod signal;
 mod stats;
 mod store_url;
 #[cfg(test)]
@@ -525,8 +526,8 @@ pub use inbox::entry::{
 pub use inbox::record::{Applied, InboxOutcome, InboxRecord, InboxRecordHandle};
 pub use inbox::sender::InboxSender;
 pub use inbox::{
-    DEFAULT_INBOX_INTERVAL, DEFAULT_INBOX_RECORD_RETENTION, InboxEntry, InboxHandler,
-    InboxHandlerError, InboxOptions, InboxRegistration, default_inbox_path,
+    DEFAULT_INBOX_INTERVAL, DEFAULT_INBOX_RECORD_RETENTION, InboxHandler, InboxHandlerError,
+    InboxOptions, InboxRegistration, default_inbox_path,
 };
 pub use job::{Claim, JobRecord, JobStatus};
 pub use keys::{MAX_QUEUE_NAME_LEN, QueueName};
@@ -538,11 +539,10 @@ pub use options::{
     PRIORITY_NORMAL, QueueConfig,
 };
 pub use queue::{
-    CancelOutcome, ClaimOutcome, EnqueueResult, JobPage, NackOutcome, Queue, WaitOutcome,
-    WakeOutcome,
+    CancelOutcome, ClaimOutcome, EnqueueResult, JobPage, NackOutcome, Queue, SignalOutcome,
+    WaitOutcome, WakeOutcome,
 };
 pub use reader::{QueueReader, ReaderMode, ReaderOptions};
-pub use signal::SignalOutcome;
 pub use stats::QueueStats;
 pub use store_url::open_url;
 pub use view::QueueView;

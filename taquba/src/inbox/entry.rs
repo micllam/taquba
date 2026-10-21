@@ -9,18 +9,23 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::effects::EnqueueRequest;
 use crate::error::{Characters, Error, Form, Result};
 use crate::options::EnqueueOptions;
+use crate::queue::{CancelOutcome, EnqueueResult, SignalOutcome};
 
 /// Maximum byte length of an inbox entry id and of a kind name.
 pub const MAX_INBOX_ID_LEN: usize = 64;
 
-/// An entry type of the inbox: the kind name and the JSON body of an entry. The
-/// core defines [`EnqueueEntry`], [`CancelEntry`] and [`SignalEntry`], and a
-/// layer defines a type per kind it registers with
+/// An entry type of the inbox: the kind name, the JSON body of an entry and the
+/// outcome recorded for an applied entry. The core defines [`EnqueueEntry`],
+/// [`CancelEntry`] and [`SignalEntry`], and a layer defines a type per kind it
+/// registers with
 /// [`Queue::register_inbox_handler`](crate::Queue::register_inbox_handler). A
 /// bytes field of a body is base64 through [`inbox_bytes`].
-pub trait InboxKind: Serialize + DeserializeOwned {
+pub trait InboxKind: Serialize + DeserializeOwned + Send + 'static {
     /// The kind name: `[a-z][a-z0-9._-]*`, at most [`MAX_INBOX_ID_LEN`] bytes.
     const KIND: &'static str;
+    /// The outcome of an applied entry, in its
+    /// [`InboxRecord`](crate::InboxRecord).
+    type Outcome: Serialize + DeserializeOwned + Send;
 }
 
 /// Serde adapter for a bytes field of an entry body, stored as standard base64
@@ -43,9 +48,8 @@ pub mod inbox_bytes {
 }
 
 /// The entry of the core kind `enqueue`: a job for a queue in
-/// [`InboxOptions::queues`](crate::InboxOptions::queues). The outcome recorded
-/// for the entry is `{"job_id": id, "new": true}`, or `{"job_id": existing,
-/// "new": false}` when `dedup_key` matched a pending or scheduled job.
+/// [`InboxOptions::queues`](crate::InboxOptions::queues). Its outcome is the
+/// [`EnqueueResult`] of the enqueue.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EnqueueEntry {
     /// The queue of the job.
@@ -131,13 +135,12 @@ impl From<EnqueueEntry> for EnqueueRequest {
 
 impl InboxKind for EnqueueEntry {
     const KIND: &'static str = "enqueue";
+    type Outcome = EnqueueResult;
 }
 
 /// The entry of the core kind `cancel`: [`Queue::cancel`](crate::Queue::cancel)
 /// of a job on a queue in [`InboxOptions::queues`](crate::InboxOptions::queues).
-/// The outcome recorded for the entry is `{"outcome": "removed"}`,
-/// `{"outcome": "requested"}` or `{"outcome": "not_found"}`, as
-/// [`CancelOutcome`](crate::CancelOutcome) reports them.
+/// Its outcome is the [`CancelOutcome`] of the cancel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelEntry {
     /// The id of the job.
@@ -146,12 +149,11 @@ pub struct CancelEntry {
 
 impl InboxKind for CancelEntry {
     const KIND: &'static str = "cancel";
+    type Outcome = CancelOutcome;
 }
 
 /// The entry of the core kind `signal`: [`Queue::signal`](crate::Queue::signal)
-/// to the job `job_id`. The outcome recorded for the entry is
-/// `{"outcome": "delivered"}` or `{"outcome": "not_waiting"}`, as
-/// [`SignalOutcome`](crate::SignalOutcome) reports them.
+/// to the job `job_id`. Its outcome is the [`SignalOutcome`] of the signal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalEntry {
     /// The id of the waiting job.
@@ -163,6 +165,7 @@ pub struct SignalEntry {
 
 impl InboxKind for SignalEntry {
     const KIND: &'static str = "signal";
+    type Outcome = SignalOutcome;
 }
 
 /// Whether `kind` is a kind that the core applies.

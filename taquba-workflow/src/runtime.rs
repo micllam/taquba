@@ -4,10 +4,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::TryStreamExt;
+use serde::{Deserialize, Serialize};
 use taquba::object_store::ObjectStore;
 use taquba::{
-    Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, InboxKind, InboxRegistration, JobRecord,
-    JobStatus, Queue, SettlementEffects, WaitOutcome, WorkerHandle,
+    Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, InboxRegistration, JobRecord, JobStatus,
+    Queue, SettlementEffects, WaitOutcome, WorkerHandle,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
@@ -19,9 +20,7 @@ use crate::durable::{
 use crate::effects::{StagedEffects, TerminalEffects};
 use crate::error::{Error, Result};
 use crate::group::{GroupStore, Membership, RunGroup, pending_member, terminated_member};
-use crate::inbox::{
-    CancelRunEntry, CancelRunHandler, INBOX_QUEUE_FIELD, SubmitEntry, SubmitHandler,
-};
+use crate::inbox::{CancelRunHandler, INBOX_QUEUE_FIELD, SubmitHandler};
 use crate::keys::{
     DEDUP_PREFIX, GROUP_TERMINAL_KV_PREFIX, HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RunId,
     TERMINAL_KV_PREFIX, check_effects, check_headers, hash_input, next_step_job_id, outcome_kv_key,
@@ -129,7 +128,7 @@ pub struct RunSpec {
 /// `submit` is idempotent on `run_id`: re-submitting an active or terminated
 /// run is a no-op and the returned `SubmitOutcome` has
 /// `newly_submitted = false`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmitOutcome {
     /// The run's identifier (generated if the spec did not include one).
     pub run_id: RunId,
@@ -247,12 +246,14 @@ impl From<DurableTermination> for RunTermination {
     }
 }
 
-/// What [`RuntimeCore::cancel_run`] did.
-pub(crate) enum CancelRun {
-    /// The queued step was removed, and the run terminated with the effects.
+/// Outcome of [`WorkflowRuntime::cancel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelRunOutcome {
+    /// The queued step was removed, and the run terminated as cancelled.
     Removed,
     /// The request reached a running step, which terminates the run when it
-    /// returns. The effects were discarded.
+    /// returns.
     Requested,
     /// The run is unknown, terminated or dead-lettered outside the worker.
     NotActive,
@@ -379,9 +380,10 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     /// queue's inbox at the build, for the entries whose `queue` field names
     /// this runtime's [`Self::queue_name`], so another process submits and
     /// cancels runs with a [`taquba::InboxSender`] and the entry types
-    /// [`SubmitEntry`] and [`CancelRunEntry`]. The registrations last for the
-    /// lifetime of the runtime, and each runtime over the queue registers them
-    /// for its own queue name.
+    /// [`SubmitEntry`](crate::SubmitEntry) and
+    /// [`CancelRunEntry`](crate::CancelRunEntry). The registrations last for
+    /// the lifetime of the runtime, and each runtime over the queue registers
+    /// them for its own queue name.
     pub fn inbox_kinds(mut self) -> Self {
         self.inbox_kinds = true;
         self
@@ -406,13 +408,11 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
         let registrations = if inbox_kinds {
             vec![
                 core.queue.register_inbox_handler_for(
-                    SubmitEntry::KIND,
                     INBOX_QUEUE_FIELD,
                     &core.queue_name,
                     SubmitHandler { core: core.clone() },
                 )?,
                 core.queue.register_inbox_handler_for(
-                    CancelRunEntry::KIND,
                     INBOX_QUEUE_FIELD,
                     &core.queue_name,
                     CancelRunHandler { core: core.clone() },
@@ -682,12 +682,13 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
 
     /// Request cancellation of an active run.
     ///
-    /// Returns `Ok(true)` once the request is recorded on the run's durable
-    /// record, or `Ok(false)` if the run is unknown or already terminal,
-    /// including a run whose current step the queue dead-lettered outside the
-    /// worker, which the worker's dead-step reconciliation terminates as
-    /// failed. The request reaches a run after a restart and from any runtime
-    /// over the same queue.
+    /// Returns [`CancelRunOutcome::Removed`] or [`CancelRunOutcome::Requested`]
+    /// once the request is recorded on the run's durable record, and
+    /// [`CancelRunOutcome::NotActive`] if the run is unknown or already
+    /// terminal. A run whose current step the queue dead-lettered outside the
+    /// worker is not active, and the worker's dead-step reconciliation
+    /// terminates it as failed. The request reaches a run after a restart and
+    /// from any runtime over the same queue.
     ///
     /// The run terminates as [`TerminalStatus::Cancelled`] and its notification
     /// job is enqueued for the terminal hook:
@@ -710,8 +711,8 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// request is recorded keeps the outcome it committed. A request applies
     /// only to the run it is recorded on, and a later submission of the same
     /// run id starts without it.
-    pub async fn cancel(&self, run_id: &RunId) -> Result<bool> {
-        self.inner.core.cancel(run_id).await
+    pub async fn cancel(&self, run_id: &RunId) -> Result<CancelRunOutcome> {
+        self.inner.core.cancel_run(run_id, Ok).await
     }
 
     /// The group named `id`.
@@ -824,9 +825,19 @@ impl RuntimeCore {
     /// [`WorkflowRuntime::submit`].
     #[instrument(skip(self, spec), fields(run_id))]
     pub(crate) async fn submit(&self, spec: RunSpec) -> Result<SubmitOutcome> {
+        self.submit_recorded(spec, |_, effects| Ok(effects)).await
+    }
+
+    /// [`Self::submit`], with the effects of a new submission passed through
+    /// `attach` with its outcome before the commit.
+    pub(crate) async fn submit_recorded(
+        &self,
+        spec: RunSpec,
+        attach: impl FnOnce(&SubmitOutcome, SettlementEffects) -> taquba::Result<SettlementEffects>,
+    ) -> Result<SubmitOutcome> {
         let run_id = self.validate_spec(&spec)?;
         tracing::Span::current().record("run_id", run_id.as_str());
-        self.enqueue_run(&run_id, spec, None).await
+        self.enqueue_run(&run_id, spec, None, attach).await
     }
 
     /// [`Self::submit`] of a member of a group: the run's step jobs hold the
@@ -837,7 +848,8 @@ impl RuntimeCore {
         spec: RunSpec,
     ) -> Result<SubmitOutcome> {
         let run_id = self.validate_spec(&spec)?;
-        self.enqueue_run(&run_id, spec, Some(membership)).await
+        self.enqueue_run(&run_id, spec, Some(membership), |_, effects| Ok(effects))
+            .await
     }
 
     /// Check `spec`'s headers and effects, and return the run id, generated
@@ -853,12 +865,14 @@ impl RuntimeCore {
     /// identifies an active run whichever process submitted it, and the step's
     /// dedup key serialises two submissions that both find the record absent. A
     /// `membership` is set on the step job and its pending member record is
-    /// written with the enqueue.
+    /// written with the enqueue. The effects of a new submission pass through
+    /// `attach` with its outcome.
     async fn enqueue_run(
         &self,
         run_id: &RunId,
         spec: RunSpec,
         membership: Option<&Membership>,
+        attach: impl FnOnce(&SubmitOutcome, SettlementEffects) -> taquba::Result<SettlementEffects>,
     ) -> Result<SubmitOutcome> {
         let input_hash = hash_input(&spec.input);
         let duplicate = |job_id: String| SubmitOutcome {
@@ -921,14 +935,20 @@ impl RuntimeCore {
                 durable::encode(&pending_member(run_id)),
             );
         }
+        let submitted = SubmitOutcome {
+            run_id: run_id.clone(),
+            newly_submitted: true,
+            job_id,
+        };
+        let effects = attach(&submitted, effects)?;
 
-        let job_id = match self
+        match self
             .queue
             .enqueue_with_effects(&request.queue, request.payload, request.options, effects)
             .await?
             .0
         {
-            EnqueueResult::New(id) => id,
+            EnqueueResult::New(_) => {}
             // A concurrent submission committed first, and its record contains
             // the input to check against. A dedup hit without a record is a
             // store this runtime did not write, reported as a duplicate.
@@ -938,14 +958,10 @@ impl RuntimeCore {
                 }
                 return Ok(duplicate(existing));
             }
-        };
+        }
 
-        debug!(run_id = %run_id, job_id = %job_id, "run submitted");
-        Ok(SubmitOutcome {
-            run_id: run_id.clone(),
-            newly_submitted: true,
-            job_id,
-        })
+        debug!(run_id = %run_id, job_id = %submitted.job_id, "run submitted");
+        Ok(submitted)
     }
 
     /// [`WorkflowRuntime::wait`].
@@ -967,21 +983,15 @@ impl RuntimeCore {
         }
     }
 
-    /// [`WorkflowRuntime::cancel`].
-    pub(crate) async fn cancel(&self, run_id: &RunId) -> Result<bool> {
-        let cancelled = self.cancel_run(run_id, |effects| effects).await?;
-        Ok(!matches!(cancelled, CancelRun::NotActive))
-    }
-
-    /// Cancel the run `run_id`, with the effects of the removal of its queued
-    /// step passed through `attach` before the commit.
+    /// [`WorkflowRuntime::cancel`], with the effects of the removal of the
+    /// queued step passed through `attach` before the commit.
     pub(crate) async fn cancel_run(
         &self,
         run_id: &RunId,
-        attach: impl Fn(SettlementEffects) -> SettlementEffects,
-    ) -> Result<CancelRun> {
+        attach: impl Fn(SettlementEffects) -> taquba::Result<SettlementEffects>,
+    ) -> Result<CancelRunOutcome> {
         let Some(input_hash) = self.request_cancel(run_id).await? else {
-            return Ok(CancelRun::NotActive);
+            return Ok(CancelRunOutcome::NotActive);
         };
         // Settle the current step now: remove it while it is queued, or fire
         // the claim's cancellation token, the parent of
@@ -991,12 +1001,12 @@ impl RuntimeCore {
         loop {
             let Some((_, job)) = self.view.current_job(run_id).await? else {
                 // Terminated on its own after the request was recorded.
-                return Ok(CancelRun::NotActive);
+                return Ok(CancelRunOutcome::NotActive);
             };
             if job.status == JobStatus::Dead {
                 // Dead-lettered by the queue outside the worker. Reconciliation
                 // terminates the run and the request is not honoured.
-                return Ok(CancelRun::NotActive);
+                return Ok(CancelRunOutcome::NotActive);
             }
             let claimed = ClaimedStep::parse(&job)?;
             // `error` is `None`: external cancellation does not include a
@@ -1005,9 +1015,9 @@ impl RuntimeCore {
             let outcome = claimed.cancelled(None);
             let termination = self.termination(&outcome, None, input_hash);
             let effects = self.terminate_collecting_effects(&outcome, &claimed, termination);
-            match self.queue.cancel_with(&job.id, attach(effects)).await?.0 {
-                taquba::CancelOutcome::Removed => return Ok(CancelRun::Removed),
-                taquba::CancelOutcome::Requested => return Ok(CancelRun::Requested),
+            match self.queue.cancel_with(&job.id, attach(effects)?).await?.0 {
+                taquba::CancelOutcome::Removed => return Ok(CancelRunOutcome::Removed),
+                taquba::CancelOutcome::Requested => return Ok(CancelRunOutcome::Requested),
                 taquba::CancelOutcome::NotFound => continue,
             }
         }
@@ -2149,7 +2159,10 @@ mod tests {
         wait_for_scheduled(&queue, 1).await;
         let job_id = waiting_job_id(&probe.runtime, &handle.run_id).await;
 
-        assert!(probe.runtime.cancel(&handle.run_id).await.unwrap());
+        assert_eq!(
+            probe.runtime.cancel(&handle.run_id).await.unwrap(),
+            CancelRunOutcome::Removed
+        );
         let terminal = tokio::time::timeout(Duration::from_secs(2), probe.rx.recv())
             .await
             .unwrap()
@@ -2844,7 +2857,10 @@ mod tests {
             .await
             .unwrap()
             .expect("step 0 is claimable");
-        assert!(before.cancel(&handle.run_id).await.unwrap());
+        assert_eq!(
+            before.cancel(&handle.run_id).await.unwrap(),
+            CancelRunOutcome::Requested
+        );
 
         let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel();
         let after = WorkflowRuntime::builder(
@@ -2929,7 +2945,10 @@ mod tests {
             .process_step(&step0, &queue.lease_handle(&step0))
             .await
             .unwrap();
-        assert!(runtime.cancel(&handle.run_id).await.unwrap());
+        assert_eq!(
+            runtime.cancel(&handle.run_id).await.unwrap(),
+            CancelRunOutcome::Requested
+        );
         queue.ack_with(&step0, effects).await.unwrap();
 
         let step1 = queue
@@ -3007,8 +3026,10 @@ mod tests {
         assert_eq!(status.state, RunState::Pending);
         assert_eq!(status.step.job_id, handle.job_id);
 
-        let was_cancelled = runtime.cancel(&handle.run_id).await.unwrap();
-        assert!(was_cancelled);
+        assert_eq!(
+            runtime.cancel(&handle.run_id).await.unwrap(),
+            CancelRunOutcome::Removed
+        );
         let status = runtime.status(&handle.run_id).await.unwrap().unwrap();
         assert_eq!(
             status.state,
@@ -3031,8 +3052,9 @@ mod tests {
             end.expect("terminal record").outcome.is_none(),
             "no worker terminated the run, so no run result record exists",
         );
-        assert!(
-            !runtime.cancel(&handle.run_id).await.unwrap(),
+        assert_eq!(
+            runtime.cancel(&handle.run_id).await.unwrap(),
+            CancelRunOutcome::NotActive,
             "a second cancel finds no run record",
         );
 
@@ -3108,7 +3130,10 @@ mod tests {
         assert!(view.run_end(&handle.run_id).await.unwrap().is_none());
         assert!(view.status(&rid("unknown")).await.unwrap().is_none());
 
-        assert!(runtime.cancel(&handle.run_id).await.unwrap());
+        assert_eq!(
+            runtime.cancel(&handle.run_id).await.unwrap(),
+            CancelRunOutcome::Removed
+        );
         let reader = QueueReader::open(store.clone(), "test").await.unwrap();
         let view = WorkflowView::new(reader.view().clone(), MemoStore::new(store, "memo"));
         let status = view
@@ -3198,8 +3223,10 @@ mod tests {
             .unwrap();
         gate.claimed().await;
 
-        let was_cancelled = runtime.cancel(&handle.run_id).await.unwrap();
-        assert!(was_cancelled);
+        assert_eq!(
+            runtime.cancel(&handle.run_id).await.unwrap(),
+            CancelRunOutcome::Requested
+        );
 
         // Release the runner. It returns Err. Without cancellation, the worker
         // dead-letters the step (permanent) or nacks it for retry (transient).
@@ -3299,8 +3326,10 @@ mod tests {
             .await
             .expect("runner observed token");
 
-        let was_cancelled = runtime.cancel(&handle.run_id).await.unwrap();
-        assert!(was_cancelled);
+        assert_eq!(
+            runtime.cancel(&handle.run_id).await.unwrap(),
+            CancelRunOutcome::Requested
+        );
 
         let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -3359,10 +3388,10 @@ mod tests {
             Some(outcome.status)
         );
 
-        let was_cancelled = runtime.cancel(&handle.run_id).await.unwrap();
-        assert!(
-            !was_cancelled,
-            "cancel on an already-terminated run must report Ok(false)",
+        assert_eq!(
+            runtime.cancel(&handle.run_id).await.unwrap(),
+            CancelRunOutcome::NotActive,
+            "cancel on an already-terminated run must report NotActive",
         );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -3371,7 +3400,10 @@ mod tests {
             "no Cancelled hook may fire after the run already terminated as Succeeded",
         );
 
-        assert!(!runtime.cancel(&rid("never-submitted")).await.unwrap());
+        assert_eq!(
+            runtime.cancel(&rid("never-submitted")).await.unwrap(),
+            CancelRunOutcome::NotActive
+        );
 
         let _ = shutdown.send(());
     }
@@ -3686,7 +3718,10 @@ mod tests {
             RunState::Running
         );
 
-        assert!(runtime.cancel(&handle.run_id).await.unwrap());
+        assert_eq!(
+            runtime.cancel(&handle.run_id).await.unwrap(),
+            CancelRunOutcome::Requested
+        );
         assert_eq!(
             runtime
                 .status(&handle.run_id)
@@ -4472,7 +4507,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(runtime.cancel(&handle.run_id).await.unwrap());
+        assert_eq!(
+            runtime.cancel(&handle.run_id).await.unwrap(),
+            CancelRunOutcome::Requested
+        );
 
         let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -4711,7 +4749,10 @@ mod tests {
             ..Default::default()
         };
         runtime.submit(spec.clone()).await.unwrap();
-        assert!(runtime.cancel(&rid("again")).await.unwrap());
+        assert_eq!(
+            runtime.cancel(&rid("again")).await.unwrap(),
+            CancelRunOutcome::Removed
+        );
         let end = runtime.wait(&rid("again")).await.unwrap();
         assert_eq!(end.termination.status, TerminalStatus::Cancelled);
 
@@ -4760,8 +4801,9 @@ mod tests {
             let runtime = runtime.clone();
             async move { runtime.wait(&rid("hung")).await }
         });
-        assert!(
-            !runtime.cancel(&rid("hung")).await.unwrap(),
+        assert_eq!(
+            runtime.cancel(&rid("hung")).await.unwrap(),
+            CancelRunOutcome::NotActive,
             "the request is not honoured"
         );
         assert_eq!(
@@ -5110,7 +5152,10 @@ mod tests {
             })
         };
         running_rx.recv().await.unwrap();
-        assert!(runtime.cancel(&rid("phantom")).await.unwrap());
+        assert_eq!(
+            runtime.cancel(&rid("phantom")).await.unwrap(),
+            CancelRunOutcome::Requested
+        );
         worker.await.unwrap();
 
         let notification = queue
@@ -5347,7 +5392,10 @@ mod tests {
 
         // An external cancellation of a pending step.
         runtime.submit(spec("cancelled")).await.unwrap();
-        assert!(runtime.cancel(&rid("cancelled")).await.unwrap());
+        assert_eq!(
+            runtime.cancel(&rid("cancelled")).await.unwrap(),
+            CancelRunOutcome::Removed
+        );
 
         // The reconciliation of a step dead-lettered outside the worker.
         runtime.submit(spec("dead")).await.unwrap();

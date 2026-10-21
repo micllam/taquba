@@ -486,9 +486,11 @@ The writer applies the entries of a pass in id order, commits an `InboxRecord`
 at the id in the transaction of the entry's effect and deletes the object. An
 entry whose record exists is deleted without an effect, so an entry sent twice
 applies once within `InboxOptions::record_retention`. `QueueView::inbox_record`
-reads the outcome from the writer or a `QueueReader`. A malformed entry, or one
-for a queue outside the allow-list, is recorded as rejected with the reason. An
-error ends the pass at its entry, and the next pass starts again there.
+reads the outcome from the writer or a `QueueReader`, as the
+`InboxKind::Outcome` of the kind: the `EnqueueResult`, `CancelOutcome` or
+`SignalOutcome` of a core kind. A malformed entry, or one for a queue outside
+the allow-list, is recorded as rejected with the reason. An error ends the pass
+at its entry, and the next pass starts again there.
 
 The inbox is one-way: a sender observes the outcome through a reader, and only
 the writer commits. A sender in another language writes the JSON body itself,

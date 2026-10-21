@@ -8,12 +8,14 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures_util::stream::{self, Stream, TryStreamExt};
+use serde::de::IgnoredAny;
 use slatedb::config::ScanOptions;
 use slatedb::{Db, DbIterator, DbReader, IsolationLevel, IterationOrder};
 
 use crate::error::{Error, Result};
 use crate::history::{JobAttempt, decode_history};
-use crate::inbox::record::InboxRecord;
+use crate::inbox::entry::InboxKind;
+use crate::inbox::record::{InboxOutcome, InboxRecord};
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{
     KeyTag, QueueName, attempt_history_key, claimed_prefix, dead_key, dead_prefix, heartbeat_key,
@@ -343,12 +345,28 @@ impl QueueView {
         }
     }
 
-    /// The record of the applied inbox entry `id`, or `None` when the entry was
-    /// not applied or its record was swept after
+    /// The record of the applied inbox entry `id` of the kind `K`, or `None`
+    /// when the entry was not applied or its record was swept after
     /// [`InboxOptions::record_retention`](crate::InboxOptions::record_retention).
-    pub async fn inbox_record(&self, id: &str) -> Result<Option<InboxRecord>> {
+    /// Fails with a decoding error for the record of an entry of another kind.
+    pub async fn inbox_record<K: InboxKind>(
+        &self,
+        id: &str,
+    ) -> Result<Option<InboxRecord<K::Outcome>>> {
         match self.handle.get(&inbox_record_key(id)).await? {
             Some(bytes) => Ok(Some(rmp_serde::from_slice(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether the record of the inbox entry `id` is a rejection, or `None`
+    /// without a record.
+    pub(crate) async fn inbox_record_rejected(&self, id: &str) -> Result<Option<bool>> {
+        match self.handle.get(&inbox_record_key(id)).await? {
+            Some(bytes) => {
+                let record: InboxRecord<IgnoredAny> = rmp_serde::from_slice(&bytes)?;
+                Ok(Some(matches!(record.outcome, InboxOutcome::Rejected(_))))
+            }
             None => Ok(None),
         }
     }

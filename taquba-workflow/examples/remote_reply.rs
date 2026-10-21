@@ -18,7 +18,7 @@
 //! No lease is held during the wait: the requesting step settles, and the
 //! waiting run is a scheduled job in the store, so the remote work can outlast
 //! this process. The queue rejects a reply that arrives after the timeout, and
-//! the inbox records the outcome `not_waiting` for it.
+//! the inbox records the outcome `SignalOutcome::NotWaiting` for it.
 //!
 //! The remote machine is simulated by a task that receives the request over a
 //! channel, works for two seconds and sends its reply to the inbox in the same

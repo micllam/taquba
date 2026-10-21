@@ -18,15 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefix of objects that the writer applies once each, through which another
   process enqueues, cancels and signals. `InboxSender` writes an entry
   (`EnqueueEntry`, `CancelEntry`, `SignalEntry` or a type of a layer that
-  implements `InboxKind`), an `EnqueueEntry` converts to and from an
-  `EnqueueRequest`, `Queue::register_inbox_handler` registers an `InboxHandler`
-  for a kind of a layer, `Queue::register_inbox_handler_for` registers one for
-  the entries of the kind with a value at a field of the body,
-  `QueueView::inbox_record` reads the `InboxRecord` of an applied entry,
+  implements `InboxKind`, which specifies the outcome type of the kind), an
+  `EnqueueEntry` converts to and from an `EnqueueRequest`,
+  `Queue::register_inbox_handler` registers an `InboxHandler` of a kind of a
+  layer, `Queue::register_inbox_handler_for` registers one for the entries of
+  the kind with a value at a field of the body, `QueueView::inbox_record` reads
+  the `InboxRecord` of an applied entry with the outcome of its kind,
   `Queue::apply_inbox_now` runs a pass and `default_inbox_path` is the path of
-  an inbox opened without `InboxOptions::path`. The key layout gains the
-  `InboxRecord` and `InboxExpiry` spaces, and the crate depends on serde_json
-  and base64. See ADR-0005.
+  an inbox opened without `InboxOptions::path`. A core kind records the
+  `EnqueueResult`, `CancelOutcome` or `SignalOutcome` of its operation, which
+  implement `Serialize` and `Deserialize`. The pass rejects a body that does not
+  decode as its kind. The key layout gains the `InboxRecord` and `InboxExpiry`
+  spaces, and the crate depends on serde_json and base64. See ADR-0005.
 
 ### Changed
 

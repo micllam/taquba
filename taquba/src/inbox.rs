@@ -34,10 +34,11 @@ use slatedb::object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreE
 use tracing::{debug, warn};
 
 use crate::background::Periodic;
+use crate::effects::SettlementEffects;
 use crate::error::{Error, Result};
-use crate::inbox::entry::{is_core_kind, validate_id, validate_kind};
+use crate::inbox::entry::{InboxKind, is_core_kind, validate_id, validate_kind};
 use crate::inbox::kinds::CoreKind;
-use crate::inbox::record::{Applied, InboxOutcome, InboxRecordHandle};
+use crate::inbox::record::{Applied, InboxRecordHandle, Settled, malformed};
 use crate::keys::{QueueName, inbox_record_key};
 use crate::queue_core::QueueCore;
 use crate::time_bound::TimeBound;
@@ -135,65 +136,69 @@ impl Default for InboxOptions {
     }
 }
 
-/// One entry as its handler receives it.
-#[derive(Debug, Clone)]
-pub struct InboxEntry {
-    /// The id of the entry, the last segment of its path.
-    pub id: String,
-    /// The kind of the entry, the segment of its path before the id.
-    pub kind: String,
-    /// The JSON body of the entry.
-    pub body: serde_json::Value,
-}
-
-impl InboxEntry {
-    /// The body as the entry type `E`.
-    pub fn decode<E: entry::InboxKind>(&self) -> std::result::Result<E, serde_json::Error> {
-        serde_json::from_value(self.body.clone())
-    }
-}
-
 /// The error of an [`InboxHandler`].
 pub type InboxHandlerError = Box<dyn std::error::Error + Send + Sync>;
 
 /// The handler of one inbox kind, registered with
 /// [`Queue::register_inbox_handler`](crate::Queue::register_inbox_handler).
 ///
-/// The handler applies the entry once. It commits the record of the entry in
-/// the transaction of the entry's effect, through the [`SettlementEffects`]
-/// that [`InboxRecordHandle::effects`] or [`InboxRecordHandle::attach`] builds,
-/// and reports [`Applied::Committed`]. When the effect is idempotent, or the
-/// entry is rejected, the handler reports [`Applied::Separately`] with the
-/// outcome and the pass commits the record on its own. An error ends the pass,
-/// and the next pass applies the entry again.
+/// The pass decodes the body of an entry as [`Self::Kind`] and rejects a body
+/// that does not decode. The handler applies the entry once. It commits the
+/// record of the entry in the transaction of the entry's effect, through the
+/// [`SettlementEffects`] that [`InboxRecordHandle::effects`] or
+/// [`InboxRecordHandle::attach`] builds, and reports [`Applied::Committed`].
+/// When the effect is idempotent, or the entry is rejected, the handler reports
+/// [`Applied::Separately`] with the outcome and the pass commits the record on
+/// its own. An error ends the pass, and the next pass applies the entry again.
 ///
 /// [`SettlementEffects`]: crate::SettlementEffects
 pub trait InboxHandler: Send + Sync + 'static {
+    /// The entry type of the kind.
+    type Kind: InboxKind;
+
     /// Apply `entry` with the record `record`.
     fn apply(
         &self,
-        entry: &InboxEntry,
-        record: &InboxRecordHandle,
-    ) -> impl Future<Output = std::result::Result<Applied, InboxHandlerError>> + Send;
+        entry: Self::Kind,
+        record: &InboxRecordHandle<OutcomeOf<Self>>,
+    ) -> impl Future<Output = std::result::Result<Applied<OutcomeOf<Self>>, InboxHandlerError>> + Send;
 }
+
+/// The outcome of the kind of the handler `H`.
+type OutcomeOf<H> = <<H as InboxHandler>::Kind as InboxKind>::Outcome;
 
 /// [`InboxHandler`] without its type, held by the queue.
 trait DynInboxHandler: Send + Sync {
+    /// Decode `body`, apply the entry `id` and encode its outcome, recorded at
+    /// `applied_at_ms`.
     fn apply<'a>(
         &'a self,
-        entry: &'a InboxEntry,
-        record: &'a InboxRecordHandle,
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<Applied, InboxHandlerError>> + Send + 'a>>;
+        id: &'a str,
+        applied_at_ms: u64,
+        body: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Settled>> + Send + 'a>>;
 }
 
 impl<H: InboxHandler> DynInboxHandler for H {
     fn apply<'a>(
         &'a self,
-        entry: &'a InboxEntry,
-        record: &'a InboxRecordHandle,
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<Applied, InboxHandlerError>> + Send + 'a>>
-    {
-        Box::pin(InboxHandler::apply(self, entry, record))
+        id: &'a str,
+        applied_at_ms: u64,
+        body: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Settled>> + Send + 'a>> {
+        Box::pin(async move {
+            let record = InboxRecordHandle::new(id.to_string(), applied_at_ms);
+            let applied = match serde_json::from_value::<H::Kind>(body) {
+                Ok(entry) => InboxHandler::apply(self, entry, &record)
+                    .await
+                    .map_err(|source| Error::InboxHandler {
+                        kind: H::Kind::KIND.to_string(),
+                        source,
+                    })?,
+                Err(err) => malformed(err),
+            };
+            record.settle(applied)
+        })
     }
 }
 
@@ -430,15 +435,15 @@ impl Periodic for Inbox {
 }
 
 impl QueueCore {
-    /// Register `handler` for `kind` on the inbox, as
+    /// Register `handler` for its kind on the inbox, as
     /// [`Queue::register_inbox_handler`](crate::Queue::register_inbox_handler)
     /// documents.
     pub(crate) fn register_inbox_handler<H: InboxHandler>(
         self: &Arc<Self>,
-        kind: &str,
         scope: Option<(&str, &str)>,
         handler: H,
     ) -> Result<InboxRegistration> {
+        let kind = H::Kind::KIND;
         let inbox = self.inbox.as_ref().ok_or(Error::InboxNotConfigured)?;
         inbox.register(kind, scope, Arc::new(handler))?;
         Ok(InboxRegistration {
@@ -477,22 +482,17 @@ impl QueueCore {
                 },
             };
             let body = inbox.get(&location).await?;
-            let record = InboxRecordHandle::new(id.clone(), self.now_ms());
-            let applied = match serde_json::from_slice::<serde_json::Value>(&body) {
-                Err(err) => Ok(Applied::Separately(InboxOutcome::Rejected(format!(
-                    "malformed body: {err}"
-                )))),
+            let applied_at_ms = self.now_ms();
+            let settled = match serde_json::from_slice::<serde_json::Value>(&body) {
+                Err(err) => {
+                    InboxRecordHandle::<()>::new(id.clone(), applied_at_ms).settle(malformed(err))
+                }
                 Ok(body) => {
-                    let entry = InboxEntry {
-                        id: id.clone(),
-                        kind: kind.clone(),
-                        body,
-                    };
                     let route = match lookup {
                         Lookup::Core(core_kind) => Route::Core(core_kind),
                         Lookup::Whole(handler) => Route::Handler(handler),
                         Lookup::ByField(field) => {
-                            let value = entry.body.get(&field).and_then(|v| v.as_str());
+                            let value = body.get(&field).and_then(|v| v.as_str());
                             match value.and_then(|value| inbox.scoped(&kind, value)) {
                                 Some(handler) => Route::Handler(handler),
                                 None => {
@@ -507,29 +507,22 @@ impl QueueCore {
                     };
                     match route {
                         Route::Core(core_kind) => {
-                            self.apply_core_kind(inbox, core_kind, &entry, &record)
+                            self.apply_core_kind(inbox, core_kind, &id, applied_at_ms, body)
                                 .await
                         }
-                        Route::Handler(handler) => {
-                            handler.apply(&entry, &record).await.map_err(|source| {
-                                Error::InboxHandler {
-                                    kind: kind.clone(),
-                                    source,
-                                }
-                            })
-                        }
+                        Route::Handler(handler) => handler.apply(&id, applied_at_ms, body).await,
                     }
                 }
             };
-            let recorded = match applied {
-                Ok(applied) => self.record_entry(&id, &kind, applied, &record).await,
+            let recorded = match settled {
+                Ok(settled) => self.record_entry(&id, &kind, settled).await,
                 Err(err) => Err(err),
             };
             // A record committed before the error stands.
             let rejected = match recorded {
                 Ok(rejected) => rejected,
-                Err(err) => match self.view.inbox_record(&id).await? {
-                    Some(stored) => matches!(stored.outcome, InboxOutcome::Rejected(_)),
+                Err(err) => match self.view.inbox_record_rejected(&id).await? {
+                    Some(rejected) => rejected,
                     None => return Err(err),
                 },
             };
@@ -544,33 +537,26 @@ impl QueueCore {
         Ok(())
     }
 
-    /// Verify or commit the record of the entry `id` of `kind` as `applied`
+    /// Verify or commit the record of the entry `id` of `kind` as `settled`
     /// reports it, and return whether the entry was rejected.
-    async fn record_entry(
-        &self,
-        id: &str,
-        kind: &str,
-        applied: Applied,
-        record: &InboxRecordHandle,
-    ) -> Result<bool> {
-        match applied {
-            Applied::Committed => {
+    async fn record_entry(&self, id: &str, kind: &str, settled: Settled) -> Result<bool> {
+        match settled {
+            Settled::Committed => {
                 if self.db.get(inbox_record_key(id)).await?.is_none() {
                     return Err(Error::InboxRecordMissing { id: id.to_string() });
                 }
                 Ok(false)
             }
-            Applied::Separately(outcome) => {
-                let reason = match &outcome {
-                    InboxOutcome::Rejected(reason) => Some(reason.clone()),
-                    InboxOutcome::Applied(_) => None,
+            Settled::Separately { record, rejection } => {
+                let effects = SettlementEffects {
+                    inbox_record: Some(record),
+                    ..SettlementEffects::default()
                 };
-                let effects = record.attach_outcome(Default::default(), outcome);
                 self.commit_effects_where(effects, &[]).await?;
-                if let Some(reason) = &reason {
+                if let Some(reason) = &rejection {
                     warn!(kind, id, reason, "inbox entry rejected");
                 }
-                Ok(reason.is_some())
+                Ok(rejection.is_some())
             }
         }
     }

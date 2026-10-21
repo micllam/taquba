@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 use crate::error::{Error, Result};
 use crate::expiry::ExpiryIndex;
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
-use crate::inbox::record::InboxRecord;
+use crate::inbox::record::StagedRecord;
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{
     KeyTag, QueueName, attempt_history_key, claimed_key, dedup_index_key, inbox_expiry_key,
@@ -115,19 +115,16 @@ impl Txn {
         self.notes.expiry.push((index.clone(), at_ms));
     }
 
-    /// Write the inbox record `record` of the entry `id` and its expiry entry,
-    /// and note the record for the bound of the inbox expiry key space. A
-    /// record at the id fails the call with [`Error::InboxAlreadyApplied`].
-    pub(crate) async fn stage_inbox_record(
-        &mut self,
-        id: &str,
-        record: &InboxRecord,
-    ) -> Result<()> {
+    /// Write the inbox record `record` and its expiry entry, and note the
+    /// record for the bound of the inbox expiry key space. A record at the id
+    /// of the entry fails the call with [`Error::InboxAlreadyApplied`].
+    pub(crate) async fn stage_inbox_record(&mut self, record: &StagedRecord) -> Result<()> {
+        let id = record.id.as_str();
         let key = inbox_record_key(id);
         if self.txn.get(&key).await?.is_some() {
             return Err(Error::InboxAlreadyApplied { id: id.to_string() });
         }
-        self.txn.put(key, rmp_serde::to_vec_named(record)?)?;
+        self.txn.put(key, &record.bytes)?;
         self.txn
             .put(inbox_expiry_key(record.applied_at_ms, id), Vec::new())?;
         let at = record.applied_at_ms;

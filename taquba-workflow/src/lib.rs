@@ -161,7 +161,8 @@
 //! The request is recorded on the run's durable record, so it persists across a
 //! restart and reaches the run from any runtime over the same queue. While
 //! termination is in flight, `status` reports [`RunState::Cancelling`]. It
-//! returns `Ok(false)` if the run is unknown or already terminal.
+//! returns [`CancelRunOutcome::NotActive`] if the run is unknown or already
+//! terminal.
 //!
 //! - If the current step is pending or scheduled, the queued step job is
 //!   removed and the run's notification job is enqueued before the call
@@ -263,9 +264,9 @@
 //! runtime over a queue receives its own entries. A submission commits its run
 //! record with the inbox record, and a cancellation commits the inbox record
 //! with the removal of the queued step. A signal from another process is the
-//! core kind `signal` ([`taquba::SignalEntry`]). The outcome of an entry is
-//! read through [`taquba::QueueView::inbox_record`] of a
-//! [`taquba::QueueReader`].
+//! core kind `signal` ([`taquba::SignalEntry`]). The outcome of an entry, its
+//! [`SubmitOutcome`] or [`CancelRunOutcome`], is read through
+//! [`taquba::QueueView::inbox_record`] of a [`taquba::QueueReader`].
 //!
 //! # Application KV effects
 //!
@@ -650,8 +651,8 @@ pub use kv::KvReadHandle;
 pub use memo::{Memo, MemoStore};
 pub use runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 pub use runtime::{
-    DEFAULT_QUEUE_NAME, RunEnd, RunOptions, RunSpec, RunState, RunStatus, RunTermination,
-    RunnerHandle, StepRef, SubmitOutcome, WorkflowRuntime, WorkflowRuntimeBuilder,
+    CancelRunOutcome, DEFAULT_QUEUE_NAME, RunEnd, RunOptions, RunSpec, RunState, RunStatus,
+    RunTermination, RunnerHandle, StepRef, SubmitOutcome, WorkflowRuntime, WorkflowRuntimeBuilder,
 };
 #[cfg(feature = "webhooks")]
 pub use terminal::WebhookTerminalHook;

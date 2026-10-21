@@ -17,7 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `workflow.cancel` for the runtime's queue name, with the entry types
   `SubmitEntry` and `CancelRunEntry`, so another process submits and cancels
   runs through a `taquba::InboxSender`. An entry identifies the runtime by its
-  `queue` field, `DEFAULT_QUEUE_NAME` by default.
+  `queue` field, `DEFAULT_QUEUE_NAME` by default, and its record contains the
+  `SubmitOutcome` or the `CancelRunOutcome` of the entry. `SubmitOutcome`
+  implements `Serialize`, `Deserialize` and `PartialEq`.
 - `EffectsHandle::enqueue` and `Delivery::next_job_id`: a step stages an enqueue
   that commits with its settlement, and `next_job_id` is the job id of the next
   step, the same on every attempt of the step.
@@ -36,6 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   id of a waiting step from `RunStatus::step`, and stage the request that leads
   to a signal with `EffectsHandle::enqueue`, with the id of
   `Delivery::next_job_id` in it.
+- `WorkflowRuntime::cancel` returns a `CancelRunOutcome`, which states whether
+  the call removed the queued step or the request reached a running step. Test
+  for `CancelRunOutcome::NotActive` where the code tested for `false`.
 
 ### Removed
 

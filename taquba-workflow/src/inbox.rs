@@ -9,21 +9,19 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use taquba::{
-    Applied, InboxEntry, InboxHandler, InboxHandlerError, InboxKind, InboxOutcome,
-    InboxRecordHandle,
+    Applied, InboxHandler, InboxHandlerError, InboxKind, InboxOutcome, InboxRecordHandle,
 };
 
 use crate::error::Error;
 use crate::keys::RunId;
-use crate::runtime::{CancelRun, DEFAULT_QUEUE_NAME, RunOptions, RunSpec, RuntimeCore};
+use crate::runtime::{
+    CancelRunOutcome, DEFAULT_QUEUE_NAME, RunOptions, RunSpec, RuntimeCore, SubmitOutcome,
+};
 
-/// The entry of the kind `workflow.submit`: a [`RunSpec`] without effects. The
-/// outcome recorded for the entry is `{"run_id": id, "newly_submitted": true}`,
-/// or `{"run_id": id, "job_id": id, "newly_submitted": false}` for a run that
-/// exists, as [`SubmitOutcome`](crate::SubmitOutcome) reports it. A submission
-/// of an existing run id with another input is rejected.
+/// The entry of the kind `workflow.submit`: a [`RunSpec`] without effects. Its
+/// outcome is the [`SubmitOutcome`] of the submission. A submission of an
+/// existing run id with another input is rejected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitEntry {
     /// The queue name of the runtime that runs the entry, as
@@ -76,14 +74,12 @@ fn default_queue_name() -> String {
 
 impl InboxKind for SubmitEntry {
     const KIND: &'static str = "workflow.submit";
+    type Outcome = SubmitOutcome;
 }
 
 /// The entry of the kind `workflow.cancel`:
-/// [`WorkflowRuntime::cancel`](crate::WorkflowRuntime::cancel) of a run. The
-/// outcome recorded for the entry is `{"cancelled": true, "removed": true}`
-/// when the queued step was removed, `{"cancelled": true, "removed": false}`
-/// when the request reached a running step and `{"cancelled": false}` for a run
-/// that is unknown or terminated.
+/// [`WorkflowRuntime::cancel`](crate::WorkflowRuntime::cancel) of a run. Its
+/// outcome is the [`CancelRunOutcome`] of the cancel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelRunEntry {
     /// The queue name of the runtime of the run, as [`SubmitEntry::queue`].
@@ -105,18 +101,14 @@ impl CancelRunEntry {
 
 impl InboxKind for CancelRunEntry {
     const KIND: &'static str = "workflow.cancel";
-}
-
-/// The rejection of an entry for `reason`.
-fn rejected(reason: String) -> Applied {
-    Applied::Separately(InboxOutcome::Rejected(reason))
+    type Outcome = CancelRunOutcome;
 }
 
 /// A permanent error of the runtime rejects the entry, and any other error ends
 /// the pass.
-fn outcome_of(err: Error) -> Result<Applied, InboxHandlerError> {
+fn outcome_of<O>(err: Error) -> Result<Applied<O>, InboxHandlerError> {
     if err.is_permanent() {
-        Ok(rejected(err.to_string()))
+        Ok(Applied::Separately(InboxOutcome::Rejected(err.to_string())))
     } else {
         Err(Box::new(err))
     }
@@ -128,18 +120,15 @@ pub(crate) struct SubmitHandler {
 }
 
 impl InboxHandler for SubmitHandler {
+    type Kind = SubmitEntry;
+
     async fn apply(
         &self,
-        entry: &InboxEntry,
-        record: &InboxRecordHandle,
-    ) -> Result<Applied, InboxHandlerError> {
-        let submit: SubmitEntry = match entry.decode() {
-            Ok(submit) => submit,
-            Err(err) => return Ok(rejected(format!("malformed body: {err}"))),
-        };
-        let run_id = submit.run_id.unwrap_or_else(RunId::generate);
+        submit: SubmitEntry,
+        record: &InboxRecordHandle<SubmitOutcome>,
+    ) -> Result<Applied<SubmitOutcome>, InboxHandlerError> {
         let spec = RunSpec {
-            run_id: Some(run_id.clone()),
+            run_id: Some(submit.run_id.unwrap_or_else(RunId::generate)),
             input: submit.input,
             options: RunOptions {
                 headers: submit.headers,
@@ -149,15 +138,15 @@ impl InboxHandler for SubmitHandler {
                     .run_at
                     .map(|ms| UNIX_EPOCH + Duration::from_millis(ms)),
             },
-            effects: record.effects(json!({ "run_id": run_id, "newly_submitted": true })),
+            effects: Default::default(),
         };
-        match self.core.submit(spec).await {
+        let submitted = self
+            .core
+            .submit_recorded(spec, |outcome, effects| record.attach(effects, outcome))
+            .await;
+        match submitted {
             Ok(outcome) if outcome.newly_submitted => Ok(Applied::Committed),
-            Ok(outcome) => Ok(Applied::Separately(InboxOutcome::Applied(json!({
-                "run_id": outcome.run_id,
-                "job_id": outcome.job_id,
-                "newly_submitted": false,
-            })))),
+            Ok(outcome) => Ok(Applied::Separately(InboxOutcome::Applied(outcome))),
             Err(err) => outcome_of(err),
         }
     }
@@ -169,30 +158,22 @@ pub(crate) struct CancelRunHandler {
 }
 
 impl InboxHandler for CancelRunHandler {
+    type Kind = CancelRunEntry;
+
     async fn apply(
         &self,
-        entry: &InboxEntry,
-        record: &InboxRecordHandle,
-    ) -> Result<Applied, InboxHandlerError> {
-        let cancel: CancelRunEntry = match entry.decode() {
-            Ok(cancel) => cancel,
-            Err(err) => return Ok(rejected(format!("malformed body: {err}"))),
-        };
-        let removed = json!({ "cancelled": true, "removed": true });
+        cancel: CancelRunEntry,
+        record: &InboxRecordHandle<CancelRunOutcome>,
+    ) -> Result<Applied<CancelRunOutcome>, InboxHandlerError> {
         let cancelled = self
             .core
             .cancel_run(&cancel.run_id, |effects| {
-                record.attach(effects, removed.clone())
+                record.attach(effects, &CancelRunOutcome::Removed)
             })
             .await;
         match cancelled {
-            Ok(CancelRun::Removed) => Ok(Applied::Committed),
-            Ok(CancelRun::Requested) => Ok(Applied::Separately(InboxOutcome::Applied(
-                json!({ "cancelled": true, "removed": false }),
-            ))),
-            Ok(CancelRun::NotActive) => Ok(Applied::Separately(InboxOutcome::Applied(
-                json!({ "cancelled": false }),
-            ))),
+            Ok(CancelRunOutcome::Removed) => Ok(Applied::Committed),
+            Ok(outcome) => Ok(Applied::Separately(InboxOutcome::Applied(outcome))),
             Err(err) => outcome_of(err),
         }
     }
@@ -203,7 +184,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use serde_json::json;
     use taquba::{InboxOptions, InboxOutcome, InboxSender, OpenOptions, Queue};
     use tokio::sync::oneshot;
 
@@ -290,15 +270,20 @@ mod tests {
             .await
             .unwrap();
         queue.apply_inbox_now().await.unwrap();
+        let first = queue
+            .view()
+            .inbox_record::<SubmitEntry>("first")
+            .await
+            .unwrap()
+            .unwrap();
+        let status = runtime.status(&rid("run-1")).await.unwrap().unwrap();
         assert_eq!(
-            queue
-                .view()
-                .inbox_record("first")
-                .await
-                .unwrap()
-                .unwrap()
-                .outcome,
-            InboxOutcome::Applied(json!({ "run_id": "run-1", "newly_submitted": true }))
+            first.outcome,
+            InboxOutcome::Applied(SubmitOutcome {
+                run_id: rid("run-1"),
+                newly_submitted: true,
+                job_id: status.step.job_id,
+            })
         );
 
         let shutdown = spawn(&runtime);
@@ -333,16 +318,24 @@ mod tests {
             .await
             .unwrap();
         queue.apply_inbox_now().await.unwrap();
-        let again = queue.view().inbox_record("again").await.unwrap().unwrap();
-        let InboxOutcome::Applied(outcome) = again.outcome else {
-            panic!("{:?}", again.outcome);
-        };
-        assert_eq!(outcome["run_id"], "run-1");
-        assert_eq!(outcome["newly_submitted"], false);
+        assert_eq!(
+            queue
+                .view()
+                .inbox_record::<SubmitEntry>("again")
+                .await
+                .unwrap()
+                .unwrap()
+                .outcome,
+            InboxOutcome::Applied(SubmitOutcome {
+                run_id: rid("run-1"),
+                newly_submitted: false,
+                job_id: end.termination.final_step.job_id,
+            })
+        );
         assert!(matches!(
             queue
                 .view()
-                .inbox_record("other")
+                .inbox_record::<SubmitEntry>("other")
                 .await
                 .unwrap()
                 .unwrap()
@@ -378,12 +371,12 @@ mod tests {
         assert_eq!(
             queue
                 .view()
-                .inbox_record("cancel")
+                .inbox_record::<CancelRunEntry>("cancel")
                 .await
                 .unwrap()
                 .unwrap()
                 .outcome,
-            InboxOutcome::Applied(json!({ "cancelled": true, "removed": true }))
+            InboxOutcome::Applied(CancelRunOutcome::Removed)
         );
         assert!(matches!(
             runtime.status(&rid("run-2")).await.unwrap().unwrap().state,
@@ -392,12 +385,12 @@ mod tests {
         assert_eq!(
             queue
                 .view()
-                .inbox_record("unknown")
+                .inbox_record::<CancelRunEntry>("unknown")
                 .await
                 .unwrap()
                 .unwrap()
                 .outcome,
-            InboxOutcome::Applied(json!({ "cancelled": false }))
+            InboxOutcome::Applied(CancelRunOutcome::NotActive)
         );
         close(queue, runtime).await;
     }
@@ -460,12 +453,24 @@ mod tests {
         queue.apply_inbox_now().await.unwrap();
         for (id, queue_name) in [("to-billing", "billing"), ("to-default", "workflow-steps")] {
             assert!(
-                queue.view().inbox_record(id).await.unwrap().is_some(),
+                queue
+                    .view()
+                    .inbox_record::<SubmitEntry>(id)
+                    .await
+                    .unwrap()
+                    .is_some(),
                 "{id}"
             );
             assert_eq!(queue.view().stats(queue_name).await.unwrap().pending, 1);
         }
-        assert_eq!(queue.view().inbox_record("to-nobody").await.unwrap(), None);
+        assert_eq!(
+            queue
+                .view()
+                .inbox_record::<SubmitEntry>("to-nobody")
+                .await
+                .unwrap(),
+            None
+        );
         drop(billing);
         close(queue, runtime).await;
 

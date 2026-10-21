@@ -934,7 +934,10 @@ mod tests {
         // No worker: the cancellation of the pending step terminates the run
         // without a run result record.
         let first = runner.submit(CountedKeyed { n: 7 }).await.unwrap();
-        assert!(runner.runtime.cancel(first.id()).await.unwrap());
+        assert_eq!(
+            runner.runtime.cancel(first.id()).await.unwrap(),
+            crate::CancelRunOutcome::Removed
+        );
         assert!(first.fetch_result().await.unwrap().is_none());
 
         let second = runner.submit(CountedKeyed { n: 7 }).await.unwrap();

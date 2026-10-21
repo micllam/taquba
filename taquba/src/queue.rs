@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use slatedb::Db;
 use slatedb::config::Settings;
 use slatedb::object_store::ObjectStore;
@@ -23,7 +24,6 @@ use crate::payload_store::PayloadStore;
 use crate::queue_core::{QueueConfigs, QueueCore};
 use crate::reaper::Reaper;
 use crate::scheduler::Scheduler;
-use crate::signal::SignalOutcome;
 use crate::stats::QueueMergeOperator;
 use crate::time_bound::TimeBound;
 use crate::txn::ClaimEnd;
@@ -31,7 +31,8 @@ use crate::view::{Handle, QueueView};
 
 /// Outcome of [`Queue::cancel`], reflecting which lifecycle branch the job was
 /// in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CancelOutcome {
     /// The job was `Pending` or `Scheduled`, and the call removed it from the
     /// queue. No worker will ever see it.
@@ -56,6 +57,17 @@ pub enum NackOutcome {
     /// Attempts were exhausted, so the job was dead-lettered and the effects
     /// were applied. The results align index-wise with the effects' enqueues.
     DeadLettered(Vec<EnqueueResult>),
+}
+
+/// Outcome of [`Queue::signal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalOutcome {
+    /// The job was waiting for a signal and is now pending, with the payload on
+    /// its record.
+    Delivered,
+    /// The job is absent or is not waiting for a signal. Nothing was changed.
+    NotWaiting,
 }
 
 /// Outcome of [`Queue::wake_scheduled`].
@@ -123,7 +135,8 @@ const ID_OVERRIDE_FORM: Form = Form {
 };
 
 /// Outcome of [`Queue::enqueue_with_effects`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EnqueueResult {
     /// A new job was enqueued, with its effects. The string is the id of the
     /// new job.
@@ -379,42 +392,38 @@ impl Queue {
         })
     }
 
-    /// Register `handler` for the inbox kind `kind`, so a pass applies the
-    /// entries of the kind through it. The registration lasts while the
-    /// returned [`InboxRegistration`] lives. A kind is `[a-z][a-z0-9._-]*` of
-    /// at most [`MAX_INBOX_ID_LEN`](crate::MAX_INBOX_ID_LEN) bytes.
+    /// Register `handler` for its inbox kind [`InboxHandler::Kind`], so a pass
+    /// applies the entries of the kind through it. The registration lasts while
+    /// the returned [`InboxRegistration`] lives.
     ///
     /// Fails with [`Error::InboxNotConfigured`] on a queue opened without
-    /// [`OpenOptions::inbox`], and with [`Error::InboxKindTaken`] for a core
-    /// kind or a kind with a live registration.
-    pub fn register_inbox_handler<H: InboxHandler>(
-        &self,
-        kind: &str,
-        handler: H,
-    ) -> Result<InboxRegistration> {
-        self.core.register_inbox_handler(kind, None, handler)
+    /// [`OpenOptions::inbox`], with [`Error::InvalidInboxKind`] for a kind name
+    /// outside the form of [`InboxKind::KIND`](crate::InboxKind::KIND), and
+    /// with [`Error::InboxKindTaken`] for a core kind or a kind with a live
+    /// registration.
+    pub fn register_inbox_handler<H: InboxHandler>(&self, handler: H) -> Result<InboxRegistration> {
+        self.core.register_inbox_handler(None, handler)
     }
 
-    /// Register `handler` for the entries of the inbox kind `kind` whose body
-    /// contains the string `value` at `field`, so each instance of a layer
-    /// applies the entries that identify it, as the core kinds identify a
-    /// queue. An entry of the kind with another string at the field, or without
-    /// one, waits for a registration for its value. A kind with a registration
-    /// for a value accepts further registrations with the same field and other
-    /// values, and refuses a registration of the whole kind.
+    /// Register `handler` for the entries of its inbox kind whose body contains
+    /// the string `value` at `field`, so each instance of a layer applies the
+    /// entries that identify it, as the core kinds identify a queue. An entry
+    /// of the kind with another string at the field, or without one, waits for
+    /// a registration for its value. A kind with a registration for a value
+    /// accepts further registrations with the same field and other values, and
+    /// refuses a registration of the whole kind.
     ///
     /// Fails as [`Self::register_inbox_handler`] fails, and with
     /// [`Error::InboxKindTaken`] for a value with a live registration or a
     /// field that differs from the field of the kind.
     pub fn register_inbox_handler_for<H: InboxHandler>(
         &self,
-        kind: &str,
         field: &str,
         value: &str,
         handler: H,
     ) -> Result<InboxRegistration> {
         self.core
-            .register_inbox_handler(kind, Some((field, value)), handler)
+            .register_inbox_handler(Some((field, value)), handler)
     }
 
     /// The writer's live view of the store: the read-only queries, with a write

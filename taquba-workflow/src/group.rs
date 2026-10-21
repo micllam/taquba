@@ -23,7 +23,7 @@ use crate::keys::{
     outcome_kv_key,
 };
 use crate::memo::MemoStore;
-use crate::runtime::{RunOptions, RunSpec, RunTermination, RuntimeCore};
+use crate::runtime::{CancelRunOutcome, RunOptions, RunSpec, RunTermination, RuntimeCore};
 use crate::sweep::{Clearable, Cleared};
 use crate::terminal::{RunOutcome, TerminalStatus};
 
@@ -629,11 +629,11 @@ impl RunGroup {
                 .into_iter()
                 .filter(|member| member.status().is_none()),
         )
-        .map(|member| async move { self.runtime.cancel(&member.record.run_id).await })
+        .map(|member| async move { self.runtime.cancel_run(&member.record.run_id, Ok).await })
         .buffer_unordered(SUBMIT_CONCURRENCY);
         let mut cancelled = 0;
-        while let Some(recorded) = cancellations.try_next().await? {
-            cancelled += usize::from(recorded);
+        while let Some(outcome) = cancellations.try_next().await? {
+            cancelled += usize::from(outcome != CancelRunOutcome::NotActive);
         }
         Ok(cancelled)
     }
