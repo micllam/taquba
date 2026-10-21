@@ -28,6 +28,8 @@ Do not add migration code or a read path for an older on-disk layout. See
 A new enum variant, struct field or function parameter in the public API goes
 into a minor release. Do not add a compatibility alias or `#[non_exhaustive]`.
 
+A release follows [RELEASE.md](RELEASE.md).
+
 ## Book
 
 The book in `book/src/` is part of the public surface. A change to what a page
