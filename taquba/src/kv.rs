@@ -700,7 +700,7 @@ mod tests {
             b"sentinel".to_vec(),
             EnqueueOptions::default(),
             SettlementEffects::default()
-                .kv_put(pending_key(&qn("work"), 1, "fake-id"), b"trickery"),
+                .kv_put(pending_key(&qn("work"), 1, 0, "fake-id"), b"trickery"),
         )
         .await
         .unwrap();
@@ -718,7 +718,7 @@ mod tests {
         // The user-visible key still reads back fine.
         let v = q
             .view()
-            .kv_get(&pending_key(&qn("work"), 1, "fake-id"))
+            .kv_get(&pending_key(&qn("work"), 1, 0, "fake-id"))
             .await
             .unwrap();
         assert_eq!(v.as_deref(), Some(b"trickery".as_slice()));

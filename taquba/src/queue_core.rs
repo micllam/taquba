@@ -75,8 +75,8 @@ pub(crate) struct QueueCore {
     /// The writer's live view of the store, which
     /// [`Queue::view`](crate::Queue::view) returns.
     pub(crate) view: QueueView,
-    /// Source of job ids. Pending keys sort by id within a priority, so ids
-    /// must increase with enqueue order, including inside one millisecond. One
+    /// Source of job ids, which increase with call order inside one millisecond
+    /// as well, so the ids of one enqueue time order its pending keys. One
     /// generator per store suffices: a store has a single writer process.
     pub(crate) id_gen: std::sync::Mutex<ulid::Generator>,
     /// Fired by [`watch_store_close`] once the store closes, before the lease

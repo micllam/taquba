@@ -455,9 +455,8 @@ pub struct EnqueueOptions {
     /// - 1-128 bytes long.
     /// - Characters limited to `[A-Za-z0-9_-]`.
     ///
-    /// Prefer ULID-shaped ids when FIFO-within-priority claim ordering matters:
-    /// `pending` and `scheduled` keys end with the id, so claim order follows
-    /// id sort.
+    /// Claim order within a priority follows the enqueue time of the job, so a
+    /// supplied id keeps the job's place in FIFO order.
     pub id_override: Option<String>,
     /// The signal key the job waits at, valid with [`Self::run_at`] alone. A
     /// signal to the key ([`Queue::signal`](crate::Queue::signal)) moves the

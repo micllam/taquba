@@ -712,7 +712,14 @@ mod tests {
 
     #[tokio::test]
     async fn list_jobs_pages_pending_in_claim_order() {
-        let q = Queue::open(make_store(), "test").await.unwrap();
+        let clock = MockClock::new(1_700_000_000_000);
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
         let low = q
             .enqueue_with(
                 "work",
@@ -724,8 +731,24 @@ mod tests {
             )
             .await
             .unwrap();
-        let normal_a = q.enqueue("work", b"a".to_vec()).await.unwrap();
-        let normal_b = q.enqueue("work", b"b".to_vec()).await.unwrap();
+        // Supplied ids that sort against the enqueue order keep FIFO order.
+        let normal_a = q
+            .enqueue_with(
+                "work",
+                b"a".to_vec(),
+                EnqueueOptions::default().id_override("zz-first".to_string()),
+            )
+            .await
+            .unwrap();
+        clock.advance(Duration::from_millis(1));
+        let normal_b = q
+            .enqueue_with(
+                "work",
+                b"b".to_vec(),
+                EnqueueOptions::default().id_override("aa-second".to_string()),
+            )
+            .await
+            .unwrap();
         let high = q
             .enqueue_with(
                 "work",

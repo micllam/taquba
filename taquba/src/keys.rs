@@ -12,9 +12,9 @@
 //! `Scheduled` and `Done` spaces lead with a timestamp so the scheduler and
 //! retention sweeps perform one global scan with an early exit. The `Pending`,
 //! `Claimed` and `Dead` spaces lead with the queue name so a listing covers one
-//! queue, `Pending` ordered by priority and then by ID and the other two by ID.
-//! The dead retention sweep is the exception: it scans the whole `Dead` space
-//! and reads the age from each record.
+//! queue, `Pending` ordered by priority, then by enqueue time and then by ID,
+//! and the other two by ID. The dead retention sweep is the exception: it scans
+//! the whole `Dead` space and reads the age from each record.
 //!
 //! A scheduled job with a signal key is indexed in `SignalWaiter` at the key,
 //! and a signal without a live waiter is held in `SignalBuffer` at the key.
@@ -157,7 +157,7 @@ pub(crate) const KEY_VERSION: u8 = 1;
 #[cfg_attr(test, derive(strum::EnumIter))]
 #[repr(u8)]
 pub(crate) enum KeyTag {
-    /// `[tag, ver, qlen, queue, priority u32 BE, id]`
+    /// `[tag, ver, qlen, queue, priority u32 BE, enqueued_at u64 BE, id]`
     Pending = 0x01,
     /// `[tag, ver, qlen, queue, id]`. The value is the job record. The key is
     /// stable for the lifetime of the claim, so a lease renewal leaves it
@@ -272,11 +272,12 @@ fn push_queue(out: &mut Vec<u8>, queue: &QueueName) {
     out.extend_from_slice(queue.as_bytes());
 }
 
-pub(crate) fn pending_key(queue: &QueueName, priority: u32, id: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(2 + 1 + queue.len() + 4 + id.len());
+pub(crate) fn pending_key(queue: &QueueName, priority: u32, enqueued_at: u64, id: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(2 + 1 + queue.len() + 4 + 8 + id.len());
     k.extend_from_slice(&header(KeyTag::Pending));
     push_queue(&mut k, queue);
     k.extend_from_slice(&priority.to_be_bytes());
+    k.extend_from_slice(&enqueued_at.to_be_bytes());
     k.extend_from_slice(id.as_bytes());
     k
 }
@@ -490,19 +491,21 @@ mod tests {
     }
 
     #[test]
-    fn pending_keys_order_by_priority_then_id_within_a_queue() {
+    fn pending_keys_order_by_priority_then_enqueue_time_then_id_within_a_queue() {
         let prefix = pending_prefix(&qn("q"));
-        let high = pending_key(&qn("q"), 100, "01A");
-        let normal_a = pending_key(&qn("q"), 1_000, "01A");
-        let normal_b = pending_key(&qn("q"), 1_000, "01B");
+        let high = pending_key(&qn("q"), 100, 9, "01Z");
+        let earlier = pending_key(&qn("q"), 1_000, 1, "zz");
+        let later_a = pending_key(&qn("q"), 1_000, 2, "01A");
+        let later_b = pending_key(&qn("q"), 1_000, 2, "01B");
         assert!(high.starts_with(&prefix));
-        assert!(high < normal_a);
-        assert!(normal_a < normal_b);
+        assert!(high < earlier);
+        assert!(earlier < later_a);
+        assert!(later_a < later_b);
     }
 
     #[test]
     fn pending_prefixes_of_nested_queue_names_do_not_collide() {
-        let key = pending_key(&qn("ab"), 1_000, "01A");
+        let key = pending_key(&qn("ab"), 1_000, 0, "01A");
         assert!(!key.starts_with(&pending_prefix(&qn("a"))));
         assert!(key.starts_with(&pending_prefix(&qn("ab"))));
     }
@@ -578,7 +581,7 @@ mod tests {
     #[test]
     fn key_spaces_do_not_overlap() {
         let keys = [
-            pending_key(&qn("q"), 1, "id"),
+            pending_key(&qn("q"), 1, 0, "id"),
             claimed_key(&qn("q"), "id"),
             scheduled_key(&qn("q"), 1, "id"),
             done_key(1, &qn("q"), "id"),

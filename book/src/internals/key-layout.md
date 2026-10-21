@@ -82,7 +82,7 @@ follows the two-byte header.
 
 | Space | Byte | Fields | Value |
 | --- | --- | --- | --- |
-| `Pending` | `0x01` | qlen, queue, priority `u32` BE, id | job record |
+| `Pending` | `0x01` | qlen, queue, priority `u32` BE, `enqueued_at` `u64` BE, id | job record |
 | `Claimed` | `0x02` | qlen, queue, id | job record |
 | `Scheduled` | `0x03` | `run_at` `u64` BE, qlen, queue, id | job record |
 | `Done` | `0x04` | `completed_at` `u64` BE, qlen, queue, id | job record |
@@ -145,7 +145,7 @@ at that key.
 
 `Pending`, `Claimed` and `Dead` lead with the queue name, so the claim scan and
 `list_jobs` ([view.rs][view]) read one queue's range. `Pending` is ordered by
-priority and then by id, and the other two by id.
+priority, then by enqueue time and then by id, and the other two by id.
 
 `Claimed` is read whole once, by `requeue_interrupted_claims`
 ([reaper.rs][reaper]) when the queue is opened. That read requeues every claim
@@ -212,14 +212,16 @@ arises. Its ordering comes from the ULID encoding:
 
 The Crockford base32 alphabet ascends in ASCII, so comparing the characters as
 bytes compares the value they encode. `next_job_id` ([effects.rs][effects]) owns
-the `ulid::Generator` and generates from the queue's clock. Pending keys within
-one priority therefore come out in enqueue order.
+the `ulid::Generator` and generates from the queue's clock, so ids increase with
+call order within one millisecond as well.
 
-`EnqueueOptions::id_override` accepts 1 to 128 bytes of `[A-Za-z0-9_-]`
-(`validate_id_override`, [queue.rs][queue]). `-` and `_` are outside the ULID
-alphabet, so caller ids interleave with generated ones by their own byte order.
-The option's documentation asks for ULID-form ids where FIFO ordering within a
-priority matters.
+A pending key places `enqueued_at` before the id, so pending keys within one
+priority come out in enqueue order for any id, and the id orders the jobs of one
+millisecond. `enqueued_at` keeps its value across retries and requeues, so a
+retried job returns to its place in that order. `EnqueueOptions::id_override`
+accepts 1 to 128 bytes of `[A-Za-z0-9_-]` (`validate_id_override`,
+[queue.rs][queue]), and a caller id orders by its own byte order within one
+millisecond.
 
 ## Parseable fields
 

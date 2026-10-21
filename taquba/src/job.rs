@@ -284,7 +284,7 @@ impl JobRecord {
     pub(crate) fn stored_key(&self) -> Vec<u8> {
         let (queue, id) = (&self.queue, self.id.as_str());
         match self.status {
-            JobStatus::Pending => pending_key(queue, self.priority, id),
+            JobStatus::Pending => pending_key(queue, self.priority, self.enqueued_at, id),
             JobStatus::Scheduled => {
                 let run_at = self.run_at.expect("a scheduled record has a run_at");
                 scheduled_key(queue, run_at, id)
@@ -397,7 +397,7 @@ mod tests {
         );
         let woken: Vec<u8> = payload.iter().rev().copied().collect();
         assert!(stored.windows(woken.len()).any(|w| w == woken.as_slice()));
-        let decoded = JobRecord::decode(&pending_key(&qn("q"), 0, "j"), &stored).unwrap();
+        let decoded = JobRecord::decode(&pending_key(&qn("q"), 0, 0, "j"), &stored).unwrap();
         assert_eq!(decoded.payload, payload);
         assert_eq!(decoded.wake_payload.as_deref(), Some(woken.as_slice()));
     }
@@ -417,7 +417,7 @@ mod tests {
         let bytes = record().stored_bytes().unwrap();
         let dead = JobRecord::decode(&dead_key(&qn("q"), "j"), &bytes).unwrap();
         assert_eq!(dead.status, JobStatus::Dead);
-        let pending = JobRecord::decode(&pending_key(&qn("q"), 0, "j"), &bytes).unwrap();
+        let pending = JobRecord::decode(&pending_key(&qn("q"), 0, 0, "j"), &bytes).unwrap();
         assert_eq!(pending.status, JobStatus::Pending);
         assert!(JobRecord::decode(&job_index_key("j"), &bytes).is_err());
     }

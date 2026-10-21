@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports a delivery. An enqueue with the key of a live waiter fails with
   `Error::SignalWaiterExists`, and a key without `run_at` with
   `Error::InvalidSignalKey`. The key layout gains the `SignalWaiter` and
-  `SignalBuffer` spaces, and a store written with 0.15.0 opens without a drain.
+  `SignalBuffer` spaces.
 - The inbox: `OpenOptions::inbox` with `InboxOptions` opens the queue with a
   prefix of objects that the writer applies once each, through which another
   process enqueues, cancels and signals. `InboxSender` writes an entry
@@ -37,6 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SettlementEffects` has a private field, so a caller constructs it with
   `SettlementEffects::default()` and the builder methods. Replace a struct
   literal with `..SettlementEffects::default()` or the setters.
+- Claims within a priority follow the enqueue time of a job before its id, so a
+  job with an `EnqueueOptions::id_override` keeps its place in FIFO order. Drain
+  the pending jobs of a store written with 0.15.0 before the upgrade.
 
 ## [0.15.0] - 2026-10-14
 
