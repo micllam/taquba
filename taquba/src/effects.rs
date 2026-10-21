@@ -16,7 +16,6 @@ use crate::kv::validate_kv_value_size;
 use crate::options::EnqueueOptions;
 use crate::queue::{EnqueueResult, validate_id_override};
 use crate::queue_core::QueueCore;
-use crate::queue_core::signal::stage_signal;
 use crate::txn::Txn;
 
 /// One enqueue contained in [`SettlementEffects`].
@@ -46,9 +45,7 @@ pub struct EnqueueRequest {
 /// `dedup_key` hit) commits without them. A key named in both `kv_writes` and
 /// `kv_deletes` is rejected with [`Error::ConflictingKvEffect`]. An entry added
 /// with [`Self::expiry_entry`] is recorded on its [`ExpiryIndex`] once the
-/// effects apply. A signal added with [`Self::signal`] is delivered or buffered
-/// as [`Queue::signal`](crate::Queue::signal) does, without a report of its
-/// outcome.
+/// effects apply.
 ///
 /// The type has private fields, so a caller constructs it with
 /// [`Default::default`] and the builder methods.
@@ -63,23 +60,12 @@ pub struct SettlementEffects {
     pub kv_deletes: Vec<Vec<u8>>,
     /// The index and the time of every entry added with [`Self::expiry_entry`].
     pub expiry_entries: Vec<(ExpiryIndex, u64)>,
-    /// The signal key and the payload of every signal added with
-    /// [`Self::signal`].
-    pub(crate) signals: Vec<(String, Vec<u8>)>,
     /// The id and the record of an inbox entry, added by
     /// [`InboxRecordHandle`](crate::InboxRecordHandle).
     pub(crate) inbox_record: Option<(String, InboxRecord)>,
 }
 
 impl SettlementEffects {
-    /// Add a signal to `key` with `payload`, delivered or buffered in the
-    /// transaction of the settlement.
-    #[must_use]
-    pub fn signal(mut self, key: impl Into<String>, payload: impl Into<Vec<u8>>) -> Self {
-        self.signals.push((key.into(), payload.into()));
-        self
-    }
-
     /// Set [`Self::enqueues`].
     #[must_use]
     pub fn enqueues(mut self, enqueues: Vec<EnqueueRequest>) -> Self {
@@ -150,7 +136,6 @@ pub(crate) struct PreparedEffects {
     pub(crate) kv_deletes: Vec<Vec<u8>>,
     /// Recorded on their indexes once the effects apply.
     pub(crate) expiry_entries: Vec<(ExpiryIndex, u64)>,
-    pub(crate) signals: Vec<(String, Vec<u8>)>,
     pub(crate) inbox_record: Option<(String, InboxRecord)>,
 }
 
@@ -198,20 +183,8 @@ impl QueueCore {
             None => (self.next_job_id(), false),
         };
 
-        if let Some(key) = &opts.signal_key {
-            let reason = if key.is_empty() {
-                Some("signal key must not be empty")
-            } else if opts.run_at.is_none() {
-                Some("signal key requires run_at")
-            } else {
-                None
-            };
-            if let Some(reason) = reason {
-                return Err(Error::InvalidSignalKey {
-                    key: key.clone(),
-                    reason,
-                });
-            }
+        if opts.signal_wait && opts.run_at.is_none() {
+            return Err(Error::SignalWaitWithoutRunAt);
         }
 
         let mut job =
@@ -222,7 +195,7 @@ impl QueueCore {
         }
         job.run_at = run_at;
         job.dedup_key = opts.dedup_key;
-        job.signal_key = opts.signal_key;
+        job.signal_wait = opts.signal_wait && job.status == JobStatus::Scheduled;
 
         Ok(PreparedJob {
             job,
@@ -302,7 +275,6 @@ impl QueueCore {
             kv_writes: effects.kv_writes,
             kv_deletes: effects.kv_deletes,
             expiry_entries: effects.expiry_entries,
-            signals: effects.signals,
             inbox_record: effects.inbox_record,
         })
     }
@@ -334,10 +306,6 @@ impl QueueCore {
         for (index, at_ms) in &prepared.expiry_entries {
             txn.note_expiry_entry(index, *at_ms);
         }
-        let now = self.now_ms();
-        for (key, payload) in &prepared.signals {
-            stage_signal(txn, key, payload.clone(), now).await?;
-        }
         if let Some((id, record)) = &prepared.inbox_record {
             txn.stage_inbox_record(id, record).await?;
         }
@@ -349,11 +317,6 @@ impl QueueCore {
     /// `Ok(Err(existing_id))` on a dedup hit, in which case no writes were
     /// added and the caller decides whether to roll back. The outer `Err` is
     /// reserved for real failures.
-    ///
-    /// A job with a signal key registers as the waiter at the key, or consumes
-    /// a signal buffered at the key and is written to pending with the signal
-    /// on its record. A live waiter at the key fails the call with
-    /// [`Error::SignalWaiterExists`].
     pub(crate) async fn stage_job_writes(
         &self,
         txn: &mut Txn,
@@ -379,14 +342,7 @@ impl QueueCore {
             return Err(Error::DuplicateJobId { id: job.id.clone() });
         }
 
-        match &job.signal_key {
-            None => txn.insert_job(job)?,
-            Some(signal_key) => {
-                let mut job = job.clone();
-                self.stage_signal_wait(txn, &mut job, signal_key).await?;
-                txn.insert_job(&job)?;
-            }
-        }
+        txn.insert_job(job)?;
         if let Some(ref dkey) = dkey {
             txn.put(dkey, job.id.as_bytes())?;
         }

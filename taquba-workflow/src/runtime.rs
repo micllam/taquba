@@ -24,8 +24,8 @@ use crate::inbox::{
 };
 use crate::keys::{
     DEDUP_PREFIX, GROUP_TERMINAL_KV_PREFIX, HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RunId,
-    TERMINAL_KV_PREFIX, check_effects, check_headers, hash_input, outcome_kv_key, run_kv_key,
-    step_kv_key,
+    TERMINAL_KV_PREFIX, check_effects, check_headers, hash_input, next_step_job_id, outcome_kv_key,
+    run_kv_key, step_kv_key,
 };
 use crate::memo::{MemoStore, RUN_RESULT_MEMO_KEY};
 use crate::runner::{StepErrorKind, StepOutcome, StepRunner, Trigger};
@@ -66,8 +66,8 @@ pub(crate) struct StepEnqueueOpts {
     pub(crate) priority: Option<u32>,
     /// Per-step `max_attempts` override.
     pub(crate) max_attempts: Option<u32>,
-    /// The signal key the step waits at until `run_at`.
-    pub(crate) signal_key: Option<String>,
+    /// Whether the step waits for a signal until `run_at`.
+    pub(crate) signal_wait: bool,
     /// Additional runtime-owned reserved headers for the step job.
     pub(crate) reserved_headers: Vec<(&'static str, String)>,
 }
@@ -178,12 +178,10 @@ pub enum RunState {
         /// The time from which a worker can claim the job.
         run_at_ms: u64,
     },
-    /// The current step is waiting for a signal at `signal_key`
-    /// ([`Trigger::OnSignal`]), and becomes claimable at `timeout_at_ms`
-    /// without one.
+    /// The current step is waiting for a signal ([`Trigger::OnSignal`]) to its
+    /// job id, the `job_id` of [`RunStatus::step`], and becomes claimable at
+    /// `timeout_at_ms` without one.
     Waiting {
-        /// The key that [`taquba::Queue::signal`] delivers to.
-        signal_key: String,
         /// The end of the wait without a signal, as a Unix timestamp in
         /// milliseconds.
         timeout_at_ms: u64,
@@ -892,13 +890,20 @@ impl RuntimeCore {
             run_at: spec.options.run_at,
             priority: spec.options.priority,
             max_attempts: spec.options.max_attempts_per_step,
-            signal_key: None,
+            signal_wait: false,
             reserved_headers: membership
                 .map(Membership::reserved_headers)
                 .unwrap_or_default(),
         };
-        let (request, job_id) =
-            self.step_enqueue_request(run_id, 0, spec.input, &spec.options.headers, opts);
+        let job_id = self.queue.next_job_id();
+        let request = self.step_enqueue_request(
+            job_id.clone(),
+            run_id,
+            0,
+            spec.input,
+            &spec.options.headers,
+            opts,
+        );
 
         let record_bytes = durable::encode(&DurableRunRecord {
             run_id: run_id.clone(),
@@ -1256,18 +1261,18 @@ impl RuntimeCore {
         }
     }
 
-    /// Build the enqueue request for one step of a run, with a pre-assigned job
-    /// id so the current-step pointer written with the enqueue can name it.
-    /// Returns the request and the assigned id.
+    /// Build the enqueue request for one step of a run with the pre-assigned
+    /// job id `job_id`, which the current-step pointer written with the enqueue
+    /// names.
     fn step_enqueue_request(
         &self,
+        job_id: String,
         run_id: &RunId,
         step_number: u32,
         payload: Vec<u8>,
         user_headers: &HashMap<String, String>,
         opts: StepEnqueueOpts,
-    ) -> (EnqueueRequest, String) {
-        let job_id = self.queue.next_job_id();
+    ) -> EnqueueRequest {
         let mut headers = user_headers.clone();
         headers.insert(HEADER_RUN_ID.to_string(), run_id.to_string());
         headers.insert(HEADER_STEP.to_string(), step_number.to_string());
@@ -1275,7 +1280,7 @@ impl RuntimeCore {
             headers.insert((*key).to_string(), value.clone());
         }
 
-        let request = EnqueueRequest {
+        EnqueueRequest {
             queue: self.queue_name.clone(),
             payload,
             options: EnqueueOptions::default()
@@ -1284,10 +1289,9 @@ impl RuntimeCore {
                 .priority(opts.priority)
                 .max_attempts(opts.max_attempts)
                 .dedup_key(Some(format!("{DEDUP_PREFIX}{run_id}:{step_number}")))
-                .id_override(Some(job_id.clone()))
-                .signal_key(opts.signal_key),
-        };
-        (request, job_id)
+                .id_override(Some(job_id))
+                .signal_wait(opts.signal_wait),
+        }
     }
 
     /// Build the enqueue request for a run's terminal-notification job. The
@@ -1377,41 +1381,31 @@ impl RuntimeCore {
             .await
     }
 
-    /// Build the effects that advance the run of `claimed` to its next step:
-    /// the next step's enqueue joins the current step's acknowledgement
-    /// transaction, so the transition is atomic.
+    /// Build the effects that advance the run of `claimed` to its next step,
+    /// the job [`next_step_job_id`] of the claimed job: the next step's enqueue
+    /// joins the current step's acknowledgement transaction, so the transition
+    /// is atomic.
     pub(crate) async fn advance(
         &self,
         claimed: &ClaimedStep<'_>,
         payload: Vec<u8>,
         opts: StepEnqueueOpts,
     ) -> SettlementEffects {
-        self.advance_with_kv(claimed, payload, opts, |_| HashMap::new())
-            .await
-    }
-
-    /// [`Self::advance`] with caller KV writes joined to the same
-    /// acknowledgement transaction. `kv_writes` receives the next step's
-    /// pre-assigned job id so the writes can reference it.
-    pub(crate) async fn advance_with_kv(
-        &self,
-        claimed: &ClaimedStep<'_>,
-        payload: Vec<u8>,
-        opts: StepEnqueueOpts,
-        kv_writes: impl FnOnce(&str) -> HashMap<Vec<u8>, Vec<u8>>,
-    ) -> SettlementEffects {
         let run_id = &claimed.run_id;
         let next_step = claimed.step_number + 1;
-        let (request, next_job_id) =
-            self.step_enqueue_request(run_id, next_step, payload, &claimed.headers, opts);
-        let mut kv_writes = kv_writes(&next_job_id);
-        kv_writes.insert(
-            step_kv_key(run_id),
-            current_step_bytes(next_step, &next_job_id),
+        let next_job_id = next_step_job_id(&claimed.job.id);
+        let pointer = current_step_bytes(next_step, &next_job_id);
+        let request = self.step_enqueue_request(
+            next_job_id,
+            run_id,
+            next_step,
+            payload,
+            &claimed.headers,
+            opts,
         );
         SettlementEffects::default()
             .enqueues(vec![request])
-            .kv_writes(kv_writes)
+            .kv_writes(HashMap::from([(step_kv_key(run_id), pointer)]))
     }
 }
 
@@ -1854,22 +1848,25 @@ mod tests {
 
     type ObservedSignals = Arc<StdMutex<Vec<Option<Vec<u8>>>>>;
 
-    /// Two-step runner: step 0 continues with a signal wait at `signal_key`,
-    /// step 1 records [`Step::signal`] and succeeds.
+    /// Two-step runner: step 0 continues with a signal wait, step 1 records
+    /// [`Step::signal`] and succeeds. With `fail_first`, the first attempt of
+    /// step 0 fails transiently. Every attempt of step 0 records its
+    /// [`Delivery::next_job_id`] in `wait_ids`.
     struct SignalProbe {
-        signal_key: String,
         timeout: Duration,
+        fail_first: bool,
         observed: ObservedSignals,
+        wait_ids: Arc<StdMutex<Vec<String>>>,
     }
 
     impl StepRunner for SignalProbe {
         async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
             if step.step_number == 0 {
-                Ok(StepOutcome::continue_on_signal(
-                    Vec::new(),
-                    self.signal_key.clone(),
-                    self.timeout,
-                ))
+                self.wait_ids.lock().unwrap().push(step.next_job_id.clone());
+                if self.fail_first && step.attempts == 1 {
+                    return Err(StepError::transient("first attempt"));
+                }
+                Ok(StepOutcome::continue_on_signal(Vec::new(), self.timeout))
             } else {
                 self.observed.lock().unwrap().push(step.signal.clone());
                 Ok(StepOutcome::Succeed { result: Vec::new() })
@@ -1894,41 +1891,66 @@ mod tests {
         panic!("scheduled count never reached {count}");
     }
 
+    /// The job id of the step that `run_id` waits at.
+    async fn waiting_job_id<R: StepRunner, H: TerminalHook>(
+        runtime: &WorkflowRuntime<R, H>,
+        run_id: &RunId,
+    ) -> String {
+        let status = runtime.status(run_id).await.unwrap().unwrap();
+        assert!(
+            matches!(status.state, RunState::Waiting { .. }),
+            "run is not waiting: {:?}",
+            status.state
+        );
+        status.step.job_id
+    }
+
+    struct ProbeRuntime {
+        runtime: WorkflowRuntime<SignalProbe, ChannelHook>,
+        observed: ObservedSignals,
+        wait_ids: Arc<StdMutex<Vec<String>>>,
+        rx: tokio::sync::mpsc::UnboundedReceiver<RunOutcome>,
+    }
+
     fn signal_probe_runtime(
         queue: Arc<Queue>,
         store: Arc<dyn taquba::object_store::ObjectStore>,
-        signal_key: &str,
         timeout: Duration,
-    ) -> (
-        WorkflowRuntime<SignalProbe, ChannelHook>,
-        ObservedSignals,
-        tokio::sync::mpsc::UnboundedReceiver<RunOutcome>,
-    ) {
+        fail_first: bool,
+    ) -> ProbeRuntime {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let observed = Arc::new(StdMutex::new(Vec::new()));
+        let wait_ids = Arc::new(StdMutex::new(Vec::new()));
         let runtime = WorkflowRuntime::builder(
             queue,
             store,
             SignalProbe {
-                signal_key: signal_key.to_string(),
                 timeout,
+                fail_first,
                 observed: observed.clone(),
+                wait_ids: wait_ids.clone(),
             },
             ChannelHook { tx },
         )
         .build()
         .unwrap();
-        (runtime, observed, rx)
+        ProbeRuntime {
+            runtime,
+            observed,
+            wait_ids,
+            rx,
+        }
     }
 
     #[tokio::test(start_paused = true)]
     async fn signal_wakes_waiting_run_early_with_payload() {
         let (queue, store, _clock) = open_queue_at(1_700_000_000_000).await;
-        let (runtime, observed, mut rx) =
-            signal_probe_runtime(queue.clone(), store, "order-1", Duration::from_secs(3600));
-        let shutdown = spawn_runtime(runtime.clone());
+        let mut probe =
+            signal_probe_runtime(queue.clone(), store, Duration::from_secs(3600), false);
+        let shutdown = spawn_runtime(probe.runtime.clone());
 
-        let handle = runtime
+        let handle = probe
+            .runtime
             .submit(RunSpec {
                 input: Vec::new(),
                 ..Default::default()
@@ -1936,29 +1958,59 @@ mod tests {
             .await
             .unwrap();
         wait_for_scheduled(&queue, 1).await;
+        let job_id = waiting_job_id(&probe.runtime, &handle.run_id).await;
         assert_eq!(
-            runtime.status(&handle.run_id).await.unwrap().unwrap().state,
+            probe
+                .runtime
+                .status(&handle.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
             RunState::Waiting {
-                signal_key: "order-1".to_string(),
                 timeout_at_ms: 1_700_000_000_000 + 3_600_000,
             }
         );
 
-        let outcome = queue.signal("order-1", b"paid".to_vec()).await.unwrap();
+        let outcome = queue.signal(&job_id, b"paid".to_vec()).await.unwrap();
         assert_eq!(outcome, SignalOutcome::Delivered);
 
         // The run completes without the timeout elapsing on the mock clock.
-        let terminal = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let terminal = tokio::time::timeout(Duration::from_secs(2), probe.rx.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(terminal.status, TerminalStatus::Succeeded);
         assert_eq!(
-            observed.lock().unwrap().as_slice(),
+            probe.observed.lock().unwrap().as_slice(),
             &[Some(b"paid".to_vec())]
         );
-        assert_eq!(queue.view().signal_waiter("order-1").await.unwrap(), None);
-        assert!(!queue.clear_signal("order-1").await.unwrap());
+        assert_eq!(
+            queue.signal(&job_id, b"again".to_vec()).await.unwrap(),
+            SignalOutcome::NotWaiting
+        );
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn next_job_id_is_the_same_on_every_attempt_and_is_the_id_of_the_wait() {
+        let (queue, store, _clock) = open_queue_at_with(1_700_000_000_000, fast_options()).await;
+        let probe = signal_probe_runtime(queue.clone(), store, Duration::from_secs(3600), true);
+        let shutdown = spawn_runtime(probe.runtime.clone());
+
+        let handle = probe
+            .runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        wait_for_scheduled(&queue, 1).await;
+        let job_id = waiting_job_id(&probe.runtime, &handle.run_id).await;
+        let wait_ids = probe.wait_ids.lock().unwrap().clone();
+        assert_eq!(wait_ids, vec![job_id.clone(), job_id]);
 
         let _ = shutdown.send(());
     }
@@ -1979,12 +2031,13 @@ mod tests {
         };
 
         let queue = open(store.clone()).await;
-        let (runtime, _observed, _rx) = signal_probe_runtime(
+        let probe = signal_probe_runtime(
             queue.clone(),
             store.clone(),
-            "approval",
             Duration::from_secs(3600),
+            false,
         );
+        let runtime = probe.runtime;
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
         let worker = tokio::spawn({
             let runtime = runtime.clone();
@@ -1996,7 +2049,7 @@ mod tests {
                     .await
             }
         });
-        runtime
+        let handle = runtime
             .submit(RunSpec {
                 input: Vec::new(),
                 ..Default::default()
@@ -2024,36 +2077,34 @@ mod tests {
             1
         );
 
-        let (runtime, observed, mut rx) =
-            signal_probe_runtime(queue.clone(), store, "approval", Duration::from_secs(3600));
-        let shutdown = spawn_runtime(runtime.clone());
+        let mut probe =
+            signal_probe_runtime(queue.clone(), store, Duration::from_secs(3600), false);
+        let shutdown = spawn_runtime(probe.runtime.clone());
+        let job_id = waiting_job_id(&probe.runtime, &handle.run_id).await;
 
-        let delivery = queue
-            .signal("approval", b"approved".to_vec())
-            .await
-            .unwrap();
+        let delivery = queue.signal(&job_id, b"approved".to_vec()).await.unwrap();
         assert_eq!(delivery, SignalOutcome::Delivered);
 
-        let terminal = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        let terminal = tokio::time::timeout(Duration::from_secs(5), probe.rx.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(terminal.status, TerminalStatus::Succeeded);
         assert_eq!(
-            observed.lock().unwrap().as_slice(),
+            probe.observed.lock().unwrap().as_slice(),
             &[Some(b"approved".to_vec())]
         );
         let _ = shutdown.send(());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn signal_timeout_delivers_none() {
+    async fn signal_timeout_delivers_none_and_rejects_a_late_signal() {
         let (queue, store, clock) = open_queue_at(1_700_000_000_000).await;
-        let (runtime, observed, mut rx) =
-            signal_probe_runtime(queue.clone(), store, "order-2", Duration::from_secs(60));
-        let shutdown = spawn_runtime(runtime.clone());
+        let mut probe = signal_probe_runtime(queue.clone(), store, Duration::from_secs(60), false);
+        let shutdown = spawn_runtime(probe.runtime.clone());
 
-        runtime
+        let handle = probe
+            .runtime
             .submit(RunSpec {
                 input: Vec::new(),
                 ..Default::default()
@@ -2061,134 +2112,34 @@ mod tests {
             .await
             .unwrap();
         wait_for_scheduled(&queue, 1).await;
+        let job_id = waiting_job_id(&probe.runtime, &handle.run_id).await;
 
         advance(&clock, Duration::from_secs(61)).await;
         queue.promote_scheduled_now().await.unwrap();
 
-        let terminal = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let terminal = tokio::time::timeout(Duration::from_secs(2), probe.rx.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(terminal.status, TerminalStatus::Succeeded);
-        assert_eq!(observed.lock().unwrap().as_slice(), &[None]);
-        assert_eq!(queue.view().signal_waiter("order-2").await.unwrap(), None);
-
-        let _ = shutdown.send(());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_buffered_signal_is_consumed_at_registration_and_a_later_one_replaces_it() {
-        let (queue, store, _clock) = open_queue_at(1_700_000_000_000).await;
-        let (runtime, observed, mut rx) =
-            signal_probe_runtime(queue.clone(), store, "order-3", Duration::from_secs(3600));
-        let shutdown = spawn_runtime(runtime.clone());
-
+        assert_eq!(probe.observed.lock().unwrap().as_slice(), &[None]);
         assert_eq!(
-            queue.signal("order-3", b"first".to_vec()).await.unwrap(),
-            SignalOutcome::Buffered
-        );
-        assert_eq!(
-            queue.signal("order-3", b"second".to_vec()).await.unwrap(),
-            SignalOutcome::Buffered
-        );
-
-        runtime
-            .submit(RunSpec {
-                input: Vec::new(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        // The buffered signal is consumed at registration: the run completes
-        // without any waiting and without the timeout elapsing.
-        let terminal = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(terminal.status, TerminalStatus::Succeeded);
-        assert_eq!(
-            observed.lock().unwrap().as_slice(),
-            &[Some(b"second".to_vec())]
-        );
-        assert!(!queue.clear_signal("order-3").await.unwrap());
-
-        let _ = shutdown.send(());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn duplicate_waiter_registration_fails_the_run() {
-        let (queue, store, _clock) = open_queue_at(1_700_000_000_000).await;
-        let (runtime, _observed, mut rx) =
-            signal_probe_runtime(queue.clone(), store, "order-6", Duration::from_secs(3600));
-        let shutdown = spawn_runtime(runtime.clone());
-
-        runtime
-            .submit(RunSpec {
-                run_id: Some(rid("run-a")),
-                input: Vec::new(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        wait_for_scheduled(&queue, 1).await;
-
-        runtime
-            .submit(RunSpec {
-                run_id: Some(rid("run-b")),
-                input: Vec::new(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        let terminal = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(terminal.run_id, "run-b");
-        assert_eq!(terminal.status, TerminalStatus::Failed);
-        assert!(
-            terminal
-                .error
-                .as_deref()
-                .is_some_and(|e| e.contains("already registered"))
-        );
-        assert_eq!(
-            queue.view().stats("workflow-steps").await.unwrap().dead,
-            1,
-            "the rejected registration dead-letters run-b's step",
-        );
-        assert!(
-            queue
-                .view()
-                .kv_get(&run_kv_key(&rid("run-b")))
-                .await
-                .unwrap()
-                .is_none(),
-            "the run record delete rides the dead-letter",
-        );
-        assert!(
-            queue
-                .view()
-                .kv_get(&run_kv_key(&rid("run-a")))
-                .await
-                .unwrap()
-                .is_some(),
-            "the waiting run keeps its record",
+            queue.signal(&job_id, b"late".to_vec()).await.unwrap(),
+            SignalOutcome::NotWaiting
         );
 
         let _ = shutdown.send(());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancelled_waiter_leaves_no_live_index_for_the_next_signal() {
+    async fn a_cancelled_wait_rejects_a_signal() {
         let (queue, store, _clock) = open_queue_at(1_700_000_000_000).await;
-        let (runtime, _observed, mut rx) =
-            signal_probe_runtime(queue.clone(), store, "order-8", Duration::from_secs(3600));
-        let shutdown = spawn_runtime(runtime.clone());
+        let mut probe =
+            signal_probe_runtime(queue.clone(), store, Duration::from_secs(3600), false);
+        let shutdown = spawn_runtime(probe.runtime.clone());
 
-        let handle = runtime
+        let handle = probe
+            .runtime
             .submit(RunSpec {
                 input: Vec::new(),
                 ..Default::default()
@@ -2196,19 +2147,17 @@ mod tests {
             .await
             .unwrap();
         wait_for_scheduled(&queue, 1).await;
+        let job_id = waiting_job_id(&probe.runtime, &handle.run_id).await;
 
-        assert!(runtime.cancel(&handle.run_id).await.unwrap());
-        let terminal = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        assert!(probe.runtime.cancel(&handle.run_id).await.unwrap());
+        let terminal = tokio::time::timeout(Duration::from_secs(2), probe.rx.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(terminal.status, TerminalStatus::Cancelled);
-
-        // The cancellation ended the wait, so the signal is buffered.
-        assert_eq!(queue.view().signal_waiter("order-8").await.unwrap(), None);
         assert_eq!(
-            queue.signal("order-8", b"orphan".to_vec()).await.unwrap(),
-            SignalOutcome::Buffered
+            queue.signal(&job_id, b"orphan".to_vec()).await.unwrap(),
+            SignalOutcome::NotWaiting
         );
 
         let _ = shutdown.send(());
@@ -4991,7 +4940,7 @@ mod tests {
                 step.effects
                     .enqueue(EnqueueRequest {
                         queue: "app-requests".to_string(),
-                        payload: b"request".to_vec(),
+                        payload: step.next_job_id.clone().into_bytes(),
                         options: EnqueueOptions::default(),
                     })
                     .map_err(|e| StepError::transient(e.to_string()))?;
@@ -5065,7 +5014,15 @@ mod tests {
             .filter(|request| request.queue == "app-requests")
             .collect();
         assert_eq!(replayed.len(), 1);
-        assert_eq!(replayed[0].payload, b"request");
+        let next_step = effects
+            .enqueues
+            .iter()
+            .find(|request| request.queue == "workflow-steps")
+            .unwrap();
+        assert_eq!(
+            Some(String::from_utf8(replayed[0].payload.clone()).unwrap()),
+            next_step.options.id_override
+        );
         queue.ack_with(&job, effects).await.unwrap();
         assert_eq!(
             queue

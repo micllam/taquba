@@ -154,10 +154,7 @@ impl From<DurableDuration> for Duration {
 pub(crate) enum DurableTrigger {
     Immediate,
     After(DurableDuration),
-    OnSignal {
-        signal_key: String,
-        timeout: DurableDuration,
-    },
+    OnSignal { timeout: DurableDuration },
 }
 
 impl From<&Trigger> for DurableTrigger {
@@ -165,11 +162,7 @@ impl From<&Trigger> for DurableTrigger {
         match trigger {
             Trigger::Immediate => Self::Immediate,
             Trigger::After(delay) => Self::After((*delay).into()),
-            Trigger::OnSignal {
-                signal_key,
-                timeout,
-            } => Self::OnSignal {
-                signal_key: signal_key.clone(),
+            Trigger::OnSignal { timeout } => Self::OnSignal {
                 timeout: (*timeout).into(),
             },
         }
@@ -181,11 +174,7 @@ impl From<DurableTrigger> for Trigger {
         match trigger {
             DurableTrigger::Immediate => Self::Immediate,
             DurableTrigger::After(delay) => Self::After(delay.into()),
-            DurableTrigger::OnSignal {
-                signal_key,
-                timeout,
-            } => Self::OnSignal {
-                signal_key,
+            DurableTrigger::OnSignal { timeout } => Self::OnSignal {
                 timeout: timeout.into(),
             },
         }

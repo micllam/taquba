@@ -100,9 +100,8 @@
 //! - Scheduled jobs become pending at their `run_at`, or earlier via the
 //!   targeted [`Queue::wake_scheduled`], which can attach bytes the worker
 //!   observes on delivery.
-//! - A scheduled job enqueued with [`EnqueueOptions::signal_key`] waits at the
-//!   key: [`Queue::signal`] wakes it with a payload, or buffers the signal for
-//!   the next job enqueued with the key.
+//! - A scheduled job enqueued with [`EnqueueOptions::signal_wait`] waits for a
+//!   signal: [`Queue::signal`] wakes it by its id with a payload.
 //! - Bounded dead-letter retention with paginated inspection.
 //!
 //! # Worker loop

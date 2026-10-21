@@ -41,11 +41,11 @@ async fn put_raw(store: &Arc<dyn ObjectStore>, kind: &str, id: &str, body: &[u8]
         .unwrap();
 }
 
-/// The options of a job that waits at `key` for an hour.
-fn waiting(key: &str) -> EnqueueOptions {
+/// The options of a job that waits for a signal for an hour.
+fn waiting() -> EnqueueOptions {
     EnqueueOptions::default()
         .run_at(std::time::UNIX_EPOCH + Duration::from_millis(INITIAL + 3_600_000))
-        .signal_key(key.to_string())
+        .signal_wait(true)
 }
 
 #[tokio::test]
@@ -509,20 +509,20 @@ async fn the_cancel_kind_removes_a_queued_job_and_records_the_other_outcomes() {
 }
 
 #[tokio::test]
-async fn the_signal_kind_wakes_a_waiter_or_buffers_and_records_the_outcome() {
+async fn the_signal_kind_wakes_a_waiter_or_records_that_none_waits() {
     let store = make_store();
     let q = open(&store, &MockClock::new(INITIAL)).await;
     let waiter = q
-        .enqueue_with("waits", b"w".to_vec(), waiting("order-1"))
+        .enqueue_with("waits", b"w".to_vec(), waiting())
         .await
         .unwrap();
     let sender = sender(&store);
-    for (id, key) in [("to-waiter", "order-1"), ("to-nobody", "order-2")] {
+    for (id, job_id) in [("to-waiter", waiter.as_str()), ("to-nobody", "absent")] {
         sender
             .send_with_id(
                 id,
                 &SignalEntry {
-                    key: key.to_string(),
+                    job_id: job_id.to_string(),
                     payload: b"go".to_vec(),
                 },
             )
@@ -550,9 +550,8 @@ async fn the_signal_kind_wakes_a_waiter_or_buffers_and_records_the_outcome() {
             .unwrap()
             .unwrap()
             .outcome,
-        InboxOutcome::Applied(json!({ "outcome": "buffered" }))
+        InboxOutcome::Applied(json!({ "outcome": "not_waiting" }))
     );
-    assert!(q.clear_signal("order-2").await.unwrap());
     q.close().await.unwrap();
 }
 
@@ -567,7 +566,7 @@ async fn the_first_pass_at_open_precedes_the_scheduler() {
             b"w".to_vec(),
             EnqueueOptions::default()
                 .run_at(std::time::UNIX_EPOCH + Duration::from_millis(INITIAL + 10_000))
-                .signal_key("order-1".to_string()),
+                .signal_wait(true),
         )
         .await
         .unwrap();
@@ -576,7 +575,7 @@ async fn the_first_pass_at_open_precedes_the_scheduler() {
     // The signal arrives and the timeout passes while the process is down.
     sender(&store)
         .send(&SignalEntry {
-            key: "order-1".to_string(),
+            job_id: waiter.clone(),
             payload: b"late".to_vec(),
         })
         .await

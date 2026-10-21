@@ -201,14 +201,14 @@ impl WorkflowView {
 }
 
 /// The state of a run whose current step's job is scheduled: a wait for a
-/// signal when the job has a signal key, a delay otherwise.
+/// signal when the job waits for one, a delay otherwise.
 fn scheduled_state(job: &JobRecord) -> RunState {
     let run_at_ms = job.run_at.unwrap_or_default();
-    match &job.signal_key {
-        Some(signal_key) => RunState::Waiting {
-            signal_key: signal_key.clone(),
+    if job.signal_wait {
+        RunState::Waiting {
             timeout_at_ms: run_at_ms,
-        },
-        None => RunState::Scheduled { run_at_ms },
+        }
+    } else {
+        RunState::Scheduled { run_at_ms }
     }
 }

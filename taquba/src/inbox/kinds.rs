@@ -133,12 +133,12 @@ impl QueueCore {
         entry: SignalEntry,
         record: &InboxRecordHandle,
     ) -> Result<Applied> {
-        let (key, payload) = (&entry.key, &entry.payload);
+        let (job_id, payload) = (&entry.job_id, &entry.payload);
         self.retry(Durability::Awaited, |mut txn| async move {
-            let outcome = stage_signal(&mut txn, key, payload.clone(), self.now_ms()).await?;
+            let outcome = stage_signal(&mut txn, job_id, payload.clone(), self.now_ms()).await?;
             let outcome = match outcome {
                 SignalOutcome::Delivered => "delivered",
-                SignalOutcome::Buffered => "buffered",
+                SignalOutcome::NotWaiting => "not_waiting",
             };
             let stored = record.record(InboxOutcome::Applied(json!({ "outcome": outcome })));
             txn.stage_inbox_record(record.id(), &stored).await?;

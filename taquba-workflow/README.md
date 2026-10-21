@@ -108,7 +108,7 @@ demonstrates.
 
 | Outcome | Effect |
 |---|---|
-| `StepOutcome::Continue { payload, when }` | Enqueue the next step. `when` (a `Trigger`) decides when it becomes claimable: `Trigger::Immediate`, `Trigger::After(delay)` or `Trigger::OnSignal { signal_key, timeout }`. Constructors: `StepOutcome::continue_now(payload)`, `StepOutcome::continue_after(payload, delay)`, `StepOutcome::continue_on_signal(payload, key, timeout)`. |
+| `StepOutcome::Continue { payload, when }` | Enqueue the next step. `when` (a `Trigger`) decides when it becomes claimable: `Trigger::Immediate`, `Trigger::After(delay)` or `Trigger::OnSignal { timeout }`. Constructors: `StepOutcome::continue_now(payload)`, `StepOutcome::continue_after(payload, delay)`, `StepOutcome::continue_on_signal(payload, timeout)`. |
 | `StepOutcome::Succeed { result }` | Ack, and the terminal hook observes `Succeeded`. |
 | `StepOutcome::Fail { reason }` | Ack, and the terminal hook observes `Failed`. A failure decided by the runner: no dead-letter. |
 | `StepOutcome::Cancel { reason }` | Ack, and the terminal hook observes `Cancelled`. A cancellation decided by the runner: no dead-letter. |
@@ -224,58 +224,53 @@ once, with a slow call's timeout, before issuing the call.
 
 A step can pause the rest of its run until an external event. Returning
 `StepOutcome::continue_on_signal` (a `Trigger::OnSignal`) defers the next step
-until a signal for the chosen signal key arrives via `taquba::Queue::signal`, or
-until the timeout elapses. The next step reads `Step::signal`: `Some(payload)`
-when a signal arrived, `None` when the timeout fired. The natural fit is a run
-that waits for an approval, a webhook callback or another run's completion, with
-the timeout as the escalation path.
+until a signal to its job id arrives through `taquba::Queue::signal`, or until
+the timeout elapses. The id is `Delivery::next_job_id` of the requesting step,
+and `RunStatus::step` reports it for a waiting run. The next step reads
+`Step::signal`: `Some(payload)` when a signal arrived, `None` when the timeout
+fired. The natural fit is a run that waits for an approval, a webhook callback
+or a remote reply, with the timeout as the escalation path.
+
+The work that leads to a signal starts after the wait commits: the step stages
+its request with `EffectsHandle::enqueue`, and the request includes the id. The
+queue rejects a signal to a job that does not wait, with
+`taquba::SignalOutcome::NotWaiting`, so a signal sent before the wait commits,
+after the timeout or a second time cannot wake a later step.
 
 ```rust,ignore
-// In the runner: pause the run for the payment webhook, or escalate
-// after seven days.
+// In the runner: request the payment with the id of the wait, and pause
+// the run for the payment webhook, or escalate after seven days.
+step.effects.enqueue(EnqueueRequest {
+    queue: "payment-requests".to_string(),
+    payload: payment_request(&order_id, &step.next_job_id),
+    options: EnqueueOptions::default(),
+})?;
 Ok(StepOutcome::continue_on_signal(
     order_id.into_bytes(),
-    format!("payment:{order_id}"),
     Duration::from_secs(7 * 24 * 3600),
 ))
 
-// In the webhook handler:
-match queue.signal(&format!("payment:{order_id}"), body).await? {
-    SignalOutcome::Delivered => { /* a waiting run was woken */ }
-    SignalOutcome::Buffered => { /* held for the next waiter */ }
+// In the webhook handler, with the id that the payment request included:
+match queue.signal(&wait_id, body).await? {
+    SignalOutcome::Delivered => { /* the waiting run was woken */ }
+    SignalOutcome::NotWaiting => { /* the wait ended without a change */ }
 }
 ```
 
-Signals are durable in both directions. The waiting step is a scheduled job in
-the store, indexed at the key through `taquba::JobRecord::signal_key`, so the
+Signals are durable. The waiting step is a scheduled job in the store, so the
 wait persists across restarts and does not occupy a worker while pending. A
-signal without a registered waiter is buffered durably at its key and consumed
-by the next waiter registered for it, so a signal that arrives before its waiter
-is not lost. `taquba::Queue::clear_signal` discards a buffered signal that is no
-longer wanted. A waiting run resumes under the runner hosted by the resuming
-process, so a runner changed while the run waits is the caller's compatibility
-concern.
+waiting run resumes under the runner hosted by the resuming process, so a runner
+changed while the run waits is the caller's compatibility concern.
 
 Delivery follows the crate's at-least-once model: the woken step can be
-redelivered and observes the same `Step::signal` value on every attempt. One
-buffered signal is held per signal key, and a second signal before consumption
-replaces the first. One waiter is allowed per signal key. Registering a second
-one fails that run, so choose keys unique to the waiter (include the run id if
-uniqueness is uncertain). A terminal hook stages a signal to another run with
-`TerminalEffects::signal`, committed with the termination.
+redelivered and observes the same `Step::signal` value on every attempt, and
+every attempt of the requesting step has the same `Delivery::next_job_id`.
 
 See [`examples/durable_approvals.rs`](examples/durable_approvals.rs) for a
-runnable approval flow covering all three delivery paths (signal, timeout and
-buffered) across process restarts.
-
-A signal is also how work on another machine reports back without an inbound
-endpoint on this process. The requesting step chooses a reply key in the bucket,
-sends it with the request and continues on a signal. The remote worker writes
-its reply at that key, and a watcher task in this process delivers the key as
-the signal when the object appears. No lease is held during the wait, because
-the requesting step settles before the remote work starts. See
-[`examples/remote_reply.rs`](examples/remote_reply.rs) for a runnable version
-with the pending-marker layout the watcher reads.
+runnable approval flow with the signal and the timeout across process restarts,
+and [`examples/remote_reply.rs`](examples/remote_reply.rs) for work on another
+machine that replies through the inbox with a `taquba::SignalEntry`, without an
+inbound endpoint on this process.
 
 ## The inbox
 

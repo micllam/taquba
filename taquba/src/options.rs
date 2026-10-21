@@ -458,20 +458,13 @@ pub struct EnqueueOptions {
     /// Claim order within a priority follows the enqueue time of the job, so a
     /// supplied id keeps the job's place in FIFO order.
     pub id_override: Option<String>,
-    /// The signal key the job waits at, valid with [`Self::run_at`] alone. A
-    /// signal to the key ([`Queue::signal`](crate::Queue::signal)) moves the
-    /// job to pending before its `run_at`, with the payload of the signal on
-    /// [`JobRecord::wake_payload`](crate::JobRecord::wake_payload). A signal
-    /// buffered at the key before the enqueue is consumed by it, and the job is
-    /// then written to pending. A key is unique per wait, such as a key with
-    /// the id of the waiting work in it: a buffered signal is kept until a job
-    /// consumes it, so a stale signal at a reused key reaches the next job that
-    /// waits at it. One waiter per key: an enqueue with the key of a live
-    /// waiter fails with
-    /// [`Error::SignalWaiterExists`](crate::Error::SignalWaiterExists). A key
-    /// without `run_at`, or an empty key, is
-    /// [`Error::InvalidSignalKey`](crate::Error::InvalidSignalKey).
-    pub signal_key: Option<String>,
+    /// Whether the scheduled job waits for a signal until its `run_at`. A
+    /// signal to the job's id ([`Queue::signal`](crate::Queue::signal)) moves
+    /// it to pending before its `run_at`, with the payload of the signal on
+    /// [`JobRecord::wake_payload`](crate::JobRecord::wake_payload). A wait
+    /// requires [`Self::run_at`], and without it the enqueue fails with
+    /// [`Error::SignalWaitWithoutRunAt`](crate::Error::SignalWaitWithoutRunAt).
+    pub signal_wait: bool,
 }
 
 impl EnqueueOptions {
@@ -524,10 +517,10 @@ impl EnqueueOptions {
         self
     }
 
-    /// Set [`Self::signal_key`].
+    /// Set [`Self::signal_wait`].
     #[must_use]
-    pub fn signal_key(mut self, signal_key: impl Into<Option<String>>) -> Self {
-        self.signal_key = signal_key.into();
+    pub fn signal_wait(mut self, signal_wait: bool) -> Self {
+        self.signal_wait = signal_wait;
         self
     }
 }

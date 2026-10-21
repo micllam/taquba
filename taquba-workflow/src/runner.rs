@@ -9,7 +9,7 @@ use taquba::{LeaseHandle, PermanentFailure, WorkerError};
 use tokio_util::sync::CancellationToken;
 
 use crate::effects::EffectsHandle;
-use crate::keys::RunId;
+use crate::keys::{RunId, next_step_job_id};
 use crate::kv::KvReadHandle;
 use crate::memo::{Memo, MemoStore};
 
@@ -30,6 +30,12 @@ pub struct Delivery {
     pub headers: HashMap<String, String>,
     /// The Taquba job ID of this delivery, useful for tracing.
     pub job_id: String,
+    /// The job id of the next step of the run, derived from [`Self::job_id`]
+    /// and the same on every attempt of this step. A step that continues with
+    /// [`StepOutcome::continue_on_signal`] waits at this id: the request that
+    /// leads to the signal includes it, and the step stages the request in its
+    /// [`Self::effects`], so the request leaves after the wait commits.
+    pub next_job_id: String,
     /// The number of attempts Taquba made at this delivery, including this one:
     /// `1` on the first attempt and `>1` after a lease expiry or a nack retry.
     pub attempts: u32,
@@ -139,6 +145,7 @@ impl Delivery {
             run_id: run_id.clone(),
             headers: HashMap::new(),
             job_id: "detached".to_string(),
+            next_job_id: next_step_job_id("detached"),
             attempts: 1,
             max_attempts: 3,
             cancel_token: CancellationToken::new(),
@@ -175,9 +182,9 @@ pub struct Step {
     pub payload: Vec<u8>,
     /// The signal payload, when this step was reached through a
     /// [`Trigger::OnSignal`] wait that a signal resolved: the previous step
-    /// continued with `OnSignal`, and a [`taquba::Queue::signal`] call for the
-    /// signal key arrived before the timeout. `None` when the timeout elapsed
-    /// first and on every step not preceded by an `OnSignal` wait.
+    /// continued with `OnSignal`, and a [`taquba::Queue::signal`] call for this
+    /// step's job id arrived before the timeout. `None` when the timeout
+    /// elapsed first and on every step not preceded by an `OnSignal` wait.
     pub signal: Option<Vec<u8>>,
 }
 
@@ -226,21 +233,14 @@ pub enum Trigger {
     Immediate,
     /// The next step is claimable `Duration` from now.
     After(Duration),
-    /// The next step is claimable when a signal for `signal_key` arrives via
+    /// The next step is claimable when a signal to its job id,
+    /// [`Delivery::next_job_id`] of this step, arrives through
     /// [`taquba::Queue::signal`], or after `timeout`, whichever comes first.
     /// The next step reads [`Step::signal`] to distinguish the two:
     /// `Some(payload)` when a signal arrived, `None` when the timeout elapsed
-    /// first. A signal that arrived before this step settled is consumed at
-    /// settlement and the next step runs immediately.
-    ///
-    /// One waiter per signal key: registering a second waiter while one is
-    /// already waiting fails the step permanently. A key is unique per wait,
-    /// such as a key with the run id in it: the queue keeps a buffered signal
-    /// until a waiter consumes it, so a stale signal at a reused key reaches
-    /// the next waiter at it.
+    /// first. The queue rejects a signal sent before this step settles, so the
+    /// step stages the request that leads to the signal in its effects.
     OnSignal {
-        /// Caller-chosen key the signaller addresses.
-        signal_key: String,
         /// Upper bound on the wait. When it elapses first, the next step runs
         /// with [`Step::signal`] `None`.
         timeout: Duration,
@@ -317,19 +317,12 @@ impl StepOutcome {
         }
     }
 
-    /// Continue the run with the next step claimable when a signal for
-    /// `signal_key` arrives, or after `timeout` at the latest.
-    pub fn continue_on_signal(
-        payload: Vec<u8>,
-        signal_key: impl Into<String>,
-        timeout: Duration,
-    ) -> Self {
+    /// Continue the run with the next step claimable when a signal to
+    /// [`Delivery::next_job_id`] arrives, or after `timeout` at the latest.
+    pub fn continue_on_signal(payload: Vec<u8>, timeout: Duration) -> Self {
         Self::Continue {
             payload,
-            when: Trigger::OnSignal {
-                signal_key: signal_key.into(),
-                timeout,
-            },
+            when: Trigger::OnSignal { timeout },
         }
     }
 }

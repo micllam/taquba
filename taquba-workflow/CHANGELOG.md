@@ -13,15 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `WorkflowView::run_end`: the `RunEnd` of a terminated run, which
   `WorkflowRuntime::wait` reports, so a process without a runtime reads it
   through a `taquba::QueueReader`. It returns `None` for an active run.
-- `TerminalEffects::signal`: a signal to the run waiting at a key, committed in
-  the settlement that terminates a run or acknowledges its notification.
 - `WorkflowRuntimeBuilder::inbox_kinds`: the inbox kinds `workflow.submit` and
   `workflow.cancel` for the runtime's queue name, with the entry types
   `SubmitEntry` and `CancelRunEntry`, so another process submits and cancels
   runs through a `taquba::InboxSender`. An entry identifies the runtime by its
   `queue` field, `DEFAULT_QUEUE_NAME` by default.
-- `EffectsHandle::enqueue`: a step stages an enqueue that commits with its
-  settlement.
+- `EffectsHandle::enqueue` and `Delivery::next_job_id`: a step stages an enqueue
+  that commits with its settlement, and `next_job_id` is the job id of the next
+  step, the same on every attempt of the step.
 
 ### Changed
 
@@ -29,13 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `newly_submitted = false`, or fails with `InputMismatch` for another
   input, until memo retention removes the terminal record of the run. To run an
   input again, submit it under a new run id.
-- A waiting step is the waiter of its signal key in the queue, through
-  `taquba::EnqueueOptions::signal_key`, so a signaller calls
-  `taquba::Queue::signal` and `taquba::Queue::clear_signal`, and the step jobs
-  of a store written with 0.14.0 need a drain. Replace `WorkflowRuntime::signal`
-  and `clear_signal` with the queue methods, and rename the field
-  `correlation_key` of `Trigger::OnSignal` and `RunState::Waiting` to
-  `signal_key`.
+- A waiting step waits for a signal to its job id in the queue, through
+  `taquba::EnqueueOptions::signal_wait`, and the queue rejects a signal sent
+  before the wait commits or after it ends, so the step jobs of a store written
+  with 0.14.0 need a drain. Drop the key of `continue_on_signal` and of
+  `Trigger::OnSignal` and the `correlation_key` of `RunState::Waiting`, read the
+  id of a waiting step from `RunStatus::step`, and stage the request that leads
+  to a signal with `EffectsHandle::enqueue`, with the id of
+  `Delivery::next_job_id` in it.
 
 ### Removed
 
@@ -44,9 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Read `RunEnd::outcome` from `WorkflowView::run_end` in their place.
 - `WorkflowRuntime::signal`, `WorkflowRuntime::clear_signal`, `SignalOutcome`,
   `HEADER_SIGNAL_WAIT` and `HEADER_SIGNAL_DELIVERED`, with the signal entries of
-  the `workflow/` KV prefix. Use `taquba::Queue::signal`,
-  `taquba::Queue::clear_signal` and `taquba::SignalOutcome`, and read the key of
-  a waiting step from `taquba::JobRecord::signal_key`.
+  the `workflow/` KV prefix. Use `taquba::Queue::signal` to the job id of the
+  waiting step and `taquba::SignalOutcome`.
 
 ### Fixed
 

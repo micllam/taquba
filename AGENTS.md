@@ -17,8 +17,9 @@ jobs in `.github/workflows/ci.yml`. Run `vale sync` after a clone.
 - **Ingress.** A request from outside the process enters through the inbox, and
   only the writer commits it. Do not add a reply path or a second channel. See
   [ADR-0005](docs/decisions/0005-bucket-inbox.md).
-- **Signals.** The signal wait is the queue's. Do not add a waiter index, a
-  signal buffer or a delivered record in a layer.
+- **Signals.** The signal wait is the queue's, and a signal addresses the
+  waiting job by id. Do not add a signal key, a waiter index, a signal buffer or
+  a delivered record.
 
 ## Versioning
 

@@ -136,6 +136,14 @@ pub(crate) fn hash_input(input: &[u8]) -> [u8; 32] {
     Sha256::digest(input).into()
 }
 
+/// The job id of the step that follows the step job `job_id`: 32 lower-case hex
+/// characters of a digest of the id, the same on every attempt of the step.
+pub(crate) fn next_step_job_id(job_id: &str) -> String {
+    let mut id = hex_sha256(&[b"workflow/next-step/", job_id.as_bytes()]);
+    id.truncate(32);
+    id
+}
+
 /// The lower-case hex SHA-256 digest of `parts` concatenated.
 pub(crate) fn hex_sha256(parts: &[&[u8]]) -> String {
     use sha2::{Digest, Sha256};

@@ -5,32 +5,28 @@
 //! the agent proposes a refund it returns `StepOutcome::continue_on_signal` and
 //! this process exits: the waiting run is a scheduled job in the store, so no
 //! process runs while the approval is pending. The decision arrives as a new
-//! invocation of this binary, which reopens the store, delivers the signal
-//! through its own runtime and resumes the run to completion.
+//! invocation of this binary, which reopens the store, reads the job id of the
+//! waiting step from `RunStatus::step`, delivers the signal to it and resumes
+//! the run to completion.
 //!
 //! ```text
 //! cargo run -p taquba-workflow --example durable_approvals               # run until waiting
 //! cargo run -p taquba-workflow --example durable_approvals -- approve
 //! cargo run -p taquba-workflow --example durable_approvals -- reject over-budget
-//! cargo run -p taquba-workflow --example durable_approvals -- clear
 //! ```
 //!
-//! The three delivery paths:
+//! The two delivery paths:
 //!
 //! - A decision delivered while the run waits wakes the waiting step
 //!   (`SignalOutcome::Delivered`) and the run completes in the
 //!   delivering process.
-//! - A decision delivered before the first plain invocation is buffered
-//!   (`SignalOutcome::Buffered`) and consumed when the waiter registers,
-//!   so the run never waits.
 //! - Without a decision inside the timeout (five minutes), the next plain
 //!   invocation promotes the waiting step with `Step::signal == None`
 //!   and the run escalates.
 //!
 //! The timeout runs on wall clock through downtime. A run that waits longer
-//! than the timeout escalates at the next open, and a decision delivered after
-//! that is buffered at a signal key no waiter will consume. The `clear` mode
-//! discards such a buffered decision.
+//! than the timeout escalates at the next open, and a decision for a run that
+//! does not wait is rejected without a change.
 //!
 //! State lives under `/tmp/taquba-durable-approvals-example`. Remove the
 //! directory to discard the run and start over.
@@ -42,8 +38,8 @@ use serde::{Deserialize, Serialize};
 use taquba::object_store::local::LocalFileSystem;
 use taquba::{Queue, SignalOutcome};
 use taquba_workflow::{
-    RunId, RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects,
-    TerminalHook, TerminalStatus, WorkflowRuntime,
+    RunId, RunOutcome, RunSpec, RunState, Step, StepError, StepOutcome, StepRunner,
+    TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
 };
 use tokio::sync::oneshot;
 
@@ -51,11 +47,6 @@ const QUEUE_DIR: &str = "/tmp/taquba-durable-approvals-example";
 const RUN_ID: &str = "refund-claim-4021";
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const EVIDENCE_TURNS: usize = 3;
-
-/// Signal key of the run's approval.
-fn approval_key(run_id: &str) -> String {
-    format!("approval:{run_id}")
-}
 
 /// The agent's working state, stored in the step payload. Each step is one
 /// turn, and the state decides what the turn does.
@@ -127,7 +118,6 @@ impl StepRunner for RefundAgent {
         );
         Ok(StepOutcome::continue_on_signal(
             encode(&state)?,
-            approval_key(&step.run_id),
             APPROVAL_TIMEOUT,
         ))
     }
@@ -182,7 +172,6 @@ impl TerminalHook for ShutdownOnTermination {
 enum Mode {
     Run,
     Decide(Vec<u8>),
-    Clear,
 }
 
 fn parse_mode() -> Result<Mode, String> {
@@ -194,9 +183,8 @@ fn parse_mode() -> Result<Mode, String> {
             let reason = args.next().unwrap_or_else(|| "no reason given".to_string());
             Ok(Mode::Decide(reason.into_bytes()))
         }
-        Some("clear") => Ok(Mode::Clear),
         Some(other) => Err(format!(
-            "unknown mode `{other}`; use `approve`, `reject <reason>` or `clear`"
+            "unknown mode `{other}`; use `approve` or `reject <reason>`"
         )),
     }
 }
@@ -245,31 +233,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .build()?;
 
     match mode {
-        Mode::Clear => {
-            if queue.clear_signal(&approval_key(RUN_ID)).await? {
-                println!("discarded a buffered decision");
-            } else {
-                println!("no buffered decision to discard");
+        Mode::Decide(payload) => {
+            let status = runtime.status(&RunId::new(RUN_ID)?).await?;
+            let Some(status) =
+                status.filter(|status| matches!(status.state, RunState::Waiting { .. }))
+            else {
+                println!("run {RUN_ID} does not wait for a decision; nothing was changed");
+                return Ok(());
+            };
+            match queue.signal(&status.step.job_id, payload).await? {
+                SignalOutcome::Delivered => {
+                    println!("decision delivered; resuming the run");
+                    runtime
+                        .run(async move {
+                            let _ = rx.await;
+                        })
+                        .await?;
+                }
+                SignalOutcome::NotWaiting => {
+                    println!("the wait ended before the decision; nothing was changed");
+                }
             }
         }
-        Mode::Decide(payload) => match queue.signal(&approval_key(RUN_ID), payload).await? {
-            SignalOutcome::Delivered => {
-                println!("decision delivered; resuming the run");
-                runtime
-                    .run(async move {
-                        let _ = rx.await;
-                    })
-                    .await?;
-            }
-            SignalOutcome::Buffered => {
-                println!("no waiting run; the decision is buffered");
-                println!(
-                    "a run that has not started yet consumes it at registration; a run \
-                     whose wait already timed out escalates and leaves the buffered \
-                     decision orphaned (discard it with `-- clear`)"
-                );
-            }
-        },
         Mode::Run => {
             let outcome = runtime
                 .submit(RunSpec {

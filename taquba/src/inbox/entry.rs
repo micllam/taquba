@@ -72,9 +72,9 @@ pub struct EnqueueEntry {
     /// [`EnqueueOptions::id_override`](crate::EnqueueOptions::id_override).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_id: Option<String>,
-    /// [`EnqueueOptions::signal_key`](crate::EnqueueOptions::signal_key).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signal_key: Option<String>,
+    /// [`EnqueueOptions::signal_wait`](crate::EnqueueOptions::signal_wait).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub signal_wait: bool,
 }
 
 impl EnqueueEntry {
@@ -104,7 +104,7 @@ impl From<EnqueueRequest> for EnqueueEntry {
             max_attempts: options.max_attempts,
             dedup_key: options.dedup_key,
             job_id: options.id_override,
-            signal_key: options.signal_key,
+            signal_wait: options.signal_wait,
         }
     }
 }
@@ -123,7 +123,7 @@ impl From<EnqueueEntry> for EnqueueRequest {
                 dedup_key: entry.dedup_key,
                 headers: entry.headers,
                 id_override: entry.job_id,
-                signal_key: entry.signal_key,
+                signal_wait: entry.signal_wait,
             },
         }
     }
@@ -149,13 +149,13 @@ impl InboxKind for CancelEntry {
 }
 
 /// The entry of the core kind `signal`: [`Queue::signal`](crate::Queue::signal)
-/// to a signal key. The outcome recorded for the entry is
-/// `{"outcome": "delivered"}` or `{"outcome": "buffered"}`, as
+/// to the job `job_id`. The outcome recorded for the entry is
+/// `{"outcome": "delivered"}` or `{"outcome": "not_waiting"}`, as
 /// [`SignalOutcome`](crate::SignalOutcome) reports them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalEntry {
-    /// The signal key.
-    pub key: String,
+    /// The id of the waiting job.
+    pub job_id: String,
     /// The payload of the signal, base64 in the body.
     #[serde(with = "inbox_bytes")]
     pub payload: Vec<u8>,
@@ -245,14 +245,14 @@ mod tests {
     #[test]
     fn a_bytes_field_is_base64_in_the_body() {
         let entry = SignalEntry {
-            key: "k".to_string(),
+            job_id: "j".to_string(),
             payload: vec![0, 255, 10],
         };
         let body = serde_json::to_value(&entry).unwrap();
         assert_eq!(body["payload"], "AP8K");
         let decoded: SignalEntry = serde_json::from_value(body).unwrap();
         assert_eq!(decoded.payload, vec![0, 255, 10]);
-        assert!(serde_json::from_str::<SignalEntry>(r#"{"key":"k","payload":"@@"}"#).is_err());
+        assert!(serde_json::from_str::<SignalEntry>(r#"{"job_id":"j","payload":"@@"}"#).is_err());
     }
 
     #[test]
@@ -267,7 +267,7 @@ mod tests {
                 dedup_key: Some("d".to_string()),
                 headers: HashMap::from([("h".to_string(), "v".to_string())]),
                 id_override: Some("j".to_string()),
-                signal_key: Some("k".to_string()),
+                signal_wait: true,
             },
         };
         let back = EnqueueRequest::from(EnqueueEntry::from(request.clone()));

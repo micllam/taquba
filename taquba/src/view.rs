@@ -17,8 +17,8 @@ use crate::inbox::record::InboxRecord;
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{
     KeyTag, QueueName, attempt_history_key, claimed_prefix, dead_key, dead_prefix, heartbeat_key,
-    inbox_record_key, job_index_key, parse_stats_key, pending_prefix, signal_waiter_key, stats_key,
-    tag_prefix, user_scoped_key,
+    inbox_record_key, job_index_key, parse_stats_key, pending_prefix, stats_key, tag_prefix,
+    user_scoped_key,
 };
 use crate::kv::{KvOrder, KvPage, KvRange};
 use crate::liveness::{HeartbeatRecord, WriterHeartbeat};
@@ -341,22 +341,6 @@ impl QueueView {
             None => Ok(Vec::new()),
             Some(bytes) => decode_history(&bytes),
         }
-    }
-
-    /// The id of the scheduled job waiting at the signal key `key`, or `None`
-    /// when no job waits at it. The writer's view reads the index entry and the
-    /// record from one snapshot, and a reader's view reads them as two plain
-    /// reads of its lagging view.
-    pub async fn signal_waiter(&self, key: &str) -> Result<Option<String>> {
-        let Some(id) = self.handle.get(&signal_waiter_key(key)).await? else {
-            return Ok(None);
-        };
-        let id = String::from_utf8(id.to_vec()).map_err(|_| Error::InvalidState)?;
-        let waiting = self
-            .indexed_job(&id)
-            .await?
-            .is_some_and(|(_, job)| job.status == JobStatus::Scheduled);
-        Ok(waiting.then_some(id))
     }
 
     /// The record of the applied inbox entry `id`, or `None` when the entry was

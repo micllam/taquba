@@ -16,7 +16,9 @@ use crate::durable::{self, DurableRunOutcome};
 use crate::effects::{EffectsHandle, TerminalEffects};
 use crate::error::{Error, worker_error};
 use crate::group::Membership;
-use crate::keys::{HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RESERVED_HEADER_PREFIX, RunId};
+use crate::keys::{
+    HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RESERVED_HEADER_PREFIX, RunId, next_step_job_id,
+};
 use crate::kv::KvReadHandle;
 use crate::runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 use crate::runtime::StepRef;
@@ -95,7 +97,7 @@ impl<'a> ClaimedStep<'a> {
             run_at: None,
             priority: Some(self.job.priority),
             max_attempts: Some(self.job.max_attempts),
-            signal_key: None,
+            signal_wait: false,
             reserved_headers: self.reserved_headers_with_none(),
         }
     }
@@ -218,12 +220,8 @@ impl RuntimeCore {
                     };
                     Ok(self.advance(claimed, payload, opts).await)
                 }
-                Trigger::OnSignal {
-                    signal_key,
-                    timeout,
-                } => {
-                    self.advance_on_signal(claimed, payload, &signal_key, timeout, input_hash)
-                        .await
+                Trigger::OnSignal { timeout } => {
+                    Ok(self.advance_on_signal(claimed, payload, timeout).await)
                 }
             },
             Ok(StepOutcome::Succeed { result }) => {
@@ -327,6 +325,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 run_id: run_id.clone(),
                 headers: claimed.headers.clone(),
                 job_id: job.id.clone(),
+                next_job_id: next_step_job_id(&job.id),
                 attempts: job.attempts,
                 max_attempts: job.max_attempts,
                 cancel_token: claim_cancel.child_token(),

@@ -9,16 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `EnqueueOptions::signal_key`: a scheduled job waits at a signal key, stored in
-  `JobRecord::signal_key` while the job is scheduled, and `Queue::signal` wakes
-  it with a payload before its `run_at` or buffers the signal for the next job
-  enqueued with the key. `Queue::clear_signal` discards a buffered signal,
-  `SettlementEffects::signal` stages a signal in a settlement,
-  `QueueView::signal_waiter` reads the waiter at a key and `SignalOutcome`
-  reports a delivery. An enqueue with the key of a live waiter fails with
-  `Error::SignalWaiterExists`, and a key without `run_at` with
-  `Error::InvalidSignalKey`. The key layout gains the `SignalWaiter` and
-  `SignalBuffer` spaces.
+- `EnqueueOptions::signal_wait`: a scheduled job waits for a signal, stored in
+  `JobRecord::signal_wait` while the job waits, and `Queue::signal` wakes it by
+  its id with a payload before its `run_at`. A signal to a job that does not
+  wait returns `SignalOutcome::NotWaiting` without a change. A wait without
+  `run_at` fails with `Error::SignalWaitWithoutRunAt`.
 - The inbox: `OpenOptions::inbox` with `InboxOptions` opens the queue with a
   prefix of objects that the writer applies once each, through which another
   process enqueues, cancels and signals. `InboxSender` writes an entry

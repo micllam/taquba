@@ -11,7 +11,6 @@ All of the queue's state is in one store:
 - The claim cursor.
 - Per-queue counters.
 - The writer heartbeat.
-- The signal waiter index and the signal buffer.
 - The inbox records and their expiry index.
 - The caller's own KV namespace.
 
@@ -93,10 +92,8 @@ follows the two-byte header.
 | `Stats` | `0x09` | qlen, queue, metric name | counter, merge-appended |
 | `AttemptHistory` | `0x0A` | id | concatenated `JobAttempt` entries |
 | `Heartbeat` | `0x0B` | none, one key per store | the writer's last heartbeat |
-| `SignalWaiter` | `0x0C` | signal key bytes | the id of the scheduled job waiting at the key |
-| `SignalBuffer` | `0x0D` | signal key bytes | the payload of a signal without a waiter |
-| `InboxRecord` | `0x0E` | inbox entry id | the `InboxRecord` of an applied entry |
-| `InboxExpiry` | `0x0F` | `applied_at` `u64` BE, inbox entry id | empty |
+| `InboxRecord` | `0x0C` | inbox entry id | the `InboxRecord` of an applied entry |
+| `InboxExpiry` | `0x0D` | `applied_at` `u64` BE, inbox entry id | empty |
 | `User` | `0xFF` | caller bytes, no version byte | the caller's value |
 
 A job record is therefore stored at exactly one of the first five keys at any
@@ -156,20 +153,13 @@ the queue is opened (`restore_cursor_state`, [claim_cursor.rs][claim_cursor]),
 and the stats space by `list_queues`, which discovers queue names from it. A
 queue's own counters are point gets.
 
-`JobIndex`, `AttemptHistory`, `Dedup`, `Heartbeat`, `SignalWaiter`,
-`SignalBuffer`, `InboxRecord` and `User` are reached by point lookup, so their
-keys contain only what identifies the record. That is a job id for the first
-two, a queue plus dedup key for `Dedup`, the signal key for the two signal
-spaces and the entry id for `InboxRecord`. The single heartbeat key ends at the
+Six key spaces are reached by point lookup: `JobIndex`, `AttemptHistory`,
+`Dedup`, `Heartbeat`, `InboxRecord` and `User`. Their keys contain only what
+identifies the record: a job id for the first two, a queue plus dedup key for
+`Dedup` and the entry id for `InboxRecord`. The single heartbeat key ends at the
 header, and a `User` key has the caller's own bytes. A point lookup reads one
 exact key, so a prefix relation between two keys of those key spaces does not
 affect its result.
-
-A scheduled job with a signal key is indexed in `SignalWaiter` at the key for as
-long as it is scheduled. `Txn::move_job` and `Txn::stage_remove` ([txn.rs][txn])
-delete the entry and clear the key from the record in the transaction that moves
-the job out of the scheduled state, so the record of a job that re-enters the
-scheduled state for a retry does not contain the key.
 
 ## Order-preserving encodings
 
@@ -274,7 +264,6 @@ such a row and the stats read drops it.
 [options]: https://github.com/micllam/taquba/blob/master/taquba/src/options.rs
 [queue]: https://github.com/micllam/taquba/blob/master/taquba/src/queue.rs
 [reaper]: https://github.com/micllam/taquba/blob/master/taquba/src/reaper.rs
-[txn]: https://github.com/micllam/taquba/blob/master/taquba/src/txn.rs
 [scheduler]: https://github.com/micllam/taquba/blob/master/taquba/src/scheduler.rs
 [view]: https://github.com/micllam/taquba/blob/master/taquba/src/view.rs
 [claim_cursor]: https://github.com/micllam/taquba/blob/master/taquba/src/claim_cursor.rs

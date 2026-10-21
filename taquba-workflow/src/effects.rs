@@ -102,9 +102,9 @@ impl EffectsState {
     }
 }
 
-/// Writes, deletes and enqueues accumulated by an [`EffectsHandle`]. Stored in
-/// the step-output replay record so a replayed delivery applies the same
-/// effects.
+/// Writes, deletes and enqueues accumulated by an [`EffectsHandle`] or a
+/// [`TerminalEffects`]. Stored in the step-output replay record so a replayed
+/// delivery applies the same effects.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct StagedEffects {
     pub(crate) writes: HashMap<Vec<u8>, Vec<u8>>,
@@ -165,7 +165,11 @@ impl EffectsHandle {
         self.inner.lock().unwrap().delete(key.into())
     }
 
-    /// Stage an enqueue, committed in the settlement of the step.
+    /// Stage an enqueue, committed in the settlement of the step. A step that
+    /// continues with [`StepOutcome::continue_on_signal`](crate::StepOutcome::continue_on_signal)
+    /// stages here the request that leads to the signal, with
+    /// [`Delivery::next_job_id`](crate::Delivery::next_job_id) in it, so the
+    /// request leaves after the wait commits.
     ///
     /// # Errors
     ///
@@ -191,28 +195,19 @@ impl EffectsHandle {
 /// [`TerminalHook::on_termination`](crate::TerminalHook::on_termination) in the
 /// same transaction as the notification job's acknowledgement.
 ///
-/// Beyond the KV writes and deletes of [`EffectsHandle`] (validated by the same
-/// rules), a hook stages follow-up enqueues, so work that a run's termination
-/// starts is created atomically with the termination or with the notification's
-/// acknowledgement. The effects of `on_termination` are applied only when it
-/// returns `Ok`, and a retried `on_termination` stages its effects again.
+/// A hook stages the KV writes and deletes and the enqueues of
+/// [`EffectsHandle`], validated by the same rules, so work that a run's
+/// termination starts is created atomically with the termination or with the
+/// notification's acknowledgement. The effects of `on_termination` are applied
+/// only when it returns `Ok`, and a retried `on_termination` stages its effects
+/// again.
 ///
 /// The handle is sealed once the hook returns. Staging through a clone retained
 /// past that point returns [`Error::EffectsSealed`]. Use
 /// [`TerminalEffects::detached`] when invoking a hook directly in tests.
 #[derive(Debug, Clone)]
 pub struct TerminalEffects {
-    inner: Arc<Mutex<TerminalState>>,
-}
-
-#[derive(Debug, Default)]
-struct TerminalState {
-    kv: EffectsState,
-    enqueues: Vec<EnqueueRequest>,
-    /// The signal key and the payload of every staged signal.
-    signals: Vec<(String, Vec<u8>)>,
-    /// The queue of the runtime, `None` for a detached handle.
-    runtime_queue: Option<String>,
+    inner: Arc<Mutex<EffectsState>>,
 }
 
 impl TerminalEffects {
@@ -223,17 +218,14 @@ impl TerminalEffects {
     /// runtime, so it accepts an enqueue to every queue.
     pub fn detached() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(TerminalState::default())),
+            inner: Arc::new(Mutex::new(EffectsState::default())),
         }
     }
 
     /// A handle for a delivery of the runtime with the queue `runtime_queue`.
     pub(crate) fn for_delivery(runtime_queue: &str) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(TerminalState {
-                runtime_queue: Some(runtime_queue.to_string()),
-                ..Default::default()
-            })),
+            inner: Arc::new(Mutex::new(EffectsState::for_delivery(runtime_queue))),
         }
     }
 
@@ -242,34 +234,9 @@ impl TerminalEffects {
     ///
     /// # Errors
     ///
-    /// [`Error::EffectsSealed`] when the hook returned,
-    /// [`Error::ReservedHeader`] when a header of `request` starts with the
-    /// reserved `workflow.*` prefix and [`Error::ReservedQueue`] when `request`
-    /// targets the queue of the runtime.
+    /// As [`EffectsHandle::enqueue`].
     pub fn enqueue(&self, request: EnqueueRequest) -> Result<()> {
-        let mut state = self.inner.lock().unwrap();
-        if state.kv.sealed {
-            return Err(Error::EffectsSealed);
-        }
-        check_enqueue(&request, state.runtime_queue.as_deref())?;
-        state.enqueues.push(request);
-        Ok(())
-    }
-
-    /// Stage a signal to `signal_key` with `payload`, delivered to the run
-    /// waiting at the key or buffered, as [`taquba::Queue::signal`] does, in
-    /// the transaction of the settlement.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::EffectsSealed`] when the hook returned.
-    pub fn signal(&self, signal_key: impl Into<String>, payload: impl Into<Vec<u8>>) -> Result<()> {
-        let mut state = self.inner.lock().unwrap();
-        if state.kv.sealed {
-            return Err(Error::EffectsSealed);
-        }
-        state.signals.push((signal_key.into(), payload.into()));
-        Ok(())
+        self.inner.lock().unwrap().enqueue(request)
     }
 
     /// Stage a write of `value` under `key` in the caller KV namespace.
@@ -278,7 +245,7 @@ impl TerminalEffects {
     ///
     /// As [`EffectsHandle::put`].
     pub fn put(&self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Result<()> {
-        self.inner.lock().unwrap().kv.put(key.into(), value.into())
+        self.inner.lock().unwrap().put(key.into(), value.into())
     }
 
     /// Stage a delete of `key` from the caller KV namespace.
@@ -287,21 +254,18 @@ impl TerminalEffects {
     ///
     /// As [`EffectsHandle::delete`].
     pub fn delete(&self, key: impl Into<Vec<u8>>) -> Result<()> {
-        self.inner.lock().unwrap().kv.delete(key.into())
+        self.inner.lock().unwrap().delete(key.into())
     }
 
     /// Seal the handle and move out everything staged, as the effects of a
     /// settlement.
     pub(crate) fn seal_into_settlement(&self) -> SettlementEffects {
-        let mut state = self.inner.lock().unwrap();
-        let staged = state.kv.seal_and_take();
-        let mut effects = SettlementEffects::default()
-            .enqueues(std::mem::take(&mut state.enqueues))
-            .kv_writes(staged.writes)
-            .kv_deletes(staged.deletes.into_iter().collect());
-        for (signal_key, payload) in std::mem::take(&mut state.signals) {
-            effects = effects.signal(signal_key, payload);
-        }
+        let mut effects = SettlementEffects::default();
+        self.inner
+            .lock()
+            .unwrap()
+            .seal_and_take()
+            .add_to(&mut effects);
         effects
     }
 }
