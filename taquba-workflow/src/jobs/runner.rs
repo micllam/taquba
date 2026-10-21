@@ -935,7 +935,7 @@ mod tests {
         // without a run result record.
         let first = runner.submit(CountedKeyed { n: 7 }).await.unwrap();
         assert_eq!(
-            runner.runtime.cancel(first.id()).await.unwrap(),
+            runner.runtime.cancel(first.id(), None).await.unwrap(),
             crate::CancelRunOutcome::Removed
         );
         assert!(first.fetch_result().await.unwrap().is_none());

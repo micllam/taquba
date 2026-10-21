@@ -14,8 +14,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 
 use crate::durable::{
-    self, DurableErrorKind, DurableRunOutcome, DurableRunRecord, DurableRunResult,
-    DurableStepOutcome, DurableStepOutcomeRecord, DurableStepRef, DurableTermination,
+    self, DurableCancelRequest, DurableErrorKind, DurableRunOutcome, DurableRunRecord,
+    DurableRunResult, DurableStepOutcome, DurableStepOutcomeRecord, DurableStepRef,
+    DurableTermination,
 };
 use crate::effects::{StagedEffects, TerminalEffects};
 use crate::error::{Error, Result};
@@ -29,7 +30,7 @@ use crate::keys::{
 use crate::memo::{MemoStore, RUN_RESULT_MEMO_KEY};
 use crate::runner::{StepErrorKind, StepOutcome, StepRunner, Trigger};
 use crate::sweep::{Clearable, Cleared, Sweep, run_periodically};
-use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
+use crate::terminal::{CancelOrigin, RunOutcome, TerminalHook, TerminalStatus};
 use crate::view::WorkflowView;
 use crate::worker::{ClaimedStep, StepWorker};
 
@@ -197,7 +198,13 @@ pub enum RunState {
     /// terminates as `Cancelled` without ever transitioning through
     /// `Cancelling`: a runner-issued cancel is observed when `run_step`
     /// returns, and the run terminates at that point.
-    Cancelling,
+    Cancelling {
+        /// The reason of the request.
+        reason: Option<String>,
+        /// The runtime clock's time at the request, as a Unix timestamp in
+        /// milliseconds.
+        requested_at_ms: u64,
+    },
     /// The queue dead-lettered the current step's job outside the worker: a
     /// lease that expired past the attempt limit, or a claim dead-lettered by
     /// crash recovery at open. The reconciliation of the worker terminates the
@@ -217,10 +224,12 @@ pub enum RunState {
 pub struct RunTermination {
     /// How the run ended.
     pub status: TerminalStatus,
-    /// The failure reason, or the runner's reason for a
-    /// [`StepOutcome::Cancel`], or `None` for a success and for an external
-    /// cancellation.
+    /// The failure reason, or the reason of a cancellation, as
+    /// [`RunOutcome::error`] reports it. `None` for a success.
     pub error: Option<String>,
+    /// The origin of a cancellation, as [`RunOutcome::cancelled_by`] reports
+    /// it.
+    pub cancelled_by: Option<CancelOrigin>,
     /// The classification of a failure: the kind of the
     /// [`StepError`](crate::StepError) that dead-lettered the run, or
     /// [`StepErrorKind::Permanent`] for a [`StepOutcome::Fail`] outcome. `None`
@@ -239,6 +248,7 @@ impl From<DurableTermination> for RunTermination {
         Self {
             status: record.status.into(),
             error: record.error,
+            cancelled_by: record.cancelled_by.map(Into::into),
             error_kind: record.error_kind.map(Into::into),
             final_step: record.final_step.into(),
             terminated_at_ms: record.terminated_at_ms,
@@ -680,7 +690,11 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         self.inner.core.wait_timeout(run_id, timeout).await
     }
 
-    /// Request cancellation of an active run.
+    /// Request cancellation of an active run for `reason`.
+    ///
+    /// The run terminates with `reason` on [`RunOutcome::error`] and
+    /// [`CancelOrigin::Request`] on [`RunOutcome::cancelled_by`]. A run with a
+    /// recorded request keeps the reason of the first request.
     ///
     /// Returns [`CancelRunOutcome::Removed`] or [`CancelRunOutcome::Requested`]
     /// once the request is recorded on the run's durable record, and
@@ -711,8 +725,8 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// request is recorded keeps the outcome it committed. A request applies
     /// only to the run it is recorded on, and a later submission of the same
     /// run id starts without it.
-    pub async fn cancel(&self, run_id: &RunId) -> Result<CancelRunOutcome> {
-        self.inner.core.cancel_run(run_id, Ok).await
+    pub async fn cancel(&self, run_id: &RunId, reason: Option<String>) -> Result<CancelRunOutcome> {
+        self.inner.core.cancel_run(run_id, reason, Ok).await
     }
 
     /// The group named `id`.
@@ -923,7 +937,7 @@ impl RuntimeCore {
             run_id: run_id.clone(),
             submitted_at_ms: self.clock.now_ms(),
             input_hash,
-            cancel_requested: false,
+            cancel_request: None,
         });
         let mut effects = spec
             .effects
@@ -988,9 +1002,10 @@ impl RuntimeCore {
     pub(crate) async fn cancel_run(
         &self,
         run_id: &RunId,
+        reason: Option<String>,
         attach: impl Fn(SettlementEffects) -> taquba::Result<SettlementEffects>,
     ) -> Result<CancelRunOutcome> {
-        let Some(input_hash) = self.request_cancel(run_id).await? else {
+        let Some((input_hash, request)) = self.request_cancel(run_id, reason).await? else {
             return Ok(CancelRunOutcome::NotActive);
         };
         // Settle the current step now: remove it while it is queued, or fire
@@ -1009,10 +1024,9 @@ impl RuntimeCore {
                 return Ok(CancelRunOutcome::NotActive);
             }
             let claimed = ClaimedStep::parse(&job)?;
-            // `error` is `None`: external cancellation does not include a
-            // reason at the API level. The effects are built before the outcome
-            // is known, and the queue applies them only on `Removed`.
-            let outcome = claimed.cancelled(None);
+            // The effects are built before the outcome is known, and the queue
+            // applies them only on `Removed`.
+            let outcome = claimed.cancelled(CancelOrigin::Request, request.reason.clone());
             let termination = self.termination(&outcome, None, input_hash);
             let effects = self.terminate_collecting_effects(&outcome, &claimed, termination);
             match self.queue.cancel_with(&job.id, attach(effects)?).await?.0 {
@@ -1223,6 +1237,7 @@ impl RuntimeCore {
         DurableTermination {
             status: outcome.status.into(),
             error: outcome.error.clone(),
+            cancelled_by: outcome.cancelled_by.map(Into::into),
             error_kind: error_kind.map(DurableErrorKind::from),
             final_step: (&outcome.final_step).into(),
             terminated_at_ms: self.clock.now_ms(),
@@ -1247,26 +1262,35 @@ impl RuntimeCore {
             .await
     }
 
-    /// Record a cancellation request on the run record of `run_id`. Returns the
-    /// record's input hash when the run is active, `None` otherwise. A request
-    /// already recorded counts as recorded again.
-    async fn request_cancel(&self, run_id: &RunId) -> Result<Option<[u8; 32]>> {
+    /// Record a cancellation request for `reason` on the run record of
+    /// `run_id`. Returns the record's input hash and the recorded request when
+    /// the run is active, `None` otherwise. A run with a recorded request keeps
+    /// the first request.
+    async fn request_cancel(
+        &self,
+        run_id: &RunId,
+        reason: Option<String>,
+    ) -> Result<Option<([u8; 32], DurableCancelRequest)>> {
         let key = run_kv_key(run_id);
         loop {
             let Some(current) = self.queue.view().kv_get(&key).await? else {
                 return Ok(None);
             };
             let mut record: DurableRunRecord = durable::decode(&current)?;
-            if record.cancel_requested {
-                return Ok(Some(record.input_hash));
+            if let Some(request) = record.cancel_request {
+                return Ok(Some((record.input_hash, request)));
             }
-            record.cancel_requested = true;
+            let request = DurableCancelRequest {
+                reason: reason.clone(),
+                requested_at_ms: self.clock.now_ms(),
+            };
+            record.cancel_request = Some(request.clone());
             if self
                 .queue
                 .kv_compare_put(&key, Some(&current), &durable::encode(&record))
                 .await?
             {
-                return Ok(Some(record.input_hash));
+                return Ok(Some((record.input_hash, request)));
             }
         }
     }
@@ -2160,7 +2184,7 @@ mod tests {
         let job_id = waiting_job_id(&probe.runtime, &handle.run_id).await;
 
         assert_eq!(
-            probe.runtime.cancel(&handle.run_id).await.unwrap(),
+            probe.runtime.cancel(&handle.run_id, None).await.unwrap(),
             CancelRunOutcome::Removed
         );
         let terminal = tokio::time::timeout(Duration::from_secs(2), probe.rx.recv())
@@ -2858,7 +2882,10 @@ mod tests {
             .unwrap()
             .expect("step 0 is claimable");
         assert_eq!(
-            before.cancel(&handle.run_id).await.unwrap(),
+            before
+                .cancel(&handle.run_id, Some("operator".to_string()))
+                .await
+                .unwrap(),
             CancelRunOutcome::Requested
         );
 
@@ -2875,7 +2902,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             after.status(&handle.run_id).await.unwrap().map(|s| s.state),
-            Some(RunState::Cancelling),
+            Some(RunState::Cancelling {
+                reason: Some("operator".to_string()),
+                requested_at_ms: 10_000,
+            }),
             "the fresh runtime reads the request from the run record",
         );
 
@@ -2946,7 +2976,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            runtime.cancel(&handle.run_id).await.unwrap(),
+            runtime.cancel(&handle.run_id, None).await.unwrap(),
             CancelRunOutcome::Requested
         );
         queue.ack_with(&step0, effects).await.unwrap();
@@ -3027,7 +3057,10 @@ mod tests {
         assert_eq!(status.step.job_id, handle.job_id);
 
         assert_eq!(
-            runtime.cancel(&handle.run_id).await.unwrap(),
+            runtime
+                .cancel(&handle.run_id, Some("operator".to_string()))
+                .await
+                .unwrap(),
             CancelRunOutcome::Removed
         );
         let status = runtime.status(&handle.run_id).await.unwrap().unwrap();
@@ -3035,7 +3068,8 @@ mod tests {
             status.state,
             RunState::Terminated(RunTermination {
                 status: TerminalStatus::Cancelled,
-                error: None,
+                error: Some("operator".to_string()),
+                cancelled_by: Some(CancelOrigin::Request),
                 error_kind: None,
                 final_step: StepRef {
                     number: 0,
@@ -3053,7 +3087,7 @@ mod tests {
             "no worker terminated the run, so no run result record exists",
         );
         assert_eq!(
-            runtime.cancel(&handle.run_id).await.unwrap(),
+            runtime.cancel(&handle.run_id, None).await.unwrap(),
             CancelRunOutcome::NotActive,
             "a second cancel finds no run record",
         );
@@ -3086,8 +3120,8 @@ mod tests {
         let outcome = rx.recv().await.unwrap();
         assert_eq!(outcome.run_id, handle.run_id);
         assert_eq!(outcome.status, TerminalStatus::Cancelled);
-        // External cancellation does not include a reason: `error` is `None`.
-        assert!(outcome.error.is_none());
+        assert_eq!(outcome.error.as_deref(), Some("operator"));
+        assert_eq!(outcome.cancelled_by, Some(CancelOrigin::Request));
         assert_eq!(outcome.headers.get("tenant").unwrap(), "acme");
         assert!(
             queue
@@ -3131,7 +3165,7 @@ mod tests {
         assert!(view.status(&rid("unknown")).await.unwrap().is_none());
 
         assert_eq!(
-            runtime.cancel(&handle.run_id).await.unwrap(),
+            runtime.cancel(&handle.run_id, None).await.unwrap(),
             CancelRunOutcome::Removed
         );
         let reader = QueueReader::open(store.clone(), "test").await.unwrap();
@@ -3144,6 +3178,7 @@ mod tests {
         let termination = RunTermination {
             status: TerminalStatus::Cancelled,
             error: None,
+            cancelled_by: Some(CancelOrigin::Request),
             error_kind: None,
             final_step: StepRef {
                 number: 0,
@@ -3224,7 +3259,7 @@ mod tests {
         gate.claimed().await;
 
         assert_eq!(
-            runtime.cancel(&handle.run_id).await.unwrap(),
+            runtime.cancel(&handle.run_id, None).await.unwrap(),
             CancelRunOutcome::Requested
         );
 
@@ -3238,10 +3273,8 @@ mod tests {
             .expect("hook fired")
             .expect("hook channel open");
         assert_eq!(outcome.status, TerminalStatus::Cancelled);
-        assert!(
-            outcome.error.is_none(),
-            "external cancel must carry no reason (Some(_) would imply runner-issued StepOutcome::Cancel)",
-        );
+        assert_eq!(outcome.error, None, "the request carries no reason");
+        assert_eq!(outcome.cancelled_by, Some(CancelOrigin::Request));
         assert_eq!(
             terminal_status_of(&runtime, &handle.run_id).await,
             Some(outcome.status)
@@ -3327,7 +3360,10 @@ mod tests {
             .expect("runner observed token");
 
         assert_eq!(
-            runtime.cancel(&handle.run_id).await.unwrap(),
+            runtime
+                .cancel(&handle.run_id, Some("stop".to_string()))
+                .await
+                .unwrap(),
             CancelRunOutcome::Requested
         );
 
@@ -3337,9 +3373,10 @@ mod tests {
             .expect("hook channel open");
 
         assert_eq!(outcome.status, TerminalStatus::Cancelled);
-        // Runner-issued Cancel wins precedence over external cancel, so the
-        // runner's reason surfaces.
-        assert_eq!(outcome.error.as_deref(), Some("cooperative"));
+        // The request's token led to the runner's Cancel, so the request's
+        // origin and reason surface.
+        assert_eq!(outcome.error.as_deref(), Some("stop"));
+        assert_eq!(outcome.cancelled_by, Some(CancelOrigin::Request));
         assert_eq!(
             terminal_status_of(&runtime, &handle.run_id).await,
             Some(outcome.status)
@@ -3389,7 +3426,7 @@ mod tests {
         );
 
         assert_eq!(
-            runtime.cancel(&handle.run_id).await.unwrap(),
+            runtime.cancel(&handle.run_id, None).await.unwrap(),
             CancelRunOutcome::NotActive,
             "cancel on an already-terminated run must report NotActive",
         );
@@ -3401,7 +3438,7 @@ mod tests {
         );
 
         assert_eq!(
-            runtime.cancel(&rid("never-submitted")).await.unwrap(),
+            runtime.cancel(&rid("never-submitted"), None).await.unwrap(),
             CancelRunOutcome::NotActive
         );
 
@@ -3719,7 +3756,10 @@ mod tests {
         );
 
         assert_eq!(
-            runtime.cancel(&handle.run_id).await.unwrap(),
+            runtime
+                .cancel(&handle.run_id, Some("operator".to_string()))
+                .await
+                .unwrap(),
             CancelRunOutcome::Requested
         );
         assert_eq!(
@@ -3729,7 +3769,10 @@ mod tests {
                 .unwrap()
                 .expect("entry retained while termination is in flight")
                 .state,
-            RunState::Cancelling
+            RunState::Cancelling {
+                reason: Some("operator".to_string()),
+                requested_at_ms: 10_000,
+            }
         );
         assert!(
             terminal_markers(&queue).await.is_empty(),
@@ -3755,14 +3798,17 @@ mod tests {
             outcome.result.is_none(),
             "succeed payload must be discarded"
         );
+        assert_eq!(outcome.error.as_deref(), Some("operator"));
+        assert_eq!(outcome.cancelled_by, Some(CancelOrigin::Request));
         let status = runtime.status(&handle.run_id).await.unwrap().unwrap();
         assert!(matches!(
             status.state,
             RunState::Terminated(RunTermination {
                 status: TerminalStatus::Cancelled,
-                error: None,
+                ref error,
+                cancelled_by: Some(CancelOrigin::Request),
                 ..
-            })
+            }) if error.as_deref() == Some("operator")
         ));
         assert_eq!(
             terminal_markers(&queue).await,
@@ -4450,6 +4496,7 @@ mod tests {
         assert_eq!(outcome.run_id, handle.run_id);
         assert_eq!(outcome.status, TerminalStatus::Cancelled);
         assert_eq!(outcome.error.as_deref(), Some("obsolete"));
+        assert_eq!(outcome.cancelled_by, Some(CancelOrigin::Runner));
         assert_eq!(
             terminal_status_of(&runtime, &handle.run_id).await,
             Some(outcome.status)
@@ -4508,7 +4555,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            runtime.cancel(&handle.run_id).await.unwrap(),
+            runtime.cancel(&handle.run_id, None).await.unwrap(),
             CancelRunOutcome::Requested
         );
 
@@ -4750,7 +4797,7 @@ mod tests {
         };
         runtime.submit(spec.clone()).await.unwrap();
         assert_eq!(
-            runtime.cancel(&rid("again")).await.unwrap(),
+            runtime.cancel(&rid("again"), None).await.unwrap(),
             CancelRunOutcome::Removed
         );
         let end = runtime.wait(&rid("again")).await.unwrap();
@@ -4769,7 +4816,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(!record.cancel_requested);
+        assert_eq!(record.cancel_request, None);
         let status = runtime.status(&rid("again")).await.unwrap().unwrap();
         assert_eq!(status.state, RunState::Pending);
     }
@@ -4802,7 +4849,7 @@ mod tests {
             async move { runtime.wait(&rid("hung")).await }
         });
         assert_eq!(
-            runtime.cancel(&rid("hung")).await.unwrap(),
+            runtime.cancel(&rid("hung"), None).await.unwrap(),
             CancelRunOutcome::NotActive,
             "the request is not honoured"
         );
@@ -4830,6 +4877,7 @@ mod tests {
             RunTermination {
                 status: TerminalStatus::Failed,
                 error: Some("hung".into()),
+                cancelled_by: None,
                 error_kind: None,
                 final_step: StepRef {
                     number: 0,
@@ -4874,7 +4922,7 @@ mod tests {
             Err(Error::InconsistentRunState(id)) if id == "torn"
         ));
         assert!(matches!(
-            runtime.cancel(&rid("torn")).await,
+            runtime.cancel(&rid("torn"), None).await,
             Err(Error::InconsistentRunState(id)) if id == "torn"
         ));
     }
@@ -5153,7 +5201,7 @@ mod tests {
         };
         running_rx.recv().await.unwrap();
         assert_eq!(
-            runtime.cancel(&rid("phantom")).await.unwrap(),
+            runtime.cancel(&rid("phantom"), None).await.unwrap(),
             CancelRunOutcome::Requested
         );
         worker.await.unwrap();
@@ -5393,7 +5441,7 @@ mod tests {
         // An external cancellation of a pending step.
         runtime.submit(spec("cancelled")).await.unwrap();
         assert_eq!(
-            runtime.cancel(&rid("cancelled")).await.unwrap(),
+            runtime.cancel(&rid("cancelled"), None).await.unwrap(),
             CancelRunOutcome::Removed
         );
 
@@ -5500,12 +5548,51 @@ mod tests {
             "succeeded"
         );
         assert!(
+            !webhook
+                .headers
+                .contains_key("http.Workflow-Run-Cancelled-By")
+        );
+        assert!(
             queue
                 .claim("workflow-steps", Duration::from_secs(30))
                 .await
                 .unwrap()
                 .is_none(),
             "no notification job is enqueued"
+        );
+
+        // A cancelled run delivers its reason and the origin of the cancel.
+        runtime
+            .submit(RunSpec {
+                run_id: Some(rid("cancelled-callback")),
+                input: Vec::new(),
+                options: RunOptions {
+                    headers: HashMap::from([(
+                        "callback_url".to_string(),
+                        "https://example.com/done".to_string(),
+                    )]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        runtime
+            .cancel(&rid("cancelled-callback"), Some("operator".to_string()))
+            .await
+            .unwrap();
+        let webhook = queue
+            .claim("callbacks", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .expect("the delivery committed with the removal");
+        assert_eq!(webhook.payload.as_slice(), b"operator");
+        assert_eq!(
+            webhook
+                .headers
+                .get("http.Workflow-Run-Cancelled-By")
+                .unwrap(),
+            "request"
         );
     }
 

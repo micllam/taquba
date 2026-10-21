@@ -135,9 +135,10 @@ impl<J: Job> JobGroup<J> {
         self.group.status().await
     }
 
-    /// Request cancellation of every active member. See [`RunGroup::cancel`].
-    pub async fn cancel(&self) -> Result<usize> {
-        self.group.cancel().await
+    /// Request cancellation of every active member for `reason`. See
+    /// [`RunGroup::cancel`].
+    pub async fn cancel(&self, reason: Option<String>) -> Result<usize> {
+        self.group.cancel(reason).await
     }
 
     /// Remove the group's state. See [`RunGroup::forget`].

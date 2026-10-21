@@ -619,17 +619,22 @@ impl RunGroup {
             .ok_or_else(|| Error::GroupNotFound(self.id.clone()))
     }
 
-    /// Request cancellation of every active member, as
+    /// Request cancellation of every active member for `reason`, as
     /// [`WorkflowRuntime::cancel`](crate::WorkflowRuntime::cancel) does for one
     /// run. Returns the number of members whose request was recorded.
-    pub async fn cancel(&self) -> Result<usize> {
+    pub async fn cancel(&self, reason: Option<String>) -> Result<usize> {
+        let reason = &reason;
         let mut cancellations = stream::iter(
             self.members()
                 .await?
                 .into_iter()
                 .filter(|member| member.status().is_none()),
         )
-        .map(|member| async move { self.runtime.cancel_run(&member.record.run_id, Ok).await })
+        .map(|member| async move {
+            self.runtime
+                .cancel_run(&member.record.run_id, reason.clone(), Ok)
+                .await
+        })
         .buffer_unordered(SUBMIT_CONCURRENCY);
         let mut cancelled = 0;
         while let Some(outcome) = cancellations.try_next().await? {
@@ -711,7 +716,7 @@ mod tests {
     use super::*;
     use crate::runner::{Step, StepError, StepOutcome, StepRunner};
     use crate::runtime::{RunSpec, StepRef, WorkflowRuntime};
-    use crate::terminal::NoopTerminalHook;
+    use crate::terminal::{CancelOrigin, NoopTerminalHook};
     use crate::test_util::{open_queue, open_queue_at, rid};
 
     /// Continues once, then succeeds with the step number.
@@ -885,8 +890,8 @@ mod tests {
             .unwrap();
         let run_id = member_run_id(&rid("g"), "a", 0);
         let job_id = runtime.status(&run_id).await.unwrap().unwrap().step.job_id;
-        assert_eq!(group.cancel().await.unwrap(), 1);
-        assert_eq!(group.cancel().await.unwrap(), 0, "no member is active");
+        assert_eq!(group.cancel(None).await.unwrap(), 1);
+        assert_eq!(group.cancel(None).await.unwrap(), 0, "no member is active");
 
         let results: Vec<MemberResult> =
             group.results().await.unwrap().try_collect().await.unwrap();
@@ -896,6 +901,7 @@ mod tests {
             RunTermination {
                 status: TerminalStatus::Cancelled,
                 error: None,
+                cancelled_by: Some(CancelOrigin::Request),
                 error_kind: None,
                 final_step: StepRef { number: 0, job_id },
                 terminated_at_ms: 10_000,
@@ -945,7 +951,7 @@ mod tests {
         ));
         assert_eq!(group.status().await.unwrap().pending, 1);
 
-        assert_eq!(group.cancel().await.unwrap(), 1);
+        assert_eq!(group.cancel(None).await.unwrap(), 1);
         group.forget().await.unwrap();
         assert!(group.members().await.unwrap().is_empty());
         assert!(matches!(
@@ -995,7 +1001,7 @@ mod tests {
         let group = runtime.group(rid("g"));
         let options = RunOptions::default();
         group.submit(vec![member("a")], &options).await.unwrap();
-        assert_eq!(group.cancel().await.unwrap(), 1);
+        assert_eq!(group.cancel(None).await.unwrap(), 1);
 
         // The submission commits between the read and the removal.
         let removal = group.store().removal(&rid("g")).await.unwrap();
@@ -1022,7 +1028,7 @@ mod tests {
         };
 
         submit().await.unwrap();
-        assert_eq!(group.cancel().await.unwrap(), 1);
+        assert_eq!(group.cancel(None).await.unwrap(), 1);
         observe().await;
 
         // The member is active when the first marker expires.
@@ -1036,11 +1042,11 @@ mod tests {
 
         // The member terminated after the second marker and its termination is
         // not observed when that marker expires.
-        assert_eq!(group.cancel().await.unwrap(), 1);
+        assert_eq!(group.cancel(None).await.unwrap(), 1);
         observe().await;
         clock.advance(Duration::from_millis(500));
         submit().await.unwrap();
-        assert_eq!(group.cancel().await.unwrap(), 1);
+        assert_eq!(group.cancel(None).await.unwrap(), 1);
         clock.advance(Duration::from_millis(500));
         assert_eq!(runtime.inner.core.sweep_once().await.unwrap(), 1);
         let second = sweep.marker_key(&rid("g"), 11_000);
@@ -1069,7 +1075,7 @@ mod tests {
                 .submit(vec![member("a")], &RunOptions::default())
                 .await
                 .unwrap();
-            assert_eq!(group.cancel().await.unwrap(), 1);
+            assert_eq!(group.cancel(None).await.unwrap(), 1);
             memos.new_run_memo(run_id).put("k", b"v").await.unwrap();
             let results: Vec<MemberResult> =
                 group.results().await.unwrap().try_collect().await.unwrap();

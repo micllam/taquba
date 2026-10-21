@@ -54,12 +54,15 @@ impl WorkflowView {
         let Some((current, job)) = self.current_job(run_id).await? else {
             return self.terminated_status(run_id).await;
         };
-        let state = match job.status {
-            JobStatus::Dead => RunState::DeadLettered,
-            _ if record.cancel_requested => RunState::Cancelling,
-            JobStatus::Claimed => RunState::Running,
-            JobStatus::Scheduled => scheduled_state(&job),
-            JobStatus::Pending | JobStatus::Done => RunState::Pending,
+        let state = match (job.status, record.cancel_request) {
+            (JobStatus::Dead, _) => RunState::DeadLettered,
+            (_, Some(request)) => RunState::Cancelling {
+                reason: request.reason,
+                requested_at_ms: request.requested_at_ms,
+            },
+            (JobStatus::Claimed, None) => RunState::Running,
+            (JobStatus::Scheduled, None) => scheduled_state(&job),
+            (JobStatus::Pending | JobStatus::Done, None) => RunState::Pending,
         };
         Ok(Some(RunStatus {
             run_id: run_id.clone(),

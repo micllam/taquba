@@ -75,7 +75,7 @@ use crate::effects::StagedEffects;
 use crate::keys::RunId;
 use crate::runner::{StepErrorKind, StepOutcome, Trigger};
 use crate::runtime::StepRef;
-use crate::terminal::{RunOutcome, TerminalStatus};
+use crate::terminal::{CancelOrigin, RunOutcome, TerminalStatus};
 
 /// Durable per-run record written atomically with the step-0 enqueue in
 /// [`WorkflowRuntime::submit`](crate::WorkflowRuntime::submit) via
@@ -88,7 +88,7 @@ use crate::terminal::{RunOutcome, TerminalStatus};
 /// `run_id` keeps the record self-describing for ad hoc operator inspection.
 /// `submitted_at_ms` is for ordering and stale-record auditing. `input_hash` is
 /// the SHA-256 of the original `spec.input` and powers the
-/// `Error::InputMismatch` check on duplicate submissions. `cancel_requested` is
+/// `Error::InputMismatch` check on duplicate submissions. `cancel_request` is
 /// set by `WorkflowRuntime::cancel` on this key so that the write conflicts
 /// with the termination's delete of the record and a request can never outlive
 /// the run.
@@ -97,7 +97,40 @@ pub(crate) struct DurableRunRecord {
     pub(crate) run_id: RunId,
     pub(crate) submitted_at_ms: u64,
     pub(crate) input_hash: [u8; 32],
-    pub(crate) cancel_requested: bool,
+    pub(crate) cancel_request: Option<DurableCancelRequest>,
+}
+
+/// The cancellation request of a run, on its run record: the reason of the
+/// first request and the runtime clock's time of its write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DurableCancelRequest {
+    pub(crate) reason: Option<String>,
+    pub(crate) requested_at_ms: u64,
+}
+
+/// Stored form of a [`CancelOrigin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum DurableCancelOrigin {
+    Runner,
+    Request,
+}
+
+impl From<CancelOrigin> for DurableCancelOrigin {
+    fn from(origin: CancelOrigin) -> Self {
+        match origin {
+            CancelOrigin::Runner => Self::Runner,
+            CancelOrigin::Request => Self::Request,
+        }
+    }
+}
+
+impl From<DurableCancelOrigin> for CancelOrigin {
+    fn from(origin: DurableCancelOrigin) -> Self {
+        match origin {
+            DurableCancelOrigin::Runner => Self::Runner,
+            DurableCancelOrigin::Request => Self::Request,
+        }
+    }
 }
 
 /// Durable pointer from a run to the queue job currently representing it, kept
@@ -285,6 +318,7 @@ impl From<DurableTerminalStatus> for TerminalStatus {
 pub(crate) struct DurableTermination {
     pub(crate) status: DurableTerminalStatus,
     pub(crate) error: Option<String>,
+    pub(crate) cancelled_by: Option<DurableCancelOrigin>,
     pub(crate) error_kind: Option<DurableErrorKind>,
     pub(crate) final_step: DurableStepRef,
     pub(crate) terminated_at_ms: u64,
@@ -311,6 +345,7 @@ pub(crate) struct DurableRunOutcome {
     #[serde(with = "serde_bytes")]
     result: Option<Vec<u8>>,
     error: Option<String>,
+    cancelled_by: Option<DurableCancelOrigin>,
     headers: HashMap<String, String>,
     final_step: DurableStepRef,
 }
@@ -357,6 +392,7 @@ impl From<&RunOutcome> for DurableRunOutcome {
             status: outcome.status.into(),
             result: outcome.result.clone(),
             error: outcome.error.clone(),
+            cancelled_by: outcome.cancelled_by.map(Into::into),
             headers: outcome.headers.clone(),
             final_step: (&outcome.final_step).into(),
         }
@@ -370,6 +406,7 @@ impl From<DurableRunOutcome> for RunOutcome {
             status: outcome.status.into(),
             result: outcome.result,
             error: outcome.error,
+            cancelled_by: outcome.cancelled_by.map(Into::into),
             headers: outcome.headers,
             final_step: outcome.final_step.into(),
         }
@@ -400,6 +437,7 @@ mod tests {
             status: DurableTerminalStatus::Succeeded,
             result: Some(payload.clone()),
             error: None,
+            cancelled_by: None,
             headers: HashMap::new(),
             final_step: DurableStepRef {
                 step_number: 0,

@@ -24,7 +24,7 @@ use crate::runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepR
 use crate::runtime::StepRef;
 use crate::runtime::{RuntimeCore, RuntimeInner, StepEnqueueOpts};
 use crate::signal::step_signal;
-use crate::terminal::{RunOutcome, TerminalHook, TerminalStatus};
+use crate::terminal::{CancelOrigin, RunOutcome, TerminalHook, TerminalStatus};
 
 /// The [`Worker`] of a runtime: every claimed job of the runtime's queue is
 /// processed by [`RuntimeInner::process_step`].
@@ -121,6 +121,7 @@ impl<'a> ClaimedStep<'a> {
             status,
             result,
             error,
+            cancelled_by: None,
             headers: self.headers.clone(),
             final_step: StepRef {
                 number: self.step_number,
@@ -139,10 +140,13 @@ impl<'a> ClaimedStep<'a> {
         self.outcome(TerminalStatus::Failed, None, Some(error))
     }
 
-    /// A `Cancelled` outcome of the run at this step, with `reason` `None` for
-    /// an external cancellation.
-    pub(crate) fn cancelled(&self, reason: Option<String>) -> RunOutcome {
-        self.outcome(TerminalStatus::Cancelled, None, reason)
+    /// A `Cancelled` outcome of the run at this step, cancelled by `origin` for
+    /// `reason`.
+    pub(crate) fn cancelled(&self, origin: CancelOrigin, reason: Option<String>) -> RunOutcome {
+        RunOutcome {
+            cancelled_by: Some(origin),
+            ..self.outcome(TerminalStatus::Cancelled, None, reason)
+        }
     }
 }
 
@@ -188,28 +192,28 @@ impl RuntimeCore {
     /// transition on an acknowledging outcome, or the error that retries or
     /// dead-letters the step.
     ///
-    /// Cancellation precedence: a runner-issued [`StepOutcome::Cancel`] wins,
-    /// with its reason on [`RunOutcome::error`]. Otherwise an external
-    /// cancellation overrides any outcome that the runner returned, including a
-    /// transient retry and a permanent failure, with `error: None` so consumers
-    /// can distinguish the two.
+    /// Cancellation precedence: an external cancellation overrides any outcome
+    /// that the runner returned, including a [`StepOutcome::Cancel`] that the
+    /// request's token led to, a transient retry and a permanent failure.
     async fn settle_outcome(
         &self,
         claimed: &ClaimedStep<'_>,
         outcome: Result<StepOutcome, StepError>,
-        external_cancel: bool,
+        external_cancel: Option<ExternalCancel>,
         input_hash: [u8; 32],
     ) -> Result<SettlementEffects, WorkerError> {
-        match outcome {
-            Ok(StepOutcome::Cancel { reason }) => {
-                self.terminate_recorded(claimed, claimed.cancelled(Some(reason)), input_hash, None)
+        match (outcome, external_cancel) {
+            (_, Some(ExternalCancel { reason })) => {
+                let outcome = claimed.cancelled(CancelOrigin::Request, reason);
+                self.terminate_recorded(claimed, outcome, input_hash, None)
                     .await
             }
-            _ if external_cancel => {
-                self.terminate_recorded(claimed, claimed.cancelled(None), input_hash, None)
+            (Ok(StepOutcome::Cancel { reason }), None) => {
+                let outcome = claimed.cancelled(CancelOrigin::Runner, Some(reason));
+                self.terminate_recorded(claimed, outcome, input_hash, None)
                     .await
             }
-            Ok(StepOutcome::Continue { payload, when }) => match when {
+            (Ok(StepOutcome::Continue { payload, when }), None) => match when {
                 Trigger::Immediate => Ok(self
                     .advance(claimed, payload, claimed.next_step_opts())
                     .await),
@@ -224,13 +228,13 @@ impl RuntimeCore {
                     Ok(self.advance_on_signal(claimed, payload, timeout).await)
                 }
             },
-            Ok(StepOutcome::Succeed { result }) => {
+            (Ok(StepOutcome::Succeed { result }), None) => {
                 self.terminate_recorded(claimed, claimed.succeeded(result), input_hash, None)
                     .await
             }
             // A runner decision: the step ran cleanly and is acknowledged, and
             // the run terminates as `Failed` without a dead-letter.
-            Ok(StepOutcome::Fail { reason }) => {
+            (Ok(StepOutcome::Fail { reason }), None) => {
                 self.terminate_recorded(
                     claimed,
                     claimed.failed(reason),
@@ -241,12 +245,20 @@ impl RuntimeCore {
             }
             // A permanent error, or a transient one on the last attempt,
             // dead-letters the step and terminates the run.
-            Err(err) if err.kind == StepErrorKind::Permanent || claimed.job.is_last_attempt() => {
+            (Err(err), None)
+                if err.kind == StepErrorKind::Permanent || claimed.job.is_last_attempt() =>
+            {
                 Err(self.terminating_failure(claimed, err, input_hash).await)
             }
-            Err(err) => Err(err.into_worker_error()),
+            (Err(err), None) => Err(err.into_worker_error()),
         }
     }
+}
+
+/// An external cancellation that a settlement observed, with the reason of the
+/// request on the run record.
+pub(crate) struct ExternalCancel {
+    pub(crate) reason: Option<String>,
 }
 
 impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
@@ -306,10 +318,11 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .await
             .map_err(worker_error)?
             .ok_or_else(|| worker_error(Error::InconsistentRunState(run_id.clone())))?;
-        if record.cancel_requested {
+        if let Some(request) = record.cancel_request {
+            let outcome = claimed.cancelled(CancelOrigin::Request, request.reason);
             return self
                 .core
-                .terminate_recorded(&claimed, claimed.cancelled(None), record.input_hash, None)
+                .terminate_recorded(&claimed, outcome, record.input_hash, None)
                 .await;
         }
 
@@ -364,12 +377,27 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         let caller_effects = replayed.unwrap_or(staged);
 
         // A request that lands after this read is recorded on the run record
-        // and settles the next step before it runs.
-        let external_cancel = claim_cancel.is_cancelled();
+        // and settles the next step before it runs. A token fired by a request
+        // reads the request's reason from the run record.
+        let external_cancel = if claim_cancel.is_cancelled() {
+            let request = self
+                .core
+                .view
+                .run_record(run_id)
+                .await
+                .map_err(worker_error)?
+                .and_then(|record| record.cancel_request);
+            Some(ExternalCancel {
+                reason: request.and_then(|request| request.reason),
+            })
+        } else {
+            None
+        };
+        let cancelled_externally = external_cancel.is_some();
 
         if self.core.step_output_replay
             && !replayed_step_output
-            && !external_cancel
+            && !cancelled_externally
             && let Ok(ref outcome) = outcome
         {
             self.core
@@ -388,7 +416,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             // The external-cancel override commits Cancelled in place of the
             // runner's outcome. The staged effects describe that outcome and
             // are discarded with it. A runner-issued Cancel keeps its effects.
-            if runner_cancelled || !external_cancel {
+            if runner_cancelled || !cancelled_externally {
                 caller_effects.add_to(&mut effects);
             }
             effects

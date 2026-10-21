@@ -185,11 +185,15 @@ sweep.
 
 ## Cancellation
 
-`WorkflowRuntime::cancel(run_id)` cancels an active run from outside the runner.
-The request is recorded on the run's durable record, so it persists across a
-restart and reaches the run from any runtime over the same queue. While
-termination is in flight, `status` reports `RunState::Cancelling`. It returns
-`CancelRunOutcome::NotActive` if the run is unknown or already terminal.
+`WorkflowRuntime::cancel` cancels an active run from outside the runner, with an
+optional reason. The request is recorded on the run's durable record, so it
+persists across a restart and reaches the run from any runtime over the same
+queue. While termination is in flight, `status` reports `RunState::Cancelling`
+with the reason and the time of the request. It returns
+`CancelRunOutcome::NotActive` if the run is unknown or already terminal. The run
+terminates with the reason on `RunOutcome::error` and `CancelOrigin::Request` on
+`RunOutcome::cancelled_by`, where a runner's `StepOutcome::Cancel` without a
+request records `CancelOrigin::Runner`.
 
 - If the current step is pending or scheduled, the queued step job is removed
   and the run's notification job is enqueued before the call returns.

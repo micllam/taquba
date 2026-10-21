@@ -87,14 +87,21 @@ pub struct CancelRunEntry {
     pub queue: String,
     /// The run.
     pub run_id: RunId,
+    /// The reason of the request: the `reason` of [`WorkflowRuntime::cancel`].
+    ///
+    /// [`WorkflowRuntime::cancel`]: crate::WorkflowRuntime::cancel
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl CancelRunEntry {
-    /// An entry for `run_id` on the runtime with the default queue name.
+    /// An entry for `run_id` on the runtime with the default queue name,
+    /// without a reason.
     pub fn new(run_id: RunId) -> Self {
         Self {
             queue: default_queue_name(),
             run_id,
+            reason: None,
         }
     }
 }
@@ -167,7 +174,7 @@ impl InboxHandler for CancelRunHandler {
     ) -> Result<Applied<CancelRunOutcome>, InboxHandlerError> {
         let cancelled = self
             .core
-            .cancel_run(&cancel.run_id, |effects| {
+            .cancel_run(&cancel.run_id, cancel.reason, |effects| {
                 record.attach(effects, &CancelRunOutcome::Removed)
             })
             .await;
@@ -359,7 +366,13 @@ mod tests {
             .unwrap();
         let sender = InboxSender::new(store.clone(), "test-inbox");
         sender
-            .send_with_id("cancel", &CancelRunEntry::new(rid("run-2")))
+            .send_with_id(
+                "cancel",
+                &CancelRunEntry {
+                    reason: Some("operator".to_string()),
+                    ..CancelRunEntry::new(rid("run-2"))
+                },
+            )
             .await
             .unwrap();
         sender
@@ -380,7 +393,9 @@ mod tests {
         );
         assert!(matches!(
             runtime.status(&rid("run-2")).await.unwrap().unwrap().state,
-            RunState::Terminated(ref termination) if termination.status == TerminalStatus::Cancelled
+            RunState::Terminated(ref termination)
+                if termination.status == TerminalStatus::Cancelled
+                    && termination.error.as_deref() == Some("operator")
         ));
         assert_eq!(
             queue

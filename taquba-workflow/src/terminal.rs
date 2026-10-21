@@ -49,6 +49,27 @@ impl std::fmt::Display for TerminalStatus {
     }
 }
 
+/// The origin of the cancellation of a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOrigin {
+    /// The runner returned [`crate::StepOutcome::Cancel`] without a request.
+    Runner,
+    /// A request through [`crate::WorkflowRuntime::cancel`] or a
+    /// [`crate::CancelRunEntry`].
+    Request,
+}
+
+impl CancelOrigin {
+    /// Canonical lower-case identifier for this origin, as
+    /// [`TerminalStatus::as_str`] has for a status.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CancelOrigin::Runner => "runner",
+            CancelOrigin::Request => "request",
+        }
+    }
+}
+
 /// Information passed to a [`TerminalHook`] when a run reaches a terminal
 /// state.
 #[derive(Debug, Clone)]
@@ -62,12 +83,14 @@ pub struct RunOutcome {
     pub result: Option<Vec<u8>>,
     /// - When `status == Failed`: the human-readable reason recorded on
     ///   the terminal step's `last_error`.
-    /// - When `status == Cancelled`: `Some(reason)` if the runner
-    ///   returned [`crate::StepOutcome::Cancel`], or `None` if
-    ///   cancellation came from [`crate::WorkflowRuntime::cancel`]
-    ///   (whose API does not accept a reason).
+    /// - When `status == Cancelled`: the reason of the
+    ///   [`crate::StepOutcome::Cancel`], or the reason of the request, which
+    ///   can be `None`.
     /// - When `status == Succeeded`: always `None`.
     pub error: Option<String>,
+    /// The origin of the cancellation when `status == Cancelled`, `None`
+    /// otherwise.
+    pub cancelled_by: Option<CancelOrigin>,
     /// Submitter-supplied metadata, threaded through from
     /// [`crate::RunOptions::headers`].
     pub headers: HashMap<String, String>,
@@ -188,9 +211,11 @@ mod webhook {
     /// runtime's own queue fails the build of the runtime.
     ///
     /// The webhook body is the raw `result` bytes for succeeded runs, and the
-    /// UTF-8 error message for failed runs. The run identifier and terminal
-    /// status are passed in the `Workflow-Run-Id` and `Workflow-Run-Status`
-    /// HTTP headers respectively.
+    /// UTF-8 error message for failed runs and the reason for cancelled runs.
+    /// The run identifier and terminal status are passed in the
+    /// `Workflow-Run-Id` and `Workflow-Run-Status` HTTP headers respectively,
+    /// and the origin of a cancellation in the `Workflow-Run-Cancelled-By`
+    /// header.
     pub struct WebhookTerminalHook {
         target_queue: String,
         url_header: String,
@@ -248,6 +273,9 @@ mod webhook {
             let mut req = WebhookRequest::new(url)
                 .header("Workflow-Run-Id", outcome.run_id.as_str())
                 .header("Workflow-Run-Status", outcome.status.as_str());
+            if let Some(origin) = outcome.cancelled_by {
+                req = req.header("Workflow-Run-Cancelled-By", origin.as_str());
+            }
             if let Some(t) = self.timeout {
                 req = req.timeout(t);
             }

@@ -19,10 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs through a `taquba::InboxSender`. An entry identifies the runtime by its
   `queue` field, `DEFAULT_QUEUE_NAME` by default, and its record contains the
   `SubmitOutcome` or the `CancelRunOutcome` of the entry. `SubmitOutcome`
-  implements `Serialize`, `Deserialize` and `PartialEq`.
+  implements `Serialize`, `Deserialize` and `PartialEq`, and
+  `CancelRunEntry::reason` contains the reason of a cancel.
 - `EffectsHandle::enqueue` and `Delivery::next_job_id`: a step stages an enqueue
   that commits with its settlement, and `next_job_id` is the job id of the next
   step, the same on every attempt of the step.
+- `CancelOrigin`: the origin of a cancellation, the runner or a request, on
+  `RunOutcome::cancelled_by` and `RunTermination::cancelled_by`.
+  `WebhookTerminalHook` sends it in the `Workflow-Run-Cancelled-By` header.
 
 ### Changed
 
@@ -38,9 +42,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   id of a waiting step from `RunStatus::step`, and stage the request that leads
   to a signal with `EffectsHandle::enqueue`, with the id of
   `Delivery::next_job_id` in it.
-- `WorkflowRuntime::cancel` returns a `CancelRunOutcome`, which states whether
-  the call removed the queued step or the request reached a running step. Test
-  for `CancelRunOutcome::NotActive` where the code tested for `false`.
+- `WorkflowRuntime::cancel` takes the reason of the request and returns a
+  `CancelRunOutcome`, which states whether the call removed the queued step or
+  the request reached a running step, and `RunGroup::cancel` takes the reason
+  for its members. Pass `None` for a request without a reason, and test for
+  `CancelRunOutcome::NotActive` where the code tested for `false`.
+- `RunOutcome::error` and `RunTermination::error` contain the reason of a
+  request that cancelled the run, and `RunState::Cancelling` contains the reason
+  and the time of the request. The run record, the terminal record, the member
+  record, the run result record and the notification payload store the request
+  and the origin, so a record written by 0.14.0 fails to decode. Read
+  `cancelled_by` in place of a test of `error` for `None`, and match
+  `RunState::Cancelling { .. }`.
 
 ### Removed
 
