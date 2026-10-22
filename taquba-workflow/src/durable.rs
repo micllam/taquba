@@ -13,10 +13,10 @@
 //! skipped by the group listing is submitted again. Where absence is read as a
 //! fresh entity, the reader calls [`decode`] or [`kv_record`], and the failure
 //! propagates as [`Error::Deserialization`](crate::Error::Deserialization): the
-//! run record, the current-step pointer, the terminal record, a member record
-//! read on its own and the group manifest, whose absence starts a new run or
-//! group. A new reader calls one of these and does not deserialize a record
-//! directly.
+//! run record with its terminal record, the current-step pointer, a member
+//! record read on its own and the group manifest, whose absence starts a new
+//! run or group. A new reader calls one of these and does not deserialize a
+//! record directly.
 
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -77,20 +77,27 @@ use crate::runner::{StepErrorKind, StepOutcome, Trigger};
 use crate::runtime::StepRef;
 use crate::terminal::{CancelOrigin, RunOutcome, TerminalStatus};
 
-/// Durable per-run record written atomically with the step-0 enqueue in
-/// [`WorkflowRuntime::submit`](crate::WorkflowRuntime::submit) via
-/// [`Queue::enqueue_with_effects`](taquba::Queue::enqueue_with_effects). It
-/// contains enough state to detect duplicate submissions across runtime
-/// restarts, to reject re-submissions that change the input and to record a
-/// cancellation request for the run's next step. Deleted with the settlement
-/// that terminates the run, staged in `terminate_collecting_effects`.
+/// The record of a run at `workflow/runs/{run_id}`. The submission writes the
+/// run record atomically with the step-0 enqueue, and the settlement that
+/// terminates the run replaces it with the terminal record, staged in
+/// `terminate_collecting_effects`. The memo sweep deletes the terminal record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum DurableRun {
+    Active(DurableRunRecord),
+    Terminated(DurableTermination),
+}
+
+/// The record of an active run. It contains enough state to detect duplicate
+/// submissions across runtime restarts, to reject re-submissions that change
+/// the input and to record a cancellation request for the run's next step.
 ///
 /// `run_id` keeps the record self-describing for ad hoc operator inspection.
-/// `submitted_at_ms` is for ordering and stale-record auditing. `input_hash` is
-/// the SHA-256 of the original `spec.input` and powers the
-/// `Error::InputMismatch` check on duplicate submissions. `cancel_request` is
-/// set by `WorkflowRuntime::cancel` on this key so that the write conflicts
-/// with the termination's delete of the record and a request can never outlive
+/// `submitted_at_ms` is the submission time that the run listing reports, and
+/// the terminal record copies it. `input_hash` is the SHA-256 of the original
+/// `spec.input` and powers the `Error::InputMismatch` check on duplicate
+/// submissions. `cancel_request` is set by `WorkflowRuntime::cancel` with a
+/// compare against the active record, so the write conflicts with the
+/// termination's write of the terminal record and a request can never outlive
 /// the run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DurableRunRecord {
@@ -98,6 +105,23 @@ pub(crate) struct DurableRunRecord {
     pub(crate) submitted_at_ms: u64,
     pub(crate) input_hash: [u8; 32],
     pub(crate) cancel_request: Option<DurableCancelRequest>,
+}
+
+/// The submission of a run as its run record states it, which a termination
+/// copies into the terminal record.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Submission {
+    pub(crate) input_hash: [u8; 32],
+    pub(crate) submitted_at_ms: u64,
+}
+
+impl From<&DurableRunRecord> for Submission {
+    fn from(record: &DurableRunRecord) -> Self {
+        Self {
+            input_hash: record.input_hash,
+            submitted_at_ms: record.submitted_at_ms,
+        }
+    }
 }
 
 /// The cancellation request of a run, on its run record: the reason of the
@@ -308,10 +332,8 @@ impl From<DurableTerminalStatus> for TerminalStatus {
 }
 
 /// The stored form of a [`RunTermination`](crate::RunTermination) with the
-/// final step and the SHA-256 of the run's input: the terminal record under
-/// `workflow/outcomes/{run_id}`, written in the settlement that terminates the
-/// run and read by [`WorkflowView::status`](crate::WorkflowView::status) once
-/// the run record is gone and by a re-submission after the termination, the
+/// final step, the SHA-256 of the run's input, the submission time and the
+/// submitter's headers: the terminal record of a [`DurableRun`], the
 /// termination half of a member record and the termination a run result record
 /// belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,6 +345,8 @@ pub(crate) struct DurableTermination {
     pub(crate) final_step: DurableStepRef,
     pub(crate) terminated_at_ms: u64,
     pub(crate) input_hash: [u8; 32],
+    pub(crate) submitted_at_ms: u64,
+    pub(crate) headers: HashMap<String, String>,
 }
 
 /// The durable member record of a grouped run, written at

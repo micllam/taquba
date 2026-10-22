@@ -2,17 +2,46 @@
 //! run and the status of a run group, from the queue's KV namespace and the
 //! memo store the runtime writes to.
 
-use taquba::{JobRecord, JobStatus, QueueView};
+use std::collections::HashMap;
+
+use futures_util::{Stream, TryStreamExt};
+use taquba::{JobRecord, JobStatus, KvOrder, QueueView};
 
 use crate::durable::{
-    self, DurableRunRecord, DurableRunResult, DurableStepRef, DurableTermination,
+    self, DurableRun, DurableRunRecord, DurableRunResult, DurableStepRef, DurableTermination,
 };
 use crate::error::{Error, Result};
 use crate::group::{self, GroupStatus};
-use crate::keys::{RunId, outcome_kv_key, run_kv_key, step_kv_key};
+use crate::keys::{
+    RUN_KV_PREFIX, RunId, STEP_KV_PREFIX, run_kv_key, step_kv_key, submitter_headers,
+};
 use crate::memo::{MemoStore, RUN_RESULT_MEMO_KEY};
 use crate::runtime::{RunEnd, RunState, RunStatus, RunTermination};
 use crate::terminal::{RunOutcome, TerminalStatus};
+
+/// The runs that [`WorkflowView::runs`] lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunFilter {
+    /// The active and the terminated runs.
+    All,
+    /// The runs submitted and not terminated.
+    Active,
+    /// The terminated runs, until the memo sweep removes their terminal record.
+    Terminated,
+}
+
+/// A run in the listing of [`WorkflowView::runs`], or read by
+/// [`WorkflowView::run`].
+#[derive(Debug, Clone)]
+pub struct ListedRun {
+    /// The status of the run, as [`WorkflowView::status`] reports it.
+    pub status: RunStatus,
+    /// The runtime clock's time at the submission, as a Unix timestamp in
+    /// milliseconds.
+    pub submitted_at_ms: u64,
+    /// The submitter's headers, without the reserved `workflow.` headers.
+    pub headers: HashMap<String, String>,
+}
 
 /// The read-only queries of a workflow store, over a [`QueueView`] and the
 /// [`MemoStore`] the runtime writes to.
@@ -46,28 +75,96 @@ impl WorkflowView {
     /// absent, the call fails with [`Error::InconsistentRunState`]. The runtime
     /// does not write a pointer without its job.
     pub async fn status(&self, run_id: &RunId) -> Result<Option<RunStatus>> {
-        let Some(record) = self.run_record(run_id).await? else {
-            return self.terminated_status(run_id).await;
+        Ok(self.run(run_id).await?.map(|run| run.status))
+    }
+
+    /// The run `run_id` as [`WorkflowView::runs`] lists it: its status, as
+    /// [`WorkflowView::status`] reports it, with its submission time and
+    /// headers. The reads are those of `status`.
+    pub async fn run(&self, run_id: &RunId) -> Result<Option<ListedRun>> {
+        match self.run_entry(run_id).await? {
+            Some(run) => self.listed(run_id.clone(), run).await,
+            None => Ok(None),
+        }
+    }
+
+    /// The runs that `filter` selects, in the order `order` of their run ids,
+    /// with `page_size` records in a page. A run id that the runtime generates
+    /// is a ULID, so such runs list in the order of their submission. A
+    /// terminated run lists until the memo sweep removes its terminal record.
+    /// The listing is not a snapshot. A run lists once, in the state of its
+    /// read. A run that is submitted or removed during the listing can be
+    /// absent, and with [`RunFilter::Active`] so can a run that terminates
+    /// before its read.
+    pub fn runs(
+        &self,
+        filter: RunFilter,
+        order: KvOrder,
+        page_size: usize,
+    ) -> impl Stream<Item = Result<ListedRun>> + Send + '_ {
+        // The current-step pointers are the active runs.
+        let prefix = match filter {
+            RunFilter::Active => STEP_KV_PREFIX,
+            RunFilter::All | RunFilter::Terminated => RUN_KV_PREFIX,
         };
-        // The pointer is deleted with the record, so its absence here means
-        // that the run terminated between the two reads.
+        self.queue
+            .kv_entries(prefix, .., order, page_size)
+            .map_err(Error::from)
+            .try_filter_map(move |(key, value)| async move {
+                let run_id = RunId::new(String::from_utf8_lossy(&key[prefix.len()..]))?;
+                match filter {
+                    RunFilter::All => self.listed(run_id, durable::decode(&value)?).await,
+                    RunFilter::Active => match self.run_record(&run_id).await? {
+                        Some(record) => self.listed_active(&run_id, &record).await,
+                        None => Ok(None),
+                    },
+                    RunFilter::Terminated => Ok(match durable::decode(&value)? {
+                        DurableRun::Terminated(termination) => {
+                            Some(listed_terminated(run_id, termination))
+                        }
+                        DurableRun::Active(_) => None,
+                    }),
+                }
+            })
+    }
+
+    /// The listed run of the record `run` of `run_id`. The termination deletes
+    /// the pointer of an active run, so a run whose pointer is absent has
+    /// terminated after the read of `run`, and lists from its terminal record.
+    async fn listed(&self, run_id: RunId, run: DurableRun) -> Result<Option<ListedRun>> {
+        let record = match run {
+            DurableRun::Terminated(termination) => {
+                return Ok(Some(listed_terminated(run_id, termination)));
+            }
+            DurableRun::Active(record) => record,
+        };
+        if let Some(run) = self.listed_active(&run_id, &record).await? {
+            return Ok(Some(run));
+        }
+        Ok(self
+            .terminal_record(&run_id)
+            .await?
+            .map(|termination| listed_terminated(run_id, termination)))
+    }
+
+    /// The listed run of the active run `run_id` with the run record `record`,
+    /// or `None` when its current-step pointer is absent.
+    async fn listed_active(
+        &self,
+        run_id: &RunId,
+        record: &DurableRunRecord,
+    ) -> Result<Option<ListedRun>> {
         let Some((current, job)) = self.current_job(run_id).await? else {
-            return self.terminated_status(run_id).await;
+            return Ok(None);
         };
-        let state = match (job.status, record.cancel_request) {
-            (JobStatus::Dead, _) => RunState::DeadLettered,
-            (_, Some(request)) => RunState::Cancelling {
-                reason: request.reason,
-                requested_at_ms: request.requested_at_ms,
+        Ok(Some(ListedRun {
+            status: RunStatus {
+                run_id: run_id.clone(),
+                state: active_state(record, &job),
+                step: current.into(),
             },
-            (JobStatus::Claimed, None) => RunState::Running,
-            (JobStatus::Scheduled, None) => scheduled_state(&job),
-            (JobStatus::Pending | JobStatus::Done, None) => RunState::Pending,
-        };
-        Ok(Some(RunStatus {
-            run_id: run_id.clone(),
-            state,
-            step: current.into(),
+            submitted_at_ms: record.submitted_at_ms,
+            headers: submitter_headers(&job.headers),
         }))
     }
 
@@ -117,9 +214,17 @@ impl WorkflowView {
         Ok(Some(status))
     }
 
-    /// The durable record of `run_id`, when the run is active.
-    pub(crate) async fn run_record(&self, run_id: &RunId) -> Result<Option<DurableRunRecord>> {
+    /// The record of `run_id`, `None` for a run that is unknown or swept.
+    pub(crate) async fn run_entry(&self, run_id: &RunId) -> Result<Option<DurableRun>> {
         durable::kv_record(&self.queue, &run_kv_key(run_id)).await
+    }
+
+    /// The run record of `run_id`, when the run is active.
+    pub(crate) async fn run_record(&self, run_id: &RunId) -> Result<Option<DurableRunRecord>> {
+        Ok(match self.run_entry(run_id).await? {
+            Some(DurableRun::Active(record)) => Some(record),
+            Some(DurableRun::Terminated(_)) | None => None,
+        })
     }
 
     /// The current-step pointer of `run_id`, or `None` when the run is not
@@ -157,22 +262,15 @@ impl WorkflowView {
         }
     }
 
-    /// The terminal record of `run_id`, or `None` when no record exists.
+    /// The terminal record of `run_id`, when the run is terminated.
     pub(crate) async fn terminal_record(
         &self,
         run_id: &RunId,
     ) -> Result<Option<DurableTermination>> {
-        durable::kv_record(&self.queue, &outcome_kv_key(run_id)).await
-    }
-
-    /// The status of a terminated run from its terminal record, or `None` when
-    /// no record exists.
-    async fn terminated_status(&self, run_id: &RunId) -> Result<Option<RunStatus>> {
-        Ok(self.terminal_record(run_id).await?.map(|record| RunStatus {
-            run_id: run_id.clone(),
-            step: record.final_step.clone().into(),
-            state: RunState::Terminated(record.into()),
-        }))
+        Ok(match self.run_entry(run_id).await? {
+            Some(DurableRun::Terminated(termination)) => Some(termination),
+            Some(DurableRun::Active(_)) | None => None,
+        })
     }
 
     /// The outcome in the run result record of `run_id` when the record belongs
@@ -200,6 +298,35 @@ impl WorkflowView {
                         .then(|| record.outcome.into())
                 }),
         )
+    }
+}
+
+/// The state of an active run with the run record `record` and the current
+/// step's job `job`.
+fn active_state(record: &DurableRunRecord, job: &JobRecord) -> RunState {
+    match (job.status, &record.cancel_request) {
+        (JobStatus::Dead, _) => RunState::DeadLettered,
+        (_, Some(request)) => RunState::Cancelling {
+            reason: request.reason.clone(),
+            requested_at_ms: request.requested_at_ms,
+        },
+        (JobStatus::Claimed, None) => RunState::Running,
+        (JobStatus::Scheduled, None) => scheduled_state(job),
+        (JobStatus::Pending | JobStatus::Done, None) => RunState::Pending,
+    }
+}
+
+/// The listed run of the terminated run `run_id` with the terminal record
+/// `termination`.
+fn listed_terminated(run_id: RunId, termination: DurableTermination) -> ListedRun {
+    ListedRun {
+        submitted_at_ms: termination.submitted_at_ms,
+        headers: termination.headers.clone(),
+        status: RunStatus {
+            run_id,
+            step: termination.final_step.clone().into(),
+            state: RunState::Terminated(termination.into()),
+        },
     }
 }
 

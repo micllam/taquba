@@ -27,6 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CancelOrigin`: the origin of a cancellation, the runner or a request, on
   `RunOutcome::cancelled_by` and `RunTermination::cancelled_by`.
   `WebhookTerminalHook` sends it in the `Workflow-Run-Cancelled-By` header.
+- `WorkflowView::runs`: the runs in run-id order as a stream of `ListedRun`,
+  with the status, the submission time and the headers of each run, and
+  `RunFilter` selects the active runs, the terminated runs or both. A run lists
+  once, in the state of its read. `WorkflowView::run` reads the `ListedRun` of
+  one run id. The terminal record of a run contains its submission time and
+  headers and replaces the run record at its key, so a store written with 0.14.0
+  needs a drain: let the runs terminate and memo retention remove their terminal
+  records before the upgrade.
 
 ### Changed
 

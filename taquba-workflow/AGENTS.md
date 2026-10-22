@@ -8,8 +8,8 @@ Each rule identifies the code it applies to, whose docs describe the mechanism.
   crate-private effects channel. The external-cancel discard stays conditional
   inside the `settled.map` tail.
 - **Terminal notifications** (`runtime.rs::terminate_collecting_effects`). Do
-  not build the notification enqueue in the `settled.map` tail. The run-record
-  delete stays on the terminal ack.
+  not build the notification enqueue in the `settled.map` tail. The write of the
+  terminal record over the run record stays on the terminal ack.
 - **Terminal record.** Every termination arm passes the input hash to
   `RuntimeCore::termination`. Do not add a result payload or a cost to the
   record.

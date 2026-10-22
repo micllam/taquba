@@ -14,9 +14,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 
 use crate::durable::{
-    self, DurableCancelRequest, DurableErrorKind, DurableRunOutcome, DurableRunRecord,
+    self, DurableCancelRequest, DurableErrorKind, DurableRun, DurableRunOutcome, DurableRunRecord,
     DurableRunResult, DurableStepOutcome, DurableStepOutcomeRecord, DurableStepRef,
-    DurableTermination,
+    DurableTermination, Submission,
 };
 use crate::effects::{StagedEffects, TerminalEffects};
 use crate::error::{Error, Result};
@@ -24,8 +24,8 @@ use crate::group::{GroupStore, Membership, RunGroup, pending_member, terminated_
 use crate::inbox::{CancelRunHandler, INBOX_QUEUE_FIELD, SubmitHandler};
 use crate::keys::{
     DEDUP_PREFIX, GROUP_TERMINAL_KV_PREFIX, HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RunId,
-    TERMINAL_KV_PREFIX, check_effects, check_headers, hash_input, next_step_job_id, outcome_kv_key,
-    run_kv_key, step_kv_key,
+    TERMINAL_KV_PREFIX, check_effects, check_headers, hash_input, next_step_job_id, run_kv_key,
+    step_kv_key,
 };
 use crate::memo::{MemoStore, RUN_RESULT_MEMO_KEY};
 use crate::runner::{StepErrorKind, StepOutcome, StepRunner, Trigger};
@@ -527,7 +527,7 @@ impl Clearable for RunStore {
 
     async fn clear(&self, run_id: &RunId, _marked_at_ms: u64) -> Result<Cleared> {
         self.memo_store.clear_memos_for_run(run_id).await?;
-        Ok(Cleared::Removed(vec![outcome_kv_key(run_id)]))
+        Ok(Cleared::Removed(vec![run_kv_key(run_id)]))
     }
 }
 
@@ -874,13 +874,13 @@ impl RuntimeCore {
         Ok(spec.run_id.clone().unwrap_or_else(RunId::generate))
     }
 
-    /// Enqueue step 0 of `run_id` unless the run is active. The run record is
-    /// written with the step-0 enqueue and deleted with the termination, so it
-    /// identifies an active run whichever process submitted it, and the step's
-    /// dedup key serialises two submissions that both find the record absent. A
-    /// `membership` is set on the step job and its pending member record is
-    /// written with the enqueue. The effects of a new submission pass through
-    /// `attach` with its outcome.
+    /// Enqueue step 0 of `run_id` unless the run is known. The run record is
+    /// written with the step-0 enqueue and replaced by the terminal record at
+    /// the termination, so it identifies a run whichever process submitted it,
+    /// and the step's dedup key serialises two submissions that both find the
+    /// record absent. A `membership` is set on the step job and its pending
+    /// member record is written with the enqueue. The effects of a new
+    /// submission pass through `attach` with its outcome.
     async fn enqueue_run(
         &self,
         run_id: &RunId,
@@ -902,16 +902,17 @@ impl RuntimeCore {
             }
         };
 
-        if let Some(existing) = self.view.run_record(run_id).await? {
-            check_input(existing.input_hash)?;
-            let current = self.current_step(run_id).await?;
-            return Ok(duplicate(current.job_id));
-        }
-        // A termination deletes the run record and writes the terminal record
-        // in one commit, so the terminal record is read second.
-        if let Some(termination) = self.view.terminal_record(run_id).await? {
-            check_input(termination.input_hash)?;
-            return Ok(duplicate(termination.final_step.job_id));
+        match self.view.run_entry(run_id).await? {
+            Some(DurableRun::Active(existing)) => {
+                check_input(existing.input_hash)?;
+                let current = self.current_step(run_id).await?;
+                return Ok(duplicate(current.job_id));
+            }
+            Some(DurableRun::Terminated(termination)) => {
+                check_input(termination.input_hash)?;
+                return Ok(duplicate(termination.final_step.job_id));
+            }
+            None => {}
         }
 
         let opts = StepEnqueueOpts {
@@ -933,12 +934,12 @@ impl RuntimeCore {
             opts,
         );
 
-        let record_bytes = durable::encode(&DurableRunRecord {
+        let record_bytes = durable::encode(&DurableRun::Active(DurableRunRecord {
             run_id: run_id.clone(),
             submitted_at_ms: self.clock.now_ms(),
             input_hash,
             cancel_request: None,
-        });
+        }));
         let mut effects = spec
             .effects
             .kv_put(run_kv_key(run_id), record_bytes)
@@ -1005,7 +1006,7 @@ impl RuntimeCore {
         reason: Option<String>,
         attach: impl Fn(SettlementEffects) -> taquba::Result<SettlementEffects>,
     ) -> Result<CancelRunOutcome> {
-        let Some((input_hash, request)) = self.request_cancel(run_id, reason).await? else {
+        let Some((submission, request)) = self.request_cancel(run_id, reason).await? else {
             return Ok(CancelRunOutcome::NotActive);
         };
         // Settle the current step now: remove it while it is queued, or fire
@@ -1027,7 +1028,7 @@ impl RuntimeCore {
             // The effects are built before the outcome is known, and the queue
             // applies them only on `Removed`.
             let outcome = claimed.cancelled(CancelOrigin::Request, request.reason.clone());
-            let termination = self.termination(&outcome, None, input_hash);
+            let termination = self.termination(&outcome, None, submission);
             let effects = self.terminate_collecting_effects(&outcome, &claimed, termination);
             match self.queue.cancel_with(&job.id, attach(effects)?).await?.0 {
                 taquba::CancelOutcome::Removed => return Ok(CancelRunOutcome::Removed),
@@ -1037,17 +1038,18 @@ impl RuntimeCore {
         }
     }
 
-    /// Settle a run into its terminal state: return the deletes of the durable
-    /// run record and the current-step pointer, the writes of the terminal
-    /// record and the terminal marker (when memo retention is enabled), the
-    /// write of the member record (when the run is a group member), the effects
-    /// that the hook stages through [`TerminalHook::stage_effects`] and the
-    /// terminal-notification enqueue (when the hook observes this outcome) as
-    /// [`SettlementEffects`] for the settlement transaction. The notification
-    /// job's payload is the committed outcome and the configured
-    /// [`TerminalHook`] runs as its worker. `terminal_step` is the step that
-    /// produced the outcome, or the pending step a cancellation removes, and
-    /// `termination` the record of the outcome the settlement writes.
+    /// Settle a run into its terminal state: return the delete of the
+    /// current-step pointer, the write of the terminal record over the run
+    /// record, the write of the terminal marker (when memo retention is
+    /// enabled), the write of the member record (when the run is a group
+    /// member), the effects that the hook stages through
+    /// [`TerminalHook::stage_effects`] and the terminal-notification enqueue
+    /// (when the hook observes this outcome) as [`SettlementEffects`] for the
+    /// settlement transaction. The notification job's payload is the committed
+    /// outcome and the configured [`TerminalHook`] runs as its worker.
+    /// `terminal_step` is the step that produced the outcome, or the pending
+    /// step a cancellation removes, and `termination` the record of the outcome
+    /// the settlement writes.
     ///
     /// The effects are pure: this function does not write or mutate state, so a
     /// caller that builds them and then commits a non-terminal outcome does not
@@ -1063,12 +1065,10 @@ impl RuntimeCore {
         let staging = TerminalEffects::for_delivery(&self.queue_name);
         self.terminal_staging.stage_effects(outcome, &staging);
         let mut effects = staging.seal_into_settlement();
-        effects
-            .kv_deletes
-            .extend([run_kv_key(&outcome.run_id), step_kv_key(&outcome.run_id)]);
+        effects.kv_deletes.push(step_kv_key(&outcome.run_id));
         effects.kv_writes.insert(
-            outcome_kv_key(&outcome.run_id),
-            durable::encode(&termination),
+            run_kv_key(&outcome.run_id),
+            durable::encode(&DurableRun::Terminated(termination.clone())),
         );
         if let Some(membership) = &terminal_step.membership {
             effects.kv_writes.insert(
@@ -1120,9 +1120,10 @@ impl RuntimeCore {
             if current.is_none_or(|current| current.job_id != job.id) {
                 continue;
             }
-            // The record is written and deleted with the pointer. A pointer
-            // without one is a store the runtime did not write, left for the
-            // worker to report.
+            // The run record is written with the pointer and replaced by the
+            // terminal record when the pointer is deleted. Only another writer
+            // of the store leaves a pointer without a record, and the worker
+            // reports that pointer.
             let Some(record) = self.view.run_record(run_id).await? else {
                 warn!(run_id = %run_id, job_id = %job.id, "dead step has a current-step pointer but no run record");
                 continue;
@@ -1132,7 +1133,7 @@ impl RuntimeCore {
                 .clone()
                 .unwrap_or_else(|| "step dead-lettered outside the worker".to_string());
             let outcome = claimed.failed(error);
-            let termination = self.termination(&outcome, None, record.input_hash);
+            let termination = self.termination(&outcome, None, Submission::from(&record));
             let effects = self.terminate_collecting_effects(&outcome, &claimed, termination);
             self.queue.commit_effects(effects).await?;
             warn!(run_id = %run_id, step_number = claimed.step_number, job_id = %job.id, "terminated a run whose step was dead-lettered outside the worker");
@@ -1226,13 +1227,13 @@ impl RuntimeCore {
         }
     }
 
-    /// The termination of `outcome`'s run at the clock's current time.
-    /// `input_hash` is the run record's.
+    /// The termination of `outcome`'s run at the clock's current time, with the
+    /// `submission` of the run record.
     pub(crate) fn termination(
         &self,
         outcome: &RunOutcome,
         error_kind: Option<StepErrorKind>,
-        input_hash: [u8; 32],
+        submission: Submission,
     ) -> DurableTermination {
         DurableTermination {
             status: outcome.status.into(),
@@ -1241,7 +1242,9 @@ impl RuntimeCore {
             error_kind: error_kind.map(DurableErrorKind::from),
             final_step: (&outcome.final_step).into(),
             terminated_at_ms: self.clock.now_ms(),
-            input_hash,
+            input_hash: submission.input_hash,
+            submitted_at_ms: submission.submitted_at_ms,
+            headers: outcome.headers.clone(),
         }
     }
 
@@ -1263,34 +1266,41 @@ impl RuntimeCore {
     }
 
     /// Record a cancellation request for `reason` on the run record of
-    /// `run_id`. Returns the record's input hash and the recorded request when
+    /// `run_id`. Returns the record's submission and the recorded request when
     /// the run is active, `None` otherwise. A run with a recorded request keeps
     /// the first request.
     async fn request_cancel(
         &self,
         run_id: &RunId,
         reason: Option<String>,
-    ) -> Result<Option<([u8; 32], DurableCancelRequest)>> {
+    ) -> Result<Option<(Submission, DurableCancelRequest)>> {
         let key = run_kv_key(run_id);
         loop {
             let Some(current) = self.queue.view().kv_get(&key).await? else {
                 return Ok(None);
             };
-            let mut record: DurableRunRecord = durable::decode(&current)?;
-            if let Some(request) = record.cancel_request {
-                return Ok(Some((record.input_hash, request)));
+            let DurableRun::Active(mut record) = durable::decode(&current)? else {
+                return Ok(None);
+            };
+            if let Some(request) = record.cancel_request.clone() {
+                return Ok(Some((Submission::from(&record), request)));
             }
             let request = DurableCancelRequest {
                 reason: reason.clone(),
                 requested_at_ms: self.clock.now_ms(),
             };
             record.cancel_request = Some(request.clone());
+            let submission = Submission::from(&record);
             if self
                 .queue
-                .kv_compare_put(&key, Some(&current), &durable::encode(&record))
+                .kv_compare_put(
+                    &key,
+                    Some(&current),
+                    &durable::encode(&DurableRun::Active(record)),
+                )
                 .await?
             {
-                return Ok(Some((record.input_hash, request)));
+                return Ok(Some((submission, request)));
             }
         }
     }
@@ -1457,9 +1467,11 @@ mod tests {
     use crate::test_util::{
         advance, fast_options, open_queue, open_queue_at, open_queue_at_with, open_queue_with, rid,
     };
-    use crate::view::WorkflowView;
+    use crate::view::{RunFilter, WorkflowView};
+    use futures_util::TryStreamExt;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use taquba::KvOrder;
     use taquba::object_store::ObjectStoreExt;
     use taquba::object_store::memory::InMemory;
     use taquba::{Expired, ExpiryIndex};
@@ -2829,13 +2841,13 @@ mod tests {
         // effects are committed once the hook fires.
         assert_eq!(queue.view().stats("workflow-steps").await.unwrap().dead, 1);
         assert!(
-            queue
+            runtime
                 .view()
-                .kv_get(&run_kv_key(&handle.run_id))
+                .run_record(&handle.run_id)
                 .await
                 .unwrap()
                 .is_none(),
-            "the run record delete rides the exhausted nack",
+            "the terminal record replaces the run record with the exhausted nack",
         );
         assert_eq!(
             terminal_markers(&queue)
@@ -3092,17 +3104,17 @@ mod tests {
             "a second cancel finds no run record",
         );
 
-        // The marker and the run record's delete commit with the removal,
-        // before the notification is processed.
+        // The marker and the terminal record commit with the removal, before
+        // the notification is processed.
         let markers = terminal_markers(&queue).await;
         assert_eq!(markers, vec![(handle.run_id.clone(), 10_000)]);
-        assert_eq!(
-            queue
+        assert!(
+            runtime
                 .view()
-                .kv_get(&run_kv_key(&handle.run_id))
+                .terminal_record(&handle.run_id)
                 .await
-                .unwrap(),
-            None,
+                .unwrap()
+                .is_some()
         );
 
         // The step job is gone, and the one claimable job is the notification.
@@ -3194,6 +3206,112 @@ mod tests {
             .expect("terminal record");
         assert_eq!(end.termination, termination);
         assert!(end.outcome.is_none(), "no worker terminated the run");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_listing_pages_the_runs_in_run_id_order_and_a_run_reads_as_it_lists() {
+        let (queue, store, clock) = open_queue_at(10_000).await;
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store.clone(),
+            UnreachableRunner,
+            NoopTerminalHook,
+        )
+        .memo_prefix("memo")
+        .build()
+        .unwrap();
+        // The worker loop is not spawned, so the steps stay pending.
+        for run_id in ["c", "a", "b"] {
+            runtime
+                .submit(RunSpec {
+                    run_id: Some(rid(run_id)),
+                    options: RunOptions {
+                        headers: HashMap::from([("tenant".to_string(), run_id.to_string())]),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            clock.advance(Duration::from_secs(1));
+        }
+        assert_eq!(
+            runtime.cancel(&rid("b"), None).await.unwrap(),
+            CancelRunOutcome::Removed
+        );
+
+        let reader = QueueReader::open(store.clone(), "test").await.unwrap();
+        let view = WorkflowView::new(reader.view().clone(), MemoStore::new(store, "memo"));
+        let columns = |run: crate::ListedRun| {
+            (
+                run.status.run_id.to_string(),
+                matches!(run.status.state, RunState::Terminated(_)),
+                run.submitted_at_ms,
+                run.headers["tenant"].clone(),
+            )
+        };
+        let list = |filter, order| {
+            view.runs(filter, order, 1)
+                .map_ok(columns)
+                .try_collect::<Vec<_>>()
+        };
+        let row = |id: &str, terminated, submitted_at_ms| {
+            (id.to_string(), terminated, submitted_at_ms, id.to_string())
+        };
+        let (a, b, c) = (
+            row("a", false, 11_000),
+            row("b", true, 12_000),
+            row("c", false, 10_000),
+        );
+        assert_eq!(
+            list(RunFilter::All, KvOrder::Ascending).await.unwrap(),
+            [a.clone(), b.clone(), c.clone()]
+        );
+        assert_eq!(
+            list(RunFilter::All, KvOrder::Descending).await.unwrap(),
+            [c.clone(), b.clone(), a.clone()]
+        );
+        for row in [&a, &b, &c] {
+            let run = view.run(&rid(&row.0)).await.unwrap().map(columns);
+            assert_eq!(run.as_ref(), Some(row));
+        }
+        assert_eq!(
+            list(RunFilter::Active, KvOrder::Ascending).await.unwrap(),
+            [a, c]
+        );
+        assert_eq!(
+            list(RunFilter::Terminated, KvOrder::Ascending)
+                .await
+                .unwrap(),
+            [b]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_run_that_terminates_during_the_listing_lists_once() {
+        let (queue, store, _clock) = open_queue_at(10_000).await;
+        let runtime = WorkflowRuntime::builder(queue, store, UnreachableRunner, NoopTerminalHook)
+            .build()
+            .unwrap();
+        for run_id in ["a", "b"] {
+            runtime
+                .submit(RunSpec {
+                    run_id: Some(rid(run_id)),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+
+        let view = runtime.view();
+        let mut runs = std::pin::pin!(view.runs(RunFilter::All, KvOrder::Ascending, 1));
+        let first = runs.try_next().await.unwrap().unwrap();
+        assert_eq!(first.status.run_id, "a");
+        runtime.cancel(&rid("b"), None).await.unwrap();
+        let rest: Vec<_> = runs.try_collect().await.unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].status.run_id, "b");
+        assert!(matches!(rest[0].status.state, RunState::Terminated(_)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -3391,8 +3509,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn cancel_returns_false_for_a_terminated_or_unknown_run() {
         // Submit a run that succeeds normally, wait for the terminal hook, then
-        // call `cancel`. The run record was deleted with the success, so
-        // `cancel` must report `Ok(false)` and must not fire a second hook.
+        // call `cancel`. The terminal record replaced the run record with the
+        // success, so `cancel` must report `Ok(false)` and must not fire a
+        // second hook.
         let (queue, store) = open_queue().await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
@@ -3779,9 +3898,9 @@ mod tests {
             "a run still executing its step must have no terminal marker",
         );
         assert!(
-            queue
+            runtime
                 .view()
-                .kv_get(&run_kv_key(&handle.run_id))
+                .run_record(&handle.run_id)
                 .await
                 .unwrap()
                 .is_some(),
@@ -4642,9 +4761,9 @@ mod tests {
             JobStatus::Dead
         );
         assert!(
-            queue
+            runtime
                 .view()
-                .kv_get(&run_kv_key(&rid("hung")))
+                .run_record(&rid("hung"))
                 .await
                 .unwrap()
                 .is_none()
@@ -4667,10 +4786,7 @@ mod tests {
         // id is then submitted again while the dead job is retained: the pass
         // identifies a dead-letter outside the worker by the current step's
         // job, so the new run is left alone.
-        queue
-            .kv_delete(&outcome_kv_key(&rid("hung")))
-            .await
-            .unwrap();
+        queue.kv_delete(&run_kv_key(&rid("hung"))).await.unwrap();
         let again = runtime
             .submit(RunSpec {
                 run_id: Some(rid("hung")),
@@ -4805,10 +4921,7 @@ mod tests {
 
         // The test removes the terminal record as the memo sweep does, so the
         // run id starts a new run.
-        queue
-            .kv_delete(&outcome_kv_key(&rid("again")))
-            .await
-            .unwrap();
+        queue.kv_delete(&run_kv_key(&rid("again"))).await.unwrap();
         assert!(runtime.submit(spec).await.unwrap().newly_submitted);
         let record = runtime
             .view()

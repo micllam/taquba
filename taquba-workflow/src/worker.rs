@@ -12,12 +12,12 @@ use taquba::{
 };
 use tracing::{debug, warn};
 
-use crate::durable::{self, DurableRunOutcome};
+use crate::durable::{self, DurableRunOutcome, Submission};
 use crate::effects::{EffectsHandle, TerminalEffects};
 use crate::error::{Error, worker_error};
 use crate::group::Membership;
 use crate::keys::{
-    HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RESERVED_HEADER_PREFIX, RunId, next_step_job_id,
+    HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RunId, next_step_job_id, submitter_headers,
 };
 use crate::kv::KvReadHandle;
 use crate::runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
@@ -74,12 +74,7 @@ impl<'a> ClaimedStep<'a> {
             header: HEADER_STEP,
             value: step_str.clone(),
         })?;
-        let headers = job
-            .headers
-            .iter()
-            .filter(|(k, _)| !k.starts_with(RESERVED_HEADER_PREFIX))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let headers = submitter_headers(&job.headers);
         Ok(Self {
             run_id,
             step_number,
@@ -159,10 +154,10 @@ impl RuntimeCore {
         &self,
         claimed: &ClaimedStep<'_>,
         error: StepError,
-        input_hash: [u8; 32],
+        submission: Submission,
     ) -> WorkerError {
         let outcome = claimed.failed(error.message.clone());
-        let termination = self.termination(&outcome, Some(error.kind), input_hash);
+        let termination = self.termination(&outcome, Some(error.kind), submission);
         if let Err(err) = self.store_run_result(&outcome, &termination).await {
             warn!(run_id = %claimed.run_id, "failed to write the run result record: {err}");
         }
@@ -178,10 +173,10 @@ impl RuntimeCore {
         &self,
         claimed: &ClaimedStep<'_>,
         outcome: RunOutcome,
-        input_hash: [u8; 32],
+        submission: Submission,
         error_kind: Option<StepErrorKind>,
     ) -> Result<SettlementEffects, WorkerError> {
-        let termination = self.termination(&outcome, error_kind, input_hash);
+        let termination = self.termination(&outcome, error_kind, submission);
         self.store_run_result(&outcome, &termination)
             .await
             .map_err(worker_error)?;
@@ -200,17 +195,17 @@ impl RuntimeCore {
         claimed: &ClaimedStep<'_>,
         outcome: Result<StepOutcome, StepError>,
         external_cancel: Option<ExternalCancel>,
-        input_hash: [u8; 32],
+        submission: Submission,
     ) -> Result<SettlementEffects, WorkerError> {
         match (outcome, external_cancel) {
             (_, Some(ExternalCancel { reason })) => {
                 let outcome = claimed.cancelled(CancelOrigin::Request, reason);
-                self.terminate_recorded(claimed, outcome, input_hash, None)
+                self.terminate_recorded(claimed, outcome, submission, None)
                     .await
             }
             (Ok(StepOutcome::Cancel { reason }), None) => {
                 let outcome = claimed.cancelled(CancelOrigin::Runner, Some(reason));
-                self.terminate_recorded(claimed, outcome, input_hash, None)
+                self.terminate_recorded(claimed, outcome, submission, None)
                     .await
             }
             (Ok(StepOutcome::Continue { payload, when }), None) => match when {
@@ -229,7 +224,7 @@ impl RuntimeCore {
                 }
             },
             (Ok(StepOutcome::Succeed { result }), None) => {
-                self.terminate_recorded(claimed, claimed.succeeded(result), input_hash, None)
+                self.terminate_recorded(claimed, claimed.succeeded(result), submission, None)
                     .await
             }
             // A runner decision: the step ran cleanly and is acknowledged, and
@@ -238,7 +233,7 @@ impl RuntimeCore {
                 self.terminate_recorded(
                     claimed,
                     claimed.failed(reason),
-                    input_hash,
+                    submission,
                     Some(StepErrorKind::Permanent),
                 )
                 .await
@@ -248,7 +243,7 @@ impl RuntimeCore {
             (Err(err), None)
                 if err.kind == StepErrorKind::Permanent || claimed.job.is_last_attempt() =>
             {
-                Err(self.terminating_failure(claimed, err, input_hash).await)
+                Err(self.terminating_failure(claimed, err, submission).await)
             }
             (Err(err), None) => Err(err.into_worker_error()),
         }
@@ -318,11 +313,11 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .await
             .map_err(worker_error)?
             .ok_or_else(|| worker_error(Error::InconsistentRunState(run_id.clone())))?;
-        if let Some(request) = record.cancel_request {
-            let outcome = claimed.cancelled(CancelOrigin::Request, request.reason);
+        if let Some(request) = &record.cancel_request {
+            let outcome = claimed.cancelled(CancelOrigin::Request, request.reason.clone());
             return self
                 .core
-                .terminate_recorded(&claimed, outcome, record.input_hash, None)
+                .terminate_recorded(&claimed, outcome, Submission::from(&record), None)
                 .await;
         }
 
@@ -409,7 +404,12 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         let runner_cancelled = matches!(outcome, Ok(StepOutcome::Cancel { .. }));
         let settled = self
             .core
-            .settle_outcome(&claimed, outcome, external_cancel, record.input_hash)
+            .settle_outcome(
+                &claimed,
+                outcome,
+                external_cancel,
+                Submission::from(&record),
+            )
             .await;
 
         settled.map(|mut effects| {

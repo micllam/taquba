@@ -19,8 +19,7 @@ use crate::blob::ObjectPrefix;
 use crate::durable::{self, DurableMember, DurableTermination};
 use crate::error::{Error, Result};
 use crate::keys::{
-    HEADER_GROUP, HEADER_GROUP_KEY, RunId, group_member_kv_key, group_members_kv_prefix,
-    outcome_kv_key,
+    HEADER_GROUP, HEADER_GROUP_KEY, RunId, group_member_kv_key, group_members_kv_prefix, run_kv_key,
 };
 use crate::memo::MemoStore;
 use crate::runtime::{CancelRunOutcome, RunOptions, RunSpec, RunTermination, RuntimeCore};
@@ -329,7 +328,7 @@ impl GroupStore {
             let outcomes = page
                 .iter()
                 .flat_map(|(_, member)| member.run_ids(&removal.group_id))
-                .map(|run_id| outcome_kv_key(&run_id));
+                .map(|run_id| run_kv_key(&run_id));
             let records = page
                 .iter()
                 .filter(|(_, member)| member.stored.is_some())
@@ -1083,7 +1082,7 @@ mod tests {
             assert!(
                 queue
                     .view()
-                    .kv_get(&outcome_kv_key(run_id))
+                    .kv_get(&run_kv_key(run_id))
                     .await
                     .unwrap()
                     .is_some()
@@ -1114,7 +1113,7 @@ mod tests {
             assert!(
                 queue
                     .view()
-                    .kv_get(&outcome_kv_key(run_id))
+                    .kv_get(&run_kv_key(run_id))
                     .await
                     .unwrap()
                     .is_none(),

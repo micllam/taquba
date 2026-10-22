@@ -40,6 +40,16 @@ pub(crate) fn check_kv_key(key: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The headers that the submitter set on a step job: `headers` without those
+/// with [`RESERVED_HEADER_PREFIX`].
+pub(crate) fn submitter_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
+    headers
+        .iter()
+        .filter(|(name, _)| !name.starts_with(RESERVED_HEADER_PREFIX))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
 /// Fails with [`Error::ReservedHeader`] for a caller header with the reserved
 /// prefix.
 pub(crate) fn check_headers(headers: &HashMap<String, String>) -> Result<()> {
@@ -93,7 +103,8 @@ pub(crate) const DEDUP_PREFIX: &str = "run:";
 /// caller-supplied job id.
 pub const MAX_RUN_ID_LEN: usize = 128;
 
-/// Prefix for the durable per-run record in Taquba's user KV namespace.
+/// Prefix for the durable record of a run in Taquba's user KV namespace: the
+/// run record of an active run and the terminal record of a terminated one.
 pub(crate) const RUN_KV_PREFIX: &[u8] = b"workflow/runs/";
 
 /// Prefix for the durable current-step pointer: `run id -> (step, job id)` of
@@ -105,11 +116,6 @@ pub(crate) const STEP_KV_PREFIX: &[u8] = b"workflow/steps/";
 /// Prefix of the terminal markers of runs, read by the memo retention sweep:
 /// entries of a [`taquba::ExpiryIndex`] with the run id as the suffix.
 pub(crate) const TERMINAL_KV_PREFIX: &[u8] = b"workflow/terminals/";
-
-/// Prefix for the durable terminal record of a run:
-/// `workflow/outcomes/{run_id}`, written in the settlement that terminates the
-/// run and removed with the run's memo entries by the memo sweep.
-pub(crate) const OUTCOME_KV_PREFIX: &[u8] = b"workflow/outcomes/";
 
 /// Prefix for the durable member records of run groups:
 /// `workflow/groups/{group_id}/{key}`, one per member, written with the
@@ -297,10 +303,6 @@ pub(crate) fn step_kv_key(run_id: &RunId) -> Vec<u8> {
     prefixed(STEP_KV_PREFIX, run_id)
 }
 
-pub(crate) fn outcome_kv_key(run_id: &RunId) -> Vec<u8> {
-    prefixed(OUTCOME_KV_PREFIX, run_id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,7 +313,6 @@ mod tests {
             RUN_KV_PREFIX,
             STEP_KV_PREFIX,
             TERMINAL_KV_PREFIX,
-            OUTCOME_KV_PREFIX,
             GROUP_KV_PREFIX,
             GROUP_TERMINAL_KV_PREFIX,
         ] {

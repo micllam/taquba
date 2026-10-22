@@ -143,15 +143,16 @@ it.
 `submit` is idempotent on `(run_id, input)`. A re-submission of an active or
 terminated run with the same input is a no-op and the returned `SubmitOutcome`
 has `newly_submitted = false`. A re-submission with a different input is
-rejected with `Error::InputMismatch`. Duplicates are caught by a durable per-run
-record written atomically with the step-0 enqueue (via Taquba's
-`enqueue_with_effects`), so they are caught across process restarts, even after
-step 0 is claimed and its dedup key is released. The record contains a SHA-256
-of the original input for the mismatch check. A current-step pointer under
-`workflow/steps/` is written with it, rewritten in the settlement that enqueues
-each next step and identifies the queue job that `SubmitOutcome::job_id` reports
-for a duplicate. Both are removed when the run reaches a terminal state, and the
-terminal record of the run catches a re-submission from then until [Memo
+rejected with `Error::InputMismatch`. Duplicates are caught by a durable run
+record under `workflow/runs/`, written atomically with the step-0 enqueue (via
+Taquba's `enqueue_with_effects`), so they are caught across process restarts,
+even after step 0 is claimed and its dedup key is released. The record contains
+a SHA-256 of the original input for the mismatch check. A current-step pointer
+under `workflow/steps/` is written with it, rewritten in the settlement that
+enqueues each next step and identifies the queue job that
+`SubmitOutcome::job_id` reports for a duplicate. When the run reaches a terminal
+state, the pointer is removed and the terminal record of the run replaces its
+run record. The terminal record catches a re-submission until [Memo
 retention](#memo-retention) removes it.
 
 `WorkflowView::status` reads the record, the pointer and the step's queue job
@@ -165,6 +166,13 @@ prefix. A terminated run reports `RunState::Terminated` with its status, error,
 error kind, final step with its job id and time of termination, read from the
 terminal record written with the terminating settlement, which
 [Memo retention](#memo-retention) removes with the run's memo entries.
+
+`WorkflowView::runs` lists the runs in run-id order, in either direction, as a
+stream of `ListedRun`: the status of a run with its submission time and the
+submitter's headers, and `WorkflowView::run` reads the `ListedRun` of one run
+id. `RunFilter` selects the active runs, the terminated runs or both. The
+terminal record contains the submission time and the headers as well, so a
+terminated run lists until [Memo retention](#memo-retention) removes the record.
 
 `WorkflowRuntime::wait` waits until a run terminates, following its current step
 across steps, and reports a `RunEnd`: the termination from the run's terminal
@@ -530,18 +538,19 @@ let runtime = WorkflowRuntime::builder(queue, store, runner, hook)
 ```
 
 Every settlement that commits a terminal outcome (`Succeeded`, `Failed` or
-`Cancelled`) writes a terminal record under `workflow/outcomes/` in the queue's
-key-value namespace, holding the status, the error, the final step and the time
-of termination. When retention is set, the same transaction writes a terminal
-marker under `workflow/terminals/`, so the marker exists exactly when the run's
-terminal outcome committed. `WorkflowRuntime::run` sweeps the markers on startup
-and at every poll interval, removing the memo entries, the step-output replay
-entries, the terminal record and the marker of every run whose marker is at
-least a window old. A marker is an entry of a `taquba::ExpiryIndex` with the run
-id as its suffix, so the sweep reads the expired set from the start of the range
-and stops at the first unexpired marker. A pass before a marker can be expired
-does not read the index, so a run's state is removed within a poll interval of
-the end of its window.
+`Cancelled`) writes a terminal record at the key of the run record in the
+queue's key-value namespace, which contains the status, the error, the final
+step, the time of termination, the submission time and the submitter's headers.
+When retention is set, the same transaction writes a terminal marker under
+`workflow/terminals/`, so the marker exists exactly when the run's terminal
+outcome committed. `WorkflowRuntime::run` sweeps the markers on startup and at
+every poll interval, removing the memo entries, the step-output replay entries,
+the terminal record and the marker of every run whose marker is at least a
+window old. A marker is an entry of a `taquba::ExpiryIndex` with the run id as
+its suffix, so the sweep reads the expired set from the start of the range and
+stops at the first unexpired marker. A pass before a marker can be expired does
+not read the index, so a run's state is removed within a poll interval of the
+end of its window.
 
 The sweep selects runs by their terminal markers, and a run id identifies one
 run until the sweep removes its terminal record, so the entries of an in-flight
