@@ -91,8 +91,7 @@ pub enum Error {
     #[error("a signal wait requires run_at")]
     SignalWaitWithoutRunAt,
 
-    /// A queue name failed validation. Queue names are limited to
-    /// [`crate::MAX_QUEUE_NAME_LEN`] bytes by the key encoding and are rejected
+    /// A queue name is outside the form of [`crate::QueueName`]. It is rejected
     /// at the API boundary before any state is written.
     #[error("invalid queue name `{queue}`: {reason}")]
     InvalidQueueName {

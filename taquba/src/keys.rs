@@ -37,17 +37,30 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::error::{Error, FormError, Result};
+use crate::error::{Characters, Error, Form, Result};
 use crate::job::JobStatus;
 
 /// Maximum byte length of a queue name, imposed by the one-byte length field in
 /// key encodings.
 pub const MAX_QUEUE_NAME_LEN: usize = 255;
 
-/// A queue name within the bound of the key encoding: at most
-/// [`MAX_QUEUE_NAME_LEN`] bytes, the range of the one-byte length field.
-/// `QueueName` is the parameter type of every key builder, so a key over an
-/// unvalidated name does not compile, and the type of
+const QUEUE_NAME_FORM: Form = Form {
+    max: MAX_QUEUE_NAME_LEN,
+    start: Some(Characters {
+        test: |c| c.is_ascii_alphanumeric(),
+        allowed: "a letter or a digit",
+    }),
+    characters: Characters {
+        test: |c| c.is_ascii_alphanumeric() || "._-".contains(c),
+        allowed: "`[A-Za-z0-9._-]`",
+    },
+};
+
+/// A queue name: 1 to [`MAX_QUEUE_NAME_LEN`] bytes of `[A-Za-z0-9._-]`,
+/// starting with a letter or a digit. The one-byte length field of the key
+/// encoding bounds the length, and a name is a single segment of an object
+/// path. `QueueName` is the parameter type of every key builder, so a key over
+/// an unvalidated name does not compile, and the type of
 /// [`JobRecord::queue`](crate::JobRecord::queue). A name is validated by
 /// [`QueueName::new`], by [`str::parse`] and by deserialization. The type
 /// dereferences to `str` and implements `PartialEq<str>`.
@@ -56,19 +69,17 @@ pub const MAX_QUEUE_NAME_LEN: usize = 255;
 pub struct QueueName(String);
 
 impl QueueName {
-    /// Validate `name`. A name over [`MAX_QUEUE_NAME_LEN`] bytes is
+    /// Validate `name`. A name outside the form of [`QueueName`] is
     /// [`Error::InvalidQueueName`].
     pub fn new(name: impl Into<String>) -> Result<Self> {
         let name = name.into();
-        if name.len() > MAX_QUEUE_NAME_LEN {
-            return Err(Error::InvalidQueueName {
+        match QUEUE_NAME_FORM.check(&name) {
+            Ok(()) => Ok(Self(name)),
+            Err(reason) => Err(Error::InvalidQueueName {
                 queue: name,
-                reason: FormError::TooLong {
-                    max: MAX_QUEUE_NAME_LEN,
-                },
-            });
+                reason,
+            }),
         }
-        Ok(Self(name))
     }
 
     /// The name as a string slice.
@@ -446,17 +457,37 @@ mod tests {
     }
 
     #[test]
-    fn queue_name_is_bounded_by_the_length_field() {
+    fn queue_name_is_a_bounded_path_segment() {
         let longest = "q".repeat(MAX_QUEUE_NAME_LEN);
         assert_eq!(QueueName::new(&longest).unwrap(), longest.as_str());
+        assert_eq!(QueueName::new("Q.1_b-c").unwrap(), "Q.1_b-c");
         let over = "q".repeat(MAX_QUEUE_NAME_LEN + 1);
-        assert!(matches!(
-            QueueName::new(&over),
-            Err(Error::InvalidQueueName {
-                reason: FormError::TooLong { max: 255 },
-                ..
-            })
-        ));
+        let start = |character| FormError::InvalidStart {
+            character,
+            allowed: "a letter or a digit",
+        };
+        let contains = |character| FormError::InvalidCharacter {
+            character,
+            allowed: "`[A-Za-z0-9._-]`",
+        };
+        for (invalid, rule) in [
+            ("", FormError::Empty),
+            (over.as_str(), FormError::TooLong { max: 255 }),
+            (".", start('.')),
+            ("..", start('.')),
+            ("_q", start('_')),
+            ("é", start('é')),
+            ("a/b", contains('/')),
+            ("a b", contains(' ')),
+        ] {
+            assert!(
+                matches!(
+                    QueueName::new(invalid),
+                    Err(Error::InvalidQueueName { reason, .. }) if reason == rule
+                ),
+                "{invalid:?}"
+            );
+        }
         assert!(over.parse::<QueueName>().is_err());
         let stored = rmp_serde::to_vec_named(&over).unwrap();
         assert!(rmp_serde::from_slice::<QueueName>(&stored).is_err());

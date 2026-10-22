@@ -39,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Error::InvalidQueueName` and `Error::InvalidId` give their reason as a
   `FormError`, which identifies the broken rule and the character at fault.
   Match the variants of `FormError` in place of the text of the reason.
+- `QueueName` accepts 1 to 255 bytes of `[A-Za-z0-9._-]` with a letter or a
+  digit first, so a queue name is a single segment of an object path. Drain a
+  queue whose name has another form, and rename it, before the upgrade.
 
 ## [0.15.0] - 2026-10-14
 

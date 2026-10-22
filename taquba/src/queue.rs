@@ -521,8 +521,8 @@ impl Queue {
     /// pending. Otherwise it waits in the scheduled key space until the
     /// background scheduler promotes it.
     ///
-    /// Queue names are limited to [`crate::MAX_QUEUE_NAME_LEN`] bytes, and
-    /// longer names return [`Error::InvalidQueueName`].
+    /// A queue name outside the form of [`QueueName`] returns
+    /// [`Error::InvalidQueueName`].
     #[instrument(skip(self, payload), fields(queue, job_id))]
     pub async fn enqueue_with(
         &self,

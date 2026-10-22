@@ -236,13 +236,14 @@ cursor key, queue "email"
    1  │   1  │       rest
 ```
 
-The queue name follows its length in the first, so it can contain any bytes and
-still end at a known offset. The length also separates queue names with a shared
-prefix, so `pending_prefix("a")` excludes the keys of queue `ab`. The cursor key
-is read by exact key, so it needs neither. The one-byte length bounds a name at
-255 bytes. That bound is the type `QueueName` ([keys.rs][keys]). Its constructor
-rejects a longer name, and it is the parameter type of every key builder and the
-type of `JobRecord::queue`, so no key is built over a name past the bound.
+The queue name follows its length in the first, so it ends at a known offset.
+The length also separates queue names with a shared prefix, so
+`pending_prefix("a")` excludes the keys of queue `ab`. The cursor key is read by
+exact key, so it needs neither. The one-byte length bounds a name at 255 bytes.
+That bound is the type `QueueName` ([keys.rs][keys]), which also limits a name
+to `[A-Za-z0-9._-]` with a letter or a digit first. Its constructor rejects any
+other name, and it is the parameter type of every key builder and the type of
+`JobRecord::queue`, so no key is built over a name outside the form.
 
 One consequence of putting the length first: within a key space, keys sort by
 queue-name length before name, so queue `z` sorts before queue `aa`. No scan of
