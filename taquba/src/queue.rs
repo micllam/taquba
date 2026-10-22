@@ -315,7 +315,6 @@ impl Queue {
         for queue in opts.queue_configs.keys() {
             QueueName::new(queue.as_str())?;
         }
-        let inbox_interval = opts.inbox.as_ref().map(|inbox| inbox.interval);
         let inbox = opts
             .inbox
             .map(|inbox| InboxState::new(inbox, &object_store, path))
@@ -348,7 +347,7 @@ impl Queue {
         // The first pass precedes the scheduler, so a signal that arrived
         // during downtime wakes a waiter whose timeout passed in the same
         // window before the scheduler promotes it.
-        core.inbox_pass().await?;
+        let inbox_pass = Inbox::open(core.clone()).await?;
         let reaper_task = BackgroundTask::spawn_periodic(
             &core.closed,
             opts.reaper_interval,
@@ -359,9 +358,8 @@ impl Queue {
             opts.scheduler_interval,
             Scheduler::new(core.clone()),
         );
-        let inbox_task = inbox_interval.map(|interval| {
-            BackgroundTask::spawn_periodic(&core.closed, interval, Inbox::new(core.clone()))
-        });
+        let inbox_task = inbox_pass
+            .map(|inbox| BackgroundTask::spawn_periodic(&core.closed, inbox.tick(), inbox));
 
         #[cfg(feature = "metrics")]
         let metrics_sampler = opts.metrics_sample_interval.map(|interval| {

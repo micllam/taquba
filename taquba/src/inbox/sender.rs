@@ -2,19 +2,36 @@
 //! in the inbox.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use slatedb::object_store::{ObjectStore, ObjectStoreExt, path::Path};
+use tracing::{debug, warn};
 use ulid::{Generator, Ulid};
 
 use crate::error::{Error, Result};
 use crate::inbox::entry::{InboxKind, validate_id, validate_kind};
-use crate::inbox::entry_path;
+use crate::inbox::{entry_path, touch_path};
+
+/// The writes of the touch object per send, the first and one retry. A failed
+/// touch delays the entry to the next listing of the writer, at most
+/// [`InboxOptions::interval`](crate::InboxOptions::interval) later, and the
+/// send still succeeds. The retry covers a write that a store rejects while
+/// other senders write the touch object. Each further attempt would delay the
+/// return of the send by [`TOUCH_RETRY_DELAY`] to save at most one listing
+/// interval.
+const TOUCH_ATTEMPTS: u32 = 2;
+
+/// The delay before a retry of the touch, longer than the interval at which a
+/// store throttles the writes to one object.
+const TOUCH_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// A sender of inbox entries over the object store of an inbox. It writes one
 /// object per entry at `{path}/v1/{kind}/{id}` with the JSON body of the entry
-/// and never opens the store of the queue. The writer applies the entry at its
-/// next pass, and the sender reads the outcome through
-/// [`QueueView::inbox_record`](crate::QueueView::inbox_record) of a
+/// and never opens the store of the queue. After the entry, it touches the
+/// inbox: it overwrites the touch object at `{path}/touch` with a fresh ULID,
+/// so the writer lists the inbox at its next poll of the touch object. The
+/// writer applies the entry at its next pass, and the sender reads the outcome
+/// through [`QueueView::inbox_record`](crate::QueueView::inbox_record) of a
 /// [`QueueReader`](crate::QueueReader).
 ///
 /// The writer applies the entries of a listing in id order. The ids of
@@ -55,6 +72,10 @@ impl InboxSender {
     /// [`MAX_INBOX_ID_LEN`](crate::MAX_INBOX_ID_LEN) bytes. An entry sent again
     /// with the id of an applied entry is deleted without an effect while the
     /// record of the first is retained.
+    ///
+    /// A failed touch is retried once after a second and then logged, and the
+    /// send succeeds: the writer applies the entry at its next listing of
+    /// [`InboxOptions::interval`](crate::InboxOptions::interval).
     pub async fn send_with_id<E: InboxKind>(&self, id: &str, entry: &E) -> Result<()> {
         validate_kind(E::KIND)?;
         validate_id(id)?;
@@ -64,7 +85,25 @@ impl InboxSender {
             .put(&path, body.into())
             .await
             .map_err(Error::InboxStore)?;
+        self.touch().await;
         Ok(())
+    }
+
+    /// Overwrite the touch object with a fresh ULID, in up to
+    /// [`TOUCH_ATTEMPTS`] writes [`TOUCH_RETRY_DELAY`] apart.
+    async fn touch(&self) {
+        let path = Path::from(touch_path(&self.prefix));
+        for attempt in 1..=TOUCH_ATTEMPTS {
+            let body = Ulid::new().to_string().into_bytes();
+            match self.store.put(&path, body.into()).await {
+                Ok(_) => return,
+                Err(err) if attempt < TOUCH_ATTEMPTS => {
+                    debug!(%err, "inbox touch failed; retrying");
+                    tokio::time::sleep(TOUCH_RETRY_DELAY).await;
+                }
+                Err(err) => warn!(%err, "inbox touch failed"),
+            }
+        }
     }
 
     /// An id that sorts after every id this sender generated.

@@ -20,7 +20,13 @@ const LEASE: Duration = Duration::from_secs(30);
 fn inbox_opts(clock: &MockClock) -> OpenOptions {
     OpenOptions {
         clock: Arc::new(clock.clone()),
-        inbox: Some(InboxOptions::default().queue("work").queue("waits")),
+        // A test runs its passes through `apply_inbox_now`.
+        inbox: Some(
+            InboxOptions::default()
+                .queue("work")
+                .queue("waits")
+                .touch_poll_interval(None),
+        ),
         ..no_backoff_opts()
     }
 }
@@ -767,4 +773,94 @@ async fn an_expired_record_is_swept_and_its_id_applies_again() {
     q.apply_inbox_now().await.unwrap();
     assert_eq!(q.view().stats("work").await.unwrap().pending, 2);
     q.close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_entry_applies_after_a_touch_and_without_one_at_the_listing_interval() {
+    let store = make_store();
+    let clock = MockClock::new(INITIAL);
+    let opts = OpenOptions {
+        inbox: Some(InboxOptions::default().queue("work")),
+        ..inbox_opts(&clock)
+    };
+    let q = Queue::open_with_options(store.clone(), "test", opts)
+        .await
+        .unwrap();
+    let applied = |id: &'static str| {
+        let view = q.view();
+        async move {
+            view.inbox_record::<EnqueueEntry>(id)
+                .await
+                .unwrap()
+                .is_some()
+        }
+    };
+
+    sender(&store)
+        .send_with_id("touched", &EnqueueEntry::new("work", b"x"))
+        .await
+        .unwrap();
+    tokio::time::sleep(DEFAULT_INBOX_TOUCH_POLL_INTERVAL * 2).await;
+    assert!(applied("touched").await);
+
+    let body = serde_json::to_vec(&EnqueueEntry::new("work", b"y")).unwrap();
+    put_raw(&store, "enqueue", "quiet", &body).await;
+    tokio::time::sleep(DEFAULT_INBOX_TOUCH_POLL_INTERVAL * 2).await;
+    assert!(!applied("quiet").await);
+    tokio::time::sleep(DEFAULT_INBOX_INTERVAL).await;
+    assert!(applied("quiet").await);
+    q.close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pass_that_fails_at_the_store_runs_again_at_the_next_poll() {
+    let store = make_store();
+    let faults = FaultStore::wrap();
+    let inbox_store: Arc<dyn ObjectStore> = faults.clone();
+    let clock = MockClock::new(INITIAL);
+    let opts = OpenOptions {
+        inbox: Some(
+            InboxOptions::default()
+                .queue("work")
+                .object_store(inbox_store.clone()),
+        ),
+        ..inbox_opts(&clock)
+    };
+    let q = Queue::open_with_options(store, "test", opts).await.unwrap();
+
+    // The pass after the touch applies the entry and fails at its delete.
+    faults.fail_deletes(true);
+    sender(&inbox_store)
+        .send_with_id("a", &EnqueueEntry::new("work", b"x"))
+        .await
+        .unwrap();
+    tokio::time::sleep(DEFAULT_INBOX_TOUCH_POLL_INTERVAL * 2).await;
+    assert!(
+        q.view()
+            .inbox_record::<EnqueueEntry>("a")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(object_count(&inbox_store, "test-inbox/v1/enqueue").await, 1);
+
+    faults.fail_deletes(false);
+    tokio::time::sleep(DEFAULT_INBOX_TOUCH_POLL_INTERVAL * 2).await;
+    assert_eq!(object_count(&inbox_store, "test-inbox/v1/enqueue").await, 0);
+    q.close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_touch_leaves_the_send_successful() {
+    let faults = FaultStore::wrap();
+    let store: Arc<dyn ObjectStore> = faults.clone();
+    // The entry's put succeeds, and both puts of the touch object fail.
+    faults.fail_puts_after(1);
+    sender(&store)
+        .send(&EnqueueEntry::new("work", b"x"))
+        .await
+        .unwrap();
+    assert_eq!(object_count(&store, "test-inbox/v1/enqueue").await, 1);
+    let touch = Path::from(touch_path("test-inbox"));
+    assert!(store.head(&touch).await.is_err());
 }

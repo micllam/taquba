@@ -28,8 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an inbox opened without `InboxOptions::path`. A core kind records the
   `EnqueueResult`, `CancelOutcome` or `SignalOutcome` of its operation, which
   implement `Serialize` and `Deserialize`. The pass rejects a body that does not
-  decode as its kind. The key layout gains the `InboxRecord` and `InboxExpiry`
-  spaces, and the crate depends on serde_json and base64. See ADR-0005.
+  decode as its kind. A sender overwrites a touch object after each entry, and
+  the writer lists the inbox when a poll at `InboxOptions::touch_poll_interval`
+  finds a change, and once per `InboxOptions::interval`. The key layout gains
+  the `InboxRecord` and `InboxExpiry` spaces, and the crate depends on
+  serde_json and base64. See ADR-0005.
 
 ### Changed
 

@@ -370,9 +370,9 @@
 //! path with the inbox prefix, which is outside the store. The writer applies
 //! each entry in one transaction of the store that also records the entry.
 //! [`OpenOptions::inbox`] opens the queue with an inbox, at `"{path}-inbox"` by
-//! default, and the writer lists it at open and once per
-//! [`InboxOptions::interval`]. An [`InboxSender`] writes an entry at
-//! `{path}/v1/{kind}/{id}`: [`EnqueueEntry`] enqueues a job on a queue of
+//! default, and the writer lists it at open, after a change of its touch object
+//! and once per [`InboxOptions::interval`]. An [`InboxSender`] writes an entry
+//! at `{path}/v1/{kind}/{id}`: [`EnqueueEntry`] enqueues a job on a queue of
 //! [`InboxOptions::queues`], [`CancelEntry`] cancels a job and [`SignalEntry`]
 //! delivers a signal. A layer registers a kind of its own with
 //! [`Queue::register_inbox_handler`], or one handler per instance of the layer
@@ -410,7 +410,9 @@
 //!   from another process, only when [`OpenOptions::liveness_heartbeat`]
 //!   is set.
 //! - **Inbox** - applies the entries sent from another process, only when
-//!   [`OpenOptions::inbox`] is set (interval: [`InboxOptions::interval`]).
+//!   [`OpenOptions::inbox`] is set (interval:
+//!   [`InboxOptions::touch_poll_interval`], or [`InboxOptions::interval`]
+//!   without a touch poll).
 //! - **Close watcher** - once the store closes, fires the cancellation token
 //!   of every claim and fails later lease renewals.
 //!
@@ -526,8 +528,8 @@ pub use inbox::entry::{
 pub use inbox::record::{Applied, InboxOutcome, InboxRecord, InboxRecordHandle};
 pub use inbox::sender::InboxSender;
 pub use inbox::{
-    DEFAULT_INBOX_INTERVAL, DEFAULT_INBOX_RECORD_RETENTION, InboxHandler, InboxHandlerError,
-    InboxOptions, InboxRegistration, default_inbox_path,
+    DEFAULT_INBOX_INTERVAL, DEFAULT_INBOX_RECORD_RETENTION, DEFAULT_INBOX_TOUCH_POLL_INTERVAL,
+    InboxHandler, InboxHandlerError, InboxOptions, InboxRegistration, default_inbox_path,
 };
 pub use job::{Claim, JobRecord, JobStatus};
 pub use keys::{MAX_QUEUE_NAME_LEN, QueueName};

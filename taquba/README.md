@@ -474,10 +474,11 @@ Another process can send a request as an entry: a JSON object at a versioned
 path with the inbox prefix, which is outside the store. The writer applies each
 entry in one transaction of the store that also records the entry.
 `OpenOptions::inbox` opens the queue with an inbox, at `"{path}-inbox"` by
-default, and the writer lists it at open and once per `InboxOptions::interval`.
-An `InboxSender` writes an entry at `{path}/v1/{kind}/{id}`: `EnqueueEntry`
-enqueues a job on a queue of `InboxOptions::queues`, `CancelEntry` cancels a job
-and `SignalEntry` delivers a signal. A layer registers a kind of its own with
+default, and the writer lists it at open, after a change of its touch object and
+once per `InboxOptions::interval`. An `InboxSender` writes an entry at
+`{path}/v1/{kind}/{id}`: `EnqueueEntry` enqueues a job on a queue of
+`InboxOptions::queues`, `CancelEntry` cancels a job and `SignalEntry` delivers a
+signal. A layer registers a kind of its own with
 `Queue::register_inbox_handler`, or one handler per instance of the layer with
 `Queue::register_inbox_handler_for`, selected by a field of the body as the core
 kinds select a queue.

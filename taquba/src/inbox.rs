@@ -14,9 +14,15 @@
 //! read. An entry of a kind registered by a field, with a value without a
 //! handler, stays as well and costs one GET per pass.
 //!
-//! The writer runs one pass at open before the scheduler starts, and one per
-//! [`InboxOptions::interval`] after it. An error ends a pass at its entry, and
-//! the next pass starts again at the first entry without a record.
+//! The writer runs one pass at open before the scheduler starts. After it, the
+//! writer polls the touch object at `{path}/touch` once per
+//! [`InboxOptions::touch_poll_interval`], and runs a pass when the touch object
+//! changed or once per [`InboxOptions::interval`]. A sender touches the inbox
+//! after each entry: it overwrites the touch object. The writer polls the touch
+//! object before the listing, so an entry written during a listing changes the
+//! touch object for the next poll. An error ends a pass at its entry, and the
+//! next pass starts again at the first entry without a record. After a pass
+//! that ends at an error of a store, the writer runs a pass at the next poll.
 
 pub(crate) mod entry;
 pub(crate) mod kinds;
@@ -30,7 +36,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use futures_util::TryStreamExt;
-use slatedb::object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, path::Path};
+use slatedb::object_store::{
+    Error as ObjectStoreError, ObjectMeta, ObjectStore, ObjectStoreExt, path::Path,
+};
 use tracing::{debug, warn};
 
 use crate::background::Periodic;
@@ -44,7 +52,10 @@ use crate::queue_core::QueueCore;
 use crate::time_bound::TimeBound;
 
 /// Default value of [`InboxOptions::interval`].
-pub const DEFAULT_INBOX_INTERVAL: Duration = Duration::from_secs(10);
+pub const DEFAULT_INBOX_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Default value of [`InboxOptions::touch_poll_interval`].
+pub const DEFAULT_INBOX_TOUCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Default value of [`InboxOptions::record_retention`].
 pub const DEFAULT_INBOX_RECORD_RETENTION: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -60,9 +71,17 @@ pub fn default_inbox_path(path: &str) -> String {
 
 /// Configuration of the inbox, set on [`OpenOptions::inbox`](crate::OpenOptions::inbox).
 pub struct InboxOptions {
-    /// How often the writer lists the inbox. Defaults to
-    /// [`DEFAULT_INBOX_INTERVAL`]. Each pass costs one LIST request.
+    /// How often the writer lists the inbox without a touch. With the touch
+    /// poll, the writer rounds the interval up to a whole number of polls, at
+    /// least one. Each pass sends one LIST request, 1,440 a day at the default.
+    /// Defaults to [`DEFAULT_INBOX_INTERVAL`].
     pub interval: Duration,
+    /// How often the writer polls the touch object with a HEAD request, and
+    /// lists the inbox when the touch object changed. Defaults to
+    /// [`DEFAULT_INBOX_TOUCH_POLL_INTERVAL`], 43,200 HEAD requests a day.
+    /// `None` turns off the poll, and the writer lists the inbox at
+    /// [`Self::interval`] alone.
+    pub touch_poll_interval: Option<Duration>,
     /// Object store of the inbox. `None` (the default) uses the object store
     /// the queue is opened on.
     pub object_store: Option<Arc<dyn ObjectStore>>,
@@ -85,6 +104,13 @@ impl InboxOptions {
     #[must_use]
     pub fn interval(mut self, interval: Duration) -> Self {
         self.interval = interval;
+        self
+    }
+
+    /// Set [`Self::touch_poll_interval`].
+    #[must_use]
+    pub fn touch_poll_interval(mut self, interval: impl Into<Option<Duration>>) -> Self {
+        self.touch_poll_interval = interval.into();
         self
     }
 
@@ -128,6 +154,7 @@ impl Default for InboxOptions {
     fn default() -> Self {
         Self {
             interval: DEFAULT_INBOX_INTERVAL,
+            touch_poll_interval: Some(DEFAULT_INBOX_TOUCH_POLL_INTERVAL),
             object_store: None,
             path: None,
             queues: Vec::new(),
@@ -260,6 +287,8 @@ enum Lookup {
 pub(crate) struct InboxState {
     store: Arc<dyn ObjectStore>,
     prefix: String,
+    interval: Duration,
+    touch_poll_interval: Option<Duration>,
     queues: HashSet<String>,
     pub(crate) retention: Duration,
     handlers: RwLock<BTreeMap<String, Registered>>,
@@ -281,6 +310,8 @@ impl InboxState {
         Ok(Self {
             store: options.object_store.unwrap_or_else(|| store.clone()),
             prefix: options.path.unwrap_or_else(|| default_inbox_path(path)),
+            interval: options.interval,
+            touch_poll_interval: options.touch_poll_interval,
             queues: options.queues.into_iter().collect(),
             retention: options.record_retention,
             handlers: RwLock::new(BTreeMap::new()),
@@ -385,6 +416,16 @@ impl InboxState {
         Ok(result.bytes().await.map_err(Error::InboxStore)?.to_vec())
     }
 
+    /// The metadata of the touch object, or `None` before the first touch.
+    async fn touch_meta(&self) -> Result<Option<ObjectMeta>> {
+        let path = Path::from(touch_path(&self.prefix));
+        match self.store.head(&path).await {
+            Ok(meta) => Ok(Some(meta)),
+            Err(ObjectStoreError::NotFound { .. }) => Ok(None),
+            Err(err) => Err(Error::InboxStore(err)),
+        }
+    }
+
     /// Delete the object at `location`. An absent object counts as deleted.
     async fn delete(&self, location: &Path) -> Result<()> {
         match self.store.delete(location).await {
@@ -406,6 +447,11 @@ pub(crate) fn entry_path(prefix: &str, kind: &str, id: &str) -> String {
     format!("{prefix}/v1/{kind}/{id}")
 }
 
+/// The path of the touch object of the inbox at `prefix`.
+pub(crate) fn touch_path(prefix: &str) -> String {
+    format!("{prefix}/touch")
+}
+
 /// The kind and the id of an entry path relative to the version prefix, or
 /// `None` for a path outside the layout.
 fn parse_entry_path(relative: &str) -> Option<(String, String)> {
@@ -416,21 +462,96 @@ fn parse_entry_path(relative: &str) -> Option<(String, String)> {
     Some((kind.to_string(), id.to_string()))
 }
 
+/// The pass task of the inbox. A tick sends a HEAD for the touch object, and a
+/// pass runs when the touch object changed or when the last pass of the task is
+/// older than [`InboxOptions::interval`].
 pub(crate) struct Inbox {
     core: Arc<QueueCore>,
+    tick: Duration,
+    ticks_per_pass: u32,
+    schedule: tokio::sync::Mutex<Schedule>,
+}
+
+struct Schedule {
+    /// The touch object at the HEAD before the last pass.
+    touched: Option<ObjectMeta>,
+    ticks: u32,
 }
 
 impl Inbox {
-    pub(crate) fn new(core: Arc<QueueCore>) -> Self {
-        Self { core }
+    /// The pass task of `core` after its first pass, or `None` for a queue
+    /// without an inbox. A failed first pass fails the open.
+    pub(crate) async fn open(core: Arc<QueueCore>) -> Result<Option<Self>> {
+        let Some(inbox) = &core.inbox else {
+            return Ok(None);
+        };
+        let (tick, ticks_per_pass) = match inbox.touch_poll_interval {
+            Some(tick) => {
+                let ticks = inbox.interval.as_nanos().div_ceil(tick.as_nanos().max(1));
+                (tick, u32::try_from(ticks).unwrap_or(u32::MAX).max(1))
+            }
+            None => (inbox.interval, 1),
+        };
+        let touched = match inbox.touch_poll_interval {
+            Some(_) => seen_touch(inbox).await,
+            None => None,
+        };
+        core.inbox_pass().await?;
+        Ok(Some(Self {
+            core: core.clone(),
+            tick,
+            ticks_per_pass,
+            schedule: tokio::sync::Mutex::new(Schedule { touched, ticks: 0 }),
+        }))
     }
+
+    /// The interval of the task's ticks.
+    pub(crate) fn tick(&self) -> Duration {
+        self.tick
+    }
+}
+
+/// The touch object of `inbox`, or `None` when the HEAD fails.
+async fn seen_touch(inbox: &InboxState) -> Option<ObjectMeta> {
+    inbox.touch_meta().await.unwrap_or_else(|err| {
+        warn!(%err, "inbox touch poll failed");
+        None
+    })
 }
 
 impl Periodic for Inbox {
     const NAME: &'static str = "inbox";
 
     async fn step(&self) -> Result<()> {
-        self.core.inbox_pass().await
+        let Some(inbox) = &self.core.inbox else {
+            return Ok(());
+        };
+        let mut schedule = self.schedule.lock().await;
+        schedule.ticks += 1;
+        let mut due = schedule.ticks >= self.ticks_per_pass;
+        if inbox.touch_poll_interval.is_some() {
+            match inbox.touch_meta().await {
+                Ok(touched) if touched != schedule.touched => {
+                    schedule.touched = touched;
+                    due = true;
+                }
+                Ok(_) => {}
+                Err(err) => warn!(%err, "inbox touch poll failed"),
+            }
+        }
+        if !due {
+            return Ok(());
+        }
+        schedule.ticks = 0;
+        let passed = self.core.inbox_pass().await;
+        // A pass that ended at an error of the store runs again at the next
+        // tick. A handler error waits for the next touch or interval.
+        if let Err(err) = &passed
+            && !matches!(err, Error::InboxHandler { .. })
+        {
+            schedule.ticks = self.ticks_per_pass;
+        }
+        passed
     }
 }
 

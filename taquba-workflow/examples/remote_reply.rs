@@ -42,7 +42,7 @@ const QUEUE_PATH: &str = "workflow";
 const REQUEST_QUEUE: &str = "remote-requests";
 const RUN_ID: &str = "translate-invoice-118";
 const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
-const INBOX_INTERVAL: Duration = Duration::from_millis(500);
+const TOUCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const REMOTE_WORK: Duration = Duration::from_secs(2);
 
 /// A request for the remote worker: the work and the id of the waiting step.
@@ -173,7 +173,7 @@ impl TerminalHook for ShutdownOnTermination {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let opts = OpenOptions {
-        inbox: Some(InboxOptions::default().interval(INBOX_INTERVAL)),
+        inbox: Some(InboxOptions::default().touch_poll_interval(TOUCH_POLL_INTERVAL)),
         ..OpenOptions::default()
     };
     let queue = Arc::new(Queue::open_with_options(store.clone(), QUEUE_PATH, opts).await?);
