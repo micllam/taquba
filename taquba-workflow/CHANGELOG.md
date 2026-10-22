@@ -35,6 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   headers and replaces the run record at its key, so a store written with 0.14.0
   needs a drain: let the runs terminate and memo retention remove their terminal
   records before the upgrade.
+- The run KV space: `EffectsHandle::put_run_kv` and
+  `EffectsHandle::delete_run_kv` stage an entry of the delivery's run,
+  `KvReadHandle::get_run_kv` reads it during a step, and `WorkflowView::run_kv`
+  and `WorkflowView::run_kv_entries` read the entries of a run from another
+  process. The memo sweep and the group sweep delete the entries of a run with
+  the run.
 
 ### Changed
 
@@ -79,6 +85,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under a new run id, with step outputs and memo entries apart from those of the
   earlier run. A caller that keeps a member's run id reads the id of a later run
   from `MemberResult::run_id`.
+- The memo sweep keeps the state of a member run submitted again after
+  `RunGroup::forget`. 0.14 removed the memo entries of the later run a window
+  after the marker of the earlier one, so its steps ran their work again.
 
 ## [0.14.0] - 2026-10-14
 

@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use bytes::Bytes;
 use futures_util::{Stream, TryStreamExt};
 use taquba::{JobRecord, JobStatus, KvOrder, QueueView};
 
@@ -13,7 +14,8 @@ use crate::durable::{
 use crate::error::{Error, Result};
 use crate::group::{self, GroupStatus};
 use crate::keys::{
-    RUN_KV_PREFIX, RunId, STEP_KV_PREFIX, run_kv_key, step_kv_key, submitter_headers,
+    RUN_KV_ENTRY_PREFIX, RUN_KV_PREFIX, RunId, STEP_KV_PREFIX, run_kv_entries_range,
+    run_kv_entry_key, run_kv_key, step_kv_key, submitter_headers,
 };
 use crate::memo::{MemoStore, RUN_RESULT_MEMO_KEY};
 use crate::runtime::{RunEnd, RunState, RunStatus, RunTermination};
@@ -186,6 +188,29 @@ impl WorkflowView {
             termination,
             outcome,
         }))
+    }
+
+    /// The value of the run KV entry `key` of `run_id`, which a step staged
+    /// through [`EffectsHandle::put_run_kv`](crate::EffectsHandle::put_run_kv),
+    /// `None` when no value exists.
+    pub async fn run_kv(&self, run_id: &RunId, key: &[u8]) -> Result<Option<Bytes>> {
+        Ok(self.queue.kv_get(&run_kv_entry_key(run_id, key)).await?)
+    }
+
+    /// The run KV entries of `run_id` in the order `order` of their keys, with
+    /// `page_size` entries in a page. A key is the one that the step staged.
+    pub fn run_kv_entries(
+        &self,
+        run_id: &RunId,
+        order: KvOrder,
+        page_size: usize,
+    ) -> impl Stream<Item = Result<(Vec<u8>, Bytes)>> + Send + '_ {
+        let range = run_kv_entries_range(run_id);
+        let len = range.start.len();
+        self.queue
+            .kv_entries(RUN_KV_ENTRY_PREFIX, range, order, page_size)
+            .map_ok(move |(mut key, value)| (key.split_off(len), value))
+            .map_err(Error::from)
     }
 
     /// The status of the run group `group_id`: the members of its manifest,

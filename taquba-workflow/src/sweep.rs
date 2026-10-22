@@ -4,9 +4,11 @@
 //! state ([`Clearable`]). A marker is an entry of the index with the id of the
 //! entity as its suffix and an empty value. A pass removes each expired
 //! entity's object-store state, then its KV state and its marker in one
-//! transaction. A marker that its entity superseded is removed alone. The
-//! removal of a run's state is unguarded by design: every consumer of a swept
-//! entry tolerates its absence and re-executes the step.
+//! transaction. A marker that its entity superseded is removed alone. A store
+//! removes an entity's state while its records are those of the marker, read
+//! before the transaction. The removal itself is unguarded: every consumer of a
+//! swept memo or step-output entry tolerates its absence and re-executes the
+//! step.
 
 use std::future::Future;
 use std::pin::Pin;

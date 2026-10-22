@@ -21,6 +21,7 @@ use crate::error::{Error, Result};
 use crate::keys::{
     HEADER_GROUP, HEADER_GROUP_KEY, RunId, group_member_kv_key, group_members_kv_prefix, run_kv_key,
 };
+use crate::kv::run_kv_entry_keys;
 use crate::memo::MemoStore;
 use crate::runtime::{CancelRunOutcome, RunOptions, RunSpec, RunTermination, RuntimeCore};
 use crate::sweep::{Clearable, Cleared};
@@ -310,10 +311,11 @@ impl GroupStore {
         })
     }
 
-    /// Remove the state that `removal` read: the member records and the
-    /// terminal record of every run of every member of the manifest, then the
-    /// memo entries of those runs and the manifest. A group without a manifest
-    /// has its member records removed and nothing else.
+    /// Remove the state that `removal` read: the member records, and the
+    /// terminal record and the run KV entries of every run of every member of
+    /// the manifest, then the memo entries of those runs and the manifest. A
+    /// group without a manifest has its member records removed and nothing
+    /// else.
     ///
     /// A transaction removes the KV state of [`MEMBER_PAGE_SIZE`] members and
     /// compares the record of each with the state that `removal` read. Returns
@@ -325,16 +327,19 @@ impl GroupStore {
                 .iter()
                 .map(|(key, member)| (key.as_slice(), member.stored.as_deref()))
                 .collect();
-            let outcomes = page
-                .iter()
-                .flat_map(|(_, member)| member.run_ids(&removal.group_id))
-                .map(|run_id| run_kv_key(&run_id));
-            let records = page
+            let mut deletes: Vec<_> = page
                 .iter()
                 .filter(|(_, member)| member.stored.is_some())
-                .map(|(key, _)| (*key).clone());
-            let effects =
-                SettlementEffects::default().kv_deletes(records.chain(outcomes).collect());
+                .map(|(key, _)| (*key).clone())
+                .collect();
+            for run_id in page
+                .iter()
+                .flat_map(|(_, member)| member.run_ids(&removal.group_id))
+            {
+                deletes.extend(run_kv_entry_keys(self.queue.view(), &run_id).await?);
+                deletes.push(run_kv_key(&run_id));
+            }
+            let effects = SettlementEffects::default().kv_deletes(deletes);
             if self
                 .queue
                 .kv_compare_commit(&compares, effects)
@@ -713,6 +718,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::keys::run_kv_entry_key;
     use crate::runner::{Step, StepError, StepOutcome, StepRunner};
     use crate::runtime::{RunSpec, StepRef, WorkflowRuntime};
     use crate::terminal::{CancelOrigin, NoopTerminalHook};
@@ -1076,6 +1082,12 @@ mod tests {
                 .unwrap();
             assert_eq!(group.cancel(None).await.unwrap(), 1);
             memos.new_run_memo(run_id).put("k", b"v").await.unwrap();
+            queue
+                .commit_effects(
+                    SettlementEffects::default().kv_put(run_kv_entry_key(run_id, b"k"), "v"),
+                )
+                .await
+                .unwrap();
             let results: Vec<MemberResult> =
                 group.results().await.unwrap().try_collect().await.unwrap();
             assert_eq!(results[0].run_id, *run_id);
@@ -1121,9 +1133,45 @@ mod tests {
             );
             assert!(memos.new_run_memo(run_id).get("k").await.unwrap().is_none());
             assert!(
+                queue
+                    .view()
+                    .kv_get(&run_kv_entry_key(run_id, b"k"))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
                 runtime.status(run_id).await.unwrap().is_none(),
                 "nothing of the member remains"
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_memo_sweep_keeps_a_member_run_submitted_again_after_forget() {
+        let (queue, store, clock) = open_queue_at(10_000).await;
+        let runtime = WorkflowRuntime::builder(queue, store, TwoSteps, NoopTerminalHook)
+            .memo_retention(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        let group = runtime.group(rid("g"));
+        let run_id = member_run_id(&rid("g"), "a", 0);
+        group
+            .submit(vec![member("a")], &RunOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(group.cancel(None).await.unwrap(), 1);
+        // The removal leaves the marker of the cancelled run, and the second
+        // submission reuses its run id.
+        group.forget().await.unwrap();
+        clock.advance(Duration::from_secs(1));
+        group
+            .submit(vec![member("a")], &RunOptions::default())
+            .await
+            .unwrap();
+
+        clock.advance(Duration::from_secs(60));
+        assert_eq!(runtime.inner.core.sweep_once().await.unwrap(), 1);
+        assert!(runtime.view().run_record(&run_id).await.unwrap().is_some());
     }
 }

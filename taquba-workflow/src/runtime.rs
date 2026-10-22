@@ -27,6 +27,7 @@ use crate::keys::{
     TERMINAL_KV_PREFIX, check_effects, check_headers, hash_input, next_step_job_id, run_kv_key,
     step_kv_key,
 };
+use crate::kv::run_kv_entry_keys;
 use crate::memo::{MemoStore, RUN_RESULT_MEMO_KEY};
 use crate::runner::{StepErrorKind, StepOutcome, StepRunner, Trigger};
 use crate::sweep::{Clearable, Cleared, Sweep, run_periodically};
@@ -460,12 +461,15 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
             .unwrap_or_else(|| format!("{}-memo", self.queue_name));
         let memo_store = MemoStore::new(self.object_store, memo_prefix);
         let group_store = GroupStore::new(memo_store.clone(), self.queue.clone());
+        let view = WorkflowView::new(self.queue.view().clone(), memo_store.clone());
         let memo_sweep = self.memo_retention.map(|retention| {
             Arc::new(Sweep::new(
                 TERMINAL_KV_PREFIX,
                 retention,
                 RunStore {
                     memo_store: memo_store.clone(),
+                    queue: self.queue.clone(),
+                    view: view.clone(),
                 },
             ))
         });
@@ -476,7 +480,6 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
                 group_store.clone(),
             ))
         });
-        let view = WorkflowView::new(self.queue.view().clone(), memo_store.clone());
         let core = RuntimeCore {
             queue: self.queue,
             view,
@@ -516,18 +519,33 @@ impl<R, H> WorkflowRuntime<R, H> {
 }
 
 /// The retained state of a terminated run: its memo and step-output entries in
-/// the object store and its terminal record in the queue's KV namespace,
-/// removed together by the memo sweep.
+/// the object store, and its terminal record and run KV entries in the queue's
+/// KV namespace, removed together by the memo sweep.
 struct RunStore {
     memo_store: MemoStore,
+    queue: Arc<Queue>,
+    view: WorkflowView,
 }
 
 impl Clearable for RunStore {
     type Error = Error;
 
-    async fn clear(&self, run_id: &RunId, _marked_at_ms: u64) -> Result<Cleared> {
+    /// A run id without the terminal record of the marker belongs to a later
+    /// submission, after [`RunGroup::forget`] removed the record of the run
+    /// that the marker names.
+    async fn clear(&self, run_id: &RunId, marked_at_ms: u64) -> Result<Cleared> {
+        let marked = self
+            .view
+            .terminal_record(run_id)
+            .await?
+            .is_some_and(|termination| termination.terminated_at_ms == marked_at_ms);
+        if !marked {
+            return Ok(Cleared::Superseded);
+        }
+        let mut keys = run_kv_entry_keys(self.queue.view(), run_id).await?;
         self.memo_store.clear_memos_for_run(run_id).await?;
-        Ok(Cleared::Removed(vec![run_kv_key(run_id)]))
+        keys.push(run_kv_key(run_id));
+        Ok(Cleared::Removed(keys))
     }
 }
 
@@ -1461,6 +1479,7 @@ mod tests {
     use crate::group::GroupMember;
     use crate::keys::TERMINAL_KV_PREFIX;
     use crate::keys::group_member_kv_key;
+    use crate::keys::run_kv_entry_key;
     use crate::runner::{Step, StepError};
     use crate::terminal::NoopTerminalHook;
     use crate::terminal::TerminalStatus;
@@ -4097,8 +4116,26 @@ mod tests {
         for (run_id, at_ms) in [("old", 1_000u64), ("young", 9_500u64)] {
             let run_id = rid(run_id);
             memos.new_memo(&run_id, 0).put("k", b"v").await.unwrap();
+            let termination = DurableTermination {
+                status: TerminalStatus::Succeeded.into(),
+                error: None,
+                cancelled_by: None,
+                error_kind: None,
+                final_step: DurableStepRef {
+                    step_number: 0,
+                    job_id: "job".to_string(),
+                },
+                terminated_at_ms: at_ms,
+                input_hash: [0; 32],
+                submitted_at_ms: at_ms,
+                headers: HashMap::new(),
+            };
+            let record = SettlementEffects::default().kv_put(
+                run_kv_key(&run_id),
+                durable::encode(&DurableRun::Terminated(termination)),
+            );
             queue
-                .commit_effects(sweep.mark(SettlementEffects::default(), &run_id, at_ms))
+                .commit_effects(sweep.mark(record, &run_id, at_ms))
                 .await
                 .unwrap();
         }
@@ -4164,6 +4201,59 @@ mod tests {
         clock.advance(Duration::from_secs(1));
         assert_eq!(runtime.inner.core.sweep_once().await.unwrap(), 1);
         assert!(runtime.submit(spec).await.unwrap().newly_submitted);
+    }
+
+    /// A hook that returns the next of `expiries` at each expiry.
+    #[tokio::test(start_paused = true)]
+    async fn the_memo_sweep_deletes_the_run_kv_entries_with_the_run() {
+        let (queue, store, clock) = open_queue_at(10_000).await;
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            FixedRunner::new(Ok(StepOutcome::Succeed {
+                result: b"done".to_vec(),
+            })),
+            NoopTerminalHook,
+        )
+        .memo_retention(Duration::from_secs(1))
+        .build()
+        .unwrap();
+        let handle = runtime
+            .submit(RunSpec {
+                run_id: Some(rid("once")),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // The id `once-x` begins with the swept run id, and its entry stays.
+        let entries = [
+            run_kv_entry_key(&rid("once"), b"a"),
+            run_kv_entry_key(&rid("once"), b"b"),
+            run_kv_entry_key(&rid("once-x"), b"a"),
+        ];
+        let mut effects = SettlementEffects::default();
+        for key in &entries {
+            effects = effects.kv_put(key.clone(), "v");
+        }
+        queue.commit_effects(effects).await.unwrap();
+        let claim = queue
+            .claim("workflow-steps", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let effects = runtime
+            .inner
+            .process_step(&claim, &LeaseHandle::detached())
+            .await
+            .unwrap();
+        queue.ack_with(&claim, effects).await.unwrap();
+        clock.advance(Duration::from_secs(1));
+
+        assert_eq!(runtime.inner.core.sweep_once().await.unwrap(), 1);
+        assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
+        for (key, kept) in entries.iter().zip([false, false, true]) {
+            assert_eq!(queue.view().kv_get(key).await.unwrap().is_some(), kept);
+        }
     }
 
     /// Yield up to `iters` times waiting for `cond` to become true. Used in
@@ -4450,6 +4540,63 @@ mod tests {
         assert_eq!(outcome.status, TerminalStatus::Succeeded);
         assert_eq!(outcome.result.as_deref(), Some(b"v".as_slice()));
         assert_eq!(*read_under_staging.lock().unwrap(), Some(None));
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_run_kv_entry_commits_with_its_step_and_reads_within_its_run() {
+        struct RunKvRunner;
+        impl StepRunner for RunKvRunner {
+            async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
+                let permanent = |e: Error| StepError::permanent(e.to_string());
+                if step.step_number == 0 {
+                    for key in ["b", "a", "c"] {
+                        step.effects.put_run_kv(key, key).map_err(permanent)?;
+                    }
+                    return Ok(StepOutcome::continue_now(Vec::new()));
+                }
+                step.effects.delete_run_kv("c").map_err(permanent)?;
+                let value = step.kv.get_run_kv(b"a").await.map_err(permanent)?;
+                Ok(StepOutcome::Succeed {
+                    result: value.unwrap_or_default().to_vec(),
+                })
+            }
+        }
+
+        let (queue, store) = open_queue().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = WorkflowRuntime::builder(queue, store, RunKvRunner, ChannelHook { tx })
+            .build()
+            .unwrap();
+        let shutdown = spawn_runtime(runtime.clone());
+
+        let handle = runtime.submit(RunSpec::default()).await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        assert_eq!(outcome.result.as_deref(), Some(b"a".as_slice()));
+        let view = runtime.view();
+        let entries: Vec<_> = view
+            .run_kv_entries(&handle.run_id, KvOrder::Descending, 1)
+            .map_ok(|(key, value)| (key, value.to_vec()))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            entries,
+            [
+                (b"b".to_vec(), b"b".to_vec()),
+                (b"a".to_vec(), b"a".to_vec())
+            ]
+        );
+        assert_eq!(
+            view.run_kv(&handle.run_id, b"a").await.unwrap().as_deref(),
+            Some(b"a".as_slice())
+        );
+        assert_eq!(view.run_kv(&rid("other"), b"a").await.unwrap(), None);
 
         let _ = shutdown.send(());
     }

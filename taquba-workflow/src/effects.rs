@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use taquba::{EnqueueEntry, EnqueueRequest, SettlementEffects};
 
 use crate::error::{Error, Result};
-use crate::keys::{check_enqueue, check_kv_key};
+use crate::keys::{RunId, check_enqueue, check_kv_key, run_kv_entry_key};
 
 /// Application KV effects and enqueues staged during a step, applied in the
 /// same transaction as the settlement that commits the step's outcome.
@@ -21,8 +21,8 @@ use crate::keys::{check_enqueue, check_kv_key};
 /// external [`WorkflowRuntime::cancel`](crate::WorkflowRuntime::cancel)
 /// overrides the runner's outcome.
 ///
-/// Each operation is validated when it is staged: keys must not start with the
-/// reserved `workflow/` prefix
+/// Each operation is validated when it is staged: keys of the caller KV
+/// namespace must not start with the reserved `workflow/` prefix
 /// ([`RESERVED_KV_PREFIX`](crate::RESERVED_KV_PREFIX)), values are capped at
 /// [`taquba::MAX_KV_VALUE_SIZE`] each (an effects set does not have an
 /// aggregate cap) and a key cannot be staged for both a write and a delete
@@ -35,6 +35,8 @@ use crate::keys::{check_enqueue, check_kv_key};
 #[derive(Debug, Clone)]
 pub struct EffectsHandle {
     inner: Arc<Mutex<EffectsState>>,
+    /// The run of the delivery, whose run KV space the handle stages into.
+    run_id: RunId,
 }
 
 #[derive(Debug, Default)]
@@ -57,6 +59,22 @@ impl EffectsState {
 
     fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         self.check_key(&key)?;
+        self.stage_write(key, value)
+    }
+
+    /// Stage a write of the run KV entry at the full key `key`.
+    fn put_run_kv(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        self.check_sealed()?;
+        self.stage_write(key, value)
+    }
+
+    /// Stage a delete of the run KV entry at the full key `key`.
+    fn delete_run_kv(&mut self, key: Vec<u8>) -> Result<()> {
+        self.check_sealed()?;
+        self.stage_delete(key)
+    }
+
+    fn stage_write(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         if value.len() > taquba::MAX_KV_VALUE_SIZE {
             return Err(Error::Queue(taquba::Error::KvValueTooLarge {
                 size: value.len(),
@@ -78,6 +96,10 @@ impl EffectsState {
 
     fn delete(&mut self, key: Vec<u8>) -> Result<()> {
         self.check_key(&key)?;
+        self.stage_delete(key)
+    }
+
+    fn stage_delete(&mut self, key: Vec<u8>) -> Result<()> {
         if self.staged.writes.contains_key(&key) {
             return Err(Error::ConflictingKvEffect(display_key(&key)));
         }
@@ -95,10 +117,15 @@ impl EffectsState {
     }
 
     fn check_key(&self, key: &[u8]) -> Result<()> {
+        self.check_sealed()?;
+        check_kv_key(key)
+    }
+
+    fn check_sealed(&self) -> Result<()> {
         if self.sealed {
             return Err(Error::EffectsSealed);
         }
-        check_kv_key(key)
+        Ok(())
     }
 }
 
@@ -127,18 +154,50 @@ impl EffectsHandle {
     /// Build a handle that is not bound to a delivery, for constructing a
     /// [`Step`](crate::Step) in tests. A detached handle accepts and validates
     /// effects like a delivery-bound one, is never sealed and its staged
-    /// effects are never applied.
+    /// effects are never applied. Its run is `detached`, the run of
+    /// [`Delivery::detached`](crate::Delivery::detached).
     pub fn detached() -> Self {
         Self {
             inner: Arc::new(Mutex::new(EffectsState::default())),
+            run_id: RunId::new("detached").expect("a literal run id"),
         }
     }
 
-    /// A handle for a delivery of the runtime with the queue `runtime_queue`.
-    pub(crate) fn for_delivery(runtime_queue: &str) -> Self {
+    /// A handle for a delivery of the run `run_id` of the runtime with the
+    /// queue `runtime_queue`.
+    pub(crate) fn for_delivery(runtime_queue: &str, run_id: &RunId) -> Self {
         Self {
             inner: Arc::new(Mutex::new(EffectsState::for_delivery(runtime_queue))),
+            run_id: run_id.clone(),
         }
+    }
+
+    /// Stage a write of `value` under `key` in the run KV space of the
+    /// delivery's run. An entry of the space belongs to its run: the memo sweep
+    /// and the group sweep delete it with the run, and
+    /// [`KvReadHandle::get_run_kv`](crate::KvReadHandle::get_run_kv) and
+    /// [`WorkflowView::run_kv`](crate::WorkflowView::run_kv) read it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Queue`] with [`taquba::Error::KvValueTooLarge`] when `value`
+    /// exceeds [`taquba::MAX_KV_VALUE_SIZE`], [`Error::ConflictingKvEffect`]
+    /// when `key` is already staged for a delete and [`Error::EffectsSealed`]
+    /// when the step returned.
+    pub fn put_run_kv(&self, key: impl AsRef<[u8]>, value: impl Into<Vec<u8>>) -> Result<()> {
+        let key = run_kv_entry_key(&self.run_id, key.as_ref());
+        self.inner.lock().unwrap().put_run_kv(key, value.into())
+    }
+
+    /// Stage a delete of `key` from the run KV space of the delivery's run.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ConflictingKvEffect`] when `key` is already staged for a write
+    /// and [`Error::EffectsSealed`] when the step returned.
+    pub fn delete_run_kv(&self, key: impl AsRef<[u8]>) -> Result<()> {
+        let key = run_kv_entry_key(&self.run_id, key.as_ref());
+        self.inner.lock().unwrap().delete_run_kv(key)
     }
 
     /// Stage a write of `value` under `key` in the caller KV namespace.
@@ -305,13 +364,20 @@ mod tests {
             handle.put("b", "v"),
             Err(Error::ConflictingKvEffect(_))
         ));
+        // A run KV key is not in the caller namespace, so the reserved prefix
+        // is a key like any other.
+        handle.put_run_kv("workflow/x", "v").unwrap();
+        assert!(matches!(
+            handle.delete_run_kv("workflow/x"),
+            Err(Error::ConflictingKvEffect(_))
+        ));
         let request = |queue: &str, header: &str| EnqueueRequest {
             queue: queue.to_string(),
             payload: Vec::new(),
             options: EnqueueOptions::default()
                 .headers(HashMap::from([(header.to_string(), String::new())])),
         };
-        let bound = EffectsHandle::for_delivery("workflow-steps");
+        let bound = EffectsHandle::for_delivery("workflow-steps", &RunId::new("r").unwrap());
         assert!(matches!(
             bound.enqueue(request("workflow-steps", "h")),
             Err(Error::ReservedQueue(_))
@@ -322,17 +388,30 @@ mod tests {
         ));
         bound.enqueue(request("other", "h")).unwrap();
         handle.enqueue(request("workflow-steps", "h")).unwrap();
+        let detached = RunId::new("detached").unwrap();
+        let staged = handle.seal_and_take();
+        assert!(
+            staged
+                .writes
+                .contains_key(&run_kv_entry_key(&detached, b"workflow/x"))
+        );
     }
 
     #[test]
     fn a_clone_stages_into_the_shared_accumulator_until_the_seal() {
-        let handle = EffectsHandle::for_delivery("workflow-steps");
+        let run_id = RunId::new("r").unwrap();
+        let handle = EffectsHandle::for_delivery("workflow-steps", &run_id);
         let clone = handle.clone();
         clone.put("a", "v").unwrap();
         clone.delete("b").unwrap();
+        clone.put_run_kv("a", "w").unwrap();
         let staged = handle.seal_and_take();
         assert_eq!(staged.writes.get(b"a".as_slice()), Some(&b"v".to_vec()));
         assert!(staged.deletes.contains(b"b".as_slice()));
+        assert_eq!(
+            staged.writes.get(&run_kv_entry_key(&run_id, b"a")),
+            Some(&b"w".to_vec())
+        );
         assert!(matches!(clone.put("c", "v"), Err(Error::EffectsSealed)));
         assert!(matches!(clone.delete("c"), Err(Error::EffectsSealed)));
         let request = EnqueueRequest {

@@ -322,10 +322,17 @@
 //!   replayed delivery applies them without invoking the runner.
 //!
 //! The written values are readable inside a step through [`Delivery::kv`] (a
-//! [`KvReadHandle`] exposing `get` only, which reads committed state, so
-//! effects staged by the running step are excluded), through
-//! [`taquba::QueueView::kv_get`] and, from another process, through a
-//! `taquba::QueueReader`.
+//! [`KvReadHandle`], which reads committed state, so effects staged by the
+//! running step are excluded), through [`taquba::QueueView::kv_get`] and, from
+//! another process, through a `taquba::QueueReader`.
+//!
+//! The run KV space contains the state of one run, such as a progress entry or
+//! a transcript. [`EffectsHandle::put_run_kv`] and
+//! [`EffectsHandle::delete_run_kv`] stage an entry of the delivery's run,
+//! [`KvReadHandle::get_run_kv`] reads an entry during a step, and
+//! [`WorkflowView::run_kv`] and [`WorkflowView::run_kv_entries`] read the
+//! entries of a run from another process. The memo sweep and the group sweep
+//! delete the entries of a run with the run.
 //!
 //! See `examples/kv_effects.rs` for a runnable order flow maintaining a status
 //! row through both surfaces.
@@ -545,11 +552,15 @@
 //! marker. A pass before a marker can be expired does not read the index, so a
 //! run's state is removed within a poll interval of the end of its window.
 //!
-//! The sweep selects runs by their terminal markers, and a run id identifies
-//! one run until the sweep removes its terminal record, so the entries of an
-//! in-flight run are not removed. Deletion is unguarded because every reader
-//! tolerates absence: a step that finds an entry absent re-executes the work,
-//! as a redelivery does under at-least-once delivery.
+//! The sweep selects runs by their terminal markers, and it removes the state
+//! of a run only while the terminal record of the run is the one of its marker.
+//! A run id submitted again after [`RunGroup::forget`] keeps its state, and the
+//! sweep removes the earlier marker alone. Deletion is unguarded because every
+//! reader tolerates absence: a step that finds an entry absent re-executes the
+//! work, as a redelivery does under at-least-once delivery.
+//!
+//! The sweep deletes the run KV entries of a run in the transaction that
+//! removes its terminal record.
 //!
 //! Other cleanup policies (selective retention, sweeps run by another process)
 //! can be built on [`taquba::QueueView::kv_scan`] over that prefix and

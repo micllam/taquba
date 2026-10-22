@@ -327,7 +327,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
         // its own token is not treated as an external cancellation below.
         let claim_cancel = lease.cancel_token().clone();
 
-        let effects_handle = EffectsHandle::for_delivery(&self.core.queue_name);
+        let effects_handle = EffectsHandle::for_delivery(&self.core.queue_name, run_id);
         let step = Step {
             delivery: Delivery {
                 run_id: run_id.clone(),
@@ -341,7 +341,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
                 memo: self.core.memo_store.new_memo(run_id, step_number),
                 run_memo: self.core.memo_store.new_run_memo(run_id),
                 effects: effects_handle.clone(),
-                kv: KvReadHandle::for_delivery(self.core.queue.clone()),
+                kv: KvReadHandle::for_delivery(self.core.queue.clone(), run_id.clone()),
             },
             step_number,
             payload: job.payload.clone(),

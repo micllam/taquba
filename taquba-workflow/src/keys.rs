@@ -6,7 +6,7 @@
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fmt;
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -116,6 +116,11 @@ pub(crate) const STEP_KV_PREFIX: &[u8] = b"workflow/steps/";
 /// Prefix of the terminal markers of runs, read by the memo retention sweep:
 /// entries of a [`taquba::ExpiryIndex`] with the run id as the suffix.
 pub(crate) const TERMINAL_KV_PREFIX: &[u8] = b"workflow/terminals/";
+
+/// Prefix of the run KV entries: `workflow/run-kv/{run_id}/{key}`, staged
+/// through [`EffectsHandle::put_run_kv`](crate::EffectsHandle::put_run_kv) and
+/// removed with the run by the memo sweep and the group sweep.
+pub(crate) const RUN_KV_ENTRY_PREFIX: &[u8] = b"workflow/run-kv/";
 
 /// Prefix for the durable member records of run groups:
 /// `workflow/groups/{group_id}/{key}`, one per member, written with the
@@ -303,6 +308,25 @@ pub(crate) fn step_kv_key(run_id: &RunId) -> Vec<u8> {
     prefixed(STEP_KV_PREFIX, run_id)
 }
 
+/// The prefix of the run KV entries of `run_id`. A run id does not contain `/`,
+/// so the prefix of one run does not contain the entries of another.
+fn run_kv_entries_prefix(run_id: &RunId) -> Vec<u8> {
+    prefixed(RUN_KV_ENTRY_PREFIX, &format!("{run_id}/"))
+}
+
+/// The range of the run KV entries of `run_id` within [`RUN_KV_ENTRY_PREFIX`],
+/// from its prefix to the prefix with `0`, the byte after `/`, in its place.
+pub(crate) fn run_kv_entries_range(run_id: &RunId) -> Range<Vec<u8>> {
+    let start = run_kv_entries_prefix(run_id);
+    let end = prefixed(RUN_KV_ENTRY_PREFIX, &format!("{run_id}0"));
+    start..end
+}
+
+/// The key of the run KV entry `key` of `run_id`.
+pub(crate) fn run_kv_entry_key(run_id: &RunId, key: &[u8]) -> Vec<u8> {
+    [run_kv_entries_prefix(run_id).as_slice(), key].concat()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +337,7 @@ mod tests {
             RUN_KV_PREFIX,
             STEP_KV_PREFIX,
             TERMINAL_KV_PREFIX,
+            RUN_KV_ENTRY_PREFIX,
             GROUP_KV_PREFIX,
             GROUP_TERMINAL_KV_PREFIX,
         ] {
