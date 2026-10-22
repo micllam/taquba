@@ -36,6 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Claims within a priority follow the enqueue time of a job before its id, so a
   job with an `EnqueueOptions::id_override` keeps its place in FIFO order. Drain
   the pending jobs of a store written with 0.15.0 before the upgrade.
+- `Error::InvalidQueueName` and `Error::InvalidId` give their reason as a
+  `FormError`, which identifies the broken rule and the character at fault.
+  Match the variants of `FormError` in place of the text of the reason.
 
 ## [0.15.0] - 2026-10-14
 

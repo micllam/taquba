@@ -7,7 +7,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::effects::EnqueueRequest;
-use crate::error::{Error, Result};
+use crate::error::{Characters, Error, Form, Result};
 use crate::options::EnqueueOptions;
 
 /// Maximum byte length of an inbox entry id and of a kind name.
@@ -170,44 +170,41 @@ pub(crate) fn is_core_kind(kind: &str) -> bool {
     [EnqueueEntry::KIND, CancelEntry::KIND, SignalEntry::KIND].contains(&kind)
 }
 
+const KIND_FORM: Form = Form {
+    max: MAX_INBOX_ID_LEN,
+    start: Some(Characters {
+        test: |c| c.is_ascii_lowercase(),
+        allowed: "a lower-case letter",
+    }),
+    characters: Characters {
+        test: |c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c),
+        allowed: "`[a-z0-9._-]`",
+    },
+};
+
+const ID_FORM: Form = Form {
+    max: MAX_INBOX_ID_LEN,
+    start: None,
+    characters: Characters {
+        test: |c| c.is_ascii_alphanumeric() || "_-".contains(c),
+        allowed: "`[A-Za-z0-9_-]`",
+    },
+};
+
 /// Validate a kind name: `[a-z][a-z0-9._-]*`, at most [`MAX_INBOX_ID_LEN`]
 /// bytes.
 pub(crate) fn validate_kind(kind: &str) -> Result<()> {
-    let reason = if kind.is_empty() {
-        "kind must not be empty"
-    } else if kind.len() > MAX_INBOX_ID_LEN {
-        "kind exceeds the maximum length of 64 bytes"
-    } else if !kind.as_bytes()[0].is_ascii_lowercase() {
-        "kind must start with a lower-case letter"
-    } else if !kind
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
-    {
-        "kind must contain only `[a-z0-9._-]`"
-    } else {
-        return Ok(());
-    };
-    Err(Error::InvalidInboxKind {
-        kind: kind.to_string(),
-        reason,
-    })
+    KIND_FORM
+        .check(kind)
+        .map_err(|reason| Error::InvalidInboxKind {
+            kind: kind.to_string(),
+            reason,
+        })
 }
 
 /// Validate an entry id: `[A-Za-z0-9_-]`, 1 to [`MAX_INBOX_ID_LEN`] bytes.
 pub(crate) fn validate_id(id: &str) -> Result<()> {
-    let reason = if id.is_empty() {
-        "id must not be empty"
-    } else if id.len() > MAX_INBOX_ID_LEN {
-        "id exceeds the maximum length of 64 bytes"
-    } else if !id
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
-        "id must contain only `[A-Za-z0-9_-]`"
-    } else {
-        return Ok(());
-    };
-    Err(Error::InvalidId {
+    ID_FORM.check(id).map_err(|reason| Error::InvalidId {
         id: id.to_string(),
         reason,
     })

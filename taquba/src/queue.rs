@@ -12,7 +12,7 @@ use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
 use crate::completion::{CompletionWaiters, Registration};
 use crate::effects::{EnqueueRequest, PreparedEffects, SettlementEffects};
-use crate::error::{Error, Result};
+use crate::error::{Characters, Error, Form, Result};
 use crate::history::AttemptOutcome;
 use crate::inbox::{Inbox, InboxHandler, InboxRegistration, InboxState};
 use crate::job::{Claim, JobRecord, JobStatus};
@@ -105,29 +105,22 @@ const MAX_ID_OVERRIDE_LEN: usize = 128;
 /// 1-[`MAX_ID_OVERRIDE_LEN`] bytes of `[A-Za-z0-9_-]`. The bound keeps ids safe
 /// for object-store paths and log lines downstream.
 pub(crate) fn validate_id_override(id: &str) -> Result<()> {
-    if id.is_empty() {
-        return Err(Error::InvalidId {
+    ID_OVERRIDE_FORM
+        .check(id)
+        .map_err(|reason| Error::InvalidId {
             id: id.to_string(),
-            reason: "id must not be empty",
-        });
-    }
-    if id.len() > MAX_ID_OVERRIDE_LEN {
-        return Err(Error::InvalidId {
-            id: id.to_string(),
-            reason: "id exceeds maximum length of 128 bytes",
-        });
-    }
-    if !id
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
-        return Err(Error::InvalidId {
-            id: id.to_string(),
-            reason: "id must contain only `[A-Za-z0-9_-]`",
-        });
-    }
-    Ok(())
+            reason,
+        })
 }
+
+const ID_OVERRIDE_FORM: Form = Form {
+    max: MAX_ID_OVERRIDE_LEN,
+    start: None,
+    characters: Characters {
+        test: |c| c.is_ascii_alphanumeric() || "_-".contains(c),
+        allowed: "`[A-Za-z0-9_-]`",
+    },
+};
 
 /// Outcome of [`Queue::enqueue_with_effects`].
 #[derive(Debug, Clone, PartialEq, Eq)]

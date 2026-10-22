@@ -37,7 +37,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, FormError, Result};
 use crate::job::JobStatus;
 
 /// Maximum byte length of a queue name, imposed by the one-byte length field in
@@ -63,7 +63,9 @@ impl QueueName {
         if name.len() > MAX_QUEUE_NAME_LEN {
             return Err(Error::InvalidQueueName {
                 queue: name,
-                reason: "queue name exceeds the maximum length of 255 bytes",
+                reason: FormError::TooLong {
+                    max: MAX_QUEUE_NAME_LEN,
+                },
             });
         }
         Ok(Self(name))
@@ -437,6 +439,7 @@ mod tests {
     use strum::IntoEnumIterator;
 
     use super::*;
+    use crate::error::FormError;
 
     fn qn(name: &str) -> QueueName {
         name.parse().unwrap()
@@ -449,7 +452,10 @@ mod tests {
         let over = "q".repeat(MAX_QUEUE_NAME_LEN + 1);
         assert!(matches!(
             QueueName::new(&over),
-            Err(Error::InvalidQueueName { .. })
+            Err(Error::InvalidQueueName {
+                reason: FormError::TooLong { max: 255 },
+                ..
+            })
         ));
         assert!(over.parse::<QueueName>().is_err());
         let stored = rmp_serde::to_vec_named(&over).unwrap();

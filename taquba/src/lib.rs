@@ -516,7 +516,7 @@ pub mod worker;
 
 pub use clock::{Clock, MockClock, SystemClock};
 pub use effects::{EnqueueRequest, SettlementEffects};
-pub use error::{Error, Result, StoreUrlError};
+pub use error::{Error, FormError, Result, StoreUrlError};
 pub use expiry::{Expired, ExpiryIndex};
 pub use history::{AttemptOutcome, JobAttempt};
 pub use inbox::entry::{
