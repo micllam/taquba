@@ -17,12 +17,14 @@ use crate::inbox::entry_path;
 /// [`QueueView::inbox_record`](crate::QueueView::inbox_record) of a
 /// [`QueueReader`](crate::QueueReader).
 ///
-/// The writer applies entries in id order. The ids of [`Self::send`] increase
-/// with call order on one sender, so the entries of one sender apply in send
-/// order, and the order between two senders follows their clocks. An id is
-/// unique per inbox, across kinds: the record of an applied entry is at the id,
-/// and a later entry of any kind with the id of a recorded one is deleted
-/// without an effect.
+/// The writer applies the entries of a listing in id order. The ids of
+/// [`Self::send`] increase with call order on one sender and its clones, so
+/// entries sent one after the other, each send awaited before the next, apply
+/// in send order. Concurrent sends, and the sends of two senders, apply in id
+/// order among the entries of one listing, and an entry written after a pass
+/// that applied a later id applies at a later pass. An id is unique per inbox,
+/// across kinds: the record of an applied entry is at the id, and a later entry
+/// of any kind with the id of a recorded one is deleted without an effect.
 #[derive(Clone)]
 pub struct InboxSender {
     store: Arc<dyn ObjectStore>,
