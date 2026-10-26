@@ -13,6 +13,7 @@ use taquba::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 
+use crate::command::CommandWorker;
 use crate::durable::{
     self, DurableCancelRequest, DurableErrorKind, DurableRun, DurableRunOutcome, DurableRunRecord,
     DurableRunResult, DurableStepOutcome, DurableStepOutcomeRecord, DurableStepRef,
@@ -297,6 +298,7 @@ pub struct WorkflowRuntimeBuilder<R, H> {
     group_retention: Option<Duration>,
     step_output_replay: bool,
     clock: Arc<dyn Clock>,
+    control_queue: Option<String>,
 }
 
 impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
@@ -385,17 +387,34 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
         self
     }
 
+    /// The queue of the runtime's commands, such as `"workflow-steps.control"`.
+    /// The worker applies each job on it as a [`Command`](crate::Command), so
+    /// another process submits and cancels runs by enqueuing a command through
+    /// a [`taquba::InboxSender`]. The queue must be in
+    /// [`taquba::InboxOptions::queues`] and differ from [`Self::queue_name`].
+    /// When unset (default), the worker leaves commands unapplied.
+    pub fn control_queue(mut self, name: impl Into<String>) -> Self {
+        self.control_queue = Some(name.into());
+        self
+    }
+
     /// Finalise the builder.
     ///
     /// # Errors
     ///
     /// The error of [`TerminalHook::check_runtime`] for the configured queue
-    /// name.
+    /// name, and [`Error::InvalidControlQueue`] for a control queue that equals
+    /// the queue name or that the inbox of the queue does not accept.
     pub fn build(self) -> Result<WorkflowRuntime<R, H>>
     where
         H: 'static,
     {
         self.terminal_hook.check_runtime(&self.queue_name)?;
+        if let Some(control) = &self.control_queue
+            && (*control == self.queue_name || !self.queue.inbox_accepts(control))
+        {
+            return Err(Error::InvalidControlQueue(control.clone()));
+        }
         Ok(self.assemble())
     }
 
@@ -451,6 +470,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
             step_output_replay: self.step_output_replay,
             clock: self.clock,
             terminal_staging: terminal_hook.clone(),
+            control_queue: self.control_queue,
         };
         (self.runner, terminal_hook, Arc::new(core))
     }
@@ -552,6 +572,8 @@ pub(crate) struct RuntimeCore {
     /// The synchronous methods of the runtime's hook, which stage the effects
     /// of a termination and decide whether it enqueues a notification job.
     terminal_staging: Arc<dyn TerminalStaging>,
+    /// [`WorkflowRuntimeBuilder::control_queue`].
+    control_queue: Option<String>,
 }
 
 /// The synchronous methods of a [`TerminalHook`], held by [`RuntimeCore`]
@@ -607,6 +629,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             group_retention: None,
             step_output_replay: false,
             clock,
+            control_queue: None,
         }
     }
 
@@ -719,9 +742,10 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// Run the step worker loop until `shutdown` resolves. Spawns up to
     /// `max_concurrent_steps` step processors, the dead-step reconciliation
     /// that terminates runs whose step the queue dead-lettered outside the
-    /// worker and, when [`WorkflowRuntimeBuilder::memo_retention`] is set, a
-    /// memo-retention sweeper, all running in parallel. All halt cleanly when
-    /// `shutdown` resolves or the worker errors.
+    /// worker, a memo-retention sweeper when
+    /// [`WorkflowRuntimeBuilder::memo_retention`] is set and a command worker
+    /// when [`WorkflowRuntimeBuilder::control_queue`] is set, all running in
+    /// parallel. All halt cleanly when `shutdown` resolves or a worker errors.
     pub async fn run<F>(&self, shutdown: F) -> Result<()>
     where
         F: Future<Output = ()>,
@@ -767,6 +791,24 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             let token = stop.clone();
             tokio::spawn(async move { core.run_dead_step_reconciliation(token).await })
         });
+        let commands = self.inner.core.control_queue.clone().map(|control| {
+            let core = self.inner.core.clone();
+            let token = stop.clone();
+            tokio::spawn(async move {
+                let worker = CommandWorker { core: core.clone() };
+                let shutdown = token.clone().cancelled_owned();
+                let result = taquba::run_worker(
+                    &core.queue,
+                    &control,
+                    &worker,
+                    core.poll_interval,
+                    shutdown,
+                )
+                .await;
+                token.cancel();
+                result
+            })
+        });
 
         let worker = Arc::new(StepWorker {
             inner: self.inner.clone(),
@@ -785,8 +827,13 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
         for handle in background {
             let _ = handle.await;
         }
+        let commanded = match commands {
+            Some(handle) => handle.await.unwrap_or(Ok(())),
+            None => Ok(()),
+        };
 
         result?;
+        commanded?;
         Ok(())
     }
 }

@@ -264,6 +264,33 @@
 //! the inbox with a [`taquba::SignalEntry`], without an inbound endpoint on
 //! this process.
 //!
+//! # The inbox
+//!
+//! Another process submits and cancels runs through the inbox of the queue
+//! ([`taquba::OpenOptions::inbox`]). [`WorkflowRuntimeBuilder::control_queue`]
+//! sets the runtime's control queue, which [`taquba::InboxOptions::queues`]
+//! must list. The runtime's worker applies each job on the control queue as a
+//! [`Command`]: a [`SubmitCommand`] or a [`CancelCommand`].
+//!
+//! A sender enqueues `taquba::EnqueueEntry::from(command)` with a
+//! [`taquba::InboxSender`] for the control queue. Through a
+//! [`taquba::QueueReader`], the sender reads the state of its command with
+//! [`WorkflowView::command`] and the state of the run with
+//! [`WorkflowView::status`]. A sender in another language writes the JSON form
+//! that [`Command`] documents. A signal from another process is the core kind
+//! `signal` ([`taquba::SignalEntry`]).
+//!
+//! A command applies at least once, so a [`SubmitCommand`] contains its run id.
+//! A command that fails is retried. A command that cannot apply, such as a
+//! submission of an existing run id with another input, is dead-lettered with
+//! its error in [`taquba::JobRecord::last_error`].
+//!
+//! A cancellation of a run whose submission waits on the control queue applies
+//! that submission and then cancels the run. A sender delays a run with
+//! [`SubmitCommand::run_at`]. A command job delayed through the `run_at` of its
+//! entry finds an earlier run of its id only while the terminal record of that
+//! run is retained.
+//!
 //! # Application KV effects
 //!
 //! Application state that describes a run (a status row, a progress marker, an
@@ -628,6 +655,7 @@
 #![warn(missing_docs)]
 
 mod blob;
+mod command;
 mod durable;
 mod effects;
 mod error;
@@ -646,6 +674,7 @@ mod test_util;
 mod view;
 mod worker;
 
+pub use command::{CancelCommand, Command, CommandState, SubmitCommand};
 pub use effects::{EffectsHandle, TerminalEffects};
 pub use error::{Error, Result};
 pub use group::{GroupMember, GroupStatus, MemberResult, RunGroup};

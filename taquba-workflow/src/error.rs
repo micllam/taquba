@@ -125,6 +125,11 @@ pub enum Error {
     /// with an active member.
     #[error("group `{0}` has an active member")]
     GroupActive(RunId),
+
+    /// The queue of [`crate::WorkflowRuntimeBuilder::control_queue`] is the
+    /// queue name of the runtime, or the inbox of the queue does not accept it.
+    #[error("control queue `{0}` is the runtime's queue or outside the inbox allow-list")]
+    InvalidControlQueue(String),
 }
 
 impl Error {
@@ -151,7 +156,8 @@ impl Error {
             | Self::MemberNotSubmitted { .. }
             | Self::DuplicateMemberKey(_)
             | Self::GroupMismatch(_)
-            | Self::GroupNotFound(_) => true,
+            | Self::GroupNotFound(_)
+            | Self::InvalidControlQueue(_) => true,
             Self::Queue(e) => e.is_permanent(),
             Self::Store(_) | Self::GroupActive(_) => false,
         }

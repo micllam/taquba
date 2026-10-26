@@ -54,7 +54,8 @@ impl std::fmt::Display for TerminalStatus {
 pub enum CancelOrigin {
     /// The runner returned [`crate::StepOutcome::Cancel`] without a request.
     Runner,
-    /// A request through [`crate::WorkflowRuntime::cancel`].
+    /// A request through [`crate::WorkflowRuntime::cancel`] or a
+    /// [`crate::CancelCommand`].
     Request,
 }
 
