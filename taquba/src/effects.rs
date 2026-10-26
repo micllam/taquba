@@ -60,8 +60,7 @@ pub struct SettlementEffects {
     pub kv_deletes: Vec<Vec<u8>>,
     /// The index and the time of every entry added with [`Self::expiry_entry`].
     pub expiry_entries: Vec<(ExpiryIndex, u64)>,
-    /// The encoded record of an inbox entry, added by
-    /// [`InboxRecordHandle`](crate::InboxRecordHandle).
+    /// The encoded record of an inbox entry.
     pub(crate) inbox_record: Option<StagedRecord>,
 }
 

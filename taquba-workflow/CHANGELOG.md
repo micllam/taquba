@@ -13,14 +13,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `WorkflowView::run_end`: the `RunEnd` of a terminated run, which
   `WorkflowRuntime::wait` reports, so a process without a runtime reads it
   through a `taquba::QueueReader`. It returns `None` for an active run.
-- `WorkflowRuntimeBuilder::inbox_kinds`: the inbox kinds `workflow.submit` and
-  `workflow.cancel` for the runtime's queue name, with the entry types
-  `SubmitEntry` and `CancelRunEntry`, so another process submits and cancels
-  runs through a `taquba::InboxSender`. An entry identifies the runtime by its
-  `queue` field, `DEFAULT_QUEUE_NAME` by default, and its record contains the
-  `SubmitOutcome` or the `CancelRunOutcome` of the entry. `SubmitOutcome`
-  implements `Serialize`, `Deserialize` and `PartialEq`, and
-  `CancelRunEntry::reason` contains the reason of a cancel.
 - `EffectsHandle::enqueue` and `Delivery::next_job_id`: a step stages an enqueue
   that commits with its settlement, and `next_job_id` is the job id of the next
   step, the same on every attempt of the step.

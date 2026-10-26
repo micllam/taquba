@@ -1,5 +1,5 @@
 //! The entries of the inbox: the kind trait, the entry types of the core kinds
-//! and the validation of the kind and id segments of an entry's path.
+//! and the validation of the id segment of an entry's path.
 
 use std::collections::HashMap;
 use std::time::{Duration, UNIX_EPOCH};
@@ -11,17 +11,16 @@ use crate::error::{Characters, Error, Form, Result};
 use crate::options::EnqueueOptions;
 use crate::queue::{CancelOutcome, EnqueueResult, SignalOutcome};
 
-/// Maximum byte length of an inbox entry id and of a kind name.
+/// Maximum byte length of an inbox entry id.
 pub const MAX_INBOX_ID_LEN: usize = 64;
 
 /// An entry type of the inbox: the kind name, the JSON body of an entry and the
-/// outcome recorded for an applied entry. The core defines [`EnqueueEntry`],
-/// [`CancelEntry`] and [`SignalEntry`], and a layer defines a type per kind it
-/// registers with
-/// [`Queue::register_inbox_handler`](crate::Queue::register_inbox_handler). A
-/// bytes field of a body is base64 through [`inbox_bytes`].
-pub trait InboxKind: Serialize + DeserializeOwned + Send + 'static {
-    /// The kind name: `[a-z][a-z0-9._-]*`, at most [`MAX_INBOX_ID_LEN`] bytes.
+/// outcome recorded for an applied entry. The path of an entry contains its
+/// queue, and the body does not. The kinds are [`EnqueueEntry`],
+/// [`CancelEntry`] and [`SignalEntry`], and the trait is sealed. A bytes field
+/// of a body is base64 through [`inbox_bytes`].
+pub trait InboxKind: sealed::Sealed + Serialize + DeserializeOwned + Send + 'static {
+    /// The kind name in the path of an entry.
     const KIND: &'static str;
     /// The outcome of an applied entry, in its
     /// [`InboxRecord`](crate::InboxRecord).
@@ -47,13 +46,10 @@ pub mod inbox_bytes {
     }
 }
 
-/// The entry of the core kind `enqueue`: a job for a queue in
-/// [`InboxOptions::queues`](crate::InboxOptions::queues). Its outcome is the
-/// [`EnqueueResult`] of the enqueue.
+/// The entry of the core kind `enqueue`: a job for the queue of the entry. Its
+/// outcome is the [`EnqueueResult`] of the enqueue.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EnqueueEntry {
-    /// The queue of the job.
-    pub queue: String,
     /// The payload of the job, base64 in the body.
     #[serde(with = "inbox_bytes")]
     pub payload: Vec<u8>,
@@ -82,22 +78,19 @@ pub struct EnqueueEntry {
 }
 
 impl EnqueueEntry {
-    /// An entry for `queue` with `payload` and every option unset.
-    pub fn new(queue: impl Into<String>, payload: impl Into<Vec<u8>>) -> Self {
+    /// An entry with `payload` and every option unset.
+    pub fn new(payload: impl Into<Vec<u8>>) -> Self {
         Self {
-            queue: queue.into(),
             payload: payload.into(),
             ..Self::default()
         }
     }
-}
 
-/// The entry of `request`. A `run_at` before the Unix epoch becomes 0.
-impl From<EnqueueRequest> for EnqueueEntry {
-    fn from(request: EnqueueRequest) -> Self {
+    /// The queue of `request` and its entry. A `run_at` before the Unix epoch
+    /// becomes 0.
+    pub fn from_request(request: EnqueueRequest) -> (String, Self) {
         let options = request.options;
-        Self {
-            queue: request.queue,
+        let entry = Self {
             payload: request.payload,
             headers: options.headers,
             run_at: options.run_at.map(|at| {
@@ -109,25 +102,23 @@ impl From<EnqueueRequest> for EnqueueEntry {
             dedup_key: options.dedup_key,
             job_id: options.id_override,
             signal_wait: options.signal_wait,
-        }
+        };
+        (request.queue, entry)
     }
-}
 
-impl From<EnqueueEntry> for EnqueueRequest {
-    fn from(entry: EnqueueEntry) -> Self {
-        Self {
-            queue: entry.queue,
-            payload: entry.payload,
+    /// The request of the entry for `queue`.
+    pub fn into_request(self, queue: impl Into<String>) -> EnqueueRequest {
+        EnqueueRequest {
+            queue: queue.into(),
+            payload: self.payload,
             options: EnqueueOptions {
-                max_attempts: entry.max_attempts,
-                priority: entry.priority,
-                run_at: entry
-                    .run_at
-                    .map(|ms| UNIX_EPOCH + Duration::from_millis(ms)),
-                dedup_key: entry.dedup_key,
-                headers: entry.headers,
-                id_override: entry.job_id,
-                signal_wait: entry.signal_wait,
+                max_attempts: self.max_attempts,
+                priority: self.priority,
+                run_at: self.run_at.map(|ms| UNIX_EPOCH + Duration::from_millis(ms)),
+                dedup_key: self.dedup_key,
+                headers: self.headers,
+                id_override: self.job_id,
+                signal_wait: self.signal_wait,
             },
         }
     }
@@ -139,8 +130,8 @@ impl InboxKind for EnqueueEntry {
 }
 
 /// The entry of the core kind `cancel`: [`Queue::cancel`](crate::Queue::cancel)
-/// of a job on a queue in [`InboxOptions::queues`](crate::InboxOptions::queues).
-/// Its outcome is the [`CancelOutcome`] of the cancel.
+/// of a job on the queue of the entry. Its outcome is the [`CancelOutcome`] of
+/// the cancel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelEntry {
     /// The id of the job.
@@ -153,7 +144,8 @@ impl InboxKind for CancelEntry {
 }
 
 /// The entry of the core kind `signal`: [`Queue::signal`](crate::Queue::signal)
-/// to the job `job_id`. Its outcome is the [`SignalOutcome`] of the signal.
+/// to the job `job_id` on the queue of the entry. Its outcome is the
+/// [`SignalOutcome`] of the signal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalEntry {
     /// The id of the waiting job.
@@ -168,22 +160,13 @@ impl InboxKind for SignalEntry {
     type Outcome = SignalOutcome;
 }
 
-/// Whether `kind` is a kind that the core applies.
-pub(crate) fn is_core_kind(kind: &str) -> bool {
-    [EnqueueEntry::KIND, CancelEntry::KIND, SignalEntry::KIND].contains(&kind)
-}
+mod sealed {
+    pub trait Sealed {}
 
-const KIND_FORM: Form = Form {
-    max: MAX_INBOX_ID_LEN,
-    start: Some(Characters {
-        test: |c| c.is_ascii_lowercase(),
-        allowed: "a lower-case letter",
-    }),
-    characters: Characters {
-        test: |c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c),
-        allowed: "`[a-z0-9._-]`",
-    },
-};
+    impl Sealed for super::EnqueueEntry {}
+    impl Sealed for super::CancelEntry {}
+    impl Sealed for super::SignalEntry {}
+}
 
 const ID_FORM: Form = Form {
     max: MAX_INBOX_ID_LEN,
@@ -193,17 +176,6 @@ const ID_FORM: Form = Form {
         allowed: "`[A-Za-z0-9_-]`",
     },
 };
-
-/// Validate a kind name: `[a-z][a-z0-9._-]*`, at most [`MAX_INBOX_ID_LEN`]
-/// bytes.
-pub(crate) fn validate_kind(kind: &str) -> Result<()> {
-    KIND_FORM
-        .check(kind)
-        .map_err(|reason| Error::InvalidInboxKind {
-            kind: kind.to_string(),
-            reason,
-        })
-}
 
 /// Validate an entry id: `[A-Za-z0-9_-]`, 1 to [`MAX_INBOX_ID_LEN`] bytes.
 pub(crate) fn validate_id(id: &str) -> Result<()> {
@@ -216,19 +188,6 @@ pub(crate) fn validate_id(id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_kind_is_lower_case_and_starts_with_a_letter() {
-        for kind in ["enqueue", "workflow.submit", "a-b_c9"] {
-            validate_kind(kind).unwrap();
-        }
-        for bad in ["", "Enqueue", "1x", "a/b", "a b", &"k".repeat(65)] {
-            assert!(
-                matches!(validate_kind(bad), Err(Error::InvalidInboxKind { .. })),
-                "`{bad}` must be rejected"
-            );
-        }
-    }
 
     #[test]
     fn an_id_is_a_path_segment_of_at_most_64_bytes() {
@@ -270,7 +229,8 @@ mod tests {
                 signal_wait: true,
             },
         };
-        let back = EnqueueRequest::from(EnqueueEntry::from(request.clone()));
+        let (queue, entry) = EnqueueEntry::from_request(request.clone());
+        let back = entry.into_request(queue);
         assert_eq!(back.queue, request.queue);
         assert_eq!(back.payload, request.payload);
         assert_eq!(

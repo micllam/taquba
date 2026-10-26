@@ -1,18 +1,18 @@
 //! The inbox: a prefix of objects that the writer applies, through which
 //! another process enqueues, cancels and signals.
 //!
-//! An entry is one object at `{path}/v1/{kind}/{id}` with a JSON body. A pass
-//! lists the version prefix, sorts the entries by id and applies each in order:
-//! the entry of a core kind through the queue, and the entry of a registered
-//! kind through its [`InboxHandler`]. The application commits an
-//! [`InboxRecord`](crate::InboxRecord) at the id in the transaction of the
-//! entry's effect, and the object is deleted after the commit. A pass that
-//! finds the record of an object deletes the object without a read, and the
-//! transaction that writes a record fails when one exists, so ingestion is at
-//! least once and application is once within the retention of the record. An
-//! entry of a kind without a handler stays until a pass finds one, without a
-//! read. An entry of a kind registered by a field, with a value without a
-//! handler, stays as well and costs one GET per pass.
+//! An entry is one object at `{path}/v1/{queue}/{kind}/{id}` with a JSON body,
+//! for the queue in its path. The kinds are `enqueue`, `cancel` and `signal`. A
+//! pass lists the version prefix, sorts the entries by id and applies each in
+//! order through the queue. The pass rejects an entry for a queue outside
+//! [`InboxOptions::queues`], an entry of another kind, a body that does not
+//! decode and an entry whose operation fails with a permanent error. The
+//! application commits an [`InboxRecord`](crate::InboxRecord) at the id in the
+//! transaction of the entry's effect, or in a transaction of its own after an
+//! idempotent effect or none, and the object is deleted after the commit. A
+//! pass that finds the record of an object deletes the object without a read,
+//! and the transaction that writes a record fails when one exists, so ingestion
+//! is at least once and application is once within the retention of the record.
 //!
 //! The writer runs one pass at open before the scheduler starts. After it, the
 //! writer polls the touch object at `{path}/touch` once per
@@ -20,33 +20,34 @@
 //! changed or once per [`InboxOptions::interval`]. A sender touches the inbox
 //! after each entry: it overwrites the touch object. The writer polls the touch
 //! object before the listing, so an entry written during a listing changes the
-//! touch object for the next poll. An error ends a pass at its entry, and the
+//! touch object for the next poll.
+//!
+//! Passes run one at a time. Any other error ends a pass at its entry, and the
 //! next pass starts again at the first entry without a record. After a pass
-//! that ends at an error of a store, the writer runs a pass at the next poll.
+//! that ends at an error, the writer runs a pass at the next poll.
 
 pub(crate) mod entry;
 pub(crate) mod kinds;
 pub(crate) mod record;
 pub(crate) mod sender;
 
-use std::collections::{BTreeMap, HashSet};
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::TryStreamExt;
 use slatedb::object_store::{
     Error as ObjectStoreError, ObjectMeta, ObjectStore, ObjectStoreExt, path::Path,
 };
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use crate::background::Periodic;
 use crate::effects::SettlementEffects;
 use crate::error::{Error, Result};
-use crate::inbox::entry::{InboxKind, is_core_kind, validate_id, validate_kind};
+use crate::inbox::entry::validate_id;
 use crate::inbox::kinds::CoreKind;
-use crate::inbox::record::{Applied, InboxRecordHandle, Settled, malformed};
+use crate::inbox::record::{InboxOutcome, InboxRecordHandle, Settled, StagedRecord};
 use crate::keys::{QueueName, inbox_record_key};
 use crate::queue_core::QueueCore;
 use crate::time_bound::TimeBound;
@@ -70,6 +71,28 @@ pub fn default_inbox_path(path: &str) -> String {
 }
 
 /// Configuration of the inbox, set on [`OpenOptions::inbox`](crate::OpenOptions::inbox).
+///
+/// The inbox is a prefix of objects outside the store, at
+/// [`default_inbox_path`] unless [`Self::path`] is set, through which another
+/// process enqueues, cancels and signals. The writer accepts the entries for
+/// the queues of [`Self::queues`].
+///
+/// The writer lists the inbox at open, after a change of its touch object and
+/// once per [`Self::interval`]. A pass applies the entries in id order. It
+/// commits an [`InboxRecord`](crate::InboxRecord) at the id in the transaction
+/// of the entry's effect, or in a transaction of its own after an idempotent
+/// effect or none, and then deletes the object. The pass rejects these entries
+/// with a record of the reason:
+///
+/// - A malformed entry.
+/// - An entry for a queue outside [`Self::queues`].
+/// - An entry of another kind.
+/// - A cancel or a signal for a job of another queue.
+/// - An entry whose operation fails with a permanent error.
+///
+/// Any other error ends the pass at its entry, and the next pass starts again
+/// there. An entry whose record exists is deleted without an effect, so an
+/// entry sent twice applies once within [`Self::record_retention`].
 pub struct InboxOptions {
     /// How often the writer lists the inbox without a touch. With the touch
     /// poll, the writer rounds the interval up to a whole number of polls, at
@@ -87,11 +110,12 @@ pub struct InboxOptions {
     pub object_store: Option<Arc<dyn ObjectStore>>,
     /// Path prefix of the inbox within its object store. `None` (the default)
     /// uses [`default_inbox_path`] of the path the queue is opened at. A custom
-    /// value that shares the object store with the queue must not equal or nest
-    /// within the queue's `path`.
+    /// value that shares the object store with the queue must lie outside the
+    /// queue's `path`: the open fails with [`Error::InboxPathWithinQueue`] for
+    /// the queue's path or a path inside it.
     pub path: Option<String>,
-    /// The queues that the core kinds `enqueue` and `cancel` may touch. An
-    /// entry for a queue outside the list is rejected.
+    /// The queues of the entries that the inbox accepts. A pass rejects an
+    /// entry for a queue outside the list.
     pub queues: Vec<String>,
     /// How long the record of an applied entry is retained, which is the window
     /// within which an entry with the same id is not applied again. Defaults to
@@ -100,6 +124,19 @@ pub struct InboxOptions {
 }
 
 impl InboxOptions {
+    /// The options of an inbox that accepts the entries of `queues`, with the
+    /// default of every other field.
+    pub fn new<Q: Into<String>>(queues: impl IntoIterator<Item = Q>) -> Self {
+        Self {
+            interval: DEFAULT_INBOX_INTERVAL,
+            touch_poll_interval: Some(DEFAULT_INBOX_TOUCH_POLL_INTERVAL),
+            object_store: None,
+            path: None,
+            queues: queues.into_iter().map(Into::into).collect(),
+            record_retention: DEFAULT_INBOX_RECORD_RETENTION,
+        }
+    }
+
     /// Set [`Self::interval`].
     #[must_use]
     pub fn interval(mut self, interval: Duration) -> Self {
@@ -128,20 +165,6 @@ impl InboxOptions {
         self
     }
 
-    /// Add one queue to [`Self::queues`].
-    #[must_use]
-    pub fn queue(mut self, queue: impl Into<String>) -> Self {
-        self.queues.push(queue.into());
-        self
-    }
-
-    /// Set [`Self::queues`].
-    #[must_use]
-    pub fn queues(mut self, queues: Vec<String>) -> Self {
-        self.queues = queues;
-        self
-    }
-
     /// Set [`Self::record_retention`].
     #[must_use]
     pub fn record_retention(mut self, record_retention: Duration) -> Self {
@@ -150,140 +173,8 @@ impl InboxOptions {
     }
 }
 
-impl Default for InboxOptions {
-    fn default() -> Self {
-        Self {
-            interval: DEFAULT_INBOX_INTERVAL,
-            touch_poll_interval: Some(DEFAULT_INBOX_TOUCH_POLL_INTERVAL),
-            object_store: None,
-            path: None,
-            queues: Vec::new(),
-            record_retention: DEFAULT_INBOX_RECORD_RETENTION,
-        }
-    }
-}
-
-/// The error of an [`InboxHandler`].
-pub type InboxHandlerError = Box<dyn std::error::Error + Send + Sync>;
-
-/// The handler of one inbox kind, registered with
-/// [`Queue::register_inbox_handler`](crate::Queue::register_inbox_handler).
-///
-/// The pass decodes the body of an entry as [`Self::Kind`] and rejects a body
-/// that does not decode. The handler applies the entry once. It commits the
-/// record of the entry in the transaction of the entry's effect, through the
-/// [`SettlementEffects`] that [`InboxRecordHandle::effects`] or
-/// [`InboxRecordHandle::attach`] builds, and reports [`Applied::Committed`].
-/// When the effect is idempotent, or the entry is rejected, the handler reports
-/// [`Applied::Separately`] with the outcome and the pass commits the record on
-/// its own. An error ends the pass, and the next pass applies the entry again.
-///
-/// [`SettlementEffects`]: crate::SettlementEffects
-pub trait InboxHandler: Send + Sync + 'static {
-    /// The entry type of the kind.
-    type Kind: InboxKind;
-
-    /// Apply `entry` with the record `record`.
-    fn apply(
-        &self,
-        entry: Self::Kind,
-        record: &InboxRecordHandle<OutcomeOf<Self>>,
-    ) -> impl Future<Output = std::result::Result<Applied<OutcomeOf<Self>>, InboxHandlerError>> + Send;
-}
-
-/// The outcome of the kind of the handler `H`.
-type OutcomeOf<H> = <<H as InboxHandler>::Kind as InboxKind>::Outcome;
-
-/// [`InboxHandler`] without its type, held by the queue.
-trait DynInboxHandler: Send + Sync {
-    /// Decode `body`, apply the entry `id` and encode its outcome, recorded at
-    /// `applied_at_ms`.
-    fn apply<'a>(
-        &'a self,
-        id: &'a str,
-        applied_at_ms: u64,
-        body: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = Result<Settled>> + Send + 'a>>;
-}
-
-impl<H: InboxHandler> DynInboxHandler for H {
-    fn apply<'a>(
-        &'a self,
-        id: &'a str,
-        applied_at_ms: u64,
-        body: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = Result<Settled>> + Send + 'a>> {
-        Box::pin(async move {
-            let record = InboxRecordHandle::new(id.to_string(), applied_at_ms);
-            let applied = match serde_json::from_value::<H::Kind>(body) {
-                Ok(entry) => InboxHandler::apply(self, entry, &record)
-                    .await
-                    .map_err(|source| Error::InboxHandler {
-                        kind: H::Kind::KIND.to_string(),
-                        source,
-                    })?,
-                Err(err) => malformed(err),
-            };
-            record.settle(applied)
-        })
-    }
-}
-
-/// The registration of an [`InboxHandler`] for one kind, or for one value of a
-/// field of the kind, returned by
-/// [`Queue::register_inbox_handler`](crate::Queue::register_inbox_handler) and
-/// [`Queue::register_inbox_handler_for`](crate::Queue::register_inbox_handler_for).
-/// The registration lasts while the value lives, and dropping it unregisters
-/// the handler: an entry of the kind, or of the value, then waits for the next
-/// registration.
-#[must_use = "dropping the registration unregisters the handler"]
-pub struct InboxRegistration {
-    core: Arc<QueueCore>,
-    kind: String,
-    /// The value of the scope, `None` for a registration of the whole kind.
-    value: Option<String>,
-}
-
-impl Drop for InboxRegistration {
-    fn drop(&mut self) {
-        let Some(inbox) = &self.core.inbox else {
-            return;
-        };
-        let mut handlers = inbox.handlers.write().unwrap();
-        match (&self.value, handlers.get_mut(&self.kind)) {
-            (Some(value), Some(Registered::ByField { values, .. })) => {
-                values.remove(value);
-                if values.is_empty() {
-                    handlers.remove(&self.kind);
-                }
-            }
-            (None, Some(Registered::Whole(_))) => {
-                handlers.remove(&self.kind);
-            }
-            _ => {}
-        }
-    }
-}
-
-/// The handlers of one kind: one for the whole kind, or one per value of a
-/// field of the body.
-enum Registered {
-    Whole(Arc<dyn DynInboxHandler>),
-    ByField {
-        field: String,
-        values: BTreeMap<String, Arc<dyn DynInboxHandler>>,
-    },
-}
-
-/// How the entries of a kind reach a handler.
-enum Lookup {
-    Core(CoreKind),
-    Whole(Arc<dyn DynInboxHandler>),
-    /// The handler is selected by the string at the field of the body.
-    ByField(String),
-}
-
-/// The inbox of an open queue: its store, its allow-list and its handlers.
+/// The inbox of an open queue: its store, its allow-list and the intervals of
+/// its pass task.
 pub(crate) struct InboxState {
     store: Arc<dyn ObjectStore>,
     prefix: String,
@@ -291,7 +182,8 @@ pub(crate) struct InboxState {
     touch_poll_interval: Option<Duration>,
     queues: HashSet<String>,
     pub(crate) retention: Duration,
-    handlers: RwLock<BTreeMap<String, Registered>>,
+    /// Held for the duration of a pass.
+    pass_lock: tokio::sync::Mutex<()>,
     /// The bound of the inbox expiry key space: the earliest `applied_at` of a
     /// live record, lowered after every commit that writes one.
     pub(crate) bound: TimeBound,
@@ -307,6 +199,15 @@ impl InboxState {
         for queue in &options.queues {
             QueueName::new(queue.as_str())?;
         }
+        if options.object_store.is_none()
+            && let Some(custom) = &options.path
+            && Path::from(custom.as_str()).prefix_matches(&Path::from(path))
+        {
+            return Err(Error::InboxPathWithinQueue {
+                path: custom.clone(),
+                queue_path: path.to_string(),
+            });
+        }
         Ok(Self {
             store: options.object_store.unwrap_or_else(|| store.clone()),
             prefix: options.path.unwrap_or_else(|| default_inbox_path(path)),
@@ -314,101 +215,14 @@ impl InboxState {
             touch_poll_interval: options.touch_poll_interval,
             queues: options.queues.into_iter().collect(),
             retention: options.record_retention,
-            handlers: RwLock::new(BTreeMap::new()),
+            pass_lock: tokio::sync::Mutex::new(()),
             bound: TimeBound::new(),
         })
     }
 
-    /// Whether the core kinds may touch `queue`.
-    pub(crate) fn allows(&self, queue: &str) -> bool {
+    /// Whether the inbox accepts the entries of `queue`.
+    pub(crate) fn accepts(&self, queue: &str) -> bool {
         self.queues.contains(queue)
-    }
-
-    /// Register `handler` for `kind`, or for the entries of `kind` with the
-    /// value of `scope` at its field. Fails for a core kind, for a kind with a
-    /// registration of the whole kind, for a value with a registration and for
-    /// a scope whose field differs from the field of the kind.
-    fn register(
-        &self,
-        kind: &str,
-        scope: Option<(&str, &str)>,
-        handler: Arc<dyn DynInboxHandler>,
-    ) -> Result<()> {
-        validate_kind(kind)?;
-        let taken = |value: Option<&str>| Error::InboxKindTaken {
-            kind: kind.to_string(),
-            value: value.map(str::to_string),
-        };
-        if is_core_kind(kind) {
-            return Err(taken(None));
-        }
-        let mut handlers = self.handlers.write().unwrap();
-        match (handlers.get_mut(kind), scope) {
-            (None, None) => {
-                handlers.insert(kind.to_string(), Registered::Whole(handler));
-            }
-            (None, Some((field, value))) => {
-                handlers.insert(
-                    kind.to_string(),
-                    Registered::ByField {
-                        field: field.to_string(),
-                        values: BTreeMap::from([(value.to_string(), handler)]),
-                    },
-                );
-            }
-            (Some(Registered::ByField { field, values }), Some((scope_field, value)))
-                if field == scope_field =>
-            {
-                if values.contains_key(value) {
-                    return Err(taken(Some(value)));
-                }
-                values.insert(value.to_string(), handler);
-            }
-            (Some(_), scope) => return Err(taken(scope.map(|(_, value)| value))),
-        }
-        Ok(())
-    }
-
-    /// How the entries of `kind` reach a handler, or `None` for a kind without
-    /// a registration.
-    fn lookup(&self, kind: &str) -> Option<Lookup> {
-        Some(match self.handlers.read().unwrap().get(kind)? {
-            Registered::Whole(handler) => Lookup::Whole(handler.clone()),
-            Registered::ByField { field, .. } => Lookup::ByField(field.clone()),
-        })
-    }
-
-    /// The handler of `kind` for `value`, or `None` without a registration.
-    fn scoped(&self, kind: &str, value: &str) -> Option<Arc<dyn DynInboxHandler>> {
-        match self.handlers.read().unwrap().get(kind)? {
-            Registered::ByField { values, .. } => values.get(value).cloned(),
-            Registered::Whole(_) => None,
-        }
-    }
-
-    /// The entries within the version prefix, in id order. A path outside the
-    /// layout is logged and left in place.
-    async fn list(&self) -> Result<Vec<Listed>> {
-        let prefix = Path::from(format!("{}/v1", self.prefix));
-        let mut objects = self.store.list(Some(&prefix));
-        let mut entries = Vec::new();
-        while let Some(object) = objects.try_next().await.map_err(Error::InboxStore)? {
-            let relative = object
-                .location
-                .as_ref()
-                .strip_prefix(prefix.as_ref())
-                .and_then(|rest| rest.strip_prefix('/'));
-            match relative.and_then(parse_entry_path) {
-                Some((kind, id)) => entries.push(Listed {
-                    kind,
-                    id,
-                    location: object.location,
-                }),
-                None => warn!(path = %object.location, "object outside the inbox layout; skipped"),
-            }
-        }
-        entries.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.kind.cmp(&b.kind)));
-        Ok(entries)
     }
 
     async fn get(&self, location: &Path) -> Result<Vec<u8>> {
@@ -435,16 +249,19 @@ impl InboxState {
     }
 }
 
-/// One listed entry: its path segments and its location.
-struct Listed {
-    kind: String,
-    id: String,
-    location: Path,
+/// The prefix of the entries of `kind` and `queue` in the inbox at `prefix`.
+pub(crate) fn kind_prefix(prefix: &str, queue: &str, kind: &str) -> String {
+    format!("{}/{queue}/{kind}", version_prefix(prefix))
 }
 
-/// The path of the entry `id` of `kind` in the inbox at `prefix`.
-pub(crate) fn entry_path(prefix: &str, kind: &str, id: &str) -> String {
-    format!("{prefix}/v1/{kind}/{id}")
+/// The prefix of the entries of the layout version in the inbox at `prefix`.
+fn version_prefix(prefix: &str) -> String {
+    format!("{prefix}/v1")
+}
+
+/// The path of the entry `id` of `kind` and `queue` in the inbox at `prefix`.
+pub(crate) fn entry_path(prefix: &str, queue: &str, kind: &str, id: &str) -> String {
+    format!("{}/{id}", kind_prefix(prefix, queue, kind))
 }
 
 /// The path of the touch object of the inbox at `prefix`.
@@ -452,14 +269,51 @@ pub(crate) fn touch_path(prefix: &str) -> String {
     format!("{prefix}/touch")
 }
 
-/// The kind and the id of an entry path relative to the version prefix, or
-/// `None` for a path outside the layout.
-fn parse_entry_path(relative: &str) -> Option<(String, String)> {
-    let (kind, id) = relative.split_once('/')?;
-    if id.contains('/') || validate_kind(kind).is_err() || validate_id(id).is_err() {
-        return None;
+/// The segments of an entry path within the version prefix, ordered by id and
+/// then by queue and kind.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct EntryPath {
+    pub(crate) id: String,
+    pub(crate) queue: String,
+    pub(crate) kind: String,
+}
+
+impl EntryPath {
+    /// The segments of the path `relative` to the version prefix, or `None` for
+    /// a path outside the layout.
+    fn parse(relative: &str) -> Option<Self> {
+        let mut segments = relative.split('/');
+        let (queue, kind, id) = (segments.next()?, segments.next()?, segments.next()?);
+        if segments.next().is_some() || kind.is_empty() || validate_id(id).is_err() {
+            return None;
+        }
+        Some(Self {
+            id: id.to_string(),
+            queue: QueueName::new(queue).ok()?.into_string(),
+            kind: kind.to_string(),
+        })
     }
-    Some((kind.to_string(), id.to_string()))
+}
+
+/// The entries within `under` in the inbox at `prefix` of `store`, in the order
+/// of [`EntryPath`]. A path outside the layout is logged and left in place.
+pub(crate) async fn list_entries(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    under: &str,
+) -> Result<Vec<(EntryPath, ObjectMeta)>> {
+    let version = format!("{}/", version_prefix(prefix));
+    let mut objects = store.list(Some(&Path::from(under)));
+    let mut entries = Vec::new();
+    while let Some(object) = objects.try_next().await.map_err(Error::InboxStore)? {
+        let path = object.location.as_ref().strip_prefix(version.as_str());
+        match path.and_then(EntryPath::parse) {
+            Some(path) => entries.push((path, object)),
+            None => warn!(path = %object.location, "object outside the inbox layout; skipped"),
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(entries)
 }
 
 /// The pass task of the inbox. A tick sends a HEAD for the touch object, and a
@@ -467,41 +321,39 @@ fn parse_entry_path(relative: &str) -> Option<(String, String)> {
 /// older than [`InboxOptions::interval`].
 pub(crate) struct Inbox {
     core: Arc<QueueCore>,
+    inbox: Arc<InboxState>,
     tick: Duration,
-    ticks_per_pass: u32,
     schedule: tokio::sync::Mutex<Schedule>,
 }
 
 struct Schedule {
     /// The touch object at the HEAD before the last pass.
     touched: Option<ObjectMeta>,
-    ticks: u32,
+    /// When the last pass of the task started, or `None` after a failed pass.
+    last_pass: Option<Instant>,
 }
 
 impl Inbox {
     /// The pass task of `core` after its first pass, or `None` for a queue
     /// without an inbox. A failed first pass fails the open.
     pub(crate) async fn open(core: Arc<QueueCore>) -> Result<Option<Self>> {
-        let Some(inbox) = &core.inbox else {
+        let Some(inbox) = core.inbox.clone() else {
             return Ok(None);
         };
-        let (tick, ticks_per_pass) = match inbox.touch_poll_interval {
-            Some(tick) => {
-                let ticks = inbox.interval.as_nanos().div_ceil(tick.as_nanos().max(1));
-                (tick, u32::try_from(ticks).unwrap_or(u32::MAX).max(1))
-            }
-            None => (inbox.interval, 1),
+        let (tick, touched) = match inbox.touch_poll_interval {
+            Some(tick) => (tick, seen_touch(&inbox).await),
+            None => (inbox.interval, None),
         };
-        let touched = match inbox.touch_poll_interval {
-            Some(_) => seen_touch(inbox).await,
-            None => None,
-        };
+        let started = Instant::now();
         core.inbox_pass().await?;
         Ok(Some(Self {
-            core: core.clone(),
+            core,
+            inbox,
             tick,
-            ticks_per_pass,
-            schedule: tokio::sync::Mutex::new(Schedule { touched, ticks: 0 }),
+            schedule: tokio::sync::Mutex::new(Schedule {
+                touched,
+                last_pass: Some(started),
+            }),
         }))
     }
 
@@ -523,14 +375,12 @@ impl Periodic for Inbox {
     const NAME: &'static str = "inbox";
 
     async fn step(&self) -> Result<()> {
-        let Some(inbox) = &self.core.inbox else {
-            return Ok(());
-        };
         let mut schedule = self.schedule.lock().await;
-        schedule.ticks += 1;
-        let mut due = schedule.ticks >= self.ticks_per_pass;
-        if inbox.touch_poll_interval.is_some() {
-            match inbox.touch_meta().await {
+        let mut due = schedule
+            .last_pass
+            .is_none_or(|started| started.elapsed() >= self.inbox.interval);
+        if self.inbox.touch_poll_interval.is_some() {
+            match self.inbox.touch_meta().await {
                 Ok(touched) if touched != schedule.touched => {
                     schedule.touched = touched;
                     due = true;
@@ -542,44 +392,21 @@ impl Periodic for Inbox {
         if !due {
             return Ok(());
         }
-        schedule.ticks = 0;
+        let started = Instant::now();
         let passed = self.core.inbox_pass().await;
-        // A pass that ended at an error of the store runs again at the next
-        // tick. A handler error waits for the next touch or interval.
-        if let Err(err) = &passed
-            && !matches!(err, Error::InboxHandler { .. })
-        {
-            schedule.ticks = self.ticks_per_pass;
-        }
+        schedule.last_pass = passed.is_ok().then_some(started);
         passed
     }
 }
 
 impl QueueCore {
-    /// Register `handler` for its kind on the inbox, as
-    /// [`Queue::register_inbox_handler`](crate::Queue::register_inbox_handler)
-    /// documents.
-    pub(crate) fn register_inbox_handler<H: InboxHandler>(
-        self: &Arc<Self>,
-        scope: Option<(&str, &str)>,
-        handler: H,
-    ) -> Result<InboxRegistration> {
-        let kind = H::Kind::KIND;
-        let inbox = self.inbox.as_ref().ok_or(Error::InboxNotConfigured)?;
-        inbox.register(kind, scope, Arc::new(handler))?;
-        Ok(InboxRegistration {
-            core: self.clone(),
-            kind: kind.to_string(),
-            value: scope.map(|(_, value)| value.to_string()),
-        })
-    }
-
     /// One pass over the inbox, as the module documents. A queue without an
     /// inbox returns without a request.
     pub(crate) async fn inbox_pass(&self) -> Result<()> {
         let Some(inbox) = &self.inbox else {
             return Ok(());
         };
+        let _pass = inbox.pass_lock.lock().await;
         let passed = self.inbox_pass_over(inbox).await;
         if passed.is_err() {
             crate::obs::inbox_pass_failed();
@@ -588,55 +415,27 @@ impl QueueCore {
     }
 
     async fn inbox_pass_over(&self, inbox: &InboxState) -> Result<()> {
-        for listed in inbox.list().await? {
-            let Listed { kind, id, location } = listed;
+        let entries =
+            list_entries(&*inbox.store, &inbox.prefix, &version_prefix(&inbox.prefix)).await?;
+        for (EntryPath { id, queue, kind }, ObjectMeta { location, .. }) in entries {
             if self.db.get(inbox_record_key(&id)).await?.is_some() {
                 inbox.delete(&location).await?;
                 debug!(kind, id, "inbox entry already applied; object deleted");
                 continue;
             }
-            let lookup = match CoreKind::parse(&kind) {
-                Some(core_kind) => Lookup::Core(core_kind),
-                None => match inbox.lookup(&kind) {
-                    Some(lookup) => lookup,
-                    None => continue,
-                },
-            };
-            let body = inbox.get(&location).await?;
-            let applied_at_ms = self.now_ms();
-            let settled = match serde_json::from_slice::<serde_json::Value>(&body) {
-                Err(err) => {
-                    InboxRecordHandle::<()>::new(id.clone(), applied_at_ms).settle(malformed(err))
+            let record = InboxRecordHandle::new(id.clone(), self.now_ms());
+            let settled = match CoreKind::parse(&kind) {
+                _ if !inbox.accepts(&queue) => Ok(Settled::Rejected(format!(
+                    "queue `{queue}` is outside the inbox allow-list"
+                ))),
+                Some(core_kind) => {
+                    let body = inbox.get(&location).await?;
+                    self.apply_entry(core_kind, &queue, &record, &body).await
                 }
-                Ok(body) => {
-                    let route = match lookup {
-                        Lookup::Core(core_kind) => Route::Core(core_kind),
-                        Lookup::Whole(handler) => Route::Handler(handler),
-                        Lookup::ByField(field) => {
-                            let value = body.get(&field).and_then(|v| v.as_str());
-                            match value.and_then(|value| inbox.scoped(&kind, value)) {
-                                Some(handler) => Route::Handler(handler),
-                                None => {
-                                    debug!(
-                                        kind,
-                                        id, field, "inbox entry of a scope without a handler; left"
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
-                    };
-                    match route {
-                        Route::Core(core_kind) => {
-                            self.apply_core_kind(inbox, core_kind, &id, applied_at_ms, body)
-                                .await
-                        }
-                        Route::Handler(handler) => handler.apply(&id, applied_at_ms, body).await,
-                    }
-                }
+                None => Ok(Settled::Rejected(format!("unknown inbox kind `{kind}`"))),
             };
             let recorded = match settled {
-                Ok(settled) => self.record_entry(&id, &kind, settled).await,
+                Ok(settled) => self.record_entry(&kind, &record, settled).await,
                 Err(err) => Err(err),
             };
             // A record committed before the error stands.
@@ -658,35 +457,38 @@ impl QueueCore {
         Ok(())
     }
 
-    /// Verify or commit the record of the entry `id` of `kind` as `settled`
-    /// reports it, and return whether the entry was rejected.
-    async fn record_entry(&self, id: &str, kind: &str, settled: Settled) -> Result<bool> {
+    /// Commit the record of an entry of `kind` that `settled` reports
+    /// separately, and return whether the entry was rejected.
+    async fn record_entry(
+        &self,
+        kind: &str,
+        record: &InboxRecordHandle,
+        settled: Settled,
+    ) -> Result<bool> {
         match settled {
-            Settled::Committed => {
-                if self.db.get(inbox_record_key(id)).await?.is_none() {
-                    return Err(Error::InboxRecordMissing { id: id.to_string() });
-                }
+            Settled::Committed => Ok(false),
+            Settled::Applied(staged) => {
+                self.commit_record(staged).await?;
                 Ok(false)
             }
-            Settled::Separately { record, rejection } => {
-                let effects = SettlementEffects {
-                    inbox_record: Some(record),
-                    ..SettlementEffects::default()
-                };
-                self.commit_effects_where(effects, &[]).await?;
-                if let Some(reason) = &rejection {
-                    warn!(kind, id, reason, "inbox entry rejected");
-                }
-                Ok(rejection.is_some())
+            Settled::Rejected(reason) => {
+                let staged = record.staged::<()>(InboxOutcome::Rejected(reason.clone()))?;
+                self.commit_record(staged).await?;
+                warn!(kind, id = record.id, reason, "inbox entry rejected");
+                Ok(true)
             }
         }
     }
-}
 
-/// The application of one entry: through the core, or through a handler.
-enum Route {
-    Core(CoreKind),
-    Handler(Arc<dyn DynInboxHandler>),
+    /// Commit `record` in a transaction of its own.
+    async fn commit_record(&self, record: StagedRecord) -> Result<()> {
+        let effects = SettlementEffects {
+            inbox_record: Some(record),
+            ..SettlementEffects::default()
+        };
+        self.commit_effects_where(effects, &[]).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -14,25 +14,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its id with a payload before its `run_at`. A signal to a job that does not
   wait returns `SignalOutcome::NotWaiting` without a change. A wait without
   `run_at` fails with `Error::SignalWaitWithoutRunAt`.
-- The inbox: `OpenOptions::inbox` with `InboxOptions` opens the queue with a
-  prefix of objects that the writer applies once each, through which another
-  process enqueues, cancels and signals. `InboxSender` writes an entry
-  (`EnqueueEntry`, `CancelEntry`, `SignalEntry` or a type of a layer that
-  implements `InboxKind`, which specifies the outcome type of the kind), an
-  `EnqueueEntry` converts to and from an `EnqueueRequest`,
-  `Queue::register_inbox_handler` registers an `InboxHandler` of a kind of a
-  layer, `Queue::register_inbox_handler_for` registers one for the entries of
-  the kind with a value at a field of the body, `QueueView::inbox_record` reads
-  the `InboxRecord` of an applied entry with the outcome of its kind,
-  `Queue::apply_inbox_now` runs a pass and `default_inbox_path` is the path of
-  an inbox opened without `InboxOptions::path`. A core kind records the
-  `EnqueueResult`, `CancelOutcome` or `SignalOutcome` of its operation, which
-  implement `Serialize` and `Deserialize`. The pass rejects a body that does not
-  decode as its kind. A sender overwrites a touch object after each entry, and
-  the writer lists the inbox when a poll at `InboxOptions::touch_poll_interval`
-  finds a change, and once per `InboxOptions::interval`. The key layout gains
-  the `InboxRecord` and `InboxExpiry` spaces, and the crate depends on
-  serde_json and base64. See ADR-0005.
+- The inbox: `OpenOptions::inbox` with `InboxOptions::new` opens the queue with
+  a prefix of objects through which another process enqueues, cancels and
+  signals. The writer applies each entry once within
+  `InboxOptions::record_retention`, and the key layout gains the `InboxRecord`
+  and `InboxExpiry` spaces. The crate depends on serde_json and base64. See
+  ADR-0005.
+- `InboxSender` writes an `EnqueueEntry`, a `CancelEntry` or a `SignalEntry`,
+  the types of the sealed trait `InboxKind`, and `InboxSender::pending` lists
+  the entries that await a pass. `EnqueueEntry::from_request` and
+  `EnqueueEntry::into_request` convert between an entry and an `EnqueueRequest`.
+- `QueueView::inbox_record` reads the `InboxRecord` of an applied entry, with
+  the outcome of its operation or the reason of its rejection. `EnqueueResult`,
+  `CancelOutcome` and `SignalOutcome` implement `Serialize` and `Deserialize`.
+- `Queue::apply_inbox_now` runs a pass of the inbox, and `Queue::inbox_accepts`
+  reports whether the inbox accepts a queue. `default_inbox_path` returns the
+  path of an inbox opened without `InboxOptions::path`.
 
 ### Changed
 

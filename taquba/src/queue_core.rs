@@ -84,7 +84,7 @@ pub(crate) struct QueueCore {
     pub(crate) closed: CancellationToken,
     /// The inbox, when [`OpenOptions::inbox`](crate::OpenOptions::inbox) is
     /// set.
-    pub(crate) inbox: Option<InboxState>,
+    pub(crate) inbox: Option<Arc<InboxState>>,
 }
 
 impl QueueCore {

@@ -112,7 +112,9 @@ impl EffectsState {
             return Err(Error::EffectsSealed);
         }
         check_enqueue(&request, self.runtime_queue.as_deref())?;
-        self.staged.enqueues.push(request.into());
+        self.staged
+            .enqueues
+            .push(EnqueueEntry::from_request(request));
         Ok(())
     }
 
@@ -136,7 +138,8 @@ impl EffectsState {
 pub(crate) struct StagedEffects {
     pub(crate) writes: HashMap<Vec<u8>, Vec<u8>>,
     pub(crate) deletes: HashSet<Vec<u8>>,
-    pub(crate) enqueues: Vec<EnqueueEntry>,
+    /// The queue and the entry of each enqueue.
+    pub(crate) enqueues: Vec<(String, EnqueueEntry)>,
 }
 
 impl StagedEffects {
@@ -144,9 +147,11 @@ impl StagedEffects {
     pub(crate) fn add_to(self, effects: &mut SettlementEffects) {
         effects.kv_writes.extend(self.writes);
         effects.kv_deletes.extend(self.deletes);
-        effects
-            .enqueues
-            .extend(self.enqueues.into_iter().map(EnqueueRequest::from));
+        effects.enqueues.extend(
+            self.enqueues
+                .into_iter()
+                .map(|(queue, entry)| entry.into_request(queue)),
+        );
     }
 }
 

@@ -636,7 +636,7 @@ impl RunGroup {
         )
         .map(|member| async move {
             self.runtime
-                .cancel_run(&member.record.run_id, reason.clone(), Ok)
+                .cancel_run(&member.record.run_id, reason.clone())
                 .await
         })
         .buffer_unordered(SUBMIT_CONCURRENCY);

@@ -366,34 +366,13 @@
 //!
 //! # Requests from another process
 //!
-//! Another process can send a request as an entry: a JSON object at a versioned
-//! path with the inbox prefix, which is outside the store. The writer applies
-//! each entry in one transaction of the store that also records the entry.
-//! [`OpenOptions::inbox`] opens the queue with an inbox, at `"{path}-inbox"` by
-//! default, and the writer lists it at open, after a change of its touch object
-//! and once per [`InboxOptions::interval`]. An [`InboxSender`] writes an entry
-//! at `{path}/v1/{kind}/{id}`: [`EnqueueEntry`] enqueues a job on a queue of
-//! [`InboxOptions::queues`], [`CancelEntry`] cancels a job and [`SignalEntry`]
-//! delivers a signal. A layer registers a kind of its own with
-//! [`Queue::register_inbox_handler`], or one handler per instance of the layer
-//! with [`Queue::register_inbox_handler_for`], selected by a field of the body
-//! as the core kinds select a queue.
-//!
-//! The writer applies the entries of a pass in id order, commits an
-//! [`InboxRecord`] at the id in the transaction of the entry's effect and
-//! deletes the object. An entry whose record exists is deleted without an
-//! effect, so an entry sent twice applies once within
-//! [`InboxOptions::record_retention`]. [`QueueView::inbox_record`] reads the
-//! outcome from the writer or a [`QueueReader`], as the [`InboxKind::Outcome`]
-//! of the kind: the [`EnqueueResult`], [`CancelOutcome`] or [`SignalOutcome`]
-//! of a core kind. A malformed entry, or one for a queue outside the
-//! allow-list, is recorded as rejected with the reason. An error ends the pass
-//! at its entry, and the next pass starts again there.
-//!
-//! The inbox is one-way: a sender observes the outcome through a reader, and
-//! only the writer commits. A sender in another language writes the JSON body
-//! itself, with a bytes field in base64. A sender without a [`QueueReader`],
-//! which is a Rust type, cannot read the outcome of its entry.
+//! Another process can enqueue, cancel and signal jobs without opening the
+//! store. It writes a request with an [`InboxSender`] to the inbox, a prefix of
+//! objects outside the store, and the writer applies the request.
+//! [`OpenOptions::inbox`] with [`InboxOptions::new`] opens the queue with an
+//! inbox for the listed queues, and [`QueueView::inbox_record`] of a
+//! [`QueueReader`] reads the outcome of a request. The docs of [`InboxOptions`]
+//! and [`InboxSender`] describe the passes and the entries.
 //!
 //! # Background tasks
 //!
@@ -525,11 +504,11 @@ pub use history::{AttemptOutcome, JobAttempt};
 pub use inbox::entry::{
     CancelEntry, EnqueueEntry, InboxKind, MAX_INBOX_ID_LEN, SignalEntry, inbox_bytes,
 };
-pub use inbox::record::{Applied, InboxOutcome, InboxRecord, InboxRecordHandle};
-pub use inbox::sender::InboxSender;
+pub use inbox::record::{InboxOutcome, InboxRecord};
+pub use inbox::sender::{InboxSender, PendingEntry};
 pub use inbox::{
     DEFAULT_INBOX_INTERVAL, DEFAULT_INBOX_RECORD_RETENTION, DEFAULT_INBOX_TOUCH_POLL_INTERVAL,
-    InboxHandler, InboxHandlerError, InboxOptions, InboxRegistration, default_inbox_path,
+    InboxOptions, default_inbox_path,
 };
 pub use job::{Claim, JobRecord, JobStatus};
 pub use keys::{MAX_QUEUE_NAME_LEN, QueueName};

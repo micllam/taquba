@@ -6,10 +6,10 @@
 //! settlement that registers the wait, so the request leaves after the wait
 //! exists. A worker of the request queue forwards the request to the machine
 //! that performs the work, and that machine sends its reply as a `SignalEntry`
-//! to the id through an `InboxSender`. The writer applies the entry at its next
-//! pass of the inbox, and the signal wakes the run with the reply as its
-//! payload. The remote machine needs write access to the inbox prefix alone,
-//! and this process does not need a reachable port.
+//! to the id through an `InboxSender`, for the queue of the runtime. The writer
+//! applies the entry at its next pass of the inbox, and the signal wakes the
+//! run with the reply as its payload. The remote machine needs write access to
+//! the inbox prefix alone, and this process does not need a reachable port.
 //!
 //! ```text
 //! cargo run -p taquba-workflow --example remote_reply
@@ -33,8 +33,8 @@ use taquba::{
     Queue, SignalEntry, Worker, WorkerError, default_inbox_path, run_worker,
 };
 use taquba_workflow::{
-    RunId, RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects,
-    TerminalHook, TerminalStatus, WorkflowRuntime,
+    DEFAULT_QUEUE_NAME, RunId, RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner,
+    TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -132,7 +132,7 @@ async fn remote_worker(mut requests: mpsc::Receiver<Request>, sender: InboxSende
             job_id: request.wait_id,
             payload: request.text.to_uppercase().into_bytes(),
         };
-        match sender.send(&entry).await {
+        match sender.send(DEFAULT_QUEUE_NAME, &entry).await {
             Ok(id) => println!("[remote] sent the reply as inbox entry {id}"),
             Err(e) => println!("[remote] failed to send the reply: {e}"),
         }
@@ -173,7 +173,9 @@ impl TerminalHook for ShutdownOnTermination {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let opts = OpenOptions {
-        inbox: Some(InboxOptions::default().touch_poll_interval(TOUCH_POLL_INTERVAL)),
+        inbox: Some(
+            InboxOptions::new([DEFAULT_QUEUE_NAME]).touch_poll_interval(TOUCH_POLL_INTERVAL),
+        ),
         ..OpenOptions::default()
     };
     let queue = Arc::new(Queue::open_with_options(store.clone(), QUEUE_PATH, opts).await?);

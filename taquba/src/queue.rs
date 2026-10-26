@@ -15,7 +15,7 @@ use crate::completion::{CompletionWaiters, Registration};
 use crate::effects::{EnqueueRequest, PreparedEffects, SettlementEffects};
 use crate::error::{Characters, Error, Form, Result};
 use crate::history::AttemptOutcome;
-use crate::inbox::{Inbox, InboxHandler, InboxRegistration, InboxState};
+use crate::inbox::{Inbox, InboxState};
 use crate::job::{Claim, JobRecord, JobStatus};
 use crate::keys::QueueName;
 use crate::lease_registry::{LeaseRegistry, Renewal};
@@ -317,7 +317,7 @@ impl Queue {
         }
         let inbox = opts
             .inbox
-            .map(|inbox| InboxState::new(inbox, &object_store, path))
+            .map(|inbox| InboxState::new(inbox, &object_store, path).map(Arc::new))
             .transpose()?;
         let db = Arc::new(builder.build().await?);
         let core = Arc::new(QueueCore {
@@ -388,40 +388,6 @@ impl Queue {
             heartbeat,
             close_watcher,
         })
-    }
-
-    /// Register `handler` for its inbox kind [`InboxHandler::Kind`], so a pass
-    /// applies the entries of the kind through it. The registration lasts while
-    /// the returned [`InboxRegistration`] lives.
-    ///
-    /// Fails with [`Error::InboxNotConfigured`] on a queue opened without
-    /// [`OpenOptions::inbox`], with [`Error::InvalidInboxKind`] for a kind name
-    /// outside the form of [`InboxKind::KIND`](crate::InboxKind::KIND), and
-    /// with [`Error::InboxKindTaken`] for a core kind or a kind with a live
-    /// registration.
-    pub fn register_inbox_handler<H: InboxHandler>(&self, handler: H) -> Result<InboxRegistration> {
-        self.core.register_inbox_handler(None, handler)
-    }
-
-    /// Register `handler` for the entries of its inbox kind whose body contains
-    /// the string `value` at `field`, so each instance of a layer applies the
-    /// entries that identify it, as the core kinds identify a queue. An entry
-    /// of the kind with another string at the field, or without one, waits for
-    /// a registration for its value. A kind with a registration for a value
-    /// accepts further registrations with the same field and other values, and
-    /// refuses a registration of the whole kind.
-    ///
-    /// Fails as [`Self::register_inbox_handler`] fails, and with
-    /// [`Error::InboxKindTaken`] for a value with a live registration or a
-    /// field that differs from the field of the kind.
-    pub fn register_inbox_handler_for<H: InboxHandler>(
-        &self,
-        field: &str,
-        value: &str,
-        handler: H,
-    ) -> Result<InboxRegistration> {
-        self.core
-            .register_inbox_handler(Some((field, value)), handler)
     }
 
     /// The writer's live view of the store: the read-only queries, with a write
@@ -1204,6 +1170,17 @@ impl Queue {
     /// a request.
     pub async fn apply_inbox_now(&self) -> Result<()> {
         self.core.inbox_pass().await
+    }
+
+    /// Whether the inbox accepts the entries of `queue`, which
+    /// [`InboxOptions::queues`](crate::InboxOptions::queues) lists. It is
+    /// `false` for every queue of a queue opened without
+    /// [`OpenOptions::inbox`].
+    pub fn inbox_accepts(&self, queue: &str) -> bool {
+        self.core
+            .inbox
+            .as_ref()
+            .is_some_and(|inbox| inbox.accepts(queue))
     }
 
     /// Shut down the background reaper and scheduler, persist each queue's

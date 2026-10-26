@@ -7,8 +7,8 @@ use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use taquba::object_store::ObjectStore;
 use taquba::{
-    Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, InboxRegistration, JobRecord, JobStatus,
-    Queue, SettlementEffects, WaitOutcome, WorkerHandle,
+    Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, JobRecord, JobStatus, Queue,
+    SettlementEffects, WaitOutcome, WorkerHandle,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
@@ -21,7 +21,6 @@ use crate::durable::{
 use crate::effects::{StagedEffects, TerminalEffects};
 use crate::error::{Error, Result};
 use crate::group::{GroupStore, Membership, RunGroup, pending_member, terminated_member};
-use crate::inbox::{CancelRunHandler, INBOX_QUEUE_FIELD, SubmitHandler};
 use crate::keys::{
     DEDUP_PREFIX, GROUP_TERMINAL_KV_PREFIX, HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RunId,
     TERMINAL_KV_PREFIX, check_effects, check_headers, hash_input, next_step_job_id, run_kv_key,
@@ -298,7 +297,6 @@ pub struct WorkflowRuntimeBuilder<R, H> {
     group_retention: Option<Duration>,
     step_output_replay: bool,
     clock: Arc<dyn Clock>,
-    inbox_kinds: bool,
 }
 
 impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
@@ -387,67 +385,27 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
         self
     }
 
-    /// Register the inbox kinds `workflow.submit` and `workflow.cancel` on the
-    /// queue's inbox at the build, for the entries whose `queue` field names
-    /// this runtime's [`Self::queue_name`], so another process submits and
-    /// cancels runs with a [`taquba::InboxSender`] and the entry types
-    /// [`SubmitEntry`](crate::SubmitEntry) and
-    /// [`CancelRunEntry`](crate::CancelRunEntry). The registrations last for
-    /// the lifetime of the runtime, and each runtime over the queue registers
-    /// them for its own queue name.
-    pub fn inbox_kinds(mut self) -> Self {
-        self.inbox_kinds = true;
-        self
-    }
-
     /// Finalise the builder.
     ///
     /// # Errors
     ///
     /// The error of [`TerminalHook::check_runtime`] for the configured queue
-    /// name. With [`Self::inbox_kinds`], [`taquba::Error::InboxNotConfigured`]
-    /// for a queue opened without an inbox and
-    /// [`taquba::Error::InboxKindTaken`] when a runtime with the same queue
-    /// name registered the kinds.
+    /// name.
     pub fn build(self) -> Result<WorkflowRuntime<R, H>>
     where
         H: 'static,
     {
         self.terminal_hook.check_runtime(&self.queue_name)?;
-        let inbox_kinds = self.inbox_kinds;
-        let (runner, terminal_hook, core) = self.parts();
-        let registrations = if inbox_kinds {
-            vec![
-                core.queue.register_inbox_handler_for(
-                    INBOX_QUEUE_FIELD,
-                    &core.queue_name,
-                    SubmitHandler { core: core.clone() },
-                )?,
-                core.queue.register_inbox_handler_for(
-                    INBOX_QUEUE_FIELD,
-                    &core.queue_name,
-                    CancelRunHandler { core: core.clone() },
-                )?,
-            ]
-        } else {
-            Vec::new()
-        };
-        Ok(WorkflowRuntime::from_parts(
-            runner,
-            terminal_hook,
-            core,
-            registrations,
-        ))
+        Ok(self.assemble())
     }
 
-    /// The runtime of this configuration, without the check of the hook and
-    /// without the inbox kinds.
+    /// The runtime of this configuration, without the check of the hook.
     pub(crate) fn assemble(self) -> WorkflowRuntime<R, H>
     where
         H: 'static,
     {
         let (runner, terminal_hook, core) = self.parts();
-        WorkflowRuntime::from_parts(runner, terminal_hook, core, Vec::new())
+        WorkflowRuntime::from_parts(runner, terminal_hook, core)
     }
 
     /// The runner, the hook and the core of this configuration.
@@ -499,20 +457,13 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
 }
 
 impl<R, H> WorkflowRuntime<R, H> {
-    /// The runtime over `core` with `runner`, `terminal_hook` and the inbox
-    /// registrations `inbox_kinds`.
-    fn from_parts(
-        runner: R,
-        terminal_hook: Arc<H>,
-        core: Arc<RuntimeCore>,
-        inbox_kinds: Vec<InboxRegistration>,
-    ) -> Self {
+    /// The runtime over `core` with `runner` and `terminal_hook`.
+    fn from_parts(runner: R, terminal_hook: Arc<H>, core: Arc<RuntimeCore>) -> Self {
         Self {
             inner: Arc::new(RuntimeInner {
                 runner,
                 terminal_hook,
                 core,
-                _inbox_kinds: inbox_kinds,
             }),
         }
     }
@@ -569,10 +520,6 @@ pub(crate) struct RuntimeInner<R, H> {
     pub(crate) runner: R,
     pub(crate) terminal_hook: Arc<H>,
     pub(crate) core: Arc<RuntimeCore>,
-    /// The registrations of the inbox kinds, made by the build with
-    /// [`WorkflowRuntimeBuilder::inbox_kinds`], held for their drop with the
-    /// runtime.
-    _inbox_kinds: Vec<InboxRegistration>,
 }
 
 /// The control half of a runtime: the queue, the stores and the settings, with
@@ -660,7 +607,6 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             group_retention: None,
             step_output_replay: false,
             clock,
-            inbox_kinds: false,
         }
     }
 
@@ -744,7 +690,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// only to the run it is recorded on, and a later submission of the same
     /// run id starts without it.
     pub async fn cancel(&self, run_id: &RunId, reason: Option<String>) -> Result<CancelRunOutcome> {
-        self.inner.core.cancel_run(run_id, reason, Ok).await
+        self.inner.core.cancel_run(run_id, reason).await
     }
 
     /// The group named `id`.
@@ -857,19 +803,9 @@ impl RuntimeCore {
     /// [`WorkflowRuntime::submit`].
     #[instrument(skip(self, spec), fields(run_id))]
     pub(crate) async fn submit(&self, spec: RunSpec) -> Result<SubmitOutcome> {
-        self.submit_recorded(spec, |_, effects| Ok(effects)).await
-    }
-
-    /// [`Self::submit`], with the effects of a new submission passed through
-    /// `attach` with its outcome before the commit.
-    pub(crate) async fn submit_recorded(
-        &self,
-        spec: RunSpec,
-        attach: impl FnOnce(&SubmitOutcome, SettlementEffects) -> taquba::Result<SettlementEffects>,
-    ) -> Result<SubmitOutcome> {
         let run_id = self.validate_spec(&spec)?;
         tracing::Span::current().record("run_id", run_id.as_str());
-        self.enqueue_run(&run_id, spec, None, attach).await
+        self.enqueue_run(&run_id, spec, None).await
     }
 
     /// [`Self::submit`] of a member of a group: the run's step jobs hold the
@@ -880,8 +816,7 @@ impl RuntimeCore {
         spec: RunSpec,
     ) -> Result<SubmitOutcome> {
         let run_id = self.validate_spec(&spec)?;
-        self.enqueue_run(&run_id, spec, Some(membership), |_, effects| Ok(effects))
-            .await
+        self.enqueue_run(&run_id, spec, Some(membership)).await
     }
 
     /// Check `spec`'s headers and effects, and return the run id, generated
@@ -897,14 +832,12 @@ impl RuntimeCore {
     /// the termination, so it identifies a run whichever process submitted it,
     /// and the step's dedup key serialises two submissions that both find the
     /// record absent. A `membership` is set on the step job and its pending
-    /// member record is written with the enqueue. The effects of a new
-    /// submission pass through `attach` with its outcome.
+    /// member record is written with the enqueue.
     async fn enqueue_run(
         &self,
         run_id: &RunId,
         spec: RunSpec,
         membership: Option<&Membership>,
-        attach: impl FnOnce(&SubmitOutcome, SettlementEffects) -> taquba::Result<SettlementEffects>,
     ) -> Result<SubmitOutcome> {
         let input_hash = hash_input(&spec.input);
         let duplicate = |job_id: String| SubmitOutcome {
@@ -973,7 +906,6 @@ impl RuntimeCore {
             newly_submitted: true,
             job_id,
         };
-        let effects = attach(&submitted, effects)?;
 
         match self
             .queue
@@ -1016,13 +948,11 @@ impl RuntimeCore {
         }
     }
 
-    /// [`WorkflowRuntime::cancel`], with the effects of the removal of the
-    /// queued step passed through `attach` before the commit.
+    /// [`WorkflowRuntime::cancel`].
     pub(crate) async fn cancel_run(
         &self,
         run_id: &RunId,
         reason: Option<String>,
-        attach: impl Fn(SettlementEffects) -> taquba::Result<SettlementEffects>,
     ) -> Result<CancelRunOutcome> {
         let Some((submission, request)) = self.request_cancel(run_id, reason).await? else {
             return Ok(CancelRunOutcome::NotActive);
@@ -1048,7 +978,7 @@ impl RuntimeCore {
             let outcome = claimed.cancelled(CancelOrigin::Request, request.reason.clone());
             let termination = self.termination(&outcome, None, submission);
             let effects = self.terminate_collecting_effects(&outcome, &claimed, termination);
-            match self.queue.cancel_with(&job.id, attach(effects)?).await?.0 {
+            match self.queue.cancel_with(&job.id, effects).await?.0 {
                 taquba::CancelOutcome::Removed => return Ok(CancelRunOutcome::Removed),
                 taquba::CancelOutcome::Requested => return Ok(CancelRunOutcome::Requested),
                 taquba::CancelOutcome::NotFound => continue,
