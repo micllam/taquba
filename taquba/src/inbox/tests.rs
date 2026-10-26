@@ -1,9 +1,8 @@
-use serde_json::json;
 use slatedb::object_store::{ObjectStoreExt, PutPayload, path::Path};
 
 use super::*;
 use crate::error::Error;
-use crate::inbox::entry::{CancelEntry, EnqueueEntry, SignalEntry};
+use crate::inbox::entry::{CancelEntry, EnqueueEntry, InboxEntry, SignalEntry};
 use crate::inbox::record::{InboxOutcome, InboxRecordHandle};
 use crate::inbox::sender::InboxSender;
 use crate::queue::{CancelOutcome, EnqueueResult, Queue, SignalOutcome};
@@ -56,7 +55,7 @@ async fn an_entry_is_applied_once_with_a_record_and_its_object_deleted() {
     let clock = MockClock::new(INITIAL);
     let q = open(&store, &clock).await;
     let id = sender(&store)
-        .send(WORK, &EnqueueEntry::new(b"hello"))
+        .send(WORK, EnqueueEntry::new(b"hello"))
         .await
         .unwrap();
     assert_eq!(object_count(&store, "test-inbox/v1/work/enqueue").await, 1);
@@ -65,32 +64,20 @@ async fn an_entry_is_applied_once_with_a_record_and_its_object_deleted() {
     let job = q.claim("work", LEASE).await.unwrap().unwrap();
     assert_eq!(job.payload, b"hello");
     assert_eq!(object_count(&store, "test-inbox/v1/work/enqueue").await, 0);
-    let record = q
-        .view()
-        .inbox_record::<EnqueueEntry>(&id)
-        .await
-        .unwrap()
-        .unwrap();
+    let record = q.view().inbox_record(&id).await.unwrap().unwrap();
     assert_eq!(record.applied_at_ms, INITIAL);
     assert_eq!(
         record.outcome,
-        InboxOutcome::Applied(EnqueueResult::New(job.id.clone()))
+        InboxOutcome::Enqueue(EnqueueResult::New(job.id.clone()))
     );
 
     // The record is read from another process, and an entry sent again with the
     // id is deleted without an effect.
     let reader = QueueReader::open(store.clone(), "test").await.unwrap();
-    assert_eq!(
-        reader
-            .view()
-            .inbox_record::<EnqueueEntry>(&id)
-            .await
-            .unwrap(),
-        Some(record)
-    );
+    assert_eq!(reader.view().inbox_record(&id).await.unwrap(), Some(record));
     reader.close().await.unwrap();
     sender(&store)
-        .send_with_id(WORK, &id, &EnqueueEntry::new(b"again"))
+        .send_with_id(WORK, &id, EnqueueEntry::new(b"again"))
         .await
         .unwrap();
     q.apply_inbox_now().await.unwrap();
@@ -105,11 +92,11 @@ async fn entries_apply_in_id_order_across_kinds() {
     let q = open(&store, &MockClock::new(INITIAL)).await;
     let sender = sender(&store);
     sender
-        .send_with_id(WORK, "b", &EnqueueEntry::new(b"second"))
+        .send_with_id(WORK, "b", EnqueueEntry::new(b"second"))
         .await
         .unwrap();
     sender
-        .send_with_id(WORK, "a", &EnqueueEntry::new(b"first"))
+        .send_with_id(WORK, "a", EnqueueEntry::new(b"first"))
         .await
         .unwrap();
     q.apply_inbox_now().await.unwrap();
@@ -127,7 +114,7 @@ async fn an_entry_that_cannot_apply_is_rejected_with_a_record() {
     put_raw(&store, WORK, "enqueue", "bad-shape", br#"{"payload": 1}"#).await;
     put_raw(&store, WORK, "custom", "unknown-kind", b"{}").await;
     sender(&store)
-        .send_with_id("other", "other-queue", &EnqueueEntry::new(b"x"))
+        .send_with_id("other", "other-queue", EnqueueEntry::new(b"x"))
         .await
         .unwrap();
     put_raw(&store, "other", "custom", "other-custom", b"{}").await;
@@ -135,7 +122,7 @@ async fn an_entry_that_cannot_apply_is_rejected_with_a_record() {
         .send_with_id(
             WORK,
             "bad-id",
-            &EnqueueEntry {
+            EnqueueEntry {
                 job_id: Some("a:b".to_string()),
                 ..EnqueueEntry::new(b"x")
             },
@@ -152,12 +139,7 @@ async fn an_entry_that_cannot_apply_is_rejected_with_a_record() {
         "other-custom",
         "bad-id",
     ] {
-        let record = q
-            .view()
-            .inbox_record::<EnqueueEntry>(id)
-            .await
-            .unwrap()
-            .unwrap();
+        let record = q.view().inbox_record(id).await.unwrap().unwrap();
         assert!(
             matches!(record.outcome, InboxOutcome::Rejected(_)),
             "{id}: {:?}",
@@ -213,13 +195,17 @@ async fn a_second_record_of_an_entry_aborts_its_commit() {
     let store = make_store();
     let q = open(&store, &MockClock::new(INITIAL)).await;
     sender(&store)
-        .send_with_id(WORK, "a", &EnqueueEntry::new(b"x"))
+        .send_with_id(WORK, "a", EnqueueEntry::new(b"x"))
         .await
         .unwrap();
     q.apply_inbox_now().await.unwrap();
     let record = InboxRecordHandle::new("a".to_string(), INITIAL);
     let err = q
-        .commit_effects(record.effects(&json!({})).unwrap())
+        .commit_effects(
+            record
+                .effects(InboxOutcome::Rejected(String::new()))
+                .unwrap(),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, Error::InboxAlreadyApplied { ref id } if id == "a"));
@@ -235,7 +221,7 @@ async fn the_ids_of_one_sender_increase_with_call_order() {
     for _ in 0..3 {
         ids.push(
             sender
-                .send(WORK, &CancelEntry { job_id: "j".into() })
+                .send(WORK, CancelEntry { job_id: "j".into() })
                 .await
                 .unwrap(),
         );
@@ -263,32 +249,21 @@ async fn a_permanent_error_of_a_kind_rejects_the_entry_and_the_pass_continues() 
         .send_with_id(
             WORK,
             "a",
-            &CancelEntry {
+            CancelEntry {
                 job_id: "corrupt".into(),
             },
         )
         .await
         .unwrap();
     sender
-        .send_with_id(WORK, "b", &EnqueueEntry::new(b"x"))
+        .send_with_id(WORK, "b", EnqueueEntry::new(b"x"))
         .await
         .unwrap();
 
     q.apply_inbox_now().await.unwrap();
-    let cancel = q
-        .view()
-        .inbox_record::<CancelEntry>("a")
-        .await
-        .unwrap()
-        .unwrap();
+    let cancel = q.view().inbox_record("a").await.unwrap().unwrap();
     assert!(matches!(cancel.outcome, InboxOutcome::Rejected(_)));
-    assert!(
-        q.view()
-            .inbox_record::<EnqueueEntry>("b")
-            .await
-            .unwrap()
-            .is_some()
-    );
+    assert!(q.view().inbox_record("b").await.unwrap().is_some());
     q.close().await.unwrap();
 }
 
@@ -353,18 +328,18 @@ async fn the_inbox_accepts_the_queues_of_its_allow_list() {
 async fn a_send_and_a_listing_refuse_an_invalid_queue_name() {
     let store = make_store();
     assert!(matches!(
-        sender(&store).send("a/b", &EnqueueEntry::new(b"x")).await,
+        sender(&store).send("a/b", EnqueueEntry::new(b"x")).await,
         Err(Error::InvalidQueueName { .. })
     ));
     assert!(matches!(
-        sender(&store).pending::<EnqueueEntry>("a/b").await,
+        sender(&store).pending("a/b").await,
         Err(Error::InvalidQueueName { .. })
     ));
     assert_eq!(object_count(&store, "test-inbox/v1").await, 0);
 }
 
 #[tokio::test]
-async fn the_pending_entries_of_a_kind_and_a_queue_are_listed_in_id_order_until_their_pass() {
+async fn the_pending_entries_of_a_queue_are_listed_in_id_order_until_their_pass() {
     let store = make_store();
     let q = open(&store, &MockClock::new(INITIAL)).await;
     let job_a = q.enqueue("work", b"a".to_vec()).await.unwrap();
@@ -375,7 +350,7 @@ async fn the_pending_entries_of_a_kind_and_a_queue_are_listed_in_id_order_until_
             .send_with_id(
                 WORK,
                 id,
-                &CancelEntry {
+                CancelEntry {
                     job_id: job_id.to_string(),
                 },
             )
@@ -383,22 +358,32 @@ async fn the_pending_entries_of_a_kind_and_a_queue_are_listed_in_id_order_until_
             .unwrap();
     }
     sender
-        .send_with_id(WAITS, "w", &CancelEntry { job_id: "w".into() })
+        .send_with_id(WAITS, "w", CancelEntry { job_id: "w".into() })
         .await
         .unwrap();
     sender
-        .send_with_id(WORK, "c", &EnqueueEntry::new(b"x"))
+        .send_with_id(WORK, "c", EnqueueEntry::new(b"x"))
         .await
         .unwrap();
     put_raw(&store, WORK, "cancel", "bad", br#"{"job": 1}"#).await;
     put_raw(&store, WORK, "cancel", "bad.id", b"{}").await;
 
-    let pending = sender.pending::<CancelEntry>(WORK).await.unwrap();
-    let listed: Vec<(&str, &str)> = pending
-        .iter()
-        .map(|p| (p.id.as_str(), p.entry.job_id.as_str()))
-        .collect();
-    assert_eq!(listed, [("a", job_a.as_str()), ("b", job_b.as_str())]);
+    let pending = sender.pending(WORK).await.unwrap();
+    let listed: Vec<(&str, &InboxEntry)> =
+        pending.iter().map(|p| (p.id.as_str(), &p.entry)).collect();
+    let cancel = |job_id: &str| {
+        InboxEntry::Cancel(CancelEntry {
+            job_id: job_id.to_string(),
+        })
+    };
+    assert_eq!(
+        listed,
+        [
+            ("a", &cancel(&job_a)),
+            ("b", &cancel(&job_b)),
+            ("c", &InboxEntry::Enqueue(EnqueueEntry::new(b"x"))),
+        ]
+    );
     let written = store
         .head(&Path::from(entry_path("test-inbox", WORK, "cancel", "a")))
         .await
@@ -409,32 +394,20 @@ async fn the_pending_entries_of_a_kind_and_a_queue_are_listed_in_id_order_until_
     // The pass deletes the applied entries, and an entry sent again with the id
     // of an applied one is listed until the next pass deletes it.
     q.apply_inbox_now().await.unwrap();
-    assert!(
-        sender
-            .pending::<CancelEntry>(WORK)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(sender.pending(WORK).await.unwrap().is_empty());
     sender
         .send_with_id(
             WORK,
             "a",
-            &CancelEntry {
+            CancelEntry {
                 job_id: job_a.clone(),
             },
         )
         .await
         .unwrap();
-    let again = sender.pending::<CancelEntry>(WORK).await.unwrap();
+    let again = sender.pending(WORK).await.unwrap();
     assert_eq!(again.len(), 1);
-    assert!(
-        q.view()
-            .inbox_record::<CancelEntry>("a")
-            .await
-            .unwrap()
-            .is_some()
-    );
+    assert!(q.view().inbox_record("a").await.unwrap().is_some());
     q.close().await.unwrap();
 }
 
@@ -457,7 +430,7 @@ async fn the_cancel_kind_removes_a_queued_job_and_records_the_other_outcomes() {
             .send_with_id(
                 WORK,
                 id,
-                &CancelEntry {
+                CancelEntry {
                     job_id: job_id.to_string(),
                 },
             )
@@ -469,27 +442,20 @@ async fn the_cancel_kind_removes_a_queued_job_and_records_the_other_outcomes() {
     let outcome = |id: &str| {
         let q = &q;
         let id = id.to_string();
-        async move {
-            q.view()
-                .inbox_record::<CancelEntry>(&id)
-                .await
-                .unwrap()
-                .unwrap()
-                .outcome
-        }
+        async move { q.view().inbox_record(&id).await.unwrap().unwrap().outcome }
     };
     assert_eq!(
         outcome("queued").await,
-        InboxOutcome::Applied(CancelOutcome::Removed)
+        InboxOutcome::Cancel(CancelOutcome::Removed)
     );
     assert!(q.view().get_job(&queued).await.unwrap().is_none());
     assert_eq!(
         outcome("claimed").await,
-        InboxOutcome::Applied(CancelOutcome::Requested)
+        InboxOutcome::Cancel(CancelOutcome::Requested)
     );
     assert_eq!(
         outcome("missing").await,
-        InboxOutcome::Applied(CancelOutcome::NotFound)
+        InboxOutcome::Cancel(CancelOutcome::NotFound)
     );
     // The job of another queue than the entry's is out of reach.
     assert!(matches!(outcome("other").await, InboxOutcome::Rejected(_)));
@@ -517,7 +483,7 @@ async fn the_signal_kind_wakes_a_waiter_of_its_queue_or_records_that_none_waits(
             .send_with_id(
                 queue,
                 id,
-                &SignalEntry {
+                SignalEntry {
                     job_id: job_id.to_string(),
                     payload: id.as_bytes().to_vec(),
                 },
@@ -532,13 +498,7 @@ async fn the_signal_kind_wakes_a_waiter_of_its_queue_or_records_that_none_waits(
     assert_eq!(woken.wake_payload.as_deref(), Some(b"to-waiter".as_slice()));
     let outcome = |id: &'static str| {
         let view = q.view();
-        async move {
-            view.inbox_record::<SignalEntry>(id)
-                .await
-                .unwrap()
-                .unwrap()
-                .outcome
-        }
+        async move { view.inbox_record(id).await.unwrap().unwrap().outcome }
     };
     // The signal for another queue than the waiter's is rejected.
     assert!(matches!(
@@ -547,11 +507,11 @@ async fn the_signal_kind_wakes_a_waiter_of_its_queue_or_records_that_none_waits(
     ));
     assert_eq!(
         outcome("to-waiter").await,
-        InboxOutcome::Applied(SignalOutcome::Delivered)
+        InboxOutcome::Signal(SignalOutcome::Delivered)
     );
     assert_eq!(
         outcome("to-nobody").await,
-        InboxOutcome::Applied(SignalOutcome::NotWaiting)
+        InboxOutcome::Signal(SignalOutcome::NotWaiting)
     );
     q.close().await.unwrap();
 }
@@ -577,7 +537,7 @@ async fn the_first_pass_at_open_precedes_the_scheduler() {
     sender(&store)
         .send(
             WAITS,
-            &SignalEntry {
+            SignalEntry {
                 job_id: waiter.clone(),
                 payload: b"late".to_vec(),
             },
@@ -610,27 +570,18 @@ async fn an_expired_record_is_swept_and_its_id_applies_again() {
         .unwrap();
     let sender = sender(&store);
     sender
-        .send_with_id(WORK, "once", &EnqueueEntry::new(b"x"))
+        .send_with_id(WORK, "once", EnqueueEntry::new(b"x"))
         .await
         .unwrap();
     q.apply_inbox_now().await.unwrap();
 
     clock.advance(retention - Duration::from_millis(1));
     tokio::time::sleep(reaper_interval * 2).await;
-    assert!(
-        q.view()
-            .inbox_record::<EnqueueEntry>("once")
-            .await
-            .unwrap()
-            .is_some()
-    );
+    assert!(q.view().inbox_record("once").await.unwrap().is_some());
 
     clock.advance(Duration::from_millis(1));
     tokio::time::sleep(reaper_interval * 2).await;
-    assert_eq!(
-        q.view().inbox_record::<EnqueueEntry>("once").await.unwrap(),
-        None
-    );
+    assert_eq!(q.view().inbox_record("once").await.unwrap(), None);
     assert!(
         q.core
             .db
@@ -644,7 +595,7 @@ async fn an_expired_record_is_swept_and_its_id_applies_again() {
     );
 
     sender
-        .send_with_id(WORK, "once", &EnqueueEntry::new(b"y"))
+        .send_with_id(WORK, "once", EnqueueEntry::new(b"y"))
         .await
         .unwrap();
     q.apply_inbox_now().await.unwrap();
@@ -665,16 +616,11 @@ async fn an_entry_applies_after_a_touch_and_without_one_at_the_listing_interval(
         .unwrap();
     let applied = |id: &'static str| {
         let view = q.view();
-        async move {
-            view.inbox_record::<EnqueueEntry>(id)
-                .await
-                .unwrap()
-                .is_some()
-        }
+        async move { view.inbox_record(id).await.unwrap().is_some() }
     };
 
     sender(&store)
-        .send_with_id(WORK, "touched", &EnqueueEntry::new(b"x"))
+        .send_with_id(WORK, "touched", EnqueueEntry::new(b"x"))
         .await
         .unwrap();
     tokio::time::sleep(DEFAULT_INBOX_TOUCH_POLL_INTERVAL * 2).await;
@@ -704,17 +650,11 @@ async fn a_pass_that_fails_at_the_store_runs_again_at_the_next_poll() {
     // The pass after the touch applies the entry and fails at its delete.
     faults.fail_deletes(true);
     sender(&inbox_store)
-        .send_with_id(WORK, "a", &EnqueueEntry::new(b"x"))
+        .send_with_id(WORK, "a", EnqueueEntry::new(b"x"))
         .await
         .unwrap();
     tokio::time::sleep(DEFAULT_INBOX_TOUCH_POLL_INTERVAL * 2).await;
-    assert!(
-        q.view()
-            .inbox_record::<EnqueueEntry>("a")
-            .await
-            .unwrap()
-            .is_some()
-    );
+    assert!(q.view().inbox_record("a").await.unwrap().is_some());
     assert_eq!(
         object_count(&inbox_store, "test-inbox/v1/work/enqueue").await,
         1
@@ -736,7 +676,7 @@ async fn a_failed_touch_leaves_the_send_successful() {
     // The entry's put succeeds, and both puts of the touch object fail.
     faults.fail_puts_after(1);
     sender(&store)
-        .send(WORK, &EnqueueEntry::new(b"x"))
+        .send(WORK, EnqueueEntry::new(b"x"))
         .await
         .unwrap();
     assert_eq!(object_count(&store, "test-inbox/v1/work/enqueue").await, 1);

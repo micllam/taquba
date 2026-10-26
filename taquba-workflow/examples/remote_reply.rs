@@ -132,7 +132,7 @@ async fn remote_worker(mut requests: mpsc::Receiver<Request>, sender: InboxSende
             job_id: request.wait_id,
             payload: request.text.to_uppercase().into_bytes(),
         };
-        match sender.send(DEFAULT_QUEUE_NAME, &entry).await {
+        match sender.send(DEFAULT_QUEUE_NAME, entry).await {
             Ok(id) => println!("[remote] sent the reply as inbox entry {id}"),
             Err(e) => println!("[remote] failed to send the reply: {e}"),
         }

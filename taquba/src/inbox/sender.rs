@@ -9,8 +9,8 @@ use tracing::{debug, warn};
 use ulid::{Generator, Ulid};
 
 use crate::error::{Error, Result};
-use crate::inbox::entry::{InboxKind, validate_id};
-use crate::inbox::{EntryPath, entry_path, kind_prefix, list_entries, touch_path};
+use crate::inbox::entry::{InboxEntry, validate_id};
+use crate::inbox::{EntryPath, entry_path, list_entries, queue_prefix, touch_path};
 use crate::keys::QueueName;
 
 /// The writes of the touch object per send, the first and one retry. A failed
@@ -28,11 +28,11 @@ const TOUCH_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// An entry in the inbox, as [`InboxSender::pending`] lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingEntry<E> {
+pub struct PendingEntry {
     /// The id of the entry.
     pub id: String,
-    /// The body of the entry.
-    pub entry: E,
+    /// The entry, of the kind in its path.
+    pub entry: InboxEntry,
     /// When the object store wrote the entry, as milliseconds from the Unix
     /// epoch on the clock of the store.
     pub sent_at_ms: u64,
@@ -46,14 +46,13 @@ pub struct PendingEntry<E> {
 /// object. The writer applies the entry at its next pass, and the sender reads
 /// the outcome through
 /// [`QueueView::inbox_record`](crate::QueueView::inbox_record) of a
-/// [`QueueReader`](crate::QueueReader): the [`InboxKind::Outcome`] of the kind,
-/// or a rejection with its reason.
+/// [`QueueReader`](crate::QueueReader): the outcome of the operation of the
+/// entry's kind, or a rejection with its reason.
 ///
-/// An entry is an [`EnqueueEntry`](crate::EnqueueEntry), a
-/// [`CancelEntry`](crate::CancelEntry) or a [`SignalEntry`](crate::SignalEntry)
-/// for a queue of [`InboxOptions::queues`](crate::InboxOptions::queues). A layer
-/// receives its own requests as jobs that a sender enqueues. A sender in
-/// another language writes the JSON body itself, with a bytes field in base64.
+/// An entry is an [`InboxEntry`] for a queue of
+/// [`InboxOptions::queues`](crate::InboxOptions::queues). A layer receives its
+/// own requests as jobs that a sender enqueues. A sender in another language
+/// writes the JSON body itself, with a bytes field in base64.
 ///
 /// The writer applies the entries of a listing in id order. The ids of
 /// [`Self::send`] increase with call order on one sender and its clones, so
@@ -84,7 +83,7 @@ impl InboxSender {
 
     /// Write `entry` for `queue` with a generated id (a ULID) and return the
     /// id.
-    pub async fn send<E: InboxKind>(&self, queue: &str, entry: &E) -> Result<String> {
+    pub async fn send(&self, queue: &str, entry: impl Into<InboxEntry>) -> Result<String> {
         let id = self.next_id();
         self.send_with_id(queue, &id, entry).await?;
         Ok(id)
@@ -98,11 +97,17 @@ impl InboxSender {
     /// A failed touch is retried once after a second and then logged, and the
     /// send succeeds: the writer applies the entry at its next listing of
     /// [`InboxOptions::interval`](crate::InboxOptions::interval).
-    pub async fn send_with_id<E: InboxKind>(&self, queue: &str, id: &str, entry: &E) -> Result<()> {
+    pub async fn send_with_id(
+        &self,
+        queue: &str,
+        id: &str,
+        entry: impl Into<InboxEntry>,
+    ) -> Result<()> {
         QueueName::new(queue)?;
         validate_id(id)?;
-        let body = serde_json::to_vec(entry).map_err(Error::InboxEncoding)?;
-        let path = Path::from(entry_path(&self.prefix, queue, E::KIND, id));
+        let entry = entry.into();
+        let body = entry.encode().map_err(Error::InboxEncoding)?;
+        let path = Path::from(entry_path(&self.prefix, queue, entry.kind(), id));
         self.store
             .put(&path, body.into())
             .await
@@ -128,31 +133,33 @@ impl InboxSender {
         }
     }
 
-    /// The entries of the kind `E` for `queue` in the inbox, in id order. The
+    /// The entries for `queue` in the inbox, of every kind, in id order. The
     /// listing contains the entries of every sender and costs one LIST request
     /// and one GET per entry. An entry whose record committed before the
-    /// deletion of its object is listed as well, and [`QueueView::inbox_record`](crate::QueueView::inbox_record)
-    /// reads the record. The listing omits an entry whose body does not decode
-    /// as `E`, which the writer rejects at the pass that reaches it.
-    pub async fn pending<E: InboxKind>(&self, queue: &str) -> Result<Vec<PendingEntry<E>>> {
+    /// deletion of its object is listed as well, and
+    /// [`QueueView::inbox_record`](crate::QueueView::inbox_record) reads the
+    /// record. The listing omits an entry of an unknown kind and an entry whose
+    /// body does not decode. The writer rejects such an entry at the pass that
+    /// reaches it.
+    pub async fn pending(&self, queue: &str) -> Result<Vec<PendingEntry>> {
         QueueName::new(queue)?;
-        let under = kind_prefix(&self.prefix, queue, E::KIND);
+        let under = queue_prefix(&self.prefix, queue);
         let listed = list_entries(&*self.store, &self.prefix, &under).await?;
         let mut pending = Vec::with_capacity(listed.len());
-        for (EntryPath { id, .. }, object) in listed {
+        for (EntryPath { id, kind, .. }, object) in listed {
             let body = match self.store.get(&object.location).await {
                 Ok(result) => result.bytes().await.map_err(Error::InboxStore)?,
                 // Applied and deleted after the listing.
                 Err(ObjectStoreError::NotFound { .. }) => continue,
                 Err(err) => return Err(Error::InboxStore(err)),
             };
-            match serde_json::from_slice(&body) {
+            match InboxEntry::decode(&kind, &body) {
                 Ok(entry) => pending.push(PendingEntry {
                     id,
                     entry,
                     sent_at_ms: u64::try_from(object.last_modified.timestamp_millis()).unwrap_or(0),
                 }),
-                Err(err) => debug!(id, %err, "inbox entry does not decode as its kind; not listed"),
+                Err(reason) => debug!(id, reason, "inbox entry does not decode; not listed"),
             }
         }
         Ok(pending)

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use bytes::Bytes;
 use futures_util::{Stream, TryStreamExt};
-use taquba::{EnqueueEntry, InboxOutcome, JobRecord, JobStatus, KvOrder, QueueView};
+use taquba::{InboxOutcome, JobRecord, JobStatus, KvOrder, QueueView};
 
 use crate::command::CommandState;
 use crate::durable::{
@@ -193,16 +193,18 @@ impl WorkflowView {
 
     /// The state of the [`Command`](crate::Command) sent as the inbox entry
     /// `entry_id`, or `None` before a pass applies the entry and after its
-    /// record expires. A command job without a record counts as applied,
+    /// record expires. An applied entry of another kind than `enqueue` reads as
+    /// `None` as well. A command job without a record counts as applied,
     /// because the queue deletes a done job. [`Self::status`] reads the state
     /// of the run that the command names.
     pub async fn command(&self, entry_id: &str) -> Result<Option<CommandState>> {
-        let Some(record) = self.queue.inbox_record::<EnqueueEntry>(entry_id).await? else {
+        let Some(record) = self.queue.inbox_record(entry_id).await? else {
             return Ok(None);
         };
         let job_id = match record.outcome {
             InboxOutcome::Rejected(reason) => return Ok(Some(CommandState::Failed(reason))),
-            InboxOutcome::Applied(enqueued) => enqueued.into_id(),
+            InboxOutcome::Enqueue(enqueued) => enqueued.into_id(),
+            InboxOutcome::Cancel(_) | InboxOutcome::Signal(_) => return Ok(None),
         };
         Ok(Some(match self.queue.get_job(&job_id).await? {
             None => CommandState::Applied,

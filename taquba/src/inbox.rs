@@ -45,8 +45,7 @@ use tracing::{debug, warn};
 use crate::background::Periodic;
 use crate::effects::SettlementEffects;
 use crate::error::{Error, Result};
-use crate::inbox::entry::validate_id;
-use crate::inbox::kinds::CoreKind;
+use crate::inbox::entry::{InboxEntry, validate_id};
 use crate::inbox::record::{InboxOutcome, InboxRecordHandle, Settled, StagedRecord};
 use crate::keys::{QueueName, inbox_record_key};
 use crate::queue_core::QueueCore;
@@ -249,9 +248,9 @@ impl InboxState {
     }
 }
 
-/// The prefix of the entries of `kind` and `queue` in the inbox at `prefix`.
-pub(crate) fn kind_prefix(prefix: &str, queue: &str, kind: &str) -> String {
-    format!("{}/{queue}/{kind}", version_prefix(prefix))
+/// The prefix of the entries of `queue` in the inbox at `prefix`.
+pub(crate) fn queue_prefix(prefix: &str, queue: &str) -> String {
+    format!("{}/{queue}", version_prefix(prefix))
 }
 
 /// The prefix of the entries of the layout version in the inbox at `prefix`.
@@ -261,7 +260,7 @@ fn version_prefix(prefix: &str) -> String {
 
 /// The path of the entry `id` of `kind` and `queue` in the inbox at `prefix`.
 pub(crate) fn entry_path(prefix: &str, queue: &str, kind: &str, id: &str) -> String {
-    format!("{}/{id}", kind_prefix(prefix, queue, kind))
+    format!("{}/{kind}/{id}", queue_prefix(prefix, queue))
 }
 
 /// The path of the touch object of the inbox at `prefix`.
@@ -424,15 +423,16 @@ impl QueueCore {
                 continue;
             }
             let record = InboxRecordHandle::new(id.clone(), self.now_ms());
-            let settled = match CoreKind::parse(&kind) {
-                _ if !inbox.accepts(&queue) => Ok(Settled::Rejected(format!(
-                    "queue `{queue}` is outside the inbox allow-list"
-                ))),
-                Some(core_kind) => {
-                    let body = inbox.get(&location).await?;
-                    self.apply_entry(core_kind, &queue, &record, &body).await
+            let settled = if inbox.accepts(&queue) {
+                let body = inbox.get(&location).await?;
+                match InboxEntry::decode(&kind, &body) {
+                    Ok(entry) => self.apply_entry(&queue, &record, entry).await,
+                    Err(reason) => Ok(Settled::Rejected(reason)),
                 }
-                None => Ok(Settled::Rejected(format!("unknown inbox kind `{kind}`"))),
+            } else {
+                Ok(Settled::Rejected(format!(
+                    "queue `{queue}` is outside the inbox allow-list"
+                )))
             };
             let recorded = match settled {
                 Ok(settled) => self.record_entry(&kind, &record, settled).await,
@@ -441,8 +441,8 @@ impl QueueCore {
             // A record committed before the error stands.
             let rejected = match recorded {
                 Ok(rejected) => rejected,
-                Err(err) => match self.view.inbox_record_rejected(&id).await? {
-                    Some(rejected) => rejected,
+                Err(err) => match self.view.inbox_record(&id).await? {
+                    Some(stored) => matches!(stored.outcome, InboxOutcome::Rejected(_)),
                     None => return Err(err),
                 },
             };
@@ -472,7 +472,7 @@ impl QueueCore {
                 Ok(false)
             }
             Settled::Rejected(reason) => {
-                let staged = record.staged::<()>(InboxOutcome::Rejected(reason.clone()))?;
+                let staged = record.staged(InboxOutcome::Rejected(reason.clone()))?;
                 self.commit_record(staged).await?;
                 warn!(kind, id = record.id, reason, "inbox entry rejected");
                 Ok(true)

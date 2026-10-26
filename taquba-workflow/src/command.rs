@@ -317,15 +317,10 @@ mod tests {
     /// the command once the worker settled it: `None` once acked, because the
     /// queue deletes a done job, and the record of a dead job.
     async fn send(queue: &Queue, sender: &InboxSender, entry: EnqueueEntry) -> Option<JobRecord> {
-        let id = sender.send(CONTROL, &entry).await.unwrap();
+        let id = sender.send(CONTROL, entry).await.unwrap();
         queue.apply_inbox_now().await.unwrap();
-        let record = queue
-            .view()
-            .inbox_record::<EnqueueEntry>(&id)
-            .await
-            .unwrap()
-            .unwrap();
-        let InboxOutcome::Applied(EnqueueResult::New(job_id)) = record.outcome else {
+        let record = queue.view().inbox_record(&id).await.unwrap().unwrap();
+        let InboxOutcome::Enqueue(EnqueueResult::New(job_id)) = record.outcome else {
             panic!("the command was not enqueued: {:?}", record.outcome);
         };
         for _ in 0..500 {
@@ -379,16 +374,16 @@ mod tests {
         let view = runtime.view();
         let submit = Command::Submit(SubmitCommand::new(rid("run-1"), b"x"));
         let applied = sender
-            .send(CONTROL, &EnqueueEntry::from(submit))
+            .send(CONTROL, EnqueueEntry::from(submit))
             .await
             .unwrap();
         let malformed = sender
-            .send(CONTROL, &EnqueueEntry::new(b"{}"))
+            .send(CONTROL, EnqueueEntry::new(b"{}"))
             .await
             .unwrap();
         let cancel = Command::Cancel(CancelCommand::new(rid("run-1")));
         let outside = sender
-            .send("other", &EnqueueEntry::from(cancel))
+            .send("other", EnqueueEntry::from(cancel))
             .await
             .unwrap();
         assert_eq!(view.command(&applied).await.unwrap(), None);
@@ -495,9 +490,9 @@ mod tests {
             reason: Some("operator".to_string()),
             ..CancelCommand::new(rid("run-3"))
         });
-        let submit_id = sender.send(CONTROL, &submit).await.unwrap();
+        let submit_id = sender.send(CONTROL, submit).await.unwrap();
         sender
-            .send(CONTROL, &EnqueueEntry::from(cancel))
+            .send(CONTROL, EnqueueEntry::from(cancel))
             .await
             .unwrap();
         queue.apply_inbox_now().await.unwrap();

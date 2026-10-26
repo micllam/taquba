@@ -1,30 +1,80 @@
-//! The entries of the inbox: the kind trait, the entry types of the core kinds
-//! and the validation of the id segment of an entry's path.
+//! The entries of the inbox: the entry of each kind and the validation of the
+//! id segment of an entry's path.
 
 use std::collections::HashMap;
 use std::time::{Duration, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 
 use crate::effects::EnqueueRequest;
 use crate::error::{Characters, Error, Form, Result};
 use crate::options::EnqueueOptions;
-use crate::queue::{CancelOutcome, EnqueueResult, SignalOutcome};
 
 /// Maximum byte length of an inbox entry id.
 pub const MAX_INBOX_ID_LEN: usize = 64;
 
-/// An entry type of the inbox: the kind name, the JSON body of an entry and the
-/// outcome recorded for an applied entry. The path of an entry contains its
-/// queue, and the body does not. The kinds are [`EnqueueEntry`],
-/// [`CancelEntry`] and [`SignalEntry`], and the trait is sealed. A bytes field
-/// of a body is base64 through [`inbox_bytes`].
-pub trait InboxKind: sealed::Sealed + Serialize + DeserializeOwned + Send + 'static {
-    /// The kind name in the path of an entry.
-    const KIND: &'static str;
-    /// The outcome of an applied entry, in its
-    /// [`InboxRecord`](crate::InboxRecord).
-    type Outcome: Serialize + DeserializeOwned + Send;
+/// An entry of the inbox, of the kind of its variant. The path of an entry
+/// contains its queue and its kind, and the body contains the JSON of the
+/// variant's entry, with a bytes field in base64 through [`inbox_bytes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboxEntry {
+    /// An entry of the kind `enqueue`.
+    Enqueue(EnqueueEntry),
+    /// An entry of the kind `cancel`.
+    Cancel(CancelEntry),
+    /// An entry of the kind `signal`.
+    Signal(SignalEntry),
+}
+
+impl InboxEntry {
+    /// The kind name in the path of the entry.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Enqueue(_) => "enqueue",
+            Self::Cancel(_) => "cancel",
+            Self::Signal(_) => "signal",
+        }
+    }
+
+    /// The JSON body of the entry.
+    pub(crate) fn encode(&self) -> serde_json::Result<Vec<u8>> {
+        match self {
+            Self::Enqueue(entry) => serde_json::to_vec(entry),
+            Self::Cancel(entry) => serde_json::to_vec(entry),
+            Self::Signal(entry) => serde_json::to_vec(entry),
+        }
+    }
+
+    /// The entry of the kind name `kind` with the JSON `body`. Fails with the
+    /// reason of the rejection for another kind name or a body that does not
+    /// decode.
+    pub(crate) fn decode(kind: &str, body: &[u8]) -> std::result::Result<Self, String> {
+        let decoded = match kind {
+            "enqueue" => serde_json::from_slice(body).map(Self::Enqueue),
+            "cancel" => serde_json::from_slice(body).map(Self::Cancel),
+            "signal" => serde_json::from_slice(body).map(Self::Signal),
+            _ => return Err(format!("unknown inbox kind `{kind}`")),
+        };
+        decoded.map_err(|err| format!("malformed body: {err}"))
+    }
+}
+
+impl From<EnqueueEntry> for InboxEntry {
+    fn from(entry: EnqueueEntry) -> Self {
+        Self::Enqueue(entry)
+    }
+}
+
+impl From<CancelEntry> for InboxEntry {
+    fn from(entry: CancelEntry) -> Self {
+        Self::Cancel(entry)
+    }
+}
+
+impl From<SignalEntry> for InboxEntry {
+    fn from(entry: SignalEntry) -> Self {
+        Self::Signal(entry)
+    }
 }
 
 /// Serde adapter for a bytes field of an entry body, stored as standard base64
@@ -46,9 +96,9 @@ pub mod inbox_bytes {
     }
 }
 
-/// The entry of the core kind `enqueue`: a job for the queue of the entry. Its
-/// outcome is the [`EnqueueResult`] of the enqueue.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// The entry of the kind `enqueue`: a job for the queue of the entry. Its
+/// outcome is [`InboxOutcome::Enqueue`](crate::InboxOutcome::Enqueue).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnqueueEntry {
     /// The payload of the job, base64 in the body.
     #[serde(with = "inbox_bytes")]
@@ -124,48 +174,25 @@ impl EnqueueEntry {
     }
 }
 
-impl InboxKind for EnqueueEntry {
-    const KIND: &'static str = "enqueue";
-    type Outcome = EnqueueResult;
-}
-
-/// The entry of the core kind `cancel`: [`Queue::cancel`](crate::Queue::cancel)
-/// of a job on the queue of the entry. Its outcome is the [`CancelOutcome`] of
-/// the cancel.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The entry of the kind `cancel`: [`Queue::cancel`](crate::Queue::cancel) of a
+/// job on the queue of the entry. Its outcome is
+/// [`InboxOutcome::Cancel`](crate::InboxOutcome::Cancel).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CancelEntry {
     /// The id of the job.
     pub job_id: String,
 }
 
-impl InboxKind for CancelEntry {
-    const KIND: &'static str = "cancel";
-    type Outcome = CancelOutcome;
-}
-
-/// The entry of the core kind `signal`: [`Queue::signal`](crate::Queue::signal)
-/// to the job `job_id` on the queue of the entry. Its outcome is the
-/// [`SignalOutcome`] of the signal.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The entry of the kind `signal`: [`Queue::signal`](crate::Queue::signal) to
+/// the job `job_id` on the queue of the entry. Its outcome is
+/// [`InboxOutcome::Signal`](crate::InboxOutcome::Signal).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignalEntry {
     /// The id of the waiting job.
     pub job_id: String,
     /// The payload of the signal, base64 in the body.
     #[serde(with = "inbox_bytes")]
     pub payload: Vec<u8>,
-}
-
-impl InboxKind for SignalEntry {
-    const KIND: &'static str = "signal";
-    type Outcome = SignalOutcome;
-}
-
-mod sealed {
-    pub trait Sealed {}
-
-    impl Sealed for super::EnqueueEntry {}
-    impl Sealed for super::CancelEntry {}
-    impl Sealed for super::SignalEntry {}
 }
 
 const ID_FORM: Form = Form {

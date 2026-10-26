@@ -6,13 +6,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::effects::SettlementEffects;
 use crate::error::Result;
+use crate::queue::{CancelOutcome, EnqueueResult, SignalOutcome};
 
-/// The outcome of an applied inbox entry, stored in its [`InboxRecord`]. `O` is
-/// the [`InboxKind::Outcome`](crate::InboxKind::Outcome) of the entry's kind.
+/// The outcome of an applied inbox entry, stored in its [`InboxRecord`]: the
+/// outcome of the operation of the entry's kind, or a rejection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum InboxOutcome<O> {
-    /// The entry was applied, with the outcome of its kind.
-    Applied(O),
+pub enum InboxOutcome {
+    /// An [`EnqueueEntry`](crate::EnqueueEntry) was applied, with the result of
+    /// the enqueue.
+    Enqueue(EnqueueResult),
+    /// A [`CancelEntry`](crate::CancelEntry) was applied, with the outcome of
+    /// the cancel.
+    Cancel(CancelOutcome),
+    /// A [`SignalEntry`](crate::SignalEntry) was applied, with the outcome of
+    /// the signal.
+    Signal(SignalOutcome),
     /// The entry was rejected for the reason, without an effect.
     Rejected(String),
 }
@@ -24,12 +32,12 @@ pub enum InboxOutcome<O> {
 /// after its application, which is the window within which the entry's id is
 /// not applied again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InboxRecord<O> {
+pub struct InboxRecord {
     /// When the writer applied the entry, as milliseconds from the Unix epoch
     /// on the queue's clock.
     pub applied_at_ms: u64,
     /// The outcome of the entry.
-    pub outcome: InboxOutcome<O>,
+    pub outcome: InboxOutcome,
 }
 
 /// The record of an entry during its application: the id of the entry and the
@@ -46,22 +54,20 @@ impl InboxRecordHandle {
 
     /// Effects that contain the record of the entry with `outcome`. Fails with
     /// the error of the encoding of `outcome`.
-    pub(crate) fn effects<O: Serialize>(&self, outcome: &O) -> Result<SettlementEffects> {
+    pub(crate) fn effects(&self, outcome: InboxOutcome) -> Result<SettlementEffects> {
         Ok(SettlementEffects {
-            inbox_record: Some(self.staged(InboxOutcome::Applied(outcome))?),
+            inbox_record: Some(self.staged(outcome)?),
             ..SettlementEffects::default()
         })
     }
 
     /// The record of the entry with `outcome`, for a commit of its own.
-    pub(crate) fn applied<O: Serialize>(&self, outcome: &O) -> Result<Settled> {
-        Ok(Settled::Applied(
-            self.staged(InboxOutcome::Applied(outcome))?,
-        ))
+    pub(crate) fn applied(&self, outcome: InboxOutcome) -> Result<Settled> {
+        Ok(Settled::Applied(self.staged(outcome)?))
     }
 
     /// The encoded record of the entry with `outcome`.
-    pub(crate) fn staged<O: Serialize>(&self, outcome: InboxOutcome<&O>) -> Result<StagedRecord> {
+    pub(crate) fn staged(&self, outcome: InboxOutcome) -> Result<StagedRecord> {
         StagedRecord::encode(self.id.clone(), self.applied_at_ms, outcome)
     }
 }
@@ -87,11 +93,7 @@ pub(crate) struct StagedRecord {
 
 impl StagedRecord {
     /// The record of the entry `id`, applied at `applied_at_ms` with `outcome`.
-    fn encode<O: Serialize>(
-        id: String,
-        applied_at_ms: u64,
-        outcome: InboxOutcome<&O>,
-    ) -> Result<Self> {
+    fn encode(id: String, applied_at_ms: u64, outcome: InboxOutcome) -> Result<Self> {
         let record = InboxRecord {
             applied_at_ms,
             outcome,
