@@ -26,8 +26,8 @@
 //! next pass starts again at the first entry without a record. After a pass
 //! that ends at an error, the writer runs a pass at the next poll.
 
+pub(crate) mod apply;
 pub(crate) mod entry;
-pub(crate) mod kinds;
 pub(crate) mod record;
 pub(crate) mod sender;
 
