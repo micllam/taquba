@@ -8,12 +8,12 @@
 //! pass rejects an entry for a queue outside [`InboxOptions::queues`], an entry
 //! of another kind, a body that does not decode and an entry whose operation
 //! fails with a permanent error. The application commits an
-//! [`InboxRecord`](crate::InboxRecord) at the id in the transaction of the
-//! entry's effect, or in a transaction of its own after an idempotent effect or
-//! none, and the object is deleted after the commit. A pass that finds the
-//! record of an object deletes the object without a read, and passes run one at
-//! a time, so ingestion is at least once and application is once within the
-//! retention of the record.
+//! [`InboxRecord`](crate::InboxRecord) at the queue and the id in the
+//! transaction of the entry's effect. After an idempotent effect or none, the
+//! record commits in a transaction of its own. The object is deleted after the
+//! commit. A pass that finds the record of an object deletes the object without
+//! a read, and passes run one at a time, so ingestion is at least once and
+//! application is once within the retention of the record.
 //!
 //! The writer runs one pass at open before the scheduler starts. After it, the
 //! writer polls the touch object at `{path}/touch` once per
@@ -79,10 +79,10 @@ pub fn default_inbox_path(path: &str) -> String {
 ///
 /// The writer lists the inbox at open, after a change of its touch object and
 /// once per [`Self::interval`]. A pass applies the entries in id order. It
-/// commits an [`InboxRecord`](crate::InboxRecord) at the id in the transaction
-/// of the entry's effect, or in a transaction of its own after an idempotent
-/// effect or none, and then deletes the object. The pass rejects these entries
-/// with a record of the reason:
+/// commits an [`InboxRecord`](crate::InboxRecord) at the queue and the id in
+/// the transaction of the entry's effect. After an idempotent effect or none,
+/// it commits the record in a transaction of its own. It then deletes the
+/// object. The pass rejects these entries with a record of the reason:
 ///
 /// - A malformed entry.
 /// - An entry for a queue outside [`Self::queues`].
@@ -274,7 +274,7 @@ pub(crate) fn touch_path(prefix: &str) -> String {
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct EntryPath {
     pub(crate) id: String,
-    pub(crate) queue: String,
+    pub(crate) queue: QueueName,
     pub(crate) kind: String,
 }
 
@@ -289,7 +289,7 @@ impl EntryPath {
         }
         Some(Self {
             id: id.to_string(),
-            queue: QueueName::new(queue).ok()?.into_string(),
+            queue: QueueName::new(queue).ok()?,
             kind: kind.to_string(),
         })
     }
@@ -411,12 +411,12 @@ impl QueueCore {
         let entries =
             list_entries(&*inbox.store, &inbox.prefix, &version_prefix(&inbox.prefix)).await?;
         for (EntryPath { id, queue, kind }, ObjectMeta { location, .. }) in entries {
-            if self.db.get(inbox_record_key(&id)).await?.is_some() {
+            if self.db.get(inbox_record_key(&queue, &id)).await?.is_some() {
                 inbox.delete(&location).await?;
                 debug!(kind, id, "inbox entry already applied; object deleted");
                 continue;
             }
-            let record = InboxRecordHandle::new(id.clone(), self.now_ms());
+            let record = InboxRecordHandle::new(queue.clone(), id.clone(), self.now_ms());
             let settled = if inbox.accepts(&queue) {
                 let body = inbox.get(&location).await?;
                 match InboxEntry::decode(&kind, &body) {

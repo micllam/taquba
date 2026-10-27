@@ -191,14 +191,18 @@ impl WorkflowView {
         }))
     }
 
-    /// The state of the [`Command`](crate::Command) sent as the inbox entry
-    /// `entry_id`, or `None` before a pass applies the entry and after its
-    /// record expires. An applied entry of another kind than `enqueue` reads as
-    /// `None` as well. A command job without a record counts as applied,
-    /// because the queue deletes a done job. [`Self::status`] reads the state
-    /// of the run that the command names.
-    pub async fn command(&self, entry_id: &str) -> Result<Option<CommandState>> {
-        let Some(record) = self.queue.inbox_record(entry_id).await? else {
+    /// The state of the [`Command`](crate::Command) of the inbox entry
+    /// `entry_id` on `control_queue`, or `None` before a pass applies the entry
+    /// and after its record expires. An applied entry of another kind than
+    /// `enqueue` reads as `None` as well. A command job without a record counts
+    /// as applied, because the queue deletes a done job. [`Self::status`] reads
+    /// the state of the run that the command names.
+    pub async fn command(
+        &self,
+        control_queue: &str,
+        entry_id: &str,
+    ) -> Result<Option<CommandState>> {
+        let Some(record) = self.queue.inbox_record(control_queue, entry_id).await? else {
             return Ok(None);
         };
         let job_id = match record.outcome {

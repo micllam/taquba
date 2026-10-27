@@ -12,7 +12,8 @@ use crate::history::AttemptOutcome;
 use crate::inbox::InboxState;
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{
-    KeyTag, claimed_key, inbox_record_key, parse_inbox_expiry_id, parse_key_timestamp, tag_prefix,
+    KeyTag, claimed_key, inbox_record_key, parse_inbox_expiry_entry, parse_key_timestamp,
+    tag_prefix,
 };
 use crate::lease_registry::DueLease;
 use crate::queue_core::QueueCore;
@@ -373,8 +374,8 @@ impl QueueCore {
             let txn = self.begin().await?;
             for (key, _) in batch {
                 txn.delete(key)?;
-                if let Some(id) = parse_inbox_expiry_id(key) {
-                    txn.delete(inbox_record_key(id))?;
+                if let Some((queue, id)) = parse_inbox_expiry_entry(key) {
+                    txn.delete(inbox_record_key(&queue, id))?;
                 }
             }
             if self.commit(txn, Durability::Deferred).await? == Commit::Conflict {

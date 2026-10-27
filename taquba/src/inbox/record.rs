@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::codec::encode;
 use crate::effects::SettlementEffects;
+use crate::keys::QueueName;
 use crate::queue::{CancelOutcome, EnqueueResult, SignalOutcome};
 
 /// The outcome of an applied inbox entry, stored in its [`InboxRecord`]: the
@@ -29,8 +30,8 @@ pub enum InboxOutcome {
 /// [`QueueView::inbox_record`](crate::QueueView::inbox_record). It is written
 /// in the transaction of the entry's effect and deleted
 /// [`InboxOptions::record_retention`](crate::InboxOptions::record_retention)
-/// after its application, which is the window within which the entry's id is
-/// not applied again.
+/// after its application. Within that retention, an entry of its queue and id
+/// does not apply again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboxRecord {
     /// When the writer applied the entry, as milliseconds from the Unix epoch
@@ -40,16 +41,21 @@ pub struct InboxRecord {
     pub outcome: InboxOutcome,
 }
 
-/// The record of an entry during its application: the id of the entry and the
-/// time of the pass that applies it.
+/// The record of an entry during its application: the queue and the id of the
+/// entry and the time of the pass that applies it.
 pub(crate) struct InboxRecordHandle {
+    queue: QueueName,
     pub(crate) id: String,
     applied_at_ms: u64,
 }
 
 impl InboxRecordHandle {
-    pub(crate) fn new(id: String, applied_at_ms: u64) -> Self {
-        Self { id, applied_at_ms }
+    pub(crate) fn new(queue: QueueName, id: String, applied_at_ms: u64) -> Self {
+        Self {
+            queue,
+            id,
+            applied_at_ms,
+        }
     }
 
     /// Effects that contain the record of the entry with `outcome`.
@@ -67,7 +73,12 @@ impl InboxRecordHandle {
 
     /// The encoded record of the entry with `outcome`.
     pub(crate) fn staged(&self, outcome: InboxOutcome) -> StagedRecord {
-        StagedRecord::encode(self.id.clone(), self.applied_at_ms, outcome)
+        StagedRecord::encode(
+            self.queue.clone(),
+            self.id.clone(),
+            self.applied_at_ms,
+            outcome,
+        )
     }
 }
 
@@ -85,19 +96,22 @@ pub(crate) enum Settled {
 /// The encoded record of an entry, as a transaction stages it.
 #[derive(Debug, Clone)]
 pub(crate) struct StagedRecord {
+    pub(crate) queue: QueueName,
     pub(crate) id: String,
     pub(crate) applied_at_ms: u64,
     pub(crate) bytes: Vec<u8>,
 }
 
 impl StagedRecord {
-    /// The record of the entry `id`, applied at `applied_at_ms` with `outcome`.
-    fn encode(id: String, applied_at_ms: u64, outcome: InboxOutcome) -> Self {
+    /// The record of the entry `id` of `queue`, applied at `applied_at_ms` with
+    /// `outcome`.
+    fn encode(queue: QueueName, id: String, applied_at_ms: u64, outcome: InboxOutcome) -> Self {
         let record = InboxRecord {
             applied_at_ms,
             outcome,
         };
         Self {
+            queue,
             id,
             applied_at_ms,
             bytes: encode(&record),

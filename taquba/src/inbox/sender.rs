@@ -60,9 +60,9 @@ pub struct PendingEntry {
 /// entries sent one after the other, each send awaited before the next, apply
 /// in send order. Concurrent sends, and the sends of two senders, apply in id
 /// order among the entries of one listing, and an entry written after a pass
-/// that applied a later id applies at a later pass. An id is unique per inbox,
-/// across kinds: the record of an applied entry is at the id, and a later entry
-/// of any kind with the id of a recorded one is deleted without an effect.
+/// that applied a later id applies at a later pass. An id is unique per queue,
+/// across kinds. The record of an applied entry is at its queue and its id, and
+/// a later entry of any kind at that queue and id is deleted without an effect.
 #[derive(Clone)]
 pub struct InboxSender {
     store: Arc<dyn ObjectStore>,
@@ -91,9 +91,9 @@ impl InboxSender {
     }
 
     /// Write `entry` for `queue` with the caller's `id`: `[A-Za-z0-9_-]`, 1 to
-    /// [`MAX_INBOX_ID_LEN`](crate::MAX_INBOX_ID_LEN) bytes. An entry sent again with the id of an applied
-    /// entry is deleted without an effect while the record of the first is
-    /// retained.
+    /// [`MAX_INBOX_ID_LEN`](crate::MAX_INBOX_ID_LEN) bytes. An entry sent again
+    /// to `queue` with the id of an applied entry is deleted without an effect
+    /// while the record of the first is retained.
     ///
     /// A failed touch is retried once after a second and then logged, and the
     /// send succeeds: the writer applies the entry at its next listing of

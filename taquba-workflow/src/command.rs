@@ -327,7 +327,12 @@ mod tests {
     async fn send(queue: &Queue, sender: &InboxSender, entry: EnqueueEntry) -> Option<JobRecord> {
         let id = sender.send(CONTROL, entry).await.unwrap();
         queue.apply_inbox_now().await.unwrap();
-        let record = queue.view().inbox_record(&id).await.unwrap().unwrap();
+        let record = queue
+            .view()
+            .inbox_record(CONTROL, &id)
+            .await
+            .unwrap()
+            .unwrap();
         let InboxOutcome::Enqueue(EnqueueResult::New(job_id)) = record.outcome else {
             panic!("the command was not enqueued: {:?}", record.outcome);
         };
@@ -394,24 +399,24 @@ mod tests {
             .send("other", EnqueueEntry::from(cancel))
             .await
             .unwrap();
-        assert_eq!(view.command(&applied).await.unwrap(), None);
+        assert_eq!(view.command(CONTROL, &applied).await.unwrap(), None);
 
         // Without a worker, the command job waits on the control queue.
         queue.apply_inbox_now().await.unwrap();
         assert_eq!(
-            view.command(&applied).await.unwrap(),
+            view.command(CONTROL, &applied).await.unwrap(),
             Some(CommandState::Queued { last_error: None })
         );
         assert!(matches!(
-            view.command(&outside).await.unwrap(),
+            view.command("other", &outside).await.unwrap(),
             Some(CommandState::Failed(ref reason)) if reason.contains("allow-list")
         ));
 
         let tx = spawn(&runtime);
         for _ in 0..500 {
             let states = (
-                view.command(&applied).await.unwrap(),
-                view.command(&malformed).await.unwrap(),
+                view.command(CONTROL, &applied).await.unwrap(),
+                view.command(CONTROL, &malformed).await.unwrap(),
             );
             if let (Some(CommandState::Applied), Some(CommandState::Failed(reason))) = states {
                 assert!(reason.contains("malformed command"));
@@ -538,7 +543,7 @@ mod tests {
         queue.promote_scheduled_now().await.unwrap();
         let mut state = None;
         for _ in 0..500 {
-            state = runtime.view().command(&submit_id).await.unwrap();
+            state = runtime.view().command(CONTROL, &submit_id).await.unwrap();
             if state == Some(CommandState::Applied) {
                 break;
             }
@@ -600,7 +605,7 @@ mod tests {
         let shutdown = spawn(&runtime);
         let mut state = None;
         for _ in 0..500 {
-            state = runtime.view().command(&cancel_id).await.unwrap();
+            state = runtime.view().command(CONTROL, &cancel_id).await.unwrap();
             if matches!(
                 state,
                 Some(CommandState::Queued {

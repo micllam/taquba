@@ -118,10 +118,12 @@ impl Txn {
     /// Write the inbox record `record` and its expiry entry, and note the
     /// record for the bound of the inbox expiry key space.
     pub(crate) fn stage_inbox_record(&mut self, record: &StagedRecord) -> Result<()> {
-        let id = record.id.as_str();
-        self.txn.put(inbox_record_key(id), &record.bytes)?;
-        self.txn
-            .put(inbox_expiry_key(record.applied_at_ms, id), Vec::new())?;
+        let (queue, id) = (&record.queue, record.id.as_str());
+        self.txn.put(inbox_record_key(queue, id), &record.bytes)?;
+        self.txn.put(
+            inbox_expiry_key(record.applied_at_ms, queue, id),
+            Vec::new(),
+        )?;
         let at = record.applied_at_ms;
         self.notes.inbox = Some(self.notes.inbox.map_or(at, |b| b.min(at)));
         Ok(())

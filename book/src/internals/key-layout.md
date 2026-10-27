@@ -92,8 +92,8 @@ follows the two-byte header.
 | `Stats` | `0x09` | qlen, queue, metric name | counter, merge-appended |
 | `AttemptHistory` | `0x0A` | id | concatenated `JobAttempt` entries |
 | `Heartbeat` | `0x0B` | none, one key per store | the writer's last heartbeat |
-| `InboxRecord` | `0x0C` | inbox entry id | the `InboxRecord` of an applied entry |
-| `InboxExpiry` | `0x0D` | `applied_at` `u64` BE, inbox entry id | empty |
+| `InboxRecord` | `0x0C` | qlen, queue, inbox entry id | the `InboxRecord` of an applied entry |
+| `InboxExpiry` | `0x0D` | `applied_at` `u64` BE, qlen, queue, inbox entry id | empty |
 | `User` | `0xFF` | caller bytes, no version byte | the caller's value |
 
 A job record is therefore stored at exactly one of the first five keys at any
@@ -155,11 +155,15 @@ queue's own counters are point gets.
 
 Six key spaces are reached by point lookup: `JobIndex`, `AttemptHistory`,
 `Dedup`, `Heartbeat`, `InboxRecord` and `User`. Their keys contain only what
-identifies the record: a job id for the first two, a queue plus dedup key for
-`Dedup` and the entry id for `InboxRecord`. The single heartbeat key ends at the
-header, and a `User` key has the caller's own bytes. A point lookup reads one
-exact key, so a prefix relation between two keys of those key spaces does not
-affect its result.
+identifies the record:
+
+- A job id for `JobIndex` and `AttemptHistory`.
+- A queue plus dedup key for `Dedup`.
+- A queue plus entry id for `InboxRecord`.
+
+The single heartbeat key ends at the header, and a `User` key has the caller's
+own bytes. A point lookup reads one exact key, so a prefix relation between two
+keys of those key spaces does not affect its result.
 
 ## Order-preserving encodings
 

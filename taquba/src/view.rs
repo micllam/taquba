@@ -343,11 +343,12 @@ impl QueueView {
         }
     }
 
-    /// The record of the applied inbox entry `id`, or `None` when the entry was
-    /// not applied or its record was swept after
+    /// The record of the applied inbox entry `id` of `queue`, or `None` when
+    /// the entry was not applied or its record was swept after
     /// [`InboxOptions::record_retention`](crate::InboxOptions::record_retention).
-    pub async fn inbox_record(&self, id: &str) -> Result<Option<InboxRecord>> {
-        match self.handle.get(&inbox_record_key(id)).await? {
+    pub async fn inbox_record(&self, queue: &str, id: &str) -> Result<Option<InboxRecord>> {
+        let queue = QueueName::new(queue)?;
+        match self.handle.get(&inbox_record_key(&queue, id)).await? {
             Some(bytes) => Ok(Some(rmp_serde::from_slice(&bytes)?)),
             None => Ok(None),
         }

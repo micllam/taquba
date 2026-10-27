@@ -16,9 +16,9 @@
 //! and the other two by ID. The dead retention sweep is the exception: it scans
 //! the whole `Dead` space and reads the age from each record.
 //!
-//! An applied inbox entry has its record in `InboxRecord` at its id, and
-//! `InboxExpiry` leads with the time of the application so the retention sweep
-//! performs one scan with an early exit.
+//! An applied inbox entry has its record in `InboxRecord` at its queue and id,
+//! and `InboxExpiry` leads with the time of the application so the retention
+//! sweep performs one scan with an early exit.
 //!
 //! A claimed job occupies one key: `Claimed` contains the record at a key
 //! stable for the life of the claim. The lease itself, the current expiry and
@@ -199,13 +199,13 @@ pub(crate) enum KeyTag {
     /// [`crate::OpenOptions::liveness_heartbeat`] interval and read through
     /// [`crate::QueueReader::writer_heartbeat`].
     Heartbeat = 0x0B,
-    /// `[tag, ver, inbox entry id]`. The value is the [`crate::InboxRecord`] of
-    /// an applied inbox entry, written in the transaction of the entry's effect
-    /// and deleted by the retention sweep.
+    /// `[tag, ver, qlen, queue, inbox entry id]`. The value is the
+    /// [`crate::InboxRecord`] of an applied inbox entry, written in the
+    /// transaction of the entry's effect and deleted by the retention sweep.
     InboxRecord = 0x0C,
-    /// `[tag, ver, applied_at u64 BE, inbox entry id]`, with an empty value.
-    /// Written with the inbox record, and read by the retention sweep in time
-    /// order.
+    /// `[tag, ver, applied_at u64 BE, qlen, queue, inbox entry id]`, with an
+    /// empty value. Written with the inbox record, and read by the retention
+    /// sweep in time order.
     InboxExpiry = 0x0D,
     /// `[tag, caller bytes]`, without a version byte. Caller bytes are opaque.
     User = 0xFF,
@@ -369,26 +369,22 @@ pub(crate) fn heartbeat_key() -> Vec<u8> {
     header(KeyTag::Heartbeat).to_vec()
 }
 
-pub(crate) fn inbox_record_key(id: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(2 + id.len());
-    k.extend_from_slice(&header(KeyTag::InboxRecord));
-    k.extend_from_slice(id.as_bytes());
-    k
+pub(crate) fn inbox_record_key(queue: &QueueName, id: &str) -> Vec<u8> {
+    queue_first_key(KeyTag::InboxRecord, queue, id)
 }
 
-pub(crate) fn inbox_expiry_key(applied_at: u64, id: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(2 + 8 + id.len());
-    k.extend_from_slice(&header(KeyTag::InboxExpiry));
-    k.extend_from_slice(&applied_at.to_be_bytes());
-    k.extend_from_slice(id.as_bytes());
-    k
+pub(crate) fn inbox_expiry_key(applied_at: u64, queue: &QueueName, id: &str) -> Vec<u8> {
+    time_first_key(KeyTag::InboxExpiry, applied_at, queue, id)
 }
 
-/// Parse the entry id from an inbox expiry key. Returns `None` when the key is
-/// not a current-version inbox expiry key or is malformed.
-pub(crate) fn parse_inbox_expiry_id(key: &[u8]) -> Option<&str> {
+/// Parse the queue and the entry id from an inbox expiry key. Returns `None`
+/// when the key is not a current-version inbox expiry key or is malformed.
+pub(crate) fn parse_inbox_expiry_entry(key: &[u8]) -> Option<(QueueName, &str)> {
     let rest = key.strip_prefix(header(KeyTag::InboxExpiry).as_slice())?;
-    std::str::from_utf8(rest.get(8..)?).ok()
+    let (qlen, rest) = rest.get(8..)?.split_first()?;
+    let (queue, id) = rest.split_at_checked(*qlen as usize)?;
+    let queue = QueueName::new(std::str::from_utf8(queue).ok()?).ok()?;
+    Some((queue, std::str::from_utf8(id).ok()?))
 }
 
 pub(crate) fn stats_key(queue: &QueueName, metric: &str) -> Vec<u8> {
@@ -567,14 +563,18 @@ mod tests {
 
     #[test]
     fn inbox_expiry_key_leads_with_the_time_and_parses_back() {
-        let key = inbox_expiry_key(1_700_000_000_123, "entry-1");
+        let key = inbox_expiry_key(1_700_000_000_123, &qn("work"), "entry-1");
         assert_eq!(
             parse_key_timestamp(&key, KeyTag::InboxExpiry),
             Some(1_700_000_000_123)
         );
-        assert_eq!(parse_inbox_expiry_id(&key), Some("entry-1"));
-        assert_eq!(parse_inbox_expiry_id(&inbox_record_key("entry-1")), None);
-        assert_eq!(parse_inbox_expiry_id(&key[..6]), None);
+        assert_eq!(
+            parse_inbox_expiry_entry(&key),
+            Some((qn("work"), "entry-1"))
+        );
+        let record = inbox_record_key(&qn("work"), "entry-1");
+        assert_eq!(parse_inbox_expiry_entry(&record), None);
+        assert_eq!(parse_inbox_expiry_entry(&key[..12]), None);
     }
 
     #[test]
@@ -600,8 +600,8 @@ mod tests {
             cursor_key(&qn("q")),
             stats_key(&qn("q"), "m"),
             heartbeat_key(),
-            inbox_record_key("id"),
-            inbox_expiry_key(1, "id"),
+            inbox_record_key(&qn("q"), "id"),
+            inbox_expiry_key(1, &qn("q"), "id"),
             user_scoped_key(b"id"),
         ];
         for (i, a) in keys.iter().enumerate() {
