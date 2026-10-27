@@ -4,8 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::codec::encode;
 use crate::effects::SettlementEffects;
-use crate::error::Result;
 use crate::queue::{CancelOutcome, EnqueueResult, SignalOutcome};
 
 /// The outcome of an applied inbox entry, stored in its [`InboxRecord`]: the
@@ -52,22 +52,21 @@ impl InboxRecordHandle {
         Self { id, applied_at_ms }
     }
 
-    /// Effects that contain the record of the entry with `outcome`. Fails with
-    /// the error of the encoding of `outcome`.
-    pub(crate) fn effects(&self, outcome: InboxOutcome) -> Result<SettlementEffects> {
-        Ok(SettlementEffects {
-            inbox_record: Some(self.staged(outcome)?),
+    /// Effects that contain the record of the entry with `outcome`.
+    pub(crate) fn effects(&self, outcome: InboxOutcome) -> SettlementEffects {
+        SettlementEffects {
+            inbox_record: Some(self.staged(outcome)),
             ..SettlementEffects::default()
-        })
+        }
     }
 
     /// The record of the entry with `outcome`, for a commit of its own.
-    pub(crate) fn applied(&self, outcome: InboxOutcome) -> Result<Settled> {
-        Ok(Settled::Applied(self.staged(outcome)?))
+    pub(crate) fn applied(&self, outcome: InboxOutcome) -> Settled {
+        Settled::Applied(self.staged(outcome))
     }
 
     /// The encoded record of the entry with `outcome`.
-    pub(crate) fn staged(&self, outcome: InboxOutcome) -> Result<StagedRecord> {
+    pub(crate) fn staged(&self, outcome: InboxOutcome) -> StagedRecord {
         StagedRecord::encode(self.id.clone(), self.applied_at_ms, outcome)
     }
 }
@@ -93,15 +92,15 @@ pub(crate) struct StagedRecord {
 
 impl StagedRecord {
     /// The record of the entry `id`, applied at `applied_at_ms` with `outcome`.
-    fn encode(id: String, applied_at_ms: u64, outcome: InboxOutcome) -> Result<Self> {
+    fn encode(id: String, applied_at_ms: u64, outcome: InboxOutcome) -> Self {
         let record = InboxRecord {
             applied_at_ms,
             outcome,
         };
-        Ok(Self {
+        Self {
             id,
             applied_at_ms,
-            bytes: rmp_serde::to_vec_named(&record)?,
-        })
+            bytes: encode(&record),
+        }
     }
 }

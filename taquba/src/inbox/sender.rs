@@ -106,7 +106,7 @@ impl InboxSender {
         QueueName::new(queue)?;
         validate_id(id)?;
         let entry = entry.into();
-        let body = entry.encode().map_err(Error::InboxEncoding)?;
+        let body = entry.encode();
         let path = Path::from(entry_path(&self.prefix, queue, entry.kind(), id));
         self.store
             .put(&path, body.into())

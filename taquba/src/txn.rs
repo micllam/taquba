@@ -83,7 +83,7 @@ impl Txn {
         let key = job.stored_key();
         if from == key.as_slice() {
             // The index entry already points to the key.
-            self.txn.put(&key, job.stored_bytes()?)?;
+            self.txn.put(&key, job.stored_bytes())?;
             self.note_written(job, &key);
             return Ok(());
         }
@@ -135,7 +135,7 @@ impl Txn {
     /// Write `job` at `key`, repoint its index entry to that key and note the
     /// record for the commit.
     fn put_job(&mut self, key: &[u8], job: &JobRecord) -> Result<()> {
-        self.txn.put(key, job.stored_bytes()?)?;
+        self.txn.put(key, job.stored_bytes())?;
         self.txn.put(job_index_key(&job.id), key)?;
         self.note_written(job, key);
         Ok(())

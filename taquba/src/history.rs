@@ -22,6 +22,7 @@
 use serde::{Deserialize, Serialize};
 use slatedb::DbTransaction;
 
+use crate::codec::encode;
 use crate::error::Result;
 use crate::keys::attempt_history_key;
 
@@ -79,8 +80,7 @@ pub enum AttemptOutcome {
 
 /// Stage one history entry in `txn` as a merge on the job's history key.
 pub(crate) fn append_attempt(txn: &DbTransaction, id: &str, entry: &JobAttempt) -> Result<()> {
-    let bytes = rmp_serde::to_vec_named(entry)?;
-    txn.merge(attempt_history_key(id), bytes)?;
+    txn.merge(attempt_history_key(id), encode(entry))?;
     Ok(())
 }
 

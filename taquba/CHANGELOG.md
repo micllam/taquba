@@ -52,6 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are unreadable. Deliver bytes with `Queue::signal` to a job enqueued with
   `EnqueueOptions::signal_wait`, and read them from `JobRecord::signal`.
 
+### Removed
+
+- `Error::Serialization` is removed, as the crate encodes only its own records,
+  whose encoding cannot fail. Remove the match arm of the variant.
+
 ## [0.15.0] - 2026-10-14
 
 ### Added

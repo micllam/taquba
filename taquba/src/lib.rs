@@ -460,6 +460,7 @@
 mod background;
 mod claim_cursor;
 mod clock;
+mod codec;
 mod completion;
 mod effects;
 mod error;

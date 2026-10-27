@@ -201,11 +201,7 @@ async fn a_second_record_of_an_entry_aborts_its_commit() {
     q.apply_inbox_now().await.unwrap();
     let record = InboxRecordHandle::new("a".to_string(), INITIAL);
     let err = q
-        .commit_effects(
-            record
-                .effects(InboxOutcome::Rejected(String::new()))
-                .unwrap(),
-        )
+        .commit_effects(record.effects(InboxOutcome::Rejected(String::new())))
         .await
         .unwrap_err();
     assert!(matches!(err, Error::InboxAlreadyApplied { ref id } if id == "a"));

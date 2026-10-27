@@ -10,11 +10,6 @@ pub enum Error {
     #[error("storage error: {0}")]
     Storage(#[from] slatedb::Error),
 
-    /// Failed to encode a job record to MessagePack before writing it to the
-    /// store. Typically indicates a payload that violates serde constraints.
-    #[error("serialization error: {0}")]
-    Serialization(#[from] rmp_serde::encode::Error),
-
     /// Failed to decode a job record read back from the store. Usually means
     /// the on-disk schema is from an incompatible Taquba version.
     #[error("deserialization error: {0}")]
@@ -154,10 +149,6 @@ pub enum Error {
         id: String,
     },
 
-    /// [`crate::InboxSender`] could not encode an entry as JSON.
-    #[error("inbox entry encoding error: {0}")]
-    InboxEncoding(#[source] serde_json::Error),
-
     /// The custom path of the inbox, in the object store of the queue, is the
     /// path of the queue or a path inside it.
     #[error("inbox path `{path}` overlaps the queue's path `{queue_path}`")]
@@ -265,8 +256,7 @@ impl Error {
     /// malformed data, which retrying cannot change.
     pub fn is_permanent(&self) -> bool {
         match self {
-            Self::Serialization(_)
-            | Self::Deserialization(_)
+            Self::Deserialization(_)
             | Self::JobNotFound(_)
             | Self::InvalidState
             | Self::ClaimLost
@@ -280,7 +270,6 @@ impl Error {
             | Self::PayloadMissing { .. }
             | Self::InvalidStoreUrl { .. }
             | Self::InboxAlreadyApplied { .. }
-            | Self::InboxEncoding(_)
             | Self::InboxPathWithinQueue { .. } => true,
             Self::Storage(_)
             | Self::PayloadStore(_)

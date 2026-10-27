@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use crate::codec::encode;
 use crate::keys::{KeyTag, QueueName, claimed_key, dead_key, done_key, pending_key, scheduled_key};
 
 /// A single job stored in a Taquba queue.
@@ -292,11 +293,11 @@ impl JobRecord {
     /// ([`Self::payload_ref`] is `Some`), the inline payload is excluded so
     /// state transitions never rewrite payload bytes. Every record write
     /// serializes through this method.
-    pub(crate) fn stored_bytes(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    pub(crate) fn stored_bytes(&self) -> Vec<u8> {
         if self.payload_ref.is_none() {
-            return rmp_serde::to_vec_named(self);
+            return encode(self);
         }
-        rmp_serde::to_vec_named(&self.stored_clone())
+        encode(&self.stored_clone())
     }
 
     /// Clone the record in its stored form: identical to [`Clone`] except that
@@ -378,7 +379,7 @@ mod tests {
         let payload: Vec<u8> = (0..=255).collect();
         let mut job = JobRecord::new_pending("j".into(), qn("q"), payload.clone(), 3, 0, 1);
         job.signal = Some(payload.iter().rev().copied().collect());
-        let stored = job.stored_bytes().unwrap();
+        let stored = job.stored_bytes();
         assert!(
             stored
                 .windows(payload.len())
@@ -397,13 +398,13 @@ mod tests {
 
     #[test]
     fn the_stored_value_carries_no_status() {
-        let bytes = record().stored_bytes().unwrap();
+        let bytes = record().stored_bytes();
         assert!(!bytes.windows(6).any(|w| w == b"status"));
     }
 
     #[test]
     fn decode_takes_the_status_from_the_key() {
-        let bytes = record().stored_bytes().unwrap();
+        let bytes = record().stored_bytes();
         let dead = JobRecord::decode(&dead_key(&qn("q"), "j"), &bytes).unwrap();
         assert_eq!(dead.status, JobStatus::Dead);
         let pending = JobRecord::decode(&pending_key(&qn("q"), 0, 0, "j"), &bytes).unwrap();
@@ -424,7 +425,7 @@ mod tests {
             job.status = status;
             job.run_at = Some(10);
             job.completed_at = Some(20);
-            let decoded = JobRecord::decode(&job.stored_key(), &job.stored_bytes().unwrap());
+            let decoded = JobRecord::decode(&job.stored_key(), &job.stored_bytes());
             assert_eq!(decoded.unwrap().status, status);
         }
     }

@@ -465,7 +465,7 @@ impl QueueCore {
                 Ok(false)
             }
             Settled::Rejected(reason) => {
-                let staged = record.staged(InboxOutcome::Rejected(reason.clone()))?;
+                let staged = record.staged(InboxOutcome::Rejected(reason.clone()));
                 self.commit_record(staged).await?;
                 warn!(kind, id = record.id, reason, "inbox entry rejected");
                 Ok(true)

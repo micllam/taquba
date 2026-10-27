@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, warn};
 
 use crate::background::Ticker;
+use crate::codec::encode;
 use crate::error::Result;
 use crate::keys::heartbeat_key;
 use crate::queue_core::QueueCore;
@@ -157,8 +158,7 @@ impl HeartbeatTask {
             closed,
         };
         self.next_counter += 1;
-        let bytes = rmp_serde::to_vec(&record)?;
-        let handle = self.core.db.put(heartbeat_key(), bytes).await?;
+        let handle = self.core.db.put(heartbeat_key(), encode(&record)).await?;
         handle.await_durable().await?;
         Ok(())
     }

@@ -36,13 +36,15 @@ impl InboxEntry {
         }
     }
 
-    /// The JSON body of the entry.
-    pub(crate) fn encode(&self) -> serde_json::Result<Vec<u8>> {
+    /// The JSON body of the entry. The entry types hold strings, bytes as
+    /// base64, integers and maps with string keys, whose encoding cannot fail.
+    pub(crate) fn encode(&self) -> Vec<u8> {
         match self {
             Self::Enqueue(entry) => serde_json::to_vec(entry),
             Self::Cancel(entry) => serde_json::to_vec(entry),
             Self::Signal(entry) => serde_json::to_vec(entry),
         }
+        .expect("an inbox entry encodes as JSON")
     }
 
     /// The entry of the kind name `kind` with the JSON `body`. Fails with the

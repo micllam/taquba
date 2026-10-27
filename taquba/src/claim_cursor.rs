@@ -6,6 +6,7 @@ use slatedb::IsolationLevel;
 use tokio::sync::Notify;
 use tracing::warn;
 
+use crate::codec::encode;
 use crate::error::Result;
 use crate::keys::{KeyTag, QueueName, cursor_key, parse_cursor_key, tag_prefix};
 use crate::queue_core::QueueCore;
@@ -317,7 +318,7 @@ pub(crate) async fn persist_cursor_state(core: &QueueCore) -> Result<()> {
     }
     let txn = core.db.begin(IsolationLevel::Snapshot).await?;
     for (queue, state) in states {
-        txn.put(cursor_key(&queue), &rmp_serde::to_vec_named(&state)?)?;
+        txn.put(cursor_key(&queue), encode(&state))?;
     }
     txn.commit().await?;
     Ok(())

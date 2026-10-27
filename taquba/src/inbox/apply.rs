@@ -37,11 +37,11 @@ impl QueueCore {
         let request = entry.into_request(queue.to_string());
         let prepared = self.prepare_job_record(&request.queue, request.payload, request.options)?;
         let outcome = InboxOutcome::Enqueue(EnqueueResult::New(prepared.job.id.clone()));
-        let effects = self.prepare_effects(record.effects(outcome)?).await?;
+        let effects = self.prepare_effects(record.effects(outcome)).await?;
         match self.write_job(prepared, effects).await?.0 {
             EnqueueResult::New(_) => Ok(Settled::Committed),
             existing @ EnqueueResult::AlreadyEnqueued(_) => {
-                record.applied(InboxOutcome::Enqueue(existing))
+                Ok(record.applied(InboxOutcome::Enqueue(existing)))
             }
         }
     }
@@ -53,16 +53,16 @@ impl QueueCore {
         record: &InboxRecordHandle,
     ) -> Result<Settled> {
         let Some(job) = self.view.job_record(&entry.job_id).await? else {
-            return record.applied(InboxOutcome::Cancel(CancelOutcome::NotFound));
+            return Ok(record.applied(InboxOutcome::Cancel(CancelOutcome::NotFound)));
         };
         if *job.queue != *queue {
             return Ok(on_another_queue(&entry.job_id, &job.queue, queue));
         }
-        let effects = record.effects(InboxOutcome::Cancel(CancelOutcome::Removed))?;
+        let effects = record.effects(InboxOutcome::Cancel(CancelOutcome::Removed));
         match self.cancel(&entry.job_id, effects).await?.0 {
             CancelOutcome::Removed => Ok(Settled::Committed),
             outcome @ (CancelOutcome::Requested | CancelOutcome::NotFound) => {
-                record.applied(InboxOutcome::Cancel(outcome))
+                Ok(record.applied(InboxOutcome::Cancel(outcome)))
             }
         }
     }
@@ -82,7 +82,7 @@ impl QueueCore {
         let (job_id, payload) = (&entry.job_id, &entry.payload);
         self.retry(Durability::Awaited, |mut txn| async move {
             let outcome = stage_signal(&mut txn, job_id, payload.clone()).await?;
-            let stored = record.staged(InboxOutcome::Signal(outcome))?;
+            let stored = record.staged(InboxOutcome::Signal(outcome));
             txn.stage_inbox_record(&stored).await?;
             Ok((txn, Attempt::Commit(())))
         })
