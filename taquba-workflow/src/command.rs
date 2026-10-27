@@ -9,34 +9,36 @@ use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use taquba::{EnqueueEntry, JobRecord, JobStatus, LeaseHandle, PermanentFailure, WorkerError};
 
+use crate::durable;
 use crate::error::worker_error;
 use crate::keys::RunId;
 use crate::runtime::{CancelRunOutcome, RunOptions, RunSpec, RuntimeCore};
 
-/// A request to a runtime from another process: the JSON payload of a job on
-/// the runtime's control queue,
+/// A request to a runtime from another process: the payload of a job on the
+/// runtime's control queue,
 /// [`WorkflowRuntimeBuilder::control_queue`](crate::WorkflowRuntimeBuilder::control_queue).
 /// A sender enqueues the [`EnqueueEntry`] of the command through a
 /// [`taquba::InboxSender`] for that queue. The command job applies at least
 /// once, and an error of the runtime retries or dead-letters it with the error
 /// in [`JobRecord::last_error`].
 ///
-/// The payload is a JSON object that contains the variant in its `command`
-/// field and the fields of the variant. The input of a submission is base64:
+/// The payload is a MessagePack map with one key, the variant as `submit` or
+/// `cancel`, whose value is the map of the variant's fields by name. The input
+/// of a submission is a binary string. In the notation of JSON, with `<hello>`
+/// for the binary string of `hello`:
 ///
-/// ```json
-/// {"command": "submit", "run_id": "run-1", "input": "aGVsbG8=",
-///  "headers": {"tenant": "a"}, "run_at": 1700000000000, "priority": 5,
-///  "max_attempts_per_step": 3}
-/// {"command": "cancel", "run_id": "run-1", "reason": "operator"}
+/// ```text
+/// {"submit": {"run_id": "run-1", "input": <hello>, "headers": {"tenant": "a"},
+///  "run_at": 1700000000000, "priority": 5, "max_attempts_per_step": 3}}
+/// {"cancel": {"run_id": "run-1", "reason": "operator"}}
 /// ```
 ///
 /// Every field of a submission other than `run_id` and `input`, and the reason
 /// of a cancellation, may be absent. A sender in another language writes the
 /// inbox entry of the core kind `enqueue` for the control queue, with the
-/// payload base64 in its `payload` field.
+/// payload in its `payload` field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum Command {
     /// A submission of a run.
     Submit(SubmitCommand),
@@ -63,8 +65,7 @@ pub enum CommandState {
 
 impl From<Command> for EnqueueEntry {
     fn from(command: Command) -> Self {
-        let payload = serde_json::to_vec(&command).expect("a command encodes as JSON");
-        EnqueueEntry::new(payload)
+        EnqueueEntry::new(durable::encode(&command))
     }
 }
 
@@ -81,8 +82,8 @@ impl From<Command> for EnqueueEntry {
 pub struct SubmitCommand {
     /// [`RunSpec::run_id`].
     pub run_id: RunId,
-    /// [`RunSpec::input`], base64 in the payload.
-    #[serde(with = "taquba::inbox_bytes")]
+    /// [`RunSpec::input`].
+    #[serde(with = "serde_bytes")]
     pub input: Vec<u8>,
     /// [`RunOptions::headers`].
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -241,9 +242,9 @@ impl CommandWorker {
 /// The page size of a scan of the control queue.
 const SCAN_PAGE: usize = 256;
 
-/// The command of the JSON `payload`.
-fn decode(payload: &[u8]) -> serde_json::Result<Command> {
-    serde_json::from_slice(payload)
+/// The command of `payload`.
+fn decode(payload: &[u8]) -> Result<Command, rmp_serde::decode::Error> {
+    rmp_serde::from_slice(payload)
 }
 
 #[cfg(test)]
@@ -423,21 +424,36 @@ mod tests {
     }
 
     #[test]
-    fn a_command_is_a_json_object_tagged_by_its_variant() {
+    fn a_command_is_a_map_keyed_by_its_variant() {
         let submit = Command::Submit(SubmitCommand {
             run_at: Some(1),
-            ..SubmitCommand::new(rid("run-1"), b"hello")
+            ..SubmitCommand::new(rid("run-1"), b"hi")
         });
+        let mut expected = vec![0x81, 0xa6];
+        expected.extend(b"submit");
+        expected.extend([0x83, 0xa6]);
+        expected.extend(b"run_id");
+        expected.push(0xa5);
+        expected.extend(b"run-1");
+        expected.push(0xa5);
+        expected.extend(b"input");
+        expected.extend([0xc4, 2]);
+        expected.extend(b"hi");
+        expected.push(0xa6);
+        expected.extend(b"run_at");
+        expected.push(1);
+        assert_eq!(EnqueueEntry::from(submit).payload, expected);
+
+        let mut cancel = vec![0x81, 0xa6];
+        cancel.extend(b"cancel");
+        cancel.extend([0x81, 0xa6]);
+        cancel.extend(b"run_id");
+        cancel.push(0xa5);
+        cancel.extend(b"run-1");
         assert_eq!(
-            serde_json::to_value(&submit).unwrap(),
-            serde_json::json!({
-                "command": "submit", "run_id": "run-1", "input": "aGVsbG8=", "run_at": 1
-            })
+            decode(&cancel).unwrap(),
+            Command::Cancel(CancelCommand::new(rid("run-1")))
         );
-        let cancel: Command =
-            serde_json::from_value(serde_json::json!({"command": "cancel", "run_id": "run-1"}))
-                .unwrap();
-        assert_eq!(cancel, Command::Cancel(CancelCommand::new(rid("run-1"))));
     }
 
     #[tokio::test]
@@ -489,10 +505,9 @@ mod tests {
         let shutdown = spawn(&runtime);
         // The submission waits an hour on the control queue for its `run_at`,
         // so the cancellation sent after it reaches the worker first.
-        let submit = EnqueueEntry {
-            run_at: Some(INITIAL + 3_600_000),
-            ..Command::Submit(SubmitCommand::new(rid("run-3"), b"x")).into()
-        };
+        let mut submit =
+            EnqueueEntry::from(Command::Submit(SubmitCommand::new(rid("run-3"), b"x")));
+        submit.options.run_at = Some(UNIX_EPOCH + Duration::from_millis(INITIAL + 3_600_000));
         let cancel = Command::Cancel(CancelCommand {
             reason: Some("operator".to_string()),
             ..CancelCommand::new(rid("run-3"))

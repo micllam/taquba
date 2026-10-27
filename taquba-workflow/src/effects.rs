@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use taquba::{EnqueueEntry, EnqueueRequest, SettlementEffects};
+use serde_bytes::{ByteBuf, Bytes};
+use taquba::{EnqueueRequest, SettlementEffects};
 
 use crate::error::{Error, Result};
 use crate::keys::{RunId, check_enqueue, check_kv_key, run_kv_entry_key};
@@ -81,10 +82,12 @@ impl EffectsState {
                 max: taquba::MAX_KV_VALUE_SIZE,
             }));
         }
-        if self.staged.deletes.contains(&key) {
+        if self.staged.deletes.contains(Bytes::new(&key)) {
             return Err(Error::ConflictingKvEffect(display_key(&key)));
         }
-        self.staged.writes.insert(key, value);
+        self.staged
+            .writes
+            .insert(ByteBuf::from(key), ByteBuf::from(value));
         Ok(())
     }
 
@@ -100,10 +103,10 @@ impl EffectsState {
     }
 
     fn stage_delete(&mut self, key: Vec<u8>) -> Result<()> {
-        if self.staged.writes.contains_key(&key) {
+        if self.staged.writes.contains_key(Bytes::new(&key)) {
             return Err(Error::ConflictingKvEffect(display_key(&key)));
         }
-        self.staged.deletes.insert(key);
+        self.staged.deletes.insert(ByteBuf::from(key));
         Ok(())
     }
 
@@ -112,9 +115,7 @@ impl EffectsState {
             return Err(Error::EffectsSealed);
         }
         check_enqueue(&request, self.runtime_queue.as_deref())?;
-        self.staged
-            .enqueues
-            .push(EnqueueEntry::from_request(request));
+        self.staged.enqueues.push(request);
         Ok(())
     }
 
@@ -133,25 +134,27 @@ impl EffectsState {
 
 /// Writes, deletes and enqueues accumulated by an [`EffectsHandle`] or a
 /// [`TerminalEffects`]. Stored in the step-output replay record so a replayed
-/// delivery applies the same effects.
+/// delivery applies the same effects, with the keys and values as binary
+/// strings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct StagedEffects {
-    pub(crate) writes: HashMap<Vec<u8>, Vec<u8>>,
-    pub(crate) deletes: HashSet<Vec<u8>>,
-    /// The queue and the entry of each enqueue.
-    pub(crate) enqueues: Vec<(String, EnqueueEntry)>,
+    pub(crate) writes: HashMap<ByteBuf, ByteBuf>,
+    pub(crate) deletes: HashSet<ByteBuf>,
+    pub(crate) enqueues: Vec<EnqueueRequest>,
 }
 
 impl StagedEffects {
     /// Add the staged effects to `effects`.
     pub(crate) fn add_to(self, effects: &mut SettlementEffects) {
-        effects.kv_writes.extend(self.writes);
-        effects.kv_deletes.extend(self.deletes);
-        effects.enqueues.extend(
-            self.enqueues
+        effects.kv_writes.extend(
+            self.writes
                 .into_iter()
-                .map(|(queue, entry)| entry.into_request(queue)),
+                .map(|(key, value)| (key.into_vec(), value.into_vec())),
         );
+        effects
+            .kv_deletes
+            .extend(self.deletes.into_iter().map(ByteBuf::into_vec));
+        effects.enqueues.extend(self.enqueues);
     }
 }
 
@@ -398,7 +401,7 @@ mod tests {
         assert!(
             staged
                 .writes
-                .contains_key(&run_kv_entry_key(&detached, b"workflow/x"))
+                .contains_key(Bytes::new(&run_kv_entry_key(&detached, b"workflow/x")))
         );
     }
 
@@ -411,11 +414,11 @@ mod tests {
         clone.delete("b").unwrap();
         clone.put_run_kv("a", "w").unwrap();
         let staged = handle.seal_and_take();
-        assert_eq!(staged.writes.get(b"a".as_slice()), Some(&b"v".to_vec()));
-        assert!(staged.deletes.contains(b"b".as_slice()));
+        assert_eq!(staged.writes[Bytes::new(b"a")].as_slice(), b"v");
+        assert!(staged.deletes.contains(Bytes::new(b"b")));
         assert_eq!(
-            staged.writes.get(&run_kv_entry_key(&run_id, b"a")),
-            Some(&b"w".to_vec())
+            staged.writes[Bytes::new(&run_kv_entry_key(&run_id, b"a"))].as_slice(),
+            b"w"
         );
         assert!(matches!(clone.put("c", "v"), Err(Error::EffectsSealed)));
         assert!(matches!(clone.delete("c"), Err(Error::EffectsSealed)));

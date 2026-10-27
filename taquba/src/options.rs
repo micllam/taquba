@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use slatedb::object_store::ObjectStore;
 
 use crate::clock::{Clock, default_clock};
@@ -412,7 +413,11 @@ impl Default for OpenOptions {
 ///
 /// let opts = EnqueueOptions::default().run_at(SystemTime::now() + Duration::from_secs(60));
 /// ```
-#[derive(Debug, Clone, Default)]
+///
+/// The serde form stores each field under its name and `run_at` as milliseconds
+/// from the Unix epoch, and it decodes an absent field as its default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EnqueueOptions {
     /// Override the queue's default `max_attempts` for just this job.
     pub max_attempts: Option<u32>,
@@ -423,6 +428,7 @@ pub struct EnqueueOptions {
     /// past or `None`, the job is written straight to pending. Otherwise it
     /// waits in the scheduled key space until promoted by the background
     /// scheduler.
+    #[serde(with = "run_at_ms")]
     pub run_at: Option<std::time::SystemTime>,
     /// Block creation if a pending or scheduled job with the same key already
     /// exists. In that case the existing job's ID is returned. The key is
@@ -522,5 +528,32 @@ impl EnqueueOptions {
     pub fn signal_wait(mut self, signal_wait: bool) -> Self {
         self.signal_wait = signal_wait;
         self
+    }
+}
+
+/// Serde adapter for [`EnqueueOptions::run_at`]: milliseconds from the Unix
+/// epoch, with a time before the epoch stored as 0.
+mod run_at_ms {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        run_at: &Option<SystemTime>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        run_at
+            .map(|at| {
+                at.duration_since(UNIX_EPOCH)
+                    .map_or(0, |since| since.as_millis() as u64)
+            })
+            .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<SystemTime>, D::Error> {
+        let ms = Option::<u64>::deserialize(deserializer)?;
+        Ok(ms.map(|ms| UNIX_EPOCH + Duration::from_millis(ms)))
     }
 }

@@ -1,12 +1,9 @@
 //! The entries of the inbox: the entry of each kind and the validation of the
 //! id segment of an entry's path.
 
-use std::collections::HashMap;
-use std::time::{Duration, UNIX_EPOCH};
-
 use serde::{Deserialize, Serialize};
 
-use crate::effects::EnqueueRequest;
+use crate::codec::encode;
 use crate::error::{Characters, Error, Form, Result};
 use crate::options::EnqueueOptions;
 
@@ -14,8 +11,20 @@ use crate::options::EnqueueOptions;
 pub const MAX_INBOX_ID_LEN: usize = 64;
 
 /// An entry of the inbox, of the kind of its variant. The path of an entry
-/// contains its queue and its kind, and the body contains the JSON of the
-/// variant's entry, with a bytes field in base64 through [`inbox_bytes`].
+/// contains its queue and its kind, and the body contains the variant's entry
+/// as a MessagePack map with field names. A sender in another language writes
+/// the map of its kind:
+///
+/// - `enqueue`: the binary string `payload` and the map `options` with the
+///   fields of [`EnqueueOptions`]. `max_attempts` and `priority` are integers,
+///   `run_at` is an integer of milliseconds from the Unix epoch, `dedup_key`
+///   and `id_override` are strings, `headers` is a map of strings and
+///   `signal_wait` is a boolean.
+/// - `cancel`: the string `job_id`.
+/// - `signal`: the string `job_id` and the binary string `payload`.
+///
+/// The writer decodes an absent `options` and an absent or nil field of it as
+/// the default. It ignores a field that it does not know.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboxEntry {
     /// An entry of the kind `enqueue`.
@@ -36,25 +45,22 @@ impl InboxEntry {
         }
     }
 
-    /// The JSON body of the entry. The entry types hold strings, bytes as
-    /// base64, integers and maps with string keys, whose encoding cannot fail.
+    /// The body of the entry.
     pub(crate) fn encode(&self) -> Vec<u8> {
         match self {
-            Self::Enqueue(entry) => serde_json::to_vec(entry),
-            Self::Cancel(entry) => serde_json::to_vec(entry),
-            Self::Signal(entry) => serde_json::to_vec(entry),
+            Self::Enqueue(entry) => encode(entry),
+            Self::Cancel(entry) => encode(entry),
+            Self::Signal(entry) => encode(entry),
         }
-        .expect("an inbox entry encodes as JSON")
     }
 
-    /// The entry of the kind name `kind` with the JSON `body`. Fails with the
-    /// reason of the rejection for another kind name or a body that does not
-    /// decode.
+    /// The entry of the kind name `kind` with `body`. Fails with the reason of
+    /// the rejection for another kind name or a body that does not decode.
     pub(crate) fn decode(kind: &str, body: &[u8]) -> std::result::Result<Self, String> {
         let decoded = match kind {
-            "enqueue" => serde_json::from_slice(body).map(Self::Enqueue),
-            "cancel" => serde_json::from_slice(body).map(Self::Cancel),
-            "signal" => serde_json::from_slice(body).map(Self::Signal),
+            "enqueue" => rmp_serde::from_slice(body).map(Self::Enqueue),
+            "cancel" => rmp_serde::from_slice(body).map(Self::Cancel),
+            "signal" => rmp_serde::from_slice(body).map(Self::Signal),
             _ => return Err(format!("unknown inbox kind `{kind}`")),
         };
         decoded.map_err(|err| format!("malformed body: {err}"))
@@ -79,54 +85,16 @@ impl From<SignalEntry> for InboxEntry {
     }
 }
 
-/// Serde adapter for a bytes field of an entry body, stored as standard base64
-/// with padding: `#[serde(with = "taquba::inbox_bytes")]`.
-pub mod inbox_bytes {
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    /// Serialize `bytes` as a base64 string.
-    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&STANDARD.encode(bytes))
-    }
-
-    /// Deserialize a base64 string into bytes.
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        let encoded = String::deserialize(deserializer)?;
-        STANDARD.decode(encoded).map_err(serde::de::Error::custom)
-    }
-}
-
 /// The entry of the kind `enqueue`: a job for the queue of the entry. Its
 /// outcome is [`InboxOutcome::Enqueue`](crate::InboxOutcome::Enqueue).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnqueueEntry {
-    /// The payload of the job, base64 in the body.
-    #[serde(with = "inbox_bytes")]
+    /// The payload of the job.
+    #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
-    /// [`EnqueueOptions::headers`](crate::EnqueueOptions::headers).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub headers: HashMap<String, String>,
-    /// [`EnqueueOptions::run_at`](crate::EnqueueOptions::run_at), as
-    /// milliseconds from the Unix epoch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_at: Option<u64>,
-    /// [`EnqueueOptions::priority`](crate::EnqueueOptions::priority).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub priority: Option<u32>,
-    /// [`EnqueueOptions::max_attempts`](crate::EnqueueOptions::max_attempts).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_attempts: Option<u32>,
-    /// [`EnqueueOptions::dedup_key`](crate::EnqueueOptions::dedup_key).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dedup_key: Option<String>,
-    /// [`EnqueueOptions::id_override`](crate::EnqueueOptions::id_override).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub job_id: Option<String>,
-    /// [`EnqueueOptions::signal_wait`](crate::EnqueueOptions::signal_wait).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub signal_wait: bool,
+    /// The options of the enqueue, default when the body omits them.
+    #[serde(default)]
+    pub options: EnqueueOptions,
 }
 
 impl EnqueueEntry {
@@ -135,43 +103,6 @@ impl EnqueueEntry {
         Self {
             payload: payload.into(),
             ..Self::default()
-        }
-    }
-
-    /// The queue of `request` and its entry. A `run_at` before the Unix epoch
-    /// becomes 0.
-    pub fn from_request(request: EnqueueRequest) -> (String, Self) {
-        let options = request.options;
-        let entry = Self {
-            payload: request.payload,
-            headers: options.headers,
-            run_at: options.run_at.map(|at| {
-                at.duration_since(UNIX_EPOCH)
-                    .map_or(0, |since| since.as_millis() as u64)
-            }),
-            priority: options.priority,
-            max_attempts: options.max_attempts,
-            dedup_key: options.dedup_key,
-            job_id: options.id_override,
-            signal_wait: options.signal_wait,
-        };
-        (request.queue, entry)
-    }
-
-    /// The request of the entry for `queue`.
-    pub fn into_request(self, queue: impl Into<String>) -> EnqueueRequest {
-        EnqueueRequest {
-            queue: queue.into(),
-            payload: self.payload,
-            options: EnqueueOptions {
-                max_attempts: self.max_attempts,
-                priority: self.priority,
-                run_at: self.run_at.map(|ms| UNIX_EPOCH + Duration::from_millis(ms)),
-                dedup_key: self.dedup_key,
-                headers: self.headers,
-                id_override: self.job_id,
-                signal_wait: self.signal_wait,
-            },
         }
     }
 }
@@ -192,8 +123,8 @@ pub struct CancelEntry {
 pub struct SignalEntry {
     /// The id of the waiting job.
     pub job_id: String,
-    /// The payload of the signal, base64 in the body.
-    #[serde(with = "inbox_bytes")]
+    /// The payload of the signal.
+    #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
 }
 
@@ -216,6 +147,9 @@ pub(crate) fn validate_id(id: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::time::{Duration, UNIX_EPOCH};
+
     use super::*;
 
     #[test]
@@ -231,40 +165,71 @@ mod tests {
     }
 
     #[test]
-    fn a_bytes_field_is_base64_in_the_body() {
-        let entry = SignalEntry {
+    fn a_body_is_a_map_with_field_names_and_binary_bytes() {
+        let entry = InboxEntry::Signal(SignalEntry {
             job_id: "j".to_string(),
             payload: vec![0, 255, 10],
-        };
-        let body = serde_json::to_value(&entry).unwrap();
-        assert_eq!(body["payload"], "AP8K");
-        let decoded: SignalEntry = serde_json::from_value(body).unwrap();
-        assert_eq!(decoded.payload, vec![0, 255, 10]);
-        assert!(serde_json::from_str::<SignalEntry>(r#"{"job_id":"j","payload":"@@"}"#).is_err());
+        });
+        let mut expected = vec![0x82, 0xa6];
+        expected.extend(b"job_id");
+        expected.extend([0xa1, b'j', 0xa7]);
+        expected.extend(b"payload");
+        expected.extend([0xc4, 3, 0, 255, 10]);
+        assert_eq!(entry.encode(), expected);
+        assert_eq!(InboxEntry::decode("signal", &expected).unwrap(), entry);
     }
 
     #[test]
-    fn an_enqueue_request_converts_to_an_entry_and_back_unchanged() {
-        let request = EnqueueRequest {
-            queue: "work".to_string(),
+    fn a_body_decodes_absent_options_and_ignores_unknown_fields() {
+        #[derive(Serialize)]
+        struct Body {
+            #[serde(with = "serde_bytes")]
+            payload: Vec<u8>,
+            unknown: u32,
+            options: HashMap<&'static str, u32>,
+        }
+        let body = encode(&Body {
             payload: b"p".to_vec(),
-            options: EnqueueOptions {
-                max_attempts: Some(3),
-                priority: Some(1),
-                run_at: Some(UNIX_EPOCH + Duration::from_millis(1_700_000_000_123)),
-                dedup_key: Some("d".to_string()),
-                headers: HashMap::from([("h".to_string(), "v".to_string())]),
-                id_override: Some("j".to_string()),
-                signal_wait: true,
-            },
+            unknown: 1,
+            options: HashMap::from([("priority", 2), ("unknown", 3)]),
+        });
+        let InboxEntry::Enqueue(entry) = InboxEntry::decode("enqueue", &body).unwrap() else {
+            panic!("an enqueue entry");
         };
-        let (queue, entry) = EnqueueEntry::from_request(request.clone());
-        let back = entry.into_request(queue);
-        assert_eq!(back.queue, request.queue);
-        assert_eq!(back.payload, request.payload);
+        assert_eq!(entry.options, EnqueueOptions::default().priority(2));
+        #[derive(Serialize)]
+        struct Bare {
+            #[serde(with = "serde_bytes")]
+            payload: Vec<u8>,
+        }
+        let bare = encode(&Bare {
+            payload: b"p".to_vec(),
+        });
         assert_eq!(
-            format!("{:?}", back.options),
-            format!("{:?}", request.options)
+            InboxEntry::decode("enqueue", &bare).unwrap(),
+            InboxEntry::Enqueue(EnqueueEntry::new(b"p"))
         );
+    }
+
+    #[test]
+    fn run_at_is_milliseconds_from_the_epoch_and_zero_before_it() {
+        let at = UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
+        let entry = InboxEntry::Enqueue(EnqueueEntry {
+            payload: Vec::new(),
+            options: EnqueueOptions::default().run_at(at),
+        });
+        assert_eq!(
+            InboxEntry::decode("enqueue", &entry.encode()).unwrap(),
+            entry
+        );
+        let before = InboxEntry::Enqueue(EnqueueEntry {
+            payload: Vec::new(),
+            options: EnqueueOptions::default().run_at(UNIX_EPOCH - Duration::from_secs(1)),
+        });
+        let InboxEntry::Enqueue(decoded) = InboxEntry::decode("enqueue", &before.encode()).unwrap()
+        else {
+            panic!("an enqueue entry");
+        };
+        assert_eq!(decoded.options.run_at, Some(UNIX_EPOCH));
     }
 }

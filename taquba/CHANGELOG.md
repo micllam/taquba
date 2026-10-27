@@ -19,12 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a prefix of objects through which another process enqueues, cancels and
   signals. The writer applies each entry once within
   `InboxOptions::record_retention`, and the key layout gains the `InboxRecord`
-  and `InboxExpiry` spaces. The crate depends on serde_json and base64. See
-  ADR-0005.
-- `InboxSender` writes an `InboxEntry`, of an `EnqueueEntry`, a `CancelEntry` or
-  a `SignalEntry`, and `InboxSender::pending` lists the entries of a queue that
-  await a pass. `EnqueueEntry::from_request` and `EnqueueEntry::into_request`
-  convert between an entry and an `EnqueueRequest`.
+  and `InboxExpiry` spaces. See ADR-0005.
+- `InboxSender` writes an `InboxEntry` as a MessagePack body: an `EnqueueEntry`,
+  a `CancelEntry` or a `SignalEntry`. `InboxSender::pending` lists the entries
+  of a queue that are awaiting a pass.
 - `QueueView::inbox_record` reads the `InboxRecord` of an applied entry, with
   its `InboxOutcome`: the outcome of its operation or the reason of its
   rejection. `EnqueueResult`, `CancelOutcome` and `SignalOutcome` implement
@@ -32,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Queue::apply_inbox_now` runs a pass of the inbox, and `Queue::inbox_accepts`
   reports whether the inbox accepts a queue. `default_inbox_path` returns the
   path of an inbox opened without `InboxOptions::path`.
+- `EnqueueOptions` and `EnqueueRequest` implement `Serialize`, `Deserialize`,
+  `PartialEq` and `Eq`, with `run_at` as milliseconds from the Unix epoch.
 
 ### Changed
 

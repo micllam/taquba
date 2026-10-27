@@ -296,8 +296,8 @@ A sender enqueues `taquba::EnqueueEntry::from(command)` with a
 `taquba::InboxSender` for the control queue. Through a `taquba::QueueReader`,
 the sender reads the state of its command with `WorkflowView::command` and the
 state of the run with `WorkflowView::status`. A sender in another language
-writes the JSON form that `Command` documents. A signal from another process is
-the core kind `signal` (`taquba::SignalEntry`).
+writes the MessagePack form that `Command` documents. A signal from another
+process is the core kind `signal` (`taquba::SignalEntry`).
 
 A command applies at least once, so a `SubmitCommand` contains its run id. A
 command that fails is retried. A command that cannot apply, such as a submission

@@ -42,6 +42,11 @@ async fn put_raw(store: &Arc<dyn ObjectStore>, queue: &str, kind: &str, id: &str
         .unwrap();
 }
 
+/// A body of one field `key` with the integer `value`.
+fn map_body(key: &str, value: u32) -> Vec<u8> {
+    crate::codec::encode(&std::collections::HashMap::from([(key, value)]))
+}
+
 /// The options of a job that waits for a signal for an hour.
 fn waiting() -> EnqueueOptions {
     EnqueueOptions::default()
@@ -110,8 +115,15 @@ async fn entries_apply_in_id_order_across_kinds() {
 async fn an_entry_that_cannot_apply_is_rejected_with_a_record() {
     let store = make_store();
     let q = open(&store, &MockClock::new(INITIAL)).await;
-    put_raw(&store, WORK, "enqueue", "bad-json", b"not json").await;
-    put_raw(&store, WORK, "enqueue", "bad-shape", br#"{"payload": 1}"#).await;
+    put_raw(&store, WORK, "enqueue", "bad-body", &[0xc1]).await;
+    put_raw(
+        &store,
+        WORK,
+        "enqueue",
+        "bad-shape",
+        &map_body("payload", 1),
+    )
+    .await;
     put_raw(&store, WORK, "custom", "unknown-kind", b"{}").await;
     sender(&store)
         .send_with_id("other", "other-queue", EnqueueEntry::new(b"x"))
@@ -123,7 +135,7 @@ async fn an_entry_that_cannot_apply_is_rejected_with_a_record() {
             WORK,
             "bad-id",
             EnqueueEntry {
-                job_id: Some("a:b".to_string()),
+                options: EnqueueOptions::default().id_override("a:b".to_string()),
                 ..EnqueueEntry::new(b"x")
             },
         )
@@ -132,7 +144,7 @@ async fn an_entry_that_cannot_apply_is_rejected_with_a_record() {
 
     q.apply_inbox_now().await.unwrap();
     for id in [
-        "bad-json",
+        "bad-body",
         "bad-shape",
         "unknown-kind",
         "other-queue",
@@ -361,7 +373,7 @@ async fn the_pending_entries_of_a_queue_are_listed_in_id_order_until_their_pass(
         .send_with_id(WORK, "c", EnqueueEntry::new(b"x"))
         .await
         .unwrap();
-    put_raw(&store, WORK, "cancel", "bad", br#"{"job": 1}"#).await;
+    put_raw(&store, WORK, "cancel", "bad", &map_body("job", 1)).await;
     put_raw(&store, WORK, "cancel", "bad.id", b"{}").await;
 
     let pending = sender.pending(WORK).await.unwrap();
@@ -622,7 +634,7 @@ async fn an_entry_applies_after_a_touch_and_without_one_at_the_listing_interval(
     tokio::time::sleep(DEFAULT_INBOX_TOUCH_POLL_INTERVAL * 2).await;
     assert!(applied("touched").await);
 
-    let body = serde_json::to_vec(&EnqueueEntry::new(b"y")).unwrap();
+    let body = InboxEntry::from(EnqueueEntry::new(b"y")).encode();
     put_raw(&store, WORK, "enqueue", "quiet", &body).await;
     tokio::time::sleep(DEFAULT_INBOX_TOUCH_POLL_INTERVAL * 2).await;
     assert!(!applied("quiet").await);

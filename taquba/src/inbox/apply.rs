@@ -34,8 +34,7 @@ impl QueueCore {
         entry: EnqueueEntry,
         record: &InboxRecordHandle,
     ) -> Result<Settled> {
-        let request = entry.into_request(queue.to_string());
-        let prepared = self.prepare_job_record(&request.queue, request.payload, request.options)?;
+        let prepared = self.prepare_job_record(queue, entry.payload, entry.options)?;
         let outcome = InboxOutcome::Enqueue(EnqueueResult::New(prepared.job.id.clone()));
         let effects = self.prepare_effects(record.effects(outcome)).await?;
         match self.write_job(prepared, effects).await?.0 {

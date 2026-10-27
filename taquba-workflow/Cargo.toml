@@ -43,10 +43,11 @@ tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 
 ulid = { workspace = true }
 serde_bytes = "0.11.19"
-serde_json = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+# Used only by the examples.
+serde_json = "1"
 
 # Used only by the `rig_agent` example.
 rig-agent = "0.41"

@@ -1,18 +1,19 @@
 //! The inbox: a prefix of objects that the writer applies, through which
 //! another process enqueues, cancels and signals.
 //!
-//! An entry is one object at `{path}/v1/{queue}/{kind}/{id}` with a JSON body,
-//! for the queue in its path. The kinds are `enqueue`, `cancel` and `signal`. A
-//! pass lists the version prefix, sorts the entries by id and applies each in
-//! order through the queue. The pass rejects an entry for a queue outside
-//! [`InboxOptions::queues`], an entry of another kind, a body that does not
-//! decode and an entry whose operation fails with a permanent error. The
-//! application commits an [`InboxRecord`](crate::InboxRecord) at the id in the
-//! transaction of the entry's effect, or in a transaction of its own after an
-//! idempotent effect or none, and the object is deleted after the commit. A
-//! pass that finds the record of an object deletes the object without a read,
-//! and the transaction that writes a record fails when one exists, so ingestion
-//! is at least once and application is once within the retention of the record.
+//! An entry is one object at `{path}/v1/{queue}/{kind}/{id}` with the
+//! MessagePack body that [`InboxEntry`] states, for the queue in its path. The
+//! kinds are `enqueue`, `cancel` and `signal`. A pass lists the version prefix,
+//! sorts the entries by id and applies each in order through the queue. The
+//! pass rejects an entry for a queue outside [`InboxOptions::queues`], an entry
+//! of another kind, a body that does not decode and an entry whose operation
+//! fails with a permanent error. The application commits an
+//! [`InboxRecord`](crate::InboxRecord) at the id in the transaction of the
+//! entry's effect, or in a transaction of its own after an idempotent effect or
+//! none, and the object is deleted after the commit. A pass that finds the
+//! record of an object deletes the object without a read, and the transaction
+//! that writes a record fails when one exists, so ingestion is at least once
+//! and application is once within the retention of the record.
 //!
 //! The writer runs one pass at open before the scheduler starts. After it, the
 //! writer polls the touch object at `{path}/touch` once per

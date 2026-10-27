@@ -501,9 +501,7 @@ pub use effects::{EnqueueRequest, SettlementEffects};
 pub use error::{Error, FormError, Result, StoreUrlError};
 pub use expiry::{Expired, ExpiryIndex};
 pub use history::{AttemptOutcome, JobAttempt};
-pub use inbox::entry::{
-    CancelEntry, EnqueueEntry, InboxEntry, MAX_INBOX_ID_LEN, SignalEntry, inbox_bytes,
-};
+pub use inbox::entry::{CancelEntry, EnqueueEntry, InboxEntry, MAX_INBOX_ID_LEN, SignalEntry};
 pub use inbox::record::{InboxOutcome, InboxRecord};
 pub use inbox::sender::{InboxSender, PendingEntry};
 pub use inbox::{

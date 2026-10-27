@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::error::{Error, Result};
@@ -18,12 +19,14 @@ use crate::queue::{EnqueueResult, validate_id_override};
 use crate::queue_core::QueueCore;
 use crate::txn::Txn;
 
-/// One enqueue contained in [`SettlementEffects`].
-#[derive(Debug, Clone)]
+/// One enqueue contained in [`SettlementEffects`]. The serde form stores the
+/// payload as bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnqueueRequest {
     /// Queue the job is enqueued on.
     pub queue: String,
     /// Job payload.
+    #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
     /// Per-job options. `run_at`, `dedup_key`, `priority` and `id_override` are
     /// all honoured exactly as in

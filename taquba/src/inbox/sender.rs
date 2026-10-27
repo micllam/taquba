@@ -39,20 +39,21 @@ pub struct PendingEntry {
 }
 
 /// A sender of inbox entries over the object store of an inbox. It writes one
-/// object per entry at `{path}/v1/{queue}/{kind}/{id}` with the JSON body of
-/// the entry and never opens the store of the queue. After the entry, it
-/// touches the inbox: it overwrites the touch object at `{path}/touch` with a
-/// fresh ULID, so the writer lists the inbox at its next poll of the touch
-/// object. The writer applies the entry at its next pass, and the sender reads
-/// the outcome through
-/// [`QueueView::inbox_record`](crate::QueueView::inbox_record) of a
-/// [`QueueReader`](crate::QueueReader): the outcome of the operation of the
-/// entry's kind, or a rejection with its reason.
+/// object per entry at `{path}/v1/{queue}/{kind}/{id}` with the body of the
+/// entry and never opens the store of the queue. After the entry, it touches
+/// the inbox: it overwrites the touch object at `{path}/touch` with a fresh
+/// ULID, so the writer lists the inbox at its next poll of the touch object.
+/// The writer applies the entry at its next pass, and the sender reads the
+/// outcome through [`QueueView::inbox_record`](crate::QueueView::inbox_record)
+/// of a [`QueueReader`](crate::QueueReader): the outcome of the operation of
+/// the entry's kind, or a rejection with its reason.
 ///
 /// An entry is an [`InboxEntry`] for a queue of
 /// [`InboxOptions::queues`](crate::InboxOptions::queues). A layer receives its
 /// own requests as jobs that a sender enqueues. A sender in another language
-/// writes the JSON body itself, with a bytes field in base64.
+/// writes the body that [`InboxEntry`] states. A sender and its writer must run
+/// the same minor version of the crate, because the format of an entry, as the
+/// layout of the store, changes between minor releases.
 ///
 /// The writer applies the entries of a listing in id order. The ids of
 /// [`Self::send`] increase with call order on one sender and its clones, so
