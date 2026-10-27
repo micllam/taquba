@@ -322,10 +322,6 @@ pub(crate) struct Inbox {
     core: Arc<QueueCore>,
     inbox: Arc<InboxState>,
     tick: Duration,
-    schedule: tokio::sync::Mutex<Schedule>,
-}
-
-struct Schedule {
     /// The touch object at the HEAD before the last pass.
     touched: Option<ObjectMeta>,
     /// When the last pass of the task started, or `None` after a failed pass.
@@ -349,10 +345,8 @@ impl Inbox {
             core,
             inbox,
             tick,
-            schedule: tokio::sync::Mutex::new(Schedule {
-                touched,
-                last_pass: Some(started),
-            }),
+            touched,
+            last_pass: Some(started),
         }))
     }
 
@@ -373,15 +367,14 @@ async fn seen_touch(inbox: &InboxState) -> Option<ObjectMeta> {
 impl Periodic for Inbox {
     const NAME: &'static str = "inbox";
 
-    async fn step(&self) -> Result<()> {
-        let mut schedule = self.schedule.lock().await;
-        let mut due = schedule
+    async fn step(&mut self) -> Result<()> {
+        let mut due = self
             .last_pass
             .is_none_or(|started| started.elapsed() >= self.inbox.interval);
         if self.inbox.touch_poll_interval.is_some() {
             match self.inbox.touch_meta().await {
-                Ok(touched) if touched != schedule.touched => {
-                    schedule.touched = touched;
+                Ok(touched) if touched != self.touched => {
+                    self.touched = touched;
                     due = true;
                 }
                 Ok(_) => {}
@@ -393,7 +386,7 @@ impl Periodic for Inbox {
         }
         let started = Instant::now();
         let passed = self.core.inbox_pass().await;
-        schedule.last_pass = passed.is_ok().then_some(started);
+        self.last_pass = passed.is_ok().then_some(started);
         passed
     }
 }

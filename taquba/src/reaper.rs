@@ -49,7 +49,7 @@ impl Periodic for Reaper {
     /// Reap expired leases, then run the done and dead retention sweeps of
     /// every queue with a retention configured. A sweep error is logged here,
     /// and the reap error is returned.
-    async fn step(&self) -> Result<()> {
+    async fn step(&mut self) -> Result<()> {
         let core = &self.core;
         let reaped = core.reap_expired().await;
         // The largest configured `keep_done_jobs`: no done record newer than
@@ -922,7 +922,7 @@ mod tests {
         let q = Queue::open_with_options(make_store(), "test", opts)
             .await
             .unwrap();
-        let reaper = Reaper::new(Arc::clone(&q.core));
+        let mut reaper = Reaper::new(Arc::clone(&q.core));
 
         // A sweep over an empty done key space leaves the bound at the maximum,
         // and the ack that follows lowers it.

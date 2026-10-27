@@ -2,7 +2,6 @@
 //! and the periodic tick of a task that runs on an interval.
 
 use std::future::Future;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
@@ -11,21 +10,14 @@ use tracing::{debug, error, warn};
 
 use crate::error::Result;
 
-/// A unit of work run once per tick by [`BackgroundTask::spawn_periodic`].
-pub(crate) trait Periodic: Send + Sync + 'static {
+/// A unit of work run once per tick by [`BackgroundTask::spawn_periodic`],
+/// which owns the task and runs one step at a time.
+pub(crate) trait Periodic: Send + 'static {
     /// Name used in the task's log lines.
     const NAME: &'static str;
 
     /// Run one tick. An error is logged at warn level and the task continues.
-    fn step(&self) -> impl Future<Output = Result<()>> + Send;
-}
-
-impl<P: Periodic> Periodic for Arc<P> {
-    const NAME: &'static str = P::NAME;
-
-    fn step(&self) -> impl Future<Output = Result<()>> + Send {
-        P::step(self)
-    }
+    fn step(&mut self) -> impl Future<Output = Result<()>> + Send;
 }
 
 /// A spawned task stopped by [`BackgroundTask::stop`]. The task is given a
@@ -76,7 +68,7 @@ impl BackgroundTask {
     pub(crate) fn spawn_periodic<P: Periodic>(
         parent: &CancellationToken,
         interval: Duration,
-        task: P,
+        mut task: P,
     ) -> BackgroundTask {
         BackgroundTask::spawn(parent, move |shutdown| async move {
             let mut ticker = Ticker::new(interval, shutdown);

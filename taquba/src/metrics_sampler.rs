@@ -28,7 +28,7 @@ impl MetricsSampler {
 impl Periodic for MetricsSampler {
     const NAME: &'static str = "metrics sampler";
 
-    async fn step(&self) -> Result<()> {
+    async fn step(&mut self) -> Result<()> {
         sample(&self.core).await
     }
 }

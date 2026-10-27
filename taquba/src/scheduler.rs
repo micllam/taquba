@@ -24,7 +24,7 @@ impl Scheduler {
 impl Periodic for Scheduler {
     const NAME: &'static str = "scheduled job promoter";
 
-    async fn step(&self) -> Result<()> {
+    async fn step(&mut self) -> Result<()> {
         self.core.promote_due_jobs().await
     }
 }
