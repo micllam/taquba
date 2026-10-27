@@ -11,9 +11,9 @@
 //! [`InboxRecord`](crate::InboxRecord) at the id in the transaction of the
 //! entry's effect, or in a transaction of its own after an idempotent effect or
 //! none, and the object is deleted after the commit. A pass that finds the
-//! record of an object deletes the object without a read, and the transaction
-//! that writes a record fails when one exists, so ingestion is at least once
-//! and application is once within the retention of the record.
+//! record of an object deletes the object without a read, and passes run one at
+//! a time, so ingestion is at least once and application is once within the
+//! retention of the record.
 //!
 //! The writer runs one pass at open before the scheduler starts. After it, the
 //! writer polls the touch object at `{path}/touch` once per
@@ -23,9 +23,9 @@
 //! object before the listing, so an entry written during a listing changes the
 //! touch object for the next poll.
 //!
-//! Passes run one at a time. Any other error ends a pass at its entry, and the
-//! next pass starts again at the first entry without a record. After a pass
-//! that ends at an error, the writer runs a pass at the next poll.
+//! Any other error ends a pass at its entry, and the next pass starts again at
+//! the first entry without a record. After a pass that ends at an error, the
+//! writer runs a pass at the next poll.
 
 pub(crate) mod apply;
 pub(crate) mod entry;
@@ -428,18 +428,7 @@ impl QueueCore {
                     "queue `{queue}` is outside the inbox allow-list"
                 )))
             };
-            let recorded = match settled {
-                Ok(settled) => self.record_entry(&kind, &record, settled).await,
-                Err(err) => Err(err),
-            };
-            // A record committed before the error stands.
-            let rejected = match recorded {
-                Ok(rejected) => rejected,
-                Err(err) => match self.view.inbox_record(&id).await? {
-                    Some(stored) => matches!(stored.outcome, InboxOutcome::Rejected(_)),
-                    None => return Err(err),
-                },
-            };
+            let rejected = self.record_entry(&kind, &record, settled?).await?;
             if rejected {
                 crate::obs::inbox_rejected(&kind);
             } else {

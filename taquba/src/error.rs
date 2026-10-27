@@ -140,15 +140,6 @@ pub enum Error {
     #[error("inbox store error: {0}")]
     InboxStore(#[source] slatedb::object_store::Error),
 
-    /// A transaction would write the record of the inbox entry `id`, and a
-    /// record exists. The transaction is aborted, and the pass treats the entry
-    /// as applied.
-    #[error("inbox entry `{id}` is already applied")]
-    InboxAlreadyApplied {
-        /// The id of the entry.
-        id: String,
-    },
-
     /// The custom path of the inbox, in the object store of the queue, is the
     /// path of the queue or a path inside it.
     #[error("inbox path `{path}` overlaps the queue's path `{queue_path}`")]
@@ -269,7 +260,6 @@ impl Error {
             | Self::InvalidQueueName { .. }
             | Self::PayloadMissing { .. }
             | Self::InvalidStoreUrl { .. }
-            | Self::InboxAlreadyApplied { .. }
             | Self::InboxPathWithinQueue { .. } => true,
             Self::Storage(_)
             | Self::PayloadStore(_)

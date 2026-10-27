@@ -3,7 +3,7 @@ use slatedb::object_store::{ObjectStoreExt, PutPayload, path::Path};
 use super::*;
 use crate::error::Error;
 use crate::inbox::entry::{CancelEntry, EnqueueEntry, InboxEntry, SignalEntry};
-use crate::inbox::record::{InboxOutcome, InboxRecordHandle};
+use crate::inbox::record::InboxOutcome;
 use crate::inbox::sender::InboxSender;
 use crate::queue::{CancelOutcome, EnqueueResult, Queue, SignalOutcome};
 use crate::reader::QueueReader;
@@ -203,21 +203,36 @@ async fn an_object_outside_the_layout_is_left_in_place() {
 }
 
 #[tokio::test]
-async fn a_second_record_of_an_entry_aborts_its_commit() {
-    let store = make_store();
-    let q = open(&store, &MockClock::new(INITIAL)).await;
-    sender(&store)
+async fn passes_run_one_at_a_time() {
+    let faults = FaultStore::wrap();
+    let inbox_store: Arc<dyn ObjectStore> = faults.clone();
+    let opts = OpenOptions {
+        inbox: Some(InboxOptions::new(["work"]).object_store(inbox_store.clone())),
+        ..inbox_opts(&MockClock::new(INITIAL))
+    };
+    let q = Queue::open_with_options(make_store(), "test", opts)
+        .await
+        .unwrap();
+    sender(&inbox_store)
         .send_with_id(WORK, "a", EnqueueEntry::new(b"x"))
         .await
         .unwrap();
-    q.apply_inbox_now().await.unwrap();
-    let record = InboxRecordHandle::new("a".to_string(), INITIAL);
-    let err = q
-        .commit_effects(record.effects(InboxOutcome::Rejected(String::new())))
-        .await
-        .unwrap_err();
-    assert!(matches!(err, Error::InboxAlreadyApplied { ref id } if id == "a"));
-    assert!(err.is_permanent());
+
+    // The listing of the first pass is waiting for the release, and the second
+    // pass starts while it is waiting.
+    let opened = faults.lists();
+    faults.hold_next_list();
+    let (lists_at_first_end, second, ()) = tokio::join!(
+        async {
+            q.apply_inbox_now().await.unwrap();
+            faults.lists()
+        },
+        q.apply_inbox_now(),
+        async { faults.release_list() },
+    );
+    second.unwrap();
+    assert_eq!(lists_at_first_end, opened + 1);
+    assert_eq!(faults.lists(), opened + 2);
     q.close().await.unwrap();
 }
 

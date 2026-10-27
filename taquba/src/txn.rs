@@ -116,15 +116,10 @@ impl Txn {
     }
 
     /// Write the inbox record `record` and its expiry entry, and note the
-    /// record for the bound of the inbox expiry key space. A record at the id
-    /// of the entry fails the call with [`Error::InboxAlreadyApplied`].
-    pub(crate) async fn stage_inbox_record(&mut self, record: &StagedRecord) -> Result<()> {
+    /// record for the bound of the inbox expiry key space.
+    pub(crate) fn stage_inbox_record(&mut self, record: &StagedRecord) -> Result<()> {
         let id = record.id.as_str();
-        let key = inbox_record_key(id);
-        if self.txn.get(&key).await?.is_some() {
-            return Err(Error::InboxAlreadyApplied { id: id.to_string() });
-        }
-        self.txn.put(key, &record.bytes)?;
+        self.txn.put(inbox_record_key(id), &record.bytes)?;
         self.txn
             .put(inbox_expiry_key(record.applied_at_ms, id), Vec::new())?;
         let at = record.applied_at_ms;

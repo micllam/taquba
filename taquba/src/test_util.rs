@@ -78,7 +78,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// In-memory object store whose `put` and `delete` requests fail with a
 /// synthetic service-unavailable error while the corresponding flag is set.
-/// Reads and lists are unaffected.
+/// Reads are unaffected, and a list is held only after
+/// [`Self::hold_next_list`].
 #[derive(Debug)]
 pub(crate) struct FaultStore {
     inner: Arc<dyn ObjectStore>,
@@ -87,6 +88,10 @@ pub(crate) struct FaultStore {
     /// Puts permitted before every later put fails. `usize::MAX` disables the
     /// countdown, and `fail_puts` is then the only cause of failure.
     puts_before_failure: AtomicUsize,
+    /// Whether the next list is waiting for [`Self::release_list`].
+    hold_list: AtomicBool,
+    list_release: Arc<tokio::sync::Notify>,
+    lists: AtomicUsize,
 }
 
 impl FaultStore {
@@ -96,7 +101,25 @@ impl FaultStore {
             fail_puts: AtomicBool::new(false),
             fail_deletes: AtomicBool::new(false),
             puts_before_failure: AtomicUsize::new(usize::MAX),
+            hold_list: AtomicBool::new(false),
+            list_release: Arc::new(tokio::sync::Notify::new()),
+            lists: AtomicUsize::new(0),
         })
+    }
+
+    /// Hold the next list until [`Self::release_list`].
+    pub(crate) fn hold_next_list(&self) {
+        self.hold_list.store(true, Ordering::SeqCst);
+    }
+
+    /// Release the held list, also before the list starts.
+    pub(crate) fn release_list(&self) {
+        self.list_release.notify_one();
+    }
+
+    /// The number of lists started.
+    pub(crate) fn lists(&self) -> usize {
+        self.lists.load(Ordering::SeqCst)
     }
 
     pub(crate) fn fail_puts(&self, fail: bool) {
@@ -188,7 +211,18 @@ impl ObjectStore for FaultStore {
     }
 
     fn list(&self, prefix: Option<&StorePath>) -> BoxStream<'static, StoreResult<ObjectMeta>> {
-        self.inner.list(prefix)
+        self.lists.fetch_add(1, Ordering::SeqCst);
+        let listing = self.inner.list(prefix);
+        if !self.hold_list.swap(false, Ordering::SeqCst) {
+            return listing;
+        }
+        let release = self.list_release.clone();
+        futures_util::stream::once(async move {
+            release.notified().await;
+            listing
+        })
+        .flatten()
+        .boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&StorePath>) -> StoreResult<ListResult> {

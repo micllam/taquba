@@ -309,7 +309,7 @@ impl QueueCore {
             txn.note_expiry_entry(index, *at_ms);
         }
         if let Some(record) = &prepared.inbox_record {
-            txn.stage_inbox_record(record).await?;
+            txn.stage_inbox_record(record)?;
         }
         Ok(results)
     }
