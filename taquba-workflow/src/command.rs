@@ -149,18 +149,15 @@ impl CancelCommand {
 }
 
 /// The worker of the control queue: it applies each command job. A payload that
-/// does not decode as a [`Command`] dead-letters the job. A cancellation of a
-/// run that is not active applies the first submission of the run that waits on
-/// the control queue, with its first step held for [`HELD_FIRST_STEP`], and
-/// then cancels the run. The submission job applies later as a duplicate. A
-/// cancellation that fails at its every attempt leaves the run held.
+/// does not decode as a [`Command`] dead-letters the job. A cancellation of an
+/// inactive run applies the first waiting submission of the run on the control
+/// queue, and then cancels the run. That submission applies with the
+/// cancellation request on its run record and without its `run_at`. The
+/// submission job applies later as a duplicate. A cancellation retries while
+/// another worker has claimed a submission of its run.
 pub(crate) struct CommandWorker {
     pub(crate) core: Arc<RuntimeCore>,
 }
-
-/// How long a submission applied for a cancellation delays its first step: a
-/// hundred years, so that the step waits for the cancellation to remove it.
-const HELD_FIRST_STEP: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
 
 impl taquba::Worker for CommandWorker {
     async fn process(&self, job: &JobRecord, _lease: &LeaseHandle) -> Result<(), WorkerError> {
@@ -186,13 +183,23 @@ impl taquba::Worker for CommandWorker {
                     .waiting_submission(&job.queue, &cancel.run_id)
                     .await
                     .map_err(worker_error)?;
-                let Some(submit) = waiting else {
+                let Some((status, submit)) = waiting else {
                     return Ok(());
                 };
+                if status == JobStatus::Claimed {
+                    return Err(format!(
+                        "a submission of run `{}` is being applied",
+                        cancel.run_id
+                    )
+                    .into());
+                }
                 let mut spec = submit.into_spec();
-                let held = Duration::from_millis(self.core.clock.now_ms()) + HELD_FIRST_STEP;
-                spec.options.run_at = Some(UNIX_EPOCH + held);
-                match self.core.submit(spec).await {
+                spec.options.run_at = None;
+                match self
+                    .core
+                    .submit_cancelled(spec, cancel.reason.clone())
+                    .await
+                {
                     Ok(_) => {}
                     // The submission job fails on its own when it applies.
                     Err(err) if err.is_permanent() => return Ok(()),
@@ -209,21 +216,21 @@ impl taquba::Worker for CommandWorker {
 }
 
 impl CommandWorker {
-    /// The first submission of `run_id` that is pending or scheduled on
-    /// `queue`.
+    /// The first submission of `run_id` that is pending, scheduled or claimed
+    /// on `queue`, with the status of its job.
     async fn waiting_submission(
         &self,
         queue: &str,
         run_id: &RunId,
-    ) -> taquba::Result<Option<SubmitCommand>> {
+    ) -> taquba::Result<Option<(JobStatus, SubmitCommand)>> {
         let view = self.core.queue.view();
-        for status in [JobStatus::Pending, JobStatus::Scheduled] {
+        for status in [JobStatus::Pending, JobStatus::Scheduled, JobStatus::Claimed] {
             let mut jobs = std::pin::pin!(view.jobs(queue, status, SCAN_PAGE));
             while let Some(job) = jobs.try_next().await? {
                 if let Ok(Command::Submit(submit)) = decode(&job.payload)
                     && submit.run_id == *run_id
                 {
-                    return Ok(Some(submit));
+                    return Ok(Some((status, submit)));
                 }
             }
         }
@@ -527,6 +534,76 @@ mod tests {
             runtime.status(&rid("run-3")).await.unwrap().unwrap().state,
             crate::RunState::Terminated(_)
         ));
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_submission_applied_for_a_cancellation_terminates_at_the_claim_of_its_first_step() {
+        let (_queue, _sender, runtime, _clock) = open(OpenOptions::default()).await;
+        // The step worker claims the first step before a cancellation removes
+        // it.
+        let spec = SubmitCommand::new(rid("run-4"), b"x").into_spec();
+        runtime
+            .inner
+            .core
+            .submit_cancelled(spec, Some("operator".to_string()))
+            .await
+            .unwrap();
+        let shutdown = spawn(&runtime);
+        let end = runtime.wait(&rid("run-4")).await.unwrap();
+        assert_eq!(end.termination.status, TerminalStatus::Cancelled);
+        assert_eq!(end.termination.error.as_deref(), Some("operator"));
+        assert_eq!(end.outcome.and_then(|outcome| outcome.result), None);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_retries_while_another_worker_has_claimed_a_submission_of_its_run() {
+        let (queue, sender, runtime, _clock) = open(OpenOptions::default()).await;
+        let submit = Command::Submit(SubmitCommand::new(rid("run-5"), b"x"));
+        let cancel = Command::Cancel(CancelCommand::new(rid("run-5")));
+        sender
+            .send(CONTROL, EnqueueEntry::from(submit))
+            .await
+            .unwrap();
+        let cancel_id = sender
+            .send(CONTROL, EnqueueEntry::from(cancel))
+            .await
+            .unwrap();
+        queue.apply_inbox_now().await.unwrap();
+        // The test claims the submission in place of a second command worker.
+        let claimed = queue
+            .claim(CONTROL, Duration::from_secs(3_600))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            decode(&claimed.job().payload),
+            Ok(Command::Submit(_))
+        ));
+
+        let shutdown = spawn(&runtime);
+        let mut state = None;
+        for _ in 0..500 {
+            state = runtime.view().command(&cancel_id).await.unwrap();
+            if matches!(
+                state,
+                Some(CommandState::Queued {
+                    last_error: Some(_)
+                })
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let Some(CommandState::Queued {
+            last_error: Some(error),
+        }) = state
+        else {
+            panic!("the cancel did not retry: {state:?}");
+        };
+        assert!(error.contains("being applied"), "{error}");
+        assert!(runtime.status(&rid("run-5")).await.unwrap().is_none());
         let _ = shutdown.send(());
     }
 }

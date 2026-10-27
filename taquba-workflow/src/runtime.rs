@@ -852,7 +852,7 @@ impl RuntimeCore {
     pub(crate) async fn submit(&self, spec: RunSpec) -> Result<SubmitOutcome> {
         let run_id = self.validate_spec(&spec)?;
         tracing::Span::current().record("run_id", run_id.as_str());
-        self.enqueue_run(&run_id, spec, None).await
+        self.enqueue_run(&run_id, spec, None, None).await
     }
 
     /// [`Self::submit`] of a member of a group: the run's step jobs hold the
@@ -863,7 +863,24 @@ impl RuntimeCore {
         spec: RunSpec,
     ) -> Result<SubmitOutcome> {
         let run_id = self.validate_spec(&spec)?;
-        self.enqueue_run(&run_id, spec, Some(membership)).await
+        self.enqueue_run(&run_id, spec, Some(membership), None)
+            .await
+    }
+
+    /// [`Self::submit`] of a run whose run record contains a cancellation
+    /// request for `reason`. A claim of its first step terminates the run
+    /// without running the step.
+    pub(crate) async fn submit_cancelled(
+        &self,
+        spec: RunSpec,
+        reason: Option<String>,
+    ) -> Result<SubmitOutcome> {
+        let run_id = self.validate_spec(&spec)?;
+        let request = DurableCancelRequest {
+            reason,
+            requested_at_ms: self.clock.now_ms(),
+        };
+        self.enqueue_run(&run_id, spec, None, Some(request)).await
     }
 
     /// Check `spec`'s headers and effects, and return the run id, generated
@@ -879,12 +896,14 @@ impl RuntimeCore {
     /// the termination, so it identifies a run whichever process submitted it,
     /// and the step's dedup key serialises two submissions that both find the
     /// record absent. A `membership` is set on the step job and its pending
-    /// member record is written with the enqueue.
+    /// member record is written with the enqueue. A `cancel_request` is written
+    /// on the run record.
     async fn enqueue_run(
         &self,
         run_id: &RunId,
         spec: RunSpec,
         membership: Option<&Membership>,
+        cancel_request: Option<DurableCancelRequest>,
     ) -> Result<SubmitOutcome> {
         let input_hash = hash_input(&spec.input);
         let duplicate = |job_id: String| SubmitOutcome {
@@ -936,7 +955,7 @@ impl RuntimeCore {
             run_id: run_id.clone(),
             submitted_at_ms: self.clock.now_ms(),
             input_hash,
-            cancel_request: None,
+            cancel_request,
         }));
         let mut effects = spec
             .effects
