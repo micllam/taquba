@@ -6,20 +6,18 @@ use tracing::debug;
 use crate::error::Result;
 use crate::queue::SignalOutcome;
 use crate::queue_core::QueueCore;
-use crate::queue_core::control::stage_wake;
+use crate::queue_core::control::{Wake, stage_wake};
 use crate::txn::{Attempt, Durability, Txn};
 
-/// Stage a signal to the job `job_id` with `payload` at `now` in `txn`: the
-/// staged wake of a job that waits for a signal, and no change to any other
-/// job.
+/// Stage a signal to the job `job_id` with `payload` in `txn`: the staged wake
+/// of a job waiting for a signal, and no change to any other job.
 pub(crate) async fn stage_signal(
     txn: &mut Txn,
     job_id: &str,
     payload: Vec<u8>,
-    now: u64,
 ) -> Result<SignalOutcome> {
     Ok(
-        match stage_wake(txn, job_id, Some(payload), now, true).await? {
+        match stage_wake(txn, job_id, Wake::Signal(payload)).await? {
             Ok(_) => SignalOutcome::Delivered,
             Err(_) => SignalOutcome::NotWaiting,
         },
@@ -32,8 +30,7 @@ impl QueueCore {
         let payload = &payload;
         let outcome = self
             .retry(Durability::Awaited, |mut txn| async move {
-                let outcome =
-                    stage_signal(&mut txn, job_id, payload.clone(), self.now_ms()).await?;
+                let outcome = stage_signal(&mut txn, job_id, payload.clone()).await?;
                 Ok((txn, Attempt::Commit(outcome)))
             })
             .await?;
@@ -70,15 +67,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_signal_wakes_the_waiting_job_with_its_payload_and_ends_the_wait() {
-        let clock = MockClock::new(INITIAL);
-        let q = open(&clock).await;
+        let q = open(&MockClock::new(INITIAL)).await;
         let id = q
             .enqueue_with("jobs", b"wait".to_vec(), waiting())
             .await
             .unwrap();
         assert!(q.view().get_job(&id).await.unwrap().unwrap().signal_wait);
 
-        clock.advance(Duration::from_secs(5));
         assert_eq!(
             q.signal(&id, b"paid".to_vec()).await.unwrap(),
             SignalOutcome::Delivered
@@ -86,8 +81,7 @@ mod tests {
 
         let job = q.claim("jobs", LEASE).await.unwrap().unwrap();
         assert_eq!(job.id, id);
-        assert_eq!(job.wake_payload.as_deref(), Some(b"paid".as_slice()));
-        assert_eq!(job.woken_at, Some(INITIAL + 5_000));
+        assert_eq!(job.signal.as_deref(), Some(b"paid".as_slice()));
         assert_eq!(job.run_at, None);
         assert!(!job.signal_wait);
         assert_eq!(
@@ -114,9 +108,9 @@ mod tests {
         }
         let delayed = q.view().get_job(&delayed).await.unwrap().unwrap();
         assert_eq!(delayed.status, JobStatus::Scheduled);
-        assert_eq!(delayed.woken_at, None);
+        assert_eq!(delayed.signal, None);
         let pending = q.view().get_job(&pending).await.unwrap().unwrap();
-        assert_eq!(pending.wake_payload, None);
+        assert_eq!(pending.signal, None);
         q.close().await.unwrap();
     }
 
@@ -146,7 +140,6 @@ mod tests {
         let job = q.view().get_job(&id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Pending);
         assert!(!job.signal_wait);
-        assert_eq!(job.woken_at, None);
         q.close().await.unwrap();
     }
 
@@ -177,16 +170,14 @@ mod tests {
             q.claim_by_id(&claimed, LEASE).await.unwrap(),
             ClaimOutcome::Claimed(_)
         ));
-        assert_eq!(
-            q.wake_scheduled(&woken, None).await.unwrap(),
-            WakeOutcome::Woken
-        );
+        assert_eq!(q.wake_scheduled(&woken).await.unwrap(), WakeOutcome::Woken);
         clock.advance(Duration::from_secs(3_601));
         q.promote_scheduled_now().await.unwrap();
 
         for id in [&promoted, &cancelled, &claimed, &woken] {
             if let Some(job) = q.view().get_job(id).await.unwrap() {
                 assert!(!job.signal_wait, "{id}");
+                assert_eq!(job.signal, None, "{id}");
             }
             assert_eq!(
                 q.signal(id, b"late".to_vec()).await.unwrap(),
@@ -198,7 +189,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_retried_waiter_rejects_a_signal_in_its_backoff() {
+    async fn a_retried_waiter_keeps_its_signal_and_rejects_another() {
         let clock = MockClock::new(INITIAL);
         let opts = OpenOptions {
             clock: Arc::new(clock.clone()),
@@ -227,10 +218,9 @@ mod tests {
             q.signal(&id, b"duplicate".to_vec()).await.unwrap(),
             SignalOutcome::NotWaiting
         );
-        clock.advance(Duration::from_secs(11));
-        q.promote_scheduled_now().await.unwrap();
+        assert_eq!(q.wake_scheduled(&id).await.unwrap(), WakeOutcome::Woken);
         let job = q.claim("jobs", LEASE).await.unwrap().unwrap();
-        assert_eq!(job.wake_payload.as_deref(), Some(b"go".as_slice()));
+        assert_eq!(job.signal.as_deref(), Some(b"go".as_slice()));
         q.close().await.unwrap();
     }
 }

@@ -184,7 +184,8 @@ pub struct Step {
     /// [`Trigger::OnSignal`] wait that a signal resolved: the previous step
     /// continued with `OnSignal`, and a [`taquba::Queue::signal`] call for this
     /// step's job id arrived before the timeout. `None` when the timeout
-    /// elapsed first and on every step not preceded by an `OnSignal` wait.
+    /// elapsed first or [`taquba::Queue::wake_scheduled`] ended the wait, and
+    /// on every step not preceded by an `OnSignal` wait.
     pub signal: Option<Vec<u8>>,
 }
 

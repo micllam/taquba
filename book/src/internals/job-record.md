@@ -83,8 +83,7 @@ Three properties of the lifecycle:
 A job is stored as a single `JobRecord`, encoded as a MessagePack map with field
 names. MessagePack is compact, and the named fields keep a stored record
 readable when the set of fields changes. The two byte fields, `payload` and
-`wake_payload`, are binary strings, so the record stores their bytes as they
-are.
+`signal`, are binary strings, so the record stores their bytes as they are.
 
 The record contains:
 
@@ -174,7 +173,7 @@ unchanged. These are the fields a transition sets:
 - **A nack** clears `claimed_at` and records `last_error`.
 - **A dead-letter** clears `claimed_at`, records `last_error` and sets
   `failed_at`.
-- **An early wake or a signal** sets `woken_at` and attaches `wake_payload`.
+- **A signal** sets `signal` to its payload.
 - **A cancel** of a claimed job sets `cancel_requested`.
 - **[`Queue::requeue_dead_job`][requeue]** resets `attempts`, `last_error`,
   `claimed_at`, `failed_at` and `cancel_requested`, so the revived job starts
@@ -186,9 +185,8 @@ because their value means something after the transition that set it:
 - **`enqueued_at`** is preserved by `requeue_dead_job`, so a revived job keeps
   its original enqueue time. That is why the dead retention sweep ages jobs by
   `failed_at`, which is set afresh at each dead-lettering.
-- **`woken_at` and `wake_payload`** stay on the record after the wake, so a
-  worker sees the early wake on every delivery of that job, redeliveries
-  included. `woken_at` marks the wake even when no bytes were attached.
+- **`signal`** stays on the record after the signal, so a worker sees the signal
+  on every delivery of that job, redeliveries included.
 - **`cancel_requested`** stays set, so a job re-claimed after a lease expires
   begins with its cancellation token already fired.
 

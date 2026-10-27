@@ -305,11 +305,7 @@ mod tests {
                 .is_none()
         );
 
-        let outcome = q
-            .wake_scheduled(&id, Some(b"signal".to_vec()))
-            .await
-            .unwrap();
-        assert_eq!(outcome, WakeOutcome::Woken);
+        assert_eq!(q.wake_scheduled(&id).await.unwrap(), WakeOutcome::Woken);
 
         let s = q.view().stats("jobs").await.unwrap();
         assert_eq!(s.scheduled, 0);
@@ -321,34 +317,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(job.id, id);
-        assert_eq!(job.wake_payload.as_deref(), Some(b"signal".as_slice()));
-        assert_eq!(job.woken_at, Some(initial));
         assert!(job.run_at.is_none());
-
-        // A wake without a payload leaves `wake_payload` unset.
-        let silent = q
-            .enqueue_with(
-                "jobs",
-                b"waiting".to_vec(),
-                EnqueueOptions {
-                    run_at: Some(run_at),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            q.wake_scheduled(&silent, None).await.unwrap(),
-            WakeOutcome::Woken
-        );
-        let job = q
-            .claim("jobs", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(job.id, silent);
-        assert!(job.wake_payload.is_none());
-        assert_eq!(job.woken_at, Some(initial));
 
         q.close().await.unwrap();
     }
@@ -359,7 +328,7 @@ mod tests {
 
         let id = q.enqueue("jobs", b"p".to_vec()).await.unwrap();
         assert_eq!(
-            q.wake_scheduled(&id, None).await.unwrap(),
+            q.wake_scheduled(&id).await.unwrap(),
             WakeOutcome::NotScheduled
         );
 
@@ -369,12 +338,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            q.wake_scheduled(&job.id, None).await.unwrap(),
+            q.wake_scheduled(&job.id).await.unwrap(),
             WakeOutcome::NotScheduled
         );
 
         assert_eq!(
-            q.wake_scheduled("01ARZ3NDEKTSV4RRFFQ69G5FAV", None)
+            q.wake_scheduled("01ARZ3NDEKTSV4RRFFQ69G5FAV")
                 .await
                 .unwrap(),
             WakeOutcome::NotFound
@@ -409,10 +378,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(q.cancel(&id).await.unwrap(), CancelOutcome::Removed);
-        assert_eq!(
-            q.wake_scheduled(&id, None).await.unwrap(),
-            WakeOutcome::NotFound
-        );
+        assert_eq!(q.wake_scheduled(&id).await.unwrap(), WakeOutcome::NotFound);
 
         q.close().await.unwrap();
     }
@@ -446,74 +412,9 @@ mod tests {
         q.promote_scheduled_now().await.unwrap();
 
         assert_eq!(
-            q.wake_scheduled(&id, Some(b"late".to_vec())).await.unwrap(),
+            q.wake_scheduled(&id).await.unwrap(),
             WakeOutcome::NotScheduled
         );
-
-        let job = q
-            .claim("jobs", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(job.wake_payload.is_none());
-        assert!(job.woken_at.is_none());
-
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_wake_payload_persists_across_redelivery() {
-        let initial = 1_700_000_000_000u64;
-        let clock = MockClock::new(initial);
-        let opts = OpenOptions {
-            clock: Arc::new(clock.clone()),
-            ..OpenOptions::default()
-        };
-        let q = Queue::open_with_options(make_store(), "test", opts)
-            .await
-            .unwrap();
-
-        let run_at = std::time::UNIX_EPOCH + Duration::from_millis(initial + 60_000);
-        let id = q
-            .enqueue_with(
-                "jobs",
-                b"waiting".to_vec(),
-                EnqueueOptions {
-                    run_at: Some(run_at),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            q.wake_scheduled(&id, Some(b"signal".to_vec()))
-                .await
-                .unwrap(),
-            WakeOutcome::Woken
-        );
-
-        let job = q
-            .claim("jobs", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        q.nack(&job, "worker failed").await.unwrap();
-
-        // The retry backoff moves the job back to `scheduled`. Promote it and
-        // verify that the redelivered record still contains the wake payload.
-        clock.advance(Duration::from_secs(5));
-        q.promote_scheduled_now().await.unwrap();
-
-        let job = q
-            .claim("jobs", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(job.id, id);
-        assert_eq!(job.attempts, 2);
-        assert_eq!(job.wake_payload.as_deref(), Some(b"signal".as_slice()));
-        assert_eq!(job.woken_at, Some(initial));
 
         q.close().await.unwrap();
     }

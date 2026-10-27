@@ -23,7 +23,6 @@ use crate::kv::KvReadHandle;
 use crate::runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 use crate::runtime::StepRef;
 use crate::runtime::{RuntimeCore, RuntimeInner, StepEnqueueOpts};
-use crate::signal::step_signal;
 use crate::terminal::{CancelOrigin, RunOutcome, TerminalHook, TerminalStatus};
 
 /// The [`Worker`] of a runtime: every claimed job of the runtime's queue is
@@ -345,7 +344,7 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             },
             step_number,
             payload: job.payload.clone(),
-            signal: step_signal(job),
+            signal: job.signal.clone(),
         };
 
         let replayed = if self.core.step_output_replay {

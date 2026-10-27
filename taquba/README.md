@@ -26,8 +26,7 @@ separate state layer (typically Postgres).
 - Multiple named queues per store with per-queue configuration.
 - Priority levels (FIFO within each priority).
 - Scheduled jobs, dedup keys, custom priority/attempts.
-- Targeted early wake of a scheduled job (`Queue::wake_scheduled`), with
-  optional attached bytes the worker observes on delivery.
+- Targeted early wake of a scheduled job (`Queue::wake_scheduled`).
 - Signal waits: a scheduled job enqueued with `EnqueueOptions::signal_wait`
   waits for a signal, and `Queue::signal` wakes it by its id with a payload.
 - An inbox (`OpenOptions::inbox`): another process enqueues, cancels and signals

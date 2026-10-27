@@ -81,7 +81,7 @@ impl QueueCore {
         }
         let (job_id, payload) = (&entry.job_id, &entry.payload);
         self.retry(Durability::Awaited, |mut txn| async move {
-            let outcome = stage_signal(&mut txn, job_id, payload.clone(), self.now_ms()).await?;
+            let outcome = stage_signal(&mut txn, job_id, payload.clone()).await?;
             let stored = record.staged(InboxOutcome::Signal(outcome))?;
             txn.stage_inbox_record(&stored).await?;
             Ok((txn, Attempt::Commit(())))

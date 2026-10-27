@@ -461,8 +461,8 @@ pub struct EnqueueOptions {
     /// Whether the scheduled job waits for a signal until its `run_at`. A
     /// signal to the job's id ([`Queue::signal`](crate::Queue::signal)) moves
     /// it to pending before its `run_at`, with the payload of the signal on
-    /// [`JobRecord::wake_payload`](crate::JobRecord::wake_payload). A wait
-    /// requires [`Self::run_at`], and without it the enqueue fails with
+    /// [`JobRecord::signal`](crate::JobRecord::signal). A wait requires
+    /// [`Self::run_at`], and without it the enqueue fails with
     /// [`Error::SignalWaitWithoutRunAt`](crate::Error::SignalWaitWithoutRunAt).
     pub signal_wait: bool,
 }

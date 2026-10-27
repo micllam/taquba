@@ -10,10 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `EnqueueOptions::signal_wait`: a scheduled job waits for a signal, stored in
-  `JobRecord::signal_wait` while the job waits, and `Queue::signal` wakes it by
-  its id with a payload before its `run_at`. A signal to a job that does not
-  wait returns `SignalOutcome::NotWaiting` without a change. A wait without
-  `run_at` fails with `Error::SignalWaitWithoutRunAt`.
+  `JobRecord::signal_wait` while the job is waiting, and `Queue::signal` wakes
+  it by its id before its `run_at`, with the payload on `JobRecord::signal`. A
+  signal to a job that is not waiting returns `SignalOutcome::NotWaiting`
+  without a change. A wait without `run_at` fails with
+  `Error::SignalWaitWithoutRunAt`.
 - The inbox: `OpenOptions::inbox` with `InboxOptions::new` opens the queue with
   a prefix of objects through which another process enqueues, cancels and
   signals. The writer applies each entry once within
@@ -46,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `QueueName` accepts 1 to 255 bytes of `[A-Za-z0-9._-]` with a letter or a
   digit first, so a queue name is a single segment of an object path. Drain a
   queue whose name has another form, and rename it, before the upgrade.
+- `Queue::wake_scheduled` takes the job id alone, and `JobRecord::woken_at` and
+  `JobRecord::wake_payload` are removed, so the bytes of a job woken in 0.15.0
+  are unreadable. Deliver bytes with `Queue::signal` to a job enqueued with
+  `EnqueueOptions::signal_wait`, and read them from `JobRecord::signal`.
 
 ## [0.15.0] - 2026-10-14
 

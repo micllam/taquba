@@ -98,8 +98,7 @@
 //! - Exponential retry backoff via the scheduled key space (configurable per
 //!   queue, see [`QueueConfig`]).
 //! - Scheduled jobs become pending at their `run_at`, or earlier via the
-//!   targeted [`Queue::wake_scheduled`], which can attach bytes the worker
-//!   observes on delivery.
+//!   targeted [`Queue::wake_scheduled`].
 //! - A scheduled job enqueued with [`EnqueueOptions::signal_wait`] waits for a
 //!   signal: [`Queue::signal`] wakes it by its id with a payload.
 //! - Bounded dead-letter retention with paginated inspection.

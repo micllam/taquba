@@ -495,7 +495,7 @@ async fn the_signal_kind_wakes_a_waiter_of_its_queue_or_records_that_none_waits(
     q.apply_inbox_now().await.unwrap();
     let woken = q.claim("waits", LEASE).await.unwrap().unwrap();
     assert_eq!(woken.id, waiter);
-    assert_eq!(woken.wake_payload.as_deref(), Some(b"to-waiter".as_slice()));
+    assert_eq!(woken.signal.as_deref(), Some(b"to-waiter".as_slice()));
     let outcome = |id: &'static str| {
         let view = q.view();
         async move { view.inbox_record(id).await.unwrap().unwrap().outcome }
@@ -549,7 +549,7 @@ async fn the_first_pass_at_open_precedes_the_scheduler() {
     let q = open(&store, &clock).await;
     let job = q.view().get_job(&waiter).await.unwrap().unwrap();
     assert_eq!(job.status, JobStatus::Pending);
-    assert_eq!(job.wake_payload.as_deref(), Some(b"late".as_slice()));
+    assert_eq!(job.signal.as_deref(), Some(b"late".as_slice()));
     assert_eq!(object_count(&store, "test-inbox/v1/waits/signal").await, 0);
     q.close().await.unwrap();
 }

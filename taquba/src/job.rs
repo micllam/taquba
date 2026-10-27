@@ -69,27 +69,18 @@ pub struct JobRecord {
     /// while `status == Scheduled`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_at: Option<u64>,
-    /// When [`Queue::wake_scheduled`](crate::Queue::wake_scheduled) moved this
-    /// job to pending before its `run_at`. `None` for jobs that became pending
-    /// any other way, including promotion at `run_at` by the scheduler. The
-    /// field distinguishes an early wake from an ordinary promotion regardless
-    /// of whether bytes were attached. Once set, the value persists across
-    /// later transitions (retries, redelivery after lease expiry).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub woken_at: Option<u64>,
-    /// Bytes attached by
-    /// [`Queue::wake_scheduled`](crate::Queue::wake_scheduled) when this job
-    /// was woken before its `run_at`. `None` when the wake attached zero bytes
-    /// or the job was never woken early. [`Self::woken_at`] is the early-wake
-    /// marker itself. Once attached, the value persists across later
-    /// transitions, so a worker observes it on every delivery of the job.
+    /// The payload of the signal that ended the job's wait, set by
+    /// [`Queue::signal`](crate::Queue::signal). `None` for a job that never
+    /// waited and when the wait ended at its `run_at` or by
+    /// [`Queue::wake_scheduled`](crate::Queue::wake_scheduled). A job receives
+    /// at most one signal, and the payload persists across later transitions,
+    /// so a worker observes it on every delivery of the job.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
-    pub wake_payload: Option<Vec<u8>>,
-    /// Whether the job waits for a signal, set from
+    pub signal: Option<Vec<u8>>,
+    /// Whether the job is waiting for a signal, set from
     /// [`EnqueueOptions::signal_wait`](crate::EnqueueOptions::signal_wait).
     /// `true` only while the job is scheduled for its wait: a signal to the
-    /// job's id ([`Queue::signal`](crate::Queue::signal)) moves it to pending
-    /// with [`Self::woken_at`] and [`Self::wake_payload`] set, and every
+    /// job's id moves it to pending with [`Self::signal`] set, and every
     /// transition out of the scheduled state clears the flag.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub signal_wait: bool,
@@ -253,8 +244,7 @@ impl JobRecord {
             enqueued_at,
             claimed_at: None,
             run_at: None,
-            woken_at: None,
-            wake_payload: None,
+            signal: None,
             signal_wait: false,
             priority,
             last_error: None,
@@ -328,8 +318,7 @@ impl JobRecord {
             enqueued_at: self.enqueued_at,
             claimed_at: self.claimed_at,
             run_at: self.run_at,
-            woken_at: self.woken_at,
-            wake_payload: self.wake_payload.clone(),
+            signal: self.signal.clone(),
             signal_wait: self.signal_wait,
             priority: self.priority,
             last_error: self.last_error.clone(),
@@ -388,18 +377,18 @@ mod tests {
         // prefixes every byte at or above `0x80`.
         let payload: Vec<u8> = (0..=255).collect();
         let mut job = JobRecord::new_pending("j".into(), qn("q"), payload.clone(), 3, 0, 1);
-        job.wake_payload = Some(payload.iter().rev().copied().collect());
+        job.signal = Some(payload.iter().rev().copied().collect());
         let stored = job.stored_bytes().unwrap();
         assert!(
             stored
                 .windows(payload.len())
                 .any(|w| w == payload.as_slice())
         );
-        let woken: Vec<u8> = payload.iter().rev().copied().collect();
-        assert!(stored.windows(woken.len()).any(|w| w == woken.as_slice()));
+        let signal: Vec<u8> = payload.iter().rev().copied().collect();
+        assert!(stored.windows(signal.len()).any(|w| w == signal.as_slice()));
         let decoded = JobRecord::decode(&pending_key(&qn("q"), 0, 0, "j"), &stored).unwrap();
         assert_eq!(decoded.payload, payload);
-        assert_eq!(decoded.wake_payload.as_deref(), Some(woken.as_slice()));
+        assert_eq!(decoded.signal.as_deref(), Some(signal.as_slice()));
     }
 
     fn record() -> JobRecord {

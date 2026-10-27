@@ -11,6 +11,16 @@ use crate::queue::{CancelOutcome, EnqueueResult, WaitOutcome, WakeOutcome};
 use crate::queue_core::QueueCore;
 use crate::txn::{Attempt, Durability, Txn, get_indexed_job};
 
+/// What moves a scheduled job to pending in [`stage_wake`].
+pub(crate) enum Wake {
+    /// A signal with its payload, which wakes only a job waiting for a signal
+    /// and is stored on [`JobRecord::signal`].
+    Signal(Vec<u8>),
+    /// An early wake, which wakes any scheduled job and leaves its record
+    /// unchanged otherwise.
+    Early,
+}
+
 /// Why [`stage_wake`] left a job unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NotWoken {
@@ -18,21 +28,18 @@ pub(crate) enum NotWoken {
     Missing,
     /// The job is not scheduled.
     Unscheduled,
-    /// The wake requires a signal wait, and the job does not wait for a signal.
+    /// The wake is a signal, and the job is not waiting for a signal.
     NoWait,
 }
 
-/// Stage the wake of the scheduled job `job_id` at `now` in `txn`, and return
-/// its queue: the job moves to pending with `woken_at` and `payload` on its
-/// record. With `signal_wait`, only a job that waits for a signal wakes. The
-/// transition reads the record, so a wake and a concurrent transition of the
-/// job conflict and one of the two retries against the other's commit.
+/// Stage the `wake` of the scheduled job `job_id` in `txn`, and return its
+/// queue. The transition reads the record, so a wake and a concurrent
+/// transition of the job conflict and one of the two retries against the
+/// other's commit.
 pub(crate) async fn stage_wake(
     txn: &mut Txn,
     job_id: &str,
-    payload: Option<Vec<u8>>,
-    now: u64,
-    signal_wait: bool,
+    wake: Wake,
 ) -> Result<std::result::Result<QueueName, NotWoken>> {
     let Some((_, current_key, mut job)) = get_indexed_job(txn, job_id).await? else {
         return Ok(Err(NotWoken::Missing));
@@ -40,11 +47,12 @@ pub(crate) async fn stage_wake(
     if job.status != JobStatus::Scheduled {
         return Ok(Err(NotWoken::Unscheduled));
     }
-    if signal_wait && !job.signal_wait {
-        return Ok(Err(NotWoken::NoWait));
+    if let Wake::Signal(payload) = wake {
+        if !job.signal_wait {
+            return Ok(Err(NotWoken::NoWait));
+        }
+        job.signal = Some(payload);
     }
-    job.woken_at = Some(now);
-    job.wake_payload = payload;
     txn.stage_to_pending(&current_key, &mut job)?;
     Ok(Ok(job.queue))
 }
@@ -147,16 +155,10 @@ impl QueueCore {
 
     /// Move the scheduled job `id` to pending before its `run_at`, as
     /// [`Queue::wake_scheduled`](crate::Queue::wake_scheduled) documents.
-    pub(crate) async fn wake_scheduled(
-        &self,
-        id: &str,
-        wake_payload: Option<Vec<u8>>,
-    ) -> Result<WakeOutcome> {
-        let wake_payload = &wake_payload;
+    pub(crate) async fn wake_scheduled(&self, id: &str) -> Result<WakeOutcome> {
         let outcome = self
             .retry(Durability::Awaited, |mut txn| async move {
-                let staged =
-                    stage_wake(&mut txn, id, wake_payload.clone(), self.now_ms(), false).await?;
+                let staged = stage_wake(&mut txn, id, Wake::Early).await?;
                 Ok(match staged {
                     Ok(queue) => (txn, Attempt::Commit(Ok(queue))),
                     Err(NotWoken::Missing) => (txn, Attempt::Abort(Err(WakeOutcome::NotFound))),

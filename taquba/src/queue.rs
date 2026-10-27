@@ -1075,41 +1075,30 @@ impl Queue {
         self.core.cancel(id, effects).await
     }
 
-    /// Move a `Scheduled` job to pending immediately, before its `run_at`,
-    /// optionally attaching `wake_payload` bytes to the record.
+    /// Move a `Scheduled` job to pending immediately, before its `run_at`.
     ///
     /// This is the targeted counterpart of the scheduler's due-job promotion:
     /// the same transition (scheduled to pending), applied to one job by ID
     /// when the caller asks, without waiting for `run_at`. On
     /// [`WakeOutcome::Woken`] the job is claimable immediately and any worker
-    /// waiting on the queue is notified.
-    ///
-    /// The wake sets [`JobRecord::woken_at`], which distinguishes an early wake
-    /// from ordinary promotion at `run_at` regardless of whether bytes were
-    /// attached. `wake_payload` is stored on [`JobRecord::wake_payload`]. Both
-    /// values persist on the record across later transitions, so redelivery
-    /// after a lease expiry observes them again. The payload is part of the
-    /// serialized record that each transition rewrites. It is intended for
-    /// coordination data, and bulk payload does not belong in it.
+    /// waiting on the queue is notified. The wake leaves the rest of the record
+    /// unchanged, so a job waiting for a signal ends its wait as at its
+    /// `run_at`, with [`JobRecord::signal`] `None`.
     ///
     /// Exactly one caller wins the transition: a concurrent scheduler
     /// promotion, `wake_scheduled` call, or [`Self::cancel`] and this call
     /// conflict on the scheduled record, and the loser observes
     /// [`WakeOutcome::NotScheduled`] or [`WakeOutcome::NotFound`]. The commit
     /// is durable before the call returns.
-    pub async fn wake_scheduled(
-        &self,
-        id: &str,
-        wake_payload: Option<Vec<u8>>,
-    ) -> Result<WakeOutcome> {
-        self.core.wake_scheduled(id, wake_payload).await
+    pub async fn wake_scheduled(&self, id: &str) -> Result<WakeOutcome> {
+        self.core.wake_scheduled(id).await
     }
 
     /// Deliver a signal to the job `job_id`.
     ///
     /// A scheduled job enqueued with [`EnqueueOptions::signal_wait`] moves to
     /// pending before its `run_at`, as [`Self::wake_scheduled`] moves it, with
-    /// `payload` on [`JobRecord::wake_payload`], and the call returns
+    /// `payload` on [`JobRecord::signal`], and the call returns
     /// [`SignalOutcome::Delivered`]. For any other job, including one whose
     /// wait ended, the call returns [`SignalOutcome::NotWaiting`] without a
     /// change. A signal is never held for a later wait, so the work that leads

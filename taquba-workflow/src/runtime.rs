@@ -1471,7 +1471,9 @@ mod tests {
     use taquba::object_store::ObjectStoreExt;
     use taquba::object_store::memory::InMemory;
     use taquba::{Expired, ExpiryIndex};
-    use taquba::{LeaseHandle, MockClock, OpenOptions, QueueConfig, QueueReader, SignalOutcome};
+    use taquba::{
+        LeaseHandle, MockClock, OpenOptions, QueueConfig, QueueReader, SignalOutcome, WakeOutcome,
+    };
     use tokio::sync::oneshot;
 
     /// Recording terminal hook backed by an mpsc channel.
@@ -2169,6 +2171,39 @@ mod tests {
             queue.signal(&job_id, b"late".to_vec()).await.unwrap(),
             SignalOutcome::NotWaiting
         );
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wake_of_a_waiting_step_delivers_none() {
+        let (queue, store, _clock) = open_queue_at(1_700_000_000_000).await;
+        let mut probe =
+            signal_probe_runtime(queue.clone(), store, Duration::from_secs(3600), false);
+        let shutdown = spawn_runtime(probe.runtime.clone());
+
+        let handle = probe
+            .runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        wait_for_scheduled(&queue, 1).await;
+        let job_id = waiting_job_id(&probe.runtime, &handle.run_id).await;
+
+        assert_eq!(
+            queue.wake_scheduled(&job_id).await.unwrap(),
+            WakeOutcome::Woken
+        );
+
+        let terminal = tokio::time::timeout(Duration::from_secs(2), probe.rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.status, TerminalStatus::Succeeded);
+        assert_eq!(probe.observed.lock().unwrap().as_slice(), &[None]);
 
         let _ = shutdown.send(());
     }
