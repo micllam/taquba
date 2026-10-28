@@ -35,7 +35,7 @@ fn sender(store: &Arc<dyn ObjectStore>) -> InboxSender {
 
 /// Write `body` at the entry path of `queue`, `kind` and `id`.
 async fn put_raw(store: &Arc<dyn ObjectStore>, queue: &str, kind: &str, id: &str, body: &[u8]) {
-    let path = Path::from(entry_path("test-inbox", queue, kind, id));
+    let path = Path::from(entry_path("test-inbox", queue, kind, Ulid::new(), id));
     store
         .put(&path, PutPayload::from(body.to_vec()))
         .await
@@ -59,15 +59,22 @@ async fn an_entry_is_applied_once_with_a_record_and_its_object_deleted() {
     let store = make_store();
     let clock = MockClock::new(INITIAL);
     let q = open(&store, &clock).await;
-    let id = sender(&store)
+    let sender = sender(&store);
+    let id = sender
         .send(WORK, EnqueueEntry::new(b"hello"))
         .await
         .unwrap();
-    assert_eq!(object_count(&store, "test-inbox/v1/work/enqueue").await, 1);
+    // A resend before the pass writes an object of its own.
+    sender
+        .send_with_id(WORK, &id, EnqueueEntry::new(b"resent"))
+        .await
+        .unwrap();
+    assert_eq!(object_count(&store, "test-inbox/v1/work/enqueue").await, 2);
 
     q.apply_inbox_now().await.unwrap();
     let job = q.claim("work", LEASE).await.unwrap().unwrap();
     assert_eq!(job.payload, b"hello");
+    assert!(q.claim("work", LEASE).await.unwrap().is_none());
     assert_eq!(object_count(&store, "test-inbox/v1/work/enqueue").await, 0);
     let record = q.view().inbox_record(WORK, &id).await.unwrap().unwrap();
     assert_eq!(record.applied_at_ms, INITIAL);
@@ -85,7 +92,7 @@ async fn an_entry_is_applied_once_with_a_record_and_its_object_deleted() {
     );
     reader.close().await.unwrap();
     for queue in [WORK, WAITS] {
-        sender(&store)
+        sender
             .send_with_id(queue, &id, EnqueueEntry::new(b"again"))
             .await
             .unwrap();
@@ -107,22 +114,41 @@ async fn an_entry_is_applied_once_with_a_record_and_its_object_deleted() {
 }
 
 #[tokio::test]
-async fn entries_apply_in_id_order_across_kinds() {
+async fn entries_apply_in_send_order_across_kinds_and_ids() {
     let store = make_store();
     let q = open(&store, &MockClock::new(INITIAL)).await;
     let sender = sender(&store);
+    // In id order, the generated id applies first and the cancel before the
+    // enqueue of its job.
     sender
-        .send_with_id(WORK, "b", EnqueueEntry::new(b"second"))
+        .send_with_id(
+            WORK,
+            "z",
+            EnqueueEntry {
+                options: EnqueueOptions::default().id_override("j".to_string()),
+                ..EnqueueEntry::new(b"cancelled")
+            },
+        )
         .await
         .unwrap();
+    sender.send(WORK, EnqueueEntry::new(b"kept")).await.unwrap();
     sender
-        .send_with_id(WORK, "a", EnqueueEntry::new(b"first"))
+        .send_with_id(WORK, "a", CancelEntry { job_id: "j".into() })
         .await
         .unwrap();
     q.apply_inbox_now().await.unwrap();
+    assert_eq!(
+        q.view()
+            .inbox_record(WORK, "a")
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome,
+        InboxOutcome::Cancel(CancelOutcome::Removed)
+    );
     let jobs = q.claim_batch("work", 2, LEASE).await.unwrap();
     let payloads: Vec<&[u8]> = jobs.iter().map(|j| j.payload.as_slice()).collect();
-    assert_eq!(payloads, [b"first".as_slice(), b"second".as_slice()]);
+    assert_eq!(payloads, [b"kept".as_slice()]);
     q.close().await.unwrap();
 }
 
@@ -156,9 +182,16 @@ async fn an_entry_that_cannot_apply_is_rejected_with_a_record() {
         )
         .await
         .unwrap();
+    let body = InboxEntry::from(EnqueueEntry::new(b"x")).encode();
+    for name in ["no-order", "not-a-ulid.bad-order"] {
+        let path = Path::from(format!("test-inbox/v1/work/enqueue/{name}"));
+        store.put(&path, body.clone().into()).await.unwrap();
+    }
 
     q.apply_inbox_now().await.unwrap();
     for (queue, id) in [
+        (WORK, "no-order"),
+        (WORK, "bad-order"),
         (WORK, "bad-body"),
         (WORK, "bad-shape"),
         (WORK, "unknown-kind"),
@@ -187,13 +220,43 @@ async fn an_entry_that_cannot_apply_is_rejected_with_a_record() {
 }
 
 #[tokio::test]
+async fn an_entry_applies_before_an_object_name_of_its_id_without_a_ulid() {
+    let store = make_store();
+    let q = open(&store, &MockClock::new(INITIAL)).await;
+    let body = InboxEntry::from(EnqueueEntry::new(b"unordered")).encode();
+    store
+        .put(&Path::from("test-inbox/v1/work/enqueue/x"), body.into())
+        .await
+        .unwrap();
+    sender(&store)
+        .send_with_id(WORK, "x", EnqueueEntry::new(b"ordered"))
+        .await
+        .unwrap();
+
+    q.apply_inbox_now().await.unwrap();
+    let job = q.claim("work", LEASE).await.unwrap().unwrap();
+    assert_eq!(job.payload, b"ordered");
+    assert_eq!(
+        q.view()
+            .inbox_record(WORK, "x")
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome,
+        InboxOutcome::Enqueue(EnqueueResult::New(job.id.clone()))
+    );
+    assert_eq!(object_count(&store, "test-inbox/v1/work/enqueue").await, 0);
+    q.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn an_object_outside_the_layout_is_left_in_place() {
     let store = make_store();
     let q = open(&store, &MockClock::new(INITIAL)).await;
     for path in [
         "test-inbox/v2/work/enqueue/future",
         "test-inbox/v1/work/enqueue/nested/id",
-        "test-inbox/v1/work/enqueue/bad.id",
+        "test-inbox/v1/work/enqueue/01ARZ3NDEKTSV4RRFFQ69G5FAV.bad.id",
         "test-inbox/v1/-q/enqueue/id",
         "test-inbox/v1/work/stray",
         "test-inbox/v1/stray",
@@ -249,22 +312,6 @@ async fn passes_run_one_at_a_time() {
     assert_eq!(lists_at_first_end, opened + 1);
     assert_eq!(faults.lists(), opened + 2);
     q.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn the_ids_of_one_sender_increase_with_call_order() {
-    let store = make_store();
-    let sender = sender(&store);
-    let mut ids = Vec::new();
-    for _ in 0..3 {
-        ids.push(
-            sender
-                .send(WORK, CancelEntry { job_id: "j".into() })
-                .await
-                .unwrap(),
-        );
-    }
-    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "{ids:?}");
 }
 
 #[tokio::test]
@@ -377,7 +424,7 @@ async fn a_send_and_a_listing_refuse_an_invalid_queue_name() {
 }
 
 #[tokio::test]
-async fn the_pending_entries_of_a_queue_are_listed_in_id_order_until_their_pass() {
+async fn the_pending_entries_of_a_queue_are_listed_in_send_order_until_their_pass() {
     let store = make_store();
     let q = open(&store, &MockClock::new(INITIAL)).await;
     let job_a = q.enqueue("work", b"a".to_vec()).await.unwrap();
@@ -404,7 +451,16 @@ async fn the_pending_entries_of_a_queue_are_listed_in_id_order_until_their_pass(
         .await
         .unwrap();
     put_raw(&store, WORK, "cancel", "bad", &map_body("job", 1)).await;
-    put_raw(&store, WORK, "cancel", "bad.id", b"{}").await;
+    let no_order = InboxEntry::from(CancelEntry {
+        job_id: job_a.clone(),
+    });
+    store
+        .put(
+            &Path::from("test-inbox/v1/work/cancel/no-order"),
+            no_order.encode().into(),
+        )
+        .await
+        .unwrap();
 
     let pending = sender.pending(WORK).await.unwrap();
     let listed: Vec<(&str, &InboxEntry)> =
@@ -417,14 +473,18 @@ async fn the_pending_entries_of_a_queue_are_listed_in_id_order_until_their_pass(
     assert_eq!(
         listed,
         [
-            ("a", &cancel(&job_a)),
             ("b", &cancel(&job_b)),
+            ("a", &cancel(&job_a)),
             ("c", &InboxEntry::Enqueue(EnqueueEntry::new(b"x"))),
         ]
     );
     let written = store
-        .head(&Path::from(entry_path("test-inbox", WORK, "cancel", "a")))
+        .list_with_delimiter(Some(&Path::from("test-inbox/v1/work/cancel")))
         .await
+        .unwrap()
+        .objects
+        .into_iter()
+        .find(|object| object.location.as_ref().ends_with(".b"))
         .unwrap()
         .last_modified;
     assert_eq!(pending[0].sent_at_ms as i64, written.timestamp_millis());

@@ -1,19 +1,21 @@
 //! The inbox: a prefix of objects that the writer applies, through which
 //! another process enqueues, cancels and signals.
 //!
-//! An entry is one object at `{path}/v1/{queue}/{kind}/{id}` with the
+//! An entry is one object at `{path}/v1/{queue}/{kind}/{order}.{id}` with the
 //! MessagePack body that [`InboxEntry`] states, for the queue in its path. The
-//! kinds are `enqueue`, `cancel` and `signal`. A pass lists the version prefix,
-//! sorts the entries by id and applies each in order through the queue. The
-//! pass rejects an entry for a queue outside [`InboxOptions::queues`], an entry
-//! of another kind, a body that does not decode and an entry whose operation
-//! fails with a permanent error. The application commits an
-//! [`InboxRecord`](crate::InboxRecord) at the queue and the id in the
-//! transaction of the entry's effect. After an idempotent effect or none, the
-//! record commits in a transaction of its own. The object is deleted after the
-//! commit. A pass that finds the record of an object deletes the object without
-//! a read, and passes run one at a time, so ingestion is at least once and
-//! application is once within the retention of the record.
+//! kinds are `enqueue`, `cancel` and `signal`, and `order` is a ULID of the
+//! send. A pass lists the version prefix, sorts the entries by order and then
+//! by id and applies each in turn through the queue. After the entries, the
+//! pass rejects each object name without a ULID before the id, so an entry of
+//! that id applies first.
+//!
+//! The pass rejects the entries that [`InboxOptions`] lists. The application
+//! commits an [`InboxRecord`](crate::InboxRecord) at the queue and the id in
+//! the transaction of the entry's effect. After an idempotent effect or none,
+//! the record commits in a transaction of its own. The object is deleted after
+//! the commit. A pass that finds the record of an object deletes the object
+//! without a read, and passes run one at a time, so ingestion is at least once
+//! and application is once within the retention of the record.
 //!
 //! The writer runs one pass at open before the scheduler starts. After it, the
 //! writer polls the touch object at `{path}/touch` once per
@@ -42,6 +44,7 @@ use slatedb::object_store::{
 };
 use tokio::time::Instant;
 use tracing::{debug, warn};
+use ulid::Ulid;
 
 use crate::background::Periodic;
 use crate::effects::SettlementEffects;
@@ -78,13 +81,15 @@ pub fn default_inbox_path(path: &str) -> String {
 /// the queues of [`Self::queues`].
 ///
 /// The writer lists the inbox at open, after a change of its touch object and
-/// once per [`Self::interval`]. A pass applies the entries in id order. It
-/// commits an [`InboxRecord`](crate::InboxRecord) at the queue and the id in
-/// the transaction of the entry's effect. After an idempotent effect or none,
-/// it commits the record in a transaction of its own. It then deletes the
-/// object. The pass rejects these entries with a record of the reason:
+/// once per [`Self::interval`]. A pass applies the entries in the order that
+/// [`InboxSender`](crate::InboxSender) states. It commits an
+/// [`InboxRecord`](crate::InboxRecord) at the queue and the id in the
+/// transaction of the entry's effect. After an idempotent effect or none, it
+/// commits the record in a transaction of its own. It then deletes the object.
+/// The pass rejects these entries with a record of the reason:
 ///
-/// - A malformed entry.
+/// - A malformed entry: an object name without a ULID before the id, or a body
+///   that does not decode.
 /// - An entry for a queue outside [`Self::queues`].
 /// - An entry of another kind.
 /// - A cancel or a signal for a job of another queue.
@@ -259,9 +264,10 @@ fn version_prefix(prefix: &str) -> String {
     format!("{prefix}/v1")
 }
 
-/// The path of the entry `id` of `kind` and `queue` in the inbox at `prefix`.
-pub(crate) fn entry_path(prefix: &str, queue: &str, kind: &str, id: &str) -> String {
-    format!("{}/{kind}/{id}", queue_prefix(prefix, queue))
+/// The path of the entry `id` of `kind` and `queue`, sent at `order`, in the
+/// inbox at `prefix`.
+pub(crate) fn entry_path(prefix: &str, queue: &str, kind: &str, order: Ulid, id: &str) -> String {
+    format!("{}/{kind}/{order}.{id}", queue_prefix(prefix, queue))
 }
 
 /// The path of the touch object of the inbox at `prefix`.
@@ -269,51 +275,86 @@ pub(crate) fn touch_path(prefix: &str) -> String {
     format!("{prefix}/touch")
 }
 
-/// The segments of an entry path within the version prefix, ordered by id and
-/// then by queue and kind.
+/// The queue, kind and id of an entry path, ordered by id and then by queue and
+/// kind.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct EntryPath {
+pub(crate) struct EntryKey {
     pub(crate) id: String,
     pub(crate) queue: QueueName,
     pub(crate) kind: String,
 }
 
-impl EntryPath {
-    /// The segments of the path `relative` to the version prefix, or `None` for
-    /// a path outside the layout.
+/// The segments of an entry path within the version prefix, ordered by order
+/// and then by key.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct EntryPath {
+    pub(crate) order: Ulid,
+    pub(crate) key: EntryKey,
+}
+
+/// A path within the layout.
+enum ParsedPath {
+    Entry(EntryPath),
+    /// An object name without a ULID before the id.
+    Unordered(EntryKey),
+}
+
+impl ParsedPath {
+    /// The path `relative` to the version prefix, or `None` for a path outside
+    /// the layout.
     fn parse(relative: &str) -> Option<Self> {
         let mut segments = relative.split('/');
-        let (queue, kind, id) = (segments.next()?, segments.next()?, segments.next()?);
+        let (queue, kind, name) = (segments.next()?, segments.next()?, segments.next()?);
+        let (order, id) = match name.split_once('.') {
+            Some((order, id)) => (Ulid::from_string(order).ok(), id),
+            None => (None, name),
+        };
         if segments.next().is_some() || kind.is_empty() || validate_id(id).is_err() {
             return None;
         }
-        Some(Self {
+        let key = EntryKey {
             id: id.to_string(),
             queue: QueueName::new(queue).ok()?,
             kind: kind.to_string(),
+        };
+        Some(match order {
+            Some(order) => Self::Entry(EntryPath { order, key }),
+            None => Self::Unordered(key),
         })
     }
 }
 
-/// The entries within `under` in the inbox at `prefix` of `store`, in the order
-/// of [`EntryPath`]. A path outside the layout is logged and left in place.
+/// The objects of a listing within the layout.
+pub(crate) struct Listing {
+    /// The entries in the order of [`EntryPath`].
+    pub(crate) entries: Vec<(EntryPath, ObjectMeta)>,
+    /// The objects with a name without a ULID before the id.
+    pub(crate) unordered: Vec<(EntryKey, ObjectMeta)>,
+}
+
+/// The objects within `under` in the inbox at `prefix` of `store`. A path
+/// outside the layout is logged and left in place.
 pub(crate) async fn list_entries(
     store: &dyn ObjectStore,
     prefix: &str,
     under: &str,
-) -> Result<Vec<(EntryPath, ObjectMeta)>> {
+) -> Result<Listing> {
     let version = format!("{}/", version_prefix(prefix));
     let mut objects = store.list(Some(&Path::from(under)));
-    let mut entries = Vec::new();
+    let mut listing = Listing {
+        entries: Vec::new(),
+        unordered: Vec::new(),
+    };
     while let Some(object) = objects.try_next().await.map_err(Error::InboxStore)? {
         let path = object.location.as_ref().strip_prefix(version.as_str());
-        match path.and_then(EntryPath::parse) {
-            Some(path) => entries.push((path, object)),
+        match path.and_then(ParsedPath::parse) {
+            Some(ParsedPath::Entry(path)) => listing.entries.push((path, object)),
+            Some(ParsedPath::Unordered(key)) => listing.unordered.push((key, object)),
             None => warn!(path = %object.location, "object outside the inbox layout; skipped"),
         }
     }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(entries)
+    listing.entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(listing)
 }
 
 /// The pass task of the inbox. A tick sends a HEAD for the touch object, and a
@@ -408,36 +449,58 @@ impl QueueCore {
     }
 
     async fn inbox_pass_over(&self, inbox: &InboxState) -> Result<()> {
-        let entries =
+        let Listing { entries, unordered } =
             list_entries(&*inbox.store, &inbox.prefix, &version_prefix(&inbox.prefix)).await?;
-        for (EntryPath { id, queue, kind }, ObjectMeta { location, .. }) in entries {
-            if self.db.get(inbox_record_key(&queue, &id)).await?.is_some() {
-                inbox.delete(&location).await?;
-                debug!(kind, id, "inbox entry already applied; object deleted");
-                continue;
-            }
-            let record = InboxRecordHandle::new(queue.clone(), id.clone(), self.now_ms());
-            let settled = if inbox.accepts(&queue) {
-                let body = inbox.get(&location).await?;
-                match InboxEntry::decode(&kind, &body) {
-                    Ok(entry) => self.apply_entry(&queue, &record, entry).await,
-                    Err(reason) => Ok(Settled::Rejected(reason)),
-                }
-            } else {
-                Ok(Settled::Rejected(format!(
-                    "queue `{queue}` is outside the inbox allow-list"
-                )))
-            };
-            let rejected = self.record_entry(&kind, &record, settled?).await?;
-            if rejected {
-                crate::obs::inbox_rejected(&kind);
-            } else {
-                crate::obs::inbox_applied(&kind);
-                debug!(kind, id, "inbox entry applied");
-            }
-            inbox.delete(&location).await?;
+        for (EntryPath { key, .. }, object) in entries {
+            self.settle_object(inbox, key, &object.location, None)
+                .await?;
+        }
+        for (key, object) in unordered {
+            let reason = "the object name has no ULID before the id".to_string();
+            self.settle_object(inbox, key, &object.location, Some(reason))
+                .await?;
         }
         Ok(())
+    }
+
+    /// Apply the object at `location`, or reject it with `rejection` without a
+    /// read, then commit its record and delete it. An object whose record
+    /// exists is deleted without an effect.
+    async fn settle_object(
+        &self,
+        inbox: &InboxState,
+        key: EntryKey,
+        location: &Path,
+        rejection: Option<String>,
+    ) -> Result<()> {
+        let EntryKey { id, queue, kind } = key;
+        if self.db.get(inbox_record_key(&queue, &id)).await?.is_some() {
+            inbox.delete(location).await?;
+            debug!(kind, id, "inbox entry already applied; object deleted");
+            return Ok(());
+        }
+        let record = InboxRecordHandle::new(queue.clone(), id.clone(), self.now_ms());
+        let settled = if !inbox.accepts(&queue) {
+            Ok(Settled::Rejected(format!(
+                "queue `{queue}` is outside the inbox allow-list"
+            )))
+        } else if let Some(reason) = rejection {
+            Ok(Settled::Rejected(reason))
+        } else {
+            let body = inbox.get(location).await?;
+            match InboxEntry::decode(&kind, &body) {
+                Ok(entry) => self.apply_entry(&queue, &record, entry).await,
+                Err(reason) => Ok(Settled::Rejected(reason)),
+            }
+        };
+        let rejected = self.record_entry(&kind, &record, settled?).await?;
+        if rejected {
+            crate::obs::inbox_rejected(&kind);
+        } else {
+            crate::obs::inbox_applied(&kind);
+            debug!(kind, id, "inbox entry applied");
+        }
+        inbox.delete(location).await
     }
 
     /// Commit the record of an entry of `kind` that `settled` reports
