@@ -52,6 +52,14 @@ pub enum Rejection {
         /// The size of the object in bytes.
         size: u64,
     },
+    /// The reads of the object of the entry failed for
+    /// [`INBOX_UNREADABLE_AFTER`](crate::INBOX_UNREADABLE_AFTER) from the
+    /// first.
+    #[error("unreadable: {detail}")]
+    Unreadable {
+        /// The error of the last read.
+        detail: String,
+    },
     /// The queue of the entry is outside
     /// [`InboxOptions::queues`](crate::InboxOptions::queues).
     #[error("the queue is outside the inbox allow-list")]

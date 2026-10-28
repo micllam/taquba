@@ -11,7 +11,7 @@ All of the queue's state is in one store:
 - The claim cursor.
 - Per-queue counters.
 - The writer heartbeat.
-- The inbox records and their expiry index.
+- The inbox records, their expiry index and the failed reads of inbox entries.
 - The caller's own KV namespace.
 
 The encoding meets three requirements, and the sections that follow describe how
@@ -94,6 +94,7 @@ follows the two-byte header.
 | `Heartbeat` | `0x0B` | none, one key per store | the writer's last heartbeat |
 | `InboxRecord` | `0x0C` | qlen, queue, inbox entry id | the `InboxRecord` of an applied entry |
 | `InboxExpiry` | `0x0D` | `applied_at` `u64` BE, qlen, queue, inbox entry id | empty |
+| `InboxFailure` | `0x0E` | qlen, queue, inbox entry id | time of the first failed read `u64` BE |
 | `User` | `0xFF` | caller bytes, no version byte | the caller's value |
 
 A job record is therefore stored at exactly one of the first five keys at any
@@ -152,6 +153,10 @@ the previous process held, and so covers every queue.
 the queue is opened (`restore_cursor_state`, [claim_cursor.rs][claim_cursor]),
 and the stats space by `list_queues`, which discovers queue names from it. A
 queue's own counters are point gets.
+
+`InboxFailure` is read whole at the end of each inbox pass that ends without an
+error (`clear_inbox_failures`, [inbox.rs][inbox]), which deletes every key. A
+failed read of an entry gets its key by point lookup.
 
 Six key spaces are reached by point lookup: `JobIndex`, `AttemptHistory`,
 `Dedup`, `Heartbeat`, `InboxRecord` and `User`. Their keys contain only what
@@ -265,6 +270,7 @@ such a row and the stats read drops it.
 [DuplicateJobId]: https://docs.rs/taquba/latest/taquba/enum.Error.html#variant.DuplicateJobId
 [keys]: https://github.com/micllam/taquba/blob/master/taquba/src/keys.rs
 [effects]: https://github.com/micllam/taquba/blob/master/taquba/src/effects.rs
+[inbox]: https://github.com/micllam/taquba/blob/master/taquba/src/inbox.rs
 [stats]: https://github.com/micllam/taquba/blob/master/taquba/src/stats.rs
 [options]: https://github.com/micllam/taquba/blob/master/taquba/src/options.rs
 [queue]: https://github.com/micllam/taquba/blob/master/taquba/src/queue.rs

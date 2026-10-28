@@ -35,9 +35,14 @@
 //! touch object for the next poll.
 //!
 //! A pass skips an entry whose object is missing at its read. A failed delete
-//! of an object is logged and counted, and a later pass deletes the object. Any
-//! other error ends a pass at its entry, after the flush and the deletes of the
-//! entries before it in its batch. The next pass starts again at the first
+//! of an object is logged and counted, and a later pass deletes the object. A
+//! failed read commits the time of the first failure at the entry's failure key
+//! and ends the pass. From [`INBOX_UNREADABLE_AFTER`] after that time, a pass
+//! rejects the entry with [`Rejection::Unreadable`] and continues. A pass that
+//! ends without an error deletes every failure key.
+//!
+//! Any other error ends a pass at its entry, after the flush and the deletes of
+//! the entries before it in its batch. The next pass starts again at the first
 //! entry without a record. After a pass that ends at an error, the writer runs
 //! a pass at the next poll.
 
@@ -63,10 +68,11 @@ use crate::background::Periodic;
 use crate::error::{Error, Result};
 use crate::inbox::entry::{InboxEntry, MAX_INBOX_ENTRY_SIZE, validate_id};
 use crate::inbox::record::{InboxOutcome, InboxRecordHandle, Rejection};
-use crate::keys::{QueueName, inbox_record_key};
+use crate::keys::{KeyTag, QueueName, inbox_failure_key, inbox_record_key, tag_prefix};
 use crate::objects::delete_objects;
 use crate::queue_core::QueueCore;
 use crate::time_bound::TimeBound;
+use crate::txn::{Attempt, Durability};
 
 /// The objects that a pass settles before one flush of their commits and the
 /// deletion of the objects.
@@ -87,6 +93,11 @@ pub const DEFAULT_INBOX_TOUCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Default value of [`InboxOptions::record_retention`].
 pub const DEFAULT_INBOX_RECORD_RETENTION: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// How long the reads of an entry's object fail, from the first failed read on
+/// the queue's clock, before a pass rejects the entry with
+/// [`Rejection::Unreadable`]. Until then, a failed read ends the pass.
+pub const INBOX_UNREADABLE_AFTER: Duration = Duration::from_secs(3600);
 
 /// The inbox path of a queue opened at `path` without [`InboxOptions::path`]:
 /// `"{path}-inbox"`, a sibling of the queue's path in its object store. A
@@ -254,17 +265,19 @@ impl InboxState {
 
     /// Read the object at `location`, with the size of the read checked against
     /// [`MAX_INBOX_ENTRY_SIZE`] before its body.
-    async fn read(&self, location: &Path) -> Result<Read> {
+    async fn read(&self, location: &Path) -> Read {
         let result = match self.store.get(location).await {
             Ok(result) => result,
-            Err(ObjectStoreError::NotFound { .. }) => return Ok(Read::Missing),
-            Err(err) => return Err(Error::InboxStore(err)),
+            Err(ObjectStoreError::NotFound { .. }) => return Read::Missing,
+            Err(err) => return Read::Failed(err),
         };
         if let Some(rejection) = oversized(result.meta.size) {
-            return Ok(Read::Rejected(rejection));
+            return Read::Rejected(rejection);
         }
-        let body = result.bytes().await.map_err(Error::InboxStore)?;
-        Ok(Read::Body(body.to_vec()))
+        match result.bytes().await {
+            Ok(body) => Read::Body(body.to_vec()),
+            Err(err) => Read::Failed(err),
+        }
     }
 
     /// The metadata of the touch object, or `None` before the first touch.
@@ -296,6 +309,8 @@ enum Read {
     Missing,
     /// The read rejects the entry without its body.
     Rejected(Rejection),
+    /// The store failed the read.
+    Failed(ObjectStoreError),
 }
 
 /// An object of a pass: the key of its path, its metadata from the listing and
@@ -545,7 +560,66 @@ impl QueueCore {
         for batch in objects.chunks(INBOX_BATCH) {
             self.inbox_batch(inbox, batch).await?;
         }
-        Ok(())
+        self.clear_inbox_failures().await
+    }
+
+    /// Delete every failure key. A pass that reaches this step settled each
+    /// listed entry, so no entry of the inbox is failing.
+    async fn clear_inbox_failures(&self) -> Result<()> {
+        let mut iter = self
+            .db
+            .scan_prefix(tag_prefix(KeyTag::InboxFailure), ..)
+            .await?;
+        let mut cleared = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            cleared.push(kv.key.to_vec());
+        }
+        drop(iter);
+        if cleared.is_empty() {
+            return Ok(());
+        }
+        let cleared = &cleared;
+        self.retry(Durability::Deferred, |txn| async move {
+            for key in cleared {
+                txn.delete(key)?;
+            }
+            Ok((txn, Attempt::Commit(())))
+        })
+        .await
+    }
+
+    /// The rejection of the entry `id` of `queue` after the failed read `err`,
+    /// once [`INBOX_UNREADABLE_AFTER`] has passed from the first failed read of
+    /// the entry, or `None` before. The first failed read commits its time, and
+    /// the commit awaits durability, so a failed open keeps it.
+    async fn unreadable(
+        &self,
+        queue: &QueueName,
+        id: &str,
+        err: &ObjectStoreError,
+    ) -> Result<Option<Rejection>> {
+        let key = &inbox_failure_key(queue, id);
+        let now = self.now_ms();
+        let first = self
+            .db
+            .get(key)
+            .await?
+            .and_then(|value| <[u8; 8]>::try_from(value.as_ref()).ok())
+            .map(u64::from_be_bytes);
+        let Some(first) = first else {
+            self.retry(Durability::Awaited, |txn| async move {
+                txn.put(key, now.to_be_bytes())?;
+                Ok((txn, Attempt::Commit(())))
+            })
+            .await?;
+            return Ok(None);
+        };
+        let after = u64::try_from(INBOX_UNREADABLE_AFTER.as_millis()).unwrap_or(u64::MAX);
+        Ok(
+            (now.saturating_sub(first) >= after).then(|| Rejection::Unreadable {
+                detail: err.to_string(),
+            }),
+        )
     }
 
     /// Settle the objects of `batch`, then flush their commits once and delete
@@ -606,7 +680,7 @@ impl QueueCore {
         if object.rejection.is_some() || self.db.get(inbox_record_key(queue, id)).await?.is_some() {
             return Ok(None);
         }
-        inbox.read(&object.meta.location).await.map(Some)
+        Ok(Some(inbox.read(&object.meta.location).await))
     }
 
     /// Apply `object`, or reject it with the rejection of its listing without a
@@ -633,7 +707,7 @@ impl QueueCore {
         } else {
             let read = match prefetched {
                 Some(read) => read,
-                None => inbox.read(&object.meta.location).await?,
+                None => inbox.read(&object.meta.location).await,
             };
             match read {
                 Read::Body(body) => InboxEntry::decode(kind, &body),
@@ -642,6 +716,10 @@ impl QueueCore {
                     debug!(kind, id, "inbox entry deleted after the listing; skipped");
                     return Ok(());
                 }
+                Read::Failed(err) => match self.unreadable(queue, id, &err).await? {
+                    Some(rejection) => Err(rejection),
+                    None => return Err(Error::InboxStore(err)),
+                },
             }
         };
         let outcome = match decoded {

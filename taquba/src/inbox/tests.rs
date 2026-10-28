@@ -983,11 +983,64 @@ async fn a_read_rejects_an_object_above_the_size_bound_before_its_body() {
         .await
         .unwrap();
 
-    let read = inbox.read(&location).await.unwrap();
+    let read = inbox.read(&location).await;
     assert!(matches!(
         read,
         Read::Rejected(Rejection::TooLarge { size: read_size }) if read_size == size as u64
     ));
+}
+
+#[tokio::test]
+async fn an_unreadable_entry_is_rejected_after_the_bound_and_the_pass_continues() {
+    let faults = FaultStore::wrap();
+    let inbox_store: Arc<dyn ObjectStore> = faults.clone();
+    let clock = MockClock::new(INITIAL);
+    let opts = OpenOptions {
+        inbox: Some(
+            InboxOptions::new(["work"])
+                .object_store(inbox_store.clone())
+                .touch_poll_interval(None),
+        ),
+        ..inbox_opts(&clock)
+    };
+    let q = Queue::open_with_options(make_store(), "test", opts)
+        .await
+        .unwrap();
+    let sender = sender(&inbox_store);
+    for id in ["a", "b"] {
+        sender
+            .send_with_id(WORK, id, EnqueueEntry::new(id.as_bytes()))
+            .await
+            .unwrap();
+    }
+    let failure = inbox_failure_key(&QueueName::new(WORK).unwrap(), "a");
+
+    // The first failed read ends the pass and commits its time.
+    faults.fail_reads_ending(Some(".a"));
+    assert!(q.apply_inbox_now().await.is_err());
+    assert!(q.core.db.get(&failure).await.unwrap().is_some());
+    clock.advance(INBOX_UNREADABLE_AFTER - Duration::from_millis(1));
+    assert!(q.apply_inbox_now().await.is_err());
+    assert!(q.view().inbox_record(WORK, "b").await.unwrap().is_none());
+
+    clock.advance(Duration::from_millis(1));
+    q.apply_inbox_now().await.unwrap();
+    assert!(matches!(
+        q.view()
+            .inbox_record(WORK, "a")
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome,
+        InboxOutcome::Rejected(Rejection::Unreadable { .. })
+    ));
+    assert!(q.view().inbox_record(WORK, "b").await.unwrap().is_some());
+    assert!(q.core.db.get(&failure).await.unwrap().is_none());
+    assert_eq!(
+        object_count(&inbox_store, "test-inbox/v1/work/enqueue").await,
+        0
+    );
+    q.close().await.unwrap();
 }
 
 #[tokio::test]

@@ -201,6 +201,10 @@ pub(crate) enum KeyTag {
     /// empty value. Written with the inbox record, and read by the retention
     /// sweep in time order.
     InboxExpiry = 0x0D,
+    /// `[tag, ver, qlen, queue, inbox entry id]`. The value is the time of the
+    /// first failed read of an object of the entry, `u64` BE. Deleted by an
+    /// inbox pass that ends without an error.
+    InboxFailure = 0x0E,
     /// `[tag, caller bytes]`, without a version byte. Caller bytes are opaque.
     User = 0xFF,
 }
@@ -227,6 +231,7 @@ impl KeyTag {
             0x0B => KeyTag::Heartbeat,
             0x0C => KeyTag::InboxRecord,
             0x0D => KeyTag::InboxExpiry,
+            0x0E => KeyTag::InboxFailure,
             0xFF => KeyTag::User,
             _ => return None,
         })
@@ -249,6 +254,7 @@ impl KeyTag {
             | KeyTag::Heartbeat
             | KeyTag::InboxRecord
             | KeyTag::InboxExpiry
+            | KeyTag::InboxFailure
             | KeyTag::User => None,
         }
     }
@@ -379,6 +385,10 @@ pub(crate) fn parse_inbox_expiry_entry(key: &[u8]) -> Option<(QueueName, &str)> 
     let (queue, id) = rest.split_at_checked(*qlen as usize)?;
     let queue = QueueName::new(std::str::from_utf8(queue).ok()?).ok()?;
     Some((queue, std::str::from_utf8(id).ok()?))
+}
+
+pub(crate) fn inbox_failure_key(queue: &QueueName, id: &str) -> Vec<u8> {
+    queue_first_key(KeyTag::InboxFailure, queue, id)
 }
 
 pub(crate) fn stats_key(queue: &QueueName, metric: &str) -> Vec<u8> {
@@ -590,6 +600,7 @@ mod tests {
             heartbeat_key(),
             inbox_record_key(&qn("q"), "id"),
             inbox_expiry_key(1, &qn("q"), "id"),
+            inbox_failure_key(&qn("q"), "id"),
             user_scoped_key(b"id"),
         ];
         for (i, a) in keys.iter().enumerate() {
