@@ -550,10 +550,14 @@ async fn an_inbox_path_within_the_queue_path_of_its_store_fails_the_open() {
 }
 
 #[tokio::test]
-async fn the_inbox_accepts_the_queues_of_its_allow_list() {
+async fn the_inbox_reports_its_allow_list_and_record_retention() {
     let q = open(&make_store(), &MockClock::new(INITIAL)).await;
     assert!(q.inbox_accepts(WORK));
     assert!(!q.inbox_accepts("other"));
+    assert_eq!(
+        q.inbox_record_retention(),
+        Some(DEFAULT_INBOX_RECORD_RETENTION)
+    );
     q.close().await.unwrap();
     let without_inbox = OpenOptions {
         inbox: None,
@@ -563,6 +567,7 @@ async fn the_inbox_accepts_the_queues_of_its_allow_list() {
         .await
         .unwrap();
     assert!(!q.inbox_accepts(WORK));
+    assert_eq!(q.inbox_record_retention(), None);
     q.close().await.unwrap();
 }
 

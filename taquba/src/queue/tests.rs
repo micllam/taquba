@@ -552,7 +552,7 @@ async fn open_rejects_a_queue_config_for_an_unencodable_name() {
 }
 
 #[tokio::test]
-async fn test_per_queue_config() {
+async fn a_queue_takes_its_config_override_or_the_default() {
     let initial = 1_700_000_000_000u64;
     let mut opts = OpenOptions {
         clock: Arc::new(MockClock::new(initial)),
@@ -569,6 +569,11 @@ async fn test_per_queue_config() {
     let q = Queue::open_with_options(make_store(), "test", opts)
         .await
         .unwrap();
+    assert_eq!(q.queue_config("fast").max_attempts, 1);
+    assert_eq!(
+        q.queue_config("other").max_attempts,
+        QueueConfig::default().max_attempts
+    );
 
     // "fast" queue inherits max_attempts=1
     q.enqueue("fast", b"x".to_vec()).await.unwrap();

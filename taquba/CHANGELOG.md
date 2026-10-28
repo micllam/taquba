@@ -31,7 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   states the reason of its rejection. `EnqueueResult`, `CancelOutcome`,
   `SignalOutcome` and `FormError` implement `Serialize` and `Deserialize`.
 - `Queue::apply_inbox_now` runs a pass of the inbox, and `Queue::inbox_accepts`
-  reports whether the inbox accepts a queue. `default_inbox_path` returns the
+  reports whether the inbox accepts a queue. `Queue::inbox_record_retention`
+  returns the record retention of the inbox. `default_inbox_path` returns the
   path of an inbox opened without `InboxOptions::path`.
 - `EnqueueOptions` and `EnqueueRequest` implement `Serialize`, `Deserialize`,
   `PartialEq` and `Eq`, with `run_at` as milliseconds from the Unix epoch.
@@ -51,6 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `JobRecord::wake_payload` are removed, so the bytes of a job woken in 0.15.0
   are unreadable. Deliver bytes with `Queue::signal` to a job enqueued with
   `EnqueueOptions::signal_wait`, and read them from `JobRecord::signal`.
+- `Queue::queue_config` returns the `QueueConfig` of a queue and replaces
+  `Queue::queue_lease_duration`, `Queue::queue_keep_done_jobs` and
+  `Queue::queue_dead_retention`. Read the field of the returned config in place
+  of each removed method.
 
 ### Removed
 

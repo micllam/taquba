@@ -406,13 +406,12 @@ impl Queue {
         self.core.next_job_id()
     }
 
-    pub(crate) fn queue_config(&self, queue: &str) -> &QueueConfig {
+    /// The configuration of `queue`: its entry of
+    /// [`OpenOptions::queue_configs`], or
+    /// [`OpenOptions::default_queue_config`]. The configurations are fixed at
+    /// open.
+    pub fn queue_config(&self, queue: &str) -> &QueueConfig {
         self.core.configs.get(queue)
-    }
-
-    /// Look up the configured lease duration for a queue.
-    pub fn queue_lease_duration(&self, queue: &str) -> Duration {
-        self.queue_config(queue).lease_duration
     }
 
     /// Build the lease handle for a claim: the capability the worker loops pass
@@ -436,18 +435,6 @@ impl Queue {
     /// second writer.
     pub(crate) async fn store_closed(&self) {
         self.core.closed.cancelled().await
-    }
-
-    /// Look up the configured `keep_done_jobs` retention for a queue. `None`
-    /// means [`Self::ack`] deletes successful jobs outright on that queue.
-    pub fn queue_keep_done_jobs(&self, queue: &str) -> Option<Duration> {
-        self.queue_config(queue).keep_done_jobs
-    }
-
-    /// Look up the configured dead-letter retention for a queue. `None` means
-    /// the dead-letter sweep is disabled for that queue.
-    pub fn queue_dead_retention(&self, queue: &str) -> Option<Duration> {
-        self.queue_config(queue).dead_retention
     }
 
     /// The [`Clock`] this queue was opened with, as an `Arc` clone that shares
@@ -779,7 +766,7 @@ impl Queue {
         effects: SettlementEffects,
     ) -> Result<Vec<EnqueueResult>> {
         let timer = crate::obs::start();
-        let keep = self.queue_keep_done_jobs(&claim.queue).is_some();
+        let keep = self.queue_config(&claim.queue).keep_done_jobs.is_some();
         let (job, results) = self
             .core
             .settle_claim(claim, effects, |_, _| ClaimEnd::Done { keep })
@@ -1164,6 +1151,13 @@ impl Queue {
             .inbox
             .as_ref()
             .is_some_and(|inbox| inbox.accepts(queue))
+    }
+
+    /// The [`InboxOptions::record_retention`](crate::InboxOptions::record_retention)
+    /// of the inbox, or `None` for a queue opened without
+    /// [`OpenOptions::inbox`].
+    pub fn inbox_record_retention(&self) -> Option<Duration> {
+        self.core.inbox.as_ref().map(|inbox| inbox.retention)
     }
 
     /// Shut down the background reaper and scheduler, persist each queue's
