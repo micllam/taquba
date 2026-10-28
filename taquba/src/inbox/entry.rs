@@ -131,11 +131,7 @@ pub struct SignalEntry {
     pub payload: Vec<u8>,
 }
 
-const ID_FORM: Form = Form {
-    max: MAX_INBOX_ID_LEN,
-    start: None,
-    characters: |c| c.is_ascii_alphanumeric() || "_-".contains(c),
-};
+const ID_FORM: Form = Form::id(MAX_INBOX_ID_LEN);
 
 /// Validate an entry id: `[A-Za-z0-9_-]`, 1 to [`MAX_INBOX_ID_LEN`] bytes.
 pub(crate) fn validate_id(id: &str) -> Result<()> {

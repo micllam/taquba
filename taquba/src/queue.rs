@@ -126,11 +126,7 @@ pub(crate) fn validate_id_override(id: &str) -> Result<()> {
         })
 }
 
-const ID_OVERRIDE_FORM: Form = Form {
-    max: MAX_ID_OVERRIDE_LEN,
-    start: None,
-    characters: |c| c.is_ascii_alphanumeric() || "_-".contains(c),
-};
+const ID_OVERRIDE_FORM: Form = Form::id(MAX_ID_OVERRIDE_LEN);
 
 /// Outcome of [`Queue::enqueue_with_effects`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -200,6 +200,15 @@ pub(crate) struct Form {
 }
 
 impl Form {
+    /// The form of an id of up to `max` bytes of `[A-Za-z0-9_-]`.
+    pub(crate) const fn id(max: usize) -> Self {
+        Self {
+            max,
+            start: None,
+            characters: |c| c.is_ascii_alphanumeric() || "_-".contains(c),
+        }
+    }
+
     /// The first rule of the form that `value` breaks, in the order of the
     /// variants of [`FormError`].
     pub(crate) fn check(&self, value: &str) -> std::result::Result<(), FormError> {
