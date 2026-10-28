@@ -4,7 +4,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::codec::encode;
-use crate::error::{Characters, Error, Form, Result};
+use crate::error::{Error, Form, Result};
+use crate::inbox::record::Rejection;
 use crate::options::EnqueueOptions;
 
 /// Maximum byte length of an inbox entry id.
@@ -56,14 +57,16 @@ impl InboxEntry {
 
     /// The entry of the kind name `kind` with `body`. Fails with the reason of
     /// the rejection for another kind name or a body that does not decode.
-    pub(crate) fn decode(kind: &str, body: &[u8]) -> std::result::Result<Self, String> {
+    pub(crate) fn decode(kind: &str, body: &[u8]) -> std::result::Result<Self, Rejection> {
         let decoded = match kind {
             "enqueue" => rmp_serde::from_slice(body).map(Self::Enqueue),
             "cancel" => rmp_serde::from_slice(body).map(Self::Cancel),
             "signal" => rmp_serde::from_slice(body).map(Self::Signal),
-            _ => return Err(format!("unknown inbox kind `{kind}`")),
+            _ => return Err(Rejection::UnknownKind),
         };
-        decoded.map_err(|err| format!("malformed body: {err}"))
+        decoded.map_err(|err| Rejection::Malformed {
+            detail: err.to_string(),
+        })
     }
 }
 
@@ -131,10 +134,7 @@ pub struct SignalEntry {
 const ID_FORM: Form = Form {
     max: MAX_INBOX_ID_LEN,
     start: None,
-    characters: Characters {
-        test: |c| c.is_ascii_alphanumeric() || "_-".contains(c),
-        allowed: "`[A-Za-z0-9_-]`",
-    },
+    characters: |c| c.is_ascii_alphanumeric() || "_-".contains(c),
 };
 
 /// Validate an entry id: `[A-Za-z0-9_-]`, 1 to [`MAX_INBOX_ID_LEN`] bytes.

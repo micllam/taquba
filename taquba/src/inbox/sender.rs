@@ -177,7 +177,7 @@ impl InboxSender {
                     entry,
                     sent_at_ms: u64::try_from(object.last_modified.timestamp_millis()).unwrap_or(0),
                 }),
-                Err(reason) => debug!(id, reason, "inbox entry does not decode; not listed"),
+                Err(reason) => debug!(id, %reason, "inbox entry does not decode; not listed"),
             }
         }
         Ok(pending)

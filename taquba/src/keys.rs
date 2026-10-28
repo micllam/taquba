@@ -37,7 +37,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::error::{Characters, Error, Form, Result};
+use crate::error::{Error, Form, Result};
 use crate::job::JobStatus;
 
 /// Maximum byte length of a queue name, imposed by the one-byte length field in
@@ -46,14 +46,8 @@ pub const MAX_QUEUE_NAME_LEN: usize = 255;
 
 const QUEUE_NAME_FORM: Form = Form {
     max: MAX_QUEUE_NAME_LEN,
-    start: Some(Characters {
-        test: |c| c.is_ascii_alphanumeric(),
-        allowed: "a letter or a digit",
-    }),
-    characters: Characters {
-        test: |c| c.is_ascii_alphanumeric() || "._-".contains(c),
-        allowed: "`[A-Za-z0-9._-]`",
-    },
+    start: Some(|c| c.is_ascii_alphanumeric()),
+    characters: |c| c.is_ascii_alphanumeric() || "._-".contains(c),
 };
 
 /// A queue name: 1 to [`MAX_QUEUE_NAME_LEN`] bytes of `[A-Za-z0-9._-]`,
@@ -458,14 +452,8 @@ mod tests {
         assert_eq!(QueueName::new(&longest).unwrap(), longest.as_str());
         assert_eq!(QueueName::new("Q.1_b-c").unwrap(), "Q.1_b-c");
         let over = "q".repeat(MAX_QUEUE_NAME_LEN + 1);
-        let start = |character| FormError::InvalidStart {
-            character,
-            allowed: "a letter or a digit",
-        };
-        let contains = |character| FormError::InvalidCharacter {
-            character,
-            allowed: "`[A-Za-z0-9._-]`",
-        };
+        let start = |character| FormError::InvalidStart { character };
+        let contains = |character| FormError::InvalidCharacter { character };
         for (invalid, rule) in [
             ("", FormError::Empty),
             (over.as_str(), FormError::TooLong { max: 255 }),

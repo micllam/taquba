@@ -3,9 +3,11 @@
 //! effect.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::codec::encode;
 use crate::effects::SettlementEffects;
+use crate::error::{Error, FormError};
 use crate::keys::QueueName;
 use crate::queue::{CancelOutcome, EnqueueResult, SignalOutcome};
 
@@ -23,7 +25,73 @@ pub enum InboxOutcome {
     /// the signal.
     Signal(SignalOutcome),
     /// The entry was rejected for the reason, without an effect.
-    Rejected(String),
+    Rejected(Rejection),
+}
+
+/// The reason of the writer for the rejection of an inbox entry. The display
+/// form is the message of the log.
+#[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
+pub enum Rejection {
+    /// The kind in the path of the entry is not `enqueue`, `cancel` or
+    /// `signal`.
+    #[error("unknown inbox kind")]
+    UnknownKind,
+    /// The object name does not have a ULID before the id.
+    #[error("the object name does not have a ULID before the id")]
+    Unordered,
+    /// The body does not decode as the entry of its kind.
+    #[error("malformed body: {detail}")]
+    Malformed {
+        /// The error of the decoder.
+        detail: String,
+    },
+    /// The queue of the entry is outside
+    /// [`InboxOptions::queues`](crate::InboxOptions::queues).
+    #[error("the queue is outside the inbox allow-list")]
+    QueueNotAccepted,
+    /// The job of a cancel or a signal is on another queue.
+    #[error("the job is on queue `{job_queue}`")]
+    OtherQueue {
+        /// The queue of the job.
+        job_queue: String,
+    },
+    /// The [`EnqueueOptions::id_override`](crate::EnqueueOptions::id_override)
+    /// of an enqueue is outside its form.
+    #[error("invalid id: {reason}")]
+    InvalidId {
+        /// The rule that the id breaks.
+        reason: FormError,
+    },
+    /// The [`EnqueueOptions::id_override`](crate::EnqueueOptions::id_override)
+    /// of an enqueue matches an existing job.
+    #[error("duplicate job id")]
+    DuplicateJobId,
+    /// An enqueue sets
+    /// [`EnqueueOptions::signal_wait`](crate::EnqueueOptions::signal_wait)
+    /// without a `run_at`.
+    #[error("a signal wait requires run_at")]
+    SignalWaitWithoutRunAt,
+    /// The operation of the entry failed with another permanent error.
+    #[error("{message}")]
+    Failed {
+        /// The message of the error.
+        message: String,
+    },
+}
+
+impl Rejection {
+    /// The rejection of an entry whose operation failed with the permanent
+    /// error `err`.
+    pub(crate) fn of_permanent(err: Error) -> Self {
+        match err {
+            Error::InvalidId { reason, .. } => Self::InvalidId { reason },
+            Error::DuplicateJobId { .. } => Self::DuplicateJobId,
+            Error::SignalWaitWithoutRunAt => Self::SignalWaitWithoutRunAt,
+            err => Self::Failed {
+                message: err.to_string(),
+            },
+        }
+    }
 }
 
 /// The record of an applied inbox entry, read through
@@ -90,7 +158,7 @@ pub(crate) enum Settled {
     Applied(StagedRecord),
     /// The entry was rejected for the reason, and its record awaits a commit of
     /// its own.
-    Rejected(String),
+    Rejected(Rejection),
 }
 
 /// The encoded record of an entry, as a transaction stages it.

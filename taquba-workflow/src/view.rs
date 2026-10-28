@@ -206,7 +206,7 @@ impl WorkflowView {
             return Ok(None);
         };
         let job_id = match record.outcome {
-            InboxOutcome::Rejected(reason) => return Ok(Some(CommandState::Failed(reason))),
+            InboxOutcome::Rejected(reason) => return Ok(Some(CommandState::Rejected(reason))),
             InboxOutcome::Enqueue(enqueued) => enqueued.into_id(),
             InboxOutcome::Cancel(_) | InboxOutcome::Signal(_) => return Ok(None),
         };

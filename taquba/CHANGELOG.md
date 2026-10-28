@@ -24,9 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a `CancelEntry` or a `SignalEntry`. `InboxSender::pending` lists the entries
   of a queue that are awaiting a pass.
 - `QueueView::inbox_record` reads the `InboxRecord` of an applied entry, with
-  its `InboxOutcome`: the outcome of its operation or the reason of its
-  rejection. `EnqueueResult`, `CancelOutcome` and `SignalOutcome` implement
-  `Serialize` and `Deserialize`.
+  its `InboxOutcome`: the outcome of its operation or the `Rejection` that
+  states the reason of its rejection. `EnqueueResult`, `CancelOutcome`,
+  `SignalOutcome` and `FormError` implement `Serialize` and `Deserialize`.
 - `Queue::apply_inbox_now` runs a pass of the inbox, and `Queue::inbox_accepts`
   reports whether the inbox accepts a queue. `default_inbox_path` returns the
   path of an inbox opened without `InboxOptions::path`.

@@ -9,13 +9,14 @@
 //! pass rejects each object name without a ULID before the id, so an entry of
 //! that id applies first.
 //!
-//! The pass rejects the entries that [`InboxOptions`] lists. The application
-//! commits an [`InboxRecord`](crate::InboxRecord) at the queue and the id in
-//! the transaction of the entry's effect. After an idempotent effect or none,
-//! the record commits in a transaction of its own. The object is deleted after
-//! the commit. A pass that finds the record of an object deletes the object
-//! without a read, and passes run one at a time, so ingestion is at least once
-//! and application is once within the retention of the record.
+//! A pass rejects an entry it cannot apply, with a record of its [`Rejection`].
+//! The application commits an [`InboxRecord`](crate::InboxRecord) at the queue
+//! and the id in the transaction of the entry's effect. After an idempotent
+//! effect or none, the record commits in a transaction of its own. The object
+//! is deleted after the commit. A pass that finds the record of an object
+//! deletes the object without a read, and passes run one at a time, so
+//! ingestion is at least once and application is once within the retention of
+//! the record.
 //!
 //! The writer runs one pass at open before the scheduler starts. After it, the
 //! writer polls the touch object at `{path}/touch` once per
@@ -50,7 +51,7 @@ use crate::background::Periodic;
 use crate::effects::SettlementEffects;
 use crate::error::{Error, Result};
 use crate::inbox::entry::{InboxEntry, validate_id};
-use crate::inbox::record::{InboxOutcome, InboxRecordHandle, Settled, StagedRecord};
+use crate::inbox::record::{InboxOutcome, InboxRecordHandle, Rejection, Settled, StagedRecord};
 use crate::keys::{QueueName, inbox_record_key};
 use crate::queue_core::QueueCore;
 use crate::time_bound::TimeBound;
@@ -86,16 +87,9 @@ pub fn default_inbox_path(path: &str) -> String {
 /// [`InboxRecord`](crate::InboxRecord) at the queue and the id in the
 /// transaction of the entry's effect. After an idempotent effect or none, it
 /// commits the record in a transaction of its own. It then deletes the object.
-/// The pass rejects these entries with a record of the reason:
 ///
-/// - A malformed entry: an object name without a ULID before the id, or a body
-///   that does not decode.
-/// - An entry for a queue outside [`Self::queues`].
-/// - An entry of another kind.
-/// - A cancel or a signal for a job of another queue.
-/// - An entry whose operation fails with a permanent error.
-///
-/// Any other error ends the pass at its entry, and the next pass starts again
+/// A pass rejects an entry it cannot apply, with a record of its [`Rejection`].
+/// A transient error ends the pass at its entry, and the next pass starts again
 /// there. An entry whose record exists is deleted without an effect, so an
 /// entry sent twice applies once within [`Self::record_retention`].
 pub struct InboxOptions {
@@ -456,8 +450,7 @@ impl QueueCore {
                 .await?;
         }
         for (key, object) in unordered {
-            let reason = "the object name has no ULID before the id".to_string();
-            self.settle_object(inbox, key, &object.location, Some(reason))
+            self.settle_object(inbox, key, &object.location, Some(Rejection::Unordered))
                 .await?;
         }
         Ok(())
@@ -471,7 +464,7 @@ impl QueueCore {
         inbox: &InboxState,
         key: EntryKey,
         location: &Path,
-        rejection: Option<String>,
+        rejection: Option<Rejection>,
     ) -> Result<()> {
         let EntryKey { id, queue, kind } = key;
         if self.db.get(inbox_record_key(&queue, &id)).await?.is_some() {
@@ -481,11 +474,9 @@ impl QueueCore {
         }
         let record = InboxRecordHandle::new(queue.clone(), id.clone(), self.now_ms());
         let settled = if !inbox.accepts(&queue) {
-            Ok(Settled::Rejected(format!(
-                "queue `{queue}` is outside the inbox allow-list"
-            )))
-        } else if let Some(reason) = rejection {
-            Ok(Settled::Rejected(reason))
+            Ok(Settled::Rejected(Rejection::QueueNotAccepted))
+        } else if let Some(rejection) = rejection {
+            Ok(Settled::Rejected(rejection))
         } else {
             let body = inbox.get(location).await?;
             match InboxEntry::decode(&kind, &body) {
@@ -520,7 +511,7 @@ impl QueueCore {
             Settled::Rejected(reason) => {
                 let staged = record.staged(InboxOutcome::Rejected(reason.clone()));
                 self.commit_record(staged).await?;
-                warn!(kind, id = record.id, reason, "inbox entry rejected");
+                warn!(kind, id = record.id, %reason, "inbox entry rejected");
                 Ok(true)
             }
         }

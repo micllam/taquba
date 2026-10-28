@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Errors returned by Taquba's public API.
@@ -165,7 +166,7 @@ pub enum StoreUrlError {
 
 /// The rule of a name or an id that a value breaks: the reason of
 /// [`Error::InvalidQueueName`] and [`Error::InvalidId`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error, Serialize, Deserialize)]
 pub enum FormError {
     /// The value is empty.
     #[error("must not be empty")]
@@ -177,35 +178,25 @@ pub enum FormError {
         max: usize,
     },
     /// The first character is outside the characters that may start the value.
-    #[error("starts with {character:?}, and must start with {allowed}")]
+    #[error("starts with {character:?}")]
     InvalidStart {
         /// The first character.
         character: char,
-        /// The characters that may start the value.
-        allowed: &'static str,
     },
     /// A character is outside the characters of the form.
-    #[error("contains {character:?}, and may contain only {allowed}")]
+    #[error("contains {character:?}")]
     InvalidCharacter {
         /// The first character outside the form.
         character: char,
-        /// The characters of the form.
-        allowed: &'static str,
     },
 }
 
-/// The form of a name or an id: a maximum length in bytes, the characters that
-/// may start it and the characters it may contain.
+/// The form of a name or an id: a maximum length in bytes, the test of the
+/// characters that may start it and the test of the characters it may contain.
 pub(crate) struct Form {
     pub(crate) max: usize,
-    pub(crate) start: Option<Characters>,
-    pub(crate) characters: Characters,
-}
-
-/// A set of characters: its test and its description in an error message.
-pub(crate) struct Characters {
-    pub(crate) test: fn(char) -> bool,
-    pub(crate) allowed: &'static str,
+    pub(crate) start: Option<fn(char) -> bool>,
+    pub(crate) characters: fn(char) -> bool,
 }
 
 impl Form {
@@ -218,19 +209,13 @@ impl Form {
         if value.len() > self.max {
             return Err(FormError::TooLong { max: self.max });
         }
-        if let Some(start) = &self.start
-            && !(start.test)(first)
+        if let Some(start) = self.start
+            && !start(first)
         {
-            return Err(FormError::InvalidStart {
-                character: first,
-                allowed: start.allowed,
-            });
+            return Err(FormError::InvalidStart { character: first });
         }
-        match value.chars().find(|&c| !(self.characters.test)(c)) {
-            Some(character) => Err(FormError::InvalidCharacter {
-                character,
-                allowed: self.characters.allowed,
-            }),
+        match value.chars().find(|&c| !(self.characters)(c)) {
+            Some(character) => Err(FormError::InvalidCharacter { character }),
             None => Ok(()),
         }
     }

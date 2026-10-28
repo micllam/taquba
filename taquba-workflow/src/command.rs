@@ -7,7 +7,9 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
-use taquba::{EnqueueEntry, JobRecord, JobStatus, LeaseHandle, PermanentFailure, WorkerError};
+use taquba::{
+    EnqueueEntry, JobRecord, JobStatus, LeaseHandle, PermanentFailure, Rejection, WorkerError,
+};
 
 use crate::durable;
 use crate::error::worker_error;
@@ -58,8 +60,9 @@ pub enum CommandState {
     },
     /// The control worker applied the command.
     Applied,
-    /// The inbox rejected the entry, or the command job was dead-lettered, for
-    /// the reason.
+    /// The inbox rejected the entry of the command for the reason.
+    Rejected(Rejection),
+    /// The command job was dead-lettered with the error of its last attempt.
     Failed(String),
 }
 
@@ -407,10 +410,10 @@ mod tests {
             view.command(CONTROL, &applied).await.unwrap(),
             Some(CommandState::Queued { last_error: None })
         );
-        assert!(matches!(
+        assert_eq!(
             view.command("other", &outside).await.unwrap(),
-            Some(CommandState::Failed(ref reason)) if reason.contains("allow-list")
-        ));
+            Some(CommandState::Rejected(Rejection::QueueNotAccepted))
+        );
 
         let tx = spawn(&runtime);
         for _ in 0..500 {

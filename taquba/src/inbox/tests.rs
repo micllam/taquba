@@ -1,9 +1,9 @@
 use slatedb::object_store::{ObjectStoreExt, PutPayload, path::Path};
 
 use super::*;
-use crate::error::Error;
+use crate::error::{Error, FormError};
 use crate::inbox::entry::{CancelEntry, EnqueueEntry, InboxEntry, SignalEntry};
-use crate::inbox::record::InboxOutcome;
+use crate::inbox::record::{InboxOutcome, Rejection};
 use crate::inbox::sender::InboxSender;
 use crate::queue::{CancelOutcome, EnqueueResult, Queue, SignalOutcome};
 use crate::reader::QueueReader;
@@ -191,22 +191,33 @@ async fn an_entry_that_cannot_apply_is_rejected_with_a_record() {
     }
 
     q.apply_inbox_now().await.unwrap();
-    for (queue, id) in [
-        (WORK, "no-order"),
-        (WORK, "bad-order"),
-        (WORK, "bad-body"),
-        (WORK, "bad-shape"),
-        (WORK, "unknown-kind"),
-        ("other", "other-queue"),
-        ("other", "other-custom"),
-        (WORK, "bad-id"),
+    let outcome = |queue: &'static str, id: &'static str| {
+        let view = q.view();
+        async move { view.inbox_record(queue, id).await.unwrap().unwrap().outcome }
+    };
+    let invalid_id = Rejection::InvalidId {
+        reason: FormError::InvalidCharacter { character: ':' },
+    };
+    for (queue, id, rejection) in [
+        (WORK, "no-order", Rejection::Unordered),
+        (WORK, "bad-order", Rejection::Unordered),
+        (WORK, "unknown-kind", Rejection::UnknownKind),
+        ("other", "other-queue", Rejection::QueueNotAccepted),
+        ("other", "other-custom", Rejection::QueueNotAccepted),
+        (WORK, "bad-id", invalid_id),
     ] {
-        let record = q.view().inbox_record(queue, id).await.unwrap().unwrap();
-        assert!(
-            matches!(record.outcome, InboxOutcome::Rejected(_)),
-            "{id}: {:?}",
-            record.outcome
+        assert_eq!(
+            outcome(queue, id).await,
+            InboxOutcome::Rejected(rejection),
+            "{id}"
         );
+    }
+    // The detail of a body is the text of the decoder.
+    for id in ["bad-body", "bad-shape"] {
+        assert!(matches!(
+            outcome(WORK, id).await,
+            InboxOutcome::Rejected(Rejection::Malformed { .. })
+        ));
     }
     for prefix in [
         "test-inbox/v1/work/enqueue",
@@ -349,7 +360,10 @@ async fn a_permanent_error_of_a_kind_rejects_the_entry_and_the_pass_continues() 
 
     q.apply_inbox_now().await.unwrap();
     let cancel = q.view().inbox_record(WORK, "a").await.unwrap().unwrap();
-    assert!(matches!(cancel.outcome, InboxOutcome::Rejected(_)));
+    assert!(matches!(
+        cancel.outcome,
+        InboxOutcome::Rejected(Rejection::Failed { .. })
+    ));
     assert!(q.view().inbox_record(WORK, "b").await.unwrap().is_some());
     q.close().await.unwrap();
 }
@@ -565,7 +579,12 @@ async fn the_cancel_kind_removes_a_queued_job_and_records_the_other_outcomes() {
         InboxOutcome::Cancel(CancelOutcome::NotFound)
     );
     // The job of another queue than the entry's is out of reach.
-    assert!(matches!(outcome("other").await, InboxOutcome::Rejected(_)));
+    assert_eq!(
+        outcome("other").await,
+        InboxOutcome::Rejected(Rejection::OtherQueue {
+            job_queue: "other".to_string()
+        })
+    );
     assert_eq!(q.view().stats("other").await.unwrap().pending, 1);
     assert_eq!(q.cancel(&claimed).await.unwrap(), CancelOutcome::Requested);
     drop(claim);
@@ -608,10 +627,12 @@ async fn the_signal_kind_wakes_a_waiter_of_its_queue_or_records_that_none_waits(
         async move { view.inbox_record(queue, id).await.unwrap().unwrap().outcome }
     };
     // The signal for another queue than the waiter's is rejected.
-    assert!(matches!(
+    assert_eq!(
         outcome(WORK, "from-work").await,
-        InboxOutcome::Rejected(_)
-    ));
+        InboxOutcome::Rejected(Rejection::OtherQueue {
+            job_queue: WAITS.to_string()
+        })
+    );
     assert_eq!(
         outcome(WAITS, "to-waiter").await,
         InboxOutcome::Signal(SignalOutcome::Delivered)

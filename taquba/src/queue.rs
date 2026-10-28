@@ -13,7 +13,7 @@ use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
 use crate::completion::{CompletionWaiters, Registration};
 use crate::effects::{EnqueueRequest, PreparedEffects, SettlementEffects};
-use crate::error::{Characters, Error, Form, Result};
+use crate::error::{Error, Form, Result};
 use crate::history::AttemptOutcome;
 use crate::inbox::{Inbox, InboxState};
 use crate::job::{Claim, JobRecord, JobStatus};
@@ -129,10 +129,7 @@ pub(crate) fn validate_id_override(id: &str) -> Result<()> {
 const ID_OVERRIDE_FORM: Form = Form {
     max: MAX_ID_OVERRIDE_LEN,
     start: None,
-    characters: Characters {
-        test: |c| c.is_ascii_alphanumeric() || "_-".contains(c),
-        allowed: "`[A-Za-z0-9_-]`",
-    },
+    characters: |c| c.is_ascii_alphanumeric() || "_-".contains(c),
 };
 
 /// Outcome of [`Queue::enqueue_with_effects`].

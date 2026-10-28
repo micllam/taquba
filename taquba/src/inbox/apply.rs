@@ -2,7 +2,7 @@
 
 use crate::error::Result;
 use crate::inbox::entry::{CancelEntry, EnqueueEntry, InboxEntry, SignalEntry};
-use crate::inbox::record::{InboxOutcome, InboxRecordHandle, Settled};
+use crate::inbox::record::{InboxOutcome, InboxRecordHandle, Rejection, Settled};
 use crate::queue::{CancelOutcome, EnqueueResult};
 use crate::queue_core::QueueCore;
 use crate::queue_core::signal::stage_signal;
@@ -23,7 +23,7 @@ impl QueueCore {
             InboxEntry::Signal(entry) => self.apply_signal(queue, entry, record).await,
         };
         match settled {
-            Err(err) if err.is_permanent() => Ok(Settled::Rejected(err.to_string())),
+            Err(err) if err.is_permanent() => Ok(Settled::Rejected(Rejection::of_permanent(err))),
             settled => settled,
         }
     }
@@ -55,7 +55,7 @@ impl QueueCore {
             return Ok(record.applied(InboxOutcome::Cancel(CancelOutcome::NotFound)));
         };
         if *job.queue != *queue {
-            return Ok(on_another_queue(&entry.job_id, &job.queue, queue));
+            return Ok(on_another_queue(&job.queue));
         }
         let effects = record.effects(InboxOutcome::Cancel(CancelOutcome::Removed));
         match self.cancel(&entry.job_id, effects).await?.0 {
@@ -76,7 +76,7 @@ impl QueueCore {
         if let Some(job) = self.view.job_record(&entry.job_id).await?
             && *job.queue != *queue
         {
-            return Ok(on_another_queue(&entry.job_id, &job.queue, queue));
+            return Ok(on_another_queue(&job.queue));
         }
         let (job_id, payload) = (&entry.job_id, &entry.payload);
         self.retry(Durability::Awaited, |mut txn| async move {
@@ -90,9 +90,9 @@ impl QueueCore {
     }
 }
 
-/// The rejection of an entry for `queue` about the job `job_id` of `job_queue`.
-fn on_another_queue(job_id: &str, job_queue: &str, queue: &str) -> Settled {
-    Settled::Rejected(format!(
-        "job `{job_id}` is on queue `{job_queue}`, not `{queue}`"
-    ))
+/// The rejection of an entry about a job of `job_queue`.
+fn on_another_queue(job_queue: &str) -> Settled {
+    Settled::Rejected(Rejection::OtherQueue {
+        job_queue: job_queue.to_string(),
+    })
 }
