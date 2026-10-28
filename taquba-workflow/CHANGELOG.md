@@ -42,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `WorkflowView::run_kv_entries` read the entries of a run from another
   process. The memo sweep and the group sweep delete the entries of a run with
   the run.
+- `DEFAULT_QUEUE_NAME`: the queue name of a runtime built without
+  `WorkflowRuntimeBuilder::queue_name`, so another process sends a
+  `taquba::SignalEntry` to the queue of such a runtime.
 
 ### Changed
 
