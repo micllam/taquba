@@ -16,8 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `WorkflowRuntimeBuilder::control_queue`: a queue on which the runtime's worker
   applies each job as a `Command`, a `SubmitCommand` or a `CancelCommand`, so
   another process submits and cancels runs through a `taquba::InboxSender`. The
-  build fails with `Error::InvalidControlQueue` for a control queue that equals
-  the queue name or that the inbox does not accept.
+  control queue must keep done and dead jobs for the record retention of the
+  inbox, and the build fails with `Error::InvalidControlQueue` and the
+  `ControlQueueError` of a queue that breaks a requirement.
 - `WorkflowView::command` reads the `CommandState` of a command from the record
   of its inbox entry and from its job. `SubmitOutcome` implements `Serialize`,
   `Deserialize` and `PartialEq`.

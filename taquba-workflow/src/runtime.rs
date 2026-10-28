@@ -20,7 +20,7 @@ use crate::durable::{
     DurableTermination, Submission,
 };
 use crate::effects::{StagedEffects, TerminalEffects};
-use crate::error::{Error, Result};
+use crate::error::{ControlQueueError, Error, Result};
 use crate::group::{GroupStore, Membership, RunGroup, pending_member, terminated_member};
 use crate::keys::{
     DEDUP_PREFIX, GROUP_TERMINAL_KV_PREFIX, HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RunId,
@@ -393,6 +393,15 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     /// a [`taquba::InboxSender`]. The queue must be in
     /// [`taquba::InboxOptions::queues`] and differ from [`Self::queue_name`].
     /// When unset (default), the worker leaves commands unapplied.
+    ///
+    /// [`WorkflowView::command`](crate::WorkflowView::command) reads the state
+    /// of a command from its job, so the [`taquba::QueueConfig`] of the queue
+    /// must keep done jobs and dead jobs for at least
+    /// [`taquba::InboxOptions::record_retention`]: a
+    /// [`keep_done_jobs`](taquba::QueueConfig::keep_done_jobs) of at least the
+    /// retention, and a [`dead_retention`](taquba::QueueConfig::dead_retention)
+    /// of `None` or at least the retention. A kept done job keeps its payload,
+    /// so the store keeps the input of each submission for that retention.
     pub fn control_queue(mut self, name: impl Into<String>) -> Self {
         self.control_queue = Some(name.into());
         self
@@ -403,19 +412,44 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     /// # Errors
     ///
     /// The error of [`TerminalHook::check_runtime`] for the configured queue
-    /// name, and [`Error::InvalidControlQueue`] for a control queue that equals
-    /// the queue name or that the inbox of the queue does not accept.
+    /// name, and [`Error::InvalidControlQueue`] for a control queue that breaks
+    /// a requirement of [`Self::control_queue`].
     pub fn build(self) -> Result<WorkflowRuntime<R, H>>
     where
         H: 'static,
     {
         self.terminal_hook.check_runtime(&self.queue_name)?;
         if let Some(control) = &self.control_queue
-            && (*control == self.queue_name || !self.queue.inbox_accepts(control))
+            && let Err(reason) = self.check_control_queue(control)
         {
-            return Err(Error::InvalidControlQueue(control.clone()));
+            return Err(Error::InvalidControlQueue {
+                queue: control.clone(),
+                reason,
+            });
         }
         Ok(self.assemble())
+    }
+
+    /// The requirement of [`Self::control_queue`] that `control` breaks.
+    fn check_control_queue(&self, control: &str) -> std::result::Result<(), ControlQueueError> {
+        if control == self.queue_name {
+            return Err(ControlQueueError::RuntimeQueue);
+        }
+        if !self.queue.inbox_accepts(control) {
+            return Err(ControlQueueError::NotAccepted);
+        }
+        let retention = self
+            .queue
+            .inbox_record_retention()
+            .expect("a queue whose inbox accepts a queue has an inbox");
+        let config = self.queue.queue_config(control);
+        if config.keep_done_jobs.is_none_or(|kept| kept < retention) {
+            return Err(ControlQueueError::DoneJobsNotKept { retention });
+        }
+        if config.dead_retention.is_some_and(|kept| kept < retention) {
+            return Err(ControlQueueError::DeadRetentionShort { retention });
+        }
+        Ok(())
     }
 
     /// The runtime of this configuration, without the check of the hook.

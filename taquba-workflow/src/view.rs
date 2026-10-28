@@ -192,11 +192,20 @@ impl WorkflowView {
     }
 
     /// The state of the [`Command`](crate::Command) of the inbox entry
-    /// `entry_id` on `control_queue`, or `None` before a pass applies the entry
-    /// and after its record expires. An applied entry of another kind than
-    /// `enqueue` reads as `None` as well. A command job without a record counts
-    /// as applied, because the queue deletes a done job. [`Self::status`] reads
-    /// the state of the run that the command names.
+    /// `entry_id` on `control_queue`, read from the record of the entry and
+    /// from the command job. [`Self::status`] reads the state of the run that
+    /// the command names.
+    ///
+    /// The state is `None` before a pass applies the entry, after its record
+    /// expires and for an applied entry of another kind than `enqueue`. It is
+    /// `None` as well when the command job is absent: a cancel through the
+    /// inbox removed it, or a sweep of the control queue removed it after the
+    /// record retention.
+    ///
+    /// An entry whose [`dedup_key`](taquba::EnqueueOptions::dedup_key) matched
+    /// a command job reads the state of that job. An entry whose `id_override`
+    /// is the id of an existing job reads as [`CommandState::Rejected`] with
+    /// [`taquba::Rejection::DuplicateJobId`].
     pub async fn command(
         &self,
         control_queue: &str,
@@ -210,17 +219,17 @@ impl WorkflowView {
             InboxOutcome::Enqueue(enqueued) => enqueued.into_id(),
             InboxOutcome::Cancel(_) | InboxOutcome::Signal(_) => return Ok(None),
         };
-        Ok(Some(match self.queue.get_job(&job_id).await? {
-            None => CommandState::Applied,
-            Some(job) => match job.status {
-                JobStatus::Done => CommandState::Applied,
-                JobStatus::Dead => CommandState::Failed(job.last_error.unwrap_or_default()),
-                JobStatus::Pending | JobStatus::Scheduled | JobStatus::Claimed => {
-                    CommandState::Queued {
-                        last_error: job.last_error,
-                    }
+        let Some(job) = self.queue.get_job(&job_id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(match job.status {
+            JobStatus::Done => CommandState::Applied,
+            JobStatus::Dead => CommandState::Failed(job.last_error.unwrap_or_default()),
+            JobStatus::Pending | JobStatus::Scheduled | JobStatus::Claimed => {
+                CommandState::Queued {
+                    last_error: job.last_error,
                 }
-            },
+            }
         }))
     }
 

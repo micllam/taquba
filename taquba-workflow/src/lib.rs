@@ -269,8 +269,10 @@
 //! Another process submits and cancels runs through the inbox of the queue
 //! ([`taquba::OpenOptions::inbox`]). [`WorkflowRuntimeBuilder::control_queue`]
 //! sets the runtime's control queue, which [`taquba::InboxOptions::queues`]
-//! must list. The runtime's worker applies each job on the control queue as a
-//! [`Command`]: a [`SubmitCommand`] or a [`CancelCommand`].
+//! must list. Its [`taquba::QueueConfig`] must keep done and dead jobs for at
+//! least [`taquba::InboxOptions::record_retention`]. The runtime's worker
+//! applies each job on the control queue as a [`Command`]: a [`SubmitCommand`]
+//! or a [`CancelCommand`].
 //!
 //! A sender enqueues `taquba::EnqueueEntry::from(command)` with a
 //! [`taquba::InboxSender`] for the control queue. Through a
@@ -676,7 +678,7 @@ mod worker;
 
 pub use command::{CancelCommand, Command, CommandState, SubmitCommand};
 pub use effects::{EffectsHandle, TerminalEffects};
-pub use error::{Error, Result};
+pub use error::{ControlQueueError, Error, Result};
 pub use group::{GroupMember, GroupStatus, MemberResult, RunGroup};
 pub use keys::{
     HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, MAX_RUN_ID_LEN, RESERVED_HEADER_PREFIX,

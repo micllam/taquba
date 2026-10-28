@@ -256,13 +256,13 @@ mod tests {
     use std::time::Duration;
 
     use taquba::{
-        EnqueueResult, InboxOptions, InboxOutcome, InboxSender, JobStatus, MockClock, OpenOptions,
-        Queue,
+        CancelEntry, DEFAULT_INBOX_RECORD_RETENTION, EnqueueResult, InboxOptions, InboxOutcome,
+        InboxSender, JobStatus, MockClock, OpenOptions, Queue, QueueConfig,
     };
     use tokio::sync::oneshot;
 
     use super::*;
-    use crate::error::Error;
+    use crate::error::{ControlQueueError, Error};
     use crate::runner::{Step, StepError, StepOutcome, StepRunner};
     use crate::runtime::{DEFAULT_QUEUE_NAME, WorkflowRuntime};
     use crate::terminal::{NoopTerminalHook, TerminalStatus};
@@ -289,6 +289,12 @@ mod tests {
         }
     }
 
+    /// The config of a control queue that keeps its done jobs for the record
+    /// retention of the inbox.
+    fn control_config() -> QueueConfig {
+        QueueConfig::default().keep_done_jobs(DEFAULT_INBOX_RECORD_RETENTION)
+    }
+
     /// A queue under `opts` with a mock clock and an inbox for [`CONTROL`], and
     /// a runtime with that control queue.
     async fn open(
@@ -300,7 +306,8 @@ mod tests {
         MockClock,
     ) {
         let inbox = InboxOptions::new([CONTROL]).touch_poll_interval(None);
-        let (queue, store, clock) = open_queue_at_with(INITIAL, opts.inbox(inbox)).await;
+        let opts = opts.inbox(inbox).queue_config(CONTROL, control_config());
+        let (queue, store, clock) = open_queue_at_with(INITIAL, opts).await;
         let runtime =
             WorkflowRuntime::builder(queue.clone(), store.clone(), Echo, NoopTerminalHook)
                 .poll_interval(Duration::from_millis(20))
@@ -325,9 +332,8 @@ mod tests {
     }
 
     /// Send `entry` to the control queue, apply the inbox and return the job of
-    /// the command once the worker settled it: `None` once acked, because the
-    /// queue deletes a done job, and the record of a dead job.
-    async fn send(queue: &Queue, sender: &InboxSender, entry: EnqueueEntry) -> Option<JobRecord> {
+    /// the command once the worker settled it, done or dead.
+    async fn send(queue: &Queue, sender: &InboxSender, entry: EnqueueEntry) -> JobRecord {
         let id = sender.send(CONTROL, entry).await.unwrap();
         queue.apply_inbox_now().await.unwrap();
         let record = queue
@@ -340,11 +346,11 @@ mod tests {
             panic!("the command was not enqueued: {:?}", record.outcome);
         };
         for _ in 0..500 {
-            match queue.view().get_job(&job_id).await.unwrap() {
-                None => return None,
-                Some(job) if job.status == JobStatus::Dead => return Some(job),
-                Some(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            let job = queue.view().get_job(&job_id).await.unwrap().unwrap();
+            if matches!(job.status, JobStatus::Done | JobStatus::Dead) {
+                return job;
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("the command job {job_id} did not settle");
     }
@@ -354,11 +360,8 @@ mod tests {
         let (queue, sender, runtime, _clock) = open(OpenOptions::default()).await;
         let shutdown = spawn(&runtime);
         let submit = |input: &[u8]| Command::Submit(SubmitCommand::new(rid("run-1"), input));
-        assert!(
-            send(&queue, &sender, submit(b"hello").into())
-                .await
-                .is_none()
-        );
+        let applied = send(&queue, &sender, submit(b"hello").into()).await;
+        assert_eq!(applied.status, JobStatus::Done);
         let end = runtime.wait(&rid("run-1")).await.unwrap();
         assert_eq!(end.termination.status, TerminalStatus::Succeeded);
         assert_eq!(
@@ -368,18 +371,12 @@ mod tests {
 
         // A second submission of the run is a no-op, one with another input
         // fails permanently, and a payload that does not decode dead-letters.
-        assert!(
-            send(&queue, &sender, submit(b"hello").into())
-                .await
-                .is_none()
-        );
-        let other = send(&queue, &sender, submit(b"other").into())
-            .await
-            .unwrap();
+        let again = send(&queue, &sender, submit(b"hello").into()).await;
+        assert_eq!(again.status, JobStatus::Done);
+        let other = send(&queue, &sender, submit(b"other").into()).await;
+        assert_eq!(other.status, JobStatus::Dead);
         assert!(other.last_error.unwrap().contains("different input"));
-        let malformed = send(&queue, &sender, EnqueueEntry::new(b"{}"))
-            .await
-            .unwrap();
+        let malformed = send(&queue, &sender, EnqueueEntry::new(b"{}")).await;
         assert!(malformed.last_error.unwrap().contains("malformed command"));
         let _ = shutdown.send(());
     }
@@ -465,20 +462,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_control_queue_differs_from_the_queue_name_and_is_in_the_allow_list() {
-        let inbox = InboxOptions::new([CONTROL, DEFAULT_QUEUE_NAME]);
-        let (queue, store, _clock) =
-            open_queue_at_with(INITIAL, OpenOptions::default().inbox(inbox)).await;
-        for control in [DEFAULT_QUEUE_NAME, "unlisted"] {
+    async fn a_build_reports_the_requirement_that_a_control_queue_breaks() {
+        let short = DEFAULT_INBOX_RECORD_RETENTION / 2;
+        let inbox = InboxOptions::new([CONTROL, DEFAULT_QUEUE_NAME, "deleted", "short", "dead"]);
+        let opts = OpenOptions::default()
+            .inbox(inbox)
+            .queue_config(CONTROL, control_config())
+            .queue_config("short", QueueConfig::default().keep_done_jobs(short))
+            .queue_config("dead", control_config().dead_retention(short));
+        let (queue, store, _clock) = open_queue_at_with(INITIAL, opts).await;
+        let retention = DEFAULT_INBOX_RECORD_RETENTION;
+        for (control, expected) in [
+            (DEFAULT_QUEUE_NAME, ControlQueueError::RuntimeQueue),
+            ("unlisted", ControlQueueError::NotAccepted),
+            ("deleted", ControlQueueError::DoneJobsNotKept { retention }),
+            ("short", ControlQueueError::DoneJobsNotKept { retention }),
+            ("dead", ControlQueueError::DeadRetentionShort { retention }),
+        ] {
             let built =
                 WorkflowRuntime::builder(queue.clone(), store.clone(), Echo, NoopTerminalHook)
                     .control_queue(control)
                     .build();
             assert!(
-                matches!(built, Err(Error::InvalidControlQueue(ref name)) if name == control),
+                matches!(
+                    built,
+                    Err(Error::InvalidControlQueue { ref queue, reason })
+                        if queue == control && reason == expected
+                ),
                 "{control}"
             );
         }
+        WorkflowRuntime::builder(queue.clone(), store.clone(), Echo, NoopTerminalHook)
+            .control_queue(CONTROL)
+            .build()
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_command_job_cancelled_through_the_inbox_reads_as_none() {
+        let (queue, sender, runtime, _clock) = open(OpenOptions::default()).await;
+        let submit = Command::Submit(SubmitCommand::new(rid("run-6"), b"x"));
+        let id = sender
+            .send(CONTROL, EnqueueEntry::from(submit))
+            .await
+            .unwrap();
+        queue.apply_inbox_now().await.unwrap();
+        let record = queue.view().inbox_record(CONTROL, &id).await.unwrap();
+        let Some(InboxOutcome::Enqueue(EnqueueResult::New(job_id))) = record.map(|r| r.outcome)
+        else {
+            panic!("the command was not enqueued");
+        };
+
+        sender.send(CONTROL, CancelEntry { job_id }).await.unwrap();
+        queue.apply_inbox_now().await.unwrap();
+        assert_eq!(runtime.view().command(CONTROL, &id).await.unwrap(), None);
     }
 
     #[tokio::test(start_paused = true)]
@@ -497,13 +534,15 @@ mod tests {
             reason: Some("operator".to_string()),
             ..CancelCommand::new(rid("run-2"))
         });
-        assert!(send(&queue, &sender, cancel.into()).await.is_none());
+        let cancelled = send(&queue, &sender, cancel.into()).await;
+        assert_eq!(cancelled.status, JobStatus::Done);
         let end = runtime.wait(&rid("run-2")).await.unwrap();
         assert_eq!(end.termination.status, TerminalStatus::Cancelled);
         assert_eq!(end.termination.error.as_deref(), Some("operator"));
 
         let unknown = Command::Cancel(CancelCommand::new(rid("run-9")));
-        assert!(send(&queue, &sender, unknown.into()).await.is_none());
+        let ignored = send(&queue, &sender, unknown.into()).await;
+        assert_eq!(ignored.status, JobStatus::Done);
         let _ = shutdown.send(());
     }
 

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use thiserror::Error;
 
 use crate::keys::RunId;
@@ -126,10 +128,41 @@ pub enum Error {
     #[error("group `{0}` has an active member")]
     GroupActive(RunId),
 
-    /// The queue of [`crate::WorkflowRuntimeBuilder::control_queue`] is the
-    /// queue name of the runtime, or the inbox of the queue does not accept it.
-    #[error("control queue `{0}` is the runtime's queue or outside the inbox allow-list")]
-    InvalidControlQueue(String),
+    /// The queue of [`crate::WorkflowRuntimeBuilder::control_queue`] breaks a
+    /// requirement of a control queue.
+    #[error("invalid control queue `{queue}`: {reason}")]
+    InvalidControlQueue {
+        /// The rejected control queue.
+        queue: String,
+        /// The requirement that the queue breaks.
+        reason: ControlQueueError,
+    },
+}
+
+/// The requirement of a control queue that a queue breaks: the reason of
+/// [`Error::InvalidControlQueue`]. `retention` is the
+/// [`taquba::InboxOptions::record_retention`] of the inbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ControlQueueError {
+    /// The queue is the queue name of the runtime.
+    #[error("is the runtime's queue")]
+    RuntimeQueue,
+    /// The inbox of the queue does not accept the queue.
+    #[error("is outside the inbox allow-list")]
+    NotAccepted,
+    /// The queue keeps its done jobs for less than `retention`, or deletes
+    /// them.
+    #[error("must keep done jobs for at least {retention:?}")]
+    DoneJobsNotKept {
+        /// The record retention of the inbox.
+        retention: Duration,
+    },
+    /// The queue keeps its dead jobs for less than `retention`.
+    #[error("must keep dead jobs for at least {retention:?}")]
+    DeadRetentionShort {
+        /// The record retention of the inbox.
+        retention: Duration,
+    },
 }
 
 impl Error {
@@ -157,7 +190,7 @@ impl Error {
             | Self::DuplicateMemberKey(_)
             | Self::GroupMismatch(_)
             | Self::GroupNotFound(_)
-            | Self::InvalidControlQueue(_) => true,
+            | Self::InvalidControlQueue { .. } => true,
             Self::Queue(e) => e.is_permanent(),
             Self::Store(_) | Self::GroupActive(_) => false,
         }
@@ -246,6 +279,13 @@ mod tests {
             (Error::GroupNotFound(rid("b")), true),
             (Error::GroupActive(rid("b")), false),
             (Error::RunNotFound(rid("run-1")), true),
+            (
+                Error::InvalidControlQueue {
+                    queue: "control".into(),
+                    reason: ControlQueueError::NotAccepted,
+                },
+                true,
+            ),
             (
                 Error::MemberNotSubmitted {
                     group_id: rid("b"),
