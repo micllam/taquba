@@ -8,12 +8,13 @@
 //! job's payload.
 //!
 //! Ordering invariant: the payload object is written before the transaction
-//! that writes the record, and deleted only after the transaction that removes
-//! the record commits. A crash between the two steps leaves an orphaned object,
-//! never a live record whose payload is gone.
+//! that writes the record, and deleted only after the removal of the record is
+//! durable. A crash between the two steps leaves an orphaned object, never a
+//! live record whose payload is gone.
 
 use std::sync::Arc;
 
+use futures_util::{StreamExt, stream};
 use slatedb::object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, path::Path};
 use ulid::Ulid;
 
@@ -152,6 +153,23 @@ impl PayloadStore {
                 payload_ref,
                 "failed to delete payload object: {err}"
             );
+        }
+    }
+
+    /// Delete the objects of `payload_refs` through the bulk delete of the
+    /// object store, and log each failure. The caller must make the removals of
+    /// their records durable first.
+    pub(crate) async fn delete_all(&self, payload_refs: Vec<String>) {
+        let paths: Vec<_> = payload_refs
+            .iter()
+            .map(|payload_ref| Ok(self.object_path(payload_ref)))
+            .collect();
+        let mut deleted = self.store.delete_stream(stream::iter(paths).boxed());
+        while let Some(result) = deleted.next().await {
+            match result {
+                Ok(_) | Err(ObjectStoreError::NotFound { .. }) => {}
+                Err(err) => tracing::warn!("failed to delete payload object: {err}"),
+            }
         }
     }
 }

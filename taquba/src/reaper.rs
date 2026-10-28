@@ -323,12 +323,17 @@ impl QueueCore {
         }
         drop(iter);
 
+        let mut payload_refs = Vec::new();
         for (key, job, at_in_key) in victims {
-            if !self.sweep_victim(&key, &job).await?
+            if !self.sweep_victim(&key, &job, &mut payload_refs).await?
                 && let (Some(scan), Some(at_in_key)) = (&mut scan, at_in_key)
             {
                 scan.retain(at_in_key);
             }
+        }
+        if !payload_refs.is_empty() {
+            self.db.flush().await?;
+            self.payload_store.delete_all(payload_refs).await;
         }
         if let Some(scan) = scan {
             scan.complete();
@@ -396,11 +401,16 @@ impl QueueCore {
     /// The commit does not await WAL durability: a commit lost in a crash
     /// leaves the record in place for the next sweep and the existence re-check
     /// keeps the rerun idempotent, including the counter decrement. A
-    /// conflicting commit leaves the victim to the next sweep. The payload
-    /// object is deleted only after the commit, so a crash in between leaves an
-    /// orphaned object, never a live record whose payload is gone. Returns
-    /// `false` when a conflict left the record in place.
-    async fn sweep_victim(&self, key: &[u8], job: &JobRecord) -> Result<bool> {
+    /// conflicting commit leaves the victim to the next sweep. The payload ref
+    /// of a removed record goes to `payload_refs`, whose objects the sweep
+    /// deletes after one flush at its end. Returns `false` when a conflict left
+    /// the record in place.
+    async fn sweep_victim(
+        &self,
+        key: &[u8],
+        job: &JobRecord,
+        payload_refs: &mut Vec<String>,
+    ) -> Result<bool> {
         let mut txn = self.begin().await?;
         let existed = txn.get(key).await?.is_some();
         if existed {
@@ -411,9 +421,7 @@ impl QueueCore {
             Commit::Conflict => return Ok(false),
         }
         if existed && let Some(payload_ref) = &job.payload_ref {
-            self.payload_store
-                .delete_best_effort(payload_ref, &job.id)
-                .await;
+            payload_refs.push(payload_ref.clone());
         }
         Ok(true)
     }
@@ -1248,6 +1256,52 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(object_count(&store, "test-payloads").await, 0);
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_swept_record_keeps_its_payload_object_until_its_removal_is_durable() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let reaper_interval = Duration::from_millis(10);
+        let retention = Duration::from_millis(20);
+        let faults = FaultStore::wrap();
+        let store: Arc<dyn ObjectStore> = faults.clone();
+        let opts = |dead_retention| OpenOptions {
+            reaper_interval,
+            default_queue_config: QueueConfig {
+                dead_retention,
+                ..QueueConfig::default()
+            },
+            clock: Arc::new(clock.clone()),
+            payload_offload_threshold: Some(64),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(store.clone(), "test", opts(Some(retention)))
+            .await
+            .unwrap();
+        let id = q.enqueue("work", vec![5u8; 256]).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        q.dead_letter(&job, "permanent").await.unwrap();
+
+        // The sweep removes the record without awaiting durability, and its
+        // flush stalls on the unavailable store. The queue is dropped without a
+        // close, which simulates a crash before the removal is durable.
+        faults.fail_puts(true);
+        clock.advance(retention + Duration::from_millis(10));
+        tokio::time::sleep(reaper_interval * 2).await;
+        assert_eq!(object_count(&store, "test-payloads").await, 1);
+        drop(q);
+
+        faults.fail_puts(false);
+        let q = Queue::open_with_options(store, "test", opts(None))
+            .await
+            .unwrap();
+        let dead = q.view().get_job(&id).await.unwrap().unwrap();
+        assert_eq!(dead.payload, vec![5u8; 256]);
         q.close().await.unwrap();
     }
 

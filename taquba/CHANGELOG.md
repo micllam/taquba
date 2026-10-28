@@ -54,6 +54,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Error::Serialization` is removed, as the crate encodes only its own records,
   whose encoding cannot fail. Remove the match arm of the variant.
 
+### Fixed
+
+- The retention sweep of done and dead records deletes their payload objects
+  after one flush at its end, so a crash before the flush no longer restores a
+  record whose payload is gone. A record that an earlier crash left without its
+  payload is removed at the next sweep, as before.
+
 ## [0.15.0] - 2026-10-14
 
 ### Added
