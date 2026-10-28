@@ -1,17 +1,21 @@
 //! The sender of inbox entries: another process writes an entry as one object
 //! in the inbox.
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use slatedb::object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, path::Path};
 use tracing::{debug, warn};
-use ulid::{Generator, Ulid};
+use ulid::Ulid;
 
 use crate::error::{Error, Result};
 use crate::inbox::entry::{InboxEntry, validate_id};
 use crate::inbox::{EntryKey, EntryPath, entry_path, list_entries, queue_prefix, touch_path};
 use crate::keys::QueueName;
+use crate::ulids::MonotonicUlids;
+
+/// The orders of the entries of every sender in the process.
+static ORDERS: MonotonicUlids = MonotonicUlids::new();
 
 /// The writes of the touch object per send, the first and one retry. A failed
 /// touch delays the entry to the next listing of the writer, at most
@@ -58,11 +62,11 @@ pub struct PendingEntry {
 /// entry, as the layout of the store, changes between minor releases.
 ///
 /// The writer applies the entries of a listing in the order of their ULIDs and
-/// then by id. The ULIDs of one sender and its clones increase with call order.
+/// then by id. The ULIDs of every sender in a process increase with call order.
 /// Entries sent one after the other, each send awaited before the next, apply
-/// in send order. The sends of two senders apply in the order of their clocks.
-/// An entry that depends on an entry of another process must be sent after the
-/// record of the first exists. Its sender reads that record through
+/// in send order. The sends of two processes apply in the order of their
+/// clocks. An entry that depends on an entry of another process must be sent
+/// after the record of the first exists. Its sender reads that record through
 /// [`QueueView::inbox_record`](crate::QueueView::inbox_record). An entry
 /// written after a pass that applied a later ULID applies at a later pass.
 ///
@@ -73,7 +77,6 @@ pub struct PendingEntry {
 pub struct InboxSender {
     store: Arc<dyn ObjectStore>,
     prefix: String,
-    orders: Arc<Mutex<Generator>>,
 }
 
 impl InboxSender {
@@ -84,14 +87,13 @@ impl InboxSender {
         Self {
             store,
             prefix: path.into(),
-            orders: Arc::new(Mutex::new(Generator::new())),
         }
     }
 
     /// Write `entry` for `queue` with the ULID of the send as its id, and
     /// return the id.
     pub async fn send(&self, queue: &str, entry: impl Into<InboxEntry>) -> Result<String> {
-        let order = self.next_order();
+        let order = ORDERS.next(SystemTime::now());
         let id = order.to_string();
         self.send_at(queue, order, &id, entry.into()).await?;
         Ok(id)
@@ -112,7 +114,7 @@ impl InboxSender {
         id: &str,
         entry: impl Into<InboxEntry>,
     ) -> Result<()> {
-        self.send_at(queue, self.next_order(), id, entry.into())
+        self.send_at(queue, ORDERS.next(SystemTime::now()), id, entry.into())
             .await
     }
 
@@ -179,12 +181,5 @@ impl InboxSender {
             }
         }
         Ok(pending)
-    }
-
-    /// A ULID that sorts after every ULID this sender generated.
-    fn next_order(&self) -> Ulid {
-        let mut orders = self.orders.lock().expect("order generator mutex poisoned");
-        // Unreachable short of 2^80 ULIDs inside one millisecond.
-        orders.generate().unwrap_or_else(|_| Ulid::new())
     }
 }

@@ -114,13 +114,12 @@ async fn an_entry_is_applied_once_with_a_record_and_its_object_deleted() {
 }
 
 #[tokio::test]
-async fn entries_apply_in_send_order_across_kinds_and_ids() {
+async fn the_entries_of_a_process_apply_in_send_order_across_senders_kinds_and_ids() {
     let store = make_store();
     let q = open(&store, &MockClock::new(INITIAL)).await;
-    let sender = sender(&store);
     // In id order, the generated id applies first and the cancel before the
-    // enqueue of its job.
-    sender
+    // enqueue of its job. Each send has a sender of its own.
+    sender(&store)
         .send_with_id(
             WORK,
             "z",
@@ -131,8 +130,11 @@ async fn entries_apply_in_send_order_across_kinds_and_ids() {
         )
         .await
         .unwrap();
-    sender.send(WORK, EnqueueEntry::new(b"kept")).await.unwrap();
-    sender
+    sender(&store)
+        .send(WORK, EnqueueEntry::new(b"kept"))
+        .await
+        .unwrap();
+    sender(&store)
         .send_with_id(WORK, "a", CancelEntry { job_id: "j".into() })
         .await
         .unwrap();

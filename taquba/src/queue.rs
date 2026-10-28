@@ -27,6 +27,7 @@ use crate::scheduler::Scheduler;
 use crate::stats::QueueMergeOperator;
 use crate::time_bound::TimeBound;
 use crate::txn::ClaimEnd;
+use crate::ulids::MonotonicUlids;
 use crate::view::{Handle, QueueView};
 
 /// Outcome of [`Queue::cancel`], reflecting which lifecycle branch the job was
@@ -331,7 +332,7 @@ impl Queue {
             lease_registry: LeaseRegistry::new(),
             completion_waiters: Arc::new(CompletionWaiters::default()),
             payload_store,
-            id_gen: std::sync::Mutex::new(ulid::Generator::new()),
+            id_gen: MonotonicUlids::new(),
             closed: tokio_util::sync::CancellationToken::new(),
             inbox,
         });

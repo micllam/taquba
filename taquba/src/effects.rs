@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use ulid::Ulid;
 
 use crate::error::{Error, Result};
 use crate::expiry::ExpiryIndex;
@@ -146,12 +145,7 @@ impl QueueCore {
     /// from the queue's clock.
     pub(crate) fn next_job_id(&self) -> String {
         let at = std::time::UNIX_EPOCH + Duration::from_millis(self.now_ms());
-        let mut generator = self.id_gen.lock().expect("id generator mutex poisoned");
-        match generator.generate_from_datetime(at) {
-            Ok(id) => id.to_string(),
-            // Unreachable short of 2^80 ids inside one millisecond.
-            Err(_) => Ulid::from_datetime(at).to_string(),
-        }
+        self.id_gen.next(at).to_string()
     }
 
     /// Resolve [`EnqueueOptions`] against the queue's defaults and build the

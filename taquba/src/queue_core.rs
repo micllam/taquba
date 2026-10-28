@@ -24,6 +24,7 @@ use crate::queue::WaitOutcome;
 use crate::time_bound::TimeBound;
 use crate::txn::ClaimEnd;
 use crate::txn::{Attempt, Durability, Txn, get_indexed_job};
+use crate::ulids::MonotonicUlids;
 use crate::view::QueueView;
 
 mod claim;
@@ -78,7 +79,7 @@ pub(crate) struct QueueCore {
     /// Source of job ids, which increase with call order inside one millisecond
     /// as well, so the ids of one enqueue time order its pending keys. One
     /// generator per store suffices: a store has a single writer process.
-    pub(crate) id_gen: std::sync::Mutex<ulid::Generator>,
+    pub(crate) id_gen: MonotonicUlids,
     /// Fired by [`watch_store_close`] once the store closes, before the lease
     /// registry closes, so a claim's fired token never precedes it.
     pub(crate) closed: CancellationToken,
