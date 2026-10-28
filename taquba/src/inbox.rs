@@ -10,9 +10,9 @@
 //! that id applies first.
 //!
 //! A pass rejects an entry it cannot apply, with a record of its [`Rejection`].
-//! The application commits an [`InboxRecord`](crate::InboxRecord) at the queue
-//! and the id in the transaction of the entry's effect. After an idempotent
-//! effect or none, the record commits in a transaction of its own. The object
+//! The application commits an [`InboxRecord`](crate::InboxRecord) with its
+//! outcome at the queue and the id in the transaction of the entry's effect,
+//! and a rejection commits its record in a transaction of its own. The object
 //! is deleted after the commit. A pass that finds the record of an object
 //! deletes the object without a read, and passes run one at a time, so
 //! ingestion is at least once and application is once within the retention of
@@ -48,10 +48,9 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use crate::background::Periodic;
-use crate::effects::SettlementEffects;
 use crate::error::{Error, Result};
 use crate::inbox::entry::{InboxEntry, validate_id};
-use crate::inbox::record::{InboxOutcome, InboxRecordHandle, Rejection, Settled, StagedRecord};
+use crate::inbox::record::{InboxOutcome, InboxRecordHandle, Rejection};
 use crate::keys::{QueueName, inbox_record_key};
 use crate::queue_core::QueueCore;
 use crate::time_bound::TimeBound;
@@ -84,9 +83,8 @@ pub fn default_inbox_path(path: &str) -> String {
 /// The writer lists the inbox at open, after a change of its touch object and
 /// once per [`Self::interval`]. A pass applies the entries in the order that
 /// [`InboxSender`](crate::InboxSender) states. It commits an
-/// [`InboxRecord`](crate::InboxRecord) at the queue and the id in the
-/// transaction of the entry's effect. After an idempotent effect or none, it
-/// commits the record in a transaction of its own. It then deletes the object.
+/// [`InboxRecord`](crate::InboxRecord) with its outcome at the queue and the id
+/// in the transaction of the entry's effect, and then deletes the object.
 ///
 /// A pass rejects an entry it cannot apply, with a record of its [`Rejection`].
 /// A transient error ends the pass at its entry, and the next pass starts again
@@ -473,58 +471,25 @@ impl QueueCore {
             return Ok(());
         }
         let record = InboxRecordHandle::new(queue.clone(), id.clone(), self.now_ms());
-        let settled = if !inbox.accepts(&queue) {
-            Ok(Settled::Rejected(Rejection::QueueNotAccepted))
+        let decoded = if !inbox.accepts(&queue) {
+            Err(Rejection::QueueNotAccepted)
         } else if let Some(rejection) = rejection {
-            Ok(Settled::Rejected(rejection))
+            Err(rejection)
         } else {
-            let body = inbox.get(location).await?;
-            match InboxEntry::decode(&kind, &body) {
-                Ok(entry) => self.apply_entry(&queue, &record, entry).await,
-                Err(reason) => Ok(Settled::Rejected(reason)),
-            }
+            InboxEntry::decode(&kind, &inbox.get(location).await?)
         };
-        let rejected = self.record_entry(&kind, &record, settled?).await?;
-        if rejected {
+        let outcome = match decoded {
+            Ok(entry) => self.apply_entry(&queue, &record, entry).await?,
+            Err(rejection) => self.commit_rejection(&record, rejection).await?,
+        };
+        if let InboxOutcome::Rejected(reason) = &outcome {
             crate::obs::inbox_rejected(&kind);
+            warn!(kind, id, %reason, "inbox entry rejected");
         } else {
             crate::obs::inbox_applied(&kind);
             debug!(kind, id, "inbox entry applied");
         }
         inbox.delete(location).await
-    }
-
-    /// Commit the record of an entry of `kind` that `settled` reports
-    /// separately, and return whether the entry was rejected.
-    async fn record_entry(
-        &self,
-        kind: &str,
-        record: &InboxRecordHandle,
-        settled: Settled,
-    ) -> Result<bool> {
-        match settled {
-            Settled::Committed => Ok(false),
-            Settled::Applied(staged) => {
-                self.commit_record(staged).await?;
-                Ok(false)
-            }
-            Settled::Rejected(reason) => {
-                let staged = record.staged(InboxOutcome::Rejected(reason.clone()));
-                self.commit_record(staged).await?;
-                warn!(kind, id = record.id, %reason, "inbox entry rejected");
-                Ok(true)
-            }
-        }
-    }
-
-    /// Commit `record` in a transaction of its own.
-    async fn commit_record(&self, record: StagedRecord) -> Result<()> {
-        let effects = SettlementEffects {
-            inbox_record: Some(record),
-            ..SettlementEffects::default()
-        };
-        self.commit_effects_where(effects, &[]).await?;
-        Ok(())
     }
 }
 

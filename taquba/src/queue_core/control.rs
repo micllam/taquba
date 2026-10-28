@@ -3,7 +3,7 @@
 
 use tracing::debug;
 
-use crate::effects::{PreparedEffects, SettlementEffects};
+use crate::effects::SettlementEffects;
 use crate::error::Result;
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::QueueName;
@@ -57,18 +57,49 @@ pub(crate) async fn stage_wake(
     Ok(Ok(job.queue))
 }
 
-/// What the cancel transaction did.
-enum Cancelled {
-    /// The pending or scheduled job was removed, and the effects were staged
-    /// with these enqueue results.
-    Removed {
-        job: JobRecord,
-        results: Vec<EnqueueResult>,
-    },
-    /// The cancellation of the claimed job was recorded on its record.
-    Requested { job: JobRecord },
-    /// The transaction did not commit.
-    Uncommitted(CancelOutcome),
+/// What [`stage_cancel`] staged for a job.
+pub(crate) enum StagedCancel {
+    /// The pending or scheduled job is removed.
+    Removed(JobRecord),
+    /// The cancellation of the claimed job is recorded on its record.
+    Requested(JobRecord),
+    /// The record of the claimed job contains the cancellation already. Nothing
+    /// is staged.
+    AlreadyRequested(JobRecord),
+    /// The job is missing, done or dead. Nothing is staged.
+    NotFound,
+}
+
+impl StagedCancel {
+    /// The outcome of the cancel for its caller.
+    pub(crate) fn outcome(&self) -> CancelOutcome {
+        match self {
+            Self::Removed(_) => CancelOutcome::Removed,
+            Self::Requested(_) | Self::AlreadyRequested(_) => CancelOutcome::Requested,
+            Self::NotFound => CancelOutcome::NotFound,
+        }
+    }
+}
+
+/// Stage the cancel of the job `job_id` in `txn`: the removal of a pending or
+/// scheduled job, or the cancellation flag on the record of a claimed job.
+pub(crate) async fn stage_cancel(txn: &mut Txn, job_id: &str) -> Result<StagedCancel> {
+    let Some((_, current_key, mut job)) = get_indexed_job(txn, job_id).await? else {
+        return Ok(StagedCancel::NotFound);
+    };
+    Ok(match job.status {
+        JobStatus::Pending | JobStatus::Scheduled => {
+            txn.stage_remove(&current_key, &job)?;
+            StagedCancel::Removed(job)
+        }
+        JobStatus::Claimed if job.cancel_requested => StagedCancel::AlreadyRequested(job),
+        JobStatus::Claimed => {
+            job.cancel_requested = true;
+            txn.move_job(&current_key, &mut job)?;
+            StagedCancel::Requested(job)
+        }
+        JobStatus::Done | JobStatus::Dead => StagedCancel::NotFound,
+    })
 }
 
 impl QueueCore {
@@ -80,77 +111,58 @@ impl QueueCore {
         effects: SettlementEffects,
     ) -> Result<(CancelOutcome, Vec<EnqueueResult>)> {
         let prepared = self.prepare_effects(effects).await?;
-        match self.cancel_txn(id, &prepared).await {
-            Ok(Cancelled::Removed { job, results }) => {
-                let results = self.finish_effects(prepared, Some(results)).await;
-                // Fired on the Removed path as well: the worker of a claim the
-                // reaper requeued just before this call can still observe the
-                // token. That claim's end removes the entry.
-                self.lease_registry.cancel(&job.queue, id);
-                // The record is deleted, so its payload object (if any) is
-                // removed here, after the commit.
-                self.payload_store.delete_for(&job).await;
-                self.completion_waiters
-                    .settle(id, || WaitOutcome::Cancelled);
-                debug!(job_id = %id, "pending/scheduled job cancelled");
-                Ok((CancelOutcome::Removed, results.unwrap_or_default()))
-            }
-            // Not yet terminal: the worker's settlement delivers the outcome
-            // when it acks, nacks or dead-letters.
-            Ok(Cancelled::Requested { job }) => {
-                self.finish_effects(prepared, None).await;
-                self.lease_registry.cancel(&job.queue, id);
-                debug!(job_id = %id, "claimed job cancellation requested");
-                Ok((CancelOutcome::Requested, Vec::new()))
-            }
-            Ok(Cancelled::Uncommitted(outcome)) => {
-                self.finish_effects(prepared, None).await;
-                Ok((outcome, Vec::new()))
-            }
-            Err(err) => {
-                self.finish_effects(prepared, None).await;
-                Err(err)
-            }
+        let mut committed = {
+            let prepared = &prepared;
+            self.retry(Durability::Awaited, |mut txn| async move {
+                let staged = stage_cancel(&mut txn, id).await?;
+                Ok(match staged {
+                    StagedCancel::Removed(_) => {
+                        let results = self.stage_effects(&mut txn, prepared).await?;
+                        (txn, Attempt::Commit((staged, Some(results))))
+                    }
+                    StagedCancel::Requested(_) => (txn, Attempt::Commit((staged, None))),
+                    StagedCancel::AlreadyRequested(_) | StagedCancel::NotFound => {
+                        (txn, Attempt::Abort((staged, None)))
+                    }
+                })
+            })
+            .await
+        };
+        let results = committed
+            .as_mut()
+            .ok()
+            .and_then(|(_, results)| results.take());
+        let results = self.finish_effects(prepared, results).await;
+        let (staged, _) = committed?;
+        let outcome = staged.outcome();
+        if let Some(removed) = self.finish_cancel(staged) {
+            self.payload_store.delete_for(&removed).await;
         }
+        Ok((outcome, results.unwrap_or_default()))
     }
 
-    /// The transaction loop of [`Self::cancel`]: resolve the job and commit the
-    /// transition its state allows.
-    async fn cancel_txn(&self, id: &str, prepared: &PreparedEffects) -> Result<Cancelled> {
-        self.transition_by_id(
-            id,
-            Durability::Awaited,
-            || Ok(Cancelled::Uncommitted(CancelOutcome::NotFound)),
-            |mut txn, current_key, mut job| async move {
-                let cancelled = match job.status {
-                    JobStatus::Pending | JobStatus::Scheduled => {
-                        txn.stage_remove(&current_key, &job)?;
-                        let results = self.stage_effects(&mut txn, prepared).await?;
-                        Cancelled::Removed { job, results }
-                    }
-                    JobStatus::Claimed => {
-                        if job.cancel_requested {
-                            // The flag is already persisted. The token is fired
-                            // again, because a re-claim after the first request
-                            // has a fresh token.
-                            self.lease_registry.cancel(&job.queue, id);
-                            debug!(job_id = %id, "cancel re-requested on claimed job");
-                            let requested = Cancelled::Uncommitted(CancelOutcome::Requested);
-                            return Ok((txn, Attempt::Abort(requested)));
-                        }
-                        job.cancel_requested = true;
-                        txn.move_job(&current_key, &mut job)?;
-                        Cancelled::Requested { job }
-                    }
-                    JobStatus::Done | JobStatus::Dead => {
-                        let not_found = Cancelled::Uncommitted(CancelOutcome::NotFound);
-                        return Ok((txn, Attempt::Abort(not_found)));
-                    }
-                };
-                Ok((txn, Attempt::Commit(cancelled)))
-            },
-        )
-        .await
+    /// Complete a cancel after its transaction. It fires the lease token of the
+    /// job and settles the completion waiters of a removed job, and returns the
+    /// removed job, whose payload object the caller deletes. The token of a
+    /// removed job fires as well, for the worker of a claim that the reaper
+    /// requeued before the cancel. A claimed job reaches its waiters at its
+    /// settlement.
+    pub(crate) fn finish_cancel(&self, staged: StagedCancel) -> Option<JobRecord> {
+        match staged {
+            StagedCancel::Removed(job) => {
+                self.lease_registry.cancel(&job.queue, &job.id);
+                self.completion_waiters
+                    .settle(&job.id, || WaitOutcome::Cancelled);
+                debug!(job_id = %job.id, "pending/scheduled job cancelled");
+                Some(job)
+            }
+            StagedCancel::Requested(job) | StagedCancel::AlreadyRequested(job) => {
+                self.lease_registry.cancel(&job.queue, &job.id);
+                debug!(job_id = %job.id, "claimed job cancellation requested");
+                None
+            }
+            StagedCancel::NotFound => None,
+        }
     }
 
     /// Move the scheduled job `id` to pending before its `run_at`, as

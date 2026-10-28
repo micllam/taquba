@@ -1,12 +1,11 @@
 //! The record of an applied inbox entry, and the handle through which the
-//! application of a kind commits the record in the transaction of the entry's
+//! application of a kind stages the record in the transaction of the entry's
 //! effect.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::codec::encode;
-use crate::effects::SettlementEffects;
 use crate::error::{Error, FormError};
 use crate::keys::QueueName;
 use crate::queue::{CancelOutcome, EnqueueResult, SignalOutcome};
@@ -16,7 +15,8 @@ use crate::queue::{CancelOutcome, EnqueueResult, SignalOutcome};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InboxOutcome {
     /// An [`EnqueueEntry`](crate::EnqueueEntry) was applied, with the result of
-    /// the enqueue.
+    /// the enqueue. An [`EnqueueResult::AlreadyEnqueued`] identifies the job
+    /// that held the dedup key in the snapshot of the application.
     Enqueue(EnqueueResult),
     /// A [`CancelEntry`](crate::CancelEntry) was applied, with the outcome of
     /// the cancel.
@@ -96,7 +96,7 @@ impl Rejection {
 
 /// The record of an applied inbox entry, read through
 /// [`QueueView::inbox_record`](crate::QueueView::inbox_record). It is written
-/// in the transaction of the entry's effect and deleted
+/// with its outcome in the transaction of the entry's effect and deleted
 /// [`InboxOptions::record_retention`](crate::InboxOptions::record_retention)
 /// after its application. Within that retention, an entry of its queue and id
 /// does not apply again.
@@ -113,7 +113,7 @@ pub struct InboxRecord {
 /// entry and the time of the pass that applies it.
 pub(crate) struct InboxRecordHandle {
     queue: QueueName,
-    pub(crate) id: String,
+    id: String,
     applied_at_ms: u64,
 }
 
@@ -126,19 +126,6 @@ impl InboxRecordHandle {
         }
     }
 
-    /// Effects that contain the record of the entry with `outcome`.
-    pub(crate) fn effects(&self, outcome: InboxOutcome) -> SettlementEffects {
-        SettlementEffects {
-            inbox_record: Some(self.staged(outcome)),
-            ..SettlementEffects::default()
-        }
-    }
-
-    /// The record of the entry with `outcome`, for a commit of its own.
-    pub(crate) fn applied(&self, outcome: InboxOutcome) -> Settled {
-        Settled::Applied(self.staged(outcome))
-    }
-
     /// The encoded record of the entry with `outcome`.
     pub(crate) fn staged(&self, outcome: InboxOutcome) -> StagedRecord {
         StagedRecord::encode(
@@ -148,17 +135,6 @@ impl InboxRecordHandle {
             outcome,
         )
     }
-}
-
-/// What the pass commits for an applied entry.
-pub(crate) enum Settled {
-    /// The record was committed with the entry's effect.
-    Committed,
-    /// The record of an applied outcome awaits a commit of its own.
-    Applied(StagedRecord),
-    /// The entry was rejected for the reason, and its record awaits a commit of
-    /// its own.
-    Rejected(Rejection),
 }
 
 /// The encoded record of an entry, as a transaction stages it.

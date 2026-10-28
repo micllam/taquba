@@ -5,7 +5,7 @@ use crate::error::{Error, FormError};
 use crate::inbox::entry::{CancelEntry, EnqueueEntry, InboxEntry, SignalEntry};
 use crate::inbox::record::{InboxOutcome, Rejection};
 use crate::inbox::sender::InboxSender;
-use crate::queue::{CancelOutcome, EnqueueResult, Queue, SignalOutcome};
+use crate::queue::{CancelOutcome, ClaimOutcome, EnqueueResult, Queue, SignalOutcome};
 use crate::reader::QueueReader;
 use crate::test_util::*;
 
@@ -151,6 +151,48 @@ async fn the_entries_of_a_process_apply_in_send_order_across_senders_kinds_and_i
     let jobs = q.claim_batch("work", 2, LEASE).await.unwrap();
     let payloads: Vec<&[u8]> = jobs.iter().map(|j| j.payload.as_slice()).collect();
     assert_eq!(payloads, [b"kept".as_slice()]);
+    q.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_enqueue_with_a_held_dedup_key_records_the_job_and_deletes_its_payload() {
+    let store = make_store();
+    let opts = OpenOptions {
+        payload_offload_threshold: Some(64),
+        ..inbox_opts(&MockClock::new(INITIAL))
+    };
+    let q = Queue::open_with_options(store.clone(), "test", opts)
+        .await
+        .unwrap();
+    let options = || EnqueueOptions::default().dedup_key("once".to_string());
+    let existing = q
+        .enqueue_with("work", vec![1; 256], options())
+        .await
+        .unwrap();
+    sender(&store)
+        .send_with_id(
+            WORK,
+            "dup",
+            EnqueueEntry {
+                options: options(),
+                ..EnqueueEntry::new(vec![2; 256])
+            },
+        )
+        .await
+        .unwrap();
+
+    q.apply_inbox_now().await.unwrap();
+    assert_eq!(
+        q.view()
+            .inbox_record(WORK, "dup")
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome,
+        InboxOutcome::Enqueue(EnqueueResult::AlreadyEnqueued(existing))
+    );
+    assert_eq!(object_count(&store, "test-payloads").await, 1);
+    assert_eq!(q.view().stats("work").await.unwrap().pending, 1);
     q.close().await.unwrap();
 }
 
@@ -531,7 +573,9 @@ async fn the_cancel_kind_removes_a_queued_job_and_records_the_other_outcomes() {
     let q = open(&store, &MockClock::new(INITIAL)).await;
     let queued = q.enqueue("work", b"a".to_vec()).await.unwrap();
     let claimed = q.enqueue("work", b"b".to_vec()).await.unwrap();
-    let claim = q.claim_by_id(&claimed, LEASE).await.unwrap();
+    let ClaimOutcome::Claimed(claim) = q.claim_by_id(&claimed, LEASE).await.unwrap() else {
+        panic!("the job is pending");
+    };
     let other = q.enqueue("other", b"c".to_vec()).await.unwrap();
     let sender = sender(&store);
     for (id, job_id) in [
@@ -574,6 +618,7 @@ async fn the_cancel_kind_removes_a_queued_job_and_records_the_other_outcomes() {
         outcome("claimed").await,
         InboxOutcome::Cancel(CancelOutcome::Requested)
     );
+    assert!(claim.cancel_token().is_cancelled());
     assert_eq!(
         outcome("missing").await,
         InboxOutcome::Cancel(CancelOutcome::NotFound)

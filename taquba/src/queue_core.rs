@@ -28,7 +28,7 @@ use crate::ulids::MonotonicUlids;
 use crate::view::QueueView;
 
 mod claim;
-mod control;
+pub(crate) mod control;
 mod enqueue;
 mod settle;
 pub(crate) mod signal;

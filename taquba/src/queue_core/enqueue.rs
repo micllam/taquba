@@ -58,7 +58,9 @@ impl QueueCore {
         mut prepared: PreparedJob,
         effects: PreparedEffects,
     ) -> Result<(EnqueueResult, Vec<EnqueueResult>)> {
-        let written = match self.payload_store.offload(&mut prepared.job).await {
+        let offloaded = self.payload_store.offload(&mut prepared.job).await;
+        let timer = crate::obs::start();
+        let written = match offloaded {
             Ok(()) => self.write_job_txn(&prepared, &effects).await,
             Err(err) => Err(err),
         };
@@ -67,12 +69,8 @@ impl QueueCore {
             Ok(Err(existing)) => (Ok(EnqueueResult::AlreadyEnqueued(existing)), None),
             Err(err) => (Err(err), None),
         };
-        // A payload object is live only when a new record committed. On a dedup
-        // downgrade or an error the record does not exist, so remove the object
-        // written above.
-        if staged.is_none() {
-            self.payload_store.delete_for(&prepared.job).await;
-        }
+        self.finish_job_write(&prepared, staged.is_some(), timer)
+            .await;
         let results = self.finish_effects(effects, staged).await;
         outcome.map(|outcome| (outcome, results.unwrap_or_default()))
     }
@@ -86,22 +84,33 @@ impl QueueCore {
         prepared: &PreparedJob,
         effects: &PreparedEffects,
     ) -> Result<std::result::Result<(String, Vec<EnqueueResult>), String>> {
-        let timer = crate::obs::start();
-        let written = self
-            .retry(Durability::Awaited, |mut txn| async move {
-                let id = match self.stage_job_writes(&mut txn, prepared).await? {
-                    Ok(id) => id,
-                    Err(already_enqueued) => {
-                        return Ok((txn, Attempt::Abort(Err(already_enqueued))));
-                    }
-                };
-                let results = self.stage_effects(&mut txn, effects).await?;
-                Ok((txn, Attempt::Commit(Ok((id, results)))))
-            })
-            .await?;
-        if written.is_ok() {
+        self.retry(Durability::Awaited, |mut txn| async move {
+            let id = match self.stage_job_writes(&mut txn, prepared).await? {
+                Ok(id) => id,
+                Err(already_enqueued) => {
+                    return Ok((txn, Attempt::Abort(Err(already_enqueued))));
+                }
+            };
+            let results = self.stage_effects(&mut txn, effects).await?;
+            Ok((txn, Attempt::Commit(Ok((id, results)))))
+        })
+        .await
+    }
+
+    /// Complete the write of `prepared` after its transaction. A new record
+    /// records the enqueue latency from `timer`. Without a new record, after a
+    /// dedup hit or an error, the offloaded payload object is deleted, because
+    /// only a committed record makes it live.
+    pub(crate) async fn finish_job_write(
+        &self,
+        prepared: &PreparedJob,
+        new: bool,
+        timer: crate::obs::Timer,
+    ) {
+        if new {
             crate::obs::enqueue_committed(&prepared.job.queue, timer);
+        } else {
+            self.payload_store.delete_for(&prepared.job).await;
         }
-        Ok(written)
     }
 }

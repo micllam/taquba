@@ -35,9 +35,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `SettlementEffects` has a private field, so a caller constructs it with
-  `SettlementEffects::default()` and the builder methods. Replace a struct
-  literal with `..SettlementEffects::default()` or the setters.
 - Claims within a priority follow the enqueue time of a job before its id, so a
   job with an `EnqueueOptions::id_override` keeps its place in FIFO order. Drain
   the pending jobs of a store written with 0.15.0 before the upgrade.
