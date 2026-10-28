@@ -2,7 +2,9 @@ use slatedb::object_store::{ObjectStoreExt, PutPayload, path::Path};
 
 use super::*;
 use crate::error::{Error, FormError};
-use crate::inbox::entry::{CancelEntry, EnqueueEntry, InboxEntry, SignalEntry};
+use crate::inbox::entry::{
+    CancelEntry, EnqueueEntry, InboxEntry, MAX_INBOX_ENTRY_SIZE, SignalEntry,
+};
 use crate::inbox::record::{InboxOutcome, Rejection};
 use crate::inbox::sender::InboxSender;
 use crate::queue::{CancelOutcome, ClaimOutcome, EnqueueResult, Queue, SignalOutcome};
@@ -931,6 +933,61 @@ async fn a_pass_that_fails_at_the_store_runs_again_at_the_next_poll() {
         0
     );
     q.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_entry_above_the_size_bound_is_rejected_without_a_read() {
+    let faults = FaultStore::wrap();
+    let inbox_store: Arc<dyn ObjectStore> = faults.clone();
+    let opts = OpenOptions {
+        inbox: Some(
+            InboxOptions::new(["work"])
+                .object_store(inbox_store.clone())
+                .touch_poll_interval(None),
+        ),
+        ..inbox_opts(&MockClock::new(INITIAL))
+    };
+    let q = Queue::open_with_options(make_store(), "test", opts)
+        .await
+        .unwrap();
+    let size = MAX_INBOX_ENTRY_SIZE + 1;
+    put_raw(&inbox_store, WORK, "enqueue", "big", &vec![0; size]).await;
+
+    // A read of the entry fails the pass.
+    faults.fail_reads_ending(Some(".big"));
+    q.apply_inbox_now().await.unwrap();
+    assert_eq!(
+        q.view()
+            .inbox_record(WORK, "big")
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome,
+        InboxOutcome::Rejected(Rejection::TooLarge { size: size as u64 })
+    );
+    assert_eq!(
+        object_count(&inbox_store, "test-inbox/v1/work/enqueue").await,
+        0
+    );
+    q.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_read_rejects_an_object_above_the_size_bound_before_its_body() {
+    let store = make_store();
+    let inbox = InboxState::new(InboxOptions::new(["work"]), &store, "test").unwrap();
+    let location = Path::from("test-inbox/v1/work/enqueue/big");
+    let size = MAX_INBOX_ENTRY_SIZE + 1;
+    store
+        .put(&location, PutPayload::from(vec![0; size]))
+        .await
+        .unwrap();
+
+    let read = inbox.read(&location).await.unwrap();
+    assert!(matches!(
+        read,
+        Read::Rejected(Rejection::TooLarge { size: read_size }) if read_size == size as u64
+    ));
 }
 
 #[tokio::test]

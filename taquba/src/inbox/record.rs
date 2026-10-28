@@ -7,6 +7,7 @@ use thiserror::Error;
 
 use crate::codec::encode;
 use crate::error::{Error, FormError};
+use crate::inbox::entry::MAX_INBOX_ENTRY_SIZE;
 use crate::keys::QueueName;
 use crate::queue::{CancelOutcome, EnqueueResult, SignalOutcome};
 
@@ -44,6 +45,12 @@ pub enum Rejection {
     Malformed {
         /// The error of the decoder.
         detail: String,
+    },
+    /// The object of the entry is larger than [`MAX_INBOX_ENTRY_SIZE`].
+    #[error("the entry is {size} bytes, over the maximum of {MAX_INBOX_ENTRY_SIZE} bytes")]
+    TooLarge {
+        /// The size of the object in bytes.
+        size: u64,
     },
     /// The queue of the entry is outside
     /// [`InboxOptions::queues`](crate::InboxOptions::queues).

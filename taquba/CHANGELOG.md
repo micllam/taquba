@@ -20,9 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signals. The writer applies each entry once within
   `InboxOptions::record_retention`, and the key layout gains the `InboxRecord`
   and `InboxExpiry` spaces. See ADR-0005.
-- `InboxSender` writes an `InboxEntry` as a MessagePack body: an `EnqueueEntry`,
-  a `CancelEntry` or a `SignalEntry`. `InboxSender::pending` lists the entries
-  of a queue that are awaiting a pass.
+- `InboxSender` writes an `InboxEntry` as a MessagePack body of at most
+  `MAX_INBOX_ENTRY_SIZE` bytes: an `EnqueueEntry`, a `CancelEntry` or a
+  `SignalEntry`. `InboxSender::pending` lists the entries of a queue that are
+  awaiting a pass.
 - `QueueView::inbox_record` reads the `InboxRecord` of an applied entry, with
   its `InboxOutcome`: the outcome of its operation or the `Rejection` that
   states the reason of its rejection. `EnqueueResult`, `CancelOutcome`,

@@ -17,12 +17,14 @@
 //! run one at a time, so ingestion is at least once and application is once
 //! within the retention of the record.
 //!
-//! A pass settles its objects in batches of [`INBOX_BATCH`], and reads the
-//! bodies of the next [`INBOX_PREFETCH`] objects during an application. The
-//! commits of a batch do not await durability. One flush after the batch makes
-//! them durable. The pass then deletes the payload objects of the jobs that the
-//! batch removed and the objects of the batch. A crash before the flush loses
-//! the commits of the batch, and the next pass applies its entries again.
+//! A pass rejects an object larger than [`MAX_INBOX_ENTRY_SIZE`] by the size of
+//! its listing, without a read. It settles its objects in batches of
+//! [`INBOX_BATCH`], and reads the bodies of up to [`INBOX_PREFETCH`] objects
+//! and [`INBOX_PREFETCH_BYTES`] before their application. The commits of a
+//! batch do not await durability. One flush after the batch makes them durable.
+//! The pass then deletes the payload objects of the jobs that the batch removed
+//! and the objects of the batch. A crash before the flush loses the commits of
+//! the batch, and the next pass applies its entries again.
 //!
 //! The writer runs one pass at open before the scheduler starts. After it, the
 //! writer polls the touch object at `{path}/touch` once per
@@ -48,7 +50,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::{StreamExt, TryStreamExt, stream};
+use futures_util::stream::FuturesOrdered;
+use futures_util::{StreamExt, TryStreamExt};
 use slatedb::object_store::{
     Error as ObjectStoreError, ObjectMeta, ObjectStore, ObjectStoreExt, path::Path,
 };
@@ -58,7 +61,7 @@ use ulid::Ulid;
 
 use crate::background::Periodic;
 use crate::error::{Error, Result};
-use crate::inbox::entry::{InboxEntry, validate_id};
+use crate::inbox::entry::{InboxEntry, MAX_INBOX_ENTRY_SIZE, validate_id};
 use crate::inbox::record::{InboxOutcome, InboxRecordHandle, Rejection};
 use crate::keys::{QueueName, inbox_record_key};
 use crate::objects::delete_objects;
@@ -71,6 +74,10 @@ const INBOX_BATCH: usize = 1_000;
 
 /// The objects whose bodies a pass reads before their application.
 const INBOX_PREFETCH: usize = 16;
+
+/// The listed bytes of the objects that a pass reads before their application.
+/// An object of this size is read alone.
+const INBOX_PREFETCH_BYTES: u64 = MAX_INBOX_ENTRY_SIZE as u64;
 
 /// Default value of [`InboxOptions::interval`].
 pub const DEFAULT_INBOX_INTERVAL: Duration = Duration::from_secs(60);
@@ -240,15 +247,24 @@ impl InboxState {
         self.queues.contains(queue)
     }
 
-    /// Read the object at `location`.
+    /// The rejection of an entry of `queue` outside the allow-list.
+    fn not_accepted(&self, queue: &str) -> Option<Rejection> {
+        (!self.accepts(queue)).then_some(Rejection::QueueNotAccepted)
+    }
+
+    /// Read the object at `location`, with the size of the read checked against
+    /// [`MAX_INBOX_ENTRY_SIZE`] before its body.
     async fn read(&self, location: &Path) -> Result<Read> {
-        match self.store.get(location).await {
-            Ok(result) => Ok(Read::Body(
-                result.bytes().await.map_err(Error::InboxStore)?.to_vec(),
-            )),
-            Err(ObjectStoreError::NotFound { .. }) => Ok(Read::Missing),
-            Err(err) => Err(Error::InboxStore(err)),
+        let result = match self.store.get(location).await {
+            Ok(result) => result,
+            Err(ObjectStoreError::NotFound { .. }) => return Ok(Read::Missing),
+            Err(err) => return Err(Error::InboxStore(err)),
+        };
+        if let Some(rejection) = oversized(result.meta.size) {
+            return Ok(Read::Rejected(rejection));
         }
+        let body = result.bytes().await.map_err(Error::InboxStore)?;
+        Ok(Read::Body(body.to_vec()))
     }
 
     /// The metadata of the touch object, or `None` before the first touch.
@@ -278,6 +294,32 @@ enum Read {
     Body(Vec<u8>),
     /// The object was deleted after the listing.
     Missing,
+    /// The read rejects the entry without its body.
+    Rejected(Rejection),
+}
+
+/// An object of a pass: the key of its path, its metadata from the listing and
+/// the rejection that the listing decides.
+struct PassObject {
+    key: EntryKey,
+    meta: ObjectMeta,
+    rejection: Option<Rejection>,
+}
+
+impl PassObject {
+    /// The bytes of a read of the object, by the size of the listing.
+    fn read_size(&self) -> u64 {
+        if self.rejection.is_some() {
+            0
+        } else {
+            self.meta.size
+        }
+    }
+}
+
+/// The rejection of an object of `size` bytes above [`MAX_INBOX_ENTRY_SIZE`].
+fn oversized(size: u64) -> Option<Rejection> {
+    (size > MAX_INBOX_ENTRY_SIZE as u64).then_some(Rejection::TooLarge { size })
 }
 
 /// The prefix of the entries of `queue` in the inbox at `prefix`.
@@ -479,12 +521,26 @@ impl QueueCore {
             list_entries(&*inbox.store, &inbox.prefix, &version_prefix(&inbox.prefix)).await?;
         let objects: Vec<_> = entries
             .into_iter()
-            .map(|(path, object)| (path.key, object.location, None))
-            .chain(
-                unordered
-                    .into_iter()
-                    .map(|(key, object)| (key, object.location, Some(Rejection::Unordered))),
-            )
+            .map(|(path, meta)| {
+                let rejection = inbox
+                    .not_accepted(&path.key.queue)
+                    .or_else(|| oversized(meta.size));
+                PassObject {
+                    key: path.key,
+                    meta,
+                    rejection,
+                }
+            })
+            .chain(unordered.into_iter().map(|(key, meta)| {
+                let rejection = inbox
+                    .not_accepted(&key.queue)
+                    .or(Some(Rejection::Unordered));
+                PassObject {
+                    key,
+                    meta,
+                    rejection,
+                }
+            }))
             .collect();
         for batch in objects.chunks(INBOX_BATCH) {
             self.inbox_batch(inbox, batch).await?;
@@ -496,11 +552,7 @@ impl QueueCore {
     /// the payloads of the jobs that they removed and the objects. An error at
     /// an object ends the batch after the flush and the deletes of the objects
     /// before it.
-    async fn inbox_batch(
-        &self,
-        inbox: &InboxState,
-        batch: &[(EntryKey, Path, Option<Rejection>)],
-    ) -> Result<()> {
+    async fn inbox_batch(&self, inbox: &InboxState, batch: &[PassObject]) -> Result<()> {
         let mut settled = Vec::new();
         let mut payload_refs = Vec::new();
         let applied = self
@@ -514,97 +566,78 @@ impl QueueCore {
         applied
     }
 
-    /// Settle the objects of `batch` in order, with the bodies of the next
-    /// [`INBOX_PREFETCH`] objects read during the application. The location of
-    /// each settled object goes to `settled`.
+    /// Settle the objects of `batch` in order, with up to [`INBOX_PREFETCH`]
+    /// objects and [`INBOX_PREFETCH_BYTES`] of their listed sizes read before
+    /// their application. The location of each settled object goes to
+    /// `settled`.
     async fn settle_batch(
         &self,
         inbox: &InboxState,
-        batch: &[(EntryKey, Path, Option<Rejection>)],
+        batch: &[PassObject],
         settled: &mut Vec<Path>,
         payload_refs: &mut Vec<String>,
     ) -> Result<()> {
-        // Collected, so that the stream does not contain the closure, whose
-        // borrow fails the `Send` bound of the pass task.
-        let reads: Vec<_> = batch
-            .iter()
-            .map(|(key, location, rejection)| async move {
-                match rejection {
-                    Some(_) => Ok(None),
-                    None => self.prefetch(inbox, key, location).await,
+        let mut reads = FuturesOrdered::new();
+        let (mut next, mut reading) = (0, 0);
+        for object in batch {
+            while let Some(ahead) = batch.get(next) {
+                let full = reads.len() >= INBOX_PREFETCH
+                    || reading + ahead.read_size() > INBOX_PREFETCH_BYTES;
+                if full && !reads.is_empty() {
+                    break;
                 }
-            })
-            .collect();
-        let mut reads = stream::iter(reads).buffered(INBOX_PREFETCH);
-        for (key, location, rejection) in batch {
+                reads.push_back(self.prefetch(inbox, ahead));
+                reading += ahead.read_size();
+                next += 1;
+            }
             let prefetched = reads.next().await.expect("one read per object")?;
-            self.settle_object(
-                inbox,
-                key,
-                location,
-                rejection.clone(),
-                prefetched,
-                payload_refs,
-            )
-            .await?;
-            settled.push(location.clone());
+            reading -= object.read_size();
+            self.settle_object(inbox, object, prefetched, payload_refs)
+                .await?;
+            settled.push(object.meta.location.clone());
         }
         Ok(())
     }
 
-    /// The read of the object of `key` at `location`, or `None` when its
-    /// application does not read the object: the queue is outside the
-    /// allow-list or the record exists.
-    async fn prefetch(
-        &self,
-        inbox: &InboxState,
-        key: &EntryKey,
-        location: &Path,
-    ) -> Result<Option<Read>> {
-        if !inbox.accepts(&key.queue)
-            || self
-                .db
-                .get(inbox_record_key(&key.queue, &key.id))
-                .await?
-                .is_some()
-        {
+    /// The read of `object` in `inbox`, or `None` when its application does not
+    /// read the object: the listing rejects it or its record exists.
+    async fn prefetch(&self, inbox: &InboxState, object: &PassObject) -> Result<Option<Read>> {
+        let EntryKey { id, queue, .. } = &object.key;
+        if object.rejection.is_some() || self.db.get(inbox_record_key(queue, id)).await?.is_some() {
             return Ok(None);
         }
-        inbox.read(location).await.map(Some)
+        inbox.read(&object.meta.location).await.map(Some)
     }
 
-    /// Apply the object of `key` at `location`, or reject it with `rejection`
-    /// without a read, and commit its record. `prefetched` is the read before
-    /// the application, and an object without it is read here. An object whose
+    /// Apply `object`, or reject it with the rejection of its listing without a
+    /// read, and commit its record. `prefetched` is the read before the
+    /// application, and an object without it is read here. An object whose
     /// record exists is settled without an effect, and an object deleted after
     /// the listing is skipped. The payload ref of a job that the application
     /// removed goes to `payload_refs`.
     async fn settle_object(
         &self,
         inbox: &InboxState,
-        key: &EntryKey,
-        location: &Path,
-        rejection: Option<Rejection>,
+        object: &PassObject,
         prefetched: Option<Read>,
         payload_refs: &mut Vec<String>,
     ) -> Result<()> {
-        let EntryKey { id, queue, kind } = key;
+        let EntryKey { id, queue, kind } = &object.key;
         if self.db.get(inbox_record_key(queue, id)).await?.is_some() {
             debug!(kind, id, "inbox entry already applied");
             return Ok(());
         }
         let record = InboxRecordHandle::new(queue.clone(), id.clone(), self.now_ms());
-        let decoded = if !inbox.accepts(queue) {
-            Err(Rejection::QueueNotAccepted)
-        } else if let Some(rejection) = rejection {
-            Err(rejection)
+        let decoded = if let Some(rejection) = &object.rejection {
+            Err(rejection.clone())
         } else {
             let read = match prefetched {
                 Some(read) => read,
-                None => inbox.read(location).await?,
+                None => inbox.read(&object.meta.location).await?,
             };
             match read {
                 Read::Body(body) => InboxEntry::decode(kind, &body),
+                Read::Rejected(rejection) => Err(rejection),
                 Read::Missing => {
                     debug!(kind, id, "inbox entry deleted after the listing; skipped");
                     return Ok(());

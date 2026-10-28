@@ -11,6 +11,10 @@ use crate::options::EnqueueOptions;
 /// Maximum byte length of an inbox entry id.
 pub const MAX_INBOX_ID_LEN: usize = 64;
 
+/// Maximum byte length of the object of an inbox entry. The writer rejects a
+/// larger entry with [`Rejection::TooLarge`] without reading it.
+pub const MAX_INBOX_ENTRY_SIZE: usize = 16 * 1024 * 1024;
+
 /// An entry of the inbox, of the kind of its variant. The path of an entry
 /// contains its queue and its kind, and the body contains the variant's entry
 /// as a MessagePack map with field names. A sender in another language writes

@@ -61,6 +61,12 @@ pub struct PendingEntry {
 /// must run the same minor version of the crate, because the format of an
 /// entry, as the layout of the store, changes between minor releases.
 ///
+/// The object of an entry must not exceed
+/// [`MAX_INBOX_ENTRY_SIZE`](crate::MAX_INBOX_ENTRY_SIZE) bytes, and the writer
+/// rejects a larger entry with
+/// [`Rejection::TooLarge`](crate::Rejection::TooLarge). Larger data belongs in
+/// an object of its own, whose key the payload contains.
+///
 /// The writer applies the entries of a listing in the order of their ULIDs and
 /// then by id. The ULIDs of every sender in a process increase with call order.
 /// Entries sent one after the other, each send awaited before the next, apply
