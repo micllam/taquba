@@ -64,21 +64,16 @@ impl EntryKind {
             other => Self::Unknown(other.to_string()),
         }
     }
-
-    /// The segment of the path.
-    pub(crate) fn segment(&self) -> &str {
-        match self {
-            Self::Enqueue => "enqueue",
-            Self::Cancel => "cancel",
-            Self::Signal => "signal",
-            Self::Unknown(segment) => segment,
-        }
-    }
 }
 
 impl std::fmt::Display for EntryKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.segment())
+        f.write_str(match self {
+            Self::Enqueue => "enqueue",
+            Self::Cancel => "cancel",
+            Self::Signal => "signal",
+            Self::Unknown(segment) => segment,
+        })
     }
 }
 

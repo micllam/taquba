@@ -567,10 +567,10 @@ impl QueueCore {
             Err(rejection) => self.commit_rejection(&record, rejection).await?,
         };
         if let InboxOutcome::Rejected(reason) = &outcome {
-            crate::obs::inbox_rejected(kind.segment());
+            crate::obs::inbox_rejected(kind);
             warn!(%kind, id, %reason, "inbox entry rejected");
         } else {
-            crate::obs::inbox_applied(kind.segment());
+            crate::obs::inbox_applied(kind);
             debug!(%kind, id, "inbox entry applied");
         }
         Ok(())

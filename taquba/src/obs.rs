@@ -25,7 +25,8 @@
 //!   failed. The metric is store-level, so it does not have a `queue` label.
 //! - `taquba_inbox_entries_applied_total{kind}` /
 //!   `taquba_inbox_entries_rejected_total{kind}`: inbox entries applied, and
-//!   entries rejected with a record of the reason.
+//!   entries rejected with a record of the reason. The label of an entry of an
+//!   unknown kind is `unknown`.
 //! - `taquba_inbox_pass_failures_total`: inbox passes that ended with an
 //!   error. Store-level, without a label.
 //! - `taquba_inbox_delete_failures_total`: deletes of applied inbox objects
@@ -46,6 +47,8 @@ mod imp {
     use slatedb_common::metrics::{
         CounterFn, GaugeFn, HistogramFn, MetricsRecorder, UpDownCounterFn,
     };
+
+    use crate::EntryKind;
 
     /// A start instant captured when metrics are enabled, threaded into the
     /// emitting call so it can record the operation's latency.
@@ -163,14 +166,23 @@ mod imp {
         metrics::counter!("taquba_heartbeat_failures_total").increment(1);
     }
 
-    pub(crate) fn inbox_applied(kind: &str) {
-        metrics::counter!("taquba_inbox_entries_applied_total", "kind" => kind.to_owned())
+    pub(crate) fn inbox_applied(kind: &EntryKind) {
+        metrics::counter!("taquba_inbox_entries_applied_total", "kind" => kind_label(kind))
             .increment(1);
     }
 
-    pub(crate) fn inbox_rejected(kind: &str) {
-        metrics::counter!("taquba_inbox_entries_rejected_total", "kind" => kind.to_owned())
+    pub(crate) fn inbox_rejected(kind: &EntryKind) {
+        metrics::counter!("taquba_inbox_entries_rejected_total", "kind" => kind_label(kind))
             .increment(1);
+    }
+
+    /// The `kind` label of `kind`: its path segment, or `unknown` for a kind
+    /// that the writer does not know.
+    fn kind_label(kind: &EntryKind) -> String {
+        match kind {
+            EntryKind::Unknown(_) => "unknown".to_owned(),
+            known => known.to_string(),
+        }
     }
 
     pub(crate) fn inbox_pass_failed() {
@@ -332,9 +344,9 @@ mod imp {
     #[inline]
     pub(crate) fn heartbeat_failed() {}
 
-    pub(crate) fn inbox_applied(_kind: &str) {}
+    pub(crate) fn inbox_applied(_kind: &crate::EntryKind) {}
 
-    pub(crate) fn inbox_rejected(_kind: &str) {}
+    pub(crate) fn inbox_rejected(_kind: &crate::EntryKind) {}
 
     pub(crate) fn inbox_pass_failed() {}
 
@@ -389,6 +401,41 @@ mod tests {
                 "expected metric {expected} was not emitted; got {emitted:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_entries_of_unknown_kinds_are_counted_under_one_label() {
+        use crate::EntryKind;
+        use metrics_util::debugging::DebugValue;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            super::inbox_rejected(&EntryKind::Unknown("enqeue".into()));
+            super::inbox_rejected(&EntryKind::Unknown("signl".into()));
+            super::inbox_rejected(&EntryKind::Cancel);
+        });
+
+        let mut counts: Vec<(String, u64)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(composite, _, _, value)| {
+                let kind = composite
+                    .key()
+                    .labels()
+                    .find(|label| label.key() == "kind")
+                    .expect("the counter is labelled by kind")
+                    .value()
+                    .to_string();
+                let DebugValue::Counter(n) = value else {
+                    panic!("{kind}: not a counter");
+                };
+                (kind, n)
+            })
+            .collect();
+        counts.sort();
+        assert_eq!(counts, [("cancel".into(), 1), ("unknown".into(), 2)]);
     }
 
     #[test]
