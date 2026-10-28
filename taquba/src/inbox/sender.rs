@@ -4,13 +4,15 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use slatedb::object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, path::Path};
+use slatedb::object_store::{ObjectStore, ObjectStoreExt, path::Path};
 use tracing::{debug, warn};
 use ulid::Ulid;
 
 use crate::error::{Error, Result};
 use crate::inbox::entry::{InboxEntry, validate_id};
-use crate::inbox::{EntryKey, EntryPath, entry_path, list_entries, queue_prefix, touch_path};
+use crate::inbox::listing::{PendingEntry, Read, entry_path, list_entries, read_object};
+use crate::inbox::record::Rejection;
+use crate::inbox::touch_path;
 use crate::keys::QueueName;
 use crate::ulids::MonotonicUlids;
 
@@ -30,16 +32,20 @@ const TOUCH_ATTEMPTS: u32 = 2;
 /// store throttles the writes to one object.
 const TOUCH_RETRY_DELAY: Duration = Duration::from_secs(1);
 
-/// An entry in the inbox, as [`InboxSender::pending`] lists it.
+/// The read of a [`PendingEntry`] by [`InboxSender::read`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingEntry {
-    /// The id of the entry.
-    pub id: String,
-    /// The entry, of the kind in its path.
-    pub entry: InboxEntry,
-    /// When the object store wrote the entry, as milliseconds from the Unix
-    /// epoch on the clock of the store.
-    pub sent_at_ms: u64,
+pub enum EntryRead {
+    /// The entry. The writer rejects it with [`Rejection::QueueNotAccepted`]
+    /// when its queue is outside
+    /// [`InboxOptions::queues`](crate::InboxOptions::queues), which the sender
+    /// does not know. A pass deletes the entry without an effect when the
+    /// record of its queue and id exists.
+    Entry(InboxEntry),
+    /// The object was deleted after the listing.
+    Missing,
+    /// The writer rejects the entry with this reason at the pass that reaches
+    /// it.
+    Rejected(Rejection),
 }
 
 /// A sender of inbox entries over the object store of an inbox. It writes one
@@ -63,8 +69,7 @@ pub struct PendingEntry {
 ///
 /// The object of an entry must not exceed
 /// [`MAX_INBOX_ENTRY_SIZE`](crate::MAX_INBOX_ENTRY_SIZE) bytes, and the writer
-/// rejects a larger entry with
-/// [`Rejection::TooLarge`](crate::Rejection::TooLarge). Larger data belongs in
+/// rejects a larger entry with [`Rejection::TooLarge`]. Larger data belongs in
 /// an object of its own, whose key the payload contains.
 ///
 /// The writer applies the entries of a listing in the order of their ULIDs and
@@ -129,7 +134,7 @@ impl InboxSender {
         QueueName::new(queue)?;
         validate_id(id)?;
         let body = entry.encode();
-        let path = Path::from(entry_path(&self.prefix, queue, entry.kind(), order, id));
+        let path = Path::from(entry_path(&self.prefix, queue, &entry.kind(), order, id));
         self.store
             .put(&path, body.into())
             .await
@@ -155,37 +160,32 @@ impl InboxSender {
         }
     }
 
-    /// The entries for `queue` in the inbox, of every kind, in the order of a
-    /// pass. The listing contains the entries of every sender and costs one
-    /// LIST request and one GET per entry. An entry whose record committed
-    /// before the deletion of its object is listed as well, and
+    /// The entries for `queue` in the inbox, of every kind and of every sender,
+    /// in the order of a pass, from a listing without a read of an entry. The
+    /// listing sends one LIST request per page of the store. It contains the
+    /// entries whose record committed before the deletion of their object, and
     /// [`QueueView::inbox_record`](crate::QueueView::inbox_record) reads the
-    /// record. The listing omits a malformed entry and an entry of an unknown
-    /// kind, which the writer rejects at the pass that reaches it.
+    /// record of an entry.
     pub async fn pending(&self, queue: &str) -> Result<Vec<PendingEntry>> {
         QueueName::new(queue)?;
-        let under = queue_prefix(&self.prefix, queue);
-        let listed = list_entries(&*self.store, &self.prefix, &under)
-            .await?
-            .entries;
-        let mut pending = Vec::with_capacity(listed.len());
-        for (EntryPath { key, .. }, object) in listed {
-            let EntryKey { id, kind, .. } = key;
-            let body = match self.store.get(&object.location).await {
-                Ok(result) => result.bytes().await.map_err(Error::InboxStore)?,
-                // Applied and deleted after the listing.
-                Err(ObjectStoreError::NotFound { .. }) => continue,
-                Err(err) => return Err(Error::InboxStore(err)),
-            };
-            match InboxEntry::decode(&kind, &body) {
-                Ok(entry) => pending.push(PendingEntry {
-                    id,
-                    entry,
-                    sent_at_ms: u64::try_from(object.last_modified.timestamp_millis()).unwrap_or(0),
-                }),
-                Err(reason) => debug!(id, %reason, "inbox entry does not decode; not listed"),
-            }
+        list_entries(&*self.store, &self.prefix, Some(queue)).await
+    }
+
+    /// Read and decode `entry`, with its size checked against
+    /// [`MAX_INBOX_ENTRY_SIZE`](crate::MAX_INBOX_ENTRY_SIZE) before its body.
+    /// An entry that the listing rejects is not read.
+    pub async fn read(&self, entry: &PendingEntry) -> Result<EntryRead> {
+        if let Some(rejection) = entry.listing_rejection() {
+            return Ok(EntryRead::Rejected(rejection));
         }
-        Ok(pending)
+        Ok(match read_object(&*self.store, entry.location()).await {
+            Read::Body(body) => match InboxEntry::decode(entry.kind(), &body) {
+                Ok(decoded) => EntryRead::Entry(decoded),
+                Err(rejection) => EntryRead::Rejected(rejection),
+            },
+            Read::Missing => EntryRead::Missing,
+            Read::Rejected(rejection) => EntryRead::Rejected(rejection),
+            Read::Failed(err) => return Err(Error::InboxStore(err)),
+        })
     }
 }

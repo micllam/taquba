@@ -504,10 +504,12 @@ pub use error::{Error, FormError, Result, StoreUrlError};
 pub use expiry::{Expired, ExpiryIndex};
 pub use history::{AttemptOutcome, JobAttempt};
 pub use inbox::entry::{
-    CancelEntry, EnqueueEntry, InboxEntry, MAX_INBOX_ENTRY_SIZE, MAX_INBOX_ID_LEN, SignalEntry,
+    CancelEntry, EnqueueEntry, EntryKind, InboxEntry, MAX_INBOX_ENTRY_SIZE, MAX_INBOX_ID_LEN,
+    SignalEntry,
 };
+pub use inbox::listing::PendingEntry;
 pub use inbox::record::{InboxOutcome, InboxRecord, Rejection};
-pub use inbox::sender::{InboxSender, PendingEntry};
+pub use inbox::sender::{EntryRead, InboxSender};
 pub use inbox::{
     DEFAULT_INBOX_INTERVAL, DEFAULT_INBOX_RECORD_RETENTION, DEFAULT_INBOX_TOUCH_POLL_INTERVAL,
     INBOX_UNREADABLE_AFTER, InboxOptions, default_inbox_path,

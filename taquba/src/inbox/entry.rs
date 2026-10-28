@@ -40,13 +40,55 @@ pub enum InboxEntry {
     Signal(SignalEntry),
 }
 
-impl InboxEntry {
-    /// The kind name in the path of the entry.
-    pub(crate) fn kind(&self) -> &'static str {
+/// The kind of an inbox entry, as the path of its object names it. The display
+/// form is the segment of the path.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EntryKind {
+    /// The kind `enqueue`.
+    Enqueue,
+    /// The kind `cancel`.
+    Cancel,
+    /// The kind `signal`.
+    Signal,
+    /// A kind that the writer does not know, with the segment of the path.
+    Unknown(String),
+}
+
+impl EntryKind {
+    /// The kind of the path segment `segment`.
+    pub(crate) fn of_segment(segment: &str) -> Self {
+        match segment {
+            "enqueue" => Self::Enqueue,
+            "cancel" => Self::Cancel,
+            "signal" => Self::Signal,
+            other => Self::Unknown(other.to_string()),
+        }
+    }
+
+    /// The segment of the path.
+    pub(crate) fn segment(&self) -> &str {
         match self {
-            Self::Enqueue(_) => "enqueue",
-            Self::Cancel(_) => "cancel",
-            Self::Signal(_) => "signal",
+            Self::Enqueue => "enqueue",
+            Self::Cancel => "cancel",
+            Self::Signal => "signal",
+            Self::Unknown(segment) => segment,
+        }
+    }
+}
+
+impl std::fmt::Display for EntryKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.segment())
+    }
+}
+
+impl InboxEntry {
+    /// The kind of the entry.
+    pub(crate) fn kind(&self) -> EntryKind {
+        match self {
+            Self::Enqueue(_) => EntryKind::Enqueue,
+            Self::Cancel(_) => EntryKind::Cancel,
+            Self::Signal(_) => EntryKind::Signal,
         }
     }
 
@@ -59,14 +101,14 @@ impl InboxEntry {
         }
     }
 
-    /// The entry of the kind name `kind` with `body`. Fails with the reason of
-    /// the rejection for another kind name or a body that does not decode.
-    pub(crate) fn decode(kind: &str, body: &[u8]) -> std::result::Result<Self, Rejection> {
+    /// The entry of `kind` with `body`. Fails with the reason of the rejection
+    /// for an unknown kind or a body that does not decode.
+    pub(crate) fn decode(kind: &EntryKind, body: &[u8]) -> std::result::Result<Self, Rejection> {
         let decoded = match kind {
-            "enqueue" => rmp_serde::from_slice(body).map(Self::Enqueue),
-            "cancel" => rmp_serde::from_slice(body).map(Self::Cancel),
-            "signal" => rmp_serde::from_slice(body).map(Self::Signal),
-            _ => return Err(Rejection::UnknownKind),
+            EntryKind::Enqueue => rmp_serde::from_slice(body).map(Self::Enqueue),
+            EntryKind::Cancel => rmp_serde::from_slice(body).map(Self::Cancel),
+            EntryKind::Signal => rmp_serde::from_slice(body).map(Self::Signal),
+            EntryKind::Unknown(_) => return Err(Rejection::UnknownKind),
         };
         decoded.map_err(|err| Rejection::Malformed {
             detail: err.to_string(),
@@ -176,7 +218,10 @@ mod tests {
         expected.extend(b"payload");
         expected.extend([0xc4, 3, 0, 255, 10]);
         assert_eq!(entry.encode(), expected);
-        assert_eq!(InboxEntry::decode("signal", &expected).unwrap(), entry);
+        assert_eq!(
+            InboxEntry::decode(&EntryKind::Signal, &expected).unwrap(),
+            entry
+        );
     }
 
     #[test]
@@ -193,7 +238,8 @@ mod tests {
             unknown: 1,
             options: HashMap::from([("priority", 2), ("unknown", 3)]),
         });
-        let InboxEntry::Enqueue(entry) = InboxEntry::decode("enqueue", &body).unwrap() else {
+        let InboxEntry::Enqueue(entry) = InboxEntry::decode(&EntryKind::Enqueue, &body).unwrap()
+        else {
             panic!("an enqueue entry");
         };
         assert_eq!(entry.options, EnqueueOptions::default().priority(2));
@@ -206,7 +252,7 @@ mod tests {
             payload: b"p".to_vec(),
         });
         assert_eq!(
-            InboxEntry::decode("enqueue", &bare).unwrap(),
+            InboxEntry::decode(&EntryKind::Enqueue, &bare).unwrap(),
             InboxEntry::Enqueue(EnqueueEntry::new(b"p"))
         );
     }
@@ -219,14 +265,15 @@ mod tests {
             options: EnqueueOptions::default().run_at(at),
         });
         assert_eq!(
-            InboxEntry::decode("enqueue", &entry.encode()).unwrap(),
+            InboxEntry::decode(&EntryKind::Enqueue, &entry.encode()).unwrap(),
             entry
         );
         let before = InboxEntry::Enqueue(EnqueueEntry {
             payload: Vec::new(),
             options: EnqueueOptions::default().run_at(UNIX_EPOCH - Duration::from_secs(1)),
         });
-        let InboxEntry::Enqueue(decoded) = InboxEntry::decode("enqueue", &before.encode()).unwrap()
+        let InboxEntry::Enqueue(decoded) =
+            InboxEntry::decode(&EntryKind::Enqueue, &before.encode()).unwrap()
         else {
             panic!("an enqueue entry");
         };

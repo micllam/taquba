@@ -1,12 +1,14 @@
 use slatedb::object_store::{ObjectStoreExt, PutPayload, path::Path};
+use ulid::Ulid;
 
 use super::*;
 use crate::error::{Error, FormError};
 use crate::inbox::entry::{
-    CancelEntry, EnqueueEntry, InboxEntry, MAX_INBOX_ENTRY_SIZE, SignalEntry,
+    CancelEntry, EnqueueEntry, EntryKind, InboxEntry, MAX_INBOX_ENTRY_SIZE, SignalEntry,
 };
+use crate::inbox::listing::entry_path;
 use crate::inbox::record::{InboxOutcome, Rejection};
-use crate::inbox::sender::InboxSender;
+use crate::inbox::sender::{EntryRead, InboxSender};
 use crate::queue::{CancelOutcome, ClaimOutcome, EnqueueResult, Queue, SignalOutcome};
 use crate::reader::QueueReader;
 use crate::test_util::*;
@@ -37,7 +39,8 @@ fn sender(store: &Arc<dyn ObjectStore>) -> InboxSender {
 
 /// Write `body` at the entry path of `queue`, `kind` and `id`.
 async fn put_raw(store: &Arc<dyn ObjectStore>, queue: &str, kind: &str, id: &str, body: &[u8]) {
-    let path = Path::from(entry_path("test-inbox", queue, kind, Ulid::new(), id));
+    let kind = EntryKind::of_segment(kind);
+    let path = Path::from(entry_path("test-inbox", queue, &kind, Ulid::new(), id));
     store
         .put(&path, PutPayload::from(body.to_vec()))
         .await
@@ -578,89 +581,123 @@ async fn a_send_and_a_listing_refuse_an_invalid_queue_name() {
 }
 
 #[tokio::test]
-async fn the_pending_entries_of_a_queue_are_listed_in_send_order_until_their_pass() {
-    let store = make_store();
+async fn the_pending_entries_of_a_queue_are_listed_in_pass_order_without_a_read() {
+    let faults = FaultStore::wrap();
+    let store: Arc<dyn ObjectStore> = faults.clone();
     let q = open(&store, &MockClock::new(INITIAL)).await;
-    let job_a = q.enqueue("work", b"a".to_vec()).await.unwrap();
-    let job_b = q.enqueue("work", b"b".to_vec()).await.unwrap();
     let sender = sender(&store);
-    for (id, job_id) in [("b", job_b.as_str()), ("a", job_a.as_str())] {
-        sender
-            .send_with_id(
-                WORK,
-                id,
-                CancelEntry {
-                    job_id: job_id.to_string(),
-                },
-            )
-            .await
-            .unwrap();
-    }
+    let enqueue = EnqueueEntry::new(b"x");
     sender
-        .send_with_id(WAITS, "w", CancelEntry { job_id: "w".into() })
+        .send_with_id(WORK, "b-entry", enqueue.clone())
         .await
         .unwrap();
     sender
-        .send_with_id(WORK, "c", EnqueueEntry::new(b"x"))
+        .send_with_id(WORK, "a-entry", CancelEntry { job_id: "j".into() })
         .await
         .unwrap();
-    put_raw(&store, WORK, "cancel", "bad", &map_body("job", 1)).await;
-    let no_order = InboxEntry::from(CancelEntry {
-        job_id: job_a.clone(),
-    });
+    sender
+        .send_with_id(WAITS, "w-entry", enqueue.clone())
+        .await
+        .unwrap();
     store
         .put(
-            &Path::from("test-inbox/v1/work/cancel/no-order"),
-            no_order.encode().into(),
+            &Path::from("test-inbox/v1/work/enqueue/c-entry"),
+            PutPayload::from(b"x".to_vec()),
         )
         .await
         .unwrap();
 
+    faults.fail_reads_ending(Some("-entry"));
     let pending = sender.pending(WORK).await.unwrap();
-    let listed: Vec<(&str, &InboxEntry)> =
-        pending.iter().map(|p| (p.id.as_str(), &p.entry)).collect();
-    let cancel = |job_id: &str| {
-        InboxEntry::Cancel(CancelEntry {
-            job_id: job_id.to_string(),
-        })
-    };
+    faults.fail_reads_ending(None);
+    let listed: Vec<_> = pending
+        .iter()
+        .map(|p| (p.queue().as_str(), p.id(), p.kind(), p.size()))
+        .collect();
+    let enqueue_size = InboxEntry::from(enqueue.clone()).encode().len() as u64;
+    let cancel_size = InboxEntry::from(CancelEntry { job_id: "j".into() })
+        .encode()
+        .len() as u64;
     assert_eq!(
         listed,
         [
-            ("b", &cancel(&job_b)),
-            ("a", &cancel(&job_a)),
-            ("c", &InboxEntry::Enqueue(EnqueueEntry::new(b"x"))),
+            (WORK, "b-entry", &EntryKind::Enqueue, enqueue_size),
+            (WORK, "a-entry", &EntryKind::Cancel, cancel_size),
+            (WORK, "c-entry", &EntryKind::Enqueue, 1),
         ]
     );
     let written = store
-        .list_with_delimiter(Some(&Path::from("test-inbox/v1/work/cancel")))
+        .list_with_delimiter(Some(&Path::from("test-inbox/v1/work/enqueue")))
         .await
         .unwrap()
         .objects
         .into_iter()
-        .find(|object| object.location.as_ref().ends_with(".b"))
+        .find(|object| object.location.as_ref().ends_with(".b-entry"))
         .unwrap()
         .last_modified;
-    assert_eq!(pending[0].sent_at_ms as i64, written.timestamp_millis());
+    assert_eq!(pending[0].sent_at_ms() as i64, written.timestamp_millis());
 
-    // The pass deletes the applied entries, and an entry sent again with the id
+    // The pass deletes the settled entries, and an entry sent again with the id
     // of an applied one is listed until the next pass deletes it.
     q.apply_inbox_now().await.unwrap();
     assert!(sender.pending(WORK).await.unwrap().is_empty());
+    sender.send_with_id(WORK, "b-entry", enqueue).await.unwrap();
+    assert_eq!(sender.pending(WORK).await.unwrap().len(), 1);
+    assert!(
+        q.view()
+            .inbox_record(WORK, "b-entry")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    q.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_read_of_a_pending_entry_decodes_it_or_states_its_rejection() {
+    let store = make_store();
+    let sender = sender(&store);
     sender
-        .send_with_id(
-            WORK,
-            "a",
-            CancelEntry {
-                job_id: job_a.clone(),
-            },
+        .send_with_id(WORK, "entry", EnqueueEntry::new(b"x"))
+        .await
+        .unwrap();
+    sender
+        .send_with_id(WORK, "deleted", EnqueueEntry::new(b"x"))
+        .await
+        .unwrap();
+    put_raw(&store, WORK, "cancel", "malformed", &map_body("job", 1)).await;
+    put_raw(&store, WORK, "unknown", "unknown", b"x").await;
+    store
+        .put(
+            &Path::from("test-inbox/v1/work/enqueue/unordered"),
+            PutPayload::from(b"x".to_vec()),
         )
         .await
         .unwrap();
-    let again = sender.pending(WORK).await.unwrap();
-    assert_eq!(again.len(), 1);
-    assert!(q.view().inbox_record(WORK, "a").await.unwrap().is_some());
-    q.close().await.unwrap();
+    let pending = sender.pending(WORK).await.unwrap();
+    let entry = |id: &str| pending.iter().find(|entry| entry.id() == id).unwrap();
+    store.delete(entry("deleted").location()).await.unwrap();
+
+    assert_eq!(
+        sender.read(entry("entry")).await.unwrap(),
+        EntryRead::Entry(InboxEntry::Enqueue(EnqueueEntry::new(b"x")))
+    );
+    assert_eq!(
+        sender.read(entry("deleted")).await.unwrap(),
+        EntryRead::Missing
+    );
+    assert!(matches!(
+        sender.read(entry("malformed")).await.unwrap(),
+        EntryRead::Rejected(Rejection::Malformed { .. })
+    ));
+    assert_eq!(
+        sender.read(entry("unknown")).await.unwrap(),
+        EntryRead::Rejected(Rejection::UnknownKind)
+    );
+    assert_eq!(
+        sender.read(entry("unordered")).await.unwrap(),
+        EntryRead::Rejected(Rejection::Unordered)
+    );
 }
 
 #[tokio::test]
@@ -975,7 +1012,6 @@ async fn an_entry_above_the_size_bound_is_rejected_without_a_read() {
 #[tokio::test]
 async fn a_read_rejects_an_object_above_the_size_bound_before_its_body() {
     let store = make_store();
-    let inbox = InboxState::new(InboxOptions::new(["work"]), &store, "test").unwrap();
     let location = Path::from("test-inbox/v1/work/enqueue/big");
     let size = MAX_INBOX_ENTRY_SIZE + 1;
     store
@@ -983,7 +1019,7 @@ async fn a_read_rejects_an_object_above_the_size_bound_before_its_body() {
         .await
         .unwrap();
 
-    let read = inbox.read(&location).await;
+    let read = read_object(&*store, &location).await;
     assert!(matches!(
         read,
         Read::Rejected(Rejection::TooLarge { size: read_size }) if read_size == size as u64

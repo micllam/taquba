@@ -23,7 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `InboxSender` writes an `InboxEntry` as a MessagePack body of at most
   `MAX_INBOX_ENTRY_SIZE` bytes: an `EnqueueEntry`, a `CancelEntry` or a
   `SignalEntry`. `InboxSender::pending` lists the entries of a queue that are
-  awaiting a pass.
+  awaiting a pass, with their `EntryKind` and size, without a read of an entry.
+  `InboxSender::read` reads one listed entry as an `EntryRead`: the entry, an
+  entry deleted after the listing or the `Rejection` that a pass would commit.
 - `QueueView::inbox_record` reads the `InboxRecord` of an applied entry, with
   its `InboxOutcome`: the outcome of its operation or the `Rejection` that
   states the reason of its rejection. `EnqueueResult`, `CancelOutcome`,

@@ -48,6 +48,7 @@
 
 pub(crate) mod apply;
 pub(crate) mod entry;
+pub(crate) mod listing;
 pub(crate) mod record;
 pub(crate) mod sender;
 
@@ -55,18 +56,18 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use futures_util::stream::FuturesOrdered;
-use futures_util::{StreamExt, TryStreamExt};
 use slatedb::object_store::{
     Error as ObjectStoreError, ObjectMeta, ObjectStore, ObjectStoreExt, path::Path,
 };
 use tokio::time::Instant;
 use tracing::{debug, warn};
-use ulid::Ulid;
 
 use crate::background::Periodic;
 use crate::error::{Error, Result};
-use crate::inbox::entry::{InboxEntry, MAX_INBOX_ENTRY_SIZE, validate_id};
+use crate::inbox::entry::{InboxEntry, MAX_INBOX_ENTRY_SIZE};
+use crate::inbox::listing::{PendingEntry, Read, list_entries, read_object};
 use crate::inbox::record::{InboxOutcome, InboxRecordHandle, Rejection};
 use crate::keys::{KeyTag, QueueName, inbox_failure_key, inbox_record_key, tag_prefix};
 use crate::objects::delete_objects;
@@ -81,8 +82,9 @@ const INBOX_BATCH: usize = 1_000;
 /// The objects whose bodies a pass reads before their application.
 const INBOX_PREFETCH: usize = 16;
 
-/// The listed bytes of the objects that a pass reads before their application.
-/// An object of this size is read alone.
+/// The listed bytes of the entries that a pass reads before their application,
+/// counted for the entries that the pass settles without a read as well. An
+/// entry of this size is read alone.
 const INBOX_PREFETCH_BYTES: u64 = MAX_INBOX_ENTRY_SIZE as u64;
 
 /// Default value of [`InboxOptions::interval`].
@@ -258,25 +260,13 @@ impl InboxState {
         self.queues.contains(queue)
     }
 
-    /// The rejection of an entry of `queue` outside the allow-list.
-    fn not_accepted(&self, queue: &str) -> Option<Rejection> {
-        (!self.accepts(queue)).then_some(Rejection::QueueNotAccepted)
-    }
-
-    /// Read the object at `location`, with the size of the read checked against
-    /// [`MAX_INBOX_ENTRY_SIZE`] before its body.
-    async fn read(&self, location: &Path) -> Read {
-        let result = match self.store.get(location).await {
-            Ok(result) => result,
-            Err(ObjectStoreError::NotFound { .. }) => return Read::Missing,
-            Err(err) => return Read::Failed(err),
-        };
-        if let Some(rejection) = oversized(result.meta.size) {
-            return Read::Rejected(rejection);
-        }
-        match result.bytes().await {
-            Ok(body) => Read::Body(body.to_vec()),
-            Err(err) => Read::Failed(err),
+    /// The rejection of `entry` without a read: a queue outside the allow-list,
+    /// else the rejection of the listing.
+    fn rejection(&self, entry: &PendingEntry) -> Option<Rejection> {
+        if self.accepts(entry.queue()) {
+            entry.listing_rejection()
+        } else {
+            Some(Rejection::QueueNotAccepted)
         }
     }
 
@@ -302,142 +292,9 @@ impl InboxState {
     }
 }
 
-/// The read of an entry object.
-enum Read {
-    Body(Vec<u8>),
-    /// The object was deleted after the listing.
-    Missing,
-    /// The read rejects the entry without its body.
-    Rejected(Rejection),
-    /// The store failed the read.
-    Failed(ObjectStoreError),
-}
-
-/// An object of a pass: the key of its path, its metadata from the listing and
-/// the rejection that the listing decides.
-struct PassObject {
-    key: EntryKey,
-    meta: ObjectMeta,
-    rejection: Option<Rejection>,
-}
-
-impl PassObject {
-    /// The bytes of a read of the object, by the size of the listing.
-    fn read_size(&self) -> u64 {
-        if self.rejection.is_some() {
-            0
-        } else {
-            self.meta.size
-        }
-    }
-}
-
-/// The rejection of an object of `size` bytes above [`MAX_INBOX_ENTRY_SIZE`].
-fn oversized(size: u64) -> Option<Rejection> {
-    (size > MAX_INBOX_ENTRY_SIZE as u64).then_some(Rejection::TooLarge { size })
-}
-
-/// The prefix of the entries of `queue` in the inbox at `prefix`.
-pub(crate) fn queue_prefix(prefix: &str, queue: &str) -> String {
-    format!("{}/{queue}", version_prefix(prefix))
-}
-
-/// The prefix of the entries of the layout version in the inbox at `prefix`.
-fn version_prefix(prefix: &str) -> String {
-    format!("{prefix}/v1")
-}
-
-/// The path of the entry `id` of `kind` and `queue`, sent at `order`, in the
-/// inbox at `prefix`.
-pub(crate) fn entry_path(prefix: &str, queue: &str, kind: &str, order: Ulid, id: &str) -> String {
-    format!("{}/{kind}/{order}.{id}", queue_prefix(prefix, queue))
-}
-
 /// The path of the touch object of the inbox at `prefix`.
 pub(crate) fn touch_path(prefix: &str) -> String {
     format!("{prefix}/touch")
-}
-
-/// The queue, kind and id of an entry path, ordered by id and then by queue and
-/// kind.
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct EntryKey {
-    pub(crate) id: String,
-    pub(crate) queue: QueueName,
-    pub(crate) kind: String,
-}
-
-/// The segments of an entry path within the version prefix, ordered by order
-/// and then by key.
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct EntryPath {
-    pub(crate) order: Ulid,
-    pub(crate) key: EntryKey,
-}
-
-/// A path within the layout.
-enum ParsedPath {
-    Entry(EntryPath),
-    /// An object name without a ULID before the id.
-    Unordered(EntryKey),
-}
-
-impl ParsedPath {
-    /// The path `relative` to the version prefix, or `None` for a path outside
-    /// the layout.
-    fn parse(relative: &str) -> Option<Self> {
-        let mut segments = relative.split('/');
-        let (queue, kind, name) = (segments.next()?, segments.next()?, segments.next()?);
-        let (order, id) = match name.split_once('.') {
-            Some((order, id)) => (Ulid::from_string(order).ok(), id),
-            None => (None, name),
-        };
-        if segments.next().is_some() || kind.is_empty() || validate_id(id).is_err() {
-            return None;
-        }
-        let key = EntryKey {
-            id: id.to_string(),
-            queue: QueueName::new(queue).ok()?,
-            kind: kind.to_string(),
-        };
-        Some(match order {
-            Some(order) => Self::Entry(EntryPath { order, key }),
-            None => Self::Unordered(key),
-        })
-    }
-}
-
-/// The objects of a listing within the layout.
-pub(crate) struct Listing {
-    /// The entries in the order of [`EntryPath`].
-    pub(crate) entries: Vec<(EntryPath, ObjectMeta)>,
-    /// The objects with a name without a ULID before the id.
-    pub(crate) unordered: Vec<(EntryKey, ObjectMeta)>,
-}
-
-/// The objects within `under` in the inbox at `prefix` of `store`. A path
-/// outside the layout is logged and left in place.
-pub(crate) async fn list_entries(
-    store: &dyn ObjectStore,
-    prefix: &str,
-    under: &str,
-) -> Result<Listing> {
-    let version = format!("{}/", version_prefix(prefix));
-    let mut objects = store.list(Some(&Path::from(under)));
-    let mut listing = Listing {
-        entries: Vec::new(),
-        unordered: Vec::new(),
-    };
-    while let Some(object) = objects.try_next().await.map_err(Error::InboxStore)? {
-        let path = object.location.as_ref().strip_prefix(version.as_str());
-        match path.and_then(ParsedPath::parse) {
-            Some(ParsedPath::Entry(path)) => listing.entries.push((path, object)),
-            Some(ParsedPath::Unordered(key)) => listing.unordered.push((key, object)),
-            None => warn!(path = %object.location, "object outside the inbox layout; skipped"),
-        }
-    }
-    listing.entries.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(listing)
 }
 
 /// The pass task of the inbox. A tick sends a HEAD for the touch object, and a
@@ -532,32 +389,8 @@ impl QueueCore {
     }
 
     async fn inbox_pass_over(&self, inbox: &InboxState) -> Result<()> {
-        let Listing { entries, unordered } =
-            list_entries(&*inbox.store, &inbox.prefix, &version_prefix(&inbox.prefix)).await?;
-        let objects: Vec<_> = entries
-            .into_iter()
-            .map(|(path, meta)| {
-                let rejection = inbox
-                    .not_accepted(&path.key.queue)
-                    .or_else(|| oversized(meta.size));
-                PassObject {
-                    key: path.key,
-                    meta,
-                    rejection,
-                }
-            })
-            .chain(unordered.into_iter().map(|(key, meta)| {
-                let rejection = inbox
-                    .not_accepted(&key.queue)
-                    .or(Some(Rejection::Unordered));
-                PassObject {
-                    key,
-                    meta,
-                    rejection,
-                }
-            }))
-            .collect();
-        for batch in objects.chunks(INBOX_BATCH) {
+        let entries = list_entries(&*inbox.store, &inbox.prefix, None).await?;
+        for batch in entries.chunks(INBOX_BATCH) {
             self.inbox_batch(inbox, batch).await?;
         }
         self.clear_inbox_failures().await
@@ -622,11 +455,11 @@ impl QueueCore {
         )
     }
 
-    /// Settle the objects of `batch`, then flush their commits once and delete
-    /// the payloads of the jobs that they removed and the objects. An error at
-    /// an object ends the batch after the flush and the deletes of the objects
-    /// before it.
-    async fn inbox_batch(&self, inbox: &InboxState, batch: &[PassObject]) -> Result<()> {
+    /// Settle the entries of `batch`, then flush their commits once and delete
+    /// the payloads of the jobs that they removed and their objects. An error
+    /// at an entry ends the batch after the flush and the deletes of the
+    /// entries before it.
+    async fn inbox_batch(&self, inbox: &InboxState, batch: &[PendingEntry]) -> Result<()> {
         let mut settled = Vec::new();
         let mut payload_refs = Vec::new();
         let applied = self
@@ -640,80 +473,84 @@ impl QueueCore {
         applied
     }
 
-    /// Settle the objects of `batch` in order, with up to [`INBOX_PREFETCH`]
-    /// objects and [`INBOX_PREFETCH_BYTES`] of their listed sizes read before
-    /// their application. The location of each settled object goes to
-    /// `settled`.
+    /// Settle the entries of `batch` in order, with up to [`INBOX_PREFETCH`]
+    /// entries and [`INBOX_PREFETCH_BYTES`] of their listed sizes read before
+    /// their application. The location of each settled entry goes to `settled`.
     async fn settle_batch(
         &self,
         inbox: &InboxState,
-        batch: &[PassObject],
+        batch: &[PendingEntry],
         settled: &mut Vec<Path>,
         payload_refs: &mut Vec<String>,
     ) -> Result<()> {
         let mut reads = FuturesOrdered::new();
         let (mut next, mut reading) = (0, 0);
-        for object in batch {
+        for entry in batch {
             while let Some(ahead) = batch.get(next) {
-                let full = reads.len() >= INBOX_PREFETCH
-                    || reading + ahead.read_size() > INBOX_PREFETCH_BYTES;
+                let full =
+                    reads.len() >= INBOX_PREFETCH || reading + ahead.size() > INBOX_PREFETCH_BYTES;
                 if full && !reads.is_empty() {
                     break;
                 }
                 reads.push_back(self.prefetch(inbox, ahead));
-                reading += ahead.read_size();
+                reading += ahead.size();
                 next += 1;
             }
-            let prefetched = reads.next().await.expect("one read per object")?;
-            reading -= object.read_size();
-            self.settle_object(inbox, object, prefetched, payload_refs)
+            let prefetched = reads.next().await.expect("one read per entry")?;
+            reading -= entry.size();
+            self.settle_entry(inbox, entry, prefetched, payload_refs)
                 .await?;
-            settled.push(object.meta.location.clone());
+            settled.push(entry.location().clone());
         }
         Ok(())
     }
 
-    /// The read of `object` in `inbox`, or `None` when its application does not
-    /// read the object: the listing rejects it or its record exists.
-    async fn prefetch(&self, inbox: &InboxState, object: &PassObject) -> Result<Option<Read>> {
-        let EntryKey { id, queue, .. } = &object.key;
-        if object.rejection.is_some() || self.db.get(inbox_record_key(queue, id)).await?.is_some() {
+    /// The read of `entry` in `inbox`, or `None` when its application does not
+    /// read the entry: the pass rejects it without a read or its record exists.
+    async fn prefetch(&self, inbox: &InboxState, entry: &PendingEntry) -> Result<Option<Read>> {
+        if inbox.rejection(entry).is_some()
+            || self
+                .db
+                .get(inbox_record_key(entry.queue(), entry.id()))
+                .await?
+                .is_some()
+        {
             return Ok(None);
         }
-        Ok(Some(inbox.read(&object.meta.location).await))
+        Ok(Some(read_object(&*inbox.store, entry.location()).await))
     }
 
-    /// Apply `object`, or reject it with the rejection of its listing without a
-    /// read, and commit its record. `prefetched` is the read before the
-    /// application, and an object without it is read here. An object whose
-    /// record exists is settled without an effect, and an object deleted after
-    /// the listing is skipped. The payload ref of a job that the application
-    /// removed goes to `payload_refs`.
-    async fn settle_object(
+    /// Apply or reject `entry` and commit its record. `prefetched` is the read
+    /// before the application, and an entry without it is read here unless the
+    /// pass rejects it without a read. An entry whose record exists is settled
+    /// without an effect, and an entry deleted after the listing is skipped.
+    /// The payload ref of a job that the application removed goes to
+    /// `payload_refs`.
+    async fn settle_entry(
         &self,
         inbox: &InboxState,
-        object: &PassObject,
+        entry: &PendingEntry,
         prefetched: Option<Read>,
         payload_refs: &mut Vec<String>,
     ) -> Result<()> {
-        let EntryKey { id, queue, kind } = &object.key;
+        let (queue, id, kind) = (entry.queue(), entry.id(), entry.kind());
         if self.db.get(inbox_record_key(queue, id)).await?.is_some() {
-            debug!(kind, id, "inbox entry already applied");
+            debug!(%kind, id, "inbox entry already applied");
             return Ok(());
         }
-        let record = InboxRecordHandle::new(queue.clone(), id.clone(), self.now_ms());
-        let decoded = if let Some(rejection) = &object.rejection {
-            Err(rejection.clone())
+        let record = InboxRecordHandle::new(queue.clone(), id.to_string(), self.now_ms());
+        let decoded = if let Some(rejection) = inbox.rejection(entry) {
+            Err(rejection)
         } else {
             let read = match prefetched {
                 Some(read) => read,
-                None => inbox.read(&object.meta.location).await,
+                None => read_object(&*inbox.store, entry.location()).await,
             };
             match read {
                 Read::Body(body) => InboxEntry::decode(kind, &body),
                 Read::Rejected(rejection) => Err(rejection),
                 Read::Missing => {
-                    debug!(kind, id, "inbox entry deleted after the listing; skipped");
+                    debug!(%kind, id, "inbox entry deleted after the listing; skipped");
                     return Ok(());
                 }
                 Read::Failed(err) => match self.unreadable(queue, id, &err).await? {
@@ -723,18 +560,18 @@ impl QueueCore {
             }
         };
         let outcome = match decoded {
-            Ok(entry) => {
-                self.apply_entry(queue, &record, entry, payload_refs)
+            Ok(inbox_entry) => {
+                self.apply_entry(queue, &record, inbox_entry, payload_refs)
                     .await?
             }
             Err(rejection) => self.commit_rejection(&record, rejection).await?,
         };
         if let InboxOutcome::Rejected(reason) = &outcome {
-            crate::obs::inbox_rejected(kind);
-            warn!(kind, id, %reason, "inbox entry rejected");
+            crate::obs::inbox_rejected(kind.segment());
+            warn!(%kind, id, %reason, "inbox entry rejected");
         } else {
-            crate::obs::inbox_applied(kind);
-            debug!(kind, id, "inbox entry applied");
+            crate::obs::inbox_applied(kind.segment());
+            debug!(%kind, id, "inbox entry applied");
         }
         Ok(())
     }
