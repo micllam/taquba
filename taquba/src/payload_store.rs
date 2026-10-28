@@ -14,12 +14,12 @@
 
 use std::sync::Arc;
 
-use futures_util::{StreamExt, stream};
 use slatedb::object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, path::Path};
 use ulid::Ulid;
 
 use crate::error::{Error, Result};
 use crate::job::JobRecord;
+use crate::objects::delete_objects;
 
 /// Storage for offloaded payload objects within a dedicated prefix.
 ///
@@ -157,19 +157,15 @@ impl PayloadStore {
     }
 
     /// Delete the objects of `payload_refs` through the bulk delete of the
-    /// object store, and log each failure. The caller must make the removals of
-    /// their records durable first.
+    /// object store, and log one warning for the failed deletes. The caller
+    /// must make the removals of their records durable first.
     pub(crate) async fn delete_all(&self, payload_refs: Vec<String>) {
-        let paths: Vec<_> = payload_refs
+        let paths = payload_refs
             .iter()
-            .map(|payload_ref| Ok(self.object_path(payload_ref)))
+            .map(|payload_ref| self.object_path(payload_ref))
             .collect();
-        let mut deleted = self.store.delete_stream(stream::iter(paths).boxed());
-        while let Some(result) = deleted.next().await {
-            match result {
-                Ok(_) | Err(ObjectStoreError::NotFound { .. }) => {}
-                Err(err) => tracing::warn!("failed to delete payload object: {err}"),
-            }
+        if let Some((failed, err)) = delete_objects(&*self.store, paths).await {
+            tracing::warn!(failed, %err, "failed to delete payload objects");
         }
     }
 }

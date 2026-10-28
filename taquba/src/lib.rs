@@ -475,6 +475,7 @@ mod lease_registry;
 mod liveness;
 #[cfg(feature = "metrics")]
 mod metrics_sampler;
+mod objects;
 mod obs;
 mod options;
 mod payload_store;

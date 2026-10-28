@@ -914,13 +914,47 @@ async fn a_pass_that_fails_at_the_store_runs_again_at_the_next_poll() {
     };
     let q = Queue::open_with_options(store, "test", opts).await.unwrap();
 
-    // The pass after the touch applies the entry and fails at its delete.
-    faults.fail_deletes(true);
+    // The pass after the touch fails at the read of the entry.
+    faults.fail_reads_ending(Some(".a"));
     sender(&inbox_store)
         .send_with_id(WORK, "a", EnqueueEntry::new(b"x"))
         .await
         .unwrap();
     tokio::time::sleep(DEFAULT_INBOX_TOUCH_POLL_INTERVAL * 2).await;
+    assert!(q.view().inbox_record(WORK, "a").await.unwrap().is_none());
+
+    faults.fail_reads_ending(None);
+    tokio::time::sleep(DEFAULT_INBOX_TOUCH_POLL_INTERVAL * 2).await;
+    assert!(q.view().inbox_record(WORK, "a").await.unwrap().is_some());
+    assert_eq!(
+        object_count(&inbox_store, "test-inbox/v1/work/enqueue").await,
+        0
+    );
+    q.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_delete_leaves_the_object_to_a_later_pass() {
+    let faults = FaultStore::wrap();
+    let inbox_store: Arc<dyn ObjectStore> = faults.clone();
+    let opts = OpenOptions {
+        inbox: Some(
+            InboxOptions::new(["work"])
+                .object_store(inbox_store.clone())
+                .touch_poll_interval(None),
+        ),
+        ..inbox_opts(&MockClock::new(INITIAL))
+    };
+    let q = Queue::open_with_options(make_store(), "test", opts)
+        .await
+        .unwrap();
+    sender(&inbox_store)
+        .send_with_id(WORK, "a", EnqueueEntry::new(b"x"))
+        .await
+        .unwrap();
+
+    faults.fail_deletes(true);
+    q.apply_inbox_now().await.unwrap();
     assert!(q.view().inbox_record(WORK, "a").await.unwrap().is_some());
     assert_eq!(
         object_count(&inbox_store, "test-inbox/v1/work/enqueue").await,
@@ -928,11 +962,59 @@ async fn a_pass_that_fails_at_the_store_runs_again_at_the_next_poll() {
     );
 
     faults.fail_deletes(false);
-    tokio::time::sleep(DEFAULT_INBOX_TOUCH_POLL_INTERVAL * 2).await;
+    q.apply_inbox_now().await.unwrap();
     assert_eq!(
         object_count(&inbox_store, "test-inbox/v1/work/enqueue").await,
         0
     );
+    assert_eq!(q.view().stats("work").await.unwrap().pending, 1);
+    q.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_entry_whose_object_is_missing_at_its_read_is_skipped() {
+    let faults = FaultStore::wrap();
+    let inbox_store: Arc<dyn ObjectStore> = faults.clone();
+    let opts = OpenOptions {
+        inbox: Some(
+            InboxOptions::new(["work"])
+                .object_store(inbox_store.clone())
+                .touch_poll_interval(None),
+        ),
+        ..inbox_opts(&MockClock::new(INITIAL))
+    };
+    let q = Queue::open_with_options(make_store(), "test", opts)
+        .await
+        .unwrap();
+    let sender = sender(&inbox_store);
+    for id in ["a", "b"] {
+        sender
+            .send_with_id(WORK, id, EnqueueEntry::new(id.as_bytes()))
+            .await
+            .unwrap();
+    }
+
+    // The listing of the pass contains both objects, and the object of `a` is
+    // deleted while the listing is held.
+    faults.hold_next_list();
+    let (passed, ()) = tokio::join!(q.apply_inbox_now(), async {
+        let listed = inbox_store
+            .list_with_delimiter(Some(&Path::from("test-inbox/v1/work/enqueue")))
+            .await
+            .unwrap();
+        let a = listed
+            .objects
+            .iter()
+            .find(|object| object.location.as_ref().ends_with(".a"))
+            .unwrap();
+        inbox_store.delete(&a.location).await.unwrap();
+        faults.release_list();
+    });
+    passed.unwrap();
+    assert!(q.view().inbox_record(WORK, "a").await.unwrap().is_none());
+    assert!(q.view().inbox_record(WORK, "b").await.unwrap().is_some());
+    let job = q.claim("work", LEASE).await.unwrap().unwrap();
+    assert_eq!(job.payload, b"b");
     q.close().await.unwrap();
 }
 

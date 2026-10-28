@@ -32,8 +32,10 @@
 //! object before the listing, so an entry written during a listing changes the
 //! touch object for the next poll.
 //!
-//! Any other error ends a pass at its entry, after the flush and the deletes of
-//! the entries before it in its batch. The next pass starts again at the first
+//! A pass skips an entry whose object is missing at its read. A failed delete
+//! of an object is logged and counted, and a later pass deletes the object. Any
+//! other error ends a pass at its entry, after the flush and the deletes of the
+//! entries before it in its batch. The next pass starts again at the first
 //! entry without a record. After a pass that ends at an error, the writer runs
 //! a pass at the next poll.
 
@@ -59,6 +61,7 @@ use crate::error::{Error, Result};
 use crate::inbox::entry::{InboxEntry, validate_id};
 use crate::inbox::record::{InboxOutcome, InboxRecordHandle, Rejection};
 use crate::keys::{QueueName, inbox_record_key};
+use crate::objects::delete_objects;
 use crate::queue_core::QueueCore;
 use crate::time_bound::TimeBound;
 
@@ -237,9 +240,15 @@ impl InboxState {
         self.queues.contains(queue)
     }
 
-    async fn get(&self, location: &Path) -> Result<Vec<u8>> {
-        let result = self.store.get(location).await.map_err(Error::InboxStore)?;
-        Ok(result.bytes().await.map_err(Error::InboxStore)?.to_vec())
+    /// Read the object at `location`.
+    async fn read(&self, location: &Path) -> Result<Read> {
+        match self.store.get(location).await {
+            Ok(result) => Ok(Read::Body(
+                result.bytes().await.map_err(Error::InboxStore)?.to_vec(),
+            )),
+            Err(ObjectStoreError::NotFound { .. }) => Ok(Read::Missing),
+            Err(err) => Err(Error::InboxStore(err)),
+        }
     }
 
     /// The metadata of the touch object, or `None` before the first touch.
@@ -252,23 +261,23 @@ impl InboxState {
         }
     }
 
-    /// Delete the objects at `locations` through the bulk delete of the store.
-    /// A missing object counts as deleted. Every delete runs, and the first
-    /// other error returns.
-    async fn delete_all(&self, locations: Vec<Path>) -> Result<()> {
-        let locations = stream::iter(locations.into_iter().map(Ok)).boxed();
-        let mut deleted = self.store.delete_stream(locations);
-        let mut failed = None;
-        while let Some(result) = deleted.next().await {
-            match result {
-                Ok(_) | Err(ObjectStoreError::NotFound { .. }) => {}
-                Err(err) => {
-                    failed.get_or_insert(Error::InboxStore(err));
-                }
-            }
+    /// Delete the objects at `locations` through the bulk delete of the store,
+    /// and log one warning for the failed deletes and count them. A later pass
+    /// finds the record of an object whose delete failed, and deletes the
+    /// object.
+    async fn delete_all(&self, locations: Vec<Path>) {
+        if let Some((failed, err)) = delete_objects(&*self.store, locations).await {
+            warn!(failed, %err, "failed to delete inbox objects; a later pass retries");
+            crate::obs::inbox_delete_failed(failed);
         }
-        failed.map_or(Ok(()), Err)
     }
+}
+
+/// The read of an entry object.
+enum Read {
+    Body(Vec<u8>),
+    /// The object was deleted after the listing.
+    Missing,
 }
 
 /// The prefix of the entries of `queue` in the inbox at `prefix`.
@@ -500,7 +509,7 @@ impl QueueCore {
         if !settled.is_empty() {
             self.db.flush().await?;
             self.payload_store.delete_all(payload_refs).await;
-            inbox.delete_all(settled).await?;
+            inbox.delete_all(settled).await;
         }
         applied
     }
@@ -526,25 +535,32 @@ impl QueueCore {
                 }
             })
             .collect();
-        let mut bodies = stream::iter(reads).buffered(INBOX_PREFETCH);
+        let mut reads = stream::iter(reads).buffered(INBOX_PREFETCH);
         for (key, location, rejection) in batch {
-            let body = bodies.next().await.expect("one read per object")?;
-            self.settle_object(inbox, key, location, rejection.clone(), body, payload_refs)
-                .await?;
+            let prefetched = reads.next().await.expect("one read per object")?;
+            self.settle_object(
+                inbox,
+                key,
+                location,
+                rejection.clone(),
+                prefetched,
+                payload_refs,
+            )
+            .await?;
             settled.push(location.clone());
         }
         Ok(())
     }
 
-    /// The body of the object of `key` at `location`, or `None` when its
-    /// application does not read the body: the queue is outside the allow-list
-    /// or the record exists.
+    /// The read of the object of `key` at `location`, or `None` when its
+    /// application does not read the object: the queue is outside the
+    /// allow-list or the record exists.
     async fn prefetch(
         &self,
         inbox: &InboxState,
         key: &EntryKey,
         location: &Path,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<Read>> {
         if !inbox.accepts(&key.queue)
             || self
                 .db
@@ -554,13 +570,14 @@ impl QueueCore {
         {
             return Ok(None);
         }
-        inbox.get(location).await.map(Some)
+        inbox.read(location).await.map(Some)
     }
 
     /// Apply the object of `key` at `location`, or reject it with `rejection`
-    /// without a read, and commit its record. `body` is the body read before,
-    /// and an object without it is read here. An object whose record exists is
-    /// settled without an effect. The payload ref of a job that the application
+    /// without a read, and commit its record. `prefetched` is the read before
+    /// the application, and an object without it is read here. An object whose
+    /// record exists is settled without an effect, and an object deleted after
+    /// the listing is skipped. The payload ref of a job that the application
     /// removed goes to `payload_refs`.
     async fn settle_object(
         &self,
@@ -568,7 +585,7 @@ impl QueueCore {
         key: &EntryKey,
         location: &Path,
         rejection: Option<Rejection>,
-        body: Option<Vec<u8>>,
+        prefetched: Option<Read>,
         payload_refs: &mut Vec<String>,
     ) -> Result<()> {
         let EntryKey { id, queue, kind } = key;
@@ -582,11 +599,17 @@ impl QueueCore {
         } else if let Some(rejection) = rejection {
             Err(rejection)
         } else {
-            let body = match body {
-                Some(body) => body,
-                None => inbox.get(location).await?,
+            let read = match prefetched {
+                Some(read) => read,
+                None => inbox.read(location).await?,
             };
-            InboxEntry::decode(kind, &body)
+            match read {
+                Read::Body(body) => InboxEntry::decode(kind, &body),
+                Read::Missing => {
+                    debug!(kind, id, "inbox entry deleted after the listing; skipped");
+                    return Ok(());
+                }
+            }
         };
         let outcome = match decoded {
             Ok(entry) => {

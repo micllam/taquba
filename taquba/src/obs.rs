@@ -28,6 +28,8 @@
 //!   entries rejected with a record of the reason.
 //! - `taquba_inbox_pass_failures_total`: inbox passes that ended with an
 //!   error. Store-level, without a label.
+//! - `taquba_inbox_delete_failures_total`: deletes of applied inbox objects
+//!   that failed, which a later pass retries. Store-level, without a label.
 //! - `taquba_enqueue_duration_seconds{queue}` /
 //!   `taquba_claim_duration_seconds{queue}` /
 //!   `taquba_ack_duration_seconds{queue}`: per-operation latency histograms.
@@ -94,6 +96,10 @@ mod imp {
         metrics::describe_counter!(
             "taquba_inbox_pass_failures_total",
             "Inbox passes that ended with an error"
+        );
+        metrics::describe_counter!(
+            "taquba_inbox_delete_failures_total",
+            "Deletes of applied inbox objects that failed"
         );
         metrics::describe_histogram!(
             "taquba_enqueue_duration_seconds",
@@ -169,6 +175,10 @@ mod imp {
 
     pub(crate) fn inbox_pass_failed() {
         metrics::counter!("taquba_inbox_pass_failures_total").increment(1);
+    }
+
+    pub(crate) fn inbox_delete_failed(n: u64) {
+        metrics::counter!("taquba_inbox_delete_failures_total").increment(n);
     }
 
     pub(crate) fn set_depth(queue: &str, pending: i64, claimed: i64) {
@@ -327,6 +337,8 @@ mod imp {
     pub(crate) fn inbox_rejected(_kind: &str) {}
 
     pub(crate) fn inbox_pass_failed() {}
+
+    pub(crate) fn inbox_delete_failed(_n: u64) {}
 }
 
 pub(crate) use imp::*;
