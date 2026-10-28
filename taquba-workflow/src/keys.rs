@@ -10,7 +10,7 @@ use std::ops::{Deref, Range};
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
-use taquba::{EnqueueRequest, SettlementEffects};
+use taquba::{EnqueueRequest, Queue, SettlementEffects};
 
 use crate::error::{Error, Result};
 
@@ -205,9 +205,9 @@ impl RunId {
         Err(Error::InvalidRunId { run_id: id, reason })
     }
 
-    /// A generated id: a ULID.
-    pub(crate) fn generate() -> Self {
-        Self(ulid::Ulid::new().to_string())
+    /// A generated id: a ULID from [`Queue::next_job_id`] of `queue`.
+    pub(crate) fn generate(queue: &Queue) -> Self {
+        Self(queue.next_job_id())
     }
 
     /// The id that is the lower-case hex SHA-256 digest of `parts`

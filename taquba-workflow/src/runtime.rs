@@ -723,7 +723,10 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
 
     /// A group with a generated id.
     pub fn new_group(&self) -> RunGroup {
-        RunGroup::new(self.inner.core.clone(), RunId::generate())
+        RunGroup::new(
+            self.inner.core.clone(),
+            RunId::generate(&self.inner.core.queue),
+        )
     }
 
     /// Spawn [`Self::run`] as a Tokio task and return a handle for graceful
@@ -888,7 +891,10 @@ impl RuntimeCore {
     fn validate_spec(&self, spec: &RunSpec) -> Result<RunId> {
         check_headers(&spec.options.headers)?;
         check_effects(&spec.effects, &self.queue_name)?;
-        Ok(spec.run_id.clone().unwrap_or_else(RunId::generate))
+        Ok(spec
+            .run_id
+            .clone()
+            .unwrap_or_else(|| RunId::generate(&self.queue)))
     }
 
     /// Enqueue step 0 of `run_id` unless the run is known. The run record is
@@ -3362,6 +3368,34 @@ mod tests {
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].status.run_id, "b");
         assert!(matches!(rest[0].status.state, RunState::Terminated(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn generated_run_ids_list_in_submission_order_at_the_time_of_the_queue_clock() {
+        let (queue, store, _clock) = open_queue_at(10_000).await;
+        let runtime = WorkflowRuntime::builder(queue, store, UnreachableRunner, NoopTerminalHook)
+            .build()
+            .unwrap();
+        // The clock stays in one millisecond, where ULIDs with fresh random
+        // bits sort at random.
+        let mut submitted = Vec::new();
+        for _ in 0..10 {
+            let outcome = runtime.submit(RunSpec::default()).await.unwrap();
+            submitted.push(outcome.run_id.to_string());
+        }
+
+        let listed: Vec<String> = runtime
+            .view()
+            .runs(RunFilter::All, KvOrder::Ascending, 10)
+            .map_ok(|run| run.status.run_id.to_string())
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(listed, submitted);
+        for run_id in &listed {
+            let generated = ulid::Ulid::from_string(run_id).unwrap();
+            assert_eq!(generated.timestamp_ms(), 10_000);
+        }
     }
 
     #[tokio::test(start_paused = true)]

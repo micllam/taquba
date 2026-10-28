@@ -93,12 +93,12 @@ impl WorkflowView {
 
     /// The runs that `filter` selects, in the order `order` of their run ids,
     /// with `page_size` records in a page. A run id that the runtime generates
-    /// is a ULID, so such runs list in the order of their submission. A
-    /// terminated run lists until the memo sweep removes its terminal record.
-    /// The listing is not a snapshot. A run lists once, in the state of its
-    /// read. A run that is submitted or removed during the listing can be
-    /// absent, and with [`RunFilter::Active`] so can a run that terminates
-    /// before its read.
+    /// comes from [`Queue::next_job_id`](taquba::Queue::next_job_id), so such
+    /// runs list in the order of their submission. A terminated run lists until
+    /// the memo sweep removes its terminal record. The listing is not a
+    /// snapshot. A run lists once, in the state of its read. A run that is
+    /// submitted or removed during the listing can be absent, and with
+    /// [`RunFilter::Active`] so can a run that terminates before its read.
     pub fn runs(
         &self,
         filter: RunFilter,

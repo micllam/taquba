@@ -88,6 +88,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The memo sweep keeps the state of a member run submitted again after
   `RunGroup::forget`. 0.14 removed the memo entries of the later run a window
   after the marker of the earlier one, so its steps ran their work again.
+- A run id that the runtime generates comes from `Queue::next_job_id`, so runs
+  submitted within one millisecond list in submission order. The time of a
+  generated run id is the time of the queue's clock, as `submitted_at_ms` is.
 
 ## [0.14.0] - 2026-10-14
 
