@@ -335,6 +335,100 @@ async fn an_object_outside_the_layout_is_left_in_place() {
     q.close().await.unwrap();
 }
 
+#[tokio::test(start_paused = true)]
+async fn the_objects_of_a_batch_stay_until_its_commits_are_durable() {
+    let faults = FaultStore::wrap();
+    let queue_store: Arc<dyn ObjectStore> = faults.clone();
+    let inbox_store = make_store();
+    let clock = MockClock::new(INITIAL);
+    let opts = || OpenOptions {
+        inbox: Some(
+            InboxOptions::new(["work"])
+                .object_store(inbox_store.clone())
+                .touch_poll_interval(None),
+        ),
+        ..inbox_opts(&clock)
+    };
+    let q = Queue::open_with_options(queue_store.clone(), "test", opts())
+        .await
+        .unwrap();
+    let sender = sender(&inbox_store);
+    for id in ["a", "b"] {
+        sender
+            .send_with_id(WORK, id, EnqueueEntry::new(b"x"))
+            .await
+            .unwrap();
+    }
+
+    // The commits of the pass do not await durability, and the flush of the
+    // batch stalls on the unavailable store. The queue is dropped without a
+    // close, which simulates a crash before the flush.
+    faults.fail_puts(true);
+    let stalled = tokio::time::timeout(Duration::from_secs(30), q.apply_inbox_now()).await;
+    assert!(stalled.is_err());
+    assert_eq!(
+        object_count(&inbox_store, "test-inbox/v1/work/enqueue").await,
+        2
+    );
+    drop(q);
+
+    faults.fail_puts(false);
+    let q = Queue::open_with_options(queue_store, "test", opts())
+        .await
+        .unwrap();
+    assert_eq!(
+        object_count(&inbox_store, "test-inbox/v1/work/enqueue").await,
+        0
+    );
+    assert_eq!(q.view().stats("work").await.unwrap().pending, 2);
+    q.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_error_at_an_entry_ends_the_pass_after_the_entries_before_it() {
+    let faults = FaultStore::wrap();
+    let inbox_store: Arc<dyn ObjectStore> = faults.clone();
+    let opts = OpenOptions {
+        inbox: Some(
+            InboxOptions::new(["work"])
+                .object_store(inbox_store.clone())
+                .touch_poll_interval(None),
+        ),
+        ..inbox_opts(&MockClock::new(INITIAL))
+    };
+    let q = Queue::open_with_options(make_store(), "test", opts)
+        .await
+        .unwrap();
+    let sender = sender(&inbox_store);
+    for id in ["a", "b", "c"] {
+        sender
+            .send_with_id(WORK, id, EnqueueEntry::new(id.as_bytes()))
+            .await
+            .unwrap();
+    }
+
+    faults.fail_reads_ending(Some(".b"));
+    assert!(matches!(
+        q.apply_inbox_now().await,
+        Err(Error::InboxStore(_))
+    ));
+    assert!(q.view().inbox_record(WORK, "a").await.unwrap().is_some());
+    assert!(q.view().inbox_record(WORK, "b").await.unwrap().is_none());
+    assert_eq!(
+        object_count(&inbox_store, "test-inbox/v1/work/enqueue").await,
+        2
+    );
+
+    faults.fail_reads_ending(None);
+    q.apply_inbox_now().await.unwrap();
+    assert_eq!(q.view().stats("work").await.unwrap().pending, 3);
+    assert_eq!(
+        object_count(&inbox_store, "test-inbox/v1/work/enqueue").await,
+        0
+    );
+    q.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn passes_run_one_at_a_time() {
     let faults = FaultStore::wrap();

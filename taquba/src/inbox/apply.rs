@@ -11,19 +11,24 @@ use crate::txn::{Attempt, Durability, Txn, get_indexed_job};
 
 impl QueueCore {
     /// Apply `entry` to `queue` and return its outcome. One transaction stages
-    /// the effect of the kind and the record with the outcome. A cancel or a
+    /// the effect of the kind and the record with the outcome, and commits
+    /// without awaiting durability: the pass flushes its batch. A cancel or a
     /// signal for a job of another queue commits a rejection in that
     /// transaction. A permanent error of the operation commits a rejection in a
-    /// transaction of its own, and any other error returns.
+    /// transaction of its own, and any other error returns. The payload ref of
+    /// a job that a cancel removed goes to `payload_refs`.
     pub(crate) async fn apply_entry(
         &self,
         queue: &str,
         record: &InboxRecordHandle,
         entry: InboxEntry,
+        payload_refs: &mut Vec<String>,
     ) -> Result<InboxOutcome> {
         let applied = match entry {
             InboxEntry::Enqueue(entry) => self.apply_enqueue(queue, entry, record).await,
-            InboxEntry::Cancel(entry) => self.apply_cancel(queue, entry, record).await,
+            InboxEntry::Cancel(entry) => {
+                self.apply_cancel(queue, entry, record, payload_refs).await
+            }
             InboxEntry::Signal(entry) => self.apply_signal(queue, entry, record).await,
         };
         match applied {
@@ -47,7 +52,7 @@ impl QueueCore {
         let committed = match offloaded {
             Ok(()) => {
                 let prepared = &prepared;
-                self.retry(Durability::Awaited, |mut txn| async move {
+                self.retry(Durability::Deferred, |mut txn| async move {
                     // After a dedup hit, the record commits alone.
                     let result = match self.stage_job_writes(&mut txn, prepared).await? {
                         Ok(id) => EnqueueResult::New(id),
@@ -71,10 +76,11 @@ impl QueueCore {
         queue: &str,
         entry: CancelEntry,
         record: &InboxRecordHandle,
+        payload_refs: &mut Vec<String>,
     ) -> Result<InboxOutcome> {
         let job_id = entry.job_id.as_str();
         let (outcome, staged) = self
-            .retry(Durability::Awaited, |mut txn| async move {
+            .retry(Durability::Deferred, |mut txn| async move {
                 let (outcome, staged) = match on_another_queue(&txn, job_id, queue).await? {
                     Some(rejection) => (InboxOutcome::Rejected(rejection), None),
                     None => {
@@ -87,7 +93,7 @@ impl QueueCore {
             })
             .await?;
         if let Some(removed) = staged.and_then(|staged| self.finish_cancel(staged)) {
-            self.payload_store.delete_for(&removed).await;
+            payload_refs.extend(removed.payload_ref);
         }
         Ok(outcome)
     }
@@ -99,7 +105,7 @@ impl QueueCore {
         record: &InboxRecordHandle,
     ) -> Result<InboxOutcome> {
         let (job_id, payload) = (entry.job_id.as_str(), &entry.payload);
-        self.retry(Durability::Awaited, |mut txn| async move {
+        self.retry(Durability::Deferred, |mut txn| async move {
             let outcome = match on_another_queue(&txn, job_id, queue).await? {
                 Some(rejection) => InboxOutcome::Rejected(rejection),
                 None => {
@@ -121,7 +127,7 @@ impl QueueCore {
     ) -> Result<InboxOutcome> {
         let outcome = InboxOutcome::Rejected(rejection);
         let staged = &record.staged(outcome.clone());
-        self.retry(Durability::Awaited, |mut txn| async move {
+        self.retry(Durability::Deferred, |mut txn| async move {
             txn.stage_inbox_record(staged)?;
             Ok((txn, Attempt::Commit(())))
         })

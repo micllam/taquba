@@ -77,14 +77,16 @@ use slatedb::object_store::{
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// In-memory object store whose `put` and `delete` requests fail with a
-/// synthetic service-unavailable error while the corresponding flag is set.
-/// Reads are unaffected, and a list is held only after
+/// synthetic service-unavailable error while the corresponding flag is set. A
+/// read fails only at a path that ends with the suffix of
+/// [`Self::fail_reads_ending`], and a list is held only after
 /// [`Self::hold_next_list`].
 #[derive(Debug)]
 pub(crate) struct FaultStore {
     inner: Arc<dyn ObjectStore>,
     fail_puts: AtomicBool,
     fail_deletes: AtomicBool,
+    fail_reads: std::sync::Mutex<Option<String>>,
     /// Puts permitted before every later put fails. `usize::MAX` disables the
     /// countdown, and `fail_puts` is then the only cause of failure.
     puts_before_failure: AtomicUsize,
@@ -100,6 +102,7 @@ impl FaultStore {
             inner: Arc::new(InMemory::new()),
             fail_puts: AtomicBool::new(false),
             fail_deletes: AtomicBool::new(false),
+            fail_reads: std::sync::Mutex::new(None),
             puts_before_failure: AtomicUsize::new(usize::MAX),
             hold_list: AtomicBool::new(false),
             list_release: Arc::new(tokio::sync::Notify::new()),
@@ -128,6 +131,12 @@ impl FaultStore {
 
     pub(crate) fn fail_deletes(&self, fail: bool) {
         self.fail_deletes.store(fail, Ordering::SeqCst);
+    }
+
+    /// Fail every read of a path that ends with `suffix`, or no read for
+    /// `None`.
+    pub(crate) fn fail_reads_ending(&self, suffix: Option<&str>) {
+        *self.fail_reads.lock().unwrap() = suffix.map(str::to_string);
     }
 
     /// Permit `n` further puts, then fail every put after them.
@@ -193,6 +202,10 @@ impl ObjectStore for FaultStore {
     }
 
     async fn get_opts(&self, location: &StorePath, options: GetOptions) -> StoreResult<GetResult> {
+        let failing = self.fail_reads.lock().unwrap().clone();
+        if failing.is_some_and(|suffix| location.as_ref().ends_with(&suffix)) {
+            return Err(Self::synthetic_503());
+        }
         self.inner.get_opts(location, options).await
     }
 
