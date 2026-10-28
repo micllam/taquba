@@ -8,7 +8,8 @@ use std::time::{Duration, UNIX_EPOCH};
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use taquba::{
-    EnqueueEntry, JobRecord, JobStatus, LeaseHandle, PermanentFailure, Rejection, WorkerError,
+    Claim, ClaimOutcome, EnqueueEntry, JobRecord, JobStatus, LeaseHandle, PermanentFailure,
+    Rejection, WorkerError,
 };
 
 use crate::durable;
@@ -77,10 +78,12 @@ impl From<Command> for EnqueueEntry {
 /// command, and a submission of an existing run id with another input fails the
 /// command.
 ///
-/// A sender delays the run with [`Self::run_at`]. A command job delayed with
-/// the `run_at` of its [`EnqueueEntry`] finds a cancelled or finished run of
-/// its id while the terminal record of the run is retained, and after the memo
-/// sweep removes the record it starts a new run.
+/// A sender delays the first step of the run with [`Self::run_at`], and the
+/// command creates the run at its application. A command job delayed with the
+/// `run_at` of its [`EnqueueEntry`] applies at that time. It applies as a
+/// duplicate while the terminal record of an earlier run of its id is retained,
+/// and starts a new run after the memo sweep removes that record. A
+/// cancellation of the run applies each waiting submission of it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmitCommand {
     /// [`RunSpec::run_id`].
@@ -153,12 +156,15 @@ impl CancelCommand {
 }
 
 /// The worker of the control queue: it applies each command job. A payload that
-/// does not decode as a [`Command`] dead-letters the job. A cancellation of an
-/// inactive run applies the first waiting submission of the run on the control
-/// queue, and then cancels the run. That submission applies with the
-/// cancellation request on its run record and without its `run_at`. The
-/// submission job applies later as a duplicate. A cancellation retries while
-/// another worker has claimed a submission of its run.
+/// does not decode as a [`Command`] dead-letters the job.
+///
+/// A cancellation of an inactive run claims each waiting submission of the run
+/// on the control queue. The first that applies creates the run with the
+/// cancellation request on its run record and without its `run_at`, and the
+/// cancellation then cancels the run. The others apply against the cancelled
+/// run. Each claimed submission settles by its own outcome, and a permanent
+/// error dead-letters it. A cancellation retries while another worker has
+/// claimed a submission of its run.
 pub(crate) struct CommandWorker {
     pub(crate) core: Arc<RuntimeCore>,
 }
@@ -174,71 +180,114 @@ impl taquba::Worker for CommandWorker {
                     .await
                     .map_err(worker_error)?;
             }
-            Command::Cancel(cancel) => {
-                let outcome = self
-                    .core
-                    .cancel_run(&cancel.run_id, cancel.reason.clone())
-                    .await
-                    .map_err(worker_error)?;
-                if outcome != CancelRunOutcome::NotActive {
-                    return Ok(());
-                }
-                let waiting = self
-                    .waiting_submission(&job.queue, &cancel.run_id)
-                    .await
-                    .map_err(worker_error)?;
-                let Some((status, submit)) = waiting else {
-                    return Ok(());
-                };
-                if status == JobStatus::Claimed {
-                    return Err(format!(
-                        "a submission of run `{}` is being applied",
-                        cancel.run_id
-                    )
-                    .into());
-                }
-                let mut spec = submit.into_spec();
-                spec.options.run_at = None;
-                match self
-                    .core
-                    .submit_cancelled(spec, cancel.reason.clone())
-                    .await
-                {
-                    Ok(_) => {}
-                    // The submission job fails on its own when it applies.
-                    Err(err) if err.is_permanent() => return Ok(()),
-                    Err(err) => return Err(worker_error(err)),
-                }
-                self.core
-                    .cancel_run(&cancel.run_id, cancel.reason)
-                    .await
-                    .map_err(worker_error)?;
-            }
+            Command::Cancel(cancel) => self.cancel(&job.queue, cancel).await?,
         }
         Ok(())
     }
 }
 
 impl CommandWorker {
-    /// The first submission of `run_id` that is pending, scheduled or claimed
-    /// on `queue`, with the status of its job.
-    async fn waiting_submission(
+    /// Apply `cancel` from the control queue `queue`.
+    async fn cancel(&self, queue: &str, cancel: CancelCommand) -> Result<(), WorkerError> {
+        let outcome = self
+            .core
+            .cancel_run(&cancel.run_id, cancel.reason.clone())
+            .await
+            .map_err(worker_error)?;
+        if outcome != CancelRunOutcome::NotActive {
+            return Ok(());
+        }
+        let mut claims = self
+            .claim_submissions(queue, &cancel.run_id)
+            .await?
+            .into_iter();
+        for (claim, submit) in claims.by_ref() {
+            let mut spec = submit.into_spec();
+            spec.options.run_at = None;
+            let applied = self
+                .core
+                .submit_cancelled(spec, cancel.reason.clone())
+                .await
+                .map(drop);
+            if applied.is_ok() {
+                self.core
+                    .cancel_run(&cancel.run_id, cancel.reason.clone())
+                    .await
+                    .map_err(worker_error)?;
+                self.settle(&claim, applied).await?;
+                break;
+            }
+            self.settle(&claim, applied).await?;
+        }
+        for (claim, submit) in claims {
+            let applied = self.core.submit(submit.into_spec()).await.map(drop);
+            self.settle(&claim, applied).await?;
+        }
+        Ok(())
+    }
+
+    /// Claim each submission of `run_id` that is pending or scheduled on
+    /// `queue`, in the order of the scan. Fails while another worker has
+    /// claimed a submission of the run.
+    async fn claim_submissions(
         &self,
         queue: &str,
         run_id: &RunId,
-    ) -> taquba::Result<Option<(JobStatus, SubmitCommand)>> {
+    ) -> Result<Vec<(Claim, SubmitCommand)>, WorkerError> {
+        let being_applied = || format!("a submission of run `{run_id}` is being applied").into();
+        let waiting = self
+            .submissions(queue, run_id)
+            .await
+            .map_err(worker_error)?;
+        let lease = self.core.queue.queue_config(queue).lease_duration;
+        let mut claims = Vec::with_capacity(waiting.len());
+        for (job, submit) in waiting {
+            if job.status == JobStatus::Claimed {
+                return Err(being_applied());
+            }
+            match self.core.queue.claim_by_id(&job.id, lease).await {
+                Ok(ClaimOutcome::Claimed(claim)) => claims.push((*claim, submit)),
+                Ok(ClaimOutcome::NotClaimable) => return Err(being_applied()),
+                Ok(ClaimOutcome::NotFound) => {}
+                Err(err) => return Err(worker_error(err)),
+            }
+        }
+        Ok(claims)
+    }
+
+    /// The submissions of `run_id` that are pending, scheduled or claimed on
+    /// `queue`, with their jobs.
+    async fn submissions(
+        &self,
+        queue: &str,
+        run_id: &RunId,
+    ) -> taquba::Result<Vec<(JobRecord, SubmitCommand)>> {
         let view = self.core.queue.view();
+        let mut submissions = Vec::new();
         for status in [JobStatus::Pending, JobStatus::Scheduled, JobStatus::Claimed] {
             let mut jobs = std::pin::pin!(view.jobs(queue, status, SCAN_PAGE));
             while let Some(job) = jobs.try_next().await? {
                 if let Ok(Command::Submit(submit)) = decode(&job.payload)
                     && submit.run_id == *run_id
                 {
-                    return Ok(Some((status, submit)));
+                    submissions.push((job, submit));
                 }
             }
         }
-        Ok(None)
+        Ok(submissions)
+    }
+
+    /// Settle `claim` by `applied`: an ack, or a dead letter for a permanent
+    /// error. Another error leaves the claim to the expiry of its lease.
+    async fn settle(&self, claim: &Claim, applied: crate::Result<()>) -> Result<(), WorkerError> {
+        let settled = match applied {
+            Ok(()) => self.core.queue.ack(claim).await,
+            Err(err) if err.is_permanent() => {
+                self.core.queue.dead_letter(claim, &err.to_string()).await
+            }
+            Err(err) => return Err(worker_error(err)),
+        };
+        settled.map_err(worker_error)
     }
 }
 
@@ -295,23 +344,24 @@ mod tests {
         QueueConfig::default().keep_done_jobs(DEFAULT_INBOX_RECORD_RETENTION)
     }
 
-    /// A queue under `opts` with a mock clock and an inbox for [`CONTROL`], and
-    /// a runtime with that control queue.
-    async fn open(
-        opts: OpenOptions,
-    ) -> (
+    /// A queue with a mock clock and an inbox for [`CONTROL`], and a runtime
+    /// with that control queue and a memo retention of a minute.
+    async fn open() -> (
         Arc<Queue>,
         InboxSender,
         WorkflowRuntime<Echo, NoopTerminalHook>,
         MockClock,
     ) {
         let inbox = InboxOptions::new([CONTROL]).touch_poll_interval(None);
-        let opts = opts.inbox(inbox).queue_config(CONTROL, control_config());
+        let opts = OpenOptions::default()
+            .inbox(inbox)
+            .queue_config(CONTROL, control_config());
         let (queue, store, clock) = open_queue_at_with(INITIAL, opts).await;
         let runtime =
             WorkflowRuntime::builder(queue.clone(), store.clone(), Echo, NoopTerminalHook)
                 .poll_interval(Duration::from_millis(20))
                 .control_queue(CONTROL)
+                .memo_retention(Duration::from_secs(60))
                 .build()
                 .unwrap();
         (queue, InboxSender::new(store, "test-inbox"), runtime, clock)
@@ -357,7 +407,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_submit_command_runs_the_run_and_a_command_that_cannot_apply_dead_letters() {
-        let (queue, sender, runtime, _clock) = open(OpenOptions::default()).await;
+        let (queue, sender, runtime, _clock) = open().await;
         let shutdown = spawn(&runtime);
         let submit = |input: &[u8]| Command::Submit(SubmitCommand::new(rid("run-1"), input));
         let applied = send(&queue, &sender, submit(b"hello").into()).await;
@@ -383,7 +433,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_view_reads_the_state_of_a_command_from_its_record_and_its_job() {
-        let (queue, sender, runtime, _clock) = open(OpenOptions::default()).await;
+        let (queue, sender, runtime, _clock) = open().await;
         let view = runtime.view();
         let submit = Command::Submit(SubmitCommand::new(rid("run-1"), b"x"));
         let applied = sender
@@ -500,7 +550,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_command_job_cancelled_through_the_inbox_reads_as_none() {
-        let (queue, sender, runtime, _clock) = open(OpenOptions::default()).await;
+        let (queue, sender, runtime, _clock) = open().await;
         let submit = Command::Submit(SubmitCommand::new(rid("run-6"), b"x"));
         let id = sender
             .send(CONTROL, EnqueueEntry::from(submit))
@@ -520,7 +570,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_cancel_command_cancels_the_run_and_ignores_an_inactive_one() {
-        let (queue, sender, runtime, _clock) = open(OpenOptions::default()).await;
+        let (queue, sender, runtime, _clock) = open().await;
         let shutdown = spawn(&runtime);
         runtime
             .submit(crate::RunSpec {
@@ -547,61 +597,69 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_cancel_applies_a_waiting_submission_of_its_run_and_cancels_the_run() {
-        let (queue, sender, runtime, clock) = open(OpenOptions::default()).await;
+    async fn a_cancel_settles_each_waiting_submission_of_its_run() {
+        let (queue, sender, runtime, clock) = open().await;
         let shutdown = spawn(&runtime);
-        // The submission waits an hour on the control queue for its `run_at`,
-        // so the cancellation sent after it reaches the worker first.
-        let mut submit =
-            EnqueueEntry::from(Command::Submit(SubmitCommand::new(rid("run-3"), b"x")));
-        submit.options.run_at = Some(UNIX_EPOCH + Duration::from_millis(INITIAL + 3_600_000));
+        // The submissions wait an hour on the control queue for their `run_at`,
+        // so the cancellation sent after them reaches the worker first.
+        let delayed = |input: &[u8]| {
+            let mut submit =
+                EnqueueEntry::from(Command::Submit(SubmitCommand::new(rid("run-3"), input)));
+            submit.options.run_at = Some(UNIX_EPOCH + Duration::from_millis(INITIAL + 3_600_000));
+            submit
+        };
         let cancel = Command::Cancel(CancelCommand {
             reason: Some("operator".to_string()),
             ..CancelCommand::new(rid("run-3"))
         });
-        let submit_id = sender.send(CONTROL, submit).await.unwrap();
+        let first = sender.send(CONTROL, delayed(b"x")).await.unwrap();
+        let other = sender.send(CONTROL, delayed(b"y")).await.unwrap();
         sender
             .send(CONTROL, EnqueueEntry::from(cancel))
             .await
             .unwrap();
         queue.apply_inbox_now().await.unwrap();
-        let mut ended = None;
+        let mut states = (None, None);
         for _ in 0..500 {
-            ended = runtime.view().run_end(&rid("run-3")).await.unwrap();
-            if ended.is_some() {
+            states = (
+                runtime.view().command(CONTROL, &first).await.unwrap(),
+                runtime.view().command(CONTROL, &other).await.unwrap(),
+            );
+            if matches!(states.1, Some(CommandState::Failed(_))) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let end = ended.unwrap();
+        let (Some(CommandState::Applied), Some(CommandState::Failed(reason))) = states else {
+            panic!("the submissions did not settle: {states:?}");
+        };
+        assert!(reason.contains("different input"), "{reason}");
+        let end = runtime
+            .view()
+            .run_end(&rid("run-3"))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(end.termination.status, TerminalStatus::Cancelled);
         assert_eq!(end.termination.error.as_deref(), Some("operator"));
         // The cancellation removed the first step while it waited, so no worker
         // recorded an outcome.
         assert!(end.outcome.is_none());
 
-        // At its `run_at`, the submission applies as a duplicate of the run.
+        // Once the `run_at` of the submissions and the memo retention have
+        // passed, the sweep removes the run. No submission starts a new run of
+        // its id.
         advance(&clock, Duration::from_secs(3_600)).await;
         queue.promote_scheduled_now().await.unwrap();
-        let mut state = None;
-        for _ in 0..500 {
-            state = runtime.view().command(CONTROL, &submit_id).await.unwrap();
-            if state == Some(CommandState::Applied) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(state, Some(CommandState::Applied));
-        assert!(matches!(
-            runtime.status(&rid("run-3")).await.unwrap().unwrap().state,
-            crate::RunState::Terminated(_)
-        ));
+        assert_eq!(runtime.inner.core.sweep_once().await.unwrap(), 1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(runtime.status(&rid("run-3")).await.unwrap().is_none());
         let _ = shutdown.send(());
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_submission_applied_for_a_cancellation_terminates_at_the_claim_of_its_first_step() {
-        let (_queue, _sender, runtime, _clock) = open(OpenOptions::default()).await;
+        let (_queue, _sender, runtime, _clock) = open().await;
         // The step worker claims the first step before a cancellation removes
         // it.
         let spec = SubmitCommand::new(rid("run-4"), b"x").into_spec();
@@ -621,7 +679,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_cancel_retries_while_another_worker_has_claimed_a_submission_of_its_run() {
-        let (queue, sender, runtime, _clock) = open(OpenOptions::default()).await;
+        let (queue, sender, runtime, _clock) = open().await;
         let submit = Command::Submit(SubmitCommand::new(rid("run-5"), b"x"));
         let cancel = Command::Cancel(CancelCommand::new(rid("run-5")));
         sender

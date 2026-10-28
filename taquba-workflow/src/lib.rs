@@ -287,11 +287,11 @@
 //! submission of an existing run id with another input, is dead-lettered with
 //! its error in [`taquba::JobRecord::last_error`].
 //!
-//! A cancellation of a run whose submission waits on the control queue applies
-//! that submission and then cancels the run. A sender delays a run with
-//! [`SubmitCommand::run_at`]. A command job delayed through the `run_at` of its
-//! entry finds an earlier run of its id only while the terminal record of that
-//! run is retained.
+//! A cancellation of a run whose submissions are waiting on the control queue
+//! applies each of them: the first creates the cancelled run, and the others
+//! apply against it. A sender delays a run with [`SubmitCommand::run_at`]. A
+//! command job delayed through the `run_at` of its entry finds an earlier run
+//! of its id only while the terminal record of that run is retained.
 //!
 //! # Application KV effects
 //!
