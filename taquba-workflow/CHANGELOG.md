@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-29
+
 ### Added
 
 - `WorkflowView::run_end`: the `RunEnd` of a terminated run, which
@@ -72,6 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the origin, so a record written by 0.14.0 fails to decode. Read
   `cancelled_by` in place of a test of `error` for `None`, and match
   `RunState::Cancelling { .. }`.
+- Raised the minimum `taquba` requirement to 0.16 and, for the `webhooks`
+  feature, the `taquba-webhooks` requirement to 0.12.
 
 ### Removed
 
