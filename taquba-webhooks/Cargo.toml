@@ -19,7 +19,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 # The hello_webhook example spins up an axum HTTP listener and uses

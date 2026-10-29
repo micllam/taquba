@@ -1254,7 +1254,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots 1.0.7",
 ]
 
 [[package]]
@@ -1902,7 +1901,7 @@ dependencies = [
  "percent-encoding",
  "quick-xml",
  "rand 0.10.1",
- "reqwest 0.13.3",
+ "reqwest",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -2381,44 +2380,6 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reqwest"
-version = "0.12.28"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "futures-core",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "js-sys",
- "log",
- "percent-encoding",
- "pin-project-lite",
- "quinn",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "sync_wrapper",
- "tokio",
- "tokio-rustls",
- "tower",
- "tower-http",
- "tower-service",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "webpki-roots 1.0.7",
-]
-
-[[package]]
-name = "reqwest"
 version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62e0021ea2c22aed41653bc7e1419abb2c97e038ff2c33d0e1309e49a97deec0"
@@ -2504,7 +2465,7 @@ dependencies = [
  "mime_guess",
  "ordered-float 5.3.0",
  "pin-project-lite",
- "reqwest 0.13.3",
+ "reqwest",
  "rig-derive",
  "schemars",
  "serde",
@@ -2609,7 +2570,6 @@ checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
- "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -3260,7 +3220,7 @@ name = "taquba-webhooks"
 version = "0.11.0"
 dependencies = [
  "axum",
- "reqwest 0.12.28",
+ "reqwest",
  "taquba",
  "thiserror 1.0.69",
  "tokio",
