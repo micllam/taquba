@@ -293,12 +293,16 @@ runtime's control queue, which `taquba::InboxOptions::queues` must list. Its
 `taquba::InboxOptions::record_retention`. The runtime's worker applies each job
 on the control queue as a `Command`: a `SubmitCommand` or a `CancelCommand`.
 
-A sender enqueues `taquba::EnqueueEntry::from(command)` with a
+A sender should enqueue `taquba::EnqueueEntry::from(command)` with a
 `taquba::InboxSender` for the control queue. Through a `taquba::QueueReader`,
-the sender reads the state of its command with `WorkflowView::command` and the
-state of the run with `WorkflowView::status`. A sender in another language
-writes the MessagePack form that `Command` documents. A signal from another
-process is the core kind `signal` (`taquba::SignalEntry`).
+the sender can read the state of its command with `WorkflowView::command` and
+the state of the run with `WorkflowView::status`. See
+[`examples/remote_submit.rs`](examples/remote_submit.rs) for a sender that
+submits two runs and cancels one of them.
+
+A sender in another language must write the MessagePack form that `Command`
+documents. A process that signals a waiting run should send a
+`taquba::SignalEntry`, the core kind `signal`.
 
 A command applies at least once, so a `SubmitCommand` contains its run id. A
 command that fails is retried. A command that cannot apply, such as a submission
@@ -307,9 +311,9 @@ of an existing run id with another input, is dead-lettered with its error in
 
 A cancellation of a run whose submissions are waiting on the control queue
 applies each of them: the first creates the cancelled run, and the others apply
-against it. A sender delays a run with `SubmitCommand::run_at`. A command job
-delayed through the `run_at` of its entry finds an earlier run of its id only
-while the terminal record of that run is retained.
+against it. A sender should delay a run with `SubmitCommand::run_at`. A command
+job delayed through the `run_at` of its entry finds an earlier run of its id
+only while the terminal record of that run is retained.
 
 ## Application KV effects
 
