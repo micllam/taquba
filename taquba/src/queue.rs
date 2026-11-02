@@ -20,7 +20,7 @@ use crate::job::{Claim, JobRecord, JobStatus};
 use crate::keys::QueueName;
 use crate::lease_registry::{LeaseRegistry, Renewal};
 use crate::options::{EnqueueOptions, OpenOptions, QueueConfig};
-use crate::payload_store::PayloadStore;
+use crate::payload_store::{PayloadStore, default_payload_path};
 use crate::queue_core::{QueueConfigs, QueueCore};
 use crate::reaper::Reaper;
 use crate::scheduler::Scheduler;
@@ -281,7 +281,7 @@ impl Queue {
         let payload_store = Arc::new(PayloadStore::new(
             opts.payload_store.unwrap_or_else(|| object_store.clone()),
             opts.payload_path
-                .unwrap_or_else(|| format!("{path}-payloads")),
+                .unwrap_or_else(|| default_payload_path(path)),
             opts.payload_offload_threshold,
         ));
         let mut settings = Settings::default();

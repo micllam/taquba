@@ -21,12 +21,18 @@ use crate::error::{Error, Result};
 use crate::job::JobRecord;
 use crate::objects::delete_objects;
 
+/// The payload prefix of a queue opened at `path` without a payload path:
+/// `"{path}-payloads"`, a sibling of the queue's path in its object store.
+pub(crate) fn default_payload_path(path: &str) -> String {
+    format!("{path}-payloads")
+}
+
 /// Storage for offloaded payload objects within a dedicated prefix.
 ///
 /// If the payload store and the queue's SlateDB store share an object store,
 /// the prefix must not overlap the path the queue was opened at, so payload
-/// objects never collide with SlateDB's internal layout. The default prefix
-/// (`"{path}-payloads"`) satisfies this.
+/// objects never collide with SlateDB's internal layout. The prefix of
+/// [`default_payload_path`] satisfies this.
 pub(crate) struct PayloadStore {
     store: Arc<dyn ObjectStore>,
     prefix: String,

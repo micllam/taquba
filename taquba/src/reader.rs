@@ -18,7 +18,7 @@ use slatedb::{DbReader, DbReaderMode};
 
 use crate::error::{Error, Result};
 use crate::liveness::{StoreActivity, WriterHeartbeat};
-use crate::payload_store::PayloadStore;
+use crate::payload_store::{PayloadStore, default_payload_path};
 use crate::stats::QueueMergeOperator;
 use crate::view::{Handle, QueueView};
 
@@ -206,7 +206,7 @@ impl QueueReader {
         let payload_store = Arc::new(PayloadStore::new(
             opts.payload_store.unwrap_or_else(|| object_store.clone()),
             opts.payload_path
-                .unwrap_or_else(|| format!("{path}-payloads")),
+                .unwrap_or_else(|| default_payload_path(path)),
             None,
         ));
         let mode = match opts.mode {
