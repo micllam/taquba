@@ -25,8 +25,11 @@ One record per decision that constrains a future change.
 # ADR-NNNN: Title
 
 Status: accepted
+
 Date: YYYY-MM-DD
+
 Scope: <crate or workspace>
+
 Supersedes: <ADR-NNNN, or delete this line>
 
 ## Rule
