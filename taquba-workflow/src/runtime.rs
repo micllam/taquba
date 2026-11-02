@@ -305,6 +305,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     /// The name of the Taquba queue that step jobs are enqueued onto. Defaults
     /// to `"workflow-steps"`. Multiple runtimes can share a `Queue` handle by
     /// using distinct queue names.
+    #[must_use]
     pub fn queue_name(mut self, name: impl Into<String>) -> Self {
         self.queue_name = name.into();
         self
@@ -314,6 +315,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     /// [`Delivery::memo`](crate::Delivery::memo) entries. Defaults to
     /// `"{queue_name}-memo"`, so runtimes with distinct queue names on one
     /// object store have distinct memo namespaces.
+    #[must_use]
     pub fn memo_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.memo_prefix = Some(prefix.into());
         self
@@ -321,6 +323,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
 
     /// Maximum number of steps processed concurrently in
     /// [`WorkflowRuntime::run`]. Defaults to 16.
+    #[must_use]
     pub fn max_concurrent_steps(mut self, n: usize) -> Self {
         assert!(n > 0, "max_concurrent_steps must be at least 1");
         self.max_concurrent_steps = n;
@@ -329,6 +332,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
 
     /// Maximum time the worker loop waits on an empty queue before re-checking.
     /// Defaults to 250ms. The retention sweeps run at this interval.
+    #[must_use]
     pub fn poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
         self
@@ -339,6 +343,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     /// and the in-process sweeper clears that run's memo entries and terminal
     /// record `retention` after termination. When unset (default), no marker is
     /// written and memo entries and terminal records are retained indefinitely.
+    #[must_use]
     pub fn memo_retention(mut self, retention: Duration) -> Self {
         self.memo_retention = Some(retention);
         self
@@ -362,6 +367,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     /// This is disabled by default because it adds one object-store read per
     /// step delivery (the replay lookup) plus one write per recorded outcome,
     /// and makes that write part of step settlement.
+    #[must_use]
     pub fn step_output_replay(mut self) -> Self {
         self.step_output_replay = true;
         self
@@ -369,6 +375,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
 
     /// Override the [`Clock`] the runtime reads its timestamps from. Defaults
     /// to the same clock the [`Queue`] was opened with (via [`Queue::clock`]).
+    #[must_use]
     pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
@@ -382,6 +389,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     /// `retention` after the next observation. When unset (default), no group
     /// terminal marker is written. A group whose results are never consumed is
     /// retained until [`RunGroup::forget`] in either case.
+    #[must_use]
     pub fn group_retention(mut self, retention: Duration) -> Self {
         self.group_retention = Some(retention);
         self
@@ -402,6 +410,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     /// retention, and a [`dead_retention`](taquba::QueueConfig::dead_retention)
     /// of `None` or at least the retention. A kept done job keeps its payload,
     /// so the store keeps the input of each submission for that retention.
+    #[must_use]
     pub fn control_queue(mut self, name: impl Into<String>) -> Self {
         self.control_queue = Some(name.into());
         self

@@ -241,12 +241,14 @@ mod webhook {
 
         /// Override the header key the hook reads. Defaults to
         /// [`Self::URL_HEADER`].
+        #[must_use]
         pub fn with_url_header(mut self, header: impl Into<String>) -> Self {
             self.url_header = header.into();
             self
         }
 
         /// Set a per-delivery timeout passed through to the webhook worker.
+        #[must_use]
         pub fn with_timeout(mut self, timeout: Duration) -> Self {
             self.timeout = Some(timeout);
             self

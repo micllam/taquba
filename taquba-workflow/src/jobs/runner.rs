@@ -285,6 +285,7 @@ impl JobRunnerBuilder {
     ///
     /// Panics if another job type with the same [`Job::NAME`] is already
     /// registered.
+    #[must_use]
     pub fn register<J: Job>(mut self) -> Self {
         let previous = self.handlers.insert(
             J::NAME,
@@ -301,6 +302,7 @@ impl JobRunnerBuilder {
     }
 
     /// The logical queue name jobs are enqueued under. Defaults to `"jobs"`.
+    #[must_use]
     pub fn queue_name(mut self, name: impl Into<String>) -> Self {
         self.queue_name = name.into();
         self
@@ -308,6 +310,7 @@ impl JobRunnerBuilder {
 
     /// The object-store prefix job memos and run result records are written
     /// under. Defaults to `"{queue_name}-memo"`.
+    #[must_use]
     pub fn memo_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.memo_prefix = Some(prefix.into());
         self
@@ -315,6 +318,7 @@ impl JobRunnerBuilder {
 
     /// Register a piece of application state, retrievable from handlers via
     /// [`JobContext::state`]. At most one value per type.
+    #[must_use]
     pub fn state<T: Any + Send + Sync>(mut self, value: T) -> Self {
         self.state.insert(value);
         self
@@ -326,6 +330,7 @@ impl JobRunnerBuilder {
     /// # Panics
     ///
     /// Panics if `max` is zero.
+    #[must_use]
     pub fn max_concurrent_jobs(mut self, max: usize) -> Self {
         assert!(max > 0, "max_concurrent_jobs must be at least 1");
         self.concurrency = Some(max);
@@ -335,6 +340,7 @@ impl JobRunnerBuilder {
     /// How long the worker waits on an idle queue before re-checking.
     /// In-process submissions wake it immediately regardless. Defaults to
     /// 250 ms.
+    #[must_use]
     pub fn poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = Some(interval);
         self
@@ -350,6 +356,7 @@ impl JobRunnerBuilder {
     /// between the original submission and an idempotent re-submission.
     ///
     /// [`JobHandle::fetch_result`]: crate::jobs::JobHandle::fetch_result
+    #[must_use]
     pub fn retention(mut self, retention: Duration) -> Self {
         self.retention = Some(retention);
         self
@@ -367,6 +374,7 @@ impl JobRunnerBuilder {
     /// [`build`](Self::build) panics if `retention < 1ms`.
     ///
     /// [group-retention]: crate::WorkflowRuntimeBuilder::group_retention
+    #[must_use]
     pub fn group_retention(mut self, retention: Duration) -> Self {
         self.group_retention = Some(retention);
         self
@@ -374,6 +382,7 @@ impl JobRunnerBuilder {
 
     /// Override the [`Clock`] the runner reads timestamps from. Defaults to the
     /// queue's clock ([`Queue::clock`]).
+    #[must_use]
     pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = Some(clock);
         self

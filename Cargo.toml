@@ -15,6 +15,7 @@ repository = "https://github.com/micllam/taquba"
 
 [workspace.lints.clippy]
 mod_module_files = "warn"
+return_self_not_must_use = "warn"
 
 [workspace.dependencies]
 taquba = { path = "taquba", version = "0.16.0" }

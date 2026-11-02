@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The setters of `WebhookRequest` and `WebhookWorker` are `#[must_use]`, as the
+  setters of `taquba` are, so the compiler generates a warning for a dropped
+  result.
+
 ## [0.12.0] - 2026-10-29
 
 ### Changed

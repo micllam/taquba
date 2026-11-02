@@ -47,6 +47,7 @@ impl WebhookWorker {
 
     /// Override the request timeout applied to jobs that declare no
     /// [`HEADER_TIMEOUT_MS`] header. Defaults to [`DEFAULT_TIMEOUT`].
+    #[must_use]
     pub fn with_default_timeout(mut self, timeout: Duration) -> Self {
         self.default_timeout = timeout;
         self
@@ -54,6 +55,7 @@ impl WebhookWorker {
 
     /// Override the name of the header that contains [`taquba::JobRecord::id`]
     /// for receiver-side idempotency. Defaults to `Webhook-Id`.
+    #[must_use]
     pub fn with_delivery_id_header(mut self, name: impl Into<String>) -> Self {
         self.delivery_id_header = Some(name.into());
         self
@@ -61,6 +63,7 @@ impl WebhookWorker {
 
     /// Disable the delivery-ID header. Without it, a receiver must deduplicate
     /// retries through its own idempotency mechanism.
+    #[must_use]
     pub fn without_delivery_id_header(mut self) -> Self {
         self.delivery_id_header = None;
         self

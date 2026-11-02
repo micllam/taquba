@@ -183,12 +183,14 @@ impl WebhookRequest {
     }
 
     /// Override the HTTP method, such as `"PUT"` or `"PATCH"`.
+    #[must_use]
     pub fn method(mut self, method: impl Into<String>) -> Self {
         self.method = method.into();
         self
     }
 
     /// Add an HTTP header to send on the outgoing request.
+    #[must_use]
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.insert(name.into(), value.into());
         self
@@ -196,6 +198,7 @@ impl WebhookRequest {
 
     /// Set a per-request timeout. Without it, the reqwest client's default
     /// applies.
+    #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
