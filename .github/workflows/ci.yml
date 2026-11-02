@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_call:
 
+permissions:
+  contents: read
+
 # Supersede an in-flight run when a newer commit lands on the same ref.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
