@@ -1,0 +1,13 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    # The commit of vale-action follows the README of writing-kit, and it
+    # changes with the package version in `.vale.ini`.
+    ignore:
+      - dependency-name: vale-cli/vale-action
