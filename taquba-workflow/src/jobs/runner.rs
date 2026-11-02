@@ -41,10 +41,11 @@ fn run_id_for_key(key: &str) -> RunId {
 
 /// The run payload of `job`: its [`Job::NAME`] and its serialized fields.
 pub(crate) fn job_payload<J: Job>(job: &J) -> Result<Vec<u8>> {
-    Ok(rmp_serde::to_vec_named(&JobPayload {
+    let input = rmp_serde::to_vec_named(job)?;
+    Ok(crate::durable::encode(&JobPayload {
         name: J::NAME.to_string(),
-        input: rmp_serde::to_vec_named(job)?,
-    })?)
+        input,
+    }))
 }
 
 type DispatchFuture<'a> =

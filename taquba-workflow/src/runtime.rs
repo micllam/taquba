@@ -1482,9 +1482,8 @@ impl RuntimeCore {
             outcome: DurableStepOutcome::from(outcome),
             effects: effects.clone(),
         };
-        let bytes = rmp_serde::to_vec_named(&record)?;
         self.memo_store
-            .put_step_output(run_id, step_number, step_payload, &bytes)
+            .put_step_output(run_id, step_number, step_payload, &durable::encode(&record))
             .await
     }
 
