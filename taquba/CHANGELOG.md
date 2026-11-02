@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `QueueView::list_jobs` and `QueueView::kv_scan` allocate for the entries they
+  read, so a `limit` such as `usize::MAX` returns its page, where it panicked
+  with a capacity overflow or aborted the process.
+
 ## [0.16.0] - 2026-10-29
 
 ### Added

@@ -195,7 +195,7 @@ impl QueueView {
         };
 
         // The scanned key of the last row is the cursor of the next page.
-        let mut jobs = Vec::with_capacity(limit);
+        let mut jobs = Vec::new();
         let mut last_key = None;
         let mut more = false;
         let mut iter = self
@@ -410,7 +410,7 @@ impl QueueView {
         if limit == 0 {
             return Ok(empty);
         }
-        let mut entries = Vec::with_capacity(limit);
+        let mut entries = Vec::new();
         let mut more = false;
         let mut iter = self
             .handle
@@ -596,6 +596,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(below_third, expected[3..]);
+    }
+
+    #[tokio::test]
+    async fn page_limit_bounds_a_page_without_preallocating() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let id = q.enqueue("alpha", b"x".to_vec()).await.unwrap();
+        q.kv_put(b"p/0", b"v").await.unwrap();
+
+        let jobs = q
+            .view()
+            .list_jobs("alpha", JobStatus::Pending, None, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(jobs.jobs.len(), 1);
+        assert_eq!(jobs.jobs[0].id, id);
+        assert_eq!(jobs.next_cursor, None);
+
+        let page = q
+            .view()
+            .kv_scan(b"p/", .., KvOrder::Ascending, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert!(!page.more);
     }
 
     #[tokio::test]
