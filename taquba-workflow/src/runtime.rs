@@ -5308,7 +5308,7 @@ mod tests {
                     .get(&group_member_kv_key(&rid("g"), "m"))
                     .await?
                     .expect("the member record is written with the submission");
-                let member: DurableMember = rmp_serde::from_slice(&record).unwrap();
+                let member: DurableMember = durable::decode(&record).unwrap();
                 self.pending_seen
                     .lock()
                     .unwrap()

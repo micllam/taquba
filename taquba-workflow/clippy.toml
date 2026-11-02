@@ -1,0 +1,4 @@
+disallowed-methods = [
+    { path = "rmp_serde::from_slice", reason = "decode a durable record through the functions of `durable.rs`" },
+    { path = "rmp_serde::from_read", reason = "decode a durable record through the functions of `durable.rs`" },
+]

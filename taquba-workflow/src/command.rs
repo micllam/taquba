@@ -295,6 +295,10 @@ impl CommandWorker {
 const SCAN_PAGE: usize = 256;
 
 /// The command of `payload`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a command is a job payload, and its failure dead-letters the job"
+)]
 fn decode(payload: &[u8]) -> Result<Command, rmp_serde::decode::Error> {
     rmp_serde::from_slice(payload)
 }

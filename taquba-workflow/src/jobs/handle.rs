@@ -171,8 +171,9 @@ pub(crate) fn decode_end<J: Job>(
     if let Some(outcome) = outcome
         && outcome.status == TerminalStatus::Succeeded
     {
-        let output = outcome.result.unwrap_or_default();
-        return Ok(Ok(rmp_serde::from_slice(&output)?));
+        #[expect(clippy::disallowed_methods, reason = "a decode of a caller type")]
+        let output = rmp_serde::from_slice(&outcome.result.unwrap_or_default())?;
+        return Ok(Ok(output));
     }
     let message = termination.error.unwrap_or_else(|| {
         match termination.status {

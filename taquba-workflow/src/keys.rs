@@ -364,9 +364,9 @@ mod tests {
             );
         }
         assert!(RunId::new("a".repeat(MAX_RUN_ID_LEN)).is_ok());
-        assert!(rmp_serde::from_slice::<RunId>(&rmp_serde::to_vec("").unwrap()).is_err());
+        assert!(crate::durable::decode::<RunId>(&rmp_serde::to_vec("").unwrap()).is_err());
         assert_eq!(
-            rmp_serde::from_slice::<RunId>(&rmp_serde::to_vec("run-1").unwrap()).unwrap(),
+            crate::durable::decode::<RunId>(&rmp_serde::to_vec("run-1").unwrap()).unwrap(),
             "run-1"
         );
     }

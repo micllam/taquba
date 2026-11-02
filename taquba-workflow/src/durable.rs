@@ -38,6 +38,7 @@ pub(crate) fn encode<T: Serialize>(record: &T) -> Vec<u8> {
 
 /// Decode one of the crate's own records. A record that does not decode is
 /// [`Error::Deserialization`](crate::Error::Deserialization).
+#[expect(clippy::disallowed_methods, reason = "a decode of a durable record")]
 pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     Ok(rmp_serde::from_slice(bytes)?)
 }
@@ -45,6 +46,7 @@ pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 /// Decode a record whose absence means that the work runs again. A record that
 /// fails to decode is logged, as the `record` kind of the entity `id`, and
 /// reported as absent.
+#[expect(clippy::disallowed_methods, reason = "a decode of a durable record")]
 pub(crate) fn decode_or_absent<T: DeserializeOwned>(
     bytes: &[u8],
     record: &'static str,

@@ -85,6 +85,7 @@ async fn run_typed<J: Job>(
     step: &Step,
     input: Vec<u8>,
 ) -> std::result::Result<StepOutcome, StepError> {
+    #[expect(clippy::disallowed_methods, reason = "a decode of a caller type")]
     let input: J = rmp_serde::from_slice(&input)
         .map_err(|err| StepError::permanent(format!("invalid input for `{}`: {err}", J::NAME)))?;
     let output = {
@@ -132,6 +133,10 @@ pub(crate) struct Dispatch {
 
 impl StepRunner for Dispatch {
     async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a job payload, whose failure fails the step permanently"
+        )]
         let JobPayload { name, input } = rmp_serde::from_slice(&step.payload).map_err(|err| {
             StepError::permanent(format!(
                 "job {} has a malformed payload: {err}",

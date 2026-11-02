@@ -270,10 +270,7 @@ mod tests {
                 Error::Serialization(rmp_serde::to_vec_named(&BadSerialize).unwrap_err()),
                 true,
             ),
-            (
-                Error::Deserialization(rmp_serde::from_slice::<u32>(b"").unwrap_err()),
-                true,
-            ),
+            (crate::durable::decode::<u32>(b"").unwrap_err(), true),
             (Error::DuplicateMemberKey("k".into()), true),
             (Error::GroupMismatch(rid("b")), true),
             (Error::GroupNotFound(rid("b")), true),
