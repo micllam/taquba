@@ -23,7 +23,7 @@
 //! A claimed job occupies one key: `Claimed` contains the record at a key
 //! stable for the life of the claim. The lease itself, the current expiry and
 //! the claim id, is process state kept in `crate::lease_registry` and never
-//! stored: a lease of a process that no longer runs is void, so every claimed
+//! stored: a lease of a process that no longer runs is lost, so every claimed
 //! record found at open is re-queued and a renewal does not write durable
 //! state.
 //!

@@ -334,7 +334,7 @@ impl Queue {
         });
         crate::claim_cursor::restore_cursor_state(&core).await?;
         // A claimed record found at open belongs to a process that no longer
-        // owns the store, so its claim is void and the job is re-queued
+        // owns the store, so its claim is lost and the job is re-queued
         // immediately. Runs after `restore_cursor_state` so each re-queued
         // job's pending insert is recorded against the restored bound.
         core.requeue_interrupted_claims().await?;

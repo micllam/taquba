@@ -195,7 +195,7 @@ impl QueueCore {
     /// Re-queue every claimed record found in the store. Called at open, before
     /// workers or the reaper start: the queue is single-process and
     /// single-writer, so a claim present at open belongs to a process that no
-    /// longer runs and is void. The requeue itself does not consume an attempt.
+    /// longer runs and is lost. The requeue itself does not consume an attempt.
     /// Attempts count claims, so `max_attempts` still bounds a crash-looping
     /// job.
     ///

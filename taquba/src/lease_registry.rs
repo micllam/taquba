@@ -4,7 +4,7 @@
 //! Lease state is process state and is never durable. The queue is
 //! single-writer and single-process, so every path that consults or changes a
 //! lease (claim, renewal, settlement, the reaper) runs in the same process as
-//! this registry, and a lease held by a process that no longer runs is void by
+//! this registry, and a lease held by a process that no longer runs is lost by
 //! definition: the store's only durable record of a claim is the claimed job
 //! record, and every claimed record found at open is re-queued before workers
 //! start. Renewal is therefore a memory operation without a durable write.
