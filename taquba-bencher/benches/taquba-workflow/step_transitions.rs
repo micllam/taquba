@@ -5,7 +5,7 @@
 // unchanged, so the measured cost is the runtime's own overhead: persisting the
 // step transition, enqueuing the next step and the claim / dispatch round trip
 // back into the runner. The transition latency of step k is the time between
-// step k-1 and step k of the same run completing.
+// the starts of step k-1 and step k of the same run in the runner.
 //
 // Parameters (env vars, all optional).
 //   N_RUNS                concurrent workflow runs (default 100).
@@ -32,9 +32,10 @@
 //
 // Output (stdout): CSV with header
 // `window_sec,n_steps,transition_p50_us,transition_p99_us`, one row per second,
-// counting step completions in that second and the distribution of transition
-// latencies that ended in it. A summary (steps/s, run end-to-end percentiles)
-// goes to stderr so stdout stays a clean data stream.
+// counting step starts in that second and the distribution of transition
+// latencies that ended in it. A summary goes to stderr so stdout stays a clean
+// data stream: the steps per second and the percentiles of the time from the
+// submission of a run to the start of its terminal step.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -47,7 +48,8 @@ use taquba_workflow::{
     TerminalStatus, WorkflowRuntime,
 };
 
-/// Step completion sample: (elapsed_us, run_idx, step_number).
+/// Step start sample, recorded when the runner receives the step: (elapsed_us,
+/// run_idx, step_number).
 type StepSample = (u64, u32, u32);
 
 struct BenchRunner {

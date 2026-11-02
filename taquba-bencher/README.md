@@ -300,11 +300,12 @@ For `step_transitions`:
 window_sec,n_steps,transition_p50_us,transition_p99_us
 ```
 
-One row per second. `n_steps` counts step completions in that second. The
-percentile columns describe the transition latencies that ended in it, in
-microseconds, where the transition latency of step k is the time between step
-k-1 and step k of the same run completing. A summary (steps/s, run end-to-end
-percentiles) prints to stderr.
+One row per second. `n_steps` counts step starts in that second. The percentile
+columns describe the transition latencies that ended in it, in microseconds. The
+transition latency of step k is the time between the starts of step k-1 and step
+k of the same run in the runner. A summary prints to stderr: the steps per
+second and the percentiles of the time from the submission of a run to the start
+of its terminal step.
 
 For `group_throughput` and `resume_replay`:
 
