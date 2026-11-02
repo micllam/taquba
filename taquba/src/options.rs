@@ -40,7 +40,9 @@ pub const DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD: usize = 256 * 1024;
 pub struct QueueConfig {
     /// Maximum delivery attempts before a job is dead-lettered. Attempts count
     /// claims: a job interrupted by a process restart is requeued at the next
-    /// open, and its next claim consumes an attempt.
+    /// open, and its next claim consumes an attempt. The producer of a job that
+    /// can outlive several hard restarts should raise its limit with
+    /// [`EnqueueOptions::max_attempts`].
     pub max_attempts: u32,
     /// How long a claimed job's lease lasts. Used by
     /// [`Queue::claim_next`](crate::Queue::claim_next).

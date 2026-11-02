@@ -405,7 +405,8 @@
 //! crash recovery happens at open, and lease expiry detects a delivery that
 //! stops progressing while the process lives. A job interrupted this way
 //! consumes one attempt at its next claim, so `max_attempts` also counts hard
-//! restarts of a long job.
+//! restarts of a long job. The producer of a job that can outlive several hard
+//! restarts should raise its limit with [`EnqueueOptions::max_attempts`].
 //!
 //! A second process that opens the store fences this one, and its open
 //! re-queues the jobs claimed here. SlateDB detects the fence at the next write
