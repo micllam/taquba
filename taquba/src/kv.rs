@@ -140,13 +140,15 @@ impl<K: AsRef<[u8]>> KvRange for (Bound<K>, Bound<K>) {
 /// [`QueueView::kv_scan`](crate::QueueView::kv_scan).
 #[derive(Debug, Clone)]
 pub struct KvPage {
-    /// Entries on this page as `(key, value)` pairs, in ascending byte order of
-    /// the keys. Keys are in the caller namespace, without the internal user
-    /// key tag.
+    /// Entries on this page as `(key, value)` pairs, in the [`KvOrder`] of the
+    /// scan. Keys are in the caller namespace, without the internal user key
+    /// tag.
     pub entries: Vec<(Vec<u8>, Bytes)>,
     /// Whether an entry within the range followed the last entry of this page
-    /// at scan time. The listing continues with the range from
-    /// `Bound::Excluded` of that entry's key to the same end.
+    /// at scan time. An ascending listing continues with the range from
+    /// `Bound::Excluded` of that entry's key to the same end. A descending
+    /// listing continues with the range from the same start to
+    /// `Bound::Excluded` of that key.
     pub more: bool,
 }
 

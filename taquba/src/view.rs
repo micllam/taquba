@@ -381,12 +381,12 @@ impl QueueView {
     /// within the prefix. The bounds of `range`, a [`KvRange`], are keys in the
     /// caller namespace: `key..` begins at `key`, and
     /// `(Bound::Excluded(key), Bound::Unbounded)` begins after it, which
-    /// continues a listing from the last key of a page. The page contains the
-    /// keys within the prefix that the range contains. A bound outside the
-    /// prefix is correct as given, and a range without such a key returns an
-    /// empty page. The listing is not a snapshot, so an entry written or
-    /// deleted between page reads is missed or observed depending on the
-    /// position of its key.
+    /// continues an ascending listing from the last key of a page. The page
+    /// contains the keys within the prefix that the range contains. A bound
+    /// outside the prefix is correct as given, and a range without such a key
+    /// returns an empty page. The listing is not a snapshot, so an entry
+    /// written or deleted between page reads is missed or observed depending on
+    /// the position of its key.
     ///
     /// Only caller-namespace entries are returned, and Taquba's internal key
     /// spaces are never visible here. This is the enumeration and export
