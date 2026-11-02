@@ -817,7 +817,7 @@ async fn a_queue_without_the_in_process_compactor_leaves_the_compactor_epoch_at_
 #[tokio::test]
 async fn test_dead_letter_skips_attempts_check() {
     // dead_letter() moves a job claimed -> dead unconditionally,
-    // without bumping attempts or honouring max_attempts.
+    // without bumping attempts or checking max_attempts.
     let q = Queue::open_with_options(
         make_store(),
         "test",

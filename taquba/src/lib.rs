@@ -129,7 +129,7 @@
 //! ```
 //!
 //! Pass any future as the shutdown signal, such as `tokio::signal::ctrl_c()` or
-//! a oneshot. Shutdown is honoured at safe points: between jobs and during idle
+//! a oneshot. The worker stops at safe points: between jobs and during idle
 //! waits. In-flight jobs always finish at shutdown, so leases are never
 //! abandoned to the reaper. The drain does not have an internal bound, so the
 //! process supervisor's kill timeout bounds a restart.

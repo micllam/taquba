@@ -1075,7 +1075,7 @@ impl RuntimeCore {
             };
             if job.status == JobStatus::Dead {
                 // Dead-lettered by the queue outside the worker. Reconciliation
-                // terminates the run and the request is not honoured.
+                // terminates the run, and the request does not apply.
                 return Ok(CancelRunOutcome::NotActive);
             }
             let claimed = ClaimedStep::parse(&job)?;
@@ -4358,7 +4358,7 @@ mod tests {
     /// Yield up to `iters` times waiting for `cond` to become true. Used in
     /// sweeper tests to let the spawned sweep task make progress between
     /// `tokio::time::advance` and the assertion. Returns true if the condition
-    /// held within the budget.
+    /// held within `iters` yields.
     async fn yield_until<F, Fut>(iters: usize, mut cond: F) -> bool
     where
         F: FnMut() -> Fut,
@@ -5210,7 +5210,7 @@ mod tests {
         assert_eq!(
             runtime.cancel(&rid("hung"), None).await.unwrap(),
             CancelRunOutcome::NotActive,
-            "the request is not honoured"
+            "the cancel does not apply to a dead run"
         );
         assert_eq!(
             runtime.status(&rid("hung")).await.unwrap().unwrap().state,

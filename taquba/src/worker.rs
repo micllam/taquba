@@ -180,8 +180,8 @@ pub trait Worker: Send + Sync {
 /// - `async move { rx.await.ok(); }` - exit when a oneshot fires
 /// - `std::future::pending::<()>()` - never exit
 ///
-/// Shutdown is only honoured at safe points: between jobs and while the queue
-/// is idle. An in-flight `process` call always finishes, so a graceful restart
+/// The worker stops only at safe points: between jobs and while the queue is
+/// idle. An in-flight `process` call always finishes, so a graceful restart
 /// does not leave the claim to the reaper, which consumes a retry. The drain
 /// does not have an internal bound, and the process supervisor's kill timeout
 /// bounds it. A killed process is recovered at the next open, where every
@@ -407,9 +407,8 @@ async fn process_and_settle<W: Worker>(
 }
 
 /// Whether the pinned shutdown future is resolved, polled without waiting. Used
-/// to honour shutdown between jobs without putting `process` inside a
-/// `select!`, which cancels it when the shutdown signal arrives while a claim
-/// is in flight.
+/// to stop between jobs without putting `process` inside a `select!`, which
+/// cancels it when the shutdown signal arrives while a claim is in flight.
 fn check_shutdown<F: Future<Output = ()>>(shutdown: std::pin::Pin<&mut F>) -> bool {
     shutdown.now_or_never().is_some()
 }

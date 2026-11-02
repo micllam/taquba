@@ -779,7 +779,7 @@ impl Queue {
     /// Report failure. Re-queues if attempts < max_attempts, otherwise
     /// dead-letters.
     ///
-    /// Re-queued jobs honour the queue's `retry_backoff_base` and
+    /// The requeue applies the queue's `retry_backoff_base` and
     /// `retry_backoff_max`: when the backoff is non-zero, the job waits in the
     /// scheduled key space and the background scheduler promotes it once the
     /// delay elapses. With zero backoff the job goes straight back to pending.

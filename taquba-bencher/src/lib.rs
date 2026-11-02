@@ -99,7 +99,7 @@ fn store_with_latency(latency_ms: u64, jitter_ms: u64) -> Arc<dyn ObjectStore> {
     }
 }
 
-/// Install a stderr tracing subscriber honouring `RUST_LOG` (for example
+/// Install a stderr tracing subscriber filtered by `RUST_LOG` (for example
 /// `RUST_LOG=taquba=warn`) so queue warnings such as transaction-conflict
 /// retries are visible during runs.
 pub fn init_tracing() {

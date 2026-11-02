@@ -216,12 +216,11 @@ async fn main() -> taquba::Result<()> {
 ```
 
 Pass any future as the shutdown signal, such as `tokio::signal::ctrl_c()` or a
-oneshot. Shutdown is honoured at safe points: between jobs and during idle
-waits. In-flight jobs always finish at shutdown, so leases are never abandoned
-to the reaper. The drain does not have an internal bound, so the process
-supervisor's kill timeout bounds a restart. See
-[`examples/worker.rs`](examples/worker.rs) for a full setup including retries
-and dead-letter inspection.
+oneshot. The worker stops at safe points: between jobs and during idle waits.
+In-flight jobs always finish at shutdown, so leases are never abandoned to the
+reaper. The drain does not have an internal bound, so the process supervisor's
+kill timeout bounds a restart. See [`examples/worker.rs`](examples/worker.rs)
+for a full setup including retries and dead-letter inspection.
 
 Settlement failures do not stop the loop: when a job outlives its lease and the
 reaper requeues it, the late acknowledgement fails with `ClaimLost`. The loop

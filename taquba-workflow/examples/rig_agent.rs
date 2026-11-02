@@ -103,7 +103,7 @@ const STEP_RESEARCH: u32 = 0;
 const STEP_WRITE: u32 = 1;
 
 // GPT-5-class reasoning models count *hidden* reasoning tokens against the same
-// budget as visible output, so reasoning can consume a small `max_tokens` (such
+// limit as visible output, so reasoning can consume a small `max_tokens` (such
 // as 512) before any text is emitted, and the visible message is then empty.
 // 4096 leaves comfortable headroom for both that case and Claude Haiku.
 const MAX_TOKENS: u64 = 4096;
@@ -152,7 +152,8 @@ impl StepRunner for RigRunner {
                 if findings.trim().is_empty() {
                     return Err(StepError::transient(
                         "research step returned empty findings (model may have \
-                         exhausted its token budget on hidden reasoning); retrying",
+                         used its whole `max_tokens` limit on hidden reasoning); \
+                         retrying",
                     ));
                 }
                 println!("[step 0] research findings: {findings}");
@@ -240,7 +241,7 @@ async fn write(
 }
 
 /// Decide which provider to use:
-///   1. If `LLM_PROVIDER` is set, honour it (and require the matching key).
+///   1. If `LLM_PROVIDER` is set, use it (and require the matching key).
 ///   2. Otherwise, prefer `ANTHROPIC_API_KEY`, then `OPENAI_API_KEY`.
 fn select_provider() -> Result<Provider> {
     let explicit = std::env::var("LLM_PROVIDER").ok();

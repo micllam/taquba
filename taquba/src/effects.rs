@@ -26,9 +26,9 @@ pub struct EnqueueRequest {
     /// Job payload.
     #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
-    /// Per-job options. `run_at`, `dedup_key`, `priority` and `id_override` are
-    /// all honoured exactly as in
-    /// [`Queue::enqueue_with`](crate::Queue::enqueue_with).
+    /// Per-job options. The commit applies `run_at`, `dedup_key`, `priority`
+    /// and `id_override` as [`Queue::enqueue_with`](crate::Queue::enqueue_with)
+    /// does.
     pub options: EnqueueOptions,
 }
 
