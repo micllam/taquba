@@ -223,9 +223,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut e2e: Vec<u64> = Vec::with_capacity(n_runs);
     let submit_at_for: std::collections::HashMap<u32, u64> = submit_times.into_iter().collect();
     for (run_idx, mut steps) in per_run.into_iter().enumerate() {
-        steps.sort_unstable();
         // Retried steps record one sample per attempt, and the bench keeps the
-        // last.
+        // last: the sort puts it first among the samples of its step.
+        steps.sort_unstable_by_key(|&(step_number, us)| (step_number, std::cmp::Reverse(us)));
         steps.dedup_by_key(|(step_number, _)| *step_number);
         for window in steps.windows(2) {
             let ((_, prev_us), (_, cur_us)) = (window[0], window[1]);
