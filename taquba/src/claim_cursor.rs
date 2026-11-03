@@ -316,7 +316,7 @@ pub(crate) async fn persist_cursor_state(core: &QueueCore) -> Result<()> {
     if states.is_empty() {
         return Ok(());
     }
-    let txn = core.db.begin(IsolationLevel::Snapshot).await?;
+    let txn = core.db.begin(IsolationLevel::Snapshot)?;
     for (queue, state) in states {
         txn.put(cursor_key(&queue), encode(&state))?;
     }
@@ -339,7 +339,7 @@ pub(crate) async fn persist_cursor_state(core: &QueueCore) -> Result<()> {
 /// of the prefix is always correct, and the loss of the record adds exactly one
 /// such scan at the next open.
 pub(crate) async fn restore_cursor_state(core: &QueueCore) -> Result<()> {
-    let txn = core.db.begin(IsolationLevel::Snapshot).await?;
+    let txn = core.db.begin(IsolationLevel::Snapshot)?;
     let mut records = Vec::new();
     {
         let mut iter = txn.scan_prefix(tag_prefix(KeyTag::Cursor), ..).await?;

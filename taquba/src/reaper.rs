@@ -376,7 +376,7 @@ impl QueueCore {
         drop(iter);
 
         for batch in expired.chunks(INBOX_SWEEP_BATCH) {
-            let txn = self.begin().await?;
+            let txn = self.begin()?;
             for (key, _) in batch {
                 txn.delete(key)?;
                 if let Some((queue, id)) = parse_inbox_expiry_entry(key) {
@@ -411,7 +411,7 @@ impl QueueCore {
         job: &JobRecord,
         payload_refs: &mut Vec<String>,
     ) -> Result<bool> {
-        let mut txn = self.begin().await?;
+        let mut txn = self.begin()?;
         let existed = txn.get(key).await?.is_some();
         if existed {
             txn.stage_remove(key, job)?;

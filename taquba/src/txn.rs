@@ -289,9 +289,9 @@ pub(crate) enum Attempt<T> {
 
 impl QueueCore {
     /// Begin a `Snapshot` transaction of the store.
-    pub(crate) async fn begin(&self) -> Result<Txn> {
+    pub(crate) fn begin(&self) -> Result<Txn> {
         Ok(Txn {
-            txn: self.db.begin(IsolationLevel::Snapshot).await?,
+            txn: self.db.begin(IsolationLevel::Snapshot)?,
             notes: CommitNotes::default(),
             stats: HashMap::new(),
         })
@@ -348,7 +348,7 @@ impl QueueCore {
         Fut: Future<Output = Result<(Txn, Attempt<T>)>>,
     {
         loop {
-            match body(self.begin().await?).await? {
+            match body(self.begin()?).await? {
                 (_, Attempt::Abort(value)) => return Ok(value),
                 (txn, Attempt::Commit(value)) => match self.commit(txn, durability).await? {
                     Commit::Committed => return Ok(value),
@@ -523,12 +523,12 @@ mod tests {
         );
         let job = JobRecord::new_pending("j".into(), qn("work"), b"p".to_vec(), 3, 0, 1);
 
-        let mut txn = core.begin().await.unwrap();
+        let mut txn = core.begin().unwrap();
         txn.insert_job(&job).unwrap();
         drop(txn);
         assert!(core.claim_cursor.known_empty("work"));
 
-        let mut txn = core.begin().await.unwrap();
+        let mut txn = core.begin().unwrap();
         txn.insert_job(&job).unwrap();
         let outcome = core.commit(txn, Durability::Awaited).await.unwrap();
         assert_eq!(outcome, Commit::Committed);

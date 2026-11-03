@@ -310,7 +310,7 @@ impl QueueView {
                 Ok(Some((index_key, JobRecord::decode(&current_key, &bytes)?)))
             }
             Handle::Writer(db) => {
-                let txn = db.begin(IsolationLevel::Snapshot).await?;
+                let txn = db.begin(IsolationLevel::Snapshot)?;
                 let found = get_indexed_job(&txn, id).await?;
                 txn.rollback();
                 Ok(found.map(|(index_key, _, job)| (index_key, job)))

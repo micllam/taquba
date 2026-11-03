@@ -36,7 +36,7 @@ impl QueueCore {
         // The empty checks report from in-process state, which outlives a close
         // of the store. A transaction reports the close.
         if self.closed.is_cancelled() {
-            drop(self.db.begin(IsolationLevel::Snapshot).await?);
+            drop(self.db.begin(IsolationLevel::Snapshot)?);
         }
         // Empty check before taking the claim lock: a queue known to be empty
         // is reported from in-process state, without contention with claims
@@ -83,7 +83,7 @@ impl QueueCore {
             if scan.known_empty {
                 return Ok(Vec::new());
             }
-            let mut txn = self.begin().await?;
+            let mut txn = self.begin()?;
 
             let mut candidates = Vec::new();
             // Set when the scan ran out of pending keys before filling the

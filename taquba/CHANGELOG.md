@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Updated slatedb from 0.17.0 to 0.18.0. The `object_store` re-export remains
+  object_store 0.14.2. A store written with 0.16.0 opens without a migration
+  step.
+
 ### Fixed
 
 - `QueueView::list_jobs` and `QueueView::kv_scan` allocate for the entries they
