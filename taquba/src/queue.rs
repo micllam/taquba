@@ -179,6 +179,22 @@ pub(crate) fn backoff_delay(attempts: u32, base: Duration, max: Duration) -> Dur
 /// then call [`Queue::close`] to flush state and shut down background tasks
 /// cleanly.
 ///
+/// An open re-queues every job that a previous process left claimed. Crash
+/// recovery therefore happens at open, and lease expiry detects a delivery that
+/// stops progressing while the process lives.
+///
+/// A second process that opens the store fences this one, and its open
+/// re-queues the jobs claimed here. SlateDB detects the fence at the next write
+/// of the fenced process or at its next manifest poll, whichever comes first.
+/// The poll runs every second.
+///
+/// Once the store closes, by a fence or otherwise, every background task ends.
+/// The queue fires the cancellation token of every claim and refuses each
+/// renewal with [`Error::ClaimLost`]. The worker loops drop the `process`
+/// future of each in-flight job without a settlement and return the store's
+/// error. A handler stops at its next await point, and blocking code or a task
+/// that it spawned continues to run.
+///
 /// # Background tasks
 ///
 /// Background tasks run while the queue and its store are open:
@@ -1160,8 +1176,8 @@ impl Queue {
         self.core.inbox.as_ref().map(|inbox| inbox.retention)
     }
 
-    /// Shut down the background reaper and scheduler, persist each queue's
-    /// claim-scan state, then close the underlying database.
+    /// Shut down the background tasks, persist each queue's claim-scan state,
+    /// then close the underlying database.
     ///
     /// The persisted state lets the next open resume claims at the recorded
     /// bound without a scan of the tombstone band left by previously claimed

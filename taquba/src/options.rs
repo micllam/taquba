@@ -211,6 +211,10 @@ pub struct OpenOptions {
     /// record, and claims fetch the payload from the object store. Defaults to
     /// [`DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD`]. `None` disables offloading, and
     /// every payload stays inline regardless of size.
+    ///
+    /// The queue deletes the object when the record leaves the queue: at the
+    /// ack, or by the retention sweep of [`QueueConfig::keep_done_jobs`], at a
+    /// cancel and by the retention sweep of [`QueueConfig::dead_retention`].
     pub payload_offload_threshold: Option<usize>,
     /// Object store for offloaded payloads. `None` (the default) uses the
     /// object store the queue is opened on. Configuring a separate store places

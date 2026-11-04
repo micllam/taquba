@@ -1,16 +1,83 @@
 //! A durable, single-process task queue for Rust **without a stateful service
 //! to operate**. Queue state lives directly in the application's object
-//! storage, and compute is stateless and replaceable. Because all state shares
-//! one transactional store, queue operations compose atomically: a single
-//! transaction can acknowledge a job, enqueue its follow-ups and update
-//! caller-owned KV state.
+//! storage, and compute is stateless and replaceable.
 //!
-//! Built on [SlateDB] and the [`object_store`] crate (local disk, S3, GCS,
-//! Azure Blob and MinIO, among others). All producers and workers for a given
-//! store run inside one process and share an `Arc<Queue>`. Use Taquba for
-//! durable background jobs whose state persists across node loss, ephemeral
-//! disks and region failures, without operating a queue server or a separate
-//! state layer (typically Postgres).
+//! > The foundation of the [Taquba ecosystem](https://github.com/micllam/taquba).
+//! > The workspace README describes the durable-execution workflow runtime,
+//! > cron, jobs and webhooks crates that build on this queue.
+//!
+//! Built on [SlateDB] and the [`object_store`] crate. Use Taquba for durable
+//! background jobs whose state persists across node loss, ephemeral disks and
+//! region failures, without operating a queue server or a database server.
+//!
+//! # Quick start
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use std::time::Duration;
+//! use taquba::{Queue, object_store::memory::InMemory};
+//!
+//! # async fn run() -> taquba::Result<()> {
+//! let q = Queue::open(Arc::new(InMemory::new()), "demo").await?;
+//!
+//! q.enqueue("email", b"alice@example.com".to_vec()).await?;
+//!
+//! if let Some(job) = q.claim("email", Duration::from_secs(30)).await? {
+//!     // ... do the work ...
+//!     q.ack(&job).await?;
+//! }
+//!
+//! q.close().await
+//! # }
+//! ```
+//!
+//! `examples/quickstart.rs` is a runnable version, and `examples/worker.rs`
+//! runs the worker loop with retries and dead-letter inspection.
+//!
+//! # Cargo features
+//!
+//! The in-memory and local-disk stores work without a feature flag. A cloud
+//! store requires the feature of its backend:
+//!
+//! ```bash
+//! cargo add taquba --features aws    # S3 / MinIO
+//! cargo add taquba --features gcp    # Google Cloud Storage
+//! cargo add taquba --features azure  # Azure Blob
+//! ```
+//!
+//! [`open_url`] opens the store of a URL such as `s3://bucket/prefix`, with the
+//! provider options from the environment.
+//!
+//! The optional `metrics` feature emits throughput, dead-rate and latency
+//! metrics through the [`metrics`](https://docs.rs/metrics) facade, and
+//! SlateDB's storage metrics through the same recorder. The crate does not
+//! include an exporter, and the metrics are no-ops until the host process
+//! installs a recorder. Spans and log events go through
+//! [`tracing`](https://docs.rs/tracing), with or without the feature.
+//!
+//! # Job lifecycle
+//!
+//! ```text
+//! enqueue at a future run_at    enqueue
+//!     │                            │
+//!     ▼      run_at, or a wake     ▼       claim             ack
+//! scheduled ──────────────────▶ pending ────────▶ claimed ──────────▶ done
+//!     ▲                            ▲                 │
+//!     │                            └─────────────────┤ lease expiry
+//!     └──────────────────────────────────────────────┤ nack, retried later
+//!                                                    └──────────────▶ dead
+//!                                                      nack at the
+//!                                                      attempt limit
+//! ```
+//!
+//! A scheduled job waits until its `run_at`, unless a call or a signal to its
+//! id wakes it earlier. A worker keeps a claimed job under a lease, and the job
+//! returns to pending if the lease expires before the settlement. Delivery is
+//! therefore at least once, so a worker must be idempotent.
+//!
+//! A settlement commits atomically with its effects, such as follow-up jobs and
+//! writes to the caller's state. One process owns a store and commits every
+//! transition, and other processes send their requests through an inbox.
 //!
 //! # When to choose Taquba
 //!
@@ -49,410 +116,22 @@
 //!   process owns each store. This caps compute that runs in the
 //!   worker process itself at one node. Steps that call remote services
 //!   scale with async concurrency inside the single process.
-//! - Latency-sensitive paths: every durable transition is an
-//!   object-store write, so end-to-end latency is floored by a PUT
-//!   round trip. [`OpenOptions::wal_object_store`] places the
-//!   write-ahead log on a separate store. A store with lower write
-//!   latency lowers that floor while compacted state stays on the
-//!   primary store.
+//! - Latency-sensitive paths: every durable transition is an object-store
+//!   write, so a PUT round trip bounds the end-to-end latency from below. A
+//!   write-ahead log on a store with lower write latency
+//!   ([`OpenOptions::wal_object_store`]) lowers that bound.
 //! - Short jobs at high volume: throughput is bound by the durable
 //!   commit rate, and sub-millisecond jobs pay the durability cost on
 //!   every transition.
 //!
 //! Measured performance numbers, with the environment and commit that produced
-//! them, are recorded in `RESULTS.md` in the source repository.
+//! them, are recorded in `taquba-bencher/RESULTS.md` in the source repository.
 //!
-//! # Quick start
+//! # Stability
 //!
-//! ```no_run
-//! use std::sync::Arc;
-//! use std::time::Duration;
-//! use taquba::{Queue, object_store::memory::InMemory};
-//!
-//! # async fn run() -> taquba::Result<()> {
-//! let q = Queue::open(Arc::new(InMemory::new()), "demo").await?;
-//!
-//! q.enqueue("email", b"alice@example.com".to_vec()).await?;
-//!
-//! if let Some(job) = q.claim("email", Duration::from_secs(30)).await? {
-//!     // ... do the work ...
-//!     q.ack(&job).await?;
-//! }
-//!
-//! q.close().await
-//! # }
-//! ```
-//!
-//! See `examples/quickstart.rs` for a runnable version.
-//!
-//! # Job lifecycle
-//!
-//! ```text
-//! pending → claimed → done
-//!               ↘
-//!            failed → (backoff → pending | dead-letter)
-//! ```
-//!
-//! - At-least-once delivery: workers must be idempotent.
-//! - Lease-based claims: a background reaper requeues abandoned jobs.
-//! - Exponential retry backoff via the scheduled key space (configurable per
-//!   queue, see [`QueueConfig`]).
-//! - Scheduled jobs become pending at their `run_at`, or earlier via the
-//!   targeted [`Queue::wake_scheduled`].
-//! - A scheduled job enqueued with [`EnqueueOptions::signal_wait`] waits for a
-//!   signal: [`Queue::signal`] wakes it by its id with a payload.
-//! - Bounded dead-letter retention with paginated inspection.
-//!
-//! # Worker loop
-//!
-//! Production workers rarely call [`Queue::claim`] and [`Queue::ack`] directly:
-//! implement [`Worker`] and let [`run_worker`] handle the claim / ack / nack
-//! loop, retries and graceful shutdown:
-//!
-//! ```no_run
-//! use taquba::{JobRecord, LeaseHandle, Worker, WorkerError};
-//!
-//! struct EmailWorker;
-//!
-//! impl Worker for EmailWorker {
-//!     async fn process(
-//!         &self,
-//!         job: &JobRecord,
-//!         _lease: &LeaseHandle,
-//!     ) -> Result<(), WorkerError> {
-//!         let to = std::str::from_utf8(&job.payload)?;
-//!         # async fn send_email(_to: &str) -> Result<(), WorkerError> { Ok(()) }
-//!         send_email(to).await?;
-//!         Ok(())
-//!     }
-//! }
-//! ```
-//!
-//! Pass any future as the shutdown signal, such as `tokio::signal::ctrl_c()` or
-//! a oneshot. The worker stops at safe points: between jobs and during idle
-//! waits. In-flight jobs always finish at shutdown, so leases are never
-//! abandoned to the reaper. The drain does not have an internal bound, so the
-//! process supervisor's kill timeout bounds a restart.
-//!
-//! Settlement failures do not stop the loop: when a job outlives its lease and
-//! the reaper requeues it, the late acknowledgement fails with
-//! [`Error::ClaimLost`]. The loop logs the failure and continues, and the
-//! redelivered attempt settles the job. Errors on the claim path still stop the
-//! loop. A long-running [`Worker::process`] can avoid the requeue by extending
-//! its own lease through the [`LeaseHandle`] it receives: call
-//! [`LeaseHandle::ensure_at_least`] at progress points, or once with a slow
-//! call's timeout before issuing it. The claim stays with the loop, which
-//! settles the job when `process` returns. See `examples/long_running.rs` for
-//! both patterns.
-//!
-//! A worker can implement [`Worker::process_with_effects`] in place of
-//! [`Worker::process`] to return [`SettlementEffects`]: follow-up enqueues and
-//! caller KV changes the loop applies atomically with the job's acknowledgement
-//! via [`Queue::ack_with`]. A failing worker can attach effects by returning
-//! the error wrapped in [`FailWith`]: the loop applies them atomically with a
-//! settlement that dead-letters the job ([`Queue::dead_letter_with`] for a
-//! [`PermanentFailure`], the dead-letter branch of [`Queue::nack_with`]
-//! otherwise) and discards them when the job is retried.
-//!
-//! [`run_worker_concurrent`] is the same loop processing up to `concurrency`
-//! jobs in parallel. It claims jobs in batches sized to its free capacity (one
-//! claim transaction per batch via [`Queue::claim_batch`]), spawns each job
-//! onto a task set and acks each job individually. On shutdown it stops
-//! claiming and drains the in-flight set before returning. Idle workers of both
-//! loops wait on a queue-scoped notification that wakes one waiting worker per
-//! inserted job, so the poll interval only bounds the latency of out-of-band
-//! events such as a scheduled job becoming due.
-//!
-//! [`WorkerHandle::spawn`] runs either loop as a Tokio task. The closure
-//! receives a cancellation token to pass to the loop as its shutdown future.
-//! The handle's [`shutdown`](WorkerHandle::shutdown) stops the loop and waits
-//! for it, and [`wait`](WorkerHandle::wait) joins a loop that stops on its own.
-//! Dropping the handle leaves the loop running.
-//!
-//! ```rust,ignore
-//! let handle = WorkerHandle::spawn(std::future::pending::<()>(), |stop| async move {
-//!     run_worker_concurrent(&queue, "emails", Arc::new(EmailWorker), 8,
-//!         Duration::from_millis(250), stop.cancelled_owned())
-//!         .await
-//! });
-//! handle.shutdown().await?;
-//! ```
-//!
-//! Claims serialise per queue. The claim lock is held across the scan and the
-//! commit, so a queue's claim rate is the batch size divided by the
-//! scan-and-commit latency and does not increase with the number of workers:
-//! additional workers on one queue wait on the lock, raising claim latency in
-//! proportion without raising throughput. Batching amortises one lock hold
-//! across the batch, and sharding work across queues raises that limit further,
-//! the lock being per queue.
-//!
-//! # Coordinating with caller state
-//!
-//! [`Queue::enqueue_with_effects`] enqueues a job *and* applies the KV writes
-//! of a [`SettlementEffects`] to a caller-owned KV namespace in a single
-//! transaction, so a downstream crate can keep its own durable coordination
-//! state (status markers, dedup records, pointers to externally-stored blobs)
-//! consistent with the queue across crashes. [`QueueView::kv_get`] and
-//! [`Queue::kv_delete`] read and clean up those entries.
-//!
-//! Caller keys live under a reserved user key tag internally so they cannot
-//! collide with Taquba's own layout. Per-value size is capped at
-//! [`MAX_KV_VALUE_SIZE`]. The namespace is sized for coordination state, and a
-//! large blob belongs in the underlying object store at a content-addressed
-//! key, with only the pointer in KV.
-//!
-//! The primary pattern couples KV mutations to queue operations: to create or
-//! update an entry atomically with a queue transition, include it in the
-//! [`SettlementEffects`] of an [`Queue::enqueue_with_effects`] or
-//! [`Queue::ack_with`] call. Note the dedup interaction: a `dedup_key` hit
-//! discards the accompanying effects, so derive them deterministically from the
-//! dedup key (see [`Queue::enqueue_with_effects`]).
-//!
-//! Standalone primitives exist for state whose lifecycle is not tied to a
-//! single queue transition: [`Queue::kv_put`] writes an entry durably on its
-//! own, [`Queue::kv_delete`] removes one (terminal cleanup),
-//! [`Queue::kv_compare_delete`] consumes an entry only if it still has the
-//! value the caller read, so a concurrent replacement is never deleted by
-//! mistake, and [`Queue::kv_compare_put`] writes only if the key still has an
-//! expected value (or is still absent), the read-modify-write primitive that
-//! makes concurrent updates of one entry lose no writes. [`QueueView::kv_scan`]
-//! lists the entries with a key prefix within a key range in either key order,
-//! in pages, for enumerating live state and for exporting the namespace, and
-//! [`QueueView::kv_entries`] streams the same listing.
-//! [`Queue::commit_effects`] applies a [`SettlementEffects`] (enqueues, KV
-//! writes and deletes) as one transaction without a job transition, for state
-//! that must move in one step when no transition of its own includes it.
-//! [`Queue::kv_compare_commit`] applies the same effects only if the value
-//! stored at each key of a list equals an expected value, or the key is absent.
-//!
-//! [`Queue::ack_with`] extends the same atomicity to settlement: it
-//! acknowledges a claimed job and, in the same transaction, enqueues follow-up
-//! jobs and applies caller KV writes and deletes. If the job's lease expired
-//! and the claim is gone, the call fails and nothing is applied, so a chained
-//! job exists only if the settlement that created it won.
-//!
-//! [`Queue::dead_letter_with`], [`Queue::nack_with`] and [`Queue::cancel_with`]
-//! extend it to the failure and cancellation transitions: dead-lettering a job,
-//! the attempts-exhausted branch of a nack and the removal of a pending or
-//! scheduled job each apply the same effects atomically with the transition. A
-//! worker running under the worker loop attaches effects to a failure by
-//! returning the error wrapped in [`FailWith`]. The loop applies them with a
-//! dead-lettering settlement and discards them when the job is retried.
-//!
-//! See `examples/atomic_settlement.rs` for a runnable order pipeline built on
-//! these primitives.
-//!
-//! # Expiring caller state
-//!
-//! An [`ExpiryIndex`] is a time-ordered index over one prefix of the caller KV
-//! namespace. An entry's key is the prefix, the time of its event as 8 bytes
-//! big-endian and a free suffix, written with
-//! [`SettlementEffects::expiry_entry`]. [`ExpiryIndex::pass`] reads the entries
-//! oldest first, calls the caller's callback for every entry whose time is a
-//! retention or more before the time the caller passes, and stops at the first
-//! entry that is not due. The callback returns an [`Expired`]: the effects that
-//! clear the state the entry refers to, which commit in the transaction that
-//! deletes the entry, or `Keep`.
-//!
-//! The index keeps in memory the earliest time of an entry that a pass did not
-//! remove. A pass returns without a read until that time is due, so a pass at a
-//! short interval reads the index only when an entry can be due. The scan
-//! starts at the key with that time, so the keys of the entries that earlier
-//! passes deleted are not read.
-//!
-//! # Large payloads
-//!
-//! A job record is rewritten on every state transition (enqueue, claim, nack,
-//! ack), so a large inline payload is written many times over its lifetime.
-//! Payloads larger than [`OpenOptions::payload_offload_threshold`] (default 256
-//! KiB) are therefore offloaded: written once as an object in a payload object
-//! store, with the record storing a reference ([`JobRecord::payload_ref`]) in
-//! place of the bytes. Claims and [`QueueView::get_job`] fetch the object and
-//! return the payload as usual, so offloading is transparent to worker code. A
-//! listing ([`QueueView::list_jobs`], [`QueueView::jobs`] and
-//! [`QueueView::dead_jobs`]) and [`QueueView::job_record`] return the record as
-//! stored, with `payload_ref` set and without the bytes. The object is deleted
-//! when the record leaves the queue: on ack (or with the done record's
-//! retention sweep when [`QueueConfig::keep_done_jobs`] is set), on cancel and
-//! with the dead-letter retention sweep.
-//!
-//! By default payload objects live next to the queue's own state, under
-//! `"{path}-payloads"` in the object store the queue is opened on.
-//! [`OpenOptions::payload_store`] and [`OpenOptions::payload_path`] place them
-//! in a different prefix, bucket or account instead. Setting
-//! [`OpenOptions::payload_offload_threshold`] to `None` disables offloading,
-//! and payloads then stay inline regardless of size.
-//!
-//! # Inspecting and operating a queue
-//!
-//! The queue exposes its state for operational triage through [`Queue::view`],
-//! a [`QueueView`]: [`QueueView::list_queues`] returns every queue that has
-//! ever held a job, [`QueueView::stats`] returns per-state job counts for one
-//! queue, [`QueueView::get_job`] looks up a single job by ID in any state,
-//! [`QueueView::list_jobs`] pages through one queue's jobs in one lifecycle
-//! state ([`QueueView::jobs`] reads the same listing as one stream) and
-//! [`QueueView::dead_jobs`] pages through the dead-letter set.
-//! [`QueueView::attempt_history`] returns a job's recorded delivery history:
-//! one [`JobAttempt`] per settled attempt (retry, dead-letter, lease expiry,
-//! interruption at open, operator requeue, completion on a queue with
-//! retention), so a job that failed three different ways reports all three
-//! errors. Interventions cover the common operator actions:
-//! [`Queue::requeue_dead_job`] revives a dead job for delivery up to its
-//! `max_attempts` again, [`Queue::cancel`] removes a pending or scheduled job
-//! (or requests cooperative cancellation of a claimed one),
-//! [`Queue::wake_scheduled`] promotes a scheduled job before its `run_at` and
-//! [`Queue::claim_by_id`] claims one pending or scheduled job without the scan,
-//! for a producer that performs the job it created.
-//!
-//! Because a store is single-writer, an admin surface that mutates state must
-//! live inside the process that owns the queue. `examples/admin_http.rs`
-//! demonstrates the pattern: a minimal HTTP server inside the owning process,
-//! mapping these APIs onto JSON endpoints.
-//!
-//! # Observing from another process
-//!
-//! The single-writer rule constrains only writes. [`QueueReader`] opens the
-//! same store path from any process with bucket credentials and
-//! [`QueueReader::view`] returns a [`QueueView`] with the reads of
-//! [`Queue::view`]: [`QueueView::stats`], [`QueueView::list_queues`],
-//! [`QueueView::list_jobs`], [`QueueView::jobs`], [`QueueView::dead_jobs`],
-//! [`QueueView::get_job`], [`QueueView::job_record`],
-//! [`QueueView::attempt_history`] and the KV reads. Dashboards, CLIs and health
-//! checks observe a live queue without an admin endpoint inside the worker
-//! process.
-//!
-//! A reader is observation only: it does not write, does not offer a lease view
-//! and reads a lagging view of the store. The lag is bounded by the writer's
-//! flush interval plus the reader's [`ReaderOptions::manifest_poll_interval`],
-//! and the reader sees whole commits or nothing. A job reported `Claimed` means
-//! a claim was taken and no settlement is visible yet. Whether the claim is
-//! live is state inside the writer process, which the reader cannot see.
-//!
-//! By default a reader maintains a checkpoint so the objects its view
-//! references are protected from garbage collection. Checkpoint refreshes are
-//! manifest writes, so this mode requires write credentials to the bucket. The
-//! checkpoint never touches the writer's epoch and does not fence the writer.
-//! [`ReaderMode::FollowLatest`] does not write to the object store, for
-//! read-only credentials, at the cost of a read failing when garbage collection
-//! removes an object under an aged view. Two caveats apply. The reader and the
-//! writer must run the same taquba minor version, because the layout can change
-//! between minor versions and the store does not record a layout version.
-//! Opening a reader against a path that a writer never created fails with
-//! [`Error::StoreNotInitialized`], which a health check racing the first
-//! deployment must expect.
-//!
-//! A reader also reports whether a writer process is alive. Admin tooling
-//! checks this first, before a destructive act such as opening the store as a
-//! writer, which fences a live one. [`QueueReader::last_store_activity`] reads
-//! the manifest's newest L0 flush timestamp and the writer epoch for display,
-//! plus the durable sequence number. A destructive operation watches the
-//! sequence number for an advance over a few poll intervals, a judgement that
-//! does not involve a clock comparison. With
-//! [`OpenOptions::liveness_heartbeat`] set, the writer additionally commits a
-//! beat on an interval and [`QueueReader::writer_heartbeat`] reads the latest
-//! one. A beat is an ordinary store commit, so a writer that lost the store to
-//! a successor stops producing observable beats at its next flush: a fresh beat
-//! shows that the process that owns the store is alive, and it does not show
-//! anything about that process's workers. A clean [`Queue::close`] commits a
-//! final beat marked closed, so a stale closed beat distinguishes a deliberate
-//! shutdown from a writer whose process terminated.
-//!
-//! To make job outcomes observable across processes, settle them into the KV
-//! namespace: [`Queue::ack_with`] writes outcome entries atomically with the
-//! settlement (and [`Queue::enqueue_with_effects`] maps caller identifiers to
-//! job ids at submit), and the reader's [`QueueView::kv_get`] /
-//! [`QueueView::kv_scan`] read them from any process.
-//!
-//! # Requests from another process
-//!
-//! Another process can enqueue, cancel and signal jobs without opening the
-//! store. It writes a request with an [`InboxSender`] to the inbox, a prefix of
-//! objects outside the store, and the writer applies the request.
-//! [`OpenOptions::inbox`] with [`InboxOptions::new`] opens the queue with an
-//! inbox for the listed queues, and [`QueueView::inbox_record`] of a
-//! [`QueueReader`] reads the outcome of a request. The docs of [`InboxOptions`]
-//! and [`InboxSender`] describe the passes and the entries.
-//!
-//! # Background tasks
-//!
-//! [`Queue::open`] spawns background tokio tasks for the lifetime of the
-//! handle:
-//!
-//! - **Reaper** - re-queues jobs whose lease expired and runs the done /
-//!   dead-letter retention sweeps (interval: [`OpenOptions::reaper_interval`]).
-//! - **Scheduler** - promotes scheduled jobs whose `run_at` is past
-//!   (interval: [`OpenOptions::scheduler_interval`]).
-//! - **Metrics sampler** - emits depth and oldest-pending-age gauges, only
-//!   when [`OpenOptions::metrics_sample_interval`] is set.
-//! - **Liveness heartbeat** - commits a beat readable by a [`QueueReader`]
-//!   from another process, only when [`OpenOptions::liveness_heartbeat`]
-//!   is set.
-//! - **Inbox** - applies the entries sent from another process, only when
-//!   [`OpenOptions::inbox`] is set (interval:
-//!   [`InboxOptions::touch_poll_interval`], or [`InboxOptions::interval`]
-//!   without a touch poll).
-//! - **Close watcher** - once the store closes, fires the cancellation token
-//!   of every claim and fails later lease renewals.
-//!
-//! Every background task ends once the store closes for any reason, including a
-//! fence by a second writer.
-//!
-//! SlateDB's compactor and garbage collector run in the same process unless
-//! [`OpenOptions::in_process_compactor`] or
-//! [`OpenOptions::in_process_garbage_collector`] is `false`.
-//!
-//! Opening a queue also re-queues every job left claimed by a previous process:
-//! crash recovery happens at open, and lease expiry detects a delivery that
-//! stops progressing while the process lives. A job interrupted this way
-//! consumes one attempt at its next claim, so `max_attempts` also counts hard
-//! restarts of a long job. The producer of a job that can outlive several hard
-//! restarts should raise its limit with [`EnqueueOptions::max_attempts`].
-//!
-//! A second process that opens the store fences this one, and its open
-//! re-queues the jobs claimed here. SlateDB detects the fence at the next write
-//! of the fenced process or at its next manifest poll, whichever comes first.
-//! The poll runs every second.
-//!
-//! Once the store closes, by a fence or otherwise, the queue fires the
-//! cancellation token of every claim and refuses each renewal with
-//! [`Error::ClaimLost`]. The worker loops drop the `process` future of each
-//! in-flight job without a settlement and return the store's error. A handler
-//! stops at its next await point, and blocking code or a task that it spawned
-//! continues to run.
-//!
-//! Call [`Queue::close`] for a clean shutdown. It stops both tasks and flushes
-//! the underlying SlateDB instance.
-//!
-//! # Cargo features
-//!
-//! No backend is enabled by default: the in-memory and local-disk stores work
-//! without any feature. Choose exactly one for production:
-//!
-//! ```bash
-//! cargo add taquba --features aws    # S3 / MinIO
-//! cargo add taquba --features gcp    # Google Cloud Storage
-//! cargo add taquba --features azure  # Azure Blob
-//! ```
-//!
-//! [`open_url`] opens the store of a URL such as `s3://bucket/prefix` and
-//! returns it with the path that the URL gives within the store. It takes the
-//! provider options from the variables whose name starts with `AWS_`, `GOOGLE_`
-//! or `AZURE_`, so `taquba::open_url(&url, std::env::vars())` configures the
-//! store from the environment, and a variable of another program, such as
-//! `TOKEN`, stays out of the configuration.
-//!
-//! The optional `metrics` feature emits queue health metrics (throughput, dead
-//! rate and claim/ack/enqueue latency histograms) through the
-//! [`metrics`](https://docs.rs/metrics) facade. The crate does not pull in an
-//! exporter. The host process installs a recorder (for example Prometheus or an
-//! OTLP bridge), and the metrics are no-ops until a recorder is installed.
-//! Setting [`OpenOptions::metrics_sample_interval`] additionally runs a
-//! background sampler that emits per-queue depth and oldest-pending-age gauges,
-//! and SlateDB's own storage metrics are forwarded into the same recorder.
-//!
-//! Spans and log events go through [`tracing`](https://docs.rs/tracing), with
-//! or without the `metrics` feature. Both are no-ops until the host process
-//! installs a subscriber.
+//! Taquba is pre-1.0. A minor release can break the Rust API and the on-disk
+//! format, and a patch release preserves both. An upgrade to a new minor
+//! version requires a drained queue or an empty store.
 //!
 //! [SlateDB]: https://github.com/slatedb/slatedb
 
