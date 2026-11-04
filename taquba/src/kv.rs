@@ -37,12 +37,15 @@ pub(crate) fn validate_kv_value_size(value: &[u8]) -> Result<()> {
 }
 
 /// Whether the state of the stored key `scoped` within `txn` matches
-/// `expected`: the value it must hold, or `None` for absence.
+/// `expected`: the value it must hold, or `None` for absence. The key joins the
+/// read set of `txn`, so another transaction's commit of the key after `txn`
+/// began fails the commit of `txn`.
 pub(crate) async fn kv_state_matches(
     txn: &DbTransaction,
     scoped: &[u8],
     expected: Option<&[u8]>,
 ) -> Result<bool> {
+    txn.mark_read([scoped])?;
     Ok(match (txn.get(scoped).await?, expected) {
         (Some(current), Some(expected)) => current.as_ref() == expected,
         (None, None) => true,
@@ -262,6 +265,7 @@ mod tests {
     use super::*;
     use crate::keys::pending_key;
     use crate::test_util::*;
+    use crate::txn::Commit;
 
     #[tokio::test(start_paused = true)]
     async fn test_kv_compare_put_stalls_during_store_outage_without_partial_state() {
@@ -378,6 +382,27 @@ mod tests {
             q.kv_compare_put(b"slot", Some(b"v2"), &oversized).await,
             Err(Error::KvValueTooLarge { .. })
         ));
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_kv_compare_conflicts_with_a_later_commit_of_its_key() {
+        let q = Queue::open(make_store(), "test").await.unwrap();
+        let (a, b) = (user_scoped_key(b"a"), user_scoped_key(b"b"));
+
+        // Each transaction requires the absence of the key the other writes, so
+        // both commits would be a write skew.
+        let first = q.core.begin().unwrap();
+        let second = q.core.begin().unwrap();
+        assert!(kv_state_matches(&first, &a, None).await.unwrap());
+        assert!(kv_state_matches(&second, &b, None).await.unwrap());
+        first.put(&b, b"1").unwrap();
+        second.put(&a, b"2").unwrap();
+
+        let first = q.core.commit(first, Durability::Awaited).await.unwrap();
+        let second = q.core.commit(second, Durability::Awaited).await.unwrap();
+        assert_eq!((first, second), (Commit::Committed, Commit::Conflict));
 
         q.close().await.unwrap();
     }

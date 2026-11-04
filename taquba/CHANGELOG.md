@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `QueueView::list_jobs` and `QueueView::kv_scan` allocate for the entries they
   read, so a `limit` such as `usize::MAX` returns its page, where it panicked
   with a capacity overflow or aborted the process.
+- `Queue::kv_compare_commit` compares again when another transaction commits a
+  compared key before its own commit. In 0.16.0, two calls that each compared a
+  key that only the other wrote could both apply.
 
 ## [0.16.0] - 2026-10-29
 
