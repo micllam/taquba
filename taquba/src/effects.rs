@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::count::{stage_count_change, stage_count_wait};
 use crate::error::{Error, Result};
 use crate::expiry::ExpiryIndex;
 use crate::job::{JobRecord, JobStatus};
@@ -46,7 +47,9 @@ pub struct EnqueueRequest {
 /// `dedup_key` hit) commits without them. A key named in both `kv_writes` and
 /// `kv_deletes` is rejected with [`Error::ConflictingKvEffect`]. An entry added
 /// with [`Self::expiry_entry`] is recorded on its [`ExpiryIndex`] once the
-/// effects apply.
+/// effects apply. The count changes of [`Self::count_up`] and
+/// [`Self::count_down`] apply before the enqueues, so an enqueue that waits for
+/// a count reads the changed count.
 #[derive(Debug, Clone, Default)]
 pub struct SettlementEffects {
     /// Jobs enqueued atomically with the settlement.
@@ -58,9 +61,30 @@ pub struct SettlementEffects {
     pub kv_deletes: Vec<Vec<u8>>,
     /// The index and the time of every entry added with [`Self::expiry_entry`].
     pub expiry_entries: Vec<(ExpiryIndex, u64)>,
+    /// The net change of each count, by name, applied once at the commit.
+    /// [`Self::count_up`] and [`Self::count_down`] change an entry by one.
+    pub count_changes: HashMap<String, i64>,
 }
 
 impl SettlementEffects {
+    /// Add one to the count `name`. A count is a number of active items in the
+    /// store, which a job waits for with
+    /// [`EnqueueOptions::count_wait`](crate::EnqueueOptions::count_wait).
+    #[must_use]
+    pub fn count_up(mut self, name: impl Into<String>) -> Self {
+        *self.count_changes.entry(name.into()).or_default() += 1;
+        self
+    }
+
+    /// Subtract one from the count `name`. The commit that leaves the count at
+    /// zero wakes the job waiting for it. A decrement that precedes its
+    /// increment takes the count below zero.
+    #[must_use]
+    pub fn count_down(mut self, name: impl Into<String>) -> Self {
+        *self.count_changes.entry(name.into()).or_default() -= 1;
+        self
+    }
+
     /// Set [`Self::enqueues`].
     #[must_use]
     pub fn enqueues(mut self, enqueues: Vec<EnqueueRequest>) -> Self {
@@ -131,6 +155,7 @@ pub(crate) struct PreparedEffects {
     pub(crate) kv_deletes: Vec<Vec<u8>>,
     /// Recorded on their indexes once the effects apply.
     pub(crate) expiry_entries: Vec<(ExpiryIndex, u64)>,
+    pub(crate) count_changes: HashMap<String, i64>,
 }
 
 impl QueueCore {
@@ -175,6 +200,9 @@ impl QueueCore {
         if opts.signal_wait && opts.run_at.is_none() {
             return Err(Error::SignalWaitWithoutRunAt);
         }
+        if opts.count_wait.is_some() && opts.run_at.is_none() {
+            return Err(Error::CountWaitWithoutRunAt);
+        }
 
         let mut job =
             JobRecord::new_pending(id, queue, payload, max_attempts, priority, self.now_ms());
@@ -185,6 +213,9 @@ impl QueueCore {
         job.run_at = run_at;
         job.dedup_key = opts.dedup_key;
         job.signal_wait = opts.signal_wait && job.status == JobStatus::Scheduled;
+        job.count_wait = opts
+            .count_wait
+            .filter(|_| job.status == JobStatus::Scheduled);
 
         Ok(PreparedJob {
             job,
@@ -264,6 +295,7 @@ impl QueueCore {
             kv_writes: effects.kv_writes,
             kv_deletes: effects.kv_deletes,
             expiry_entries: effects.expiry_entries,
+            count_changes: effects.count_changes,
         })
     }
 
@@ -278,6 +310,9 @@ impl QueueCore {
         txn: &mut Txn,
         prepared: &PreparedEffects,
     ) -> Result<Vec<EnqueueResult>> {
+        for (name, delta) in &prepared.count_changes {
+            stage_count_change(txn, name, *delta).await?;
+        }
         let mut results = Vec::with_capacity(prepared.prepared_jobs.len());
         for prepared_job in &prepared.prepared_jobs {
             results.push(match self.stage_job_writes(txn, prepared_job).await? {
@@ -327,7 +362,13 @@ impl QueueCore {
             return Err(Error::DuplicateJobId { id: job.id.clone() });
         }
 
-        txn.insert_job(job)?;
+        if job.count_wait.is_some() {
+            let mut job = job.clone();
+            stage_count_wait(txn, &mut job).await?;
+            txn.insert_job(&job)?;
+        } else {
+            txn.insert_job(job)?;
+        }
         if let Some(ref dkey) = dkey {
             txn.put(dkey, job.id.as_bytes())?;
         }
@@ -358,8 +399,7 @@ mod tests {
                 options: EnqueueOptions::default(),
             }],
             kv_writes: HashMap::from([(b"runs/1".to_vec(), b"done".to_vec())]),
-            kv_deletes: Vec::new(),
-            expiry_entries: Vec::new(),
+            ..SettlementEffects::default()
         };
         q.enqueue("work", b"job".to_vec()).await.unwrap();
         let job = q
@@ -449,7 +489,7 @@ mod tests {
                     }],
                     kv_writes: HashMap::from([(b"runs/2".to_vec(), b"done".to_vec())]),
                     kv_deletes: vec![b"runs/1".to_vec()],
-                    expiry_entries: Vec::new(),
+                    ..SettlementEffects::default()
                 },
             )
             .await
@@ -484,8 +524,7 @@ mod tests {
                 options: EnqueueOptions::default(),
             }],
             kv_writes: HashMap::from([(b"k".to_vec(), b"v".to_vec())]),
-            kv_deletes: Vec::new(),
-            expiry_entries: Vec::new(),
+            ..SettlementEffects::default()
         };
         assert!(matches!(
             q.ack_with(&job, effects()).await,
@@ -572,8 +611,7 @@ mod tests {
                         options: EnqueueOptions::default(),
                     }],
                     kv_writes: HashMap::from([(b"runs/1".to_vec(), b"failed".to_vec())]),
-                    kv_deletes: Vec::new(),
-                    expiry_entries: Vec::new(),
+                    ..SettlementEffects::default()
                 },
             )
             .await
@@ -611,8 +649,7 @@ mod tests {
                         options: EnqueueOptions::default(),
                     }],
                     kv_writes: HashMap::from([(b"k".to_vec(), b"v".to_vec())]),
-                    kv_deletes: Vec::new(),
-                    expiry_entries: Vec::new(),
+                    ..SettlementEffects::default()
                 },
             )
             .await
@@ -655,8 +692,7 @@ mod tests {
                         options: EnqueueOptions::default(),
                     }],
                     kv_writes: HashMap::from([(b"runs/1".to_vec(), b"failed".to_vec())]),
-                    kv_deletes: Vec::new(),
-                    expiry_entries: Vec::new(),
+                    ..SettlementEffects::default()
                 },
             )
             .await
@@ -694,9 +730,8 @@ mod tests {
                         payload: b"cancelled".to_vec(),
                         options: EnqueueOptions::default(),
                     }],
-                    kv_writes: HashMap::new(),
                     kv_deletes: vec![b"runs/1".to_vec()],
-                    expiry_entries: Vec::new(),
+                    ..SettlementEffects::default()
                 },
             )
             .await
@@ -730,8 +765,7 @@ mod tests {
                         options: EnqueueOptions::default(),
                     }],
                     kv_writes: HashMap::from([(b"k".to_vec(), b"v".to_vec())]),
-                    kv_deletes: Vec::new(),
-                    expiry_entries: Vec::new(),
+                    ..SettlementEffects::default()
                 },
             )
             .await

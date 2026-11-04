@@ -85,6 +85,13 @@ pub struct JobRecord {
     /// transition out of the scheduled state clears the flag.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub signal_wait: bool,
+    /// The name of the count the job is waiting for, set from
+    /// [`EnqueueOptions::count_wait`](crate::EnqueueOptions::count_wait).
+    /// `Some` only while the job is scheduled for its wait: the change that
+    /// brings the count to zero moves the job to pending, and every transition
+    /// out of the scheduled state clears the name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_wait: Option<String>,
     /// Priority bucket. Lower numbers are claimed first. See
     /// [`PRIORITY_HIGH`](crate::PRIORITY_HIGH),
     /// [`PRIORITY_NORMAL`](crate::PRIORITY_NORMAL), and
@@ -247,6 +254,7 @@ impl JobRecord {
             run_at: None,
             signal: None,
             signal_wait: false,
+            count_wait: None,
             priority,
             last_error: None,
             dedup_key: None,
@@ -321,6 +329,7 @@ impl JobRecord {
             run_at: self.run_at,
             signal: self.signal.clone(),
             signal_wait: self.signal_wait,
+            count_wait: self.count_wait.clone(),
             priority: self.priority,
             last_error: self.last_error.clone(),
             dedup_key: self.dedup_key.clone(),

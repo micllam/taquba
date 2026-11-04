@@ -23,8 +23,8 @@ pub const MAX_INBOX_ENTRY_SIZE: usize = 16 * 1024 * 1024;
 /// - `enqueue`: the binary string `payload` and the map `options` with the
 ///   fields of [`EnqueueOptions`]. `max_attempts` and `priority` are integers,
 ///   `run_at` is an integer of milliseconds from the Unix epoch, `dedup_key`
-///   and `id_override` are strings, `headers` is a map of strings and
-///   `signal_wait` is a boolean.
+///   `id_override` and `count_wait` are strings, `headers` is a map of strings
+///   and `signal_wait` is a boolean.
 /// - `cancel`: the string `job_id`.
 /// - `signal`: the string `job_id` and the binary string `payload`.
 ///

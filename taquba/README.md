@@ -84,10 +84,10 @@ scheduled ──────────────────▶ pending ─�
                                                      attempt limit
 ```
 
-A scheduled job waits until its `run_at`, unless a call or a signal to its id
-wakes it earlier. A worker keeps a claimed job under a lease, and the job
-returns to pending if the lease expires before the settlement. Delivery is
-therefore at least once, so a worker must be idempotent.
+A scheduled job waits until its `run_at`, unless a call, a signal to its id or a
+count reaching zero wakes it earlier. A worker keeps a claimed job under a
+lease, and the job returns to pending if the lease expires before the
+settlement. Delivery is therefore at least once, so a worker must be idempotent.
 
 A settlement commits atomically with its effects, such as follow-up jobs and
 writes to the caller's state. One process owns a store and commits every

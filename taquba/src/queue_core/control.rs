@@ -16,6 +16,9 @@ pub(crate) enum Wake {
     /// A signal with its payload, which wakes only a job waiting for a signal
     /// and is stored on [`JobRecord::signal`].
     Signal(Vec<u8>),
+    /// The count of the name reached zero, which wakes only a job waiting for
+    /// that count.
+    Count(String),
     /// An early wake, which wakes any scheduled job and leaves its record
     /// unchanged otherwise.
     Early,
@@ -28,7 +31,7 @@ pub(crate) enum NotWoken {
     Missing,
     /// The job is not scheduled.
     Unscheduled,
-    /// The wake is a signal, and the job is not waiting for a signal.
+    /// The wake is a signal or a count, and the job is not waiting for it.
     NoWait,
 }
 
@@ -47,11 +50,19 @@ pub(crate) async fn stage_wake(
     if job.status != JobStatus::Scheduled {
         return Ok(Err(NotWoken::Unscheduled));
     }
-    if let Wake::Signal(payload) = wake {
-        if !job.signal_wait {
-            return Ok(Err(NotWoken::NoWait));
+    match wake {
+        Wake::Signal(payload) => {
+            if !job.signal_wait {
+                return Ok(Err(NotWoken::NoWait));
+            }
+            job.signal = Some(payload);
         }
-        job.signal = Some(payload);
+        Wake::Count(name) => {
+            if job.count_wait.as_deref() != Some(name.as_str()) {
+                return Ok(Err(NotWoken::NoWait));
+            }
+        }
+        Wake::Early => {}
     }
     txn.stage_to_pending(&current_key, &mut job)?;
     Ok(Ok(job.queue))

@@ -75,10 +75,12 @@ impl Txn {
 
     /// Move `job` from its record at `from` to its record at
     /// [`JobRecord::stored_key`], and repoint its index entry to that key. A
-    /// job that leaves the scheduled state leaves its signal wait.
+    /// job that leaves the scheduled state leaves its signal wait and its count
+    /// wait.
     pub(crate) fn move_job(&mut self, from: &[u8], job: &mut JobRecord) -> Result<()> {
         if job.status != JobStatus::Scheduled {
             job.signal_wait = false;
+            job.count_wait = None;
         }
         let key = job.stored_key();
         if from == key.as_slice() {

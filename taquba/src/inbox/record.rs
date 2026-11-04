@@ -86,6 +86,16 @@ pub enum Rejection {
     /// without a `run_at`.
     #[error("a signal wait requires run_at")]
     SignalWaitWithoutRunAt,
+    /// An enqueue sets
+    /// [`EnqueueOptions::count_wait`](crate::EnqueueOptions::count_wait)
+    /// without a `run_at`.
+    #[error("a count wait requires run_at")]
+    CountWaitWithoutRunAt,
+    /// An enqueue sets
+    /// [`EnqueueOptions::count_wait`](crate::EnqueueOptions::count_wait) for a
+    /// count whose waiting job is still waiting.
+    #[error("the count has a waiting job")]
+    CountWaiterExists,
     /// The operation of the entry failed with another permanent error.
     #[error("{message}")]
     Failed {
@@ -102,6 +112,8 @@ impl Rejection {
             Error::InvalidId { reason, .. } => Self::InvalidId { reason },
             Error::DuplicateJobId { .. } => Self::DuplicateJobId,
             Error::SignalWaitWithoutRunAt => Self::SignalWaitWithoutRunAt,
+            Error::CountWaitWithoutRunAt => Self::CountWaitWithoutRunAt,
+            Error::CountWaiterExists { .. } => Self::CountWaiterExists,
             err => Self::Failed {
                 message: err.to_string(),
             },

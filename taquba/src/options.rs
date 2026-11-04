@@ -477,6 +477,18 @@ pub struct EnqueueOptions {
     /// [`Self::run_at`], and without it the enqueue fails with
     /// [`Error::SignalWaitWithoutRunAt`](crate::Error::SignalWaitWithoutRunAt).
     pub signal_wait: bool,
+    /// The name of a count the scheduled job waits for until its `run_at`. The
+    /// change that brings the count to zero
+    /// ([`SettlementEffects::count_down`](crate::SettlementEffects::count_down))
+    /// moves the job to pending before its `run_at`. A job enqueued while the
+    /// count is zero is pending without a wait. A count has one waiting job.
+    /// While that job is waiting, a further wait for the count fails with
+    /// [`Error::CountWaiterExists`](crate::Error::CountWaiterExists). Once it
+    /// is no longer waiting, after its `run_at` or a cancel, a further wait
+    /// replaces it. A wait requires [`Self::run_at`], and without it the
+    /// enqueue fails with
+    /// [`Error::CountWaitWithoutRunAt`](crate::Error::CountWaitWithoutRunAt).
+    pub count_wait: Option<String>,
 }
 
 impl EnqueueOptions {
@@ -533,6 +545,13 @@ impl EnqueueOptions {
     #[must_use]
     pub fn signal_wait(mut self, signal_wait: bool) -> Self {
         self.signal_wait = signal_wait;
+        self
+    }
+
+    /// Set [`Self::count_wait`].
+    #[must_use]
+    pub fn count_wait(mut self, name: impl Into<Option<String>>) -> Self {
+        self.count_wait = name.into();
         self
     }
 }

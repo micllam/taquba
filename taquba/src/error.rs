@@ -87,6 +87,22 @@ pub enum Error {
     #[error("a signal wait requires run_at")]
     SignalWaitWithoutRunAt,
 
+    /// An enqueue set [`crate::EnqueueOptions::count_wait`] without a `run_at`.
+    /// The enqueue is rejected before any state is written.
+    #[error("a count wait requires run_at")]
+    CountWaitWithoutRunAt,
+
+    /// An enqueue set [`crate::EnqueueOptions::count_wait`] for a count whose
+    /// waiting job is still waiting. The enqueue is rejected before any state
+    /// is written.
+    #[error("the count `{count}` has the waiting job `{waiter}`")]
+    CountWaiterExists {
+        /// The name of the count.
+        count: String,
+        /// The id of the job waiting for the count.
+        waiter: String,
+    },
+
     /// A queue name is outside the form of [`crate::QueueName`]. It is rejected
     /// at the API boundary before any state is written.
     #[error("invalid queue name `{queue}`: {reason}")]
@@ -251,6 +267,8 @@ impl Error {
             | Self::InvalidId { .. }
             | Self::DuplicateJobId { .. }
             | Self::SignalWaitWithoutRunAt
+            | Self::CountWaitWithoutRunAt
+            | Self::CountWaiterExists { .. }
             | Self::InvalidQueueName { .. }
             | Self::PayloadMissing { .. }
             | Self::InvalidStoreUrl { .. }
@@ -287,6 +305,14 @@ mod tests {
         );
         assert!(Error::DuplicateJobId { id: "job-1".into() }.is_permanent());
         assert!(Error::SignalWaitWithoutRunAt.is_permanent());
+        assert!(Error::CountWaitWithoutRunAt.is_permanent());
+        assert!(
+            Error::CountWaiterExists {
+                count: "batch".into(),
+                waiter: "job-1".into(),
+            }
+            .is_permanent()
+        );
         assert!(
             Error::InvalidStoreUrl {
                 url: "x".into(),

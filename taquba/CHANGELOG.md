@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Count waits: a scheduled job enqueued with `EnqueueOptions::count_wait` waits
+  for a named count to reach zero, which `SettlementEffects::count_up` and
+  `count_down` change. A struct literal of either type needs the new field or
+  `..Default::default()`.
+
 ### Changed
 
 - Updated slatedb from 0.17.0 to 0.18.0. The `object_store` re-export remains

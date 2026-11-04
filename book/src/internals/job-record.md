@@ -91,8 +91,9 @@ The record contains:
 - **The per-job settings,** resolved at enqueue from
   [`EnqueueOptions`][EnqueueOptions] against the queue's defaults: `priority`,
   `max_attempts`, `run_at` for a scheduled job, `signal_wait` for a scheduled
-  job that waits for a signal, and `dedup_key`. The dedup key is a caller key
-  that deduplicates enqueues while the job waits, and the first claim clears it.
+  job that waits for a signal, `count_wait` for a scheduled job that waits for a
+  count to reach zero, and `dedup_key`. The dedup key is a caller key that
+  deduplicates enqueues while the job waits, and the first claim clears it.
 - **The delivery record:** `attempts`, `claimed_at`, `last_error` and the
   terminal timestamps `completed_at` and `failed_at`.
 
@@ -190,12 +191,13 @@ because their value means something after the transition that set it:
 - **`cancel_requested`** stays set, so a job re-claimed after a lease expires
   begins with its cancellation token already fired.
 
-Two fields are cleared on purpose. `dedup_key` leaves the record at the first
+Three fields are cleared on purpose. `dedup_key` leaves the record at the first
 claim, which frees the key for a new job as soon as this one starts running.
 [The dedup key](claiming.md#the-dedup-key) describes the index and why the
-record drops the key. `signal_wait` is cleared in the transaction that moves the
-job out of the scheduled state, so a retry that re-enters the state does not
-wait, and the queue rejects a signal to its id.
+record drops the key. `signal_wait` and `count_wait` are cleared in the
+transaction that moves the job out of the scheduled state, so a retry that
+re-enters the state does not wait. The queue then rejects a signal to its id,
+and a count that reaches zero leaves the job as it is.
 
 [JobRecord]: https://docs.rs/taquba/latest/taquba/struct.JobRecord.html
 [EnqueueOptions]: https://docs.rs/taquba/latest/taquba/struct.EnqueueOptions.html

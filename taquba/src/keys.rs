@@ -20,6 +20,8 @@
 //! and `InboxExpiry` leads with the time of the application so the retention
 //! sweep performs one scan with an early exit.
 //!
+//! A count has its record in `Count` at its name while its number is not zero.
+//!
 //! A claimed job occupies one key: `Claimed` contains the record at a key
 //! stable for the life of the claim. The lease itself, the current expiry and
 //! the claim id, is process state kept in `crate::lease_registry` and never
@@ -205,6 +207,10 @@ pub(crate) enum KeyTag {
     /// first failed read of an object of the entry, `u64` BE. Deleted by an
     /// inbox pass that ends without an error.
     InboxFailure = 0x0E,
+    /// `[tag, ver, count name]`. The value is the count record of the name: its
+    /// number of active items and the id of the job waiting for zero. Deleted
+    /// when the number reaches zero.
+    Count = 0x0F,
     /// `[tag, caller bytes]`, without a version byte. Caller bytes are opaque.
     User = 0xFF,
 }
@@ -232,6 +238,7 @@ impl KeyTag {
             0x0C => KeyTag::InboxRecord,
             0x0D => KeyTag::InboxExpiry,
             0x0E => KeyTag::InboxFailure,
+            0x0F => KeyTag::Count,
             0xFF => KeyTag::User,
             _ => return None,
         })
@@ -255,6 +262,7 @@ impl KeyTag {
             | KeyTag::InboxRecord
             | KeyTag::InboxExpiry
             | KeyTag::InboxFailure
+            | KeyTag::Count
             | KeyTag::User => None,
         }
     }
@@ -389,6 +397,13 @@ pub(crate) fn parse_inbox_expiry_entry(key: &[u8]) -> Option<(QueueName, &str)> 
 
 pub(crate) fn inbox_failure_key(queue: &QueueName, id: &str) -> Vec<u8> {
     queue_first_key(KeyTag::InboxFailure, queue, id)
+}
+
+pub(crate) fn count_key(name: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(2 + name.len());
+    k.extend_from_slice(&header(KeyTag::Count));
+    k.extend_from_slice(name.as_bytes());
+    k
 }
 
 pub(crate) fn stats_key(queue: &QueueName, metric: &str) -> Vec<u8> {
@@ -601,6 +616,7 @@ mod tests {
             inbox_record_key(&qn("q"), "id"),
             inbox_expiry_key(1, &qn("q"), "id"),
             inbox_failure_key(&qn("q"), "id"),
+            count_key("id"),
             user_scoped_key(b"id"),
         ];
         for (i, a) in keys.iter().enumerate() {

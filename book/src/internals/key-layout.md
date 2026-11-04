@@ -95,6 +95,7 @@ follows the two-byte header.
 | `InboxRecord` | `0x0C` | qlen, queue, inbox entry id | the `InboxRecord` of an applied entry |
 | `InboxExpiry` | `0x0D` | `applied_at` `u64` BE, qlen, queue, inbox entry id | empty |
 | `InboxFailure` | `0x0E` | qlen, queue, inbox entry id | time of the first failed read `u64` BE |
+| `Count` | `0x0F` | count name | the number of active items and the id of the job waiting for zero, while the number is not zero |
 | `User` | `0xFF` | caller bytes, no version byte | the caller's value |
 
 A job record is therefore stored at exactly one of the first five keys at any
