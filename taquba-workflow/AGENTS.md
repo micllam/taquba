@@ -10,13 +10,11 @@ Each rule identifies the code it applies to, whose docs describe the mechanism.
 - **Terminal effects** (`runtime.rs::terminate_collecting_effects`). Do not
   stage the hook's effects in the `settled.map` tail. The write of the terminal
   record over the run record stays on the terminal ack.
-- **Terminal hook** (`terminal.rs`). The hook stages effects into the
-  terminating settlement and nothing else. Do not add an asynchronous hook
-  method, a notification job or a filter of the runs that the hook sees. For a
-  reaction after the termination, the hook stages an enqueue.
-- **Terminal record.** Every termination arm passes the input hash to
-  `RuntimeCore::termination`. The record contains the reference to the result of
-  a succeeded run, never the result or a cost, because the run listing scans the
+- **Terminal hook** (`terminal.rs`). Do not add an asynchronous hook method, a
+  notification job or a filter of the runs that the hook sees. For a reaction
+  after the termination, the hook stages an enqueue.
+- **Terminal record.** The record contains the reference to the result of a
+  succeeded run, never the result or a cost, because the run listing scans the
   record and the member record copies it.
 - **Result** (`view.rs::outcome_of`). Only this function resolves the result
   reference of a terminal record. Every result object is named by the step job
@@ -40,8 +38,6 @@ Each rule identifies the code it applies to, whose docs describe the mechanism.
   `sweep::Clearable` and registers a `sweep::Sweep`. Do not add a second sweep
   loop.
 - **Memo** (`memo.rs`). Do not add a codec, decode-policy or version parameter.
-  A layout change updates the literal digests in
-  `entries_are_stored_at_the_documented_paths`.
 
 ## Typed jobs and groups
 
