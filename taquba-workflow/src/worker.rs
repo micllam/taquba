@@ -86,8 +86,7 @@ impl<'a> ClaimedStep<'a> {
             run_at: None,
             priority: Some(self.job.priority),
             max_attempts: Some(self.job.max_attempts),
-            signal_wait: false,
-            count_wait: None,
+            wait: None,
             reserved_headers: self.reserved_headers_with_none(),
         }
     }

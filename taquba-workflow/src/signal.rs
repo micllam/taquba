@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use taquba::SettlementEffects;
 
-use crate::runtime::{RuntimeCore, StepEnqueueOpts};
+use crate::runtime::{RuntimeCore, StepEnqueueOpts, StepWait};
 use crate::worker::ClaimedStep;
 
 impl RuntimeCore {
@@ -20,7 +20,7 @@ impl RuntimeCore {
     ) -> SettlementEffects {
         let opts = StepEnqueueOpts {
             run_at: Some(self.run_at_after(timeout)),
-            signal_wait: true,
+            wait: Some(StepWait::Signal),
             ..claimed.next_step_opts()
         };
         self.advance(claimed, payload, opts)

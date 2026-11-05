@@ -24,8 +24,8 @@ fn current_step_bytes(step_number: u32, job_id: &str) -> Vec<u8> {
 
 /// Per-step enqueue options the runtime forwards through to Taquba. The runtime
 /// always owns `headers` (it injects [`HEADER_RUN_ID`] and [`HEADER_STEP`]) and
-/// `dedup_key` (it derives one from `(run_id, step_number)`), so callers only
-/// choose the three fields below.
+/// `dedup_key` (it derives one from `(run_id, step_number)`), so callers choose
+/// the fields below.
 #[derive(Debug, Default)]
 pub(crate) struct StepEnqueueOpts {
     /// Earliest claimable time for the step. `None` means immediate.
@@ -34,12 +34,19 @@ pub(crate) struct StepEnqueueOpts {
     pub(crate) priority: Option<u32>,
     /// Per-step `max_attempts` override.
     pub(crate) max_attempts: Option<u32>,
-    /// Whether the step waits for a signal until `run_at`.
-    pub(crate) signal_wait: bool,
-    /// The name of the count the step waits for until `run_at`.
-    pub(crate) count_wait: Option<String>,
+    /// The wake that the step waits for until `run_at`.
+    pub(crate) wait: Option<StepWait>,
     /// Additional runtime-owned reserved headers for the step job.
     pub(crate) reserved_headers: Vec<(&'static str, String)>,
+}
+
+/// The wake of a scheduled step before its `run_at`.
+#[derive(Debug)]
+pub(crate) enum StepWait {
+    /// A signal to the step's job id.
+    Signal,
+    /// The change that brings the named count to zero.
+    Count(String),
 }
 
 impl RuntimeCore {
@@ -137,8 +144,7 @@ impl RuntimeCore {
             run_at: spec.options.run_at,
             priority: spec.options.priority,
             max_attempts: spec.options.max_attempts_per_step,
-            signal_wait: false,
-            count_wait: None,
+            wait: None,
             reserved_headers: membership
                 .map(Membership::reserved_headers)
                 .unwrap_or_default(),
@@ -217,6 +223,11 @@ impl RuntimeCore {
         for (key, value) in &opts.reserved_headers {
             headers.insert((*key).to_string(), value.clone());
         }
+        let (signal_wait, count_wait) = match opts.wait {
+            None => (false, None),
+            Some(StepWait::Signal) => (true, None),
+            Some(StepWait::Count(name)) => (false, Some(name)),
+        };
 
         EnqueueRequest {
             queue: self.queue_name.clone(),
@@ -228,8 +239,8 @@ impl RuntimeCore {
                 .max_attempts(opts.max_attempts)
                 .dedup_key(Some(format!("{DEDUP_PREFIX}{run_id}:{step_number}")))
                 .id_override(Some(job_id))
-                .signal_wait(opts.signal_wait)
-                .count_wait(opts.count_wait),
+                .signal_wait(signal_wait)
+                .count_wait(count_wait),
         }
     }
 

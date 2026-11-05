@@ -28,7 +28,7 @@ mod terminate;
 mod tests;
 
 pub use builder::WorkflowRuntimeBuilder;
-pub(crate) use enqueue::StepEnqueueOpts;
+pub(crate) use enqueue::{StepEnqueueOpts, StepWait};
 
 /// The queue name of a runtime built without
 /// [`WorkflowRuntimeBuilder::queue_name`].

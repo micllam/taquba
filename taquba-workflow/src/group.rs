@@ -25,7 +25,9 @@ use crate::keys::{
 };
 use crate::kv::run_kv_entry_keys;
 use crate::memo::MemoStore;
-use crate::runtime::{CancelRunOutcome, RunOptions, RunSpec, RuntimeCore, StepEnqueueOpts};
+use crate::runtime::{
+    CancelRunOutcome, RunOptions, RunSpec, RuntimeCore, StepEnqueueOpts, StepWait,
+};
 use crate::sweep::{Clearable, Cleared};
 use crate::terminal::{TerminalStatus, TerminatedRun};
 use crate::worker::ClaimedStep;
@@ -721,7 +723,7 @@ impl RuntimeCore {
         }
         let opts = StepEnqueueOpts {
             run_at: Some(self.run_at_after(timeout)),
-            count_wait: Some(group_count_name(group_id)),
+            wait: Some(StepWait::Count(group_count_name(group_id))),
             ..claimed.next_step_opts()
         };
         Ok(self.advance(claimed, payload, opts))
