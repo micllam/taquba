@@ -651,6 +651,8 @@ is created exactly once with the termination. Set the per-run URL on
 `RunOptions::headers["callback_url"]`. Runs without that header enqueue no
 delivery.
 
+<!-- vale off -->
+
 ## License
 
 Licensed under either of
