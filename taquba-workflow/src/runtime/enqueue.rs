@@ -243,7 +243,7 @@ impl RuntimeCore {
     /// the job [`next_step_job_id`] of the claimed job: the next step's enqueue
     /// joins the current step's acknowledgement transaction, so the transition
     /// is atomic.
-    pub(crate) async fn advance(
+    pub(crate) fn advance(
         &self,
         claimed: &ClaimedStep<'_>,
         payload: Vec<u8>,

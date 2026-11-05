@@ -724,7 +724,7 @@ impl RuntimeCore {
             count_wait: Some(group_count_name(group_id)),
             ..claimed.next_step_opts()
         };
-        Ok(self.advance(claimed, payload, opts).await)
+        Ok(self.advance(claimed, payload, opts))
     }
 }
 

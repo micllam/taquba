@@ -223,18 +223,16 @@ impl RuntimeCore {
                     .await
             }
             (Ok(StepOutcome::Continue { payload, when }), None) => match when {
-                Trigger::Immediate => Ok(self
-                    .advance(claimed, payload, claimed.next_step_opts())
-                    .await),
+                Trigger::Immediate => Ok(self.advance(claimed, payload, claimed.next_step_opts())),
                 Trigger::After(delay) => {
                     let opts = StepEnqueueOpts {
                         run_at: Some(self.run_at_after(delay)),
                         ..claimed.next_step_opts()
                     };
-                    Ok(self.advance(claimed, payload, opts).await)
+                    Ok(self.advance(claimed, payload, opts))
                 }
                 Trigger::OnSignal { timeout } => {
-                    Ok(self.advance_on_signal(claimed, payload, timeout).await)
+                    Ok(self.advance_on_signal(claimed, payload, timeout))
                 }
                 Trigger::OnGroup { group_id, timeout } => {
                     match self

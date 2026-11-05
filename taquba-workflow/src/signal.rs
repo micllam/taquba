@@ -12,7 +12,7 @@ use crate::worker::ClaimedStep;
 impl RuntimeCore {
     /// Build the effects that advance the run of `claimed` to a step that waits
     /// for a signal until `timeout` from now.
-    pub(crate) async fn advance_on_signal(
+    pub(crate) fn advance_on_signal(
         &self,
         claimed: &ClaimedStep<'_>,
         payload: Vec<u8>,
@@ -23,6 +23,6 @@ impl RuntimeCore {
             signal_wait: true,
             ..claimed.next_step_opts()
         };
-        self.advance(claimed, payload, opts).await
+        self.advance(claimed, payload, opts)
     }
 }
