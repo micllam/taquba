@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The setters of `WorkflowRuntimeBuilder`, `JobRunnerBuilder` and
   `WebhookTerminalHook` are `#[must_use]`, as the setters of `taquba` are, so
   the compiler generates a warning for a dropped result.
+- `RunGroup::submit`, `RunGroup::resume` and `RunGroup::cancel` keep up to 100
+  member runs in flight, which shortens the submit of a large group. In 0.15.0,
+  they kept up to 32 in flight.
 
 ## [0.15.0] - 2026-10-29
 

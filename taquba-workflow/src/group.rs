@@ -29,7 +29,7 @@ use crate::terminal::{RunOutcome, TerminalStatus};
 
 /// Member submissions and cancellations in flight at once. Each blocks on a
 /// durable commit, and concurrent commits share WAL flushes.
-const SUBMIT_CONCURRENCY: usize = 32;
+const SUBMIT_CONCURRENCY: usize = 100;
 /// Member records read per page, and members removed per transaction by
 /// [`GroupStore::remove`].
 const MEMBER_PAGE_SIZE: usize = 1000;
