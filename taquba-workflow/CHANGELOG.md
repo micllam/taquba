@@ -29,6 +29,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RunGroup::submit`, `RunGroup::resume` and `RunGroup::cancel` keep up to 100
   member runs in flight, which shortens the submit of a large group. In 0.15.0,
   they kept up to 32 in flight.
+- `TerminalHook` stages effects into the terminating settlement only, with
+  `stage_effects` as its required method, and a run terminates without a
+  notification job. After the upgrade, an implementation must drop
+  `on_termination` and `observes`, and a reaction after the termination should
+  stage an enqueue to a queue of the application or await
+  `WorkflowRuntime::wait`.
+- `WorkflowRuntime::builder` takes the queue, the object store and the runner,
+  and `WorkflowRuntimeBuilder::terminal_hook` sets the hook, so the runtime
+  types lose their hook parameter. After the upgrade, a caller must move the
+  hook to `terminal_hook`, drop `NoopTerminalHook` and write
+  `WorkflowRuntime<R>`.
+- `RunOutcome` is renamed `TerminatedRun` and contains the `RunTermination`, the
+  result and the headers, so the hook and `WorkflowRuntime::wait` report the
+  time of the termination. After the upgrade, a caller must read `status`,
+  `error`, `cancelled_by` and `final_step` through `termination` and replace
+  `RunEnd` and `WorkflowView::run_end` with `TerminatedRun` and
+  `WorkflowView::terminated_run`.
+- `MemberResult` contains the key and the `TerminatedRun` of a member. After the
+  upgrade, a caller must read the run id and the termination through `outcome`.
+- `JobHandle::fetch_result` returns the `JobError` of a job that terminated
+  without a worker, where 0.15.0 returned `None`. After the upgrade, a caller
+  that read `None` as a cancellation must match the `JobError`.
+- The runtime writes the result of a succeeded run as an object under `results/`
+  of the memo prefix, and the terminal record refers to it, so the result
+  commits with the termination. Before the upgrade, a store written with 0.15.0
+  must be drained: its runs must terminate, its notification jobs must complete
+  and memo retention must remove their terminal records.
+
+### Removed
+
+- `HEADER_TERMINAL`, the header of the notification job. After the upgrade, a
+  caller that filters the jobs of the runtime's queue by the header must drop
+  the filter.
 
 ## [0.15.0] - 2026-10-29
 

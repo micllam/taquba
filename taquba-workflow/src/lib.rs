@@ -36,9 +36,7 @@
 //! ```no_run
 //! use std::sync::Arc;
 //! use taquba::{Queue, object_store::memory::InMemory};
-//! use taquba_workflow::{
-//!     NoopTerminalHook, RunSpec, Step, StepError, StepOutcome, StepRunner, WorkflowRuntime,
-//! };
+//! use taquba_workflow::{RunSpec, Step, StepError, StepOutcome, StepRunner, WorkflowRuntime};
 //!
 //! struct EchoRunner;
 //!
@@ -52,15 +50,16 @@
 //! let store = Arc::new(InMemory::new());
 //! let queue = Arc::new(Queue::open(store.clone(), "demo").await?);
 //!
-//! let runtime = WorkflowRuntime::builder(queue, store, EchoRunner, NoopTerminalHook).build()?;
+//! let runtime = WorkflowRuntime::builder(queue, store, EchoRunner).build()?;
 //!
 //! let worker = runtime.spawn(std::future::pending::<()>());
 //!
-//! let outcome = runtime.submit(RunSpec {
+//! let submitted = runtime.submit(RunSpec {
 //!     input: b"hello".to_vec(),
 //!     ..Default::default()
 //! }).await?;
-//! println!("submitted run {}", outcome.run_id);
+//! let run = runtime.wait(&submitted.run_id).await?;
+//! println!("run {} {}", run.run_id, run.termination.status);
 //! worker.shutdown().await?;
 //! # Ok(()) }
 //! ```
@@ -76,9 +75,9 @@
 //! | Outcome | Effect |
 //! |---|---|
 //! | [`StepOutcome::Continue`]` { payload, when }` | Enqueue the next step. `when` (a [`Trigger`]) decides when it becomes claimable: [`Trigger::Immediate`], [`Trigger::After`]`(delay)`, [`Trigger::OnSignal`]` { timeout }` or [`Trigger::OnGroup`]` { group_id, timeout }`. Constructors: [`StepOutcome::continue_now`], [`StepOutcome::continue_after`], [`StepOutcome::continue_on_signal`], [`StepOutcome::continue_on_group`]. |
-//! | [`StepOutcome::Succeed`]` { result }` | Ack, and the terminal hook observes [`TerminalStatus::Succeeded`]. |
-//! | [`StepOutcome::Fail`]` { reason }` | Ack, and the terminal hook observes [`TerminalStatus::Failed`]. A failure decided by the runner: no dead-letter. |
-//! | [`StepOutcome::Cancel`]` { reason }` | Ack, and the terminal hook observes [`TerminalStatus::Cancelled`]. A cancellation decided by the runner: no dead-letter. |
+//! | [`StepOutcome::Succeed`]` { result }` | Ack, and the run terminates as [`TerminalStatus::Succeeded`]. |
+//! | [`StepOutcome::Fail`]` { reason }` | Ack, and the run terminates as [`TerminalStatus::Failed`]. A failure decided by the runner: no dead-letter. |
+//! | [`StepOutcome::Cancel`]` { reason }` | Ack, and the run terminates as [`TerminalStatus::Cancelled`]. A cancellation decided by the runner: no dead-letter. |
 //! | `Err(`[`StepError::transient`]`(_))` | Retry per backoff up to `max_attempts`, then dead-letter. |
 //! | `Err(`[`StepError::permanent`]`(_))` | Dead-letter immediately. |
 //!
@@ -148,21 +147,20 @@
 //! [Memo retention](#memo-retention) removes the record.
 //!
 //! [`WorkflowRuntime::wait`] waits until a run terminates, following its
-//! current step across steps, and reports a [`RunEnd`]: the termination from
-//! the run's terminal record and the committed outcome, when the worker that
-//! terminated the run recorded one. A run already terminated is reported at
-//! once, and [`WorkflowRuntime::wait_timeout`] bounds the wait. The wait relies
-//! on the queue's in-process completion notification, so it runs in the process
-//! that runs the worker. [`WorkflowView::run_end`] reads the end of a
-//! terminated run without a wait, also in a process without a runtime.
+//! current step across steps, and reports the [`TerminatedRun`]: the
+//! [`RunTermination`] from the run's terminal record, the result of a succeeded
+//! run and the submitter's headers. For a run that has already terminated,
+//! `wait` returns without waiting, and [`WorkflowRuntime::wait_timeout`] bounds
+//! the wait. The wait relies on the queue's in-process completion notification,
+//! so it runs in the process that runs the worker.
+//! [`WorkflowView::terminated_run`] reads a terminated run without a wait, also
+//! in a process without a runtime.
 //!
-//! The committed [`RunOutcome`] of a [`RunEnd`] (the run's result or error, the
-//! submitter's headers and the final step) is read from the run result record
-//! the worker writes to the run's memo, at the reserved key `workflow.outcome`,
-//! before every terminating settlement it performs. A run terminated without a
-//! worker (a cancellation of a pending step, a step dead-lettered outside the
-//! worker) does not have a record. The record is removed with the run's memo
-//! entries by the memo sweep.
+//! The worker writes the result of a succeeded run as an object under
+//! `results/` of the memo prefix before the terminating settlement, and the
+//! terminal record contains a reference to the object. An empty result does not
+//! have an object. The memo sweep removes the object with the run's memo
+//! entries.
 //!
 //! # Cancellation
 //!
@@ -172,16 +170,17 @@
 //! over the same queue. While termination is in flight, `status` reports
 //! [`RunState::Cancelling`] with the reason and the time of the request. It
 //! returns [`CancelRunOutcome::NotActive`] if the run is unknown or already
-//! terminal. The run terminates with the reason on [`RunOutcome::error`] and
-//! [`CancelOrigin::Request`] on [`RunOutcome::cancelled_by`], where a runner's
-//! [`StepOutcome::Cancel`] without a request records [`CancelOrigin::Runner`].
+//! terminal. The run terminates with the reason on [`RunTermination::error`]
+//! and [`CancelOrigin::Request`] on [`RunTermination::cancelled_by`], where a
+//! runner's [`StepOutcome::Cancel`] without a request records
+//! [`CancelOrigin::Runner`].
 //!
 //! - If the current step is pending or scheduled, the queued step job is
-//!   removed and the run's notification job is enqueued before the call
-//!   returns.
+//!   removed and the run terminates in the same transaction, before the
+//!   call returns.
 //! - If the current step is running, the request is delivered through
-//!   [`Delivery::cancel_token`] (a `tokio_util::sync::CancellationToken`).
-//!   A runner that watches the token returns at once:
+//!   [`Delivery::cancel_token`] (a `tokio_util::sync::CancellationToken`). A
+//!   runner that watches the token returns without finishing its work:
 //!
 //!   ```ignore
 //!   tokio::select! {
@@ -365,24 +364,24 @@
 //! reject an enqueue to the queue of the runtime with [`Error::ReservedQueue`].
 //! [`HEADER_RUN_ID`] and [`HEADER_STEP`] are set by the runtime on every step.
 //! Other headers on [`RunOptions::headers`] thread through every step and reach
-//! the terminal hook on [`RunOutcome::headers`].
+//! the terminal hook on [`TerminatedRun::headers`].
 //!
 //! # Run groups
 //!
 //! A [`RunGroup`] is a durable set of runs of one runtime, identified by a
 //! group id: [`WorkflowRuntime::group`] names it, [`RunGroup::submit`] writes
 //! its manifest (the members' keys and inputs) and submits the members,
-//! [`RunGroup::results`] yields each member's [`MemberResult`] (its termination
-//! and, when a worker recorded one, its [`RunOutcome`]) as it terminates,
-//! [`RunGroup::cancel`] cancels every active member and [`RunGroup::status`]
-//! counts the members by state. A process without a runtime reads the same
-//! counts with [`WorkflowView::group_status`]. A member's run id is derived
-//! from the group id, its key and its count of earlier runs, so groups never
-//! share run state and a run never shares the state of an earlier run. A second
-//! submission of the same set, or [`RunGroup::resume`] from the manifest alone,
-//! runs again only the members that did not succeed, which is how a step that
-//! fans out stays safe under a retry and how a batch of inputs is run again
-//! after a partial failure.
+//! [`RunGroup::results`] yields each member's [`MemberResult`] (its key and its
+//! [`TerminatedRun`]) as it terminates, [`RunGroup::cancel`] cancels every
+//! active member and [`RunGroup::status`] counts the members by state. A
+//! process without a runtime reads the same counts with
+//! [`WorkflowView::group_status`]. A member's run id is derived from the group
+//! id, its key and its count of earlier runs, so groups never share run state
+//! and a run never shares the state of an earlier run. A second submission of
+//! the same set, or [`RunGroup::resume`] from the manifest alone, runs again
+//! only the members that did not succeed, which is how a step that fans out
+//! stays safe under a retry and how a batch of inputs is run again after a
+//! partial failure.
 //!
 //! The group's durable state is the manifest in the object store and one member
 //! record per key under `workflow/groups/` in the queue's key-value namespace,
@@ -413,7 +412,7 @@
 //! returns its result to an awaiting caller: define a [`jobs::Job`] with typed
 //! input fields, an `Output` and an `Error`, register it on a
 //! [`jobs::JobRunner`], submit instances and await the [`jobs::JobHandle`]. The
-//! result is the run result record in the run's memo, so
+//! result is stored with the run's terminal record, so
 //! [`jobs::JobHandle::fetch_result`] reads it after a restart, and a
 //! [`jobs::Job::idempotency_key`] collapses duplicate submissions before and
 //! after completion. A handler that submits further jobs keeps a
@@ -524,9 +523,8 @@
 //!
 //! [`Delivery::run_memo`] is the run-scoped variant: one namespace shared by
 //! every step of the run, for values a later step reads back (an accumulating
-//! journal, for example). Its key `workflow.outcome` is reserved for the run
-//! result record. Its entries are stored with the per-step entries and are
-//! removed with them when the run's retention expires.
+//! journal, for example). Its entries are stored with the per-step entries and
+//! are removed with them when the run's retention expires.
 //!
 //! Memo entries are stored in the object store passed to
 //! [`WorkflowRuntime::builder`] at the path prefix configured by
@@ -562,7 +560,7 @@
 //! [`WorkflowRuntimeBuilder::memo_retention`]:
 //!
 //! ```ignore
-//! let runtime = WorkflowRuntime::builder(queue, store, runner, hook)
+//! let runtime = WorkflowRuntime::builder(queue, store, runner)
 //!     .memo_retention(Duration::from_secs(24 * 60 * 60))
 //!     .build()?;
 //! ```
@@ -575,12 +573,13 @@
 //! marker under `workflow/terminals/`, so the marker exists exactly when the
 //! run's terminal outcome committed. [`WorkflowRuntime::run`] sweeps the
 //! markers on startup and at every poll interval, removing the memo entries,
-//! the step-output replay entries, the terminal record and the marker of every
-//! run whose marker is at least a window old. A marker is an entry of a
-//! [`taquba::ExpiryIndex`] with the run id as its suffix, so the sweep reads
-//! the expired set from the start of the range and stops at the first unexpired
-//! marker. A pass before a marker can be expired does not read the index, so a
-//! run's state is removed within a poll interval of the end of its window.
+//! the step-output replay entries, the result object, the terminal record and
+//! the marker of every run whose marker is at least a window old. A marker is
+//! an entry of a [`taquba::ExpiryIndex`] with the run id as its suffix, so the
+//! sweep reads the expired set from the start of the range and stops at the
+//! first unexpired marker. A pass before a marker can be expired does not read
+//! the index, so a run's state is removed within a poll interval of the end of
+//! its window.
 //!
 //! The sweep selects runs by their terminal markers, and it removes the state
 //! of a run only while the terminal record of the run is the one of its marker.
@@ -612,7 +611,7 @@
 //! let clock = MockClock::new(1_700_000_000_000);
 //! let opts = OpenOptions::default().clock(Arc::new(clock.clone()));
 //! let queue = Queue::open_with_options(store.clone(), "db", opts).await?;
-//! let runtime = WorkflowRuntime::builder(queue, store, runner, hook).build()?;
+//! let runtime = WorkflowRuntime::builder(queue, store, runner).build()?;
 //! // `runtime` reads the same clock as `queue`.
 //! ```
 //!
@@ -622,50 +621,38 @@
 //!
 //! # Terminal hook
 //!
-//! [`TerminalHook::on_termination`] processes a run's termination
-//! ([`TerminalStatus::Succeeded`], [`TerminalStatus::Failed`] or
-//! [`TerminalStatus::Cancelled`]), receiving the submitter's headers and the
-//! runner's result or error. Termination is delivered as a queue job: the
-//! settlement that commits a run's terminal outcome atomically enqueues a
-//! notification job, and the hook runs as that job's worker. The hook therefore
-//! observes only outcomes that committed, and delivery is at-least-once, so
-//! implementations must be idempotent. A transient error
-//! ([`StepError::transient`]) retries the notification per the queue's backoff
-//! up to the terminal step's `max_attempts`. A permanent error dead-letters it.
+//! A [`TerminalHook`], set with [`WorkflowRuntimeBuilder::terminal_hook`],
+//! stages effects into the settlement that terminates a run.
+//! [`TerminalHook::stage_effects`] receives the [`TerminatedRun`] and stages KV
+//! writes, KV deletes and enqueues on a [`TerminalEffects`] handle. The effects
+//! commit atomically with the terminal outcome, so a staged enqueue is created
+//! exactly once with the termination. A reaction that runs code after the
+//! termination stages an enqueue to a queue of the application, whose worker
+//! processes it at least once.
 //!
-//! `on_termination` stages effects on a [`TerminalEffects`] handle: KV writes
-//! and deletes plus follow-up enqueues, applied in the same transaction as the
-//! notification's acknowledgement. [`TerminalHook::observes`] (default `true`)
-//! is consulted when a run terminates. When it returns `false`, the runtime
-//! skips the notification job for that run. [`NoopTerminalHook`] does not
-//! observe any run, so runs terminate without a notification job.
+//! The runtime calls the hook again for a settlement that it builds again: a
+//! failed settlement at the redelivery of the step, and a cancellation that
+//! finds the step running or settled. A hook must therefore stage from the
+//! outcome alone and stage the same effects for the same outcome. A staging
+//! error drops the effect, and the hook must log it because the hook does not
+//! return a result.
 //!
-//! [`TerminalHook::stage_effects`] (default: none) stages effects on a
-//! [`TerminalEffects`] handle that commit in the settlement that terminates the
-//! run, on every termination path below. A failed settlement calls it again at
-//! the redelivery of the step, so it must stage from the outcome alone. It does
-//! not return a result, so a hook must log a staging error, and the effect is
-//! dropped. A hook that only stages effects returns `false` from `observes`,
-//! and its runs terminate without a notification job.
-//!
-//! Runs terminated without an acknowledging settlement (an external
-//! cancellation of a pending step, a step that dead-letters) settle their
-//! notification the same way: the effects are applied by the dead-letter, by
-//! the attempts-exhausting nack or by the cancellation's removal, so the
-//! notification job is created exactly once on every worker and cancellation
-//! path. Two terminations occur outside any settlement the runtime performs: a
-//! job the reaper dead-letters after its lease expires past the attempt limit,
-//! and one dead-lettered during crash recovery when the queue is opened. The
-//! worker reconciles them: whenever the queue's dead count changes it
-//! terminates every run whose dead step job still has a run record, as `Failed`
-//! with the queue record's last error, enqueueing the notification in the same
-//! transaction.
+//! The hook stages its effects on every termination path. Runs terminated
+//! without an acknowledging settlement (an external cancellation of a pending
+//! step, a step that dead-letters) stage them in the transaction of that
+//! transition: the dead-letter, the attempts-exhausting nack or the
+//! cancellation's removal. Two terminations occur outside any settlement the
+//! runtime performs: a job the reaper dead-letters after its lease expires past
+//! the attempt limit, and one dead-lettered during crash recovery when the
+//! queue is opened. The worker reconciles them. Whenever the queue's dead count
+//! changes, it terminates every run whose dead step job still has a run record,
+//! as `Failed` with the queue record's last error. The hook's effects commit in
+//! the same transaction.
 //!
 //! `WebhookTerminalHook` (enabled by the `webhooks` feature) delivers HTTP
-//! callbacks via `taquba-webhooks`. It stages the delivery enqueue through
-//! [`TerminalHook::stage_effects`], so the delivery is created exactly once
-//! with the termination and no notification job is enqueued. Set the per-run
-//! URL on [`RunOptions::headers`]`["callback_url"]`. Runs without that header
+//! callbacks via `taquba-webhooks`. It stages the delivery enqueue, so the
+//! delivery is created exactly once with the termination. Set the per-run URL
+//! on [`RunOptions::headers`]`["callback_url"]`. Runs without that header
 //! enqueue no delivery.
 //!
 //! [Taquba]: https://docs.rs/taquba
@@ -697,17 +684,17 @@ pub use effects::{EffectsHandle, TerminalEffects};
 pub use error::{ControlQueueError, Error, Result};
 pub use group::{GroupMember, GroupStatus, MemberResult, RunGroup};
 pub use keys::{
-    HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, MAX_RUN_ID_LEN, RESERVED_COUNT_PREFIX,
-    RESERVED_HEADER_PREFIX, RESERVED_KV_PREFIX, RunId,
+    HEADER_RUN_ID, HEADER_STEP, MAX_RUN_ID_LEN, RESERVED_COUNT_PREFIX, RESERVED_HEADER_PREFIX,
+    RESERVED_KV_PREFIX, RunId,
 };
 pub use kv::KvReadHandle;
 pub use memo::{Memo, MemoStore};
 pub use runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 pub use runtime::{
-    CancelRunOutcome, DEFAULT_QUEUE_NAME, RunEnd, RunOptions, RunSpec, RunState, RunStatus,
-    RunTermination, RunnerHandle, StepRef, SubmitOutcome, WorkflowRuntime, WorkflowRuntimeBuilder,
+    CancelRunOutcome, DEFAULT_QUEUE_NAME, RunOptions, RunSpec, RunState, RunStatus, RunnerHandle,
+    StepRef, SubmitOutcome, WorkflowRuntime, WorkflowRuntimeBuilder,
 };
 #[cfg(feature = "webhooks")]
 pub use terminal::WebhookTerminalHook;
-pub use terminal::{CancelOrigin, NoopTerminalHook, RunOutcome, TerminalHook, TerminalStatus};
+pub use terminal::{CancelOrigin, RunTermination, TerminalHook, TerminalStatus, TerminatedRun};
 pub use view::{ListedRun, RunFilter, WorkflowView};

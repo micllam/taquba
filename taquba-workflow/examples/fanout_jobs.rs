@@ -27,11 +27,7 @@ use serde::{Deserialize, Serialize};
 use taquba::Queue;
 use taquba::object_store::memory::InMemory;
 use taquba_workflow::jobs::{Job, JobContext, JobRunner};
-use taquba_workflow::{
-    RunId, RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects,
-    TerminalHook, TerminalStatus, WorkflowRuntime,
-};
-use tokio::sync::oneshot;
+use taquba_workflow::{RunId, RunSpec, Step, StepError, StepOutcome, StepRunner, WorkflowRuntime};
 
 /// Mocked page fetch. The example derives a deterministic byte count from the
 /// URL where a real version issues an HTTP request.
@@ -122,39 +118,6 @@ impl StepRunner for FanoutRunner {
     }
 }
 
-struct ShutdownOnComplete {
-    shutdown: tokio::sync::Mutex<Option<oneshot::Sender<()>>>,
-}
-
-impl TerminalHook for ShutdownOnComplete {
-    async fn on_termination(
-        &self,
-        outcome: &RunOutcome,
-        _effects: &TerminalEffects,
-    ) -> std::result::Result<(), StepError> {
-        println!(
-            "\n=== run {} {} (final_step={}) ===",
-            outcome.run_id, outcome.status, outcome.final_step.number
-        );
-        match outcome.status {
-            TerminalStatus::Succeeded => {
-                if let Some(result) = &outcome.result {
-                    println!("{}", String::from_utf8_lossy(result));
-                }
-            }
-            _ => {
-                if let Some(err) = &outcome.error {
-                    eprintln!("error: {err}");
-                }
-            }
-        }
-        if let Some(tx) = self.shutdown.lock().await.take() {
-            let _ = tx.send(());
-        }
-        Ok(())
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(InMemory::new());
@@ -167,25 +130,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
     let jobs_handle = jobs.spawn(std::future::pending::<()>());
 
-    let (tx, rx) = oneshot::channel::<()>();
-    let runtime = WorkflowRuntime::builder(
-        queue,
-        store,
-        FanoutRunner { jobs },
-        ShutdownOnComplete {
-            shutdown: tokio::sync::Mutex::new(Some(tx)),
-        },
-    )
-    .build()?;
-
-    let worker_runtime = runtime.clone();
-    let worker_task = tokio::spawn(async move {
-        worker_runtime
-            .run(async move {
-                let _ = rx.await;
-            })
-            .await
-    });
+    let runtime = WorkflowRuntime::builder(queue, store, FanoutRunner { jobs }).build()?;
+    let worker = runtime.spawn(std::future::pending());
 
     let urls = [
         "https://example.com/a",
@@ -200,7 +146,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     println!("submitted run {}", handle.run_id);
 
-    worker_task.await??;
+    let run = runtime.wait(&handle.run_id).await?;
+    let termination = &run.termination;
+    println!(
+        "\n=== run {} {} (final_step={}) ===",
+        run.run_id, termination.status, termination.final_step.number
+    );
+    match (&run.result, &termination.error) {
+        (Some(result), _) => println!("{}", String::from_utf8_lossy(result)),
+        (None, Some(err)) => eprintln!("error: {err}"),
+        (None, None) => {}
+    }
+
+    worker.shutdown().await?;
     jobs_handle.shutdown().await?;
     Ok(())
 }

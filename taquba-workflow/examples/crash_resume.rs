@@ -22,10 +22,8 @@ use std::time::Duration;
 use taquba::object_store::local::LocalFileSystem;
 use taquba::{OpenOptions, Queue, QueueConfig};
 use taquba_workflow::{
-    RunId, RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects,
-    TerminalHook, TerminalStatus, WorkflowRuntime,
+    RunId, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalStatus, WorkflowRuntime,
 };
-use tokio::sync::oneshot;
 
 const QUEUE_DIR: &str = "/tmp/taquba-crash-resume-example";
 const RUN_ID: &str = "crash-resume-demo";
@@ -92,38 +90,6 @@ impl StepRunner for Stages {
     }
 }
 
-struct ShutdownOnTermination {
-    shutdown: tokio::sync::Mutex<Option<oneshot::Sender<()>>>,
-}
-
-impl TerminalHook for ShutdownOnTermination {
-    async fn on_termination(
-        &self,
-        outcome: &RunOutcome,
-        _effects: &TerminalEffects,
-    ) -> std::result::Result<(), StepError> {
-        println!();
-        match outcome.status {
-            TerminalStatus::Succeeded => println!(
-                "run {} succeeded after {} steps, result: {}",
-                outcome.run_id,
-                outcome.final_step.number + 1,
-                String::from_utf8_lossy(outcome.result.as_deref().unwrap_or(&[]))
-            ),
-            _ => println!(
-                "run {} terminated as {:?}: {}",
-                outcome.run_id,
-                outcome.status,
-                outcome.error.as_deref().unwrap_or("(no error)")
-            ),
-        }
-        if let Some(tx) = self.shutdown.lock().await.take() {
-            let _ = tx.send(());
-        }
-        Ok(())
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The directory must exist before LocalFileSystem can canonicalize it.
@@ -149,17 +115,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?,
     );
 
-    let (tx, rx) = oneshot::channel::<()>();
-    let runtime = WorkflowRuntime::builder(
-        queue,
-        store,
-        Stages,
-        ShutdownOnTermination {
-            shutdown: tokio::sync::Mutex::new(Some(tx)),
-        },
-    )
-    .poll_interval(Duration::from_millis(200))
-    .build()?;
+    let runtime = WorkflowRuntime::builder(queue, store, Stages)
+        .poll_interval(Duration::from_millis(200))
+        .build()?;
 
     // Submission is idempotent on the run id across restarts: a later process
     // finds the durable run record and this call is a no-op.
@@ -172,11 +130,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     if !outcome.newly_submitted
-        && let Some(end) = runtime.view().run_end(&outcome.run_id).await?
+        && let Some(run) = runtime.view().terminated_run(&outcome.run_id).await?
     {
         println!(
             "run {} already ended as {}; remove {QUEUE_DIR} to start over",
-            outcome.run_id, end.termination.status
+            outcome.run_id, run.termination.status
         );
         return Ok(());
     }
@@ -191,12 +149,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // The worker loop claims steps until the terminal hook fires.
-    runtime
-        .run(async move {
-            let _ = rx.await;
-        })
-        .await?;
+    // The worker claims steps until the run terminates.
+    let worker = runtime.spawn(std::future::pending());
+    let run = runtime.wait(&outcome.run_id).await?;
+    let termination = &run.termination;
+    println!();
+    match termination.status {
+        TerminalStatus::Succeeded => println!(
+            "run {} succeeded after {} steps, result: {}",
+            run.run_id,
+            termination.final_step.number + 1,
+            String::from_utf8_lossy(run.result.as_deref().unwrap_or(&[]))
+        ),
+        TerminalStatus::Failed | TerminalStatus::Cancelled => println!(
+            "run {} terminated as {}: {}",
+            run.run_id,
+            termination.status,
+            termination.error.as_deref().unwrap_or("(no error)")
+        ),
+    }
+    worker.shutdown().await?;
 
     println!("remove {QUEUE_DIR} to discard the run and start over");
     Ok(())

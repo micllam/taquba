@@ -14,9 +14,9 @@
 //!
 //! Through the reader, the operator reads the state of each command with
 //! `WorkflowView::command` and the end of each run with
-//! `WorkflowView::run_end`. The reader polls the store every half second, so
-//! the operator observes each change with up to that lag. The control queue
-//! keeps its done jobs for the record retention of the inbox, as
+//! `WorkflowView::terminated_run`. The reader polls the store every half
+//! second, so the operator observes each change with up to that lag. The
+//! control queue keeps its done jobs for the record retention of the inbox, as
 //! `WorkflowRuntimeBuilder::control_queue` requires.
 //!
 //! The operator process is simulated by a task that shares the in-memory object
@@ -32,8 +32,8 @@ use taquba::{
     QueueConfig, QueueReader, ReaderOptions, default_inbox_path,
 };
 use taquba_workflow::{
-    CancelCommand, Command, CommandState, MemoStore, NoopTerminalHook, RunEnd, RunId, RunState,
-    Step, StepError, StepOutcome, StepRunner, SubmitCommand, WorkflowRuntime, WorkflowView,
+    CancelCommand, Command, CommandState, MemoStore, RunId, RunState, Step, StepError, StepOutcome,
+    StepRunner, SubmitCommand, TerminatedRun, WorkflowRuntime, WorkflowView,
 };
 use tokio::sync::oneshot;
 
@@ -121,13 +121,12 @@ async fn operator(store: Arc<dyn ObjectStore>) -> Result<(), Box<dyn Error>> {
     println!("[operator] inbox entry {entry_id}: {state:?}");
 
     for run_id in [&report, &export] {
-        let end = run_end(&view, run_id).await?;
-        let result = end.outcome.and_then(|outcome| outcome.result);
+        let run = terminated_run(&view, run_id).await?;
         println!(
             "[operator] run {run_id} ended as {:?}, cancelled by {:?}, with the result {:?}",
-            end.termination.status,
-            end.termination.cancelled_by,
-            result.as_deref().map(String::from_utf8_lossy),
+            run.termination.status,
+            run.termination.cancelled_by,
+            run.result.as_deref().map(String::from_utf8_lossy),
         );
     }
     reader.close().await?;
@@ -152,12 +151,15 @@ async fn settled_command(
     .await?
 }
 
-/// The end of `run_id` once the run terminates.
-async fn run_end(view: &WorkflowView, run_id: &RunId) -> Result<RunEnd, Box<dyn Error>> {
+/// The terminated run `run_id` once the run terminates.
+async fn terminated_run(
+    view: &WorkflowView,
+    run_id: &RunId,
+) -> Result<TerminatedRun, Box<dyn Error>> {
     tokio::time::timeout(READ_TIMEOUT, async {
         loop {
-            if let Some(end) = view.run_end(run_id).await? {
-                return Ok(end);
+            if let Some(run) = view.terminated_run(run_id).await? {
+                return Ok(run);
             }
             tokio::time::sleep(READ_INTERVAL).await;
         }
@@ -173,7 +175,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .inbox(InboxOptions::new([CONTROL_QUEUE]).touch_poll_interval(TOUCH_POLL_INTERVAL))
         .queue_config(CONTROL_QUEUE, control_config);
     let queue = Arc::new(Queue::open_with_options(store.clone(), QUEUE_PATH, opts).await?);
-    let runtime = WorkflowRuntime::builder(queue, store.clone(), Stages, NoopTerminalHook)
+    let runtime = WorkflowRuntime::builder(queue, store.clone(), Stages)
         .poll_interval(Duration::from_millis(200))
         .memo_prefix(MEMO_PREFIX)
         .control_queue(CONTROL_QUEUE)

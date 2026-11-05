@@ -25,11 +25,9 @@ use crate::keys::{
 };
 use crate::kv::run_kv_entry_keys;
 use crate::memo::MemoStore;
-use crate::runtime::{
-    CancelRunOutcome, RunOptions, RunSpec, RunTermination, RuntimeCore, StepEnqueueOpts,
-};
+use crate::runtime::{CancelRunOutcome, RunOptions, RunSpec, RuntimeCore, StepEnqueueOpts};
 use crate::sweep::{Clearable, Cleared};
-use crate::terminal::{RunOutcome, TerminalStatus};
+use crate::terminal::{TerminalStatus, TerminatedRun};
 use crate::worker::ClaimedStep;
 
 /// Member submissions and cancellations in flight at once. Each blocks on a
@@ -160,13 +158,8 @@ pub struct GroupStatus {
 pub struct MemberResult {
     /// The member's key.
     pub key: String,
-    /// The run id of the member's last run.
-    pub run_id: RunId,
-    /// The member's last recorded termination.
-    pub termination: RunTermination,
-    /// The member's committed outcome, as [`RunEnd::outcome`](crate::RunEnd)
-    /// reports it, or `None` for a member terminated without a worker.
-    pub outcome: Option<RunOutcome>,
+    /// The outcome of the member's last run.
+    pub outcome: TerminatedRun,
 }
 
 /// A member record as read back, with the key it is stored under.
@@ -602,20 +595,19 @@ impl RunGroup {
             let group = group.clone();
             async move {
                 let member = member?;
-                let termination: RunTermination = member
+                let run_id = member.record.run_id;
+                let termination = member
                     .record
                     .terminated
-                    .ok_or_else(|| Error::InconsistentRunState(member.record.run_id.clone()))?
-                    .into();
+                    .ok_or_else(|| Error::InconsistentRunState(run_id.clone()))?;
                 let outcome = group
                     .core()
                     .view
-                    .run_result_of(&member.record.run_id, &termination)
-                    .await?;
+                    .outcome_of(&run_id, termination)
+                    .await?
+                    .ok_or(Error::RunNotFound(run_id))?;
                 Ok(MemberResult {
                     key: member.key,
-                    run_id: member.record.run_id,
-                    termination,
                     outcome,
                 })
             }
@@ -695,7 +687,7 @@ impl RunGroup {
     }
 
     /// Remove the group's state: its manifest, member records and the memo
-    /// entries, run result records and terminal records of its members. A later
+    /// entries, result objects and terminal records of its members. A later
     /// [`submit`](Self::submit) with the same id starts from nothing. Returns
     /// [`Error::GroupActive`] and keeps the group's state for a group with an
     /// active member. It returns the same error for a group whose member is
@@ -761,7 +753,7 @@ mod tests {
     use crate::keys::run_kv_entry_key;
     use crate::runner::{Step, StepError, StepOutcome, StepRunner};
     use crate::runtime::{RunSpec, RunState, StepRef, WorkflowRuntime};
-    use crate::terminal::{CancelOrigin, NoopTerminalHook};
+    use crate::terminal::{CancelOrigin, RunTermination};
     use crate::test_util::{open_queue, open_queue_at, rid};
 
     /// Continues once, then succeeds with the step number.
@@ -809,11 +801,10 @@ mod tests {
     async fn a_member_run_again_does_not_replay_the_step_outputs_of_its_earlier_run() {
         let (queue, store) = open_queue().await;
         let runs = Arc::new(AtomicU32::new(0));
-        let runtime =
-            WorkflowRuntime::builder(queue, store, Failing(runs.clone()), NoopTerminalHook)
-                .step_output_replay()
-                .build()
-                .unwrap();
+        let runtime = WorkflowRuntime::builder(queue, store, Failing(runs.clone()))
+            .step_output_replay()
+            .build()
+            .unwrap();
         let group = runtime.group(rid("g"));
         let worker = runtime.spawn(std::future::pending::<()>());
         let mut results = Vec::new();
@@ -834,19 +825,16 @@ mod tests {
         worker.shutdown().await.unwrap();
 
         assert_eq!(runs.load(Ordering::SeqCst), 2);
-        assert_eq!(results[0].run_id, member_run_id(&rid("g"), "a", 0));
-        assert_eq!(results[1].run_id, member_run_id(&rid("g"), "a", 1));
-        assert_eq!(results[1].termination.error.as_deref(), Some("run 1"));
-        assert_eq!(
-            results[1].outcome.as_ref().and_then(|o| o.error.as_deref()),
-            Some("run 1"),
-        );
+        assert_eq!(results[0].outcome.run_id, member_run_id(&rid("g"), "a", 0));
+        assert_eq!(results[1].outcome.run_id, member_run_id(&rid("g"), "a", 1));
+        let termination = &results[1].outcome.termination;
+        assert_eq!(termination.error.as_deref(), Some("run 1"));
     }
 
     #[tokio::test(start_paused = true)]
     async fn membership_holds_across_steps_and_terminations_wait_for_the_last_one() {
         let (queue, store) = open_queue().await;
-        let runtime = WorkflowRuntime::builder(queue.clone(), store, TwoSteps, NoopTerminalHook)
+        let runtime = WorkflowRuntime::builder(queue.clone(), store, TwoSteps)
             .poll_interval(Duration::from_millis(10))
             .build()
             .unwrap();
@@ -874,14 +862,13 @@ mod tests {
         .unwrap();
         assert_eq!(terminated.len(), 2);
         for m in &terminated {
-            assert_eq!(m.termination.status, TerminalStatus::Succeeded);
-            let outcome = m.outcome.as_ref().expect("the worker recorded the outcome");
-            assert_eq!(outcome.run_id, m.run_id);
+            let termination = &m.outcome.termination;
+            assert_eq!(termination.status, TerminalStatus::Succeeded);
             assert_eq!(
-                outcome.final_step.number, 1,
+                termination.final_step.number, 1,
                 "the member terminated at its second step"
             );
-            assert_eq!(outcome.result.as_deref(), Some(b"1".as_slice()));
+            assert_eq!(m.outcome.result.as_deref(), Some(b"1".as_slice()));
         }
         let status = group.status().await.unwrap();
         assert_eq!((status.total, status.succeeded, status.pending), (2, 2, 0));
@@ -895,7 +882,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_run_options_apply_to_every_member() {
         let (queue, store) = open_queue().await;
-        let runtime = WorkflowRuntime::builder(queue.clone(), store, TwoSteps, NoopTerminalHook)
+        let runtime = WorkflowRuntime::builder(queue.clone(), store, TwoSteps)
             .build()
             .unwrap();
         let group = runtime.group(rid("g"));
@@ -925,7 +912,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_group_cancellation_records_the_member_cancelled() {
         let (queue, store, _clock) = open_queue_at(10_000).await;
-        let runtime = WorkflowRuntime::builder(queue.clone(), store, TwoSteps, NoopTerminalHook)
+        let runtime = WorkflowRuntime::builder(queue.clone(), store, TwoSteps)
             .build()
             .unwrap();
         let group = runtime.group(rid("g"));
@@ -940,9 +927,9 @@ mod tests {
 
         let results: Vec<MemberResult> =
             group.results().await.unwrap().try_collect().await.unwrap();
-        assert_eq!(results[0].run_id, run_id);
+        assert_eq!(results[0].outcome.run_id, run_id);
         assert_eq!(
-            results[0].termination,
+            results[0].outcome.termination,
             RunTermination {
                 status: TerminalStatus::Cancelled,
                 error: None,
@@ -952,10 +939,7 @@ mod tests {
                 terminated_at_ms: 10_000,
             }
         );
-        assert!(
-            results[0].outcome.is_none(),
-            "a pending step is cancelled without a worker, so no result is recorded",
-        );
+        assert_eq!(results[0].outcome.result, None);
 
         // The cancelled member runs again under the next run id, and a plain
         // submission of that run id finds the member's run active.
@@ -981,7 +965,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn forget_refuses_a_group_with_an_active_member() {
         let (queue, store) = open_queue().await;
-        let runtime = WorkflowRuntime::builder(queue, store, TwoSteps, NoopTerminalHook)
+        let runtime = WorkflowRuntime::builder(queue, store, TwoSteps)
             .build()
             .unwrap();
         let group = runtime.group(rid("g"));
@@ -1008,7 +992,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_reader_view_reads_the_group_status_of_the_runtime() {
         let (queue, store) = open_queue().await;
-        let runtime = WorkflowRuntime::builder(queue, store.clone(), TwoSteps, NoopTerminalHook)
+        let runtime = WorkflowRuntime::builder(queue, store.clone(), TwoSteps)
             .memo_prefix("memo")
             .build()
             .unwrap();
@@ -1040,7 +1024,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_removal_does_not_apply_after_a_later_submission() {
         let (queue, store) = open_queue().await;
-        let runtime = WorkflowRuntime::builder(queue, store, TwoSteps, NoopTerminalHook)
+        let runtime = WorkflowRuntime::builder(queue, store, TwoSteps)
             .build()
             .unwrap();
         let group = runtime.group(rid("g"));
@@ -1058,7 +1042,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_group_sweep_retains_a_group_submitted_again_after_its_marker() {
         let (queue, store, clock) = open_queue_at(10_000).await;
-        let runtime = WorkflowRuntime::builder(queue.clone(), store, TwoSteps, NoopTerminalHook)
+        let runtime = WorkflowRuntime::builder(queue.clone(), store, TwoSteps)
             .group_retention(Duration::from_secs(1))
             .build()
             .unwrap();
@@ -1102,11 +1086,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_group_sweep_removes_the_records_of_every_run_of_a_member() {
         let (queue, store, clock) = open_queue_at(10_000).await;
-        let runtime =
-            WorkflowRuntime::builder(queue.clone(), store.clone(), TwoSteps, NoopTerminalHook)
-                .group_retention(Duration::from_secs(1))
-                .build()
-                .unwrap();
+        let runtime = WorkflowRuntime::builder(queue.clone(), store.clone(), TwoSteps)
+            .group_retention(Duration::from_secs(1))
+            .build()
+            .unwrap();
         let group = runtime.group(rid("g"));
         let memos = crate::memo::MemoStore::new(store, "workflow-steps-memo");
         // The second submission runs the cancelled member again under the next
@@ -1130,7 +1113,7 @@ mod tests {
                 .unwrap();
             let results: Vec<MemberResult> =
                 group.results().await.unwrap().try_collect().await.unwrap();
-            assert_eq!(results[0].run_id, *run_id);
+            assert_eq!(results[0].outcome.run_id, *run_id);
             assert!(
                 queue
                     .view()
@@ -1190,7 +1173,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_memo_sweep_keeps_a_member_run_submitted_again_after_forget() {
         let (queue, store, clock) = open_queue_at(10_000).await;
-        let runtime = WorkflowRuntime::builder(queue, store, TwoSteps, NoopTerminalHook)
+        let runtime = WorkflowRuntime::builder(queue, store, TwoSteps)
             .memo_retention(Duration::from_secs(60))
             .build()
             .unwrap();
@@ -1219,7 +1202,7 @@ mod tests {
     /// continues on the group `group_id`. The next step succeeds with the count
     /// of the members of `g` that succeeded.
     struct WaitsForGroup<R: StepRunner> {
-        members_runtime: WorkflowRuntime<R, NoopTerminalHook>,
+        members_runtime: WorkflowRuntime<R>,
         members: Vec<GroupMember>,
         group_id: RunId,
     }
@@ -1255,21 +1238,17 @@ mod tests {
         runner: R,
         members: Vec<GroupMember>,
         group_id: &str,
-    ) -> (
-        WorkflowRuntime<R, NoopTerminalHook>,
-        WorkflowRuntime<WaitsForGroup<R>, NoopTerminalHook>,
-    ) {
-        let members_runtime =
-            WorkflowRuntime::builder(queue.clone(), store.clone(), runner, NoopTerminalHook)
-                .queue_name("members")
-                .build()
-                .unwrap();
+    ) -> (WorkflowRuntime<R>, WorkflowRuntime<WaitsForGroup<R>>) {
+        let members_runtime = WorkflowRuntime::builder(queue.clone(), store.clone(), runner)
+            .queue_name("members")
+            .build()
+            .unwrap();
         let runner = WaitsForGroup {
             members_runtime: members_runtime.clone(),
             members,
             group_id: rid(group_id),
         };
-        let waiting = WorkflowRuntime::builder(queue, store, runner, NoopTerminalHook)
+        let waiting = WorkflowRuntime::builder(queue, store, runner)
             .queue_name("waiting")
             .build()
             .unwrap();
@@ -1285,7 +1264,7 @@ mod tests {
 
     /// Polls the status of `run_id` until its state matches `expected`.
     async fn until_state<R: StepRunner>(
-        runtime: &WorkflowRuntime<R, NoopTerminalHook>,
+        runtime: &WorkflowRuntime<R>,
         run_id: &str,
         expected: impl Fn(&RunState) -> bool,
     ) {
@@ -1323,8 +1302,7 @@ mod tests {
             .expect("the last termination woke the waiter")
             .unwrap();
         assert_eq!(end.termination.status, TerminalStatus::Succeeded);
-        let result = end.outcome.and_then(|outcome| outcome.result);
-        assert_eq!(result.as_deref(), Some(b"2".as_slice()));
+        assert_eq!(end.result.as_deref(), Some(b"2".as_slice()));
         waiting_worker.shutdown().await.unwrap();
         members_worker.shutdown().await.unwrap();
     }
@@ -1408,8 +1386,7 @@ mod tests {
             .await
             .expect("the termination of the rerun woke the waiter")
             .unwrap();
-        let result = end.outcome.and_then(|outcome| outcome.result);
-        assert_eq!(result.as_deref(), Some(b"2".as_slice()));
+        assert_eq!(end.result.as_deref(), Some(b"2".as_slice()));
         for worker in workers {
             worker.shutdown().await.unwrap();
         }

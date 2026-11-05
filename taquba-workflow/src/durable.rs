@@ -9,14 +9,13 @@
 //! own. Where absence means that the work runs again, the reader calls
 //! [`decode_or_absent`], which logs the failure and reports the record as
 //! absent: a memo entry is recomputed, a step-output replay record re-executes
-//! the step, a run result record is reported as missing, and a member record
-//! skipped by the group listing is submitted again. Where absence is read as a
-//! fresh entity, the reader calls [`decode`] or [`kv_record`], and the failure
-//! propagates as [`Error::Deserialization`](crate::Error::Deserialization): the
-//! run record with its terminal record, the current-step pointer, a member
-//! record read on its own and the group manifest, whose absence starts a new
-//! run or group. A new reader calls one of these and does not deserialize a
-//! record directly.
+//! the step, and a member record skipped by the group listing is submitted
+//! again. Where absence is read as a fresh entity, the reader calls [`decode`]
+//! or [`kv_record`], and the failure propagates as
+//! [`Error::Deserialization`](crate::Error::Deserialization): the run record
+//! with its terminal record, the current-step pointer, a member record read on
+//! its own and the group manifest, whose absence starts a new run or group. A
+//! new reader calls one of these and does not deserialize a record directly.
 
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -77,7 +76,7 @@ use crate::effects::StagedEffects;
 use crate::keys::RunId;
 use crate::runner::{StepErrorKind, StepOutcome, Trigger};
 use crate::runtime::StepRef;
-use crate::terminal::{CancelOrigin, RunOutcome, TerminalStatus};
+use crate::terminal::{CancelOrigin, RunTermination, TerminalStatus};
 
 /// The record of a run at `workflow/runs/{run_id}`. The submission writes the
 /// run record atomically with the step-0 enqueue, and the settlement that
@@ -347,11 +346,10 @@ impl From<DurableTerminalStatus> for TerminalStatus {
     }
 }
 
-/// The stored form of a [`RunTermination`](crate::RunTermination) with the
-/// final step, the SHA-256 of the run's input, the submission time and the
-/// submitter's headers: the terminal record of a [`DurableRun`], the
-/// termination half of a member record and the termination a run result record
-/// belongs to.
+/// The stored form of a [`RunTermination`] with the final step, the SHA-256 of
+/// the run's input, the submission time, the submitter's headers and the
+/// reference to the result: the terminal record of a [`DurableRun`] and the
+/// termination half of a member record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DurableTermination {
     pub(crate) status: DurableTerminalStatus,
@@ -363,6 +361,32 @@ pub(crate) struct DurableTermination {
     pub(crate) input_hash: [u8; 32],
     pub(crate) submitted_at_ms: u64,
     pub(crate) headers: HashMap<String, String>,
+    /// The result of a succeeded run, `None` for any other status.
+    pub(crate) result: Option<DurableResult>,
+}
+
+impl From<&DurableTermination> for RunTermination {
+    fn from(record: &DurableTermination) -> Self {
+        Self {
+            status: record.status.into(),
+            error: record.error.clone(),
+            cancelled_by: record.cancelled_by.map(Into::into),
+            error_kind: record.error_kind.map(Into::into),
+            final_step: record.final_step.clone().into(),
+            terminated_at_ms: record.terminated_at_ms,
+        }
+    }
+}
+
+/// The reference from a terminal record to the result of a succeeded run. A
+/// non-empty result is an object of the memo store, which the attempt `attempt`
+/// of the final step writes before the terminating settlement. The attempt
+/// makes the object name unique, so a stale attempt cannot overwrite a
+/// committed result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum DurableResult {
+    Empty,
+    Object { attempt: u32 },
 }
 
 /// The durable member record of a grouped run, written at
@@ -373,21 +397,6 @@ pub(crate) struct DurableMember {
     pub(crate) run_id: RunId,
     /// The member's termination, or `None` while it is active.
     pub(crate) terminated: Option<DurableTermination>,
-}
-
-/// Stored form of a [`RunOutcome`]: the payload of a terminal-notification job
-/// and the outcome half of the run result record, self-contained so both
-/// persist across restarts and redeliveries.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct DurableRunOutcome {
-    run_id: RunId,
-    status: DurableTerminalStatus,
-    #[serde(with = "serde_bytes")]
-    result: Option<Vec<u8>>,
-    error: Option<String>,
-    cancelled_by: Option<DurableCancelOrigin>,
-    headers: HashMap<String, String>,
-    final_step: DurableStepRef,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,49 +423,9 @@ impl From<DurableErrorKind> for StepErrorKind {
     }
 }
 
-/// The run result record, stored in the run memo under
-/// [`RUN_RESULT_MEMO_KEY`](crate::memo::RUN_RESULT_MEMO_KEY) by the worker
-/// before the settlement that terminates the run: the committed outcome and the
-/// termination the record belongs to, equal to the terminal record written by
-/// the same settlement.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct DurableRunResult {
-    pub(crate) termination: DurableTermination,
-    pub(crate) outcome: DurableRunOutcome,
-}
-
-impl From<&RunOutcome> for DurableRunOutcome {
-    fn from(outcome: &RunOutcome) -> Self {
-        Self {
-            run_id: outcome.run_id.clone(),
-            status: outcome.status.into(),
-            result: outcome.result.clone(),
-            error: outcome.error.clone(),
-            cancelled_by: outcome.cancelled_by.map(Into::into),
-            headers: outcome.headers.clone(),
-            final_step: (&outcome.final_step).into(),
-        }
-    }
-}
-
-impl From<DurableRunOutcome> for RunOutcome {
-    fn from(outcome: DurableRunOutcome) -> Self {
-        Self {
-            run_id: outcome.run_id,
-            status: outcome.status.into(),
-            result: outcome.result,
-            error: outcome.error,
-            cancelled_by: outcome.cancelled_by.map(Into::into),
-            headers: outcome.headers,
-            final_step: outcome.final_step.into(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::rid;
 
     #[test]
     fn payload_bytes_are_stored_as_binary_strings() {
@@ -472,21 +441,5 @@ mod tests {
         assert!(is_contiguous(&encode(&DurableStepOutcome::Succeed {
             result: payload.clone(),
         })));
-        let outcome = DurableRunOutcome {
-            run_id: rid("run"),
-            status: DurableTerminalStatus::Succeeded,
-            result: Some(payload.clone()),
-            error: None,
-            cancelled_by: None,
-            headers: HashMap::new(),
-            final_step: DurableStepRef {
-                step_number: 0,
-                job_id: "job".to_string(),
-            },
-        };
-        let stored = encode(&outcome);
-        assert!(is_contiguous(&stored));
-        let decoded: DurableRunOutcome = decode(&stored).unwrap();
-        assert_eq!(decoded.result, Some(payload));
     }
 }

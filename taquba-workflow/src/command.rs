@@ -318,7 +318,7 @@ mod tests {
     use crate::error::{ControlQueueError, Error};
     use crate::runner::{Step, StepError, StepOutcome, StepRunner};
     use crate::runtime::{DEFAULT_QUEUE_NAME, WorkflowRuntime};
-    use crate::terminal::{NoopTerminalHook, TerminalStatus};
+    use crate::terminal::TerminalStatus;
     use crate::test_util::{advance, open_queue_at_with, rid};
 
     const CONTROL: &str = "workflow-steps.control";
@@ -350,29 +350,23 @@ mod tests {
 
     /// A queue with a mock clock and an inbox for [`CONTROL`], and a runtime
     /// with that control queue and a memo retention of a minute.
-    async fn open() -> (
-        Arc<Queue>,
-        InboxSender,
-        WorkflowRuntime<Echo, NoopTerminalHook>,
-        MockClock,
-    ) {
+    async fn open() -> (Arc<Queue>, InboxSender, WorkflowRuntime<Echo>, MockClock) {
         let inbox = InboxOptions::new([CONTROL]).touch_poll_interval(None);
         let opts = OpenOptions::default()
             .inbox(inbox)
             .queue_config(CONTROL, control_config());
         let (queue, store, clock) = open_queue_at_with(INITIAL, opts).await;
-        let runtime =
-            WorkflowRuntime::builder(queue.clone(), store.clone(), Echo, NoopTerminalHook)
-                .poll_interval(Duration::from_millis(20))
-                .control_queue(CONTROL)
-                .memo_retention(Duration::from_secs(60))
-                .build()
-                .unwrap();
+        let runtime = WorkflowRuntime::builder(queue.clone(), store.clone(), Echo)
+            .poll_interval(Duration::from_millis(20))
+            .control_queue(CONTROL)
+            .memo_retention(Duration::from_secs(60))
+            .build()
+            .unwrap();
         (queue, InboxSender::new(store, "test-inbox"), runtime, clock)
     }
 
     /// Run `runtime` until the returned sender fires.
-    fn spawn(runtime: &WorkflowRuntime<Echo, NoopTerminalHook>) -> oneshot::Sender<()> {
+    fn spawn(runtime: &WorkflowRuntime<Echo>) -> oneshot::Sender<()> {
         let (tx, rx) = oneshot::channel::<()>();
         let running = runtime.clone();
         tokio::spawn(async move {
@@ -418,10 +412,7 @@ mod tests {
         assert_eq!(applied.status, JobStatus::Done);
         let end = runtime.wait(&rid("run-1")).await.unwrap();
         assert_eq!(end.termination.status, TerminalStatus::Succeeded);
-        assert_eq!(
-            end.outcome.unwrap().result.as_deref(),
-            Some(b"hello".as_slice())
-        );
+        assert_eq!(end.result.as_deref(), Some(b"hello".as_slice()));
 
         // A second submission of the run is a no-op, one with another input
         // fails permanently, and a payload that does not decode dead-letters.
@@ -533,10 +524,9 @@ mod tests {
             ("short", ControlQueueError::DoneJobsNotKept { retention }),
             ("dead", ControlQueueError::DeadRetentionShort { retention }),
         ] {
-            let built =
-                WorkflowRuntime::builder(queue.clone(), store.clone(), Echo, NoopTerminalHook)
-                    .control_queue(control)
-                    .build();
+            let built = WorkflowRuntime::builder(queue.clone(), store.clone(), Echo)
+                .control_queue(control)
+                .build();
             assert!(
                 matches!(
                     built,
@@ -546,7 +536,7 @@ mod tests {
                 "{control}"
             );
         }
-        WorkflowRuntime::builder(queue.clone(), store.clone(), Echo, NoopTerminalHook)
+        WorkflowRuntime::builder(queue.clone(), store.clone(), Echo)
             .control_queue(CONTROL)
             .build()
             .unwrap();
@@ -640,15 +630,13 @@ mod tests {
         assert!(reason.contains("different input"), "{reason}");
         let end = runtime
             .view()
-            .run_end(&rid("run-3"))
+            .terminated_run(&rid("run-3"))
             .await
             .unwrap()
             .unwrap();
         assert_eq!(end.termination.status, TerminalStatus::Cancelled);
         assert_eq!(end.termination.error.as_deref(), Some("operator"));
-        // The cancellation removed the first step while it waited, so no worker
-        // recorded an outcome.
-        assert!(end.outcome.is_none());
+        assert_eq!(end.result, None);
 
         // Once the `run_at` of the submissions and the memo retention have
         // passed, the sweep removes the run. No submission starts a new run of
@@ -677,7 +665,7 @@ mod tests {
         let end = runtime.wait(&rid("run-4")).await.unwrap();
         assert_eq!(end.termination.status, TerminalStatus::Cancelled);
         assert_eq!(end.termination.error.as_deref(), Some("operator"));
-        assert_eq!(end.outcome.and_then(|outcome| outcome.result), None);
+        assert_eq!(end.result, None);
         let _ = shutdown.send(());
     }
 

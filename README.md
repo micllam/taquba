@@ -61,9 +61,7 @@ builder in production.
 ```rust
 use std::sync::Arc;
 use taquba::{Queue, object_store::memory::InMemory};
-use taquba_workflow::{
-    NoopTerminalHook, RunSpec, Step, StepError, StepOutcome, StepRunner, WorkflowRuntime,
-};
+use taquba_workflow::{RunSpec, Step, StepError, StepOutcome, StepRunner, WorkflowRuntime};
 
 struct EchoRunner;
 impl StepRunner for EchoRunner {
@@ -77,15 +75,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(InMemory::new());
     let queue = Arc::new(Queue::open(store.clone(), "demo").await?);
 
-    let runtime = WorkflowRuntime::builder(queue, store, EchoRunner, NoopTerminalHook).build()?;
-    let worker = runtime.clone();
-    tokio::spawn(async move { worker.run(std::future::pending::<()>()).await });
+    let runtime = WorkflowRuntime::builder(queue, store, EchoRunner).build()?;
+    let worker = runtime.spawn(std::future::pending::<()>());
 
-    let outcome = runtime.submit(RunSpec {
+    let submitted = runtime.submit(RunSpec {
         input: b"hello".to_vec(),
         ..Default::default()
     }).await?;
-    println!("submitted run {}", outcome.run_id);
+    let run = runtime.wait(&submitted.run_id).await?;
+    println!("run {} {}", run.run_id, run.termination.status);
+    worker.shutdown().await?;
     Ok(())
 }
 ```

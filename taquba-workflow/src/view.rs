@@ -10,7 +10,7 @@ use taquba::{InboxOutcome, JobRecord, JobStatus, KvOrder, QueueView};
 
 use crate::command::CommandState;
 use crate::durable::{
-    self, DurableRun, DurableRunRecord, DurableRunResult, DurableStepRef, DurableTermination,
+    self, DurableResult, DurableRun, DurableRunRecord, DurableStepRef, DurableTermination,
 };
 use crate::error::{Error, Result};
 use crate::group::{self, GroupStatus};
@@ -18,9 +18,9 @@ use crate::keys::{
     RUN_KV_ENTRY_PREFIX, RUN_KV_PREFIX, RunId, STEP_KV_PREFIX, group_of_count_name,
     run_kv_entries_range, run_kv_entry_key, run_kv_key, step_kv_key, submitter_headers,
 };
-use crate::memo::{MemoStore, RUN_RESULT_MEMO_KEY};
-use crate::runtime::{RunEnd, RunState, RunStatus, RunTermination};
-use crate::terminal::{RunOutcome, TerminalStatus};
+use crate::memo::MemoStore;
+use crate::runtime::{RunState, RunStatus};
+use crate::terminal::{RunTermination, TerminalStatus, TerminatedRun};
 
 /// The runs that [`WorkflowView::runs`] lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,24 +171,17 @@ impl WorkflowView {
         }))
     }
 
-    /// The end of a terminated run, as
+    /// The outcome of a terminated run, as
     /// [`WorkflowRuntime::wait`](crate::WorkflowRuntime::wait) reports it: the
-    /// termination from its terminal record, with the committed outcome from
-    /// its run result record. The worker that terminates the run writes the
-    /// record before the terminating settlement, so the outcome is `None` for a
-    /// run terminated without a worker (a cancellation of a pending step, a
-    /// dead-letter outside the worker). The end is `None` for a run that is
-    /// unknown, still active or swept.
-    pub async fn run_end(&self, run_id: &RunId) -> Result<Option<RunEnd>> {
-        let Some(termination) = self.terminal_record(run_id).await? else {
-            return Ok(None);
-        };
-        let termination = RunTermination::from(termination);
-        let outcome = self.run_result_of(run_id, &termination).await?;
-        Ok(Some(RunEnd {
-            termination,
-            outcome,
-        }))
+    /// termination from its terminal record, with the result of a succeeded
+    /// run. The outcome is `None` for a run that is unknown, still active or
+    /// swept. Returns [`Error::InconsistentRunState`] for a succeeded run whose
+    /// terminal record does not have the reference to its result.
+    pub async fn terminated_run(&self, run_id: &RunId) -> Result<Option<TerminatedRun>> {
+        match self.terminal_record(run_id).await? {
+            Some(termination) => self.outcome_of(run_id, termination).await,
+            None => Ok(None),
+        }
     }
 
     /// The state of the [`Command`](crate::Command) of the inbox entry
@@ -341,31 +334,34 @@ impl WorkflowView {
         })
     }
 
-    /// The outcome in the run result record of `run_id` when the record belongs
-    /// to `termination`. A record written before a settlement that did not
-    /// commit outlives the termination that followed, so a record of another
-    /// termination is not reported. A record that fails to decode is treated as
-    /// absent.
-    pub(crate) async fn run_result_of(
+    /// The outcome of `run_id` with the terminal record `termination`, with the
+    /// result that the record refers to. A result object that the memo sweep
+    /// has removed before the terminal record reports the run as swept, `None`.
+    pub(crate) async fn outcome_of(
         &self,
         run_id: &RunId,
-        termination: &RunTermination,
-    ) -> Result<Option<RunOutcome>> {
-        let Some(bytes) = self
-            .memos
-            .new_run_memo(run_id)
-            .get(RUN_RESULT_MEMO_KEY)
-            .await?
-        else {
-            return Ok(None);
+        termination: DurableTermination,
+    ) -> Result<Option<TerminatedRun>> {
+        let result = match (termination.status.into(), termination.result) {
+            (TerminalStatus::Succeeded, Some(DurableResult::Empty)) => Some(Vec::new()),
+            (TerminalStatus::Succeeded, Some(DurableResult::Object { attempt })) => {
+                let job_id = &termination.final_step.job_id;
+                match self.memos.get_result(run_id, job_id, attempt).await? {
+                    Some(result) => Some(result),
+                    None => return Ok(None),
+                }
+            }
+            (TerminalStatus::Succeeded, None) => {
+                return Err(Error::InconsistentRunState(run_id.clone()));
+            }
+            (TerminalStatus::Failed | TerminalStatus::Cancelled, _) => None,
         };
-        Ok(
-            durable::decode_or_absent::<DurableRunResult>(&bytes, "run result record", run_id)
-                .and_then(|record| {
-                    (RunTermination::from(record.termination) == *termination)
-                        .then(|| record.outcome.into())
-                }),
-        )
+        Ok(Some(TerminatedRun {
+            run_id: run_id.clone(),
+            termination: RunTermination::from(&termination),
+            result,
+            headers: termination.headers,
+        }))
     }
 }
 
@@ -393,7 +389,7 @@ fn listed_terminated(run_id: RunId, termination: DurableTermination) -> ListedRu
         status: RunStatus {
             run_id,
             step: termination.final_step.clone().into(),
-            state: RunState::Terminated(termination.into()),
+            state: RunState::Terminated(RunTermination::from(&termination)),
         },
     }
 }

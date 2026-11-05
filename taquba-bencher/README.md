@@ -46,7 +46,7 @@ the header comment of its source file.
 
 | Benchmark | Workload | Measurement |
 |---|---|---|
-| `fanout` | Submit `N_JOBS` jobs concurrently with idempotency keys and await every handle, then submit the identical batch again | The throughput that a typed-job fan-out sustains cold (run record, enqueue, claim, run, outcome-record write, completion notification, outcome read), and the throughput of the idempotent short-circuit that crash-resume relies on. |
+| `fanout` | Submit `N_JOBS` jobs concurrently with idempotency keys and await every handle, then submit the identical batch again | The throughput that a typed-job fan-out sustains cold (run record, enqueue, claim, run, result-object write, completion notification, result read), and the throughput of the idempotent short-circuit that crash-resume relies on. |
 
 ## Running
 

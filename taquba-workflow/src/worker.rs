@@ -1,37 +1,31 @@
 //! The worker path: how a claimed job is identified, run and settled.
 //! [`StepWorker`] is the runtime's [`Worker`]. A step job is parsed into a
 //! [`ClaimedStep`], run through the [`StepRunner`] and settled into the
-//! [`SettlementEffects`] of its outcome, and a terminal-notification job runs
-//! the [`TerminalHook`].
+//! [`SettlementEffects`] of its outcome.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use taquba::{
-    FailWith, JobRecord, LeaseHandle, PermanentFailure, SettlementEffects, Worker, WorkerError,
-};
+use taquba::{FailWith, JobRecord, LeaseHandle, SettlementEffects, Worker, WorkerError};
 use tracing::{debug, warn};
 
-use crate::durable::{self, DurableRunOutcome, Submission};
-use crate::effects::{EffectsHandle, TerminalEffects};
+use crate::durable::Submission;
+use crate::effects::EffectsHandle;
 use crate::error::{Error, worker_error};
 use crate::group::Membership;
-use crate::keys::{
-    HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RunId, next_step_job_id, submitter_headers,
-};
+use crate::keys::{HEADER_RUN_ID, HEADER_STEP, RunId, next_step_job_id, submitter_headers};
 use crate::kv::KvReadHandle;
 use crate::runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
-use crate::runtime::StepRef;
 use crate::runtime::{RuntimeCore, RuntimeInner, StepEnqueueOpts};
-use crate::terminal::{CancelOrigin, RunOutcome, TerminalHook, TerminalStatus};
+use crate::terminal::{CancelOrigin, TerminalStatus};
 
 /// The [`Worker`] of a runtime: every claimed job of the runtime's queue is
 /// processed by [`RuntimeInner::process_step`].
-pub(crate) struct StepWorker<R, H> {
-    pub(crate) inner: Arc<RuntimeInner<R, H>>,
+pub(crate) struct StepWorker<R> {
+    pub(crate) inner: Arc<RuntimeInner<R>>,
 }
 
-impl<R: StepRunner + 'static, H: TerminalHook + 'static> Worker for StepWorker<R, H> {
+impl<R: StepRunner + 'static> Worker for StepWorker<R> {
     async fn process_with_effects(
         &self,
         job: &JobRecord,
@@ -103,44 +97,46 @@ impl<'a> ClaimedStep<'a> {
             .map(Membership::reserved_headers)
             .unwrap_or_default()
     }
+}
 
-    /// The outcome of the run terminating at this step with `status`.
-    fn outcome(
-        &self,
-        status: TerminalStatus,
-        result: Option<Vec<u8>>,
-        error: Option<String>,
-    ) -> RunOutcome {
-        RunOutcome {
-            run_id: self.run_id.clone(),
-            status,
-            result,
-            error,
+/// How a run ends at a step: its status, the error with its kind and the origin
+/// of a cancellation. The runtime adds the time, the submission and the result
+/// to form the terminal record.
+pub(crate) struct Ending {
+    pub(crate) status: TerminalStatus,
+    pub(crate) error: Option<String>,
+    pub(crate) cancelled_by: Option<CancelOrigin>,
+    pub(crate) error_kind: Option<StepErrorKind>,
+}
+
+impl Ending {
+    /// A `Succeeded` ending.
+    pub(crate) fn succeeded() -> Self {
+        Self {
+            status: TerminalStatus::Succeeded,
+            error: None,
             cancelled_by: None,
-            headers: self.headers.clone(),
-            final_step: StepRef {
-                number: self.step_number,
-                job_id: self.job.id.clone(),
-            },
+            error_kind: None,
         }
     }
 
-    /// A `Succeeded` outcome of the run at this step.
-    pub(crate) fn succeeded(&self, result: Vec<u8>) -> RunOutcome {
-        self.outcome(TerminalStatus::Succeeded, Some(result), None)
+    /// A `Failed` ending with `error`, classified as `error_kind`.
+    pub(crate) fn failed(error: String, error_kind: Option<StepErrorKind>) -> Self {
+        Self {
+            status: TerminalStatus::Failed,
+            error: Some(error),
+            cancelled_by: None,
+            error_kind,
+        }
     }
 
-    /// A `Failed` outcome of the run at this step.
-    pub(crate) fn failed(&self, error: String) -> RunOutcome {
-        self.outcome(TerminalStatus::Failed, None, Some(error))
-    }
-
-    /// A `Cancelled` outcome of the run at this step, cancelled by `origin` for
-    /// `reason`.
-    pub(crate) fn cancelled(&self, origin: CancelOrigin, reason: Option<String>) -> RunOutcome {
-        RunOutcome {
+    /// A `Cancelled` ending by `origin` for `reason`.
+    pub(crate) fn cancelled(origin: CancelOrigin, reason: Option<String>) -> Self {
+        Self {
+            status: TerminalStatus::Cancelled,
+            error: reason,
             cancelled_by: Some(origin),
-            ..self.outcome(TerminalStatus::Cancelled, None, reason)
+            error_kind: None,
         }
     }
 }
@@ -149,14 +145,14 @@ impl RuntimeCore {
     /// The error that settles a failed step: a permanent error, or a transient
     /// one on the last attempt, dead-letters the step and terminates the run,
     /// and another transient error retries the step.
-    async fn step_failure(
+    fn step_failure(
         &self,
         claimed: &ClaimedStep<'_>,
         err: StepError,
         submission: Submission,
     ) -> WorkerError {
         if err.kind == StepErrorKind::Permanent || claimed.job.is_last_attempt() {
-            self.terminating_failure(claimed, err, submission).await
+            self.terminating_failure(claimed, err, submission)
         } else {
             err.into_worker_error()
         }
@@ -164,39 +160,40 @@ impl RuntimeCore {
 
     /// The error a step returns for a failure that terminates its run: the
     /// effects of the `Failed` termination on a [`FailWith`], so the core
-    /// applies them only with the dead-lettering settlement. The run result
-    /// record is written first, and a failed write is logged.
-    pub(crate) async fn terminating_failure(
+    /// applies them only with the dead-lettering settlement.
+    pub(crate) fn terminating_failure(
         &self,
         claimed: &ClaimedStep<'_>,
         error: StepError,
         submission: Submission,
     ) -> WorkerError {
-        let outcome = claimed.failed(error.message.clone());
-        let termination = self.termination(&outcome, Some(error.kind), submission);
-        if let Err(err) = self.store_run_result(&outcome, &termination).await {
-            warn!(run_id = %claimed.run_id, "failed to write the run result record: {err}");
-        }
-        let effects = self.terminate_collecting_effects(&outcome, claimed, termination);
+        let ending = Ending::failed(error.message.clone(), Some(error.kind));
+        let termination = self.termination(claimed, ending, None, submission);
+        let effects = self.terminate_collecting_effects(claimed, termination, None);
         FailWith::new(error.into_worker_error(), effects).into()
     }
 
-    /// Terminate the run of `claimed` with `outcome` from an acking settlement:
-    /// write the run result record, then build the settlement effects. A failed
-    /// write is a transient error, so the step is delivered again. `error_kind`
-    /// classifies a `Failed` outcome.
+    /// Terminate the run of `claimed` with `ending` from an acking settlement.
+    /// The result of a succeeded run is written before the settlement effects
+    /// are built, and a failed write is a transient error, so the step is
+    /// delivered again.
     async fn terminate_recorded(
         &self,
         claimed: &ClaimedStep<'_>,
-        outcome: RunOutcome,
+        ending: Ending,
+        result: Option<Vec<u8>>,
         submission: Submission,
-        error_kind: Option<StepErrorKind>,
     ) -> Result<SettlementEffects, WorkerError> {
-        let termination = self.termination(&outcome, error_kind, submission);
-        self.store_run_result(&outcome, &termination)
-            .await
-            .map_err(worker_error)?;
-        Ok(self.terminate_collecting_effects(&outcome, claimed, termination))
+        let reference = match &result {
+            Some(result) => Some(
+                self.store_result(claimed, result)
+                    .await
+                    .map_err(worker_error)?,
+            ),
+            None => None,
+        };
+        let termination = self.termination(claimed, ending, reference, submission);
+        Ok(self.terminate_collecting_effects(claimed, termination, result))
     }
 
     /// The settlement of `outcome` for `claimed`: the effects of the run's
@@ -215,13 +212,13 @@ impl RuntimeCore {
     ) -> Result<SettlementEffects, WorkerError> {
         match (outcome, external_cancel) {
             (_, Some(ExternalCancel { reason })) => {
-                let outcome = claimed.cancelled(CancelOrigin::Request, reason);
-                self.terminate_recorded(claimed, outcome, submission, None)
+                let ending = Ending::cancelled(CancelOrigin::Request, reason);
+                self.terminate_recorded(claimed, ending, None, submission)
                     .await
             }
             (Ok(StepOutcome::Cancel { reason }), None) => {
-                let outcome = claimed.cancelled(CancelOrigin::Runner, Some(reason));
-                self.terminate_recorded(claimed, outcome, submission, None)
+                let ending = Ending::cancelled(CancelOrigin::Runner, Some(reason));
+                self.terminate_recorded(claimed, ending, None, submission)
                     .await
             }
             (Ok(StepOutcome::Continue { payload, when }), None) => match when {
@@ -244,26 +241,22 @@ impl RuntimeCore {
                         .await
                     {
                         Ok(effects) => Ok(effects),
-                        Err(err) => Err(self.step_failure(claimed, err.into(), submission).await),
+                        Err(err) => Err(self.step_failure(claimed, err.into(), submission)),
                     }
                 }
             },
             (Ok(StepOutcome::Succeed { result }), None) => {
-                self.terminate_recorded(claimed, claimed.succeeded(result), submission, None)
+                self.terminate_recorded(claimed, Ending::succeeded(), Some(result), submission)
                     .await
             }
             // A runner decision: the step ran cleanly and is acknowledged, and
             // the run terminates as `Failed` without a dead-letter.
             (Ok(StepOutcome::Fail { reason }), None) => {
-                self.terminate_recorded(
-                    claimed,
-                    claimed.failed(reason),
-                    submission,
-                    Some(StepErrorKind::Permanent),
-                )
-                .await
+                let ending = Ending::failed(reason, Some(StepErrorKind::Permanent));
+                self.terminate_recorded(claimed, ending, None, submission)
+                    .await
             }
-            (Err(err), None) => Err(self.step_failure(claimed, err, submission).await),
+            (Err(err), None) => Err(self.step_failure(claimed, err, submission)),
         }
     }
 }
@@ -274,44 +267,15 @@ pub(crate) struct ExternalCancel {
     pub(crate) reason: Option<String>,
 }
 
-impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
-    /// Process a terminal-notification job: decode the committed outcome and
-    /// run the configured [`TerminalHook`] as the job's worker. Effects the
-    /// hook stages join this job's acknowledgement. A transient hook error
-    /// retries the job per the queue's backoff, and a permanent error
-    /// dead-letters it.
-    async fn process_notification(
-        &self,
-        job: &JobRecord,
-    ) -> Result<SettlementEffects, WorkerError> {
-        let outcome: RunOutcome = durable::decode::<DurableRunOutcome>(&job.payload)
-            .map_err(|err| {
-                warn!(job_id = %job.id, error = %err, "terminal notification has a malformed payload");
-                PermanentFailure::new(err.to_string())
-            })?
-            .into();
-        let effects = TerminalEffects::for_delivery(&self.core.queue_name);
-        let result = self.terminal_hook.on_termination(&outcome, &effects).await;
-        let staged = effects.seal_into_settlement();
-        match result {
-            Ok(()) => Ok(staged),
-            Err(err) => Err(err.into_worker_error()),
-        }
-    }
-
-    /// Process one claimed job of the runtime's queue. A notification job runs
-    /// the terminal hook. A step job is run through the runner, or its stored
-    /// outcome is replayed, and the job is settled with the effects of the
-    /// outcome.
+impl<R: StepRunner> RuntimeInner<R> {
+    /// Process one claimed step job of the runtime's queue. The step runs
+    /// through the runner, or its stored outcome is replayed, and the job is
+    /// settled with the effects of the outcome.
     pub(crate) async fn process_step(
         &self,
         job: &JobRecord,
         lease: &LeaseHandle,
     ) -> Result<SettlementEffects, WorkerError> {
-        if job.headers.contains_key(HEADER_TERMINAL) {
-            return self.process_notification(job).await;
-        }
-
         let claimed = match ClaimedStep::parse(job) {
             Ok(claimed) => claimed,
             Err(err) => {
@@ -332,10 +296,10 @@ impl<R: StepRunner, H: TerminalHook> RuntimeInner<R, H> {
             .map_err(worker_error)?
             .ok_or_else(|| worker_error(Error::InconsistentRunState(run_id.clone())))?;
         if let Some(request) = &record.cancel_request {
-            let outcome = claimed.cancelled(CancelOrigin::Request, request.reason.clone());
+            let ending = Ending::cancelled(CancelOrigin::Request, request.reason.clone());
             return self
                 .core
-                .terminate_recorded(&claimed, outcome, Submission::from(&record), None)
+                .terminate_recorded(&claimed, ending, None, Submission::from(&record))
                 .await;
         }
 

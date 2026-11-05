@@ -297,7 +297,7 @@ pub enum StepOutcome {
     /// [`taquba::QueueView::dead_jobs`]. `Fail` is a successful execution with
     /// a negative outcome and does not dead-letter.
     Fail {
-        /// Human-readable reason recorded on [`crate::RunOutcome::error`].
+        /// Human-readable reason recorded on [`crate::RunTermination::error`].
         reason: String,
     },
     /// The run is finished as cancelled by the runner. A runner returns it when
@@ -311,7 +311,7 @@ pub enum StepOutcome {
     /// process, call [`crate::WorkflowRuntime::cancel`]. The runtime translates
     /// that call into the same `Cancelled` terminal state.
     Cancel {
-        /// Human-readable reason recorded on [`crate::RunOutcome::error`].
+        /// Human-readable reason recorded on [`crate::RunTermination::error`].
         reason: String,
     },
 }

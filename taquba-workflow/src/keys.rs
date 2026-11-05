@@ -103,11 +103,6 @@ pub(crate) fn check_effects(effects: &SettlementEffects, runtime_queue: &str) ->
     Ok(())
 }
 
-/// Header key marking a job as a terminal-notification job, whose payload is
-/// the run's committed outcome and whose worker is the configured
-/// [`TerminalHook`](crate::TerminalHook).
-pub const HEADER_TERMINAL: &str = "workflow.terminal";
-
 /// Header key identifying the group a run is a member of, set on every step job
 /// of a grouped run.
 pub const HEADER_GROUP: &str = "workflow.group";

@@ -1,5 +1,6 @@
-//! Minimal one-step run: submit a payload, the runner returns it unchanged, the
-//! completion hook prints the result and shuts the runtime down.
+//! Minimal one-step run. The runner returns its payload unchanged as the
+//! result. The submitter waits for the run, prints the result and shuts the
+//! runtime down.
 //!
 //! Run with:
 //!
@@ -11,11 +12,7 @@ use std::sync::Arc;
 
 use taquba::Queue;
 use taquba::object_store::memory::InMemory;
-use taquba_workflow::{
-    RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects, TerminalHook,
-    WorkflowRuntime,
-};
-use tokio::sync::oneshot;
+use taquba_workflow::{RunSpec, Step, StepError, StepOutcome, StepRunner, WorkflowRuntime};
 
 struct Echo;
 
@@ -27,61 +24,29 @@ impl StepRunner for Echo {
     }
 }
 
-struct PrintAndExit {
-    shutdown: tokio::sync::Mutex<Option<oneshot::Sender<()>>>,
-}
-
-impl TerminalHook for PrintAndExit {
-    async fn on_termination(
-        &self,
-        outcome: &RunOutcome,
-        _effects: &TerminalEffects,
-    ) -> std::result::Result<(), StepError> {
-        println!(
-            "run {} -> {:?}: {}",
-            outcome.run_id,
-            outcome.status,
-            String::from_utf8_lossy(outcome.result.as_deref().unwrap_or(b""))
-        );
-        if let Some(tx) = self.shutdown.lock().await.take() {
-            let _ = tx.send(());
-        }
-        Ok(())
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(InMemory::new());
     let queue = Arc::new(Queue::open(store.clone(), "agent-demo").await?);
 
-    let (tx, rx) = oneshot::channel::<()>();
-    let runtime = WorkflowRuntime::builder(
-        queue,
-        store,
-        Echo,
-        PrintAndExit {
-            shutdown: tokio::sync::Mutex::new(Some(tx)),
-        },
-    )
-    .build()?;
+    let runtime = WorkflowRuntime::builder(queue, store, Echo).build()?;
+    let worker = runtime.spawn(std::future::pending());
 
-    let worker_runtime = runtime.clone();
-    let worker_task = tokio::spawn(async move {
-        worker_runtime
-            .run(async move {
-                let _ = rx.await;
-            })
-            .await
-    });
-
-    runtime
+    let handle = runtime
         .submit(RunSpec {
             input: b"hello, world".to_vec(),
             ..Default::default()
         })
         .await?;
 
-    worker_task.await??;
+    let run = runtime.wait(&handle.run_id).await?;
+    println!(
+        "run {} -> {}: {}",
+        run.run_id,
+        run.termination.status,
+        String::from_utf8_lossy(run.result.as_deref().unwrap_or(b""))
+    );
+
+    worker.shutdown().await?;
     Ok(())
 }

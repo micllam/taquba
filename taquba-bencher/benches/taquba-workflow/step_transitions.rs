@@ -44,8 +44,8 @@ use std::time::{Duration, Instant};
 use taquba::{OpenOptions, Queue, QueueConfig};
 use taquba_bencher::{env_var, init_tracing, pct, store_from_env};
 use taquba_workflow::{
-    RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects, TerminalHook,
-    TerminalStatus, WorkflowRuntime,
+    RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects, TerminalHook,
+    TerminalStatus, TerminatedRun, WorkflowRuntime,
 };
 
 /// Step start sample, recorded when the runner receives the step: (elapsed_us,
@@ -79,19 +79,15 @@ struct CountingHook {
 }
 
 impl TerminalHook for CountingHook {
-    async fn on_termination(
-        &self,
-        outcome: &RunOutcome,
-        _effects: &TerminalEffects,
-    ) -> std::result::Result<(), StepError> {
-        if !matches!(outcome.status, TerminalStatus::Succeeded) {
+    fn stage_effects(&self, outcome: &TerminatedRun, _effects: &TerminalEffects) {
+        let termination = &outcome.termination;
+        if termination.status != TerminalStatus::Succeeded {
             eprintln!(
-                "run {} terminated as {:?}: {:?}",
-                outcome.run_id, outcome.status, outcome.error,
+                "run {} terminated as {}: {:?}",
+                outcome.run_id, termination.status, termination.error,
             );
         }
         self.terminated.fetch_add(1, Ordering::SeqCst);
-        Ok(())
     }
 }
 
@@ -139,10 +135,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bench_start,
             samples: samples.clone(),
         },
-        CountingHook {
-            terminated: terminated.clone(),
-        },
     )
+    .terminal_hook(CountingHook {
+        terminated: terminated.clone(),
+    })
     .max_concurrent_steps(max_concurrent_steps)
     .build()
     .unwrap();

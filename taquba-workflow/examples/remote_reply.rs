@@ -33,8 +33,8 @@ use taquba::{
     Queue, SignalEntry, Worker, WorkerError, default_inbox_path, run_worker,
 };
 use taquba_workflow::{
-    DEFAULT_QUEUE_NAME, RunId, RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner,
-    TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
+    DEFAULT_QUEUE_NAME, RunId, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalStatus,
+    WorkflowRuntime,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -139,36 +139,6 @@ async fn remote_worker(mut requests: mpsc::Receiver<Request>, sender: InboxSende
     }
 }
 
-struct ShutdownOnTermination {
-    shutdown: tokio::sync::Mutex<Option<oneshot::Sender<()>>>,
-}
-
-impl TerminalHook for ShutdownOnTermination {
-    async fn on_termination(
-        &self,
-        outcome: &RunOutcome,
-        _effects: &TerminalEffects,
-    ) -> std::result::Result<(), StepError> {
-        match outcome.status {
-            TerminalStatus::Succeeded => println!(
-                "run {} succeeded: {:?}",
-                outcome.run_id,
-                String::from_utf8_lossy(outcome.result.as_deref().unwrap_or(&[]))
-            ),
-            _ => println!(
-                "run {} terminated as {:?}: {}",
-                outcome.run_id,
-                outcome.status,
-                outcome.error.as_deref().unwrap_or("(no error)")
-            ),
-        }
-        if let Some(tx) = self.shutdown.lock().await.take() {
-            let _ = tx.send(());
-        }
-        Ok(())
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -182,17 +152,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sender = InboxSender::new(store.clone(), default_inbox_path(QUEUE_PATH));
 
     let (requests, request_rx) = mpsc::channel::<Request>(8);
-    let (tx, rx) = oneshot::channel::<()>();
-    let runtime = WorkflowRuntime::builder(
-        queue.clone(),
-        store,
-        Dispatcher,
-        ShutdownOnTermination {
-            shutdown: tokio::sync::Mutex::new(Some(tx)),
-        },
-    )
-    .poll_interval(Duration::from_millis(200))
-    .build()?;
+    let runtime = WorkflowRuntime::builder(queue.clone(), store, Dispatcher)
+        .poll_interval(Duration::from_millis(200))
+        .build()?;
+    let worker = runtime.spawn(std::future::pending());
 
     tokio::spawn(remote_worker(request_rx, sender));
     let (stop_forwarder, forwarder_stopped) = oneshot::channel::<()>();
@@ -222,11 +185,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     println!("submitted run {}", outcome.run_id);
 
-    runtime
-        .run(async move {
-            let _ = rx.await;
-        })
-        .await?;
+    let run = runtime.wait(&outcome.run_id).await?;
+    let termination = &run.termination;
+    match termination.status {
+        TerminalStatus::Succeeded => println!(
+            "run {} succeeded: {:?}",
+            run.run_id,
+            String::from_utf8_lossy(run.result.as_deref().unwrap_or(&[]))
+        ),
+        TerminalStatus::Failed | TerminalStatus::Cancelled => println!(
+            "run {} terminated as {}: {}",
+            run.run_id,
+            termination.status,
+            termination.error.as_deref().unwrap_or("(no error)")
+        ),
+    }
+
+    worker.shutdown().await?;
     let _ = stop_forwarder.send(());
     forwarder.await??;
     Ok(())

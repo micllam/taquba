@@ -29,21 +29,19 @@
 //! - `<prefix>/step-outputs/<run_id>/<step_number>/<sha256(step_payload)>`:
 //!   step-output replay entries written by the workflow runtime when
 //!   enabled.
-//!
-//! # Reserved key
-//!
-//! [`RUN_RESULT_MEMO_KEY`] is the key of the run result record that the runtime
-//! writes to a run-scoped memo. A handler's run memo must not use it.
+//! - `<prefix>/results/<run_id>/<job_id>/<attempt>`: the result of a run that
+//!   succeeded, written by the attempt `attempt` of its final step's job
+//!   `job_id` before the settlement that terminates the run.
 //!
 //! # Cleanup
 //!
 //! The [`Memo`] primitive does not manage its own lifecycle.
-//! [`MemoStore::clear_memos_for_run`] removes every memo entry and step-output
-//! replay entry for a given run. Deciding *which* runs are eligible is the
-//! caller's concern: the workflow runtime records a terminal marker for each
-//! finished run in the queue's key-value namespace, in the same transaction
-//! that settles the run, and its retention sweep pairs that marker with
-//! `clear_memos_for_run`.
+//! [`MemoStore::clear_memos_for_run`] removes every memo entry, step-output
+//! replay entry and result object for a given run. Deciding *which* runs are
+//! eligible is the caller's concern: the workflow runtime records a terminal
+//! marker for each finished run in the queue's key-value namespace, in the same
+//! transaction that settles the run, and its retention sweep pairs that marker
+//! with `clear_memos_for_run`.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -58,15 +56,11 @@ use crate::durable::decode_or_absent;
 use crate::error::{Error, Result};
 use crate::keys::{RunId, hex_sha256};
 
-/// Run-memo key of the run result record. Handlers receive the run memo as
-/// well, so the key is reserved and documented.
-pub(crate) const RUN_RESULT_MEMO_KEY: &str = "workflow.outcome";
-
 /// Backing store for [`Memo`] entries, parametrised by an [`ObjectStore`] and a
 /// path prefix. Builds per-step [`Memo`] views via [`MemoStore::new_memo`].
 ///
-/// Owns the memo and step-output sub-prefixes. The module docs describe the
-/// path layout.
+/// Owns the memo, step-output and result sub-prefixes. The module docs describe
+/// the path layout.
 #[derive(Clone)]
 pub struct MemoStore {
     objects: ObjectPrefix,
@@ -84,9 +78,10 @@ impl std::fmt::Debug for MemoStore {
 
 impl MemoStore {
     /// Build a `MemoStore` over the given object store and path prefix. Memo
-    /// entries live under `<prefix>/memos/...` and step-output replay entries
-    /// under `<prefix>/step-outputs/...`. The prefix must not overlap with the
-    /// queue's SlateDB path or with any other consumer of the same store.
+    /// entries live under `<prefix>/memos/...`, step-output replay entries
+    /// under `<prefix>/step-outputs/...` and run results under
+    /// `<prefix>/results/...`. The prefix must not overlap with the queue's
+    /// SlateDB path or with any other consumer of the same store.
     pub fn new(store: Arc<dyn ObjectStore>, prefix: impl Into<String>) -> Self {
         Self {
             objects: ObjectPrefix::new(store, prefix),
@@ -110,10 +105,11 @@ impl MemoStore {
         Memo::new(self.clone(), run_id, MemoScope::Run)
     }
 
-    /// Delete every memo entry and runtime step-output replay entry for
-    /// `run_id`. Returns the number of entries removed. Errors during
-    /// individual deletes are logged (best-effort cleanup) but do not stop the
-    /// sweep. An aggregated error is returned only if a list operation fails.
+    /// Delete every memo entry, runtime step-output replay entry and result
+    /// object for `run_id`. Returns the number of entries removed. Errors
+    /// during individual deletes are logged (best-effort cleanup) but do not
+    /// stop the sweep. An aggregated error is returned only if a list operation
+    /// fails.
     pub async fn clear_memos_for_run(&self, run_id: &RunId) -> Result<usize> {
         let memo_deleted = self
             .clear_prefix(run_id, self.memos_run_prefix(run_id), "memo")
@@ -121,7 +117,10 @@ impl MemoStore {
         let step_output_deleted = self
             .clear_prefix(run_id, self.step_outputs_run_prefix(run_id), "step output")
             .await?;
-        Ok(memo_deleted + step_output_deleted)
+        let result_deleted = self
+            .clear_prefix(run_id, self.results_run_prefix(run_id), "result")
+            .await?;
+        Ok(memo_deleted + step_output_deleted + result_deleted)
     }
 
     async fn clear_prefix(
@@ -176,6 +175,33 @@ impl MemoStore {
             .await
     }
 
+    /// The result object of `run_id` written by the attempt `attempt` of the
+    /// job `job_id`, `None` when it is absent.
+    pub(crate) async fn get_result(
+        &self,
+        run_id: &RunId,
+        job_id: &str,
+        attempt: u32,
+    ) -> Result<Option<Vec<u8>>> {
+        self.objects
+            .get(&self.result_path(run_id, job_id, attempt))
+            .await
+    }
+
+    /// Write `result` as the result object of `run_id` for the attempt
+    /// `attempt` of the job `job_id`.
+    pub(crate) async fn put_result(
+        &self,
+        run_id: &RunId,
+        job_id: &str,
+        attempt: u32,
+        result: &[u8],
+    ) -> Result<()> {
+        self.objects
+            .put(&self.result_path(run_id, job_id, attempt), result)
+            .await
+    }
+
     fn memo_path(&self, run_id: &RunId, scope: MemoScope, key: &str) -> Path {
         let segment = match scope {
             MemoScope::Step(step_number) => step_number.to_string(),
@@ -192,6 +218,16 @@ impl MemoStore {
 
     fn step_outputs_run_prefix(&self, run_id: &RunId) -> Path {
         self.objects.path(&format!("step-outputs/{run_id}"))
+    }
+
+    fn results_run_prefix(&self, run_id: &RunId) -> Path {
+        self.objects.path(&format!("results/{run_id}"))
+    }
+
+    fn result_path(&self, run_id: &RunId, job_id: &str, attempt: u32) -> Path {
+        self.results_run_prefix(run_id)
+            .join(job_id)
+            .join(attempt.to_string())
     }
 
     fn step_output_path(&self, run_id: &RunId, step_number: u32, step_payload: &[u8]) -> Path {
@@ -587,6 +623,10 @@ mod tests {
             .put_step_output(&rid("run-1"), 0, b"payload", b"out")
             .await
             .unwrap();
+        store
+            .put_result(&rid("run-1"), "job-1", 2, b"result")
+            .await
+            .unwrap();
 
         let mut paths = Vec::new();
         let mut listing = backing.list(None);
@@ -604,13 +644,14 @@ mod tests {
                 "memo/memos/run-1/0/1adc4f8ba16f15ba2172dab9b84bb9ba73f5cf4f156f50df4dda663b4f9c61ba",
                 "memo/memos/run-1/0/8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a",
                 "memo/memos/run-1/run/8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a",
+                "memo/results/run-1/job-1/2",
                 "memo/step-outputs/run-1/0/239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
             ],
         );
     }
 
     #[tokio::test]
-    async fn clear_memos_for_run_removes_step_output_and_run_memo_entries() {
+    async fn clear_memos_for_run_removes_step_output_run_memo_and_result_entries() {
         let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
         store
             .new_memo(&rid("run-1"), 0)
@@ -626,10 +667,21 @@ mod tests {
             .put_step_output(&rid("run-1"), 0, b"payload", b"out")
             .await
             .unwrap();
+        store
+            .put_result(&rid("run-1"), "job-1", 1, b"result")
+            .await
+            .unwrap();
 
         let deleted = store.clear_memos_for_run(&rid("run-1")).await.unwrap();
 
-        assert_eq!(deleted, 3);
+        assert_eq!(deleted, 4);
+        assert!(
+            store
+                .get_result(&rid("run-1"), "job-1", 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(
             store
                 .new_memo(&rid("run-1"), 0)

@@ -41,10 +41,8 @@ use serde_json::json;
 use taquba::Queue;
 use taquba::object_store::memory::InMemory;
 use taquba_workflow::{
-    RunOptions, RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects,
-    TerminalHook, TerminalStatus, WorkflowRuntime,
+    RunOptions, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalStatus, WorkflowRuntime,
 };
-use tokio::sync::oneshot;
 
 /// Mocked "fact lookup" tool. It returns hardcoded strings where a real version
 /// queries a search API or a vector store.
@@ -276,32 +274,6 @@ fn select_provider() -> Result<Provider> {
     }
 }
 
-struct ShutdownOnComplete {
-    shutdown: tokio::sync::Mutex<Option<oneshot::Sender<()>>>,
-}
-
-impl TerminalHook for ShutdownOnComplete {
-    async fn on_termination(
-        &self,
-        outcome: &RunOutcome,
-        _effects: &TerminalEffects,
-    ) -> std::result::Result<(), StepError> {
-        println!(
-            "\n=== run {} {} (final_step={}) ===",
-            outcome.run_id, outcome.status, outcome.final_step.number
-        );
-        if outcome.status == TerminalStatus::Failed
-            && let Some(err) = &outcome.error
-        {
-            eprintln!("error: {err}");
-        }
-        if let Some(tx) = self.shutdown.lock().await.take() {
-            let _ = tx.send(());
-        }
-        Ok(())
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let provider = select_provider()?;
@@ -310,27 +282,10 @@ async fn main() -> Result<()> {
     let store = Arc::new(InMemory::new());
     let queue = Arc::new(Queue::open(store.clone(), "rig-demo").await?);
 
-    let (tx, rx) = oneshot::channel::<()>();
-
-    let runtime = WorkflowRuntime::builder(
-        queue,
-        store,
-        RigRunner { provider },
-        ShutdownOnComplete {
-            shutdown: tokio::sync::Mutex::new(Some(tx)),
-        },
-    )
-    .max_concurrent_steps(2)
-    .build()?;
-
-    let worker_runtime = runtime.clone();
-    let worker_task = tokio::spawn(async move {
-        worker_runtime
-            .run(async move {
-                let _ = rx.await;
-            })
-            .await
-    });
+    let runtime = WorkflowRuntime::builder(queue, store, RigRunner { provider })
+        .max_concurrent_steps(2)
+        .build()?;
+    let worker = runtime.spawn(std::future::pending());
 
     let mut headers = std::collections::HashMap::new();
     headers.insert(
@@ -349,6 +304,18 @@ async fn main() -> Result<()> {
         .await?;
     println!("submitted run {}", handle.run_id);
 
-    worker_task.await??;
+    let run = runtime.wait(&handle.run_id).await?;
+    let termination = &run.termination;
+    println!(
+        "\n=== run {} {} (final_step={}) ===",
+        run.run_id, termination.status, termination.final_step.number
+    );
+    if termination.status == TerminalStatus::Failed
+        && let Some(err) = &termination.error
+    {
+        eprintln!("error: {err}");
+    }
+
+    worker.shutdown().await?;
     Ok(())
 }

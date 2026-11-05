@@ -1,9 +1,9 @@
 //! Submit a run that loops through several steps before completing.
 //!
 //! Each step parses its payload as `"<current>/<target>"`, increments the
-//! current value and either returns `Continue` with the new state or `Complete`
-//! with the final value. The completion hook prints the result and the runtime
-//! shuts down.
+//! current value and either returns `Continue` with the new state or `Succeed`
+//! with the final value. The submitter waits for the run, prints the result and
+//! shuts the runtime down.
 //!
 //! Run with:
 //!
@@ -17,10 +17,8 @@ use std::time::Duration;
 use taquba::Queue;
 use taquba::object_store::memory::InMemory;
 use taquba_workflow::{
-    RunOptions, RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects,
-    TerminalHook, TerminalStatus, WorkflowRuntime,
+    RunOptions, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalStatus, WorkflowRuntime,
 };
-use tokio::sync::oneshot;
 
 struct Counter;
 
@@ -56,69 +54,16 @@ impl StepRunner for Counter {
     }
 }
 
-struct ShutdownOnComplete {
-    shutdown: tokio::sync::Mutex<Option<oneshot::Sender<()>>>,
-}
-
-impl TerminalHook for ShutdownOnComplete {
-    async fn on_termination(
-        &self,
-        outcome: &RunOutcome,
-        _effects: &TerminalEffects,
-    ) -> std::result::Result<(), StepError> {
-        let result = match outcome.status {
-            TerminalStatus::Succeeded => {
-                String::from_utf8_lossy(outcome.result.as_deref().unwrap_or(&[])).into_owned()
-            }
-            TerminalStatus::Failed => format!(
-                "failed: {}",
-                outcome.error.as_deref().unwrap_or("(no error)")
-            ),
-            _ => "(unknown terminal status)".to_string(),
-        };
-        println!(
-            "completion: run={} status={:?} final_step={} result={:?} trace={:?}",
-            outcome.run_id,
-            outcome.status,
-            outcome.final_step.number,
-            result,
-            outcome.headers.get("trace_id"),
-        );
-        if let Some(tx) = self.shutdown.lock().await.take() {
-            let _ = tx.send(());
-        }
-        Ok(())
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(InMemory::new());
     let queue = Arc::new(Queue::open(store.clone(), "agent-demo").await?);
 
-    let (tx, rx) = oneshot::channel::<()>();
-    let runtime = WorkflowRuntime::builder(
-        queue,
-        store,
-        Counter,
-        ShutdownOnComplete {
-            shutdown: tokio::sync::Mutex::new(Some(tx)),
-        },
-    )
-    .max_concurrent_steps(4)
-    .poll_interval(Duration::from_millis(50))
-    .build()?;
-
-    // Spawn the worker loop. It exits when `rx` resolves (fired by the hook on
-    // terminal status).
-    let worker_runtime = runtime.clone();
-    let worker_task = tokio::spawn(async move {
-        worker_runtime
-            .run(async move {
-                let _ = rx.await;
-            })
-            .await
-    });
+    let runtime = WorkflowRuntime::builder(queue, store, Counter)
+        .max_concurrent_steps(4)
+        .poll_interval(Duration::from_millis(50))
+        .build()?;
+    let worker = runtime.spawn(std::future::pending());
 
     // Submit a run that loops from 0 to 5 across six steps.
     let mut headers = std::collections::HashMap::new();
@@ -135,6 +80,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     println!("submitted run {}", handle.run_id);
 
-    worker_task.await??;
+    let run = runtime.wait(&handle.run_id).await?;
+    let termination = &run.termination;
+    let result = match termination.status {
+        TerminalStatus::Succeeded => {
+            String::from_utf8_lossy(run.result.as_deref().unwrap_or(&[])).into_owned()
+        }
+        TerminalStatus::Failed | TerminalStatus::Cancelled => format!(
+            "{}: {}",
+            termination.status,
+            termination.error.as_deref().unwrap_or("(no error)")
+        ),
+    };
+    println!(
+        "completion: run={} status={} final_step={} result={:?} trace={:?}",
+        run.run_id,
+        termination.status,
+        termination.final_step.number,
+        result,
+        run.headers.get("trace_id"),
+    );
+
+    worker.shutdown().await?;
     Ok(())
 }

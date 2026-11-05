@@ -7,33 +7,31 @@ use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use taquba::object_store::ObjectStore;
 use taquba::{
-    Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, JobRecord, JobStatus, Queue,
-    SettlementEffects, WaitOutcome, WorkerHandle,
+    Clock, EnqueueOptions, EnqueueRequest, EnqueueResult, JobStatus, Queue, SettlementEffects,
+    WaitOutcome, WorkerHandle,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 
 use crate::command::CommandWorker;
 use crate::durable::{
-    self, DurableCancelRequest, DurableErrorKind, DurableRun, DurableRunOutcome, DurableRunRecord,
-    DurableRunResult, DurableStepOutcome, DurableStepOutcomeRecord, DurableStepRef,
-    DurableTermination, Submission,
+    self, DurableCancelRequest, DurableErrorKind, DurableResult, DurableRun, DurableRunRecord,
+    DurableStepOutcome, DurableStepOutcomeRecord, DurableStepRef, DurableTermination, Submission,
 };
 use crate::effects::{StagedEffects, TerminalEffects};
 use crate::error::{ControlQueueError, Error, Result};
 use crate::group::{GroupStore, Membership, RunGroup, pending_member, terminated_member};
 use crate::keys::{
-    DEDUP_PREFIX, GROUP_TERMINAL_KV_PREFIX, HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, RunId,
-    TERMINAL_KV_PREFIX, check_effects, check_headers, hash_input, next_step_job_id, run_kv_key,
-    step_kv_key,
+    DEDUP_PREFIX, GROUP_TERMINAL_KV_PREFIX, HEADER_RUN_ID, HEADER_STEP, RunId, TERMINAL_KV_PREFIX,
+    check_effects, check_headers, hash_input, next_step_job_id, run_kv_key, step_kv_key,
 };
 use crate::kv::run_kv_entry_keys;
-use crate::memo::{MemoStore, RUN_RESULT_MEMO_KEY};
-use crate::runner::{StepErrorKind, StepOutcome, StepRunner, Trigger};
+use crate::memo::MemoStore;
+use crate::runner::{StepOutcome, StepRunner, Trigger};
 use crate::sweep::{Clearable, Cleared, Sweep, run_periodically};
-use crate::terminal::{CancelOrigin, RunOutcome, TerminalHook, TerminalStatus};
+use crate::terminal::{CancelOrigin, RunTermination, TerminalHook, TerminatedRun};
 use crate::view::WorkflowView;
-use crate::worker::{ClaimedStep, StepWorker};
+use crate::worker::{ClaimedStep, Ending, StepWorker};
 
 /// The queue name of a runtime built without
 /// [`WorkflowRuntimeBuilder::queue_name`].
@@ -233,44 +231,6 @@ pub enum RunState {
     Terminated(RunTermination),
 }
 
-/// The committed terminal outcome of a run, as [`RunState::Terminated`] reports
-/// it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunTermination {
-    /// How the run ended.
-    pub status: TerminalStatus,
-    /// The failure reason, or the reason of a cancellation, as
-    /// [`RunOutcome::error`] reports it. `None` for a success.
-    pub error: Option<String>,
-    /// The origin of a cancellation, as [`RunOutcome::cancelled_by`] reports
-    /// it.
-    pub cancelled_by: Option<CancelOrigin>,
-    /// The classification of a failure: the kind of the
-    /// [`StepError`](crate::StepError) that dead-lettered the run, or
-    /// [`StepErrorKind::Permanent`] for a [`StepOutcome::Fail`] outcome. `None`
-    /// for a success, a cancellation and a termination outside the worker.
-    pub error_kind: Option<StepErrorKind>,
-    /// The step whose settlement terminated the run. Its job is the dead job of
-    /// a run that a dead-letter terminated.
-    pub final_step: StepRef,
-    /// The runtime clock's time at the terminating settlement, as a Unix
-    /// timestamp in milliseconds.
-    pub terminated_at_ms: u64,
-}
-
-impl From<DurableTermination> for RunTermination {
-    fn from(record: DurableTermination) -> Self {
-        Self {
-            status: record.status.into(),
-            error: record.error,
-            cancelled_by: record.cancelled_by.map(Into::into),
-            error_kind: record.error_kind.map(Into::into),
-            final_step: record.final_step.into(),
-            terminated_at_ms: record.terminated_at_ms,
-        }
-    }
-}
-
 /// Outcome of [`WorkflowRuntime::cancel`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -284,28 +244,16 @@ pub enum CancelRunOutcome {
     NotActive,
 }
 
-/// The end of a run, as [`WorkflowRuntime::wait`] and [`WorkflowView::run_end`]
-/// report it.
-#[derive(Debug, Clone)]
-pub struct RunEnd {
-    /// The run's termination, from its terminal record.
-    pub termination: RunTermination,
-    /// The committed outcome: the result the runner returned or the error that
-    /// ended the run, with the submitter's headers and the final step. It is
-    /// `None` when the worker that terminated the run did not record one.
-    pub outcome: Option<RunOutcome>,
-}
-
 /// Builder for [`WorkflowRuntime`].
 ///
 /// Construct via [`WorkflowRuntime::builder`].
-pub struct WorkflowRuntimeBuilder<R, H> {
+pub struct WorkflowRuntimeBuilder<R> {
     queue: Arc<Queue>,
     object_store: Arc<dyn ObjectStore>,
     queue_name: String,
     memo_prefix: Option<String>,
     runner: R,
-    terminal_hook: H,
+    terminal_hook: Option<Arc<dyn TerminalHook>>,
     max_concurrent_steps: usize,
     poll_interval: Duration,
     memo_retention: Option<Duration>,
@@ -315,7 +263,16 @@ pub struct WorkflowRuntimeBuilder<R, H> {
     control_queue: Option<String>,
 }
 
-impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
+impl<R: StepRunner> WorkflowRuntimeBuilder<R> {
+    /// The hook that stages effects into the settlement that terminates each
+    /// run. When unset (default), a run terminates with the runtime's own
+    /// effects alone.
+    #[must_use]
+    pub fn terminal_hook(mut self, hook: impl TerminalHook + 'static) -> Self {
+        self.terminal_hook = Some(Arc::new(hook));
+        self
+    }
+
     /// The name of the Taquba queue that step jobs are enqueued onto. Defaults
     /// to `"workflow-steps"`. Multiple runtimes can share a `Queue` handle by
     /// using distinct queue names.
@@ -437,11 +394,10 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     /// The error of [`TerminalHook::check_runtime`] for the configured queue
     /// name, and [`Error::InvalidControlQueue`] for a control queue that breaks
     /// a requirement of [`Self::control_queue`].
-    pub fn build(self) -> Result<WorkflowRuntime<R, H>>
-    where
-        H: 'static,
-    {
-        self.terminal_hook.check_runtime(&self.queue_name)?;
+    pub fn build(self) -> Result<WorkflowRuntime<R>> {
+        if let Some(hook) = &self.terminal_hook {
+            hook.check_runtime(&self.queue_name)?;
+        }
         if let Some(control) = &self.control_queue
             && let Err(reason) = self.check_control_queue(control)
         {
@@ -476,20 +432,13 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
     }
 
     /// The runtime of this configuration, without the check of the hook.
-    pub(crate) fn assemble(self) -> WorkflowRuntime<R, H>
-    where
-        H: 'static,
-    {
-        let (runner, terminal_hook, core) = self.parts();
-        WorkflowRuntime::from_parts(runner, terminal_hook, core)
+    pub(crate) fn assemble(self) -> WorkflowRuntime<R> {
+        let (runner, core) = self.parts();
+        WorkflowRuntime::from_parts(runner, core)
     }
 
-    /// The runner, the hook and the core of this configuration.
-    fn parts(self) -> (R, Arc<H>, Arc<RuntimeCore>)
-    where
-        H: 'static,
-    {
-        let terminal_hook = Arc::new(self.terminal_hook);
+    /// The runner and the core of this configuration.
+    fn parts(self) -> (R, Arc<RuntimeCore>) {
         let memo_prefix = self
             .memo_prefix
             .unwrap_or_else(|| format!("{}-memo", self.queue_name));
@@ -526,22 +475,18 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntimeBuilder<R, H> {
             group_sweep,
             step_output_replay: self.step_output_replay,
             clock: self.clock,
-            terminal_staging: terminal_hook.clone(),
+            terminal_hook: self.terminal_hook,
             control_queue: self.control_queue,
         };
-        (self.runner, terminal_hook, Arc::new(core))
+        (self.runner, Arc::new(core))
     }
 }
 
-impl<R, H> WorkflowRuntime<R, H> {
-    /// The runtime over `core` with `runner` and `terminal_hook`.
-    fn from_parts(runner: R, terminal_hook: Arc<H>, core: Arc<RuntimeCore>) -> Self {
+impl<R> WorkflowRuntime<R> {
+    /// The runtime over `core` with `runner`.
+    fn from_parts(runner: R, core: Arc<RuntimeCore>) -> Self {
         Self {
-            inner: Arc::new(RuntimeInner {
-                runner,
-                terminal_hook,
-                core,
-            }),
+            inner: Arc::new(RuntimeInner { runner, core }),
         }
     }
 }
@@ -578,11 +523,11 @@ impl Clearable for RunStore {
 }
 
 /// Durable runtime for workflow runs. A clone copies one `Arc`.
-pub struct WorkflowRuntime<R, H> {
-    pub(crate) inner: Arc<RuntimeInner<R, H>>,
+pub struct WorkflowRuntime<R> {
+    pub(crate) inner: Arc<RuntimeInner<R>>,
 }
 
-impl<R, H> Clone for WorkflowRuntime<R, H> {
+impl<R> Clone for WorkflowRuntime<R> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -590,19 +535,17 @@ impl<R, H> Clone for WorkflowRuntime<R, H> {
     }
 }
 
-/// A runtime's [`StepRunner`] and [`TerminalHook`], with the shared
-/// [`RuntimeCore`] they operate on: the executing half of a runtime, held by
-/// the worker.
-pub(crate) struct RuntimeInner<R, H> {
+/// A runtime's [`StepRunner`], with the shared [`RuntimeCore`] it operates on:
+/// the executing half of a runtime, held by the worker.
+pub(crate) struct RuntimeInner<R> {
     pub(crate) runner: R,
-    pub(crate) terminal_hook: Arc<H>,
     pub(crate) core: Arc<RuntimeCore>,
 }
 
 /// The control half of a runtime: the queue, the stores and the settings, with
-/// every operation that reads or settles run state without invoking the runner
-/// or the hook. It is not generic over the runner and hook types, so the
-/// worker, [`WorkflowRuntime`] and [`RunGroup`] share it.
+/// every operation that reads or settles run state without invoking the runner.
+/// It is not generic over the runner type, so the worker, [`WorkflowRuntime`]
+/// and [`RunGroup`] share it.
 pub(crate) struct RuntimeCore {
     pub(crate) queue: Arc<Queue>,
     pub(crate) view: WorkflowView,
@@ -626,34 +569,16 @@ pub(crate) struct RuntimeCore {
     /// Time source. Defaults to the queue's clock. A test can substitute a
     /// [`MockClock`](taquba::MockClock) to virtualise time.
     pub(crate) clock: Arc<dyn Clock>,
-    /// The synchronous methods of the runtime's hook, which stage the effects
-    /// of a termination and decide whether it enqueues a notification job.
-    terminal_staging: Arc<dyn TerminalStaging>,
+    /// [`WorkflowRuntimeBuilder::terminal_hook`].
+    terminal_hook: Option<Arc<dyn TerminalHook>>,
     /// [`WorkflowRuntimeBuilder::control_queue`].
     control_queue: Option<String>,
 }
 
-/// The synchronous methods of a [`TerminalHook`], held by [`RuntimeCore`]
-/// without the hook's type.
-trait TerminalStaging: Send + Sync {
-    fn observes(&self, outcome: &RunOutcome) -> bool;
-    fn stage_effects(&self, outcome: &RunOutcome, effects: &TerminalEffects);
-}
-
-impl<H: TerminalHook> TerminalStaging for H {
-    fn observes(&self, outcome: &RunOutcome) -> bool {
-        TerminalHook::observes(self, outcome)
-    }
-
-    fn stage_effects(&self, outcome: &RunOutcome, effects: &TerminalEffects) {
-        TerminalHook::stage_effects(self, outcome, effects);
-    }
-}
-
-impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
-    /// Start configuring a runtime. Takes the four required dependencies
-    /// (Taquba queue, object store, [`StepRunner`], [`TerminalHook`]). Optional
-    /// fields are set via [`WorkflowRuntimeBuilder`] methods before [`build`].
+impl<R: StepRunner> WorkflowRuntime<R> {
+    /// Start configuring a runtime. Takes the three required dependencies
+    /// (Taquba queue, object store, [`StepRunner`]). Optional fields are set
+    /// via [`WorkflowRuntimeBuilder`] methods before [`build`].
     ///
     /// The object store backs [`Delivery::memo`]. It can differ from the store
     /// the [`Queue`] was opened with, though sharing one store is the common
@@ -661,17 +586,13 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// [`WorkflowRuntimeBuilder::memo_prefix`] when multiple runtimes share one
     /// store.
     ///
-    /// Use [`crate::NoopTerminalHook`] when the application does not use
-    /// terminal callbacks.
-    ///
     /// [`Delivery::memo`]: crate::Delivery::memo
     /// [`build`]: WorkflowRuntimeBuilder::build
     pub fn builder(
         queue: Arc<Queue>,
         object_store: Arc<dyn ObjectStore>,
         runner: R,
-        terminal_hook: H,
-    ) -> WorkflowRuntimeBuilder<R, H> {
+    ) -> WorkflowRuntimeBuilder<R> {
         let clock = queue.clock();
         WorkflowRuntimeBuilder {
             queue,
@@ -679,7 +600,7 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
             queue_name: DEFAULT_QUEUE_NAME.to_string(),
             memo_prefix: None,
             runner,
-            terminal_hook,
+            terminal_hook: None,
             max_concurrent_steps: 16,
             poll_interval: Duration::from_millis(250),
             memo_retention: None,
@@ -717,28 +638,35 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
 
     /// Wait until the run `run_id` terminates and report its end. The wait
     /// follows the run's current step across its steps, so it reports a run of
-    /// any length, after a restart and from any runtime over the same queue. A
-    /// run already terminated is reported at once from its records. A step
-    /// dead-lettered outside the worker is terminated by the worker's dead-step
-    /// reconciliation, which the wait polls for at the poll interval.
+    /// any length, after a restart and from any runtime over the same queue.
+    /// For a run that has already terminated, the wait reads its records
+    /// without waiting. A step dead-lettered outside the worker is terminated
+    /// by the worker's dead-step reconciliation, which the wait polls for at
+    /// the poll interval.
     ///
     /// Returns [`Error::RunNotFound`] for a run without a record in the
-    /// runtime: never submitted, or terminated and swept.
-    pub async fn wait(&self, run_id: &RunId) -> Result<RunEnd> {
+    /// runtime: never submitted, or terminated and swept. Returns
+    /// [`Error::InconsistentRunState`] for a succeeded run whose terminal
+    /// record does not have the reference to its result.
+    pub async fn wait(&self, run_id: &RunId) -> Result<TerminatedRun> {
         self.inner.core.wait(run_id).await
     }
 
     /// [`Self::wait`] bounded by `timeout`. Returns `Ok(None)` when the timeout
     /// elapses first.
-    pub async fn wait_timeout(&self, run_id: &RunId, timeout: Duration) -> Result<Option<RunEnd>> {
+    pub async fn wait_timeout(
+        &self,
+        run_id: &RunId,
+        timeout: Duration,
+    ) -> Result<Option<TerminatedRun>> {
         self.inner.core.wait_timeout(run_id, timeout).await
     }
 
     /// Request cancellation of an active run for `reason`.
     ///
-    /// The run terminates with `reason` on [`RunOutcome::error`] and
-    /// [`CancelOrigin::Request`] on [`RunOutcome::cancelled_by`]. A run with a
-    /// recorded request keeps the reason of the first request.
+    /// The run terminates with `reason` on [`RunTermination::error`] and
+    /// [`CancelOrigin::Request`] on [`RunTermination::cancelled_by`]. A run
+    /// with a recorded request keeps the reason of the first request.
     ///
     /// Returns [`CancelRunOutcome::Removed`] or [`CancelRunOutcome::Requested`]
     /// once the request is recorded on the run's durable record, and
@@ -748,12 +676,12 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     /// terminates it as failed. The request reaches a run after a restart and
     /// from any runtime over the same queue.
     ///
-    /// The run terminates as [`TerminalStatus::Cancelled`] and its notification
-    /// job is enqueued for the terminal hook:
+    /// The run terminates as
+    /// [`TerminalStatus::Cancelled`](crate::TerminalStatus::Cancelled):
     ///
     /// - **Pending / scheduled step**: the queued step job is removed
-    ///   and the notification enqueued in one transaction before this
-    ///   call returns. The hook runs from a worker afterwards.
+    ///   and the run terminated in one transaction before this call
+    ///   returns.
     /// - **Running step**: cancellation is delivered to the runner via
     ///   [`Delivery::cancel_token`](crate::Delivery::cancel_token). Runners
     ///   that watch the token short-circuit immediately. Runners that ignore
@@ -793,7 +721,6 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     where
         F: Future<Output = ()> + Send + 'static,
         R: 'static,
-        H: 'static,
     {
         let runtime = self.clone();
         WorkerHandle::spawn(shutdown, |stop| async move { runtime.run_with(stop).await })
@@ -810,7 +737,6 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     where
         F: Future<Output = ()>,
         R: 'static,
-        H: 'static,
     {
         let stop = CancellationToken::new();
         let mut worker = std::pin::pin!(self.run_with(stop.clone()));
@@ -829,7 +755,6 @@ impl<R: StepRunner, H: TerminalHook> WorkflowRuntime<R, H> {
     async fn run_with(&self, stop: CancellationToken) -> Result<()>
     where
         R: 'static,
-        H: 'static,
     {
         let mut background: Vec<_> = self
             .inner
@@ -1062,7 +987,7 @@ impl RuntimeCore {
     }
 
     /// [`WorkflowRuntime::wait`].
-    pub(crate) async fn wait(&self, run_id: &RunId) -> Result<RunEnd> {
+    pub(crate) async fn wait(&self, run_id: &RunId) -> Result<TerminatedRun> {
         self.wait_run(run_id)
             .await?
             .ok_or_else(|| Error::RunNotFound(run_id.clone()))
@@ -1073,7 +998,7 @@ impl RuntimeCore {
         &self,
         run_id: &RunId,
         timeout: Duration,
-    ) -> Result<Option<RunEnd>> {
+    ) -> Result<Option<TerminatedRun>> {
         match tokio::time::timeout(timeout, self.wait(run_id)).await {
             Ok(end) => end.map(Some),
             Err(_) => Ok(None),
@@ -1107,9 +1032,9 @@ impl RuntimeCore {
             let claimed = ClaimedStep::parse(&job)?;
             // The effects are built before the outcome is known, and the queue
             // applies them only on `Removed`.
-            let outcome = claimed.cancelled(CancelOrigin::Request, request.reason.clone());
-            let termination = self.termination(&outcome, None, submission);
-            let effects = self.terminate_collecting_effects(&outcome, &claimed, termination);
+            let ending = Ending::cancelled(CancelOrigin::Request, request.reason.clone());
+            let termination = self.termination(&claimed, ending, None, submission);
+            let effects = self.terminate_collecting_effects(&claimed, termination, None);
             match self.queue.cancel_with(&job.id, effects).await?.0 {
                 taquba::CancelOutcome::Removed => return Ok(CancelRunOutcome::Removed),
                 taquba::CancelOutcome::Requested => return Ok(CancelRunOutcome::Requested),
@@ -1122,14 +1047,12 @@ impl RuntimeCore {
     /// current-step pointer, the write of the terminal record over the run
     /// record, the write of the terminal marker (when memo retention is
     /// enabled), the write of the member record and the decrement of the count
-    /// of its group (when the run is a group member), the effects that the hook
-    /// stages through [`TerminalHook::stage_effects`] and the
-    /// terminal-notification enqueue (when the hook observes this outcome) as
-    /// [`SettlementEffects`] for the settlement transaction. The notification
-    /// job's payload is the committed outcome and the configured
-    /// [`TerminalHook`] runs as its worker. `terminal_step` is the step that
-    /// produced the outcome, or the pending step a cancellation removes, and
-    /// `termination` the record of the outcome the settlement writes.
+    /// of its group (when the run is a group member) and the effects that the
+    /// hook stages through [`TerminalHook::stage_effects`] as
+    /// [`SettlementEffects`] for the settlement transaction. `terminal_step` is
+    /// the step that produced the outcome, or the pending step a cancellation
+    /// removes, `termination` the record the settlement writes and `result` the
+    /// result of a succeeded run.
     ///
     /// The effects are pure: this function does not write or mutate state, so a
     /// caller that builds them and then commits a non-terminal outcome does not
@@ -1137,33 +1060,37 @@ impl RuntimeCore {
     /// re-terminates and rebuilds the same effects.
     pub(crate) fn terminate_collecting_effects(
         &self,
-        outcome: &RunOutcome,
         terminal_step: &ClaimedStep<'_>,
         termination: DurableTermination,
+        result: Option<Vec<u8>>,
     ) -> SettlementEffects {
+        let run_id = &terminal_step.run_id;
         let terminated_at_ms = termination.terminated_at_ms;
         let staging = TerminalEffects::for_delivery(&self.queue_name);
-        self.terminal_staging.stage_effects(outcome, &staging);
+        if let Some(hook) = &self.terminal_hook {
+            let outcome = TerminatedRun {
+                run_id: run_id.clone(),
+                termination: RunTermination::from(&termination),
+                result,
+                headers: termination.headers.clone(),
+            };
+            hook.stage_effects(&outcome, &staging);
+        }
         let mut effects = staging.seal_into_settlement();
-        effects.kv_deletes.push(step_kv_key(&outcome.run_id));
+        effects.kv_deletes.push(step_kv_key(run_id));
         effects.kv_writes.insert(
-            run_kv_key(&outcome.run_id),
+            run_kv_key(run_id),
             durable::encode(&DurableRun::Terminated(termination.clone())),
         );
         if let Some(membership) = &terminal_step.membership {
             effects.kv_writes.insert(
                 membership.kv_key(),
-                durable::encode(&terminated_member(&outcome.run_id, termination)),
+                durable::encode(&terminated_member(run_id, termination)),
             );
             effects = effects.count_down(membership.count_name());
         }
-        if self.terminal_staging.observes(outcome) {
-            effects
-                .enqueues
-                .push(self.notification_enqueue_request(outcome, Some(terminal_step.job)));
-        }
         match &self.memo_sweep {
-            Some(sweep) => sweep.mark(effects, &outcome.run_id, terminated_at_ms),
+            Some(sweep) => sweep.mark(effects, run_id, terminated_at_ms),
             None => effects,
         }
     }
@@ -1172,15 +1099,15 @@ impl RuntimeCore {
     /// worker path: a lease that expired past the attempt limit, or a claim
     /// dead-lettered by crash recovery when the queue was opened. Such a
     /// settlement does not run workflow code, so the run record and the
-    /// current-step pointer remain after it and no notification is enqueued. A
-    /// dead step job that the run's current-step pointer refers to identifies
-    /// the case exactly, because every worker-path dead-letter deletes the
-    /// pointer in its own transaction and a re-submission of the run id refers
-    /// to a new job. The run terminates as [`TerminalStatus::Failed`] with the
-    /// queue record's last error, through the same effects as a worker-path
-    /// termination committed as one transaction without a transition of their
-    /// own. The runner's failure writes cannot apply, because no runner
-    /// returned. Returns the number of runs terminated.
+    /// current-step pointer remain after it. A dead step job that the run's
+    /// current-step pointer refers to identifies the case exactly, because
+    /// every worker-path dead-letter deletes the pointer in its own transaction
+    /// and a re-submission of the run id refers to a new job. The run
+    /// terminates as [`TerminalStatus::Failed`](crate::TerminalStatus::Failed)
+    /// with the queue record's last error, through the same effects as a
+    /// worker-path termination committed as one transaction without a
+    /// transition of their own. The runner's failure writes cannot apply,
+    /// because no runner returned. Returns the number of runs terminated.
     pub(crate) async fn reconcile_dead_steps(&self) -> Result<usize> {
         const PAGE: usize = 256;
         let mut terminated = 0usize;
@@ -1190,9 +1117,6 @@ impl RuntimeCore {
             PAGE
         ));
         while let Some(job) = dead.try_next().await? {
-            if job.headers.contains_key(HEADER_TERMINAL) {
-                continue;
-            }
             let Ok(claimed) = ClaimedStep::parse(&job) else {
                 continue;
             };
@@ -1213,9 +1137,9 @@ impl RuntimeCore {
                 .last_error
                 .clone()
                 .unwrap_or_else(|| "step dead-lettered outside the worker".to_string());
-            let outcome = claimed.failed(error);
-            let termination = self.termination(&outcome, None, Submission::from(&record));
-            let effects = self.terminate_collecting_effects(&outcome, &claimed, termination);
+            let ending = Ending::failed(error, None);
+            let termination = self.termination(&claimed, ending, None, Submission::from(&record));
+            let effects = self.terminate_collecting_effects(&claimed, termination, None);
             self.queue.commit_effects(effects).await?;
             warn!(run_id = %run_id, step_number = claimed.step_number, job_id = %job.id, "terminated a run whose step was dead-lettered outside the worker");
             terminated += 1;
@@ -1281,10 +1205,10 @@ impl RuntimeCore {
     /// and report its end. Returns `None` for a run without a current step or a
     /// record. A current step the queue dead-lettered outside the worker is
     /// polled at the poll interval until reconciliation terminates the run.
-    pub(crate) async fn wait_run(&self, run_id: &RunId) -> Result<Option<RunEnd>> {
+    pub(crate) async fn wait_run(&self, run_id: &RunId) -> Result<Option<TerminatedRun>> {
         loop {
             let Some((current, _)) = self.view.current_job(run_id).await? else {
-                return self.view.run_end(run_id).await;
+                return self.view.terminated_run(run_id).await;
             };
             match self.queue.wait_for_completion(&current.job_id).await? {
                 // `NotFound`: the job settled between the two reads, and the
@@ -1308,42 +1232,49 @@ impl RuntimeCore {
         }
     }
 
-    /// The termination of `outcome`'s run at the clock's current time, with the
-    /// `submission` of the run record.
+    /// The terminal record of the run of `claimed` ending at that step with
+    /// `ending` at the clock's current time, with the reference `result` to the
+    /// result of a succeeded run and the `submission` of the run record.
     pub(crate) fn termination(
         &self,
-        outcome: &RunOutcome,
-        error_kind: Option<StepErrorKind>,
+        claimed: &ClaimedStep<'_>,
+        ending: Ending,
+        result: Option<DurableResult>,
         submission: Submission,
     ) -> DurableTermination {
         DurableTermination {
-            status: outcome.status.into(),
-            error: outcome.error.clone(),
-            cancelled_by: outcome.cancelled_by.map(Into::into),
-            error_kind: error_kind.map(DurableErrorKind::from),
-            final_step: (&outcome.final_step).into(),
+            status: ending.status.into(),
+            error: ending.error,
+            cancelled_by: ending.cancelled_by.map(Into::into),
+            error_kind: ending.error_kind.map(DurableErrorKind::from),
+            final_step: DurableStepRef {
+                step_number: claimed.step_number,
+                job_id: claimed.job.id.clone(),
+            },
             terminated_at_ms: self.clock.now_ms(),
             input_hash: submission.input_hash,
             submitted_at_ms: submission.submitted_at_ms,
-            headers: outcome.headers.clone(),
+            headers: claimed.headers.clone(),
+            result,
         }
     }
 
-    /// Write the run result record of `outcome`'s run, belonging to
-    /// `termination`.
-    pub(crate) async fn store_run_result(
+    /// Write `result` as the result object of the run of `claimed` for the
+    /// claim's attempt, and return the reference the terminal record stores. An
+    /// empty result is not written.
+    pub(crate) async fn store_result(
         &self,
-        outcome: &RunOutcome,
-        termination: &DurableTermination,
-    ) -> Result<()> {
-        let record = DurableRunResult {
-            termination: termination.clone(),
-            outcome: DurableRunOutcome::from(outcome),
-        };
+        claimed: &ClaimedStep<'_>,
+        result: &[u8],
+    ) -> Result<DurableResult> {
+        if result.is_empty() {
+            return Ok(DurableResult::Empty);
+        }
+        let attempt = claimed.job.attempts;
         self.memo_store
-            .new_run_memo(&outcome.run_id)
-            .put(RUN_RESULT_MEMO_KEY, &durable::encode(&record))
-            .await
+            .put_result(&claimed.run_id, &claimed.job.id, attempt, result)
+            .await?;
+        Ok(DurableResult::Object { attempt })
     }
 
     /// Record a cancellation request for `reason` on the run record of
@@ -1417,29 +1348,6 @@ impl RuntimeCore {
                 .id_override(Some(job_id))
                 .signal_wait(opts.signal_wait)
                 .count_wait(opts.count_wait),
-        }
-    }
-
-    /// Build the enqueue request for a run's terminal-notification job. The
-    /// priority and attempt limit are inherited from `terminal_step`, the job
-    /// of the step that produced the outcome, when one exists.
-    fn notification_enqueue_request(
-        &self,
-        outcome: &RunOutcome,
-        terminal_step: Option<&JobRecord>,
-    ) -> EnqueueRequest {
-        let payload = durable::encode(&DurableRunOutcome::from(outcome));
-        let mut headers = HashMap::new();
-        headers.insert(HEADER_RUN_ID.to_string(), outcome.run_id.to_string());
-        headers.insert(HEADER_TERMINAL.to_string(), "1".to_string());
-        EnqueueRequest {
-            queue: self.queue_name.clone(),
-            payload,
-            options: EnqueueOptions::default()
-                .headers(headers)
-                .priority(terminal_step.map(|job| job.priority))
-                .max_attempts(terminal_step.map(|job| job.max_attempts))
-                .dedup_key(Some(format!("{DEDUP_PREFIX}{}:terminal", outcome.run_id))),
         }
     }
 
@@ -1543,8 +1451,7 @@ mod tests {
     use crate::keys::TERMINAL_KV_PREFIX;
     use crate::keys::group_member_kv_key;
     use crate::keys::run_kv_entry_key;
-    use crate::runner::{Step, StepError};
-    use crate::terminal::NoopTerminalHook;
+    use crate::runner::{Step, StepError, StepErrorKind};
     use crate::terminal::TerminalStatus;
     use crate::test_util::{
         advance, fast_options, open_queue, open_queue_at, open_queue_at_with, open_queue_with, rid,
@@ -1561,22 +1468,6 @@ mod tests {
         LeaseHandle, MockClock, OpenOptions, QueueConfig, QueueReader, SignalOutcome, WakeOutcome,
     };
     use tokio::sync::oneshot;
-
-    /// Recording terminal hook backed by an mpsc channel.
-    struct ChannelHook {
-        tx: tokio::sync::mpsc::UnboundedSender<RunOutcome>,
-    }
-
-    impl TerminalHook for ChannelHook {
-        async fn on_termination(
-            &self,
-            outcome: &RunOutcome,
-            _effects: &TerminalEffects,
-        ) -> std::result::Result<(), StepError> {
-            let _ = self.tx.send(outcome.clone());
-            Ok(())
-        }
-    }
 
     /// Runner that executes a fixed list of step outcomes in order.
     struct ScriptedRunner {
@@ -1726,8 +1617,8 @@ mod tests {
 
     /// The terminal status `status` reports for `run_id`, or `None` while the
     /// run is active or unknown.
-    async fn terminal_status_of<R: StepRunner, H: TerminalHook>(
-        runtime: &WorkflowRuntime<R, H>,
+    async fn terminal_status_of<R: StepRunner>(
+        runtime: &WorkflowRuntime<R>,
         run_id: &RunId,
     ) -> Option<TerminalStatus> {
         match runtime.status(run_id).await.unwrap().map(|s| s.state) {
@@ -1736,10 +1627,28 @@ mod tests {
         }
     }
 
-    fn spawn_runtime<R, H>(runtime: WorkflowRuntime<R, H>) -> oneshot::Sender<()>
+    /// The termination that `status` reports for a terminated run.
+    fn status_termination(status: &RunStatus) -> RunTermination {
+        match &status.state {
+            RunState::Terminated(termination) => termination.clone(),
+            state => panic!("run is not terminated: {state:?}"),
+        }
+    }
+
+    /// The outcome of `run_id` once it terminates, within two seconds.
+    async fn wait_for<R: StepRunner>(
+        runtime: &WorkflowRuntime<R>,
+        run_id: &RunId,
+    ) -> TerminatedRun {
+        tokio::time::timeout(Duration::from_secs(2), runtime.wait(run_id))
+            .await
+            .expect("the run terminates")
+            .unwrap()
+    }
+
+    fn spawn_runtime<R>(runtime: WorkflowRuntime<R>) -> oneshot::Sender<()>
     where
         R: StepRunner + 'static,
-        H: TerminalHook + 'static,
     {
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
@@ -1778,18 +1687,13 @@ mod tests {
         let base = 1_700_000_000_000;
         let (queue, store, _clock) = open_queue_at(base).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (hook_tx, mut hook_rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store.clone(),
-            RenewingRunner { queue, tx },
-            ChannelHook { tx: hook_tx },
-        )
-        .build()
-        .unwrap();
+        let runtime =
+            WorkflowRuntime::builder(queue.clone(), store.clone(), RenewingRunner { queue, tx })
+                .build()
+                .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
-        runtime
+        let handle = runtime
             .submit(RunSpec {
                 input: Vec::new(),
                 ..Default::default()
@@ -1804,11 +1708,8 @@ mod tests {
             expiry >= base + 600_000,
             "the extension must reach the lease registry",
         );
-        let outcome = tokio::time::timeout(Duration::from_secs(2), hook_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        let outcome = wait_for(&runtime, &handle.run_id).await;
+        assert_eq!(outcome.termination.status, TerminalStatus::Succeeded);
 
         let _ = shutdown.send(());
     }
@@ -1816,14 +1717,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn single_step_succeeds_and_writes_no_marker_without_retention() {
         let (queue, store) = open_queue().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue,
             store.clone(),
             ScriptedRunner::new(vec![StepOutcome::Succeed {
                 result: b"done".to_vec(),
             }]),
-            ChannelHook { tx },
         )
         .build()
         .unwrap();
@@ -1836,15 +1735,12 @@ mod tests {
             })
             .await
             .unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let outcome = wait_for(&runtime, &handle.run_id).await;
 
         assert_eq!(outcome.run_id, handle.run_id);
-        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        assert_eq!(outcome.termination.status, TerminalStatus::Succeeded);
         assert_eq!(outcome.result.as_deref(), Some(b"done".as_slice()));
-        assert_eq!(outcome.final_step.number, 0);
+        assert_eq!(outcome.termination.final_step.number, 0);
         assert_eq!(
             terminal_status_of(&runtime, &handle.run_id).await,
             Some(TerminalStatus::Succeeded),
@@ -1858,7 +1754,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn multi_step_run_advances_through_continue_with_its_headers() {
         let (queue, store) = open_queue().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue,
             store.clone(),
@@ -1869,7 +1764,6 @@ mod tests {
                     result: b"final".to_vec(),
                 },
             ]),
-            ChannelHook { tx },
         )
         .build()
         .unwrap();
@@ -1889,31 +1783,16 @@ mod tests {
             })
             .await
             .unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let outcome = wait_for(&runtime, &handle.run_id).await;
 
         assert_eq!(outcome.run_id, handle.run_id);
-        assert_eq!(outcome.final_step.number, 2);
-        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        assert_eq!(outcome.termination.final_step.number, 2);
+        assert_eq!(outcome.termination.status, TerminalStatus::Succeeded);
         assert_eq!(outcome.result.as_deref(), Some(b"final".as_slice()));
         assert_eq!(outcome.headers.get("trace_id").unwrap(), "abc-123");
         assert_eq!(outcome.headers.get("tenant").unwrap(), "acme");
         assert!(!outcome.headers.contains_key(HEADER_RUN_ID));
         assert!(!outcome.headers.contains_key(HEADER_STEP));
-
-        let recorded = runtime
-            .view()
-            .run_end(&handle.run_id)
-            .await
-            .unwrap()
-            .and_then(|end| end.outcome)
-            .expect("the worker writes the run result record before the terminating settlement");
-        assert_eq!(recorded.status, TerminalStatus::Succeeded);
-        assert_eq!(recorded.final_step.number, 2);
-        assert_eq!(recorded.result.as_deref(), Some(b"final".as_slice()));
-        assert_eq!(recorded.headers, outcome.headers);
 
         let _ = shutdown.send(());
     }
@@ -1922,7 +1801,6 @@ mod tests {
     async fn continue_after_delays_next_step_until_promotion() {
         let initial = 1_700_000_000_000u64;
         let (queue, store, clock) = open_queue_at(initial).await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store.clone(),
@@ -1932,7 +1810,6 @@ mod tests {
                     result: b"final".to_vec(),
                 },
             ]),
-            ChannelHook { tx },
         )
         .build()
         .unwrap();
@@ -1949,7 +1826,7 @@ mod tests {
         // The delayed step is held in `scheduled` and the run must not
         // terminate while the delay is pending.
         assert!(
-            tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            tokio::time::timeout(Duration::from_millis(500), runtime.wait(&handle.run_id))
                 .await
                 .is_err()
         );
@@ -1965,13 +1842,10 @@ mod tests {
         advance(&clock, Duration::from_secs(61)).await;
         queue.promote_scheduled_now().await.unwrap();
 
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let outcome = wait_for(&runtime, &handle.run_id).await;
         assert_eq!(outcome.run_id, handle.run_id);
-        assert_eq!(outcome.final_step.number, 1);
-        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        assert_eq!(outcome.termination.final_step.number, 1);
+        assert_eq!(outcome.termination.status, TerminalStatus::Succeeded);
 
         let _ = shutdown.send(());
     }
@@ -2022,10 +1896,7 @@ mod tests {
     }
 
     /// The job id of the step that `run_id` waits at.
-    async fn waiting_job_id<R: StepRunner, H: TerminalHook>(
-        runtime: &WorkflowRuntime<R, H>,
-        run_id: &RunId,
-    ) -> String {
+    async fn waiting_job_id<R: StepRunner>(runtime: &WorkflowRuntime<R>, run_id: &RunId) -> String {
         let status = runtime.status(run_id).await.unwrap().unwrap();
         assert!(
             matches!(status.state, RunState::Waiting { .. }),
@@ -2036,10 +1907,9 @@ mod tests {
     }
 
     struct ProbeRuntime {
-        runtime: WorkflowRuntime<SignalProbe, ChannelHook>,
+        runtime: WorkflowRuntime<SignalProbe>,
         observed: ObservedSignals,
         wait_ids: Arc<StdMutex<Vec<String>>>,
-        rx: tokio::sync::mpsc::UnboundedReceiver<RunOutcome>,
     }
 
     fn signal_probe_runtime(
@@ -2048,7 +1918,6 @@ mod tests {
         timeout: Duration,
         fail_first: bool,
     ) -> ProbeRuntime {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let observed = Arc::new(StdMutex::new(Vec::new()));
         let wait_ids = Arc::new(StdMutex::new(Vec::new()));
         let runtime = WorkflowRuntime::builder(
@@ -2060,7 +1929,6 @@ mod tests {
                 observed: observed.clone(),
                 wait_ids: wait_ids.clone(),
             },
-            ChannelHook { tx },
         )
         .build()
         .unwrap();
@@ -2068,15 +1936,13 @@ mod tests {
             runtime,
             observed,
             wait_ids,
-            rx,
         }
     }
 
     #[tokio::test(start_paused = true)]
     async fn signal_wakes_waiting_run_early_with_payload() {
         let (queue, store, _clock) = open_queue_at(1_700_000_000_000).await;
-        let mut probe =
-            signal_probe_runtime(queue.clone(), store, Duration::from_secs(3600), false);
+        let probe = signal_probe_runtime(queue.clone(), store, Duration::from_secs(3600), false);
         let shutdown = spawn_runtime(probe.runtime.clone());
 
         let handle = probe
@@ -2106,11 +1972,8 @@ mod tests {
         assert_eq!(outcome, SignalOutcome::Delivered);
 
         // The run completes without the timeout elapsing on the mock clock.
-        let terminal = tokio::time::timeout(Duration::from_secs(2), probe.rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(terminal.status, TerminalStatus::Succeeded);
+        let terminal = wait_for(&probe.runtime, &handle.run_id).await;
+        assert_eq!(terminal.termination.status, TerminalStatus::Succeeded);
         assert_eq!(
             probe.observed.lock().unwrap().as_slice(),
             &[Some(b"paid".to_vec())]
@@ -2207,19 +2070,15 @@ mod tests {
             1
         );
 
-        let mut probe =
-            signal_probe_runtime(queue.clone(), store, Duration::from_secs(3600), false);
+        let probe = signal_probe_runtime(queue.clone(), store, Duration::from_secs(3600), false);
         let shutdown = spawn_runtime(probe.runtime.clone());
         let job_id = waiting_job_id(&probe.runtime, &handle.run_id).await;
 
         let delivery = queue.signal(&job_id, b"approved".to_vec()).await.unwrap();
         assert_eq!(delivery, SignalOutcome::Delivered);
 
-        let terminal = tokio::time::timeout(Duration::from_secs(5), probe.rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(terminal.status, TerminalStatus::Succeeded);
+        let terminal = wait_for(&probe.runtime, &handle.run_id).await;
+        assert_eq!(terminal.termination.status, TerminalStatus::Succeeded);
         assert_eq!(
             probe.observed.lock().unwrap().as_slice(),
             &[Some(b"approved".to_vec())]
@@ -2230,7 +2089,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn signal_timeout_delivers_none_and_rejects_a_late_signal() {
         let (queue, store, clock) = open_queue_at(1_700_000_000_000).await;
-        let mut probe = signal_probe_runtime(queue.clone(), store, Duration::from_secs(60), false);
+        let probe = signal_probe_runtime(queue.clone(), store, Duration::from_secs(60), false);
         let shutdown = spawn_runtime(probe.runtime.clone());
 
         let handle = probe
@@ -2247,11 +2106,8 @@ mod tests {
         advance(&clock, Duration::from_secs(61)).await;
         queue.promote_scheduled_now().await.unwrap();
 
-        let terminal = tokio::time::timeout(Duration::from_secs(2), probe.rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(terminal.status, TerminalStatus::Succeeded);
+        let terminal = wait_for(&probe.runtime, &handle.run_id).await;
+        assert_eq!(terminal.termination.status, TerminalStatus::Succeeded);
         assert_eq!(probe.observed.lock().unwrap().as_slice(), &[None]);
         assert_eq!(
             queue.signal(&job_id, b"late".to_vec()).await.unwrap(),
@@ -2264,8 +2120,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_wake_of_a_waiting_step_delivers_none() {
         let (queue, store, _clock) = open_queue_at(1_700_000_000_000).await;
-        let mut probe =
-            signal_probe_runtime(queue.clone(), store, Duration::from_secs(3600), false);
+        let probe = signal_probe_runtime(queue.clone(), store, Duration::from_secs(3600), false);
         let shutdown = spawn_runtime(probe.runtime.clone());
 
         let handle = probe
@@ -2284,11 +2139,8 @@ mod tests {
             WakeOutcome::Woken
         );
 
-        let terminal = tokio::time::timeout(Duration::from_secs(2), probe.rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(terminal.status, TerminalStatus::Succeeded);
+        let terminal = wait_for(&probe.runtime, &handle.run_id).await;
+        assert_eq!(terminal.termination.status, TerminalStatus::Succeeded);
         assert_eq!(probe.observed.lock().unwrap().as_slice(), &[None]);
 
         let _ = shutdown.send(());
@@ -2297,8 +2149,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_cancelled_wait_rejects_a_signal() {
         let (queue, store, _clock) = open_queue_at(1_700_000_000_000).await;
-        let mut probe =
-            signal_probe_runtime(queue.clone(), store, Duration::from_secs(3600), false);
+        let probe = signal_probe_runtime(queue.clone(), store, Duration::from_secs(3600), false);
         let shutdown = spawn_runtime(probe.runtime.clone());
 
         let handle = probe
@@ -2316,11 +2167,8 @@ mod tests {
             probe.runtime.cancel(&handle.run_id, None).await.unwrap(),
             CancelRunOutcome::Removed
         );
-        let terminal = tokio::time::timeout(Duration::from_secs(2), probe.rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(terminal.status, TerminalStatus::Cancelled);
+        let terminal = wait_for(&probe.runtime, &handle.run_id).await;
+        assert_eq!(terminal.termination.status, TerminalStatus::Cancelled);
         assert_eq!(
             queue.signal(&job_id, b"orphan".to_vec()).await.unwrap(),
             SignalOutcome::NotWaiting
@@ -2330,59 +2178,11 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_failure_notification_inherits_the_step_limits() {
-        let (queue, store) = open_queue().await;
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store,
-            FixedRunner::new(Err(StepError::permanent("nope"))),
-            ChannelHook { tx },
-        )
-        .build()
-        .unwrap();
-        runtime
-            .submit(RunSpec {
-                input: b"x".to_vec(),
-                options: RunOptions {
-                    priority: Some(3),
-                    max_attempts_per_step: Some(5),
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        let job = queue
-            .claim("workflow-steps", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        let err = runtime
-            .inner
-            .process_step(&job, &LeaseHandle::detached())
-            .await
-            .unwrap_err();
-        let failure = err
-            .downcast_ref::<taquba::FailWith>()
-            .expect("a terminating failure carries its effects");
-        let notification = &failure.effects.enqueues[0];
-        assert_eq!(notification.options.priority, Some(3));
-        assert_eq!(notification.options.max_attempts, Some(5));
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn a_duplicate_submit_is_idempotent_drops_its_effects_and_rejects_a_changed_input() {
         let (queue, store) = open_queue().await;
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store,
-            ScriptedRunner::new(vec![]),
-            NoopTerminalHook,
-        )
-        .build()
-        .unwrap();
+        let runtime = WorkflowRuntime::builder(queue.clone(), store, ScriptedRunner::new(vec![]))
+            .build()
+            .unwrap();
         // No worker loop runs, so the step stays queued and the run is active
         // for every later submit.
         let spec = |input: &[u8], key: &[u8]| RunSpec {
@@ -2415,7 +2215,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_duplicate_known_only_from_the_durable_record_reports_the_current_job() {
         let (queue, store) = open_queue().await;
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         // Step 0 continues into a step scheduled an hour out, so the run rests
         // at step 1 with a job the second runtime never saw.
         let first = WorkflowRuntime::builder(
@@ -2425,7 +2224,6 @@ mod tests {
                 b"next".to_vec(),
                 Duration::from_secs(3600),
             )]),
-            ChannelHook { tx },
         )
         .build()
         .unwrap();
@@ -2453,15 +2251,9 @@ mod tests {
         }
         let _ = shutdown.send(());
 
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let second = WorkflowRuntime::builder(
-            queue.clone(),
-            store,
-            ScriptedRunner::new(vec![]),
-            ChannelHook { tx },
-        )
-        .build()
-        .unwrap();
+        let second = WorkflowRuntime::builder(queue.clone(), store, ScriptedRunner::new(vec![]))
+            .build()
+            .unwrap();
         let duplicate = second
             .submit(RunSpec {
                 run_id: Some(rid("durable")),
@@ -2501,7 +2293,7 @@ mod tests {
 
         let t0 = 1_700_000_000_000;
         let (queue, store, clock) = open_queue_at(t0).await;
-        let runtime = WorkflowRuntime::builder(queue.clone(), store, Echo, NoopTerminalHook)
+        let runtime = WorkflowRuntime::builder(queue.clone(), store, Echo)
             .build()
             .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
@@ -2551,14 +2343,9 @@ mod tests {
 
         let seen = Arc::new(std::sync::Mutex::new(None));
         let (queue, store) = open_queue().await;
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store,
-            Recording(seen.clone()),
-            NoopTerminalHook,
-        )
-        .build()
-        .unwrap();
+        let runtime = WorkflowRuntime::builder(queue.clone(), store, Recording(seen.clone()))
+            .build()
+            .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let outcome = runtime
@@ -2582,7 +2369,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn concurrent_submits_of_one_run_admit_one_and_reject_a_changed_input() {
         let (queue, store) = open_queue().await;
-        let runtime = WorkflowRuntime::builder(queue, store.clone(), PauseRunner, NoopTerminalHook)
+        let runtime = WorkflowRuntime::builder(queue, store.clone(), PauseRunner)
             .build()
             .unwrap();
         let spec = |input: &[u8]| RunSpec {
@@ -2629,11 +2416,10 @@ mod tests {
 
         let (runner, gate) =
             GatedRunner::new(Ok(StepOutcome::continue_now(b"step1-payload".to_vec())));
-        let runtime_a =
-            WorkflowRuntime::builder(queue.clone(), store.clone(), runner, NoopTerminalHook)
-                .max_concurrent_steps(1)
-                .build()
-                .unwrap();
+        let runtime_a = WorkflowRuntime::builder(queue.clone(), store.clone(), runner)
+            .max_concurrent_steps(1)
+            .build()
+            .unwrap();
 
         let (shutdown_a_tx, shutdown_a_rx) = oneshot::channel::<()>();
         let worker_a = {
@@ -2674,22 +2460,17 @@ mod tests {
 
         // Bring up runtime B on the same Queue handle. It continues with step 1
         // from where A stopped.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime_b =
-            WorkflowRuntime::builder(queue, store.clone(), CompleteOnStep1, ChannelHook { tx })
-                .build()
-                .unwrap();
+        let runtime_b = WorkflowRuntime::builder(queue, store.clone(), CompleteOnStep1)
+            .build()
+            .unwrap();
         let shutdown_b = spawn_runtime(runtime_b.clone());
 
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("hook fired in time")
-            .expect("hook channel open");
+        let outcome = wait_for(&runtime_b, &handle.run_id).await;
 
         assert_eq!(outcome.run_id, handle.run_id);
-        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        assert_eq!(outcome.termination.status, TerminalStatus::Succeeded);
         assert_eq!(outcome.result.as_deref(), Some(b"resumed".as_slice()));
-        assert_eq!(outcome.final_step.number, 1);
+        assert_eq!(outcome.termination.final_step.number, 1);
 
         let _ = shutdown_b.send(());
     }
@@ -2713,7 +2494,6 @@ mod tests {
                 result: Ok(StepOutcome::continue_now(b"step1-payload".to_vec())),
                 calls: calls.clone(),
             },
-            NoopTerminalHook,
         )
         .step_output_replay()
         .build()
@@ -2783,7 +2563,6 @@ mod tests {
                 result: Ok(StepOutcome::continue_now(b"step1-payload".to_vec())),
                 calls: calls.clone(),
             },
-            NoopTerminalHook,
         )
         .step_output_replay()
         .build()
@@ -2835,7 +2614,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn step_output_replay_of_terminal_outcome_skips_runner() {
         let (queue, store) = open_queue().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let calls = Arc::new(AtomicU32::new(0));
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -2846,7 +2624,6 @@ mod tests {
                 }),
                 calls: calls.clone(),
             },
-            ChannelHook { tx },
         )
         .step_output_replay()
         .build()
@@ -2883,21 +2660,9 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         queue.ack_with(&job, effects).await.unwrap();
 
-        // The committed settlement enqueued one notification, and the hook
-        // observes the replayed outcome when it is processed.
-        let notification = queue
-            .claim("workflow-steps", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        let effects = runtime
-            .inner
-            .process_step(&notification, &LeaseHandle::detached())
-            .await
-            .unwrap();
-        queue.ack_with(&notification, effects).await.unwrap();
-        let outcome = rx.recv().await.unwrap();
-        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        // The committed settlement contains the replayed outcome.
+        let outcome = runtime.wait(&rid("terminal-replay")).await.unwrap();
+        assert_eq!(outcome.termination.status, TerminalStatus::Succeeded);
         assert_eq!(outcome.result.as_deref(), Some(b"final".as_slice()));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -2905,12 +2670,10 @@ mod tests {
     /// Submits a run whose runner always returns [`StepError::transient`],
     /// capped at `max_attempts`. Asserts the runner is invoked exactly
     /// `max_attempts` times (per-step max-attempts propagation) and that the
-    /// terminal hook fires Failed exactly once on the final attempt
-    /// (fire-once-on-last-attempt logic).
+    /// run terminates as failed with its marker on the exhausting attempt.
     async fn assert_transient_retries_until_max(max_attempts: u32) {
         let (queue, store) = open_queue_with(fast_options()).await;
         let calls = Arc::new(AtomicU32::new(0));
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store.clone(),
@@ -2918,7 +2681,6 @@ mod tests {
                 result: Err(StepError::transient("flaky")),
                 calls: calls.clone(),
             },
-            ChannelHook { tx },
         )
         .memo_retention(Duration::from_secs(60))
         .build()
@@ -2937,25 +2699,16 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .expect("hook fired in time")
-            .expect("hook channel open");
+        let outcome = wait_for(&runtime, &handle.run_id).await;
 
-        assert_eq!(outcome.status, TerminalStatus::Failed);
-        assert_eq!(outcome.error.as_deref(), Some("flaky"));
+        assert_eq!(outcome.termination.status, TerminalStatus::Failed);
+        assert_eq!(outcome.termination.error.as_deref(), Some("flaky"));
         assert_eq!(
             calls.load(Ordering::SeqCst),
             max_attempts,
             "runner called once per attempt up to max_attempts"
         );
 
-        // Settle window: assert no duplicate hook fires after the terminal one.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(rx.try_recv().is_err(), "hook fired more than once");
-
-        // The notification job was enqueued with the exhausted nack, so its
-        // effects are committed once the hook fires.
         assert_eq!(queue.view().stats("workflow-steps").await.unwrap().dead, 1);
         assert!(
             runtime
@@ -2986,14 +2739,12 @@ mod tests {
         // fresh runtime starts without process state. The runner returns
         // Succeed, so a Cancelled outcome shows the request was read.
         let (queue, store, _clock) = open_queue_at(10_000).await;
-        let (tx_a, _rx_a) = tokio::sync::mpsc::unbounded_channel();
         let before = WorkflowRuntime::builder(
             queue.clone(),
             store.clone(),
             ScriptedRunner::new(vec![StepOutcome::Succeed {
                 result: b"done".to_vec(),
             }]),
-            ChannelHook { tx: tx_a },
         )
         .build()
         .unwrap();
@@ -3018,14 +2769,12 @@ mod tests {
             CancelRunOutcome::Requested
         );
 
-        let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel();
         let after = WorkflowRuntime::builder(
             queue.clone(),
             store.clone(),
             ScriptedRunner::new(vec![StepOutcome::Succeed {
                 result: b"done".to_vec(),
             }]),
-            ChannelHook { tx: tx_b },
         )
         .build()
         .unwrap();
@@ -3045,20 +2794,8 @@ mod tests {
             .unwrap();
         queue.ack_with(&claim, effects).await.unwrap();
 
-        let notification = queue
-            .claim("workflow-steps", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .expect("the terminal notification is claimable");
-        let effects = after
-            .inner
-            .process_step(&notification, &LeaseHandle::detached())
-            .await
-            .unwrap();
-        queue.ack_with(&notification, effects).await.unwrap();
-
-        let outcome = rx_b.recv().await.unwrap();
-        assert_eq!(outcome.status, TerminalStatus::Cancelled);
+        let outcome = after.wait(&handle.run_id).await.unwrap();
+        assert_eq!(outcome.termination.status, TerminalStatus::Cancelled);
         assert!(outcome.result.is_none(), "the succeed payload is discarded");
     }
 
@@ -3069,7 +2806,6 @@ mod tests {
         // The worker reads it from the run record when the next step is
         // claimed, and settles that step without running it.
         let (queue, store, _clock) = open_queue_at(10_000).await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store.clone(),
@@ -3082,7 +2818,6 @@ mod tests {
                     result: b"done".to_vec(),
                 },
             ]),
-            ChannelHook { tx },
         )
         .build()
         .unwrap();
@@ -3122,44 +2857,26 @@ mod tests {
             .unwrap();
         queue.ack_with(&step1, effects).await.unwrap();
 
-        let notification = queue
-            .claim("workflow-steps", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .expect("the terminal notification is claimable");
-        let effects = runtime
-            .inner
-            .process_step(&notification, &LeaseHandle::detached())
-            .await
-            .unwrap();
-        queue.ack_with(&notification, effects).await.unwrap();
-
-        let outcome = rx.recv().await.unwrap();
-        assert_eq!(outcome.status, TerminalStatus::Cancelled);
-        assert_eq!(outcome.final_step.number, 1);
+        let outcome = runtime.wait(&handle.run_id).await.unwrap();
+        assert_eq!(outcome.termination.status, TerminalStatus::Cancelled);
+        assert_eq!(outcome.termination.final_step.number, 1);
         assert_eq!(
             terminal_status_of(&runtime, &handle.run_id).await,
-            Some(outcome.status)
+            Some(outcome.termination.status)
         );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancelling_a_pending_run_commits_its_marker_and_fires_the_hook_once() {
+    async fn cancelling_a_pending_run_commits_its_termination_with_the_removal() {
         // Pending case: a run sits in the queue, we call `cancel()` before any
-        // worker claims it. `cancel` removes the step job and enqueues the
-        // notification before returning.
+        // worker claims it. `cancel` removes the step job and terminates the
+        // run before returning.
 
         let (queue, store, _clock) = open_queue_at(10_000).await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store.clone(),
-            UnreachableRunner,
-            ChannelHook { tx },
-        )
-        .memo_retention(Duration::from_secs(60))
-        .build()
-        .unwrap();
+        let runtime = WorkflowRuntime::builder(queue.clone(), store.clone(), UnreachableRunner)
+            .memo_retention(Duration::from_secs(60))
+            .build()
+            .unwrap();
         // Note: deliberately do NOT spawn the worker loop, so the submitted
         // step stays Pending in the queue while we cancel it.
 
@@ -3210,19 +2927,13 @@ mod tests {
         );
         assert_eq!(status.step.number, 0);
         assert_eq!(status.step.job_id, handle.job_id);
-        let end = runtime.view().run_end(&handle.run_id).await.unwrap();
-        assert!(
-            end.expect("terminal record").outcome.is_none(),
-            "no worker terminated the run, so no run result record exists",
-        );
         assert_eq!(
             runtime.cancel(&handle.run_id, None).await.unwrap(),
             CancelRunOutcome::NotActive,
             "a second cancel finds no run record",
         );
 
-        // The marker and the terminal record commit with the removal, before
-        // the notification is processed.
+        // The marker and the terminal record commit with the removal.
         let markers = terminal_markers(&queue).await;
         assert_eq!(markers, vec![(handle.run_id.clone(), 10_000)]);
         assert!(
@@ -3234,33 +2945,11 @@ mod tests {
                 .is_some()
         );
 
-        // The step job is gone, and the one claimable job is the notification.
-        let notification = queue
-            .claim("workflow-steps", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        let effects = runtime
-            .inner
-            .process_step(&notification, &LeaseHandle::detached())
-            .await
-            .unwrap();
-        queue.ack_with(&notification, effects).await.unwrap();
-        let outcome = rx.recv().await.unwrap();
+        let outcome = runtime.wait(&handle.run_id).await.unwrap();
         assert_eq!(outcome.run_id, handle.run_id);
-        assert_eq!(outcome.status, TerminalStatus::Cancelled);
-        assert_eq!(outcome.error.as_deref(), Some("operator"));
-        assert_eq!(outcome.cancelled_by, Some(CancelOrigin::Request));
+        assert_eq!(outcome.termination, status_termination(&status));
+        assert_eq!(outcome.result, None);
         assert_eq!(outcome.headers.get("tenant").unwrap(), "acme");
-        assert!(
-            queue
-                .claim("workflow-steps", Duration::from_secs(30))
-                .await
-                .unwrap()
-                .is_none(),
-            "the cancel enqueues one notification",
-        );
-        assert!(rx.try_recv().is_err());
 
         let stats = queue.view().stats("workflow-steps").await.unwrap();
         assert_eq!(stats.dead, 0, "cancel must not dead-letter");
@@ -3270,15 +2959,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_view_reads_the_same_state_through_the_runtime_and_a_reader() {
         let (queue, store, _clock) = open_queue_at(10_000).await;
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store.clone(),
-            UnreachableRunner,
-            NoopTerminalHook,
-        )
-        .memo_prefix("memo")
-        .build()
-        .unwrap();
+        let runtime = WorkflowRuntime::builder(queue.clone(), store.clone(), UnreachableRunner)
+            .memo_prefix("memo")
+            .build()
+            .unwrap();
         // The worker loop is not spawned, so the step stays pending.
         let handle = runtime.submit(RunSpec::default()).await.unwrap();
 
@@ -3290,7 +2974,7 @@ mod tests {
         assert_eq!(through_reader.state, RunState::Pending);
         assert_eq!(through_reader.state, through_runtime.state);
         assert_eq!(through_reader.step.number, through_runtime.step.number);
-        assert!(view.run_end(&handle.run_id).await.unwrap().is_none());
+        assert!(view.terminated_run(&handle.run_id).await.unwrap().is_none());
         assert!(view.status(&rid("unknown")).await.unwrap().is_none());
 
         assert_eq!(
@@ -3316,27 +3000,22 @@ mod tests {
             terminated_at_ms: 10_000,
         };
         assert_eq!(status.state, RunState::Terminated(termination.clone()));
-        let end = view
-            .run_end(&handle.run_id)
+        let run = view
+            .terminated_run(&handle.run_id)
             .await
             .unwrap()
             .expect("terminal record");
-        assert_eq!(end.termination, termination);
-        assert!(end.outcome.is_none(), "no worker terminated the run");
+        assert_eq!(run.termination, termination);
+        assert_eq!(run.result, None);
     }
 
     #[tokio::test(start_paused = true)]
     async fn the_listing_pages_the_runs_in_run_id_order_and_a_run_reads_as_it_lists() {
         let (queue, store, clock) = open_queue_at(10_000).await;
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store.clone(),
-            UnreachableRunner,
-            NoopTerminalHook,
-        )
-        .memo_prefix("memo")
-        .build()
-        .unwrap();
+        let runtime = WorkflowRuntime::builder(queue.clone(), store.clone(), UnreachableRunner)
+            .memo_prefix("memo")
+            .build()
+            .unwrap();
         // The worker loop is not spawned, so the steps stay pending.
         for run_id in ["c", "a", "b"] {
             runtime
@@ -3407,7 +3086,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_run_that_terminates_during_the_listing_lists_once() {
         let (queue, store, _clock) = open_queue_at(10_000).await;
-        let runtime = WorkflowRuntime::builder(queue, store, UnreachableRunner, NoopTerminalHook)
+        let runtime = WorkflowRuntime::builder(queue, store, UnreachableRunner)
             .build()
             .unwrap();
         for run_id in ["a", "b"] {
@@ -3434,7 +3113,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn generated_run_ids_list_in_submission_order_at_the_time_of_the_queue_clock() {
         let (queue, store, _clock) = open_queue_at(10_000).await;
-        let runtime = WorkflowRuntime::builder(queue, store, UnreachableRunner, NoopTerminalHook)
+        let runtime = WorkflowRuntime::builder(queue, store, UnreachableRunner)
             .build()
             .unwrap();
         // The clock stays in one millisecond, where ULIDs with fresh random
@@ -3469,7 +3148,7 @@ mod tests {
                 .payload_store(payloads.clone()),
         )
         .await;
-        let runtime = WorkflowRuntime::builder(queue, store, UnreachableRunner, NoopTerminalHook)
+        let runtime = WorkflowRuntime::builder(queue, store, UnreachableRunner)
             .memo_prefix("memo")
             .build()
             .unwrap();
@@ -3495,21 +3174,15 @@ mod tests {
     /// Run a single step that blocks on a gate, calls `cancel(run_id)` while
     /// the step is in-flight, and then has the runner return the supplied
     /// error. Asserts that external cancellation suppresses the error path
-    /// entirely: the hook fires `Cancelled` (not `Failed`), no dead-letter is
-    /// produced regardless of `permanent`/`transient`, and the worker returns
-    /// `Ok` (no retry, no PermanentFailure propagation).
+    /// entirely: the run terminates as `Cancelled` (not `Failed`), no
+    /// dead-letter is produced regardless of `permanent`/`transient`, and the
+    /// worker returns `Ok` (no retry, no PermanentFailure propagation).
     async fn assert_cancel_suppresses_runner_error(error: StepError) {
         let (queue, store) = open_queue_with(fast_options()).await;
         let (runner, gate) = GatedRunner::new(Err(error));
-        let (hook_tx, mut hook_rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store.clone(),
-            runner,
-            ChannelHook { tx: hook_tx },
-        )
-        .build()
-        .unwrap();
+        let runtime = WorkflowRuntime::builder(queue.clone(), store.clone(), runner)
+            .build()
+            .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let handle = runtime
@@ -3531,20 +3204,22 @@ mod tests {
         // Cancellation must suppress both.
         gate.release();
 
-        let outcome = tokio::time::timeout(Duration::from_secs(2), hook_rx.recv())
-            .await
-            .expect("hook fired")
-            .expect("hook channel open");
-        assert_eq!(outcome.status, TerminalStatus::Cancelled);
-        assert_eq!(outcome.error, None, "the request carries no reason");
-        assert_eq!(outcome.cancelled_by, Some(CancelOrigin::Request));
+        let outcome = wait_for(&runtime, &handle.run_id).await;
+        assert_eq!(outcome.termination.status, TerminalStatus::Cancelled);
+        assert_eq!(
+            outcome.termination.error, None,
+            "the request carries no reason"
+        );
+        assert_eq!(
+            outcome.termination.cancelled_by,
+            Some(CancelOrigin::Request)
+        );
         assert_eq!(
             terminal_status_of(&runtime, &handle.run_id).await,
-            Some(outcome.status)
+            Some(outcome.termination.status)
         );
 
-        // Settle window: assert no retry attempt and no dead-letter or
-        // duplicate hook fires after the terminal one.
+        // Settle window: assert no retry attempt and no dead-letter.
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             gate.calls.load(Ordering::SeqCst),
@@ -3553,10 +3228,6 @@ mod tests {
         );
         let stats = queue.view().stats("workflow-steps").await.unwrap();
         assert_eq!(stats.dead, 0, "cancellation must suppress dead-letter");
-        assert!(
-            hook_rx.try_recv().is_err(),
-            "hook must fire exactly once for the cancelled run",
-        );
 
         let _ = shutdown.send(());
     }
@@ -3598,14 +3269,12 @@ mod tests {
 
         let (queue, store) = open_queue().await;
         let claimed = Arc::new(tokio::sync::Notify::new());
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store.clone(),
             CooperativeRunner {
                 claimed: claimed.clone(),
             },
-            ChannelHook { tx },
         )
         .build()
         .unwrap();
@@ -3630,19 +3299,20 @@ mod tests {
             CancelRunOutcome::Requested
         );
 
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("hook fired well before the 30s sleep would have")
-            .expect("hook channel open");
+        // The run terminates well before the 30s sleep would end.
+        let outcome = wait_for(&runtime, &handle.run_id).await;
 
-        assert_eq!(outcome.status, TerminalStatus::Cancelled);
+        assert_eq!(outcome.termination.status, TerminalStatus::Cancelled);
         // The request's token led to the runner's Cancel, so the request's
         // origin and reason surface.
-        assert_eq!(outcome.error.as_deref(), Some("stop"));
-        assert_eq!(outcome.cancelled_by, Some(CancelOrigin::Request));
+        assert_eq!(outcome.termination.error.as_deref(), Some("stop"));
+        assert_eq!(
+            outcome.termination.cancelled_by,
+            Some(CancelOrigin::Request)
+        );
         assert_eq!(
             terminal_status_of(&runtime, &handle.run_id).await,
-            Some(outcome.status)
+            Some(outcome.termination.status)
         );
 
         let stats = queue.view().stats("workflow-steps").await.unwrap();
@@ -3653,19 +3323,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cancel_returns_false_for_a_terminated_or_unknown_run() {
-        // Submit a run that succeeds normally, wait for the terminal hook, then
+        // Submit a run that succeeds normally, wait for its termination, then
         // call `cancel`. The terminal record replaced the run record with the
-        // success, so `cancel` must report `Ok(false)` and must not fire a
-        // second hook.
+        // success, so `cancel` must report `NotActive`.
         let (queue, store) = open_queue().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue,
             store.clone(),
             ScriptedRunner::new(vec![StepOutcome::Succeed {
                 result: b"done".to_vec(),
             }]),
-            ChannelHook { tx },
         )
         .build()
         .unwrap();
@@ -3679,14 +3346,11 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("Succeeded hook fired")
-            .expect("hook channel open");
-        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        let outcome = wait_for(&runtime, &handle.run_id).await;
+        assert_eq!(outcome.termination.status, TerminalStatus::Succeeded);
         assert_eq!(
             terminal_status_of(&runtime, &handle.run_id).await,
-            Some(outcome.status)
+            Some(outcome.termination.status)
         );
 
         assert_eq!(
@@ -3694,11 +3358,10 @@ mod tests {
             CancelRunOutcome::NotActive,
             "cancel on an already-terminated run must report NotActive",
         );
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            rx.try_recv().is_err(),
-            "no Cancelled hook may fire after the run already terminated as Succeeded",
+        assert_eq!(
+            terminal_status_of(&runtime, &handle.run_id).await,
+            Some(TerminalStatus::Succeeded),
+            "the cancel leaves the terminated run as it was",
         );
 
         assert_eq!(
@@ -3744,13 +3407,12 @@ mod tests {
         }
 
         let (queue, store) = open_queue_with(fast_options()).await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(queue, store, MemoRetryRunner, ChannelHook { tx })
+        let runtime = WorkflowRuntime::builder(queue, store, MemoRetryRunner)
             .build()
             .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
-        runtime
+        let handle = runtime
             .submit(RunSpec {
                 input: b"start".to_vec(),
                 options: RunOptions {
@@ -3761,11 +3423,8 @@ mod tests {
             })
             .await
             .unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .expect("hook fired in time")
-            .expect("hook channel open");
-        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        let outcome = wait_for(&runtime, &handle.run_id).await;
+        assert_eq!(outcome.termination.status, TerminalStatus::Succeeded);
         assert_eq!(
             outcome.result.as_deref(),
             Some(b"first-attempt-value".as_slice())
@@ -3780,14 +3439,12 @@ mod tests {
         // Queue::clock()), so a `clock.advance` between submit and terminate is
         // visible in the marker's terminal_at_ms.
         let (queue, store, clock) = open_queue_at(10_000).await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue,
             store.clone(),
             ScriptedRunner::new(vec![StepOutcome::Succeed {
                 result: b"done".to_vec(),
             }]),
-            ChannelHook { tx },
         )
         .memo_retention(Duration::from_secs(60))
         .build()
@@ -3802,10 +3459,7 @@ mod tests {
             .await
             .unwrap();
         advance(&clock, Duration::from_secs(30)).await;
-        let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let _ = wait_for(&runtime, &handle.run_id).await;
 
         let markers = terminal_markers(&runtime.inner.core.queue).await;
         assert_eq!(markers.len(), 1);
@@ -3820,15 +3474,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn submit_rejects_the_reserved_names_in_its_headers_and_effects() {
         let (queue, store, _clock) = open_queue_at(10_000).await;
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue,
-            store,
-            ScriptedRunner::new(vec![]),
-            ChannelHook { tx },
-        )
-        .build()
-        .unwrap();
+        let runtime = WorkflowRuntime::builder(queue, store, ScriptedRunner::new(vec![]))
+            .build()
+            .unwrap();
 
         let err = runtime
             .submit(RunSpec {
@@ -3911,15 +3559,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn submit_applies_the_deletes_and_expiry_entries_of_the_spec() {
         let (queue, store, _clock) = open_queue_at(10_000).await;
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store,
-            ScriptedRunner::new(vec![]),
-            ChannelHook { tx },
-        )
-        .build()
-        .unwrap();
+        let runtime = WorkflowRuntime::builder(queue.clone(), store, ScriptedRunner::new(vec![]))
+            .build()
+            .unwrap();
         let index = ExpiryIndex::new(b"app/expiry/".to_vec());
         queue.kv_put(b"app/stale", b"1").await.unwrap();
         // An entry at 9_000 sets the bound of the index, so a pass reads the
@@ -3955,16 +3597,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_malformed_terminal_marker_is_deleted_without_clearing_memos() {
         let (queue, store, clock) = open_queue_at(10_000).await;
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store.clone(),
-            ScriptedRunner::new(vec![]),
-            ChannelHook { tx },
-        )
-        .memo_retention(Duration::from_secs(60))
-        .build()
-        .unwrap();
+        let runtime =
+            WorkflowRuntime::builder(queue.clone(), store.clone(), ScriptedRunner::new(vec![]))
+                .memo_retention(Duration::from_secs(60))
+                .build()
+                .unwrap();
 
         let memos = MemoStore::new(store, "workflow-steps-memo");
         memos
@@ -4003,12 +3640,10 @@ mod tests {
         let (runner, gate) = GatedRunner::new(Ok(StepOutcome::Succeed {
             result: b"would-have-succeeded".to_vec(),
         }));
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime =
-            WorkflowRuntime::builder(queue.clone(), store.clone(), runner, ChannelHook { tx })
-                .memo_retention(Duration::from_secs(60))
-                .build()
-                .unwrap();
+        let runtime = WorkflowRuntime::builder(queue.clone(), store.clone(), runner)
+            .memo_retention(Duration::from_secs(60))
+            .build()
+            .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let handle = runtime
@@ -4063,17 +3698,17 @@ mod tests {
         );
 
         gate.release();
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("hook fired")
-            .expect("hook channel open");
-        assert_eq!(outcome.status, TerminalStatus::Cancelled);
+        let outcome = wait_for(&runtime, &handle.run_id).await;
+        assert_eq!(outcome.termination.status, TerminalStatus::Cancelled);
         assert!(
             outcome.result.is_none(),
             "succeed payload must be discarded"
         );
-        assert_eq!(outcome.error.as_deref(), Some("operator"));
-        assert_eq!(outcome.cancelled_by, Some(CancelOrigin::Request));
+        assert_eq!(outcome.termination.error.as_deref(), Some("operator"));
+        assert_eq!(
+            outcome.termination.cancelled_by,
+            Some(CancelOrigin::Request)
+        );
         let status = runtime.status(&handle.run_id).await.unwrap().unwrap();
         assert!(matches!(
             status.state,
@@ -4097,12 +3732,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_permanent_step_error_dead_letters_with_its_marker_and_no_staged_effects() {
         let (queue, store, _clock) = open_queue_at(10_000).await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store,
             EffectStagingRunner::new(vec![Err(StepError::permanent("nope"))]),
-            ChannelHook { tx },
         )
         .memo_retention(Duration::from_secs(60))
         .build()
@@ -4116,13 +3749,10 @@ mod tests {
             })
             .await
             .unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let outcome = wait_for(&runtime, &handle.run_id).await;
         assert_eq!(outcome.run_id, handle.run_id);
-        assert_eq!(outcome.status, TerminalStatus::Failed);
-        assert_eq!(outcome.error.as_deref(), Some("nope"));
+        assert_eq!(outcome.termination.status, TerminalStatus::Failed);
+        assert_eq!(outcome.termination.error.as_deref(), Some("nope"));
         let status = runtime.status(&handle.run_id).await.unwrap().unwrap();
         assert!(
             matches!(
@@ -4136,19 +3766,10 @@ mod tests {
             ),
             "the terminal record commits with the dead-letter and carries the error kind",
         );
-        let recorded = runtime
-            .view()
-            .run_end(&handle.run_id)
-            .await
-            .unwrap()
-            .and_then(|end| end.outcome)
-            .unwrap();
-        assert_eq!(recorded.status, TerminalStatus::Failed);
-        assert_eq!(recorded.error.as_deref(), Some("nope"));
 
-        // The notification was enqueued by the dead-letter transaction, so the
-        // dead job and the marker are already visible, and the staged effect
-        // was discarded with the failure.
+        // The dead-letter transaction commits the termination, so the dead job
+        // and the marker are visible, and the staged effect was discarded with
+        // the failure.
         assert_eq!(queue.view().stats("workflow-steps").await.unwrap().dead, 1);
         assert_eq!(
             terminal_markers(&queue).await,
@@ -4188,7 +3809,6 @@ mod tests {
 
         let (queue, store, clock) = open_queue_at_with(10_000, fast_options()).await;
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store.clone(),
@@ -4196,7 +3816,6 @@ mod tests {
                 attempts: attempts.clone(),
                 clock: clock.clone(),
             },
-            ChannelHook { tx },
         )
         .memo_retention(Duration::from_secs(60))
         .build()
@@ -4214,11 +3833,8 @@ mod tests {
             })
             .await
             .unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        let outcome = wait_for(&runtime, &handle.run_id).await;
+        assert_eq!(outcome.termination.status, TerminalStatus::Succeeded);
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
 
         // Exactly one marker, recorded at a time after the retry's clock
@@ -4236,16 +3852,11 @@ mod tests {
         // Markers sort by timestamp, so the sweep scans from the start of the
         // range and returns at the first unexpired marker.
         let (queue, store, _clock) = open_queue_at(10_000).await;
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store.clone(),
-            ScriptedRunner::new(vec![]),
-            ChannelHook { tx },
-        )
-        .memo_retention(Duration::from_secs(1))
-        .build()
-        .unwrap();
+        let runtime =
+            WorkflowRuntime::builder(queue.clone(), store.clone(), ScriptedRunner::new(vec![]))
+                .memo_retention(Duration::from_secs(1))
+                .build()
+                .unwrap();
 
         let memos = MemoStore::new(store, "workflow-steps-memo");
         let sweep = runtime.inner.core.memo_sweep.as_ref().unwrap();
@@ -4265,6 +3876,7 @@ mod tests {
                 input_hash: [0; 32],
                 submitted_at_ms: at_ms,
                 headers: HashMap::new(),
+                result: Some(DurableResult::Empty),
             };
             let record = SettlementEffects::default().kv_put(
                 run_kv_key(&run_id),
@@ -4299,7 +3911,6 @@ mod tests {
             FixedRunner::new(Ok(StepOutcome::Succeed {
                 result: b"done".to_vec(),
             })),
-            NoopTerminalHook,
         )
         .memo_retention(Duration::from_secs(1))
         .build()
@@ -4349,7 +3960,6 @@ mod tests {
             FixedRunner::new(Ok(StepOutcome::Succeed {
                 result: b"done".to_vec(),
             })),
-            NoopTerminalHook,
         )
         .memo_retention(Duration::from_secs(1))
         .build()
@@ -4416,14 +4026,12 @@ mod tests {
         // marker is written leaves it. Within a poll interval of the boundary
         // the sweep loop clears the marker and the run's memo entries.
         let (queue, store, clock) = open_queue_at(10_000).await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue,
             store.clone(),
             ScriptedRunner::new(vec![StepOutcome::Succeed {
                 result: b"done".to_vec(),
             }]),
-            ChannelHook { tx },
         )
         .memo_retention(Duration::from_millis(200))
         .poll_interval(Duration::from_millis(10))
@@ -4438,10 +4046,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let _ = wait_for(&runtime, &handle.run_id).await;
         let memos = MemoStore::new(store.clone(), "workflow-steps-memo");
         memos
             .new_memo(&handle.run_id, 0)
@@ -4487,16 +4092,10 @@ mod tests {
         // exists for a run without a terminal marker. Advancing well past
         // retention must leave it in place.
         let (queue, store, clock) = open_queue_at(10_000).await;
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue,
-            store.clone(),
-            ScriptedRunner::new(vec![]),
-            ChannelHook { tx },
-        )
-        .memo_retention(Duration::from_millis(100))
-        .build()
-        .unwrap();
+        let runtime = WorkflowRuntime::builder(queue, store.clone(), ScriptedRunner::new(vec![]))
+            .memo_retention(Duration::from_millis(100))
+            .build()
+            .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let memos = MemoStore::new(store.clone(), "workflow-steps-memo");
@@ -4582,7 +4181,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn step_effects_commit_with_the_acking_settlement() {
         let (queue, store) = open_queue().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store,
@@ -4590,24 +4188,20 @@ mod tests {
                 Ok(StepOutcome::continue_now(b"next".to_vec())),
                 Ok(StepOutcome::Succeed { result: Vec::new() }),
             ]),
-            ChannelHook { tx },
         )
         .build()
         .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
-        runtime
+        let handle = runtime
             .submit(RunSpec {
                 input: Vec::new(),
                 ..Default::default()
             })
             .await
             .unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        let outcome = wait_for(&runtime, &handle.run_id).await;
+        assert_eq!(outcome.termination.status, TerminalStatus::Succeeded);
         assert_eq!(wait_for_kv(&queue, b"app/step-0").await, b"done");
         assert_eq!(wait_for_kv(&queue, b"app/step-1").await, b"done");
         assert_eq!(queue.view().stats("app-requests").await.unwrap().pending, 2);
@@ -4648,7 +4242,6 @@ mod tests {
         }
 
         let (queue, store) = open_queue().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let read_under_staging = Arc::new(StdMutex::new(None));
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -4656,24 +4249,20 @@ mod tests {
             ReadingRunner {
                 read_under_staging: read_under_staging.clone(),
             },
-            ChannelHook { tx },
         )
         .build()
         .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
-        runtime
+        let handle = runtime
             .submit(RunSpec {
                 input: Vec::new(),
                 ..Default::default()
             })
             .await
             .unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        let outcome = wait_for(&runtime, &handle.run_id).await;
+        assert_eq!(outcome.termination.status, TerminalStatus::Succeeded);
         assert_eq!(outcome.result.as_deref(), Some(b"v".as_slice()));
         assert_eq!(*read_under_staging.lock().unwrap(), Some(None));
 
@@ -4701,18 +4290,14 @@ mod tests {
         }
 
         let (queue, store) = open_queue().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(queue, store, RunKvRunner, ChannelHook { tx })
+        let runtime = WorkflowRuntime::builder(queue, store, RunKvRunner)
             .build()
             .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let handle = runtime.submit(RunSpec::default()).await.unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        let outcome = wait_for(&runtime, &handle.run_id).await;
+        assert_eq!(outcome.termination.status, TerminalStatus::Succeeded);
         assert_eq!(outcome.result.as_deref(), Some(b"a".as_slice()));
         let view = runtime.view();
         let entries: Vec<_> = view
@@ -4754,24 +4339,20 @@ mod tests {
         }
 
         let (queue, store) = open_queue().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(queue, store, JournalRunner, ChannelHook { tx })
+        let runtime = WorkflowRuntime::builder(queue, store, JournalRunner)
             .build()
             .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
-        runtime
+        let handle = runtime
             .submit(RunSpec {
                 input: Vec::new(),
                 ..Default::default()
             })
             .await
             .unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        let outcome = wait_for(&runtime, &handle.run_id).await;
+        assert_eq!(outcome.termination.status, TerminalStatus::Succeeded);
         assert_eq!(outcome.result.as_deref(), Some(b"entry".as_slice()));
 
         let _ = shutdown.send(());
@@ -4780,14 +4361,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_fail_verdict_acks_with_its_effects_and_no_dead_letter() {
         let (queue, store) = open_queue().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store,
             EffectStagingRunner::new(vec![Ok(StepOutcome::Fail {
                 reason: "denied".to_string(),
             })]),
-            ChannelHook { tx },
         )
         .build()
         .unwrap();
@@ -4800,16 +4379,13 @@ mod tests {
             })
             .await
             .unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let outcome = wait_for(&runtime, &handle.run_id).await;
         assert_eq!(outcome.run_id, handle.run_id);
-        assert_eq!(outcome.status, TerminalStatus::Failed);
-        assert_eq!(outcome.error.as_deref(), Some("denied"));
+        assert_eq!(outcome.termination.status, TerminalStatus::Failed);
+        assert_eq!(outcome.termination.error.as_deref(), Some("denied"));
         assert_eq!(
             terminal_status_of(&runtime, &handle.run_id).await,
-            Some(outcome.status)
+            Some(outcome.termination.status)
         );
         assert_eq!(wait_for_kv(&queue, b"app/step-0").await, b"done");
         assert_eq!(
@@ -4839,29 +4415,20 @@ mod tests {
         }
 
         let (queue, store, _clock) = open_queue_at(10_000).await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store,
-            SelfCancellingRunner,
-            ChannelHook { tx },
-        )
-        .build()
-        .unwrap();
+        let runtime = WorkflowRuntime::builder(queue.clone(), store, SelfCancellingRunner)
+            .build()
+            .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
-        runtime
+        let handle = runtime
             .submit(RunSpec {
                 input: Vec::new(),
                 ..Default::default()
             })
             .await
             .unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        let outcome = wait_for(&runtime, &handle.run_id).await;
+        assert_eq!(outcome.termination.status, TerminalStatus::Succeeded);
         assert_eq!(outcome.result.as_deref(), Some(b"finished".as_slice()));
         assert_eq!(wait_for_kv(&queue, b"app/step-0").await, b"done");
 
@@ -4871,14 +4438,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_cancel_verdict_acks_with_its_effects_and_no_dead_letter() {
         let (queue, store) = open_queue().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store,
             EffectStagingRunner::new(vec![Ok(StepOutcome::Cancel {
                 reason: "obsolete".to_string(),
             })]),
-            ChannelHook { tx },
         )
         .build()
         .unwrap();
@@ -4891,17 +4456,14 @@ mod tests {
             })
             .await
             .unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let outcome = wait_for(&runtime, &handle.run_id).await;
         assert_eq!(outcome.run_id, handle.run_id);
-        assert_eq!(outcome.status, TerminalStatus::Cancelled);
-        assert_eq!(outcome.error.as_deref(), Some("obsolete"));
-        assert_eq!(outcome.cancelled_by, Some(CancelOrigin::Runner));
+        assert_eq!(outcome.termination.status, TerminalStatus::Cancelled);
+        assert_eq!(outcome.termination.error.as_deref(), Some("obsolete"));
+        assert_eq!(outcome.termination.cancelled_by, Some(CancelOrigin::Runner));
         assert_eq!(
             terminal_status_of(&runtime, &handle.run_id).await,
-            Some(outcome.status)
+            Some(outcome.termination.status)
         );
         assert_eq!(wait_for_kv(&queue, b"app/step-0").await, b"done");
         assert_eq!(
@@ -4932,14 +4494,12 @@ mod tests {
 
         let (queue, store) = open_queue().await;
         let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store,
             StageThenAwaitCancel {
                 started: started_tx,
             },
-            ChannelHook { tx },
         )
         .build()
         .unwrap();
@@ -4961,12 +4521,9 @@ mod tests {
             CancelRunOutcome::Requested
         );
 
-        let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(outcome.status, TerminalStatus::Cancelled);
-        assert_eq!(outcome.error, None);
+        let outcome = wait_for(&runtime, &handle.run_id).await;
+        assert_eq!(outcome.termination.status, TerminalStatus::Cancelled);
+        assert_eq!(outcome.termination.error, None);
 
         wait_for_drained(&queue).await;
         assert!(
@@ -4992,12 +4549,10 @@ mod tests {
             ),
         )
         .await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime =
-            WorkflowRuntime::builder(queue.clone(), store, PauseRunner, ChannelHook { tx })
-                .poll_interval(Duration::from_millis(10))
-                .build()
-                .unwrap();
+        let runtime = WorkflowRuntime::builder(queue.clone(), store, PauseRunner)
+            .poll_interval(Duration::from_millis(10))
+            .build()
+            .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
         let submitted = runtime
@@ -5026,13 +4581,10 @@ mod tests {
         // The lease expires past the attempt limit: the reaper dead-letters the
         // step outside the worker, without a worker in the loop.
         advance(&clock, Duration::from_secs(2)).await;
-        let outcome = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let outcome = wait_for(&runtime, &rid("hung")).await;
         assert_eq!(outcome.run_id, "hung");
-        assert_eq!(outcome.status, TerminalStatus::Failed);
-        assert_eq!(outcome.final_step.number, 0);
+        assert_eq!(outcome.termination.status, TerminalStatus::Failed);
+        assert_eq!(outcome.termination.final_step.number, 0);
         assert_eq!(
             queue
                 .view()
@@ -5098,7 +4650,6 @@ mod tests {
                     result: b"done".to_vec(),
                 },
             ]),
-            NoopTerminalHook,
         )
         .build()
         .unwrap();
@@ -5116,28 +4667,27 @@ mod tests {
             })
             .await
             .unwrap();
-        let end = tokio::time::timeout(Duration::from_secs(5), runtime.wait(&rid("two")))
+        let outcome = tokio::time::timeout(Duration::from_secs(5), runtime.wait(&rid("two")))
             .await
             .expect("the wait resolved")
             .unwrap();
-        let outcome = end.outcome.expect("the worker recorded the outcome");
         assert_eq!(
-            (outcome.final_step.number, outcome.result.as_deref()),
-            (1, Some(b"done".as_slice()))
-        );
-        assert_eq!(
-            (end.termination.status, end.termination.final_step.number),
-            (TerminalStatus::Succeeded, 1)
+            (
+                outcome.termination.status,
+                outcome.termination.final_step.number,
+                outcome.result.as_deref()
+            ),
+            (TerminalStatus::Succeeded, 1, Some(b"done".as_slice()))
         );
 
-        // A run already terminated is reported at once.
+        // A run that has already terminated is reported without a wait.
         let again = runtime.wait(&rid("two")).await.unwrap();
-        assert_eq!(again.termination, end.termination);
+        assert_eq!(again, outcome);
         let _ = shutdown.send(());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_result_record_of_a_settlement_that_did_not_commit_is_not_reported() {
+    async fn a_result_written_by_a_settlement_that_did_not_commit_is_not_reported() {
         let (queue, store, _clock) = open_queue_at(10_000).await;
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -5145,7 +4695,6 @@ mod tests {
             FixedRunner::new(Ok(StepOutcome::Succeed {
                 result: b"done".to_vec(),
             })),
-            NoopTerminalHook,
         )
         .build()
         .unwrap();
@@ -5162,33 +4711,129 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        // The worker writes the run result record before its settlement. The
+        // The worker writes the result object before its settlement. The
         // settlement does not commit, and the queue dead-letters the step.
         runtime
             .inner
             .process_step(&claim, &LeaseHandle::detached())
             .await
             .unwrap();
-        let record = runtime.inner.core.memo_store.new_run_memo(&rid("r"));
-        assert!(record.get(RUN_RESULT_MEMO_KEY).await.unwrap().is_some());
+        let memos = &runtime.inner.core.memo_store;
+        let written = memos.get_result(&rid("r"), &claim.id, claim.attempts).await;
+        assert_eq!(written.unwrap().as_deref(), Some(b"done".as_slice()));
         queue.dead_letter(&claim, "hung").await.unwrap();
         assert_eq!(runtime.inner.core.reconcile_dead_steps().await.unwrap(), 1);
 
-        let end = runtime.view().run_end(&rid("r")).await.unwrap().unwrap();
-        assert_eq!(end.termination.status, TerminalStatus::Failed);
-        assert!(
-            end.outcome.is_none(),
-            "the record belongs to the settlement that did not commit"
+        let run = runtime.wait(&rid("r")).await.unwrap();
+        assert_eq!(run.termination.status, TerminalStatus::Failed);
+        assert_eq!(
+            run.result, None,
+            "the object belongs to the settlement that did not commit"
         );
+    }
+
+    /// Submits the run `r` of a runner that returns `result`, settles its step
+    /// and returns the runtime with the job id and the attempt of the claim.
+    async fn settled_success(result: &[u8]) -> (WorkflowRuntime<FixedRunner>, String, u32) {
+        let (queue, store, _clock) = open_queue_at(10_000).await;
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            store,
+            FixedRunner::new(Ok(StepOutcome::Succeed {
+                result: result.to_vec(),
+            })),
+        )
+        .build()
+        .unwrap();
+        runtime
+            .submit(RunSpec {
+                run_id: Some(rid("r")),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let claim = queue
+            .claim("workflow-steps", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let effects = runtime
+            .inner
+            .process_step(&claim, &LeaseHandle::detached())
+            .await
+            .unwrap();
+        queue.ack_with(&claim, effects).await.unwrap();
+        (runtime, claim.id.clone(), claim.attempts)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_result_is_reported_without_an_object() {
+        let (runtime, job_id, attempt) = settled_success(b"").await;
+        let memos = &runtime.inner.core.memo_store;
+        let object = memos.get_result(&rid("r"), &job_id, attempt).await;
+        assert_eq!(object.unwrap(), None);
+        let run = runtime.wait(&rid("r")).await.unwrap();
+        assert_eq!(run.result.as_deref(), Some(b"".as_slice()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_result_object_removed_before_its_terminal_record_reads_as_swept() {
+        let (runtime, _, _) = settled_success(b"done").await;
+        // The memo sweep removes the objects of a run before the transaction
+        // that deletes its terminal record.
+        let memos = &runtime.inner.core.memo_store;
+        assert_eq!(memos.clear_memos_for_run(&rid("r")).await.unwrap(), 1);
+        assert!(runtime.status(&rid("r")).await.unwrap().is_some());
+        assert_eq!(
+            runtime.view().terminated_run(&rid("r")).await.unwrap(),
+            None
+        );
+        assert!(matches!(
+            runtime.wait(&rid("r")).await,
+            Err(Error::RunNotFound(id)) if id == "r"
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_succeeded_terminal_record_without_a_result_reference_is_inconsistent() {
+        let (queue, store, _clock) = open_queue_at(10_000).await;
+        let runtime = WorkflowRuntime::builder(queue.clone(), store, UnreachableRunner)
+            .build()
+            .unwrap();
+        // A terminal record of a run that succeeded before results were
+        // referenced from the record.
+        let termination = DurableTermination {
+            status: TerminalStatus::Succeeded.into(),
+            error: None,
+            cancelled_by: None,
+            error_kind: None,
+            final_step: DurableStepRef {
+                step_number: 0,
+                job_id: "job".to_string(),
+            },
+            terminated_at_ms: 10_000,
+            input_hash: [0; 32],
+            submitted_at_ms: 10_000,
+            headers: HashMap::new(),
+            result: None,
+        };
+        let record = durable::encode(&DurableRun::Terminated(termination));
+        queue
+            .commit_effects(SettlementEffects::default().kv_put(run_kv_key(&rid("old")), record))
+            .await
+            .unwrap();
+        assert!(matches!(
+            runtime.wait(&rid("old")).await,
+            Err(Error::InconsistentRunState(id)) if id == "old"
+        ));
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_cancel_request_does_not_reach_a_re_submission_of_the_run_id() {
         let (queue, store, _clock) = open_queue_at(10_000).await;
-        let runtime =
-            WorkflowRuntime::builder(queue.clone(), store, UnreachableRunner, NoopTerminalHook)
-                .build()
-                .unwrap();
+        let runtime = WorkflowRuntime::builder(queue.clone(), store, UnreachableRunner)
+            .build()
+            .unwrap();
         let spec = RunSpec {
             run_id: Some(rid("again")),
             input: b"x".to_vec(),
@@ -5220,11 +4865,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_step_dead_lettered_outside_the_worker_is_waited_for_until_reconciliation() {
         let (queue, store, _clock) = open_queue_at(10_000).await;
-        let runtime =
-            WorkflowRuntime::builder(queue.clone(), store, UnreachableRunner, NoopTerminalHook)
-                .poll_interval(Duration::from_millis(10))
-                .build()
-                .unwrap();
+        let runtime = WorkflowRuntime::builder(queue.clone(), store, UnreachableRunner)
+            .poll_interval(Duration::from_millis(10))
+            .build()
+            .unwrap();
         runtime
             .submit(RunSpec {
                 run_id: Some(rid("hung")),
@@ -5283,10 +4927,10 @@ mod tests {
             },
             "the termination is read from the terminal record",
         );
-        assert!(end.outcome.is_none());
+        assert_eq!(end.result, None);
         assert_eq!(
-            runtime.wait(&rid("hung")).await.unwrap().termination,
-            end.termination,
+            runtime.wait(&rid("hung")).await.unwrap(),
+            end,
             "the record is retained without memo retention",
         );
     }
@@ -5294,10 +4938,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_pointer_over_a_missing_job_is_an_inconsistent_run_state() {
         let (queue, store) = open_queue().await;
-        let runtime =
-            WorkflowRuntime::builder(queue.clone(), store, UnreachableRunner, NoopTerminalHook)
-                .build()
-                .unwrap();
+        let runtime = WorkflowRuntime::builder(queue.clone(), store, UnreachableRunner)
+            .build()
+            .unwrap();
         let submitted = runtime
             .submit(RunSpec {
                 run_id: Some(rid("torn")),
@@ -5346,7 +4989,6 @@ mod tests {
         }
 
         let (queue, store) = open_queue_with(fast_options()).await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let pending_seen = Arc::new(StdMutex::new(Vec::new()));
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
@@ -5354,7 +4996,6 @@ mod tests {
             RecordReadingRunner {
                 pending_seen: pending_seen.clone(),
             },
-            ChannelHook { tx },
         )
         .build()
         .unwrap();
@@ -5374,11 +5015,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(outcome.status, TerminalStatus::Failed);
+        let member = crate::group::member_run_id(&rid("g"), "m", 0);
+        let outcome = wait_for(&runtime, &member).await;
+        assert_eq!(outcome.termination.status, TerminalStatus::Failed);
         for _ in 0..200 {
             if queue.view().stats("workflow-steps").await.unwrap().dead == 1 {
                 break;
@@ -5442,7 +5081,6 @@ mod tests {
             StagingContinueRunner {
                 calls: calls.clone(),
             },
-            NoopTerminalHook,
         )
         .step_output_replay()
         .build()
@@ -5523,7 +5161,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn only_the_committed_outcome_produces_a_notification() {
+    async fn only_the_committed_outcome_is_reported() {
         struct GatedSecondAttempt {
             calls: Arc<AtomicU32>,
             running: tokio::sync::mpsc::UnboundedSender<()>,
@@ -5546,7 +5184,6 @@ mod tests {
 
         let (queue, store) = open_queue().await;
         let (running_tx, mut running_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = WorkflowRuntime::builder(
             queue.clone(),
             store,
@@ -5554,7 +5191,6 @@ mod tests {
                 calls: Arc::new(AtomicU32::new(0)),
                 running: running_tx,
             },
-            ChannelHook { tx },
         )
         .build()
         .unwrap();
@@ -5573,9 +5209,9 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // First settlement attempt: the runner succeeds, but the effects are
-        // dropped, as when the settlement loses the claim. The Succeeded
-        // notification is dropped with them.
+        // First settlement attempt: the runner succeeds and its result is
+        // written, but the effects are dropped, as when the settlement loses
+        // the claim.
         let _ = runtime
             .inner
             .process_step(&job, &queue.lease_handle(&job))
@@ -5601,205 +5237,23 @@ mod tests {
             CancelRunOutcome::Requested
         );
         worker.await.unwrap();
-
-        let notification = queue
-            .claim("workflow-steps", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .expect("the committed settlement enqueued its notification");
-        let effects = runtime
-            .inner
-            .process_step(&notification, &LeaseHandle::detached())
-            .await
-            .unwrap();
-        queue.ack_with(&notification, effects).await.unwrap();
-        let outcome = rx.recv().await.unwrap();
-        assert_eq!(outcome.status, TerminalStatus::Cancelled);
-        assert!(
-            queue
-                .claim("workflow-steps", Duration::from_secs(30))
-                .await
-                .unwrap()
-                .is_none(),
-            "the outcome that never committed must produce no notification",
-        );
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn hook_effects_commit_with_the_notification_ack() {
-        struct EffectHook;
-
-        impl TerminalHook for EffectHook {
-            async fn on_termination(
-                &self,
-                outcome: &RunOutcome,
-                effects: &TerminalEffects,
-            ) -> std::result::Result<(), StepError> {
-                effects
-                    .put(
-                        format!("app/outcomes/{}", outcome.run_id),
-                        outcome.status.as_str(),
-                    )
-                    .map_err(|e| StepError::permanent(e.to_string()))?;
-                effects
-                    .enqueue(EnqueueRequest {
-                        queue: "side-effects".to_string(),
-                        payload: outcome.run_id.to_string().into_bytes(),
-                        options: EnqueueOptions::default(),
-                    })
-                    .map_err(|e| StepError::permanent(e.to_string()))?;
-                Ok(())
-            }
-        }
-
-        let (queue, store) = open_queue().await;
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store,
-            ScriptedRunner::new(vec![StepOutcome::Succeed { result: Vec::new() }]),
-            EffectHook,
-        )
-        .build()
-        .unwrap();
-        let shutdown = spawn_runtime(runtime.clone());
-
-        runtime
-            .submit(RunSpec {
-                run_id: Some(rid("hooked")),
-                input: Vec::new(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(
-            wait_for_kv(&queue, b"app/outcomes/hooked").await,
-            b"succeeded"
-        );
-        let side = queue
-            .claim("side-effects", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .expect("the staged enqueue committed with the notification ack");
-        assert_eq!(side.payload.as_slice(), b"hooked");
-
-        let _ = shutdown.send(());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_transiently_failing_hook_retries_the_notification() {
-        struct FlakyHook {
-            calls: Arc<AtomicU32>,
-        }
-
-        impl TerminalHook for FlakyHook {
-            async fn on_termination(
-                &self,
-                outcome: &RunOutcome,
-                effects: &TerminalEffects,
-            ) -> std::result::Result<(), StepError> {
-                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                    return Err(StepError::transient("first attempt fails"));
-                }
-                effects
-                    .put(format!("app/notified/{}", outcome.run_id), b"1".to_vec())
-                    .map_err(|e| StepError::permanent(e.to_string()))?;
-                Ok(())
-            }
-        }
-
-        let (queue, store) = open_queue_with(fast_options()).await;
-        let calls = Arc::new(AtomicU32::new(0));
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store,
-            ScriptedRunner::new(vec![StepOutcome::Succeed { result: Vec::new() }]),
-            FlakyHook {
-                calls: calls.clone(),
-            },
-        )
-        .build()
-        .unwrap();
-        let shutdown = spawn_runtime(runtime.clone());
-
-        runtime
-            .submit(RunSpec {
-                run_id: Some(rid("flaky")),
-                input: Vec::new(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(wait_for_kv(&queue, b"app/notified/flaky").await, b"1");
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-
-        let _ = shutdown.send(());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_noop_hook_enqueues_no_notification() {
-        let (queue, store) = open_queue().await;
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            store,
-            ScriptedRunner::new(vec![StepOutcome::Succeed { result: Vec::new() }]),
-            NoopTerminalHook,
-        )
-        .build()
-        .unwrap();
-        runtime
-            .submit(RunSpec {
-                input: Vec::new(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let job = queue
-            .claim("workflow-steps", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-        let effects = runtime
-            .inner
-            .process_step(&job, &LeaseHandle::detached())
-            .await
-            .unwrap();
-        assert!(effects.enqueues.is_empty());
-        queue.ack_with(&job, effects).await.unwrap();
-        assert!(
-            queue
-                .claim("workflow-steps", Duration::from_secs(30))
-                .await
-                .unwrap()
-                .is_none()
-        );
+        let outcome = runtime.wait(&rid("phantom")).await.unwrap();
+        assert_eq!(outcome.termination.status, TerminalStatus::Cancelled);
+        assert_eq!(outcome.result, None, "the success never committed");
     }
 
     #[tokio::test(start_paused = true)]
     async fn staged_hook_effects_commit_on_every_termination_path() {
-        /// Stages a record of each termination and does not observe an outcome.
+        /// Stages a record of each termination: its status and time.
         struct StagingHook;
 
         impl TerminalHook for StagingHook {
-            async fn on_termination(
-                &self,
-                _: &RunOutcome,
-                _: &TerminalEffects,
-            ) -> std::result::Result<(), StepError> {
-                unreachable!("the hook observes no outcome")
-            }
-
-            fn observes(&self, _: &RunOutcome) -> bool {
-                false
-            }
-
-            fn stage_effects(&self, outcome: &RunOutcome, effects: &TerminalEffects) {
+            fn stage_effects(&self, outcome: &TerminatedRun, effects: &TerminalEffects) {
+                let termination = &outcome.termination;
                 effects
                     .put(
                         format!("app/terminated/{}", outcome.run_id),
-                        outcome.status.as_str(),
+                        format!("{}@{}", termination.status, termination.terminated_at_ms),
                     )
                     .unwrap();
             }
@@ -5810,8 +5264,8 @@ mod tests {
             queue.clone(),
             store,
             ScriptedRunner::new(vec![StepOutcome::Succeed { result: Vec::new() }]),
-            StagingHook,
         )
+        .terminal_hook(StagingHook)
         .build()
         .unwrap();
         let spec = |id: &str| RunSpec {
@@ -5851,23 +5305,19 @@ mod tests {
         queue.dead_letter(&job, "hung").await.unwrap();
         assert_eq!(runtime.inner.core.reconcile_dead_steps().await.unwrap(), 1);
 
+        // The staged record contains the time of the terminal record.
         for (id, status) in [
-            ("settled", "succeeded"),
-            ("cancelled", "cancelled"),
-            ("dead", "failed"),
+            ("settled", TerminalStatus::Succeeded),
+            ("cancelled", TerminalStatus::Cancelled),
+            ("dead", TerminalStatus::Failed),
         ] {
+            let termination = runtime.wait(&rid(id)).await.unwrap().termination;
+            assert_eq!(termination.status, status, "run {id}");
             let key = format!("app/terminated/{id}");
             let value = queue.view().kv_get(key.as_bytes()).await.unwrap();
-            assert_eq!(value.as_deref(), Some(status.as_bytes()), "run {id}");
+            let staged = format!("{status}@{}", termination.terminated_at_ms);
+            assert_eq!(value.as_deref(), Some(staged.as_bytes()), "run {id}");
         }
-        assert!(
-            queue
-                .claim("workflow-steps", Duration::from_secs(30))
-                .await
-                .unwrap()
-                .is_none(),
-            "no notification job is enqueued"
-        );
     }
 
     #[cfg(feature = "webhooks")]
@@ -5876,13 +5326,9 @@ mod tests {
         use crate::terminal::WebhookTerminalHook;
 
         let (queue, store) = open_queue().await;
-        let built = WorkflowRuntime::builder(
-            queue,
-            store,
-            UnreachableRunner,
-            WebhookTerminalHook::new("workflow-steps"),
-        )
-        .build();
+        let built = WorkflowRuntime::builder(queue, store, UnreachableRunner)
+            .terminal_hook(WebhookTerminalHook::new("workflow-steps"))
+            .build();
         assert!(matches!(built, Err(Error::ReservedQueue(q)) if q == "workflow-steps"));
     }
 
@@ -5898,8 +5344,8 @@ mod tests {
             ScriptedRunner::new(vec![StepOutcome::Succeed {
                 result: b"payload".to_vec(),
             }]),
-            WebhookTerminalHook::new("callbacks"),
         )
+        .terminal_hook(WebhookTerminalHook::new("callbacks"))
         .build()
         .unwrap();
         runtime
@@ -5947,14 +5393,6 @@ mod tests {
             !webhook
                 .headers
                 .contains_key("http.Workflow-Run-Cancelled-By")
-        );
-        assert!(
-            queue
-                .claim("workflow-steps", Duration::from_secs(30))
-                .await
-                .unwrap()
-                .is_none(),
-            "no notification job is enqueued"
         );
 
         // A cancelled run delivers its reason and the origin of the cancel.
@@ -6006,7 +5444,6 @@ mod tests {
         }
 
         let (queue, store) = open_queue().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let escaped = Arc::new(StdMutex::new(None));
         let runtime = WorkflowRuntime::builder(
             queue,
@@ -6014,23 +5451,19 @@ mod tests {
             EscapingRunner {
                 escaped: escaped.clone(),
             },
-            ChannelHook { tx },
         )
         .build()
         .unwrap();
         let shutdown = spawn_runtime(runtime.clone());
 
-        runtime
+        let handle = runtime
             .submit(RunSpec {
                 input: Vec::new(),
                 ..Default::default()
             })
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        wait_for(&runtime, &handle.run_id).await;
 
         let handle = escaped.lock().unwrap().take().unwrap();
         assert!(matches!(

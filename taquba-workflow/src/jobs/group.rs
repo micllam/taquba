@@ -94,8 +94,7 @@ impl<J: Job> JobGroup<J> {
 
     /// The members' results as each member terminates, in completion order. The
     /// stream yields a member that already terminated at once. A member that
-    /// terminated without a run result record (cancelled, or dead-lettered
-    /// outside its handler) is reported as a transient [`JobError`]. Returns
+    /// failed or was cancelled is reported as a [`JobError`]. Returns
     /// [`Error::GroupNotFound`](crate::Error::GroupNotFound) for a group never
     /// submitted.
     pub async fn results(&self) -> Result<impl Stream<Item = Result<GroupResult<J>>> + use<J>> {
@@ -104,7 +103,7 @@ impl<J: Job> JobGroup<J> {
             let member = member?;
             Ok(GroupResult {
                 key: member.key,
-                result: decode_end::<J>(member.termination, member.outcome)?,
+                result: decode_end::<J>(member.outcome)?,
             })
         }))
     }

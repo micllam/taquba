@@ -1,9 +1,8 @@
 use std::collections::HashMap;
-use std::future::Future;
 
 use crate::effects::TerminalEffects;
 use crate::keys::RunId;
-use crate::runner::StepError;
+use crate::runner::StepErrorKind;
 use crate::runtime::StepRef;
 
 /// Terminal state of a workflow run, passed to a [`TerminalHook`].
@@ -70,17 +69,13 @@ impl CancelOrigin {
     }
 }
 
-/// Information passed to a [`TerminalHook`] when a run reaches a terminal
-/// state.
-#[derive(Debug, Clone)]
-pub struct RunOutcome {
-    /// The run's identifier.
-    pub run_id: RunId,
-    /// Whether the run completed successfully or failed.
+/// How a run ended, as its terminal record states it.
+/// [`RunState::Terminated`](crate::RunState::Terminated) reports it without the
+/// result, and [`TerminatedRun`] contains it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunTermination {
+    /// How the run ended.
     pub status: TerminalStatus,
-    /// Set when `status == Succeeded`: the bytes the runner returned via
-    /// [`crate::StepOutcome::Succeed`].
-    pub result: Option<Vec<u8>>,
     /// - When `status == Failed`: the human-readable reason recorded on
     ///   the terminal step's `last_error`.
     /// - When `status == Cancelled`: the reason of the
@@ -91,62 +86,56 @@ pub struct RunOutcome {
     /// The origin of the cancellation when `status == Cancelled`, `None`
     /// otherwise.
     pub cancelled_by: Option<CancelOrigin>,
+    /// The classification of a failure: the kind of the
+    /// [`StepError`](crate::StepError) that dead-lettered the run, or
+    /// [`StepErrorKind::Permanent`] for a [`crate::StepOutcome::Fail`] outcome.
+    /// `None` for a success, a cancellation and a termination outside the
+    /// worker.
+    pub error_kind: Option<StepErrorKind>,
+    /// The step whose settlement terminated the run. Its job is the dead job of
+    /// a run that a dead-letter terminated.
+    pub final_step: StepRef,
+    /// The runtime clock's time at the terminating settlement, as a Unix
+    /// timestamp in milliseconds.
+    pub terminated_at_ms: u64,
+}
+
+/// The end of a run: its termination, its result and the submitter's headers.
+/// [`TerminalHook::stage_effects`] receives it, and
+/// [`WorkflowRuntime::wait`](crate::WorkflowRuntime::wait) and
+/// [`RunGroup::results`](crate::RunGroup::results) report it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminatedRun {
+    /// The run's identifier.
+    pub run_id: RunId,
+    /// How the run ended.
+    pub termination: RunTermination,
+    /// The bytes the runner returned via [`crate::StepOutcome::Succeed`] when
+    /// the run succeeded, `None` otherwise.
+    pub result: Option<Vec<u8>>,
     /// Submitter-supplied metadata, threaded through from
     /// [`crate::RunOptions::headers`].
     pub headers: HashMap<String, String>,
-    /// The step that produced the terminal outcome.
-    pub final_step: StepRef,
 }
 
-/// User-implemented hook processing a run's termination.
+/// User-implemented hook that stages effects into the settlement that
+/// terminates a run. Set on a runtime with
+/// [`WorkflowRuntimeBuilder::terminal_hook`](crate::WorkflowRuntimeBuilder::terminal_hook).
 ///
-/// A hook acts at two points. [`Self::stage_effects`] stages effects into the
-/// settlement that terminates the run, and [`Self::on_termination`] runs after
-/// that commit, as the worker of a notification job. [`Self::observes`] decides
-/// whether the notification job is enqueued.
-///
-/// The settlement that commits a run's terminal outcome atomically enqueues the
-/// **notification job** on the same queue. The consequences:
-///
-/// - The hook observes only outcomes that committed. A settlement that
-///   loses its claim loses its notification with it, so a redelivered
-///   terminal step notifies only the outcome it actually commits.
-/// - Delivery is at-least-once: a crash after the hook ran but before
-///   the notification job was acknowledged re-delivers it, so
-///   implementations must be idempotent.
-/// - The notification job takes the terminal step's priority and
-///   `max_attempts`. A transient error ([`StepError::transient`]) retries the
-///   notification job per the queue's backoff up to `max_attempts`. A permanent
-///   error dead-letters it, where [`taquba::QueueView::dead_jobs`] finds it.
-/// - Effects that [`Self::on_termination`] stages on its [`TerminalEffects`]
-///   handle are applied in the same transaction as the notification's
-///   acknowledgement when it returns `Ok`.
-///
-/// Runs terminated without an acknowledging settlement (an external
-/// cancellation of a pending step, a step that dead-letters) enqueue the
-/// notification job in the transaction of that transition, so it is created
-/// exactly once on every worker and cancellation path. A step the reaper
-/// dead-letters after its lease expires, or one dead-lettered during crash
-/// recovery at open, is reconciled by the worker, which terminates the run as
-/// failed and enqueues the notification in one transaction.
+/// The staged effects commit atomically with the run's terminal outcome, on
+/// every termination path: the worker's settlement, an external cancellation
+/// and the reconciliation of a step dead-lettered outside the worker. A
+/// reaction that runs code after the termination stages an enqueue to a queue
+/// of the application, whose worker processes it at least once.
 pub trait TerminalHook: Send + Sync {
-    /// Process the termination of one run. `outcome` is the committed terminal
-    /// state. Effects staged on `effects` commit with this notification's
-    /// acknowledgement.
-    fn on_termination(
-        &self,
-        outcome: &RunOutcome,
-        effects: &TerminalEffects,
-    ) -> impl Future<Output = std::result::Result<(), StepError>> + Send;
-
-    /// Whether a notification job is enqueued for `outcome`. Consulted when the
-    /// run terminates. A return value of `false` skips the notification
-    /// entirely, and [`Self::on_termination`] is never called for that run.
-    /// Defaults to `true`.
-    fn observes(&self, outcome: &RunOutcome) -> bool {
-        let _ = outcome;
-        true
-    }
+    /// Stage effects that commit in the settlement that terminates the run of
+    /// `outcome`. The runtime calls the method again for a settlement that it
+    /// builds again: a failed settlement at the redelivery of the step, and a
+    /// cancellation that finds the step running or settled. The method must
+    /// therefore stage from `outcome` alone and stage the same effects for the
+    /// same outcome. A staging error of `effects` is a programming error: the
+    /// hook logs it and drops the effect, and the run terminates.
+    fn stage_effects(&self, outcome: &TerminatedRun, effects: &TerminalEffects);
 
     /// Check the hook's configuration against a runtime with the queue
     /// `runtime_queue`. [`WorkflowRuntimeBuilder::build`](crate::WorkflowRuntimeBuilder::build)
@@ -155,42 +144,11 @@ pub trait TerminalHook: Send + Sync {
         let _ = runtime_queue;
         Ok(())
     }
-
-    /// Stage effects that commit in the settlement that terminates the run of
-    /// `outcome`, on every termination path: the worker's settlement, an
-    /// external cancellation and the reconciliation of a step dead-lettered
-    /// outside the worker. A settlement that fails calls the method again at
-    /// the redelivery of the step, so it must stage from `outcome` alone and
-    /// stage the same effects for the same outcome. A staging error of
-    /// `effects` is a programming error: the hook logs it and drops the effect,
-    /// and the run terminates. Defaults to staging nothing.
-    fn stage_effects(&self, outcome: &RunOutcome, effects: &TerminalEffects) {
-        let _ = (outcome, effects);
-    }
-}
-
-/// A no-op terminal hook. Declares itself unobservant, so runs terminate
-/// without enqueueing a notification job.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoopTerminalHook;
-
-impl TerminalHook for NoopTerminalHook {
-    async fn on_termination(
-        &self,
-        _outcome: &RunOutcome,
-        _effects: &TerminalEffects,
-    ) -> std::result::Result<(), StepError> {
-        Ok(())
-    }
-
-    fn observes(&self, _outcome: &RunOutcome) -> bool {
-        false
-    }
 }
 
 #[cfg(feature = "webhooks")]
 mod webhook {
-    use super::{RunOutcome, StepError, TerminalEffects, TerminalHook, TerminalStatus};
+    use super::{TerminalEffects, TerminalHook, TerminalStatus, TerminatedRun};
     use crate::error::Error;
     use std::time::Duration;
     use taquba_webhooks::{WebhookRequest, webhook_enqueue_request};
@@ -207,8 +165,8 @@ mod webhook {
     ///
     /// The webhook enqueue is staged in the settlement that terminates the run,
     /// so the delivery job is created exactly once and atomically with the
-    /// termination. No notification job is enqueued. A hook whose target is the
-    /// runtime's own queue fails the build of the runtime.
+    /// termination. A hook whose target is the runtime's own queue fails the
+    /// build of the runtime.
     ///
     /// The webhook body is the raw `result` bytes for succeeded runs, and the
     /// UTF-8 error message for failed runs and the reason for cancelled runs.
@@ -223,7 +181,7 @@ mod webhook {
     }
 
     impl WebhookTerminalHook {
-        /// Default header key the hook looks for on each [`RunOutcome`].
+        /// Default header key the hook looks for on each [`TerminatedRun`].
         /// Deliberately outside the reserved `workflow.*` prefix so submitters
         /// can set it on [`crate::RunOptions::headers`] without being rejected.
         pub const URL_HEADER: &'static str = "callback_url";
@@ -256,35 +214,24 @@ mod webhook {
     }
 
     impl TerminalHook for WebhookTerminalHook {
-        async fn on_termination(
-            &self,
-            _outcome: &RunOutcome,
-            _effects: &TerminalEffects,
-        ) -> std::result::Result<(), StepError> {
-            Ok(())
-        }
-
-        fn observes(&self, _outcome: &RunOutcome) -> bool {
-            false
-        }
-
-        fn stage_effects(&self, outcome: &RunOutcome, effects: &TerminalEffects) {
+        fn stage_effects(&self, outcome: &TerminatedRun, effects: &TerminalEffects) {
             let Some(url) = outcome.headers.get(&self.url_header) else {
                 return;
             };
+            let termination = &outcome.termination;
             let mut req = WebhookRequest::new(url)
                 .header("Workflow-Run-Id", outcome.run_id.as_str())
-                .header("Workflow-Run-Status", outcome.status.as_str());
-            if let Some(origin) = outcome.cancelled_by {
+                .header("Workflow-Run-Status", termination.status.as_str());
+            if let Some(origin) = termination.cancelled_by {
                 req = req.header("Workflow-Run-Cancelled-By", origin.as_str());
             }
             if let Some(t) = self.timeout {
                 req = req.timeout(t);
             }
-            let body = match outcome.status {
+            let body = match termination.status {
                 TerminalStatus::Succeeded => outcome.result.clone().unwrap_or_default(),
                 TerminalStatus::Failed | TerminalStatus::Cancelled => {
-                    outcome.error.clone().unwrap_or_default().into_bytes()
+                    termination.error.clone().unwrap_or_default().into_bytes()
                 }
             };
             let request = webhook_enqueue_request(&self.target_queue, req, body);

@@ -5,8 +5,7 @@
 //! as one workflow run with a single step, so durability, retries, idempotent
 //! submission, memoization and retention are the workflow runtime's, and this
 //! crate adds the function abstraction: typed inputs and outputs, a type
-//! registry, a typed view of the runtime's run result record and an awaitable
-//! handle.
+//! registry, a typed view of the run's result and an awaitable handle.
 //!
 //! Use a job when the caller awaits a typed return value, and a
 //! [`StepRunner`](crate::StepRunner) directly when one entity moves through
@@ -78,23 +77,23 @@
 //! job's [`Job::NAME`] and its serialized fields, and whose single step routes
 //! by that name to the registered handler.
 //!
-//! A job's outcome is durable: the runtime writes the run result record (the
-//! serialized output, or the failure) to the run's memo in the object store
-//! before the settlement that terminates the run. Awaiting a [`JobHandle`] is
+//! A job's outcome is durable: the settlement that terminates the run commits
+//! the failure in the run's terminal record, and the serialized output as a
+//! result object written before that settlement. Awaiting a [`JobHandle`] is
 //! in-process (it uses Taquba's in-process completion notification), but the
 //! outcome can be read back with [`JobHandle::fetch_result`] after a process
 //! restart.
 //!
 //! Delivery is at-least-once, inherited from Taquba: **job handlers must be
-//! idempotent.** A retried attempt that runs after an earlier attempt already
-//! wrote a run result record overwrites it with the new attempt's outcome. The
+//! idempotent.** Each attempt writes its output as an object of its own, and
+//! the job's outcome is the one of the attempt whose settlement commits. The
 //! [`memo`](crate::Delivery::memo) gives a handler a durable memo for the
 //! results of slow or billed calls, so a retried attempt reads them back.
 //!
-//! Run result records and memo entries are retained indefinitely by default.
-//! With [`JobRunnerBuilder::retention`] (see [Retention]), the runtime removes
-//! them on a schedule. A lifecycle policy on the object-store prefix can remove
-//! them in its place.
+//! Terminal records, result objects and memo entries are retained indefinitely
+//! by default. With [`JobRunnerBuilder::retention`] (see [Retention]), the
+//! runtime removes them on a schedule. A lifecycle policy on the object-store
+//! prefix can remove them in its place.
 //!
 //! [Retention]: #retention
 //! [Idempotent submissions]: #idempotent-submissions
@@ -154,10 +153,10 @@
 //!
 //! # Retention
 //!
-//! [`JobRunnerBuilder::retention`] removes a job's run result record and memo
-//! entries a configured window after the job reaches a terminal state, through
-//! the workflow runtime's memo retention. When the option is unset (default),
-//! records are retained indefinitely.
+//! [`JobRunnerBuilder::retention`] removes a job's terminal record, result
+//! object and memo entries a configured window after the job reaches a terminal
+//! state, through the workflow runtime's memo retention. When the option is
+//! unset (default), records are retained indefinitely.
 //!
 //! ```no_run
 //! # use std::sync::Arc;

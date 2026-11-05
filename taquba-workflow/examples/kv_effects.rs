@@ -28,10 +28,7 @@ use std::time::Duration;
 
 use taquba::object_store::memory::InMemory;
 use taquba::{Queue, SettlementEffects};
-use taquba_workflow::{
-    RunId, RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner, TerminalEffects,
-    TerminalHook, WorkflowRuntime,
-};
+use taquba_workflow::{RunId, RunSpec, Step, StepError, StepOutcome, StepRunner, WorkflowRuntime};
 
 fn status_key(run_id: &str) -> Vec<u8> {
     format!("app/orders/{run_id}/status").into_bytes()
@@ -62,35 +59,19 @@ impl StepRunner for OrderFlow {
     }
 }
 
-struct CollectOutcomes {
-    tx: tokio::sync::mpsc::UnboundedSender<RunOutcome>,
-}
-
-impl TerminalHook for CollectOutcomes {
-    async fn on_termination(
-        &self,
-        outcome: &RunOutcome,
-        _effects: &TerminalEffects,
-    ) -> std::result::Result<(), StepError> {
-        let _ = self.tx.send(outcome.clone());
-        Ok(())
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(InMemory::new());
     let queue = Arc::new(Queue::open(store.clone(), "kv-effects-demo").await?);
 
-    let (tx, mut outcomes) = tokio::sync::mpsc::unbounded_channel();
-    let runtime = WorkflowRuntime::builder(queue.clone(), store, OrderFlow, CollectOutcomes { tx })
+    let runtime = WorkflowRuntime::builder(queue.clone(), store, OrderFlow)
         .poll_interval(Duration::from_millis(50))
         .build()?;
 
     // Submit before the worker starts, so the status row still reads `received`
     // when printed below.
     let run_id = "order-1001";
-    runtime
+    let handle = runtime
         .submit(RunSpec {
             run_id: Some(RunId::new(run_id)?),
             input: b"2 units of item 7".to_vec(),
@@ -102,28 +83,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     println!("submitted: status = {}", read_status(&queue, run_id).await?);
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let worker_runtime = runtime.clone();
-    let worker_task = tokio::spawn(async move {
-        worker_runtime
-            .run(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
-    });
+    let worker = runtime.spawn(std::future::pending());
 
-    // The hook runs as the worker of a notification job enqueued atomically
-    // with the terminal acknowledgement, so once the outcome arrives the final
-    // effects are already committed.
-    let outcome = outcomes.recv().await.expect("terminal outcome");
-    println!("run terminated: {}", outcome.status);
+    // The final effects commit with the terminal acknowledgement, so they are
+    // visible once the run has terminated.
+    let run = runtime.wait(&handle.run_id).await?;
+    println!("run terminated: {}", run.termination.status);
 
     println!("final: status = {}", read_status(&queue, run_id).await?);
     let pending = queue.view().kv_get(&pending_key(run_id)).await?;
     println!("final: pending marker present = {}", pending.is_some());
 
-    let _ = shutdown_tx.send(());
-    worker_task.await??;
+    worker.shutdown().await?;
     Ok(())
 }
 

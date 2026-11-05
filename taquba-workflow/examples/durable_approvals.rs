@@ -38,10 +38,9 @@ use serde::{Deserialize, Serialize};
 use taquba::object_store::local::LocalFileSystem;
 use taquba::{Queue, SignalOutcome};
 use taquba_workflow::{
-    RunId, RunOutcome, RunSpec, RunState, Step, StepError, StepOutcome, StepRunner,
-    TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
+    RunId, RunSpec, RunState, Step, StepError, StepOutcome, StepRunner, TerminalStatus,
+    TerminatedRun, WorkflowRuntime,
 };
-use tokio::sync::oneshot;
 
 const QUEUE_DIR: &str = "/tmp/taquba-durable-approvals-example";
 const RUN_ID: &str = "refund-claim-4021";
@@ -138,34 +137,22 @@ async fn issue_refund(step: &Step, amount: u32) -> Result<(), StepError> {
     Ok(())
 }
 
-struct ShutdownOnTermination {
-    shutdown: tokio::sync::Mutex<Option<oneshot::Sender<()>>>,
-}
-
-impl TerminalHook for ShutdownOnTermination {
-    async fn on_termination(
-        &self,
-        outcome: &RunOutcome,
-        _effects: &TerminalEffects,
-    ) -> std::result::Result<(), StepError> {
-        println!();
-        match outcome.status {
-            TerminalStatus::Succeeded => println!(
-                "run {} succeeded: {}",
-                outcome.run_id,
-                String::from_utf8_lossy(outcome.result.as_deref().unwrap_or(&[]))
-            ),
-            _ => println!(
-                "run {} terminated as {:?}: {}",
-                outcome.run_id,
-                outcome.status,
-                outcome.error.as_deref().unwrap_or("(no error)")
-            ),
-        }
-        if let Some(tx) = self.shutdown.lock().await.take() {
-            let _ = tx.send(());
-        }
-        Ok(())
+/// Print how the run `run` ended.
+fn report(run: &TerminatedRun) {
+    let termination = &run.termination;
+    println!();
+    match termination.status {
+        TerminalStatus::Succeeded => println!(
+            "run {} succeeded: {}",
+            run.run_id,
+            String::from_utf8_lossy(run.result.as_deref().unwrap_or(&[]))
+        ),
+        TerminalStatus::Failed | TerminalStatus::Cancelled => println!(
+            "run {} terminated as {}: {}",
+            run.run_id,
+            termination.status,
+            termination.error.as_deref().unwrap_or("(no error)")
+        ),
     }
 }
 
@@ -220,21 +207,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(LocalFileSystem::new_with_prefix(QUEUE_DIR)?);
     let queue = Arc::new(Queue::open(store.clone(), "workflow").await?);
 
-    let (tx, rx) = oneshot::channel::<()>();
-    let runtime = WorkflowRuntime::builder(
-        queue.clone(),
-        store,
-        RefundAgent,
-        ShutdownOnTermination {
-            shutdown: tokio::sync::Mutex::new(Some(tx)),
-        },
-    )
-    .poll_interval(Duration::from_millis(200))
-    .build()?;
+    let runtime = WorkflowRuntime::builder(queue.clone(), store, RefundAgent)
+        .poll_interval(Duration::from_millis(200))
+        .build()?;
+    let run_id = RunId::new(RUN_ID)?;
 
     match mode {
         Mode::Decide(payload) => {
-            let status = runtime.status(&RunId::new(RUN_ID)?).await?;
+            let status = runtime.status(&run_id).await?;
             let Some(status) =
                 status.filter(|status| matches!(status.state, RunState::Waiting { .. }))
             else {
@@ -244,11 +224,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match queue.signal(&status.step.job_id, payload).await? {
                 SignalOutcome::Delivered => {
                     println!("decision delivered; resuming the run");
-                    runtime
-                        .run(async move {
-                            let _ = rx.await;
-                        })
-                        .await?;
+                    let worker = runtime.spawn(std::future::pending());
+                    report(&runtime.wait(&run_id).await?);
+                    worker.shutdown().await?;
                 }
                 SignalOutcome::NotWaiting => {
                     println!("the wait ended before the decision; nothing was changed");
@@ -258,17 +236,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Mode::Run => {
             let outcome = runtime
                 .submit(RunSpec {
-                    run_id: Some(RunId::new(RUN_ID)?),
+                    run_id: Some(run_id.clone()),
                     input: Vec::new(),
                     ..Default::default()
                 })
                 .await?;
             if !outcome.newly_submitted
-                && let Some(end) = runtime.view().run_end(&outcome.run_id).await?
+                && let Some(run) = runtime.view().terminated_run(&outcome.run_id).await?
             {
                 println!(
                     "run {} already ended as {}; remove {QUEUE_DIR} to start over",
-                    outcome.run_id, end.termination.status
+                    outcome.run_id, run.termination.status
                 );
                 return Ok(());
             }
@@ -278,12 +256,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("run {} already exists; resuming it", outcome.run_id);
             }
 
-            let watch = queue.clone();
-            runtime
-                .run(async move {
-                    tokio::select! {
-                        _ = rx => {}
-                        _ = awaiting_approval(watch) => {
+            let worker = runtime.spawn(std::future::pending());
+            tokio::select! {
+                run = runtime.wait(&run_id) => report(&run?),
+                _ = awaiting_approval(queue.clone()) => {
                             println!();
                             println!("run is waiting for approval; this process exits");
                             println!(
@@ -296,10 +272,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!(
                                 "  cargo run -p taquba-workflow --example durable_approvals -- reject <reason>"
                             );
-                        }
-                    }
-                })
-                .await?;
+                }
+            }
+            worker.shutdown().await?;
         }
     }
 

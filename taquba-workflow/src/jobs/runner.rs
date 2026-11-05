@@ -20,7 +20,6 @@ use crate::jobs::group::JobGroup;
 use crate::jobs::handle::JobHandle;
 use crate::jobs::job::Job;
 use crate::keys::RunId;
-use crate::terminal::NoopTerminalHook;
 
 /// The payload of a job's run: the job's [`Job::NAME`], by which the step
 /// runner routes the run to the registered handler, and the serialized job.
@@ -158,9 +157,8 @@ impl StepRunner for Dispatch {
 /// builder, then [`spawn`](Self::spawn) the worker. Jobs can be submitted
 /// before or after spawning.
 pub struct JobRunner {
-    /// The runtime a job runs as one step of. Its terminal hook is
-    /// [`NoopTerminalHook`], so a job does not enqueue a notification.
-    runtime: WorkflowRuntime<Dispatch, NoopTerminalHook>,
+    /// The runtime a job runs as one step of.
+    runtime: WorkflowRuntime<Dispatch>,
 }
 
 impl Clone for JobRunner {
@@ -314,8 +312,8 @@ impl JobRunnerBuilder {
         self
     }
 
-    /// The object-store prefix job memos and run result records are written
-    /// under. Defaults to `"{queue_name}-memo"`.
+    /// The object-store prefix of the job memos and the result objects.
+    /// Defaults to `"{queue_name}-memo"`.
     #[must_use]
     pub fn memo_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.memo_prefix = Some(prefix.into());
@@ -352,9 +350,9 @@ impl JobRunnerBuilder {
         self
     }
 
-    /// Remove a job's memo, run result record and terminal record `retention`
-    /// after it reaches a terminal state. When unset (default), records are
-    /// retained indefinitely.
+    /// Remove a job's memo, result object and terminal record `retention` after
+    /// it reaches a terminal state. When unset (default), records are retained
+    /// indefinitely.
     ///
     /// Once the records are removed, [`JobHandle::fetch_result`] for that job
     /// returns `Ok(None)` and an idempotent re-submission of the same payload
@@ -369,7 +367,7 @@ impl JobRunnerBuilder {
     }
 
     /// Remove a job group's state (its manifest, member records and the memo
-    /// entries and run result records of its members) `retention` after a
+    /// entries and result objects of its members) `retention` after a
     /// [`JobGroup::results`] or [`JobGroup::join`] consumer observed the last
     /// member's termination. See
     /// [`WorkflowRuntimeBuilder::group_retention`][group-retention]. When unset
@@ -400,9 +398,8 @@ impl JobRunnerBuilder {
             handlers: self.handlers,
             state: self.state,
         };
-        let mut builder =
-            WorkflowRuntime::builder(self.queue, self.object_store, dispatch, NoopTerminalHook)
-                .queue_name(self.queue_name);
+        let mut builder = WorkflowRuntime::builder(self.queue, self.object_store, dispatch)
+            .queue_name(self.queue_name);
         if let Some(prefix) = self.memo_prefix {
             builder = builder.memo_prefix(prefix);
         }
@@ -422,7 +419,8 @@ impl JobRunnerBuilder {
             builder = builder.group_retention(retention);
         }
         JobRunner {
-            // The check of `NoopTerminalHook` accepts every runtime.
+            // A runtime without a hook or a control queue passes the checks of
+            // `build`.
             runtime: builder.assemble(),
         }
     }
@@ -938,7 +936,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_resubmission_after_a_termination_without_a_result_joins_it() {
+    async fn a_resubmission_after_a_cancellation_joins_it() {
         let (queue, store) = open_queue().await;
         let runs = Arc::new(AtomicU32::new(0));
         let runner = JobRunner::builder(queue, store)
@@ -946,14 +944,14 @@ mod tests {
             .register::<CountedKeyed>()
             .build();
 
-        // No worker: the cancellation of the pending step terminates the run
-        // without a run result record.
+        // No worker: the cancellation of the pending step terminates the run.
         let first = runner.submit(CountedKeyed { n: 7 }).await.unwrap();
         assert_eq!(
             runner.runtime.cancel(first.id(), None).await.unwrap(),
             crate::CancelRunOutcome::Removed
         );
-        assert!(first.fetch_result().await.unwrap().is_none());
+        let fetched = first.fetch_result().await.unwrap().expect("terminated");
+        assert_eq!(fetched.unwrap_err().message, "job cancelled");
 
         let second = runner.submit(CountedKeyed { n: 7 }).await.unwrap();
         assert!(!second.newly_submitted(), "the terminal record answers");
