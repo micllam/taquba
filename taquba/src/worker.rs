@@ -199,7 +199,9 @@ pub trait Worker: Send + Sync {
 /// due.
 ///
 /// Errors from the claim path terminate the loop and propagate. Settlement
-/// failures do not: they affect only the one job. In particular, when a job
+/// failures do not: they affect only the one job. A settlement that the queue
+/// rejects with a permanent error, such as effects that write and delete one
+/// key, dead-letters the job without its effects, with that error. When a job
 /// outlives its lease and the reaper requeues it, the late settlement fails
 /// with [`Error::ClaimLost`]. The loop logs it and continues, and the
 /// redelivered attempt settles the job instead. Size the queue's lease to cover
@@ -351,7 +353,9 @@ fn note_task_result(queue: &str, result: std::result::Result<(), tokio::task::Jo
 /// Process one claimed job and apply its settlement (ack with effects, nack or
 /// dead-letter). A settlement failure affects one job and does not stop the
 /// loop. A [`Error::ClaimLost`] means the job outlived its lease and the reaper
-/// requeued it, so the redelivered attempt settles it. Any other settlement
+/// requeued it, so the redelivered attempt settles it. A settlement that fails
+/// with another permanent error, such as effects that the queue rejects,
+/// dead-letters the job without the effects, with that error. A transient
 /// failure leaves the claim to the reaper. A close of the store drops `process`
 /// and skips the settlement.
 async fn process_and_settle<W: Worker>(
@@ -402,6 +406,16 @@ async fn process_and_settle<W: Worker>(
             job_id = %job_id,
             "job lost its claim during processing; the redelivered attempt settles it"
         ),
+        Err(e) if e.is_permanent() => {
+            warn!(queue = queue, job_id = %job_id, "settlement rejected: {e}");
+            let error = e.to_string();
+            if let Err(e) = queue_handle
+                .dead_letter_with(&claim, &error, SettlementEffects::default())
+                .await
+            {
+                warn!(queue = queue, job_id = %job_id, "dead-letter of a rejected settlement failed: {e}");
+            }
+        }
         Err(e) => warn!(queue = queue, job_id = %job_id, "settlement failed: {e}"),
     }
 }
@@ -737,6 +751,51 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// Returns effects that write and delete one key.
+    struct RejectedEffectsWorker;
+
+    impl Worker for RejectedEffectsWorker {
+        async fn process_with_effects(
+            &self,
+            _job: &JobRecord,
+            _lease: &LeaseHandle,
+        ) -> std::result::Result<SettlementEffects, WorkerError> {
+            Ok(SettlementEffects::default()
+                .kv_put(b"k".to_vec(), b"v".to_vec())
+                .kv_delete(b"k".to_vec()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rejected_settlement_dead_letters_the_job_with_its_error() {
+        let queue = Queue::open(Arc::new(InMemory::new()), "test")
+            .await
+            .unwrap();
+        let id = queue.enqueue("work", b"job".to_vec()).await.unwrap();
+
+        let settled = async {
+            while queue.view().stats("work").await.unwrap().dead == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        run_worker(
+            &queue,
+            "work",
+            &RejectedEffectsWorker,
+            Duration::from_millis(50),
+            settled,
+        )
+        .await
+        .unwrap();
+
+        let dead = queue.view().get_job(&id).await.unwrap().unwrap();
+        assert_eq!(dead.attempts, 1);
+        let rejection = Error::ConflictingKvEffect { key: b"k".to_vec() };
+        assert_eq!(dead.last_error, Some(rejection.to_string()));
+        assert!(queue.view().kv_get(b"k").await.unwrap().is_none());
+        queue.close().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

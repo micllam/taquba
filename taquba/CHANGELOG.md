@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Queue::kv_compare_commit` compares again when another transaction commits a
   compared key before its own commit. In 0.16.0, two calls that each compared a
   key that only the other wrote could both apply.
+- `run_worker` and `run_worker_concurrent` dead-letter a job whose settlement
+  the queue rejects with a permanent error, with that error and without the
+  effects. In 0.16.0, the job stayed claimed until its lease expired, and it was
+  dead-lettered with "lease expired" after its attempts.
 
 ## [0.16.0] - 2026-10-29
 
