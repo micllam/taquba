@@ -691,10 +691,10 @@ pub use kv::KvReadHandle;
 pub use memo::{Memo, MemoStore};
 pub use runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 pub use runtime::{
-    CancelRunOutcome, DEFAULT_QUEUE_NAME, RunOptions, RunSpec, RunState, RunStatus, RunnerHandle,
-    StepRef, SubmitOutcome, WorkflowRuntime, WorkflowRuntimeBuilder,
+    CancelRunOutcome, DEFAULT_QUEUE_NAME, RunOptions, RunSpec, RunnerHandle, SubmitOutcome,
+    WorkflowRuntime, WorkflowRuntimeBuilder,
 };
 #[cfg(feature = "webhooks")]
 pub use terminal::WebhookTerminalHook;
 pub use terminal::{CancelOrigin, RunTermination, TerminalHook, TerminalStatus, TerminatedRun};
-pub use view::{ListedRun, RunFilter, WorkflowView};
+pub use view::{ListedRun, RunFilter, RunState, RunStatus, StepRef, WorkflowView};

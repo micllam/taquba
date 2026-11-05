@@ -75,8 +75,8 @@ pub(crate) async fn kv_record<T: DeserializeOwned>(
 use crate::effects::StagedEffects;
 use crate::keys::RunId;
 use crate::runner::{StepErrorKind, StepOutcome, Trigger};
-use crate::runtime::StepRef;
 use crate::terminal::{CancelOrigin, RunTermination, TerminalStatus};
+use crate::view::StepRef;
 
 /// The record of a run at `workflow/runs/{run_id}`. The submission writes the
 /// run record atomically with the step-0 enqueue, and the settlement that

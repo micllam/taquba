@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::effects::TerminalEffects;
 use crate::keys::RunId;
 use crate::runner::StepErrorKind;
-use crate::runtime::StepRef;
+use crate::view::StepRef;
 
 /// Terminal state of a workflow run, passed to a [`TerminalHook`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

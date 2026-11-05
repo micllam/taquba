@@ -752,9 +752,10 @@ mod tests {
     use super::*;
     use crate::keys::run_kv_entry_key;
     use crate::runner::{Step, StepError, StepOutcome, StepRunner};
-    use crate::runtime::{RunSpec, RunState, StepRef, WorkflowRuntime};
+    use crate::runtime::{RunSpec, WorkflowRuntime};
     use crate::terminal::{CancelOrigin, RunTermination};
     use crate::test_util::{open_queue, open_queue_at, rid};
+    use crate::view::{RunState, StepRef};
 
     /// Continues once, then succeeds with the step number.
     struct TwoSteps;

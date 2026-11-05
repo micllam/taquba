@@ -5,13 +5,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use taquba::{FailWith, JobRecord, LeaseHandle, SettlementEffects, Worker, WorkerError};
 use tracing::{debug, warn};
 
-use crate::durable::Submission;
-use crate::effects::EffectsHandle;
-use crate::error::{Error, worker_error};
+use crate::durable::{self, DurableStepOutcome, DurableStepOutcomeRecord, Submission};
+use crate::effects::{EffectsHandle, StagedEffects};
+use crate::error::{self, Error, worker_error};
 use crate::group::Membership;
 use crate::keys::{HEADER_RUN_ID, HEADER_STEP, RunId, next_step_job_id, submitter_headers};
 use crate::kv::KvReadHandle;
@@ -403,5 +404,85 @@ impl<R: StepRunner> RuntimeInner<R> {
             }
             effects
         })
+    }
+}
+
+/// The portion of `delay` that remains after `now_ms`, measured from
+/// `stored_at_ms`. Saturates to the full delay if the clock reads earlier than
+/// the stored timestamp.
+fn remaining_delay(stored_at_ms: u64, now_ms: u64, delay: Duration) -> Duration {
+    let elapsed = Duration::from_millis(now_ms.saturating_sub(stored_at_ms));
+    delay.saturating_sub(elapsed)
+}
+
+impl RuntimeCore {
+    pub(crate) async fn load_step_output(
+        &self,
+        run_id: &RunId,
+        step_number: u32,
+        step_payload: &[u8],
+    ) -> error::Result<Option<(StepOutcome, StagedEffects)>> {
+        let Some(bytes) = self
+            .memo_store
+            .get_step_output(run_id, step_number, step_payload)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(record) = durable::decode_or_absent::<DurableStepOutcomeRecord>(
+            &bytes,
+            "step-output replay record",
+            &format_args!("{run_id}/{step_number}"),
+        ) else {
+            return Ok(None);
+        };
+        let mut outcome = StepOutcome::from(record.outcome);
+        match &mut outcome {
+            StepOutcome::Continue {
+                when: Trigger::After(delay),
+                ..
+            } => {
+                *delay = remaining_delay(record.stored_at_ms, self.clock.now_ms(), *delay);
+            }
+            StepOutcome::Continue {
+                when: Trigger::OnSignal { timeout } | Trigger::OnGroup { timeout, .. },
+                ..
+            } => {
+                *timeout = remaining_delay(record.stored_at_ms, self.clock.now_ms(), *timeout);
+            }
+            _ => {}
+        }
+        Ok(Some((outcome, record.effects)))
+    }
+
+    pub(crate) async fn store_step_output(
+        &self,
+        run_id: &RunId,
+        step_number: u32,
+        step_payload: &[u8],
+        outcome: &StepOutcome,
+        effects: &StagedEffects,
+    ) -> error::Result<()> {
+        let record = DurableStepOutcomeRecord {
+            stored_at_ms: self.clock.now_ms(),
+            outcome: DurableStepOutcome::from(outcome),
+            effects: effects.clone(),
+        };
+        self.memo_store
+            .put_step_output(run_id, step_number, step_payload, &durable::encode(&record))
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remaining_delay_measures_from_stored_timestamp() {
+        let delay = Duration::from_secs(10);
+        assert_eq!(remaining_delay(1_000, 4_000, delay), Duration::from_secs(7));
+        assert_eq!(remaining_delay(1_000, 20_000, delay), Duration::ZERO);
+        assert_eq!(remaining_delay(5_000, 1_000, delay), delay);
     }
 }

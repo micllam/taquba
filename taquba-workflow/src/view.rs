@@ -19,7 +19,6 @@ use crate::keys::{
     run_kv_entries_range, run_kv_entry_key, run_kv_key, step_kv_key, submitter_headers,
 };
 use crate::memo::MemoStore;
-use crate::runtime::{RunState, RunStatus};
 use crate::terminal::{RunTermination, TerminalStatus, TerminatedRun};
 
 /// The runs that [`WorkflowView::runs`] lists.
@@ -409,4 +408,100 @@ fn scheduled_state(job: &JobRecord) -> RunState {
         },
         (false, None) => RunState::Scheduled { run_at_ms },
     }
+}
+
+/// A step of a run, with the queue job of the step.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StepRef {
+    /// The zero-based step number.
+    pub number: u32,
+    /// The id of the step's queue job, which [`taquba::QueueView::job_record`]
+    /// reads while the queue retains the job.
+    pub job_id: String,
+}
+
+/// Status snapshot of a run, read from its durable state by
+/// [`WorkflowView::status`].
+#[derive(Debug, Clone)]
+pub struct RunStatus {
+    /// The run's identifier.
+    pub run_id: RunId,
+    /// Lifecycle state of the run's current step, or its termination.
+    pub state: RunState,
+    /// The run's current step, or the final step of a terminated run.
+    pub step: StepRef,
+}
+
+/// Lifecycle state tracked in [`RunStatus::state`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunState {
+    /// The current step's job is ready for a worker to claim.
+    Pending,
+    /// The current step's job becomes claimable at `run_at_ms`, a Unix
+    /// timestamp in milliseconds: a step after a [`Trigger::After`] delay, or a
+    /// retry after a transient error.
+    ///
+    /// [`Trigger::After`]: crate::Trigger::After
+    Scheduled {
+        /// The time from which a worker can claim the job.
+        run_at_ms: u64,
+    },
+    /// The current step is waiting for a signal ([`Trigger::OnSignal`]) to its
+    /// job id, the `job_id` of [`RunStatus::step`], and becomes claimable at
+    /// `timeout_at_ms` without one.
+    ///
+    /// [`Trigger::OnSignal`]: crate::Trigger::OnSignal
+    Waiting {
+        /// The end of the wait without a signal, as a Unix timestamp in
+        /// milliseconds.
+        timeout_at_ms: u64,
+    },
+    /// The current step is waiting for the last active member of the group
+    /// `group_id` to terminate ([`Trigger::OnGroup`]), and becomes claimable at
+    /// `timeout_at_ms` at the latest.
+    ///
+    /// [`Trigger::OnGroup`]: crate::Trigger::OnGroup
+    WaitingForGroup {
+        /// The group the step is waiting for.
+        group_id: RunId,
+        /// The end of the wait, as a Unix timestamp in milliseconds.
+        timeout_at_ms: u64,
+    },
+    /// A step is currently being processed by a worker.
+    Running,
+    /// [`WorkflowRuntime::cancel`] was called for this run and the run has not
+    /// yet terminated. Reported until the in-flight step returns and the
+    /// runtime settles the run as [`crate::TerminalStatus::Cancelled`], which
+    /// [`Self::Terminated`] reports.
+    ///
+    /// Only set by external cancellation. A pure runner-issued
+    /// [`crate::StepOutcome::Cancel`] (without an external `cancel()` call)
+    /// terminates as `Cancelled` without ever transitioning through
+    /// `Cancelling`: a runner-issued cancel is observed when `run_step`
+    /// returns, and the run terminates at that point.
+    ///
+    /// [`WorkflowRuntime::cancel`]: crate::WorkflowRuntime::cancel
+    Cancelling {
+        /// The reason of the request.
+        reason: Option<String>,
+        /// The runtime clock's time at the request, as a Unix timestamp in
+        /// milliseconds.
+        requested_at_ms: u64,
+    },
+    /// The queue dead-lettered the current step's job outside the worker: a
+    /// lease that expired past the attempt limit, or a claim dead-lettered by
+    /// crash recovery at open. The reconciliation of the worker terminates the
+    /// run as [`crate::TerminalStatus::Failed`], and
+    /// [`WorkflowRuntime::cancel`] returns `false` for the run.
+    ///
+    /// [`WorkflowRuntime::cancel`]: crate::WorkflowRuntime::cancel
+    DeadLettered,
+    /// The run reached a terminal state. Reported from the run's terminal
+    /// record, written with the terminating settlement and removed with the
+    /// run's memo entries by the memo sweep under
+    /// [`WorkflowRuntimeBuilder::memo_retention`].
+    ///
+    /// [`WorkflowRuntimeBuilder::memo_retention`]:
+    ///     crate::WorkflowRuntimeBuilder::memo_retention
+    Terminated(RunTermination),
 }
