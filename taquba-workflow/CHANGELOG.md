@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports. A match on `Trigger` or `RunState` needs the new variant, and a wait
   for a group with a member submitted by 0.15.0 or an earlier version lasts
   until its timeout.
+- `RESERVED_COUNT_PREFIX`: `RunSpec::effects` rejects a count change whose name
+  starts with the prefix, with `Error::ReservedCountName`, so that only the
+  runtime changes the counts of its groups. A match on `Error` needs the new
+  variant.
 
 ### Changed
 

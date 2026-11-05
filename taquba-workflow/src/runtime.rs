@@ -115,12 +115,15 @@ pub struct RunSpec {
     pub options: RunOptions,
     /// Effects applied in the same transaction as the step-0 enqueue, as
     /// [`taquba::Queue::enqueue_with_effects`] applies them: the enqueues, the
-    /// KV writes, the KV deletes and the expiry entries. Applied only when the
-    /// submission is new: a duplicate submission's effects are dropped, and the
-    /// effects do not participate in the duplicate-submission input check. A KV
-    /// key written or deleted must not start with the reserved `workflow/`
-    /// prefix ([`RESERVED_KV_PREFIX`](crate::RESERVED_KV_PREFIX)), and a header
-    /// of an enqueue must not start with the reserved `workflow.*` prefix
+    /// KV writes, the KV deletes, the expiry entries and the count changes.
+    /// Applied only when the submission is new: a duplicate submission's
+    /// effects are dropped, and the effects do not participate in the
+    /// duplicate-submission input check. A KV key written or deleted must not
+    /// start with the reserved `workflow/` prefix
+    /// ([`RESERVED_KV_PREFIX`](crate::RESERVED_KV_PREFIX)), and neither must
+    /// the name of a count
+    /// ([`RESERVED_COUNT_PREFIX`](crate::RESERVED_COUNT_PREFIX)). A header of
+    /// an enqueue must not start with the reserved `workflow.*` prefix
     /// ([`RESERVED_HEADER_PREFIX`](crate::RESERVED_HEADER_PREFIX)). An enqueue
     /// must not target the queue of the runtime. Values are capped at
     /// [`taquba::MAX_KV_VALUE_SIZE`].
@@ -3893,6 +3896,16 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::ReservedKvKey(_)));
+
+        let err = runtime
+            .submit(RunSpec {
+                input: Vec::new(),
+                effects: SettlementEffects::default().count_up("workflow/groups/g"),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::ReservedCountName(name) if name == "workflow/groups/g"));
     }
 
     #[tokio::test(start_paused = true)]

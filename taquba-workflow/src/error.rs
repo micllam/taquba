@@ -65,6 +65,12 @@ pub enum Error {
     #[error("kv key `{0}` uses the reserved `workflow/` prefix")]
     ReservedKvKey(String),
 
+    /// A count changed through [`crate::RunSpec::effects`] starts with the
+    /// reserved `workflow/` prefix. The runtime owns the counts with that
+    /// prefix. A caller must use another name.
+    #[error("count `{0}` uses the reserved `workflow/` prefix")]
+    ReservedCountName(String),
+
     /// A key was staged through an [`crate::EffectsHandle`] for both a write
     /// and a delete within one step. The combination does not have a defined
     /// order in the settlement transaction and is rejected when the second
@@ -182,6 +188,7 @@ impl Error {
             | Self::InputMismatch(_)
             | Self::InconsistentRunState(_)
             | Self::ReservedKvKey(_)
+            | Self::ReservedCountName(_)
             | Self::ReservedQueue(_)
             | Self::ConflictingKvEffect(_)
             | Self::EffectsSealed
@@ -251,6 +258,7 @@ mod tests {
             (Error::InputMismatch(rid("run-1")), true),
             (Error::InconsistentRunState(rid("run-1")), true),
             (Error::ReservedKvKey("workflow/x".into()), true),
+            (Error::ReservedCountName("workflow/x".into()), true),
             (Error::ReservedQueue("workflow-steps".into()), true),
             (Error::ConflictingKvEffect("k".into()), true),
             (Error::EffectsSealed, true),

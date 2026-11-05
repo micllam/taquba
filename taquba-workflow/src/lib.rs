@@ -697,8 +697,8 @@ pub use effects::{EffectsHandle, TerminalEffects};
 pub use error::{ControlQueueError, Error, Result};
 pub use group::{GroupMember, GroupStatus, MemberResult, RunGroup};
 pub use keys::{
-    HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, MAX_RUN_ID_LEN, RESERVED_HEADER_PREFIX,
-    RESERVED_KV_PREFIX, RunId,
+    HEADER_RUN_ID, HEADER_STEP, HEADER_TERMINAL, MAX_RUN_ID_LEN, RESERVED_COUNT_PREFIX,
+    RESERVED_HEADER_PREFIX, RESERVED_KV_PREFIX, RunId,
 };
 pub use kv::KvReadHandle;
 pub use memo::{Memo, MemoStore};

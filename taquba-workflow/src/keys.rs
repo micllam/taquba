@@ -40,6 +40,21 @@ pub(crate) fn check_kv_key(key: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Reserved prefix the runtime owns in the count names of the queue. The name
+/// of a count changed through [`RunSpec::effects`](crate::RunSpec::effects)
+/// must not start with this prefix, and such a count is rejected with
+/// [`Error::ReservedCountName`].
+pub const RESERVED_COUNT_PREFIX: &str = "workflow/";
+
+/// Fails with [`Error::ReservedCountName`] for a caller count name with the
+/// reserved prefix.
+fn check_count_name(name: &str) -> Result<()> {
+    if name.starts_with(RESERVED_COUNT_PREFIX) {
+        return Err(Error::ReservedCountName(name.to_string()));
+    }
+    Ok(())
+}
+
 /// The headers that the submitter set on a step job: `headers` without those
 /// with [`RESERVED_HEADER_PREFIX`].
 pub(crate) fn submitter_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
@@ -78,6 +93,9 @@ pub(crate) fn check_effects(effects: &SettlementEffects, runtime_queue: &str) ->
     let deletes = effects.kv_deletes.iter();
     for key in effects.kv_writes.keys().chain(deletes) {
         check_kv_key(key)?;
+    }
+    for name in effects.count_changes.keys() {
+        check_count_name(name)?;
     }
     for request in &effects.enqueues {
         check_enqueue(request, Some(runtime_queue))?;
@@ -345,7 +363,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn internal_kv_prefixes_are_under_the_reserved_prefix() {
+    fn internal_prefixes_are_under_the_reserved_prefixes() {
         for prefix in [
             RUN_KV_PREFIX,
             STEP_KV_PREFIX,
@@ -360,6 +378,7 @@ mod tests {
                 String::from_utf8_lossy(prefix),
             );
         }
+        assert!(GROUP_COUNT_PREFIX.starts_with(RESERVED_COUNT_PREFIX));
     }
 
     #[test]
