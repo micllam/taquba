@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `StepOutcome::continue_on_group` and `Trigger::OnGroup`: a step waits for a
+  group, and the termination of its last active member makes the next step
+  claimable without a worker during the wait, which `RunState::WaitingForGroup`
+  reports. A match on `Trigger` or `RunState` needs the new variant, and a wait
+  for a group with a member submitted by 0.15.0 or an earlier version lasts
+  until its timeout.
+
 ### Changed
 
 - The setters of `WorkflowRuntimeBuilder`, `JobRunnerBuilder` and

@@ -15,8 +15,8 @@ use crate::durable::{
 use crate::error::{Error, Result};
 use crate::group::{self, GroupStatus};
 use crate::keys::{
-    RUN_KV_ENTRY_PREFIX, RUN_KV_PREFIX, RunId, STEP_KV_PREFIX, run_kv_entries_range,
-    run_kv_entry_key, run_kv_key, step_kv_key, submitter_headers,
+    RUN_KV_ENTRY_PREFIX, RUN_KV_PREFIX, RunId, STEP_KV_PREFIX, group_of_count_name,
+    run_kv_entries_range, run_kv_entry_key, run_kv_key, step_kv_key, submitter_headers,
 };
 use crate::memo::{MemoStore, RUN_RESULT_MEMO_KEY};
 use crate::runtime::{RunEnd, RunState, RunStatus, RunTermination};
@@ -399,14 +399,18 @@ fn listed_terminated(run_id: RunId, termination: DurableTermination) -> ListedRu
 }
 
 /// The state of a run whose current step's job is scheduled: a wait for a
-/// signal when the job waits for one, a delay otherwise.
+/// signal or for a group when the job waits for one, a delay otherwise.
 fn scheduled_state(job: &JobRecord) -> RunState {
     let run_at_ms = job.run_at.unwrap_or_default();
-    if job.signal_wait {
-        RunState::Waiting {
+    let group_id = job.count_wait.as_deref().and_then(group_of_count_name);
+    match (job.signal_wait, group_id) {
+        (true, _) => RunState::Waiting {
             timeout_at_ms: run_at_ms,
-        }
-    } else {
-        RunState::Scheduled { run_at_ms }
+        },
+        (false, Some(group_id)) => RunState::WaitingForGroup {
+            group_id,
+            timeout_at_ms: run_at_ms,
+        },
+        (false, None) => RunState::Scheduled { run_at_ms },
     }
 }

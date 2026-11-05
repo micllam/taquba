@@ -246,6 +246,21 @@ pub enum Trigger {
         /// with [`Step::signal`] `None`.
         timeout: Duration,
     },
+    /// The next step is claimable when the last active member of the group
+    /// `group_id` terminates, or after `timeout`, whichever comes first. When
+    /// every member has terminated, it is claimable immediately. The group can
+    /// belong to any runtime on the same [`taquba::Queue`]. A group without a
+    /// submitted member fails the run with
+    /// [`Error::GroupNotFound`](crate::Error::GroupNotFound). A group has one
+    /// waiting step: while it is waiting, a wait for the group from another run
+    /// fails that other run. The next step reads the status or the results of
+    /// the group, which show whether the timeout elapsed first.
+    OnGroup {
+        /// The id of the group.
+        group_id: RunId,
+        /// Upper bound on the wait.
+        timeout: Duration,
+    },
 }
 
 /// What the runner wants the runtime to do after this step.
@@ -324,6 +339,15 @@ impl StepOutcome {
         Self::Continue {
             payload,
             when: Trigger::OnSignal { timeout },
+        }
+    }
+
+    /// Continue the run with the next step claimable when every member of the
+    /// group `group_id` has terminated, or after `timeout` at the latest.
+    pub fn continue_on_group(payload: Vec<u8>, group_id: RunId, timeout: Duration) -> Self {
+        Self::Continue {
+            payload,
+            when: Trigger::OnGroup { group_id, timeout },
         }
     }
 }

@@ -119,7 +119,9 @@ pub enum Error {
     #[error("group `{0}` exists with a different member set")]
     GroupMismatch(RunId),
 
-    /// A group operation named a group that does not have a manifest.
+    /// A group operation named a group that does not have a manifest, or a
+    /// [`Trigger::OnGroup`](crate::Trigger::OnGroup) named a group without a
+    /// member record.
     #[error("group `{0}` not found")]
     GroupNotFound(RunId),
 

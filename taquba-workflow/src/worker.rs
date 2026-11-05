@@ -92,6 +92,7 @@ impl<'a> ClaimedStep<'a> {
             priority: Some(self.job.priority),
             max_attempts: Some(self.job.max_attempts),
             signal_wait: false,
+            count_wait: None,
             reserved_headers: self.reserved_headers_with_none(),
         }
     }
@@ -145,6 +146,22 @@ impl<'a> ClaimedStep<'a> {
 }
 
 impl RuntimeCore {
+    /// The error that settles a failed step: a permanent error, or a transient
+    /// one on the last attempt, dead-letters the step and terminates the run,
+    /// and another transient error retries the step.
+    async fn step_failure(
+        &self,
+        claimed: &ClaimedStep<'_>,
+        err: StepError,
+        submission: Submission,
+    ) -> WorkerError {
+        if err.kind == StepErrorKind::Permanent || claimed.job.is_last_attempt() {
+            self.terminating_failure(claimed, err, submission).await
+        } else {
+            err.into_worker_error()
+        }
+    }
+
     /// The error a step returns for a failure that terminates its run: the
     /// effects of the `Failed` termination on a [`FailWith`], so the core
     /// applies them only with the dead-lettering settlement. The run result
@@ -221,6 +238,15 @@ impl RuntimeCore {
                 Trigger::OnSignal { timeout } => {
                     Ok(self.advance_on_signal(claimed, payload, timeout).await)
                 }
+                Trigger::OnGroup { group_id, timeout } => {
+                    match self
+                        .advance_on_group(claimed, payload, &group_id, timeout)
+                        .await
+                    {
+                        Ok(effects) => Ok(effects),
+                        Err(err) => Err(self.step_failure(claimed, err.into(), submission).await),
+                    }
+                }
             },
             (Ok(StepOutcome::Succeed { result }), None) => {
                 self.terminate_recorded(claimed, claimed.succeeded(result), submission, None)
@@ -237,14 +263,7 @@ impl RuntimeCore {
                 )
                 .await
             }
-            // A permanent error, or a transient one on the last attempt,
-            // dead-letters the step and terminates the run.
-            (Err(err), None)
-                if err.kind == StepErrorKind::Permanent || claimed.job.is_last_attempt() =>
-            {
-                Err(self.terminating_failure(claimed, err, submission).await)
-            }
-            (Err(err), None) => Err(err.into_worker_error()),
+            (Err(err), None) => Err(self.step_failure(claimed, err, submission).await),
         }
     }
 }

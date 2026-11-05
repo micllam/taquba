@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::stream::{self, FuturesUnordered, Stream, StreamExt, TryStreamExt};
@@ -19,13 +20,17 @@ use crate::blob::ObjectPrefix;
 use crate::durable::{self, DurableMember, DurableTermination};
 use crate::error::{Error, Result};
 use crate::keys::{
-    HEADER_GROUP, HEADER_GROUP_KEY, RunId, group_member_kv_key, group_members_kv_prefix, run_kv_key,
+    HEADER_GROUP, HEADER_GROUP_KEY, RunId, group_count_name, group_member_kv_key,
+    group_members_kv_prefix, run_kv_key,
 };
 use crate::kv::run_kv_entry_keys;
 use crate::memo::MemoStore;
-use crate::runtime::{CancelRunOutcome, RunOptions, RunSpec, RunTermination, RuntimeCore};
+use crate::runtime::{
+    CancelRunOutcome, RunOptions, RunSpec, RunTermination, RuntimeCore, StepEnqueueOpts,
+};
 use crate::sweep::{Clearable, Cleared};
 use crate::terminal::{RunOutcome, TerminalStatus};
+use crate::worker::ClaimedStep;
 
 /// Member submissions and cancellations in flight at once. Each blocks on a
 /// durable commit, and concurrent commits share WAL flushes.
@@ -107,6 +112,11 @@ impl Membership {
     /// The KV key of this member's record.
     pub(crate) fn kv_key(&self) -> Vec<u8> {
         group_member_kv_key(&self.group_id, &self.key)
+    }
+
+    /// The name of the count of the active members of the group.
+    pub(crate) fn count_name(&self) -> String {
+        group_count_name(&self.group_id)
     }
 }
 
@@ -696,6 +706,36 @@ impl RunGroup {
     }
 }
 
+impl RuntimeCore {
+    /// Build the effects that advance the run of `claimed` to a step that waits
+    /// for the count of the group `group_id` until `timeout` from now. The
+    /// group can belong to any runtime on the queue, and a group without a
+    /// member record is [`Error::GroupNotFound`].
+    pub(crate) async fn advance_on_group(
+        &self,
+        claimed: &ClaimedStep<'_>,
+        payload: Vec<u8>,
+        group_id: &RunId,
+        timeout: Duration,
+    ) -> Result<SettlementEffects> {
+        let prefix = group_members_kv_prefix(group_id);
+        let members = self
+            .queue
+            .view()
+            .kv_scan(&prefix, .., KvOrder::Ascending, 1)
+            .await?;
+        if members.entries.is_empty() {
+            return Err(Error::GroupNotFound(group_id.clone()));
+        }
+        let opts = StepEnqueueOpts {
+            run_at: Some(self.run_at_after(timeout)),
+            count_wait: Some(group_count_name(group_id)),
+            ..claimed.next_step_opts()
+        };
+        Ok(self.advance(claimed, payload, opts).await)
+    }
+}
+
 /// The member record written with a member's submission.
 pub(crate) fn pending_member(run_id: &RunId) -> DurableMember {
     DurableMember {
@@ -720,7 +760,7 @@ mod tests {
     use super::*;
     use crate::keys::run_kv_entry_key;
     use crate::runner::{Step, StepError, StepOutcome, StepRunner};
-    use crate::runtime::{RunSpec, StepRef, WorkflowRuntime};
+    use crate::runtime::{RunSpec, RunState, StepRef, WorkflowRuntime};
     use crate::terminal::{CancelOrigin, NoopTerminalHook};
     use crate::test_util::{open_queue, open_queue_at, rid};
 
@@ -1173,5 +1213,222 @@ mod tests {
         clock.advance(Duration::from_secs(60));
         assert_eq!(runtime.inner.core.sweep_once().await.unwrap(), 1);
         assert!(runtime.view().run_record(&run_id).await.unwrap().is_some());
+    }
+
+    /// Submits any `members` as the group `g` of `members_runtime` and
+    /// continues on the group `group_id`. The next step succeeds with the count
+    /// of the members of `g` that succeeded.
+    struct WaitsForGroup<R: StepRunner> {
+        members_runtime: WorkflowRuntime<R, NoopTerminalHook>,
+        members: Vec<GroupMember>,
+        group_id: RunId,
+    }
+
+    impl<R: StepRunner> StepRunner for WaitsForGroup<R> {
+        async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
+            let group = self.members_runtime.group(rid("g"));
+            if step.step_number == 1 {
+                let succeeded = group.status().await?.succeeded;
+                return Ok(StepOutcome::Succeed {
+                    result: succeeded.to_string().into_bytes(),
+                });
+            }
+            if !self.members.is_empty() {
+                group
+                    .submit(self.members.clone(), &RunOptions::default())
+                    .await?;
+            }
+            Ok(StepOutcome::continue_on_group(
+                Vec::new(),
+                self.group_id.clone(),
+                Duration::from_secs(3_600),
+            ))
+        }
+    }
+
+    /// The runtime of the members on `queue` with `runner`, and the runtime of
+    /// the run `waiter`, which waits for the group `group_id`. The run is
+    /// submitted.
+    async fn waiting_runtimes<R: StepRunner>(
+        queue: Arc<Queue>,
+        store: Arc<dyn taquba::object_store::ObjectStore>,
+        runner: R,
+        members: Vec<GroupMember>,
+        group_id: &str,
+    ) -> (
+        WorkflowRuntime<R, NoopTerminalHook>,
+        WorkflowRuntime<WaitsForGroup<R>, NoopTerminalHook>,
+    ) {
+        let members_runtime =
+            WorkflowRuntime::builder(queue.clone(), store.clone(), runner, NoopTerminalHook)
+                .queue_name("members")
+                .build()
+                .unwrap();
+        let runner = WaitsForGroup {
+            members_runtime: members_runtime.clone(),
+            members,
+            group_id: rid(group_id),
+        };
+        let waiting = WorkflowRuntime::builder(queue, store, runner, NoopTerminalHook)
+            .queue_name("waiting")
+            .build()
+            .unwrap();
+        waiting
+            .submit(RunSpec {
+                run_id: Some(rid("waiter")),
+                ..RunSpec::default()
+            })
+            .await
+            .unwrap();
+        (members_runtime, waiting)
+    }
+
+    /// Polls the status of `run_id` until its state matches `expected`.
+    async fn until_state<R: StepRunner>(
+        runtime: &WorkflowRuntime<R, NoopTerminalHook>,
+        run_id: &str,
+        expected: impl Fn(&RunState) -> bool,
+    ) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let status = runtime.status(&rid(run_id)).await.unwrap();
+                if status.is_some_and(|status| expected(&status.state)) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the run reaches the state");
+    }
+
+    fn waits_for_g(state: &RunState) -> bool {
+        matches!(state, RunState::WaitingForGroup { group_id, .. } if group_id == "g")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_step_that_continues_on_its_group_runs_once_the_last_member_terminates() {
+        let (queue, store) = open_queue().await;
+        let members = vec![member("a"), member("b")];
+        let (members_runtime, waiting) =
+            waiting_runtimes(queue, store, TwoSteps, members, "g").await;
+        let waiting_worker = waiting.spawn(std::future::pending::<()>());
+        until_state(&waiting, "waiter", waits_for_g).await;
+
+        // The members run only now, so their terminations wake the wait, which
+        // ends an hour of the queue's clock later otherwise.
+        let members_worker = members_runtime.spawn(std::future::pending::<()>());
+        let end = tokio::time::timeout(Duration::from_secs(10), waiting.wait(&rid("waiter")))
+            .await
+            .expect("the last termination woke the waiter")
+            .unwrap();
+        assert_eq!(end.termination.status, TerminalStatus::Succeeded);
+        let result = end.outcome.and_then(|outcome| outcome.result);
+        assert_eq!(result.as_deref(), Some(b"2".as_slice()));
+        waiting_worker.shutdown().await.unwrap();
+        members_worker.shutdown().await.unwrap();
+    }
+
+    /// Runs the step of a member once its key has a permit, and fails the first
+    /// run of `a`.
+    #[derive(Clone)]
+    struct Gated {
+        gates: Arc<HashMap<Vec<u8>, tokio::sync::Semaphore>>,
+        failed_a: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Gated {
+        fn new(keys: &[&str]) -> Self {
+            let gates = keys
+                .iter()
+                .map(|key| (key.as_bytes().to_vec(), tokio::sync::Semaphore::new(0)))
+                .collect();
+            Self {
+                gates: Arc::new(gates),
+                failed_a: Arc::default(),
+            }
+        }
+
+        fn release(&self, key: &str) {
+            self.gates[key.as_bytes()].add_permits(1);
+        }
+    }
+
+    impl StepRunner for Gated {
+        async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
+            self.gates[&step.payload].acquire().await.unwrap().forget();
+            if step.payload == b"a" && !self.failed_a.swap(true, Ordering::SeqCst) {
+                return Ok(StepOutcome::Fail {
+                    reason: "first run".to_string(),
+                });
+            }
+            Ok(StepOutcome::Succeed { result: Vec::new() })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_submit_of_the_group_while_a_step_waits_raises_the_count_and_delays_the_wake() {
+        let (queue, store) = open_queue().await;
+        let gated = Gated::new(&["a", "b"]);
+        let members = vec![member("a"), member("b")];
+        let (members_runtime, waiting) =
+            waiting_runtimes(queue, store, gated.clone(), members.clone(), "g").await;
+        let workers = [
+            waiting.spawn(std::future::pending::<()>()),
+            members_runtime.spawn(std::future::pending::<()>()),
+        ];
+        until_state(&waiting, "waiter", waits_for_g).await;
+        let group = members_runtime.group(rid("g"));
+        let until_group = |done: fn(&GroupStatus) -> bool| {
+            let group = group.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while !done(&group.status().await.unwrap()) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("the group reaches the status");
+            }
+        };
+
+        gated.release("a");
+        until_group(|status| status.failed == 1).await;
+        group.submit(members, &RunOptions::default()).await.unwrap();
+        gated.release("b");
+        until_group(|status| status.succeeded == 1).await;
+        let state = waiting.status(&rid("waiter")).await.unwrap().unwrap().state;
+        assert!(
+            waits_for_g(&state),
+            "the rerun of `a` keeps the wait: {state:?}"
+        );
+
+        gated.release("a");
+        let end = tokio::time::timeout(Duration::from_secs(10), waiting.wait(&rid("waiter")))
+            .await
+            .expect("the termination of the rerun woke the waiter")
+            .unwrap();
+        let result = end.outcome.and_then(|outcome| outcome.result);
+        assert_eq!(result.as_deref(), Some(b"2".as_slice()));
+        for worker in workers {
+            worker.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_step_that_continues_on_a_group_without_a_member_fails_the_run() {
+        let (queue, store) = open_queue().await;
+        let (_, waiting) = waiting_runtimes(queue, store, TwoSteps, Vec::new(), "unknown").await;
+        let worker = waiting.spawn(std::future::pending::<()>());
+        let end = tokio::time::timeout(Duration::from_secs(10), waiting.wait(&rid("waiter")))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(end.termination.status, TerminalStatus::Failed);
+        assert_eq!(
+            end.termination.error,
+            Some(Error::GroupNotFound(rid("unknown")).to_string())
+        );
+        worker.shutdown().await.unwrap();
     }
 }

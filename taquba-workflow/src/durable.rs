@@ -213,7 +213,13 @@ impl From<DurableDuration> for Duration {
 pub(crate) enum DurableTrigger {
     Immediate,
     After(DurableDuration),
-    OnSignal { timeout: DurableDuration },
+    OnSignal {
+        timeout: DurableDuration,
+    },
+    OnGroup {
+        group_id: RunId,
+        timeout: DurableDuration,
+    },
 }
 
 impl From<&Trigger> for DurableTrigger {
@@ -222,6 +228,10 @@ impl From<&Trigger> for DurableTrigger {
             Trigger::Immediate => Self::Immediate,
             Trigger::After(delay) => Self::After((*delay).into()),
             Trigger::OnSignal { timeout } => Self::OnSignal {
+                timeout: (*timeout).into(),
+            },
+            Trigger::OnGroup { group_id, timeout } => Self::OnGroup {
+                group_id: group_id.clone(),
                 timeout: (*timeout).into(),
             },
         }
@@ -234,6 +244,10 @@ impl From<DurableTrigger> for Trigger {
             DurableTrigger::Immediate => Self::Immediate,
             DurableTrigger::After(delay) => Self::After(delay.into()),
             DurableTrigger::OnSignal { timeout } => Self::OnSignal {
+                timeout: timeout.into(),
+            },
+            DurableTrigger::OnGroup { group_id, timeout } => Self::OnGroup {
+                group_id,
                 timeout: timeout.into(),
             },
         }

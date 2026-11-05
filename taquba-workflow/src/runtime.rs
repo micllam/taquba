@@ -69,6 +69,8 @@ pub(crate) struct StepEnqueueOpts {
     pub(crate) max_attempts: Option<u32>,
     /// Whether the step waits for a signal until `run_at`.
     pub(crate) signal_wait: bool,
+    /// The name of the count the step waits for until `run_at`.
+    pub(crate) count_wait: Option<String>,
     /// Additional runtime-owned reserved headers for the step job.
     pub(crate) reserved_headers: Vec<(&'static str, String)>,
 }
@@ -185,6 +187,15 @@ pub enum RunState {
     Waiting {
         /// The end of the wait without a signal, as a Unix timestamp in
         /// milliseconds.
+        timeout_at_ms: u64,
+    },
+    /// The current step is waiting for the last active member of the group
+    /// `group_id` to terminate ([`Trigger::OnGroup`]), and becomes claimable at
+    /// `timeout_at_ms` at the latest.
+    WaitingForGroup {
+        /// The group the step is waiting for.
+        group_id: RunId,
+        /// The end of the wait, as a Unix timestamp in milliseconds.
         timeout_at_ms: u64,
     },
     /// A step is currently being processed by a worker.
@@ -944,9 +955,9 @@ impl RuntimeCore {
     /// written with the step-0 enqueue and replaced by the terminal record at
     /// the termination, so it identifies a run whichever process submitted it,
     /// and the step's dedup key serialises two submissions that both find the
-    /// record absent. A `membership` is set on the step job and its pending
-    /// member record is written with the enqueue. A `cancel_request` is written
-    /// on the run record.
+    /// record absent. A `membership` is set on the step job, and its pending
+    /// member record and the increment of the count of its group commit with
+    /// the enqueue. A `cancel_request` is written on the run record.
     async fn enqueue_run(
         &self,
         run_id: &RunId,
@@ -986,6 +997,7 @@ impl RuntimeCore {
             priority: spec.options.priority,
             max_attempts: spec.options.max_attempts_per_step,
             signal_wait: false,
+            count_wait: None,
             reserved_headers: membership
                 .map(Membership::reserved_headers)
                 .unwrap_or_default(),
@@ -1011,10 +1023,12 @@ impl RuntimeCore {
             .kv_put(run_kv_key(run_id), record_bytes)
             .kv_put(step_kv_key(run_id), current_step_bytes(0, &job_id));
         if let Some(membership) = membership {
-            effects = effects.kv_put(
-                membership.kv_key(),
-                durable::encode(&pending_member(run_id)),
-            );
+            effects = effects
+                .kv_put(
+                    membership.kv_key(),
+                    durable::encode(&pending_member(run_id)),
+                )
+                .count_up(membership.count_name());
         }
         let submitted = SubmitOutcome {
             run_id: run_id.clone(),
@@ -1104,15 +1118,15 @@ impl RuntimeCore {
     /// Settle a run into its terminal state: return the delete of the
     /// current-step pointer, the write of the terminal record over the run
     /// record, the write of the terminal marker (when memo retention is
-    /// enabled), the write of the member record (when the run is a group
-    /// member), the effects that the hook stages through
-    /// [`TerminalHook::stage_effects`] and the terminal-notification enqueue
-    /// (when the hook observes this outcome) as [`SettlementEffects`] for the
-    /// settlement transaction. The notification job's payload is the committed
-    /// outcome and the configured [`TerminalHook`] runs as its worker.
-    /// `terminal_step` is the step that produced the outcome, or the pending
-    /// step a cancellation removes, and `termination` the record of the outcome
-    /// the settlement writes.
+    /// enabled), the write of the member record and the decrement of the count
+    /// of its group (when the run is a group member), the effects that the hook
+    /// stages through [`TerminalHook::stage_effects`] and the
+    /// terminal-notification enqueue (when the hook observes this outcome) as
+    /// [`SettlementEffects`] for the settlement transaction. The notification
+    /// job's payload is the committed outcome and the configured
+    /// [`TerminalHook`] runs as its worker. `terminal_step` is the step that
+    /// produced the outcome, or the pending step a cancellation removes, and
+    /// `termination` the record of the outcome the settlement writes.
     ///
     /// The effects are pure: this function does not write or mutate state, so a
     /// caller that builds them and then commits a non-terminal outcome does not
@@ -1138,6 +1152,7 @@ impl RuntimeCore {
                 membership.kv_key(),
                 durable::encode(&terminated_member(&outcome.run_id, termination)),
             );
+            effects = effects.count_down(membership.count_name());
         }
         if self.terminal_staging.observes(outcome) {
             effects
@@ -1397,7 +1412,8 @@ impl RuntimeCore {
                 .max_attempts(opts.max_attempts)
                 .dedup_key(Some(format!("{DEDUP_PREFIX}{run_id}:{step_number}")))
                 .id_override(Some(job_id))
-                .signal_wait(opts.signal_wait),
+                .signal_wait(opts.signal_wait)
+                .count_wait(opts.count_wait),
         }
     }
 
@@ -1459,7 +1475,7 @@ impl RuntimeCore {
                 *delay = remaining_delay(record.stored_at_ms, self.clock.now_ms(), *delay);
             }
             StepOutcome::Continue {
-                when: Trigger::OnSignal { timeout, .. },
+                when: Trigger::OnSignal { timeout } | Trigger::OnGroup { timeout, .. },
                 ..
             } => {
                 *timeout = remaining_delay(record.stored_at_ms, self.clock.now_ms(), *timeout);

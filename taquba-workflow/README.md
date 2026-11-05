@@ -108,7 +108,7 @@ demonstrates.
 
 | Outcome | Effect |
 |---|---|
-| `StepOutcome::Continue { payload, when }` | Enqueue the next step. `when` (a `Trigger`) decides when it becomes claimable: `Trigger::Immediate`, `Trigger::After(delay)` or `Trigger::OnSignal { timeout }`. Constructors: `StepOutcome::continue_now(payload)`, `StepOutcome::continue_after(payload, delay)`, `StepOutcome::continue_on_signal(payload, timeout)`. |
+| `StepOutcome::Continue { payload, when }` | Enqueue the next step. `when` (a `Trigger`) decides when it becomes claimable: `Trigger::Immediate`, `Trigger::After(delay)`, `Trigger::OnSignal { timeout }` or `Trigger::OnGroup { group_id, timeout }`. Constructors: `StepOutcome::continue_now(payload)`, `StepOutcome::continue_after(payload, delay)`, `StepOutcome::continue_on_signal(payload, timeout)`, `StepOutcome::continue_on_group(payload, group_id, timeout)`. |
 | `StepOutcome::Succeed { result }` | Ack, and the terminal hook observes `Succeeded`. |
 | `StepOutcome::Fail { reason }` | Ack, and the terminal hook observes `Failed`. A failure decided by the runner: no dead-letter. |
 | `StepOutcome::Cancel { reason }` | Ack, and the terminal hook observes `Cancelled`. A cancellation decided by the runner: no dead-letter. |
@@ -157,15 +157,16 @@ retention](#memo-retention) removes it.
 
 `WorkflowView::status` reads the record, the pointer and the step's queue job
 into a `RunStatus`: the lifecycle position of the current step (`Pending`,
-`Scheduled`, `Waiting`, `Running`, `Cancelling` or `DeadLettered`) and the step
-as a `StepRef`, its number and its job id. `WorkflowRuntime::status` reads
-through the runtime's view, so the status is available after a restart and from
-any runtime over the same queue. A process without a runtime builds a
-`WorkflowView` from a `QueueReader` view and a `MemoStore` at the runtime's memo
-prefix. A terminated run reports `RunState::Terminated` with its status, error,
-error kind, final step with its job id and time of termination, read from the
-terminal record written with the terminating settlement, which
-[Memo retention](#memo-retention) removes with the run's memo entries.
+`Scheduled`, `Waiting`, `WaitingForGroup`, `Running`, `Cancelling` or
+`DeadLettered`) and the step as a `StepRef`, its number and its job id.
+`WorkflowRuntime::status` reads through the runtime's view, so the status is
+available after a restart and from any runtime over the same queue. A process
+without a runtime builds a `WorkflowView` from a `QueueReader` view and a
+`MemoStore` at the runtime's memo prefix. A terminated run reports
+`RunState::Terminated` with its status, error, error kind, final step with its
+job id and time of termination, read from the terminal record written with the
+terminating settlement, which [Memo retention](#memo-retention) removes with the
+run's memo entries.
 
 `WorkflowView::runs` lists the runs in run-id order, in either direction, as a
 stream of `ListedRun`: the status of a run with its submission time and the
@@ -408,6 +409,16 @@ window after a `RunGroup::results` consumer observed the last termination,
 through a sweep over `workflow/group-terminals/`. A group submitted again within
 the window is retained until a window after the next observation, and a group
 whose results are never consumed is retained until it is forgotten.
+
+A step waits for a group with `StepOutcome::continue_on_group` (a
+`Trigger::OnGroup`), which defers the next step until the last active member
+terminates or the timeout elapses. The queue counts the active members of each
+group: a member's submission adds one and its termination subtracts one, in the
+transactions that write its member record. The termination that leaves the count
+at zero makes the waiting step claimable, without a worker during the wait, and
+`RunState::WaitingForGroup` reports the wait. The group can belong to another
+runtime on the same queue, such as the `JobRunner` of a
+[job group](#job-groups). A group has one waiting step.
 
 ## Typed jobs
 

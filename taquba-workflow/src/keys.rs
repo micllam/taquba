@@ -137,6 +137,19 @@ pub(crate) fn group_member_kv_key(group_id: &RunId, key: &str) -> Vec<u8> {
     prefixed(&group_members_kv_prefix(group_id), key)
 }
 
+/// The name of the count of the active members of the group `group_id`.
+pub(crate) fn group_count_name(group_id: &RunId) -> String {
+    format!("{GROUP_COUNT_PREFIX}{group_id}")
+}
+
+/// The group of the count name `name`, when [`group_count_name`] built it.
+pub(crate) fn group_of_count_name(name: &str) -> Option<RunId> {
+    RunId::new(name.strip_prefix(GROUP_COUNT_PREFIX)?).ok()
+}
+
+/// The prefix of the names of the counts of groups.
+const GROUP_COUNT_PREFIX: &str = "workflow/groups/";
+
 /// Prefix of the terminal markers of run groups, read by the group retention
 /// sweep: entries of a [`taquba::ExpiryIndex`] with the group id as the suffix.
 pub(crate) const GROUP_TERMINAL_KV_PREFIX: &[u8] = b"workflow/group-terminals/";
