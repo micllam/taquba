@@ -80,7 +80,7 @@ impl RuntimeCore {
     /// re-terminates and rebuilds the same effects.
     ///
     /// [`TerminalHook::stage_effects`]: crate::TerminalHook::stage_effects
-    pub(crate) fn terminate_collecting_effects(
+    pub(crate) fn termination_effects(
         &self,
         terminal_step: &ClaimedStep<'_>,
         ending: Ending,
@@ -163,12 +163,8 @@ impl RuntimeCore {
                 .clone()
                 .unwrap_or_else(|| "step dead-lettered outside the worker".to_string());
             let ending = Ending::failed(error, None);
-            let effects = self.terminate_collecting_effects(
-                &claimed,
-                ending,
-                None,
-                Submission::from(&record),
-            );
+            let effects =
+                self.termination_effects(&claimed, ending, None, Submission::from(&record));
             self.queue.commit_effects(effects).await?;
             warn!(run_id = %run_id, step_number = claimed.step_number, job_id = %job.id, "terminated a run whose step was dead-lettered outside the worker");
             terminated += 1;

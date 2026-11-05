@@ -81,7 +81,7 @@ use crate::view::StepRef;
 /// The record of a run at `workflow/runs/{run_id}`. The submission writes the
 /// run record atomically with the step-0 enqueue, and the settlement that
 /// terminates the run replaces it with the terminal record, staged in
-/// `terminate_collecting_effects`. The memo sweep deletes the terminal record.
+/// `termination_effects`. The memo sweep deletes the terminal record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum DurableRun {
     Active(DurableRunRecord),

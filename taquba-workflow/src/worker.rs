@@ -168,7 +168,7 @@ impl RuntimeCore {
         submission: Submission,
     ) -> WorkerError {
         let ending = Ending::failed(error.message.clone(), Some(error.kind));
-        let effects = self.terminate_collecting_effects(claimed, ending, None, submission);
+        let effects = self.termination_effects(claimed, ending, None, submission);
         FailWith::new(error.into_worker_error(), effects).into()
     }
 
@@ -193,7 +193,7 @@ impl RuntimeCore {
             }
             None => None,
         };
-        Ok(self.terminate_collecting_effects(claimed, ending, result, submission))
+        Ok(self.termination_effects(claimed, ending, result, submission))
     }
 
     /// The settlement of `outcome` for `claimed`: the effects of the run's

@@ -38,7 +38,7 @@ impl RuntimeCore {
             // The effects are built before the outcome is known, and the queue
             // applies them only on `Removed`.
             let ending = Ending::cancelled(CancelOrigin::Request, request.reason.clone());
-            let effects = self.terminate_collecting_effects(&claimed, ending, None, submission);
+            let effects = self.termination_effects(&claimed, ending, None, submission);
             match self.queue.cancel_with(&job.id, effects).await?.0 {
                 taquba::CancelOutcome::Removed => return Ok(CancelRunOutcome::Removed),
                 taquba::CancelOutcome::Requested => return Ok(CancelRunOutcome::Requested),
