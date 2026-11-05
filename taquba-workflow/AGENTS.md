@@ -7,9 +7,9 @@ Each rule identifies the code it applies to, whose docs describe the mechanism.
 - **Application KV effects** (`worker.rs::process_step`). Do not add a second,
   crate-private effects channel. The external-cancel discard inside the
   `settled.map` tail must stay conditional.
-- **Terminal effects** (`runtime.rs::terminate_collecting_effects`). Do not
-  stage the hook's effects in the `settled.map` tail. The write of the terminal
-  record over the run record must stay on the terminal ack.
+- **Terminal effects** (`runtime/terminate.rs::terminate_collecting_effects`).
+  Do not stage the hook's effects in the `settled.map` tail. The write of the
+  terminal record over the run record must stay on the terminal ack.
 - **Terminal hook** (`terminal.rs`). Do not add an asynchronous hook method, a
   notification job or a filter of the runs that the hook sees. A reaction after
   the termination must be an enqueue that the hook stages.
