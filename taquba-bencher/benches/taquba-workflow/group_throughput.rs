@@ -25,8 +25,9 @@
 //                       STORE_LATENCY_MS and STORE_JITTER_MS.
 //
 // Output (stdout): CSV with header `window_sec,completed`, one row per second
-// with the cumulative number of terminal items. A summary (items/s, succeeded /
-// failed counts) goes to stderr so stdout stays a clean data stream.
+// with the cumulative number of terminal items. The duration of the group
+// submit and a summary (items/s, succeeded / failed counts) go to stderr so
+// stdout stays a clean data stream.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -125,6 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     group
         .submit((0..n_items as u32).map(|idx| Item { idx }))
         .await?;
+    let submitted = started.elapsed();
     let (mut succeeded, mut failed) = (0usize, 0usize);
     let mut completions = Vec::with_capacity(n_items);
     {
@@ -153,6 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let secs = elapsed.as_secs_f64();
+    eprintln!("submit: {n_items} items in {:.3}s", submitted.as_secs_f64());
     eprintln!(
         "summary: {n_items} items ({succeeded} succeeded, {failed} failed) in {secs:.2}s \
          ({:.0} items/s)",

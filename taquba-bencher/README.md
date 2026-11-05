@@ -39,7 +39,7 @@ the header comment of its source file.
 
 | Benchmark | Workload | Measurement |
 |---|---|---|
-| `group_throughput` | Run `N_ITEMS` jobs of one group through `N_PHASES` memoized phases that do no work | The per-item orchestration overhead (run submission, the single workflow step, one memo write per phase, terminal accounting, the result read) and the item throughput that it bounds. |
+| `group_throughput` | Run `N_ITEMS` jobs of one group through `N_PHASES` memoized phases that do no work | The per-item orchestration overhead (run submission, the single workflow step, one memo write per phase, terminal accounting, the result read), the item throughput that it bounds and the duration of the group submit. |
 | `resume_replay` | Each job of a group fails transiently on its first attempt after completing `FAIL_AT` phases of `PHASE_WORK_MS` simulated work. The retry re-enters the handler. `MEMO=0` runs the identical workload without memoization | The completed work that `Memo::memoized` saves a retried item. The expected result is zero re-executed completed phases for the memoized run, and the `MEMO=0` run executes them again. |
 
 ### taquba-workflow typed jobs (`jobs` module)
@@ -314,10 +314,10 @@ window_sec,completed
 ```
 
 One row per second with the cumulative number of terminal items. The summary
-printed to stderr reports items/s and succeeded / failed counts for
-`group_throughput`, and items/s plus the phase execution count against the
-no-retry floor for `resume_replay` (executions above the floor are phases a
-retry re-executed).
+printed to stderr reports the duration of the group submit, items/s and
+succeeded / failed counts for `group_throughput`. For `resume_replay` it reports
+items/s and the phase execution count against the no-retry floor, and the
+executions above the floor are phases that a retry executed again.
 
 For `fanout`:
 
