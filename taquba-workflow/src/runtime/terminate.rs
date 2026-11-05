@@ -20,7 +20,7 @@ impl RuntimeCore {
     /// The terminal record of the run of `claimed` ending at that step with
     /// `ending` at the clock's current time, with the reference `result` to the
     /// result of a succeeded run and the `submission` of the run record.
-    pub(crate) fn termination(
+    fn termination(
         &self,
         claimed: &ClaimedStep<'_>,
         ending: Ending,
@@ -70,8 +70,9 @@ impl RuntimeCore {
     /// hook stages through [`TerminalHook::stage_effects`] as
     /// [`SettlementEffects`] for the settlement transaction. `terminal_step` is
     /// the step that produced the outcome, or the pending step a cancellation
-    /// removes, `termination` the record the settlement writes and `result` the
-    /// result of a succeeded run.
+    /// removes, and the run ends with `ending`. `result` contains the stored
+    /// reference and the bytes of the result of a succeeded run, and
+    /// `submission` comes from the run record.
     ///
     /// The effects are pure: this function does not write or mutate state, so a
     /// caller that builds them and then commits a non-terminal outcome does not
@@ -82,9 +83,12 @@ impl RuntimeCore {
     pub(crate) fn terminate_collecting_effects(
         &self,
         terminal_step: &ClaimedStep<'_>,
-        termination: DurableTermination,
-        result: Option<Vec<u8>>,
+        ending: Ending,
+        result: Option<(DurableResult, Vec<u8>)>,
+        submission: Submission,
     ) -> SettlementEffects {
+        let (reference, result) = result.unzip();
+        let termination = self.termination(terminal_step, ending, reference, submission);
         let run_id = &terminal_step.run_id;
         let terminated_at_ms = termination.terminated_at_ms;
         let staging = TerminalEffects::for_delivery(&self.queue_name);
@@ -159,8 +163,12 @@ impl RuntimeCore {
                 .clone()
                 .unwrap_or_else(|| "step dead-lettered outside the worker".to_string());
             let ending = Ending::failed(error, None);
-            let termination = self.termination(&claimed, ending, None, Submission::from(&record));
-            let effects = self.terminate_collecting_effects(&claimed, termination, None);
+            let effects = self.terminate_collecting_effects(
+                &claimed,
+                ending,
+                None,
+                Submission::from(&record),
+            );
             self.queue.commit_effects(effects).await?;
             warn!(run_id = %run_id, step_number = claimed.step_number, job_id = %job.id, "terminated a run whose step was dead-lettered outside the worker");
             terminated += 1;

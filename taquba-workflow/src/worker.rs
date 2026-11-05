@@ -169,8 +169,7 @@ impl RuntimeCore {
         submission: Submission,
     ) -> WorkerError {
         let ending = Ending::failed(error.message.clone(), Some(error.kind));
-        let termination = self.termination(claimed, ending, None, submission);
-        let effects = self.terminate_collecting_effects(claimed, termination, None);
+        let effects = self.terminate_collecting_effects(claimed, ending, None, submission);
         FailWith::new(error.into_worker_error(), effects).into()
     }
 
@@ -185,16 +184,17 @@ impl RuntimeCore {
         result: Option<Vec<u8>>,
         submission: Submission,
     ) -> Result<SettlementEffects, WorkerError> {
-        let reference = match &result {
-            Some(result) => Some(
-                self.store_result(claimed, result)
+        let result = match result {
+            Some(result) => {
+                let reference = self
+                    .store_result(claimed, &result)
                     .await
-                    .map_err(worker_error)?,
-            ),
+                    .map_err(worker_error)?;
+                Some((reference, result))
+            }
             None => None,
         };
-        let termination = self.termination(claimed, ending, reference, submission);
-        Ok(self.terminate_collecting_effects(claimed, termination, result))
+        Ok(self.terminate_collecting_effects(claimed, ending, result, submission))
     }
 
     /// The settlement of `outcome` for `claimed`: the effects of the run's
