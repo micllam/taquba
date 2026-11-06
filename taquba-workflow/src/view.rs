@@ -492,7 +492,9 @@ pub enum RunState {
     /// lease that expired past the attempt limit, or a claim dead-lettered by
     /// crash recovery at open. The reconciliation of the worker terminates the
     /// run as [`crate::TerminalStatus::Failed`], and
-    /// [`WorkflowRuntime::cancel`] returns `false` for the run.
+    /// [`WorkflowRuntime::cancel`] returns
+    /// [`CancelRunOutcome::NotActive`](crate::CancelRunOutcome::NotActive) for
+    /// the run.
     ///
     /// [`WorkflowRuntime::cancel`]: crate::WorkflowRuntime::cancel
     DeadLettered,

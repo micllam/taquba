@@ -97,9 +97,10 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
 
     /// An optional idempotency key for this job instance.
     ///
-    /// When `Some`, a submission whose key matches an already-pending or
-    /// scheduled job is collapsed onto that existing job, and the returned
-    /// [`JobHandle`](crate::jobs::JobHandle) points at the original. The
+    /// When `Some`, a submission whose key matches an earlier job collapses
+    /// onto that job in any state from pending to terminated. The returned
+    /// [`JobHandle`](crate::jobs::JobHandle) points at the original. A
+    /// terminated original matches while its terminal record is retained. The
     /// default is `None`: every submission runs.
     ///
     /// To opt in to hash-based deduplication, return

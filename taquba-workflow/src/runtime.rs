@@ -248,8 +248,10 @@ impl<R: StepRunner> WorkflowRuntime<R> {
 
     /// Wait until the run `run_id` terminates and report its end. The wait
     /// follows the run's current step across its steps, so it reports a run of
-    /// any length, after a restart and from any runtime over the same queue.
-    /// For a run that has already terminated, the wait reads its records
+    /// any length, after a restart and from any runtime over the same `Queue`.
+    /// The wait relies on the in-process completion notification of the
+    /// `Queue`, so a worker over the same `Queue` in this process must run the
+    /// steps. For a run that has already terminated, the wait reads its records
     /// without waiting. A step dead-lettered outside the worker is terminated
     /// by the worker's dead-step reconciliation, which the wait polls for at
     /// the poll interval.

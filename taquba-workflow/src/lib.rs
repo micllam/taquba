@@ -609,10 +609,12 @@
 //! The sweep deletes the run KV entries of a run in the transaction that
 //! removes its terminal record.
 //!
-//! Other cleanup policies (selective retention, sweeps run by another process)
-//! can be built on [`taquba::QueueView::kv_scan`] over that prefix and
-//! [`MemoStore::clear_memos_for_run`], without configuring
-//! [`WorkflowRuntimeBuilder::memo_retention`].
+//! The runtime writes terminal markers only with the retention of
+//! [`WorkflowRuntimeBuilder::memo_retention`]. A custom cleanup policy, such as
+//! selective retention or a sweep run by another process, can select the
+//! terminated runs with [`WorkflowView::runs`] and [`RunFilter::Terminated`]
+//! and remove their objects with [`MemoStore::clear_memos_for_run`]. The
+//! terminal records and the run KV entries of those runs remain.
 //!
 //! # Time injection
 //!
