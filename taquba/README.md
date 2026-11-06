@@ -4,8 +4,8 @@
 [![docs.rs](https://img.shields.io/docsrs/taquba)](https://docs.rs/taquba)
 [![license](https://img.shields.io/crates/l/taquba.svg)](#license)
 
-A durable task queue for Rust whose state lives in object storage. Jobs, their
-payloads and the application's own state are stored in S3, GCS, Azure Blob or a
+A durable task queue for Rust on object storage. Jobs, their payloads and a
+key-value namespace for application state are stored in S3, GCS, Azure Blob or a
 local directory through [SlateDB](https://github.com/slatedb/slatedb). There is
 no queue server or database server to operate.
 
@@ -71,22 +71,22 @@ returns to pending if the lease expires before the settlement. Delivery is
 therefore at least once, so a worker must be idempotent.
 
 A cancellation removes a pending or scheduled job and asks the worker of a
-claimed job to stop. A dead job stays for inspection until a requeue returns it
-to pending.
+claimed job to stop. The queue keeps a dead job for inspection, and a requeue
+returns it to pending.
 
 ## Transactional settlement
 
 A settlement commits in one transaction with its effects:
 
 - Follow-up jobs.
-- Writes and deletes of the application's keys, with conditions on their current
+- Writes and deletes in the key-value namespace, with conditions on the current
   values.
 - Changes to counts, the named numbers of active items that a scheduled job can
   wait for.
 
 After a crash, the settlement and all its effects are present, or none of them.
-A state machine built on the queue therefore stays consistent without an outbox
-or a second datastore.
+A state machine built on the queue therefore remains consistent without an
+outbox or a second database.
 [`examples/atomic_settlement.rs`](https://github.com/micllam/taquba/blob/master/taquba/examples/atomic_settlement.rs)
 acknowledges an order, enqueues its confirmation and records its status in one
 commit.
@@ -117,7 +117,8 @@ Taquba is the correct choice when:
 
 A different tool is the correct choice for:
 
-- A queue that must share the application's database transactions.
+- An application whose enqueues must commit in the transactions of another
+  database.
 - Compute spread over a fleet of workers on several machines.
 - A latency-sensitive path, because each transition waits for an object-store
   write.

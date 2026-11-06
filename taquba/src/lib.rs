@@ -1,6 +1,6 @@
-//! A durable task queue whose state lives in object storage, through [SlateDB]
-//! and the [`object_store`] crate. One process owns a store and commits every
-//! transition, and its producers and workers share one [`Queue`]. The
+//! A durable task queue that stores its state in object storage through
+//! [SlateDB] and the [`object_store`] crate. One process owns a store and
+//! commits every transition, and producers and workers share one [`Queue`]. The
 //! [README](https://github.com/micllam/taquba/tree/master/taquba) states when
 //! the queue is the correct choice, and `taquba-workflow` runs durable
 //! multi-step processes on it.
