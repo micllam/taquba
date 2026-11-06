@@ -88,8 +88,11 @@ pub(crate) fn check_enqueue(request: &EnqueueRequest, runtime_queue: Option<&str
 }
 
 /// Checks every KV key and every enqueue of the effects of a caller of the
-/// runtime with the queue `runtime_queue`.
+/// runtime with the queue `runtime_queue`, and rejects a compare.
 pub(crate) fn check_effects(effects: &SettlementEffects, runtime_queue: &str) -> Result<()> {
+    if !effects.kv_compares.is_empty() {
+        return Err(Error::KvCompareInEffects);
+    }
     let deletes = effects.kv_deletes.iter();
     for key in effects.kv_writes.keys().chain(deletes) {
         check_kv_key(key)?;

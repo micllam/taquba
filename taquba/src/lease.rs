@@ -15,6 +15,17 @@ use crate::lease_registry::{LeaseRegistry, Renewal};
 /// runs to its declared bound still has lease left to settle in.
 pub(crate) const SETTLEMENT_MARGIN: Duration = Duration::from_secs(5);
 
+/// A condition of [`crate::SettlementEffects`] that a claim is still the live
+/// claim of its job, from [`LeaseHandle::fence`]. The claim's own settlement
+/// ends the claim, so a fence belongs on other effects that commit during the
+/// claim, such as an enqueue or [`crate::Queue::commit_effects`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimFence {
+    pub(crate) queue: QueueName,
+    pub(crate) id: String,
+    pub(crate) claim_id: u64,
+}
+
 /// A handle on one claim's lease and cancellation token, passed to
 /// [`crate::Worker::process`] by the worker loop.
 ///
@@ -71,6 +82,17 @@ impl LeaseHandle {
             inner: None,
             cancel: CancellationToken::new(),
         }
+    }
+
+    /// The fence of this claim, which effects add with
+    /// [`crate::SettlementEffects::claim_fence`] to commit only while the claim
+    /// is live. A detached handle does not have a fence.
+    pub fn fence(&self) -> Option<ClaimFence> {
+        self.inner.as_ref().map(|inner| ClaimFence {
+            queue: inner.queue.clone(),
+            id: inner.id.clone(),
+            claim_id: inner.claim_id,
+        })
     }
 
     /// The delivery's cooperative cancellation token, fired by

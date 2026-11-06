@@ -181,7 +181,7 @@ mod view;
 pub mod worker;
 
 pub use clock::{Clock, MockClock, SystemClock};
-pub use effects::{EnqueueRequest, SettlementEffects};
+pub use effects::{EnqueueRequest, KvCompare, SettlementEffects};
 pub use error::{Error, FormError, Result, StoreUrlError};
 pub use expiry::{Expired, ExpiryIndex};
 pub use history::{AttemptOutcome, JobAttempt};
@@ -199,7 +199,7 @@ pub use inbox::{
 pub use job::{Claim, JobRecord, JobStatus};
 pub use keys::{MAX_QUEUE_NAME_LEN, QueueName};
 pub use kv::{KvOrder, KvPage, KvRange, MAX_KV_VALUE_SIZE};
-pub use lease::LeaseHandle;
+pub use lease::{ClaimFence, LeaseHandle};
 pub use liveness::{StoreActivity, WriterHeartbeat};
 pub use options::{
     DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD, EnqueueOptions, OpenOptions, PRIORITY_HIGH, PRIORITY_LOW,

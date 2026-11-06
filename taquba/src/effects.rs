@@ -12,11 +12,12 @@ use crate::error::{Error, Result};
 use crate::expiry::ExpiryIndex;
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::{QueueName, dedup_index_key, job_index_key, user_scoped_key};
-use crate::kv::validate_kv_value_size;
+use crate::kv::{kv_state_matches, validate_kv_value_size};
+use crate::lease::ClaimFence;
 use crate::options::EnqueueOptions;
 use crate::queue::{EnqueueResult, validate_id_override};
 use crate::queue_core::QueueCore;
-use crate::txn::Txn;
+use crate::txn::{Txn, read_claim};
 
 /// One enqueue contained in [`SettlementEffects`]. The serde form stores the
 /// payload as bytes.
@@ -31,6 +32,34 @@ pub struct EnqueueRequest {
     /// and `id_override` as [`Queue::enqueue_with`](crate::Queue::enqueue_with)
     /// does.
     pub options: EnqueueOptions,
+}
+
+/// A condition of [`SettlementEffects`] on a user KV key: the value the key
+/// must contain, or its absence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvCompare {
+    /// The compared key.
+    pub key: Vec<u8>,
+    /// The value the key must contain, or `None` for an absent key.
+    pub expected: Option<Vec<u8>>,
+}
+
+impl KvCompare {
+    /// A compare that requires `key` to contain `value`.
+    pub fn value(key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
+        Self {
+            key: key.into(),
+            expected: Some(value.into()),
+        }
+    }
+
+    /// A compare that requires `key` to be absent.
+    pub fn absent(key: impl Into<Vec<u8>>) -> Self {
+        Self {
+            key: key.into(),
+            expected: None,
+        }
+    }
 }
 
 /// Effects applied in the same transaction as a settlement: an acknowledgement
@@ -50,8 +79,21 @@ pub struct EnqueueRequest {
 /// effects apply. The count changes of [`Self::count_up`] and
 /// [`Self::count_down`] apply before the enqueues, so an enqueue that waits for
 /// a count reads the changed count.
+///
+/// The settlement tests every compare of [`Self::kv_compares`] in its
+/// transaction before it applies the effects, on the branches that apply them.
+/// A compare that does not match fails the settlement with
+/// [`Error::KvCompareFailed`], and nothing commits. A commit of a compared key
+/// by another transaction before this one commits retries the settlement, which
+/// tests the compares again. The effects can write or delete a compared key.
 #[derive(Debug, Clone, Default)]
 pub struct SettlementEffects {
+    /// The conditions on user KV keys under which the effects apply.
+    pub kv_compares: Vec<KvCompare>,
+    /// The claim that must be live for the effects to apply. A claim that has
+    /// ended fails the settlement with [`Error::ClaimLost`], and a commit that
+    /// ends the claim before this one commits retries the settlement.
+    pub claim_fence: Option<ClaimFence>,
     /// Jobs enqueued atomically with the settlement.
     pub enqueues: Vec<EnqueueRequest>,
     /// Writes applied to the caller KV namespace. Values are size-capped at
@@ -67,6 +109,20 @@ pub struct SettlementEffects {
 }
 
 impl SettlementEffects {
+    /// Add one compare to [`Self::kv_compares`].
+    #[must_use]
+    pub fn kv_compare(mut self, compare: KvCompare) -> Self {
+        self.kv_compares.push(compare);
+        self
+    }
+
+    /// Set [`Self::claim_fence`].
+    #[must_use]
+    pub fn claim_fence(mut self, fence: ClaimFence) -> Self {
+        self.claim_fence = Some(fence);
+        self
+    }
+
     /// Add one to the count `name`. A count is a number of active items in the
     /// store, which a job waits for with
     /// [`EnqueueOptions::count_wait`](crate::EnqueueOptions::count_wait).
@@ -150,6 +206,8 @@ pub(crate) struct PreparedJob {
 /// transaction.
 #[derive(Default)]
 pub(crate) struct PreparedEffects {
+    pub(crate) kv_compares: Vec<KvCompare>,
+    pub(crate) claim_fence: Option<ClaimFence>,
     pub(crate) prepared_jobs: Vec<PreparedJob>,
     pub(crate) kv_writes: HashMap<Vec<u8>, Vec<u8>>,
     pub(crate) kv_deletes: Vec<Vec<u8>>,
@@ -291,6 +349,8 @@ impl QueueCore {
             .collect::<Result<Vec<_>>>()?;
         self.offload_prepared(&mut prepared_jobs).await?;
         Ok(PreparedEffects {
+            kv_compares: effects.kv_compares,
+            claim_fence: effects.claim_fence,
             prepared_jobs,
             kv_writes: effects.kv_writes,
             kv_deletes: effects.kv_deletes,
@@ -301,15 +361,35 @@ impl QueueCore {
 
     /// Add prepared effects to a caller-owned settlement transaction, and
     /// return one enqueue result per prepared enqueue, in order. Called inside
-    /// every iteration of the settlement's retry loop. A dedup hit downgrades
-    /// that enqueue to [`EnqueueResult::AlreadyEnqueued`] without affecting the
-    /// rest. After the settlement ends, the caller passes the results to
-    /// [`Self::finish_effects`].
+    /// every iteration of the settlement's retry loop. A fence of a claim that
+    /// has ended returns [`Error::ClaimLost`], and a compare that does not
+    /// match returns [`Error::KvCompareFailed`], before any write is staged. A
+    /// dedup hit downgrades that enqueue to [`EnqueueResult::AlreadyEnqueued`]
+    /// without affecting the rest. After the settlement ends, the caller passes
+    /// the results to [`Self::finish_effects`].
     pub(crate) async fn stage_effects(
         &self,
         txn: &mut Txn,
         prepared: &PreparedEffects,
     ) -> Result<Vec<EnqueueResult>> {
+        if let Some(fence) = &prepared.claim_fence {
+            read_claim(
+                txn,
+                &self.lease_registry,
+                &fence.queue,
+                &fence.id,
+                fence.claim_id,
+            )
+            .await?;
+        }
+        for compare in &prepared.kv_compares {
+            let scoped = user_scoped_key(&compare.key);
+            if !kv_state_matches(txn, &scoped, compare.expected.as_deref()).await? {
+                return Err(Error::KvCompareFailed {
+                    key: compare.key.clone(),
+                });
+            }
+        }
         for (name, delta) in &prepared.count_changes {
             stage_count_change(txn, name, *delta).await?;
         }

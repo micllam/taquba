@@ -262,6 +262,16 @@ async fn submit_rejects_the_reserved_names_in_its_headers_and_effects() {
         .await
         .unwrap_err();
     assert!(matches!(&err, Error::ReservedCountName(name) if name == "workflow/groups/g"));
+
+    let err = runtime
+        .submit(RunSpec {
+            input: Vec::new(),
+            effects: SettlementEffects::default().kv_compare(taquba::KvCompare::absent(b"k")),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::KvCompareInEffects));
 }
 
 #[tokio::test(start_paused = true)]

@@ -232,17 +232,34 @@ pub(crate) async fn take_claim(
     id: &str,
     claim_id: u64,
 ) -> Result<JobRecord> {
+    let (key, job) = read_claim(txn, registry, queue, id, claim_id).await?;
+    txn.delete(&key)?;
+    Ok(job)
+}
+
+/// Verify that the claim `claim_id` identifies is still the job's live claim,
+/// as [`take_claim`] does, without ending it: the claimed record joins the read
+/// set of `txn`, so a commit that ends or replaces the claim before `txn`
+/// commits fails `txn` with a conflict. Returns the record's key and the stored
+/// record, or [`Error::ClaimLost`] when the claim ended.
+pub(crate) async fn read_claim(
+    txn: &DbTransaction,
+    registry: &LeaseRegistry,
+    queue: &QueueName,
+    id: &str,
+    claim_id: u64,
+) -> Result<(Vec<u8>, JobRecord)> {
     match registry.current(queue, id) {
         Some((_, current)) if current == claim_id => {}
         _ => return Err(Error::ClaimLost),
     }
     let key = claimed_key(queue, id);
+    txn.mark_read([&key])?;
     let Some(raw) = txn.get(&key).await? else {
         return Err(Error::ClaimLost);
     };
     let job = JobRecord::decode(&key, &raw)?;
-    txn.delete(&key)?;
-    Ok(job)
+    Ok((key, job))
 }
 
 /// Whether a commit waits for its WAL flush before returning.

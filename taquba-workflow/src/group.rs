@@ -13,7 +13,7 @@ use bytes::Bytes;
 use futures_util::stream::{self, FuturesUnordered, Stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use taquba::object_store::path::Path;
-use taquba::{KvOrder, Queue, QueueView, SettlementEffects};
+use taquba::{KvCompare, KvOrder, Queue, QueueView, SettlementEffects};
 use tracing::warn;
 
 use crate::blob::ObjectPrefix;
@@ -342,7 +342,10 @@ impl GroupStore {
         for page in members.chunks(MEMBER_PAGE_SIZE) {
             let compares: Vec<_> = page
                 .iter()
-                .map(|(key, member)| (key.as_slice(), member.stored.as_deref()))
+                .map(|(key, member)| KvCompare {
+                    key: key.to_vec(),
+                    expected: member.stored.as_ref().map(|stored| stored.to_vec()),
+                })
                 .collect();
             let mut deletes: Vec<_> = page
                 .iter()
@@ -356,14 +359,15 @@ impl GroupStore {
                 deletes.extend(run_kv_entry_keys(self.queue.view(), &run_id).await?);
                 deletes.push(run_kv_key(&run_id));
             }
-            let effects = SettlementEffects::default().kv_deletes(deletes);
-            if self
-                .queue
-                .kv_compare_commit(&compares, effects)
-                .await?
-                .is_none()
-            {
-                return Ok(false);
+            let effects = SettlementEffects {
+                kv_compares: compares,
+                kv_deletes: deletes,
+                ..SettlementEffects::default()
+            };
+            match self.queue.commit_effects(effects).await {
+                Ok(_) => {}
+                Err(taquba::Error::KvCompareFailed { .. }) => return Ok(false),
+                Err(err) => return Err(err.into()),
             }
         }
         for member in removal.members.values() {

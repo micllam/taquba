@@ -571,29 +571,12 @@ impl Queue {
     /// keeps separate from the queue and must move in one step without a
     /// transition of its own, such as reconciling the state of a job the reaper
     /// dead-lettered.
-    pub async fn commit_effects(&self, effects: SettlementEffects) -> Result<Vec<EnqueueResult>> {
-        let committed = self.core.commit_effects_where(effects, &[]).await?;
-        Ok(committed.expect("a commit without a compare is unconditional"))
-    }
-
-    /// Apply `effects` as [`Self::commit_effects`] does, only if the current
-    /// state of every user KV key of `compares` matches its expected state:
-    /// `Some(v)` requires the key to contain exactly `v`, and `None` requires
-    /// the key to be absent.
     ///
-    /// Returns the enqueue results when every state matched and the effects
-    /// were applied, and `None` when one did not (nothing is changed in that
-    /// case). The compares and the effects execute in one transaction, so no
-    /// concurrent write can be interleaved between a compare and the commit:
-    /// either this call applies the effects to the state it compared against,
-    /// or it reports `None`. The effects are durable before the call returns
-    /// `Some`, and they can write or delete a compared key.
-    pub async fn kv_compare_commit(
-        &self,
-        compares: &[(&[u8], Option<&[u8]>)],
-        effects: SettlementEffects,
-    ) -> Result<Option<Vec<EnqueueResult>>> {
-        self.core.commit_effects_where(effects, compares).await
+    /// A compare of [`SettlementEffects::kv_compares`] that does not match
+    /// returns [`Error::KvCompareFailed`] and leaves the store as it was. The
+    /// effects are durable before the call returns `Ok`.
+    pub async fn commit_effects(&self, effects: SettlementEffects) -> Result<Vec<EnqueueResult>> {
+        self.core.commit_effects(effects).await
     }
 
     /// Claim the next pending job using the configured default lease duration.

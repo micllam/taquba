@@ -71,6 +71,12 @@ pub enum Error {
     #[error("count `{0}` uses the reserved `workflow/` prefix")]
     ReservedCountName(String),
 
+    /// [`crate::RunSpec::effects`] contains a [`taquba::KvCompare`]. A failed
+    /// compare reruns a step, which the runtime does not define for the effects
+    /// of a caller.
+    #[error("the effects of a run spec contain a kv compare")]
+    KvCompareInEffects,
+
     /// A key was staged through an [`crate::EffectsHandle`] for both a write
     /// and a delete within one step. The combination does not have a defined
     /// order in the settlement transaction and is rejected when the second
@@ -198,6 +204,7 @@ impl Error {
             | Self::InconsistentRunState(_)
             | Self::ReservedKvKey(_)
             | Self::ReservedCountName(_)
+            | Self::KvCompareInEffects
             | Self::ReservedQueue(_)
             | Self::ConflictingKvEffect(_)
             | Self::EffectsSealed
@@ -269,6 +276,7 @@ mod tests {
             (Error::InconsistentRunState(rid("run-1")), true),
             (Error::ReservedKvKey("workflow/x".into()), true),
             (Error::ReservedCountName("workflow/x".into()), true),
+            (Error::KvCompareInEffects, true),
             (Error::ReservedQueue("workflow-steps".into()), true),
             (Error::ConflictingKvEffect("k".into()), true),
             (Error::EffectsSealed, true),

@@ -3,42 +3,29 @@
 
 use crate::effects::{PreparedEffects, PreparedJob, SettlementEffects};
 use crate::error::Result;
-use crate::keys::user_scoped_key;
-use crate::kv::kv_state_matches;
 use crate::queue::EnqueueResult;
 use crate::queue_core::QueueCore;
 use crate::txn::{Attempt, Durability};
 
 impl QueueCore {
-    /// Body of `commit_effects` and `kv_compare_commit`: the transaction loop
-    /// over the prepared effects, with every compare of `compares` (a key and
-    /// its expected state) tested first.
-    pub(crate) async fn commit_effects_where(
+    /// Body of `commit_effects`: the transaction loop over the prepared
+    /// effects.
+    pub(crate) async fn commit_effects(
         &self,
         effects: SettlementEffects,
-        compares: &[(&[u8], Option<&[u8]>)],
-    ) -> Result<Option<Vec<EnqueueResult>>> {
+    ) -> Result<Vec<EnqueueResult>> {
         let prepared = self.prepare_effects(effects).await?;
-        let compares: Vec<_> = compares
-            .iter()
-            .map(|(key, expected)| (user_scoped_key(key), *expected))
-            .collect();
         let mut committed = {
-            let (prepared, compares) = (&prepared, &compares);
+            let prepared = &prepared;
             self.retry(Durability::Awaited, |mut txn| async move {
-                for (scoped, expected) in compares {
-                    if !kv_state_matches(&txn, scoped, *expected).await? {
-                        return Ok((txn, Attempt::Abort(None)));
-                    }
-                }
                 let staged = self.stage_effects(&mut txn, prepared).await?;
-                Ok((txn, Attempt::Commit(Some(staged))))
+                Ok((txn, Attempt::Commit(staged)))
             })
             .await
         };
-        let staged = committed.as_mut().ok().and_then(Option::take);
+        let staged = committed.as_mut().ok().map(std::mem::take);
         let results = self.finish_effects(prepared, staged).await;
-        committed.map(|_| results)
+        committed.map(|_| results.unwrap_or_default())
     }
 
     /// Persist a prepared [`JobRecord`](crate::JobRecord) with its prepared

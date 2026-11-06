@@ -9,8 +9,8 @@ use std::time::Duration;
 use futures_util::TryStreamExt;
 use tracing::warn;
 
-use crate::effects::SettlementEffects;
-use crate::error::Result;
+use crate::effects::{KvCompare, SettlementEffects};
+use crate::error::{Error, Result};
 use crate::kv::KvOrder;
 use crate::queue::Queue;
 use crate::time_bound::TimeBound;
@@ -50,8 +50,8 @@ pub enum Expired {
     /// Commit the effects in the transaction that deletes the entry.
     Delete(SettlementEffects),
     /// As [`Delete`](Self::Delete) when the user KV key `key` matches
-    /// `expected`, as [`Queue::kv_compare_commit`] compares it, and a delete of
-    /// the entry alone when it does not.
+    /// `expected`, as a [`KvCompare`] of the effects compares it, and a delete
+    /// of the entry alone when it does not.
     DeleteIf {
         /// The key compared.
         key: Vec<u8>,
@@ -152,14 +152,17 @@ impl ExpiryIndex {
                     expected,
                     effects,
                 } => {
-                    let applied = queue
-                        .kv_compare_commit(
-                            &[(&compared, expected.as_deref())],
-                            effects.kv_delete(key.clone()),
-                        )
-                        .await?;
-                    if applied.is_none() {
-                        queue.kv_delete(&key).await?;
+                    let compare = KvCompare {
+                        key: compared,
+                        expected,
+                    };
+                    match queue
+                        .commit_effects(effects.kv_compare(compare).kv_delete(key.clone()))
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(Error::KvCompareFailed { .. }) => queue.kv_delete(&key).await?,
+                        Err(err) => return Err(err),
                     }
                     removed += 1;
                 }

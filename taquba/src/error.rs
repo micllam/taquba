@@ -51,6 +51,15 @@ pub enum Error {
         key: Vec<u8>,
     },
 
+    /// A [`crate::KvCompare`] of a [`crate::SettlementEffects`] value did not
+    /// match the stored state, so neither the settlement nor its effects
+    /// committed. The state can match on a later attempt.
+    #[error("kv key {key:?} does not match the compare of the settlement")]
+    KvCompareFailed {
+        /// The compared key.
+        key: Vec<u8>,
+    },
+
     /// A value written to the user KV namespace exceeded the configured maximum
     /// size. The cap is enforced at the API boundary to keep bulk payload out
     /// of the LSM tree. Store large blobs in the underlying object store and
@@ -274,6 +283,7 @@ impl Error {
             | Self::InvalidStoreUrl { .. }
             | Self::InboxPathWithinQueue { .. } => true,
             Self::Storage(_)
+            | Self::KvCompareFailed { .. }
             | Self::PayloadStore(_)
             | Self::StoreNotInitialized { .. }
             | Self::InboxStore(_) => false,

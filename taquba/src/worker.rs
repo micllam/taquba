@@ -157,7 +157,10 @@ pub trait Worker: Send + Sync {
     /// [`SettlementEffects`] that the worker loop passes to
     /// [`crate::Queue::ack_with`], so follow-up enqueues and caller KV changes
     /// are written in the same transaction as the ack. Errors behave exactly as
-    /// in [`Self::process`].
+    /// in [`Self::process`]. When a compare of the effects does not match, the
+    /// worker loop nacks the job without the effects, so the job runs again
+    /// against the current state within its attempts. The same applies to the
+    /// effects of a [`FailWith`].
     fn process_with_effects(
         &self,
         job: &JobRecord,
@@ -401,6 +404,14 @@ async fn process_and_settle<W: Worker>(
     };
     match settlement {
         Ok(()) => {}
+        Err(err @ Error::KvCompareFailed { .. }) => {
+            if let Err(e) = queue_handle
+                .nack_with(&claim, &err.to_string(), SettlementEffects::default())
+                .await
+            {
+                warn!(queue = queue, job_id = %job_id, "retry of a settlement whose compare failed failed: {e}");
+            }
+        }
         Err(Error::ClaimLost) => warn!(
             queue = queue,
             job_id = %job_id,
@@ -492,6 +503,7 @@ impl<T: Send + 'static> WorkerHandle<T> {
 mod tests {
     use super::*;
     use crate::clock::MockClock;
+    use crate::effects::KvCompare;
     use crate::options::{OpenOptions, QueueConfig};
     use crate::queue::Queue;
     use slatedb::object_store::memory::InMemory;
@@ -795,6 +807,59 @@ mod tests {
         let rejection = Error::ConflictingKvEffect { key: b"k".to_vec() };
         assert_eq!(dead.last_error, Some(rejection.to_string()));
         assert!(queue.view().kv_get(b"k").await.unwrap().is_none());
+        queue.close().await.unwrap();
+    }
+
+    /// Writes its attempt under `k`, with a compare that only the second
+    /// attempt matches.
+    struct ComparingWorker;
+
+    impl Worker for ComparingWorker {
+        async fn process_with_effects(
+            &self,
+            job: &JobRecord,
+            _lease: &LeaseHandle,
+        ) -> std::result::Result<SettlementEffects, WorkerError> {
+            let expected: &[u8] = if job.attempts == 1 {
+                b"stale"
+            } else {
+                b"current"
+            };
+            Ok(SettlementEffects::default()
+                .kv_compare(KvCompare::value(b"k", expected))
+                .kv_put(b"k".to_vec(), job.attempts.to_string().into_bytes()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_settlement_whose_compare_fails_runs_the_job_again_without_its_effects() {
+        let queue = Queue::open(Arc::new(InMemory::new()), "test")
+            .await
+            .unwrap();
+        queue.kv_put(b"k", b"current").await.unwrap();
+        queue.enqueue("work", b"job".to_vec()).await.unwrap();
+
+        let settled = async {
+            while queue.view().kv_get(b"k").await.unwrap().as_deref() == Some(b"current") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        run_worker(
+            &queue,
+            "work",
+            &ComparingWorker,
+            Duration::from_millis(50),
+            settled,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            queue.view().kv_get(b"k").await.unwrap().as_deref(),
+            Some(b"2".as_slice())
+        );
+        let stats = queue.view().stats("work").await.unwrap();
+        assert_eq!((stats.pending, stats.dead), (0, 0));
         queue.close().await.unwrap();
     }
 

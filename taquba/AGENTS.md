@@ -22,6 +22,9 @@ Each rule identifies the code it applies to, whose docs describe the mechanism.
 - **Claim fencing** (`txn::take_claim`). Do not fence on key identity, and do
   not reuse a claim id across a reap.
 - **Claim id.** Do not rename it to `token`, and do not add a public accessor.
+  The claim id is not ordered, so it fences only against the queue's own state
+  (`queue_core/claim.rs::new_claim_id`). A fence on the queue's state must use
+  `ClaimFence`.
 - **Leases** (`lease.rs`). Do not add a flag that skips the requeue at open, a
   shortening or absolute-set renewal method, an automatic renewer or a
   `max_lease_lifetime`.

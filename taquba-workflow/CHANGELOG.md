@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   key, with the member record and the result object of that member alone, and
   return `Error::MemberNotFound` for a key outside the group. A match on `Error`
   needs the new variant.
+- `RunSpec::effects` rejects a `taquba::KvCompare` with
+  `Error::KvCompareInEffects`, because a failed compare would run a step again.
+  A match on `Error` needs the new variant.
 
 ### Changed
 

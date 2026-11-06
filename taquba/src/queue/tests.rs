@@ -1,12 +1,12 @@
 use ulid::Ulid;
 
 use super::*;
-use crate::EnqueueRequest;
 use crate::expiry::{Expired, ExpiryIndex};
 use crate::keys::MAX_QUEUE_NAME_LEN;
 use crate::kv::MAX_KV_VALUE_SIZE;
 use crate::options::{PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_NORMAL};
 use crate::test_util::*;
+use crate::{EnqueueRequest, KvCompare};
 
 #[tokio::test]
 async fn clock_accessor_returns_the_configured_clock() {
@@ -1396,12 +1396,13 @@ async fn commit_effects_applies_enqueues_and_kv_in_one_transaction() {
 }
 
 #[tokio::test]
-async fn kv_compare_commit_applies_the_effects_only_when_every_key_matches() {
+async fn commit_effects_applies_the_effects_only_when_every_compare_matches() {
     let q = Queue::open(make_store(), "test").await.unwrap();
     q.kv_put(b"runs/1", b"active").await.unwrap();
     q.kv_put(b"runs/1/step", b"3").await.unwrap();
-    let effects = || {
-        SettlementEffects::default()
+    let effects = |compares: Vec<KvCompare>| SettlementEffects {
+        kv_compares: compares,
+        ..SettlementEffects::default()
             .enqueue(EnqueueRequest {
                 queue: "work".to_string(),
                 payload: b"follow-up".to_vec(),
@@ -1410,6 +1411,7 @@ async fn kv_compare_commit_applies_the_effects_only_when_every_key_matches() {
             .kv_put(b"runs/1".to_vec(), b"done".to_vec())
             .kv_delete(b"runs/1/step".to_vec())
     };
+    let failed = |result: Result<Vec<EnqueueResult>>| matches!(result, Err(Error::KvCompareFailed { key }) if key == b"runs/1/step" || key == b"runs/1");
     async fn pending(q: &Queue) -> usize {
         q.view()
             .list_jobs("work", JobStatus::Pending, None, 10)
@@ -1421,28 +1423,22 @@ async fn kv_compare_commit_applies_the_effects_only_when_every_key_matches() {
 
     // A different value and a wrong absence expectation do not apply the
     // effects.
-    assert!(
-        q.kv_compare_commit(&[(b"runs/1", Some(b"stale"))], effects())
+    assert!(failed(
+        q.commit_effects(effects(vec![KvCompare::value(b"runs/1", b"stale")]))
             .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        q.kv_compare_commit(&[(b"runs/1", None)], effects())
+    ));
+    assert!(failed(
+        q.commit_effects(effects(vec![KvCompare::absent(b"runs/1")]))
             .await
-            .unwrap()
-            .is_none()
-    );
+    ));
     // One compare of a list that does not match has the same effect.
-    assert!(
-        q.kv_compare_commit(
-            &[(b"runs/1", Some(b"active")), (b"runs/1/step", Some(b"2"))],
-            effects()
-        )
+    assert!(failed(
+        q.commit_effects(effects(vec![
+            KvCompare::value(b"runs/1", b"active"),
+            KvCompare::value(b"runs/1/step", b"2"),
+        ]))
         .await
-        .unwrap()
-        .is_none()
-    );
+    ));
     assert_eq!(
         q.view().kv_get(b"runs/1").await.unwrap().as_deref(),
         Some(b"active".as_slice())
@@ -1455,13 +1451,12 @@ async fn kv_compare_commit_applies_the_effects_only_when_every_key_matches() {
 
     // The expected values apply the effects, the compared keys included.
     let results = q
-        .kv_compare_commit(
-            &[(b"runs/1", Some(b"active")), (b"runs/1/step", Some(b"3"))],
-            effects(),
-        )
+        .commit_effects(effects(vec![
+            KvCompare::value(b"runs/1", b"active"),
+            KvCompare::value(b"runs/1/step", b"3"),
+        ]))
         .await
-        .unwrap()
-        .expect("the value matched");
+        .unwrap();
     assert!(matches!(results.as_slice(), [EnqueueResult::New(_)]));
     assert_eq!(
         q.view().kv_get(b"runs/1").await.unwrap().as_deref(),
@@ -1471,16 +1466,51 @@ async fn kv_compare_commit_applies_the_effects_only_when_every_key_matches() {
     assert_eq!(pending(&q).await, 1);
 
     // Absence is a state to compare against.
-    let claim = SettlementEffects::default().kv_put(b"runs/2".to_vec(), b"active".to_vec());
-    let results = q
-        .kv_compare_commit(&[(b"runs/2", None)], claim)
-        .await
-        .unwrap();
-    assert!(matches!(results.as_deref(), Some([])));
+    let claim = SettlementEffects::default()
+        .kv_compare(KvCompare::absent(b"runs/2"))
+        .kv_put(b"runs/2".to_vec(), b"active".to_vec());
+    let results = q.commit_effects(claim).await.unwrap();
+    assert!(results.is_empty());
     assert_eq!(
         q.view().kv_get(b"runs/2").await.unwrap().as_deref(),
         Some(b"active".as_slice())
     );
+
+    q.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_claim_fence_applies_the_effects_only_while_the_claim_is_live() {
+    let q = Queue::open(make_store(), "test").await.unwrap();
+    q.enqueue("work", b"job".to_vec()).await.unwrap();
+    let claim = q
+        .claim("work", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .unwrap();
+    let fence = q.lease_handle(&claim).fence().expect("a claimed handle");
+    let effects = |value: &[u8]| {
+        SettlementEffects::default()
+            .claim_fence(fence.clone())
+            .kv_put(b"k".to_vec(), value.to_vec())
+    };
+
+    q.commit_effects(effects(b"live")).await.unwrap();
+    assert_eq!(
+        q.view().kv_get(b"k").await.unwrap().as_deref(),
+        Some(b"live".as_slice())
+    );
+
+    q.ack(&claim).await.unwrap();
+    assert!(matches!(
+        q.commit_effects(effects(b"ended")).await,
+        Err(Error::ClaimLost)
+    ));
+    assert_eq!(
+        q.view().kv_get(b"k").await.unwrap().as_deref(),
+        Some(b"live".as_slice())
+    );
+    assert!(LeaseHandle::detached().fence().is_none());
 
     q.close().await.unwrap();
 }

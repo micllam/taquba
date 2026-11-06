@@ -13,6 +13,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for a named count to reach zero, which `SettlementEffects::count_up` and
   `count_down` change. A struct literal of either type needs the new field or
   `..Default::default()`.
+- `SettlementEffects::kv_compares` with `KvCompare`: a settlement and
+  `commit_effects` apply the effects only when each compared user KV key has its
+  expected state, and fail with `Error::KvCompareFailed` otherwise, which makes
+  `run_worker` and `run_worker_concurrent` run the job again. A struct literal
+  of `SettlementEffects` needs the new field or `..Default::default()`, and a
+  match on `Error` needs the new variant.
+- `SettlementEffects::claim_fence` with `LeaseHandle::fence`: effects that a
+  handler commits during its claim apply only while the claim is live, and fail
+  with `Error::ClaimLost` once it has ended. A struct literal of
+  `SettlementEffects` needs the new field or `..Default::default()`.
 
 ### Changed
 
@@ -20,14 +30,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   object_store 0.14.2. A store written with 0.16.0 opens without a migration
   step.
 
+### Removed
+
+- `Queue::kv_compare_commit`, which `commit_effects` with the compares of
+  `SettlementEffects::kv_compares` replaces. After the upgrade, a caller must
+  move its compares into the effects and match `Error::KvCompareFailed` where it
+  read `None`.
+
 ### Fixed
 
 - `QueueView::list_jobs` and `QueueView::kv_scan` allocate for the entries they
   read, so a `limit` such as `usize::MAX` returns its page, where it panicked
   with a capacity overflow or aborted the process.
-- `Queue::kv_compare_commit` compares again when another transaction commits a
-  compared key before its own commit. In 0.16.0, two calls that each compared a
-  key that only the other wrote could both apply.
 - `run_worker` and `run_worker_concurrent` dead-letter a job whose settlement
   the queue rejects with a permanent error, with that error and without the
   effects. In 0.16.0, the job stayed claimed until its lease expired, and it was
