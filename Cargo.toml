@@ -18,9 +18,9 @@ mod_module_files = "warn"
 return_self_not_must_use = "warn"
 
 [workspace.dependencies]
-taquba = { path = "taquba", version = "0.16.0" }
-taquba-webhooks = { path = "taquba-webhooks", version = "0.12.0" }
-taquba-workflow = { path = "taquba-workflow", version = "0.15.0" }
+taquba = { path = "taquba", version = "0.17.0" }
+taquba-webhooks = { path = "taquba-webhooks", version = "0.13.0" }
+taquba-workflow = { path = "taquba-workflow", version = "0.16.0" }
 
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-util = "0.7"

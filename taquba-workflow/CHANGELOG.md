@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-06
+
 ### Added
 
 - `StepOutcome::continue_on_group` and `Trigger::OnGroup`: a step waits for a
@@ -72,6 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fills it from `Job::max_attempts`, so a member takes the limit of its job as
   `JobRunner::submit` does. After the upgrade, a construction of `GroupMember`
   must set the field.
+- Raised the minimum `taquba` requirement to 0.17 and, for the `webhooks`
+  feature, the `taquba-webhooks` requirement to 0.13.
 
 ### Removed
 
