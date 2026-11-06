@@ -109,6 +109,16 @@ impl<J: Job> JobGroup<J> {
         }))
     }
 
+    /// The result of the member `key` once it terminates. See
+    /// [`RunGroup::result`].
+    pub async fn result(&self, key: &str) -> Result<GroupResult<J>> {
+        let member = self.group.result(key).await?;
+        Ok(GroupResult {
+            key: member.key,
+            result: decode_end::<J>(member.outcome)?,
+        })
+    }
+
     /// Wait until every member terminates and return their results in
     /// submission order. See [`results`](Self::results).
     pub async fn join(&self) -> Result<Vec<GroupResult<J>>> {
@@ -225,6 +235,7 @@ mod tests {
         assert_eq!(keys, ["square:3", "square:13", "square:2"]);
         assert_eq!(results[0].result.as_ref().unwrap(), &9);
         assert_eq!(results[2].result.as_ref().unwrap(), &4);
+        assert_eq!(group.result("square:2").await.unwrap().result.unwrap(), 4);
         let failure = results[1].result.as_ref().unwrap_err();
         assert_eq!(
             (failure.kind, failure.message.as_str()),
@@ -272,6 +283,10 @@ mod tests {
         group.forget().await.unwrap();
         assert!(matches!(group.status().await, Err(Error::GroupNotFound(_))));
         assert!(matches!(group.resume().await, Err(Error::GroupNotFound(_))));
+        assert!(matches!(
+            group.results().await,
+            Err(Error::GroupNotFound(_))
+        ));
         worker.shutdown().await.unwrap();
     }
 }

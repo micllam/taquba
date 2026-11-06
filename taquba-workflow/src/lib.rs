@@ -372,16 +372,16 @@
 //! group id: [`WorkflowRuntime::group`] names it, [`RunGroup::submit`] writes
 //! its manifest (the members' keys and inputs) and submits the members,
 //! [`RunGroup::results`] yields each member's [`MemberResult`] (its key and its
-//! [`TerminatedRun`]) as it terminates, [`RunGroup::cancel`] cancels every
-//! active member and [`RunGroup::status`] counts the members by state. A
-//! process without a runtime reads the same counts with
-//! [`WorkflowView::group_status`]. A member's run id is derived from the group
-//! id, its key and its count of earlier runs, so groups never share run state
-//! and a run never shares the state of an earlier run. A second submission of
-//! the same set, or [`RunGroup::resume`] from the manifest alone, runs again
-//! only the members that did not succeed, which is how a step that fans out
-//! stays safe under a retry and how a batch of inputs is run again after a
-//! partial failure.
+//! [`TerminatedRun`]) as it terminates, [`RunGroup::result`] reads the result
+//! of one member by key, [`RunGroup::cancel`] cancels every active member and
+//! [`RunGroup::status`] counts the members by state. A process without a
+//! runtime reads the same counts with [`WorkflowView::group_status`]. A
+//! member's run id is derived from the group id, its key and its count of
+//! earlier runs, so groups never share run state and a run never shares the
+//! state of an earlier run. A second submission of the same set, or
+//! [`RunGroup::resume`] from the manifest alone, runs again only the members
+//! that did not succeed, which is how a step that fans out stays safe under a
+//! retry and how a batch of inputs is run again after a partial failure.
 //!
 //! The group's durable state is the manifest in the object store and one member
 //! record per key under `workflow/groups/` in the queue's key-value namespace,
@@ -450,6 +450,7 @@
 //! jobs, each with the job's idempotency key or the positional `item-{i}` as
 //! its key, [`jobs::JobGroup::results`] yields each member's typed result as it
 //! terminates and [`jobs::JobGroup::join`] returns them in submission order.
+//! [`jobs::JobGroup::result`] reads the typed result of one member by key.
 //! `resume`, `status`, `cancel`, `forget` and
 //! [`jobs::JobRunnerBuilder::group_retention`] are the run group's. Streamed
 //! output, progress, a failure threshold and a cost rollup are folds the caller

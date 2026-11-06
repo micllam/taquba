@@ -116,6 +116,15 @@ pub enum Error {
         key: String,
     },
 
+    /// A read of one member named a key outside the group's manifest.
+    #[error("group `{group_id}` has no member `{key}`")]
+    MemberNotFound {
+        /// The group id.
+        group_id: RunId,
+        /// The key.
+        key: String,
+    },
+
     /// Two members of one group have the same key.
     #[error("duplicate member key `{0}` in group")]
     DuplicateMemberKey(String),
@@ -196,6 +205,7 @@ impl Error {
             | Self::Deserialization(_)
             | Self::RunNotFound(_)
             | Self::MemberNotSubmitted { .. }
+            | Self::MemberNotFound { .. }
             | Self::DuplicateMemberKey(_)
             | Self::GroupMismatch(_)
             | Self::GroupNotFound(_)
@@ -295,6 +305,13 @@ mod tests {
             ),
             (
                 Error::MemberNotSubmitted {
+                    group_id: rid("b"),
+                    key: "k".into(),
+                },
+                true,
+            ),
+            (
+                Error::MemberNotFound {
                     group_id: rid("b"),
                     key: "k".into(),
                 },

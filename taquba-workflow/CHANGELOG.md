@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   starts with the prefix, with `Error::ReservedCountName`, so that only the
   runtime changes the counts of its groups. A match on `Error` needs the new
   variant.
+- `RunGroup::result` and `JobGroup::result` read the result of one member by
+  key, with the member record and the result object of that member alone, and
+  return `Error::MemberNotFound` for a key outside the group. A match on `Error`
+  needs the new variant.
 
 ### Changed
 

@@ -385,8 +385,9 @@ A `RunGroup` is a durable set of runs of one runtime, identified by a group id:
 `WorkflowRuntime::group` names it, `RunGroup::submit` writes its manifest (the
 members' keys and inputs) and submits the members, `RunGroup::results` yields
 each member's `MemberResult` (its key and its `TerminatedRun`) as it terminates,
-`RunGroup::cancel` cancels every active member and `RunGroup::status` counts the
-members by state. A process without a runtime reads the same counts with
+`RunGroup::result` reads the result of one member by key, `RunGroup::cancel`
+cancels every active member and `RunGroup::status` counts the members by state.
+A process without a runtime reads the same counts with
 `WorkflowView::group_status`. A member's run id is derived from the group id,
 its key and its count of earlier runs, so groups never share run state and a run
 never shares the state of an earlier run. A second submission of the same set,
@@ -456,10 +457,11 @@ A `JobGroup` is a [run group](#run-groups) of jobs of one type:
 `JobRunner::group` names it, `JobGroup::submit` takes the jobs, each with the
 job's idempotency key or the positional `item-{i}` as its key,
 `JobGroup::results` yields each member's typed result as it terminates and
-`JobGroup::join` returns them in submission order. `resume`, `status`, `cancel`,
-`forget` and `JobRunnerBuilder::group_retention` are the run group's. Streamed
-output, progress, a failure threshold and a cost rollup are folds the caller
-writes over the results.
+`JobGroup::join` returns them in submission order. `JobGroup::result` reads the
+typed result of one member by key. `resume`, `status`, `cancel`, `forget` and
+`JobRunnerBuilder::group_retention` are the run group's. Streamed output,
+progress, a failure threshold and a cost rollup are folds the caller writes over
+the results.
 [`examples/group_document_pipeline.rs`](examples/group_document_pipeline.rs)
 shows a per-document pipeline of memoized stages with counters rolled up by the
 caller.

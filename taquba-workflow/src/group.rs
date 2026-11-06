@@ -621,25 +621,61 @@ impl RunGroup {
         let group = self.clone();
         Ok(terminations.then(move |member| {
             let group = group.clone();
-            async move {
-                let member = member?;
-                let run_id = member.record.run_id;
-                let termination = member
-                    .record
-                    .terminated
-                    .ok_or_else(|| Error::InconsistentRunState(run_id.clone()))?;
-                let outcome = group
-                    .core()
-                    .view
-                    .outcome_of(&run_id, termination)
-                    .await?
-                    .ok_or(Error::RunNotFound(run_id))?;
-                Ok(MemberResult {
-                    key: member.key,
-                    outcome,
-                })
-            }
+            async move { group.member_result(member?).await }
         }))
+    }
+
+    /// The result of the member `key` once it terminates. A member already
+    /// terminated is returned at once. Returns [`Error::GroupNotFound`] for a
+    /// group never submitted and [`Error::MemberNotFound`] for a key outside
+    /// the group's manifest.
+    pub async fn result(&self, key: &str) -> Result<MemberResult> {
+        let record = match self.wait_member(key).await {
+            Err(Error::MemberNotSubmitted { .. }) => return Err(self.missing_member(key).await),
+            record => record?,
+        };
+        self.member_result(MemberState {
+            key: key.to_string(),
+            record,
+        })
+        .await
+    }
+
+    /// The error for the member `key` without a member record:
+    /// [`Error::GroupNotFound`] without a manifest, [`Error::MemberNotFound`]
+    /// for a key outside the manifest and [`Error::MemberNotSubmitted`]
+    /// otherwise.
+    async fn missing_member(&self, key: &str) -> Error {
+        let manifest = match self.manifest().await {
+            Ok(manifest) => manifest,
+            Err(err) => return err,
+        };
+        let id = self.id.clone();
+        let key = key.to_string();
+        if manifest.members.iter().any(|member| member.key == key) {
+            Error::MemberNotSubmitted { group_id: id, key }
+        } else {
+            Error::MemberNotFound { group_id: id, key }
+        }
+    }
+
+    /// The result of the terminated member `member`.
+    async fn member_result(&self, member: MemberState) -> Result<MemberResult> {
+        let run_id = member.record.run_id;
+        let termination = member
+            .record
+            .terminated
+            .ok_or_else(|| Error::InconsistentRunState(run_id.clone()))?;
+        let outcome = self
+            .core()
+            .view
+            .outcome_of(&run_id, termination)
+            .await?
+            .ok_or(Error::RunNotFound(run_id))?;
+        Ok(MemberResult {
+            key: member.key,
+            outcome,
+        })
     }
 
     /// The group's durable state, as
@@ -907,6 +943,53 @@ mod tests {
         let again: Vec<MemberResult> = group.results().await.unwrap().try_collect().await.unwrap();
         assert_eq!(again.len(), 2);
         worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_member_result_waits_for_the_member_and_names_what_is_missing() {
+        let (queue, store) = open_queue().await;
+        let runtime = WorkflowRuntime::builder(queue, store, TwoSteps)
+            .poll_interval(Duration::from_millis(10))
+            .build()
+            .unwrap();
+        let group = runtime.group(rid("g"));
+        group
+            .submit(vec![member("a"), member("b")], &RunOptions::default())
+            .await
+            .unwrap();
+
+        let worker = runtime.spawn(std::future::pending::<()>());
+        let result = tokio::time::timeout(Duration::from_secs(10), group.result("b"))
+            .await
+            .expect("result finished in time")
+            .unwrap();
+        assert_eq!(result.key, "b");
+        assert_eq!(result.outcome.run_id, member_run_id(&rid("g"), "b", 0));
+        assert_eq!(result.outcome.result.as_deref(), Some(b"1".as_slice()));
+        worker.shutdown().await.unwrap();
+
+        assert!(matches!(
+            group.result("c").await,
+            Err(Error::MemberNotFound { key, .. }) if key == "c"
+        ));
+        assert!(matches!(
+            runtime.group(rid("none")).result("a").await,
+            Err(Error::GroupNotFound(id)) if id == "none"
+        ));
+        // A manifest written without its members, as a crash leaves it.
+        let unsubmitted = runtime.group(rid("h"));
+        unsubmitted
+            .store()
+            .write_manifest(&Manifest {
+                group_id: rid("h"),
+                members: vec![member("a")],
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            unsubmitted.result("a").await,
+            Err(Error::MemberNotSubmitted { key, .. }) if key == "a"
+        ));
     }
 
     #[tokio::test(start_paused = true)]
