@@ -47,4 +47,6 @@ Each rule identifies the code it applies to, whose docs describe the mechanism.
   job id to `JobHandle`, a second handler trait, an open-coded decode-run-encode
   sequence or a runtime wrapper.
 - **Run groups** (`group.rs`). Do not add a batch type, a second typed
-  presentation, per-member settings or membership on the run record.
+  presentation, a per-member setting other than the attempt limit or membership
+  on the run record. A member setting must stay out of the member set that a
+  later submission is compared with.

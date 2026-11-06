@@ -60,9 +60,9 @@ impl<J: Job> JobGroup<J> {
     /// success and two jobs with one key are rejected with
     /// [`Error::DuplicateMemberKey`](crate::Error::DuplicateMemberKey).
     ///
-    /// `options` applies to every member, and the group does not consult
-    /// [`Job::max_attempts`]. A limit other than the queue's must be set with
-    /// [`RunOptions::max_attempts_per_step`].
+    /// `options` applies to every member. [`RunOptions::max_attempts_per_step`]
+    /// takes precedence over each member's [`Job::max_attempts`], as in
+    /// [`JobRunner::submit_with`](crate::jobs::JobRunner::submit_with).
     pub async fn submit_with(
         &self,
         jobs: impl IntoIterator<Item = J>,
@@ -73,6 +73,7 @@ impl<J: Job> JobGroup<J> {
             members.push(GroupMember {
                 key: job.idempotency_key().unwrap_or_else(|| format!("item-{i}")),
                 input: job_payload(&job)?,
+                max_attempts: job.max_attempts(),
             });
         }
         self.group.submit(members, &options).await
@@ -187,6 +188,10 @@ mod tests {
         fn idempotency_key(&self) -> Option<String> {
             Some(format!("square:{}", self.n))
         }
+
+        fn max_attempts(&self) -> Option<u32> {
+            Some(self.n)
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -202,6 +207,16 @@ mod tests {
         let jobs = || vec![Square { n: 3 }, Square { n: 13 }, Square { n: 2 }];
         let group = runner.group::<Square>(rid("squares"));
         group.submit(jobs()).await.unwrap();
+        let limits: Vec<Option<u32>> = group
+            .group
+            .manifest()
+            .await
+            .unwrap()
+            .members
+            .iter()
+            .map(|member| member.max_attempts)
+            .collect();
+        assert_eq!(limits, [Some(3), Some(13), Some(2)]);
         let results = tokio::time::timeout(std::time::Duration::from_secs(10), group.join())
             .await
             .expect("join finished in time")

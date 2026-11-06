@@ -349,6 +349,7 @@ async fn a_member_record_is_rewritten_only_by_the_terminating_settlement() {
             vec![GroupMember {
                 key: "m".to_string(),
                 input: Vec::new(),
+                max_attempts: None,
             }],
             &RunOptions {
                 max_attempts_per_step: Some(2),

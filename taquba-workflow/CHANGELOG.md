@@ -56,6 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commits with the termination. Before the upgrade, a store written with 0.15.0
   must be drained: its runs must terminate, its notification jobs must complete
   and memo retention must remove their terminal records.
+- `GroupMember::max_attempts` sets the attempt limit of a member, and `JobGroup`
+  fills it from `Job::max_attempts`, so a member takes the limit of its job as
+  `JobRunner::submit` does. After the upgrade, a construction of `GroupMember`
+  must set the field.
 
 ### Removed
 

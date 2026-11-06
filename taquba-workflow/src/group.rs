@@ -128,6 +128,18 @@ pub struct GroupMember {
     pub key: String,
     /// The input of the member's step 0.
     pub input: Vec<u8>,
+    /// The attempt limit of each step of the member's run.
+    /// [`RunOptions::max_attempts_per_step`] takes precedence, and the queue's
+    /// limit applies when neither is set.
+    pub max_attempts: Option<u32>,
+}
+
+impl GroupMember {
+    /// The key and the input, which identify the member in the member set. The
+    /// attempt limit can change between two submissions of a group.
+    fn identity(&self) -> (&str, &[u8]) {
+        (&self.key, &self.input)
+    }
 }
 
 /// The members of one group, in submission order.
@@ -489,9 +501,11 @@ impl RunGroup {
     /// rejected with [`Error::GroupMismatch`], and a later submission with the
     /// same set submits every member whose last recorded termination is not a
     /// success, so a group is re-submitted after a crash or to run its failed
-    /// members again. Two members with one key are rejected with
-    /// [`Error::DuplicateMemberKey`]. `options` applies to every member. A
-    /// submission that fails returns after the members submitted so far.
+    /// members again. The member set compares keys and inputs, and a later
+    /// submission applies its own attempt limits. Two members with one key are
+    /// rejected with [`Error::DuplicateMemberKey`]. `options` applies to every
+    /// member. A submission that fails returns after the members submitted so
+    /// far.
     pub async fn submit(&self, members: Vec<GroupMember>, options: &RunOptions) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
         for member in &members {
@@ -504,7 +518,13 @@ impl RunGroup {
             members,
         };
         match self.store().read_manifest(&self.id).await? {
-            Some(existing) if existing.members != manifest.members => {
+            Some(existing)
+                if existing
+                    .members
+                    .iter()
+                    .map(GroupMember::identity)
+                    .ne(manifest.members.iter().map(GroupMember::identity)) =>
+            {
                 return Err(Error::GroupMismatch(self.id.clone()));
             }
             Some(_) => {}
@@ -515,8 +535,9 @@ impl RunGroup {
 
     /// Submit the members of the group's manifest whose last recorded
     /// termination is not a success: a member still active continues, and the
-    /// rest run. Returns [`Error::GroupNotFound`] for a group never submitted.
-    /// `options` applies as in [`submit`](Self::submit).
+    /// rest run, with the attempt limits of the first submission. Returns
+    /// [`Error::GroupNotFound`] for a group never submitted. `options` applies
+    /// as in [`submit`](Self::submit).
     pub async fn resume(&self, options: &RunOptions) -> Result<()> {
         let manifest = self.manifest().await?;
         self.submit_members(manifest.members, options).await
@@ -544,7 +565,12 @@ impl RunGroup {
                     RunSpec {
                         run_id: Some(run_id),
                         input: member.input,
-                        options: options.clone(),
+                        options: RunOptions {
+                            max_attempts_per_step: options
+                                .max_attempts_per_step
+                                .or(member.max_attempts),
+                            ..options.clone()
+                        },
                         effects: SettlementEffects::default(),
                     },
                 )
@@ -778,6 +804,7 @@ mod tests {
         GroupMember {
             key: key.to_string(),
             input: key.as_bytes().to_vec(),
+            max_attempts: None,
         }
     }
 
@@ -895,8 +922,12 @@ mod tests {
             headers: HashMap::from([("tenant".to_string(), "acme".to_string())]),
             ..Default::default()
         };
+        let limited = GroupMember {
+            max_attempts: Some(2),
+            ..member("a")
+        };
         group
-            .submit(vec![member("a"), member("b")], &options)
+            .submit(vec![limited, member("b")], &options)
             .await
             .unwrap();
 
@@ -910,6 +941,47 @@ mod tests {
             assert_eq!(job.max_attempts, 5);
             assert_eq!(job.headers.get("tenant").map(String::as_str), Some("acme"));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_submission_applies_its_attempt_limits_and_a_resume_those_of_the_manifest() {
+        let (queue, store) = open_queue().await;
+        let runtime = WorkflowRuntime::builder(queue, store, TwoSteps)
+            .build()
+            .unwrap();
+        let group = runtime.group(rid("g"));
+        let limited = |max_attempts| GroupMember {
+            max_attempts: Some(max_attempts),
+            ..member("a")
+        };
+        let limit_of_run = |run| {
+            let runtime = runtime.clone();
+            async move {
+                let run_id = member_run_id(&rid("g"), "a", run);
+                let (_, job) = runtime
+                    .inner
+                    .core
+                    .view
+                    .current_job(&run_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                job.max_attempts
+            }
+        };
+        let options = RunOptions::default();
+
+        group.submit(vec![limited(2)], &options).await.unwrap();
+        assert_eq!(limit_of_run(0).await, 2);
+
+        // A changed limit is not a different member set.
+        group.cancel(None).await.unwrap();
+        group.submit(vec![limited(4)], &options).await.unwrap();
+        assert_eq!(limit_of_run(1).await, 4);
+
+        group.cancel(None).await.unwrap();
+        group.resume(&options).await.unwrap();
+        assert_eq!(limit_of_run(2).await, 2);
     }
 
     #[tokio::test(start_paused = true)]
