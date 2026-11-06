@@ -5,7 +5,10 @@ use futures_util::TryStreamExt;
 use taquba::{KvOrder, Queue, QueueView};
 
 use crate::error::Result;
-use crate::keys::{RUN_KV_ENTRY_PREFIX, RunId, run_kv_entries_range, run_kv_entry_key};
+use crate::keys::{
+    OWNER_QUEUES_KV_PREFIX, RUN_KV_ENTRY_PREFIX, RunId, owner_queues_range, run_kv_entries_range,
+    run_kv_entry_key,
+};
 
 /// Read access to Taquba's caller KV namespace and to the run KV space of the
 /// delivery's run during a step.
@@ -83,23 +86,25 @@ impl KvReadHandle {
     }
 }
 
-/// The keys of the run KV entries of `run_id` through `view`, for a sweep that
-/// removes the run.
-pub(crate) async fn run_kv_entry_keys(view: &QueueView, run_id: &RunId) -> Result<Vec<Vec<u8>>> {
-    let range = run_kv_entries_range(run_id);
-    Ok(view
-        .kv_entries(
-            RUN_KV_ENTRY_PREFIX,
-            range,
-            KvOrder::Ascending,
-            RUN_KV_PAGE_SIZE,
-        )
-        .map_ok(|(key, _)| key)
-        .try_collect()
-        .await?)
+/// The keys that a sweep removes with the run `run_id` besides its record, read
+/// through `view`: its run KV entries and the queues of its owned work.
+pub(crate) async fn run_swept_keys(view: &QueueView, run_id: &RunId) -> Result<Vec<Vec<u8>>> {
+    let mut keys = Vec::new();
+    for (prefix, range) in [
+        (RUN_KV_ENTRY_PREFIX, run_kv_entries_range(run_id)),
+        (OWNER_QUEUES_KV_PREFIX, owner_queues_range(run_id)),
+    ] {
+        let page: Vec<Vec<u8>> = view
+            .kv_entries(prefix, range, KvOrder::Ascending, RUN_KV_PAGE_SIZE)
+            .map_ok(|(key, _)| key)
+            .try_collect()
+            .await?;
+        keys.extend(page);
+    }
+    Ok(keys)
 }
 
-/// The page size of [`run_kv_entry_keys`].
+/// The page size of [`run_swept_keys`].
 const RUN_KV_PAGE_SIZE: usize = 256;
 
 #[cfg(test)]

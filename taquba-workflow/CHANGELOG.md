@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RunSpec::effects` rejects a `taquba::KvCompare` with
   `Error::KvCompareInEffects`, because a failed compare would run a step again.
   A match on `Error` needs the new variant.
+- `RunOptions::owner`, set to `Delivery::owner` during the step, makes a run, a
+  group or a job the owned work of the step's run, and the termination of the
+  owner cancels it with `CancelOrigin::Owner`. A struct literal of `RunOptions`
+  or `Delivery` needs the new field, and a match on `CancelOrigin` or `Error`
+  needs the new variants.
 
 ### Changed
 

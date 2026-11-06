@@ -92,10 +92,11 @@
 //! headers, the queue job id, the attempt count and limit
 //! ([`Delivery::is_last_attempt`] reports whether a transient error from this
 //! attempt dead-letters the step) and the delivery's handles (the cancellation
-//! token, the lease, the per-step and run-scoped memos, the staged KV effects
-//! and committed KV reads). [`jobs::JobContext`] dereferences to the same type.
-//! [`Delivery::detached`] and [`Step::detached`] build instances without a
-//! queue, for tests.
+//! token, the lease, the per-step and run-scoped memos, the staged KV effects,
+//! the committed KV reads and the run as the owner of
+//! [owned work](#owned-work)). [`jobs::JobContext`] dereferences to the same
+//! type. [`Delivery::detached`] and [`Step::detached`] build instances without
+//! a queue, for tests.
 //!
 //! # Submissions
 //!
@@ -200,6 +201,22 @@
 //!   are the same.
 //! - A step claimed after the request is settled as cancelled without
 //!   running.
+//!
+//! # Owned work
+//!
+//! A step submits a run, a group or a job as the owned work of its run, with
+//! [`RunOptions::owner`] set to [`Delivery::owner`]. The termination of the
+//! owner with any status cancels its active owned runs with
+//! [`CancelOrigin::Owner`], so the work that a step fans out ends with the run
+//! that started it. Owned work can run on another runtime over the same queue,
+//! which must run its worker to apply the cancel.
+//!
+//! An owner is valid while its step runs. A submission fails with
+//! [`Error::OwnerStepEnded`] once the step has returned or lost its claim, and
+//! with [`Error::OwnerOfAnotherQueue`] for the owner of a runtime over another
+//! [`taquba::Queue`]. A group stores the owner of its first submission, so
+//! [`RunGroup::resume`] of an owned group must pass the owner of a running step
+//! of the owner run. A duplicate submission keeps the owner of the first.
 //!
 //! # Long-running steps
 //!
@@ -670,6 +687,7 @@ pub mod jobs;
 mod keys;
 mod kv;
 mod memo;
+mod owner;
 mod runner;
 mod runtime;
 mod signal;
@@ -690,6 +708,7 @@ pub use keys::{
 };
 pub use kv::KvReadHandle;
 pub use memo::{Memo, MemoStore};
+pub use owner::Owner;
 pub use runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 pub use runtime::{
     CancelRunOutcome, DEFAULT_QUEUE_NAME, RunOptions, RunSpec, RunnerHandle, SubmitOutcome,

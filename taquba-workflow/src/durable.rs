@@ -74,6 +74,7 @@ pub(crate) async fn kv_record<T: DeserializeOwned>(
 
 use crate::effects::StagedEffects;
 use crate::keys::RunId;
+use crate::owner::SubmissionId;
 use crate::runner::{StepErrorKind, StepOutcome, Trigger};
 use crate::terminal::{CancelOrigin, RunTermination, TerminalStatus};
 use crate::view::StepRef;
@@ -103,6 +104,7 @@ pub(crate) enum DurableRun {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DurableRunRecord {
     pub(crate) run_id: RunId,
+    pub(crate) submission_id: SubmissionId,
     pub(crate) submitted_at_ms: u64,
     pub(crate) input_hash: [u8; 32],
     pub(crate) cancel_request: Option<DurableCancelRequest>,
@@ -112,6 +114,7 @@ pub(crate) struct DurableRunRecord {
 /// copies into the terminal record.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Submission {
+    pub(crate) submission_id: SubmissionId,
     pub(crate) input_hash: [u8; 32],
     pub(crate) submitted_at_ms: u64,
 }
@@ -119,17 +122,19 @@ pub(crate) struct Submission {
 impl From<&DurableRunRecord> for Submission {
     fn from(record: &DurableRunRecord) -> Self {
         Self {
+            submission_id: record.submission_id,
             input_hash: record.input_hash,
             submitted_at_ms: record.submitted_at_ms,
         }
     }
 }
 
-/// The cancellation request of a run, on its run record: the reason of the
-/// first request and the runtime clock's time of its write.
+/// The cancellation request of a run, on its run record: the reason and the
+/// origin of the first request and the runtime clock's time of its write.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DurableCancelRequest {
     pub(crate) reason: Option<String>,
+    pub(crate) origin: DurableCancelOrigin,
     pub(crate) requested_at_ms: u64,
 }
 
@@ -138,6 +143,7 @@ pub(crate) struct DurableCancelRequest {
 pub(crate) enum DurableCancelOrigin {
     Runner,
     Request,
+    Owner,
 }
 
 impl From<CancelOrigin> for DurableCancelOrigin {
@@ -145,6 +151,7 @@ impl From<CancelOrigin> for DurableCancelOrigin {
         match origin {
             CancelOrigin::Runner => Self::Runner,
             CancelOrigin::Request => Self::Request,
+            CancelOrigin::Owner => Self::Owner,
         }
     }
 }
@@ -154,6 +161,7 @@ impl From<DurableCancelOrigin> for CancelOrigin {
         match origin {
             DurableCancelOrigin::Runner => Self::Runner,
             DurableCancelOrigin::Request => Self::Request,
+            DurableCancelOrigin::Owner => Self::Owner,
         }
     }
 }

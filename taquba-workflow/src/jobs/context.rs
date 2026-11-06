@@ -26,10 +26,10 @@ impl State {
 /// The per-call context passed to [`Job::run`](crate::jobs::Job::run): the
 /// application state registered on the [`JobRunner`](crate::jobs::JobRunner)
 /// and the [`Delivery`] the job runs under, which it dereferences to (identity,
-/// attempt count, lease, cancellation token, memo, staged KV effects and
-/// committed KV reads). It does not contain domain-specific clients, such as
-/// HTTP or LLM clients. Those belong to the application's registered state or
-/// to layers built on top.
+/// attempt count, lease, cancellation token, memo, staged KV effects, committed
+/// KV reads and the owner of the work the job submits). It does not contain
+/// domain-specific clients, such as HTTP or LLM clients. Those belong to the
+/// application's registered state or to layers built on top.
 pub struct JobContext<'a> {
     state: &'a State,
     delivery: &'a Delivery,

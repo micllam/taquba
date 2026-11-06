@@ -12,6 +12,7 @@ use crate::effects::EffectsHandle;
 use crate::keys::{RunId, next_step_job_id};
 use crate::kv::KvReadHandle;
 use crate::memo::{Memo, MemoStore};
+use crate::owner::{Owner, OwnerRef, SubmissionId};
 
 /// The delivery a handler runs under: the identity of the run and of the queue
 /// job delivering it, the attempt count and the delivery's handles. [`Step`]
@@ -126,6 +127,10 @@ pub struct Delivery {
     ///
     /// See [`KvReadHandle`] for the read semantics.
     pub kv: KvReadHandle,
+    /// This run as the owner of the runs that the step submits with
+    /// [`RunOptions::owner`](crate::RunOptions::owner). The run's termination
+    /// cancels them.
+    pub owner: Owner,
 }
 
 impl Delivery {
@@ -137,7 +142,8 @@ impl Delivery {
 
     /// A delivery without a queue, for tests: run `detached`, attempt 1 of 3,
     /// empty headers, a new cancellation token, the detached lease, effects and
-    /// KV handles and memos over an in-memory object store.
+    /// KV handles, memos over an in-memory object store and an owner that a
+    /// submission rejects with [`Error::OwnerOfAnotherQueue`](crate::Error).
     pub fn detached() -> Self {
         let run_id = RunId::new("detached").expect("a literal run id");
         let memo_store = MemoStore::new(Arc::new(InMemory::new()), "memo");
@@ -154,6 +160,14 @@ impl Delivery {
             run_memo: memo_store.new_run_memo(&run_id),
             effects: EffectsHandle::detached(),
             kv: KvReadHandle::detached(),
+            owner: Owner {
+                run: OwnerRef {
+                    run_id,
+                    submission_id: SubmissionId::detached(),
+                },
+                queue: None,
+                step: None,
+            },
         }
     }
 }

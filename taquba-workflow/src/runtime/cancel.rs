@@ -16,7 +16,19 @@ impl RuntimeCore {
         run_id: &RunId,
         reason: Option<String>,
     ) -> Result<CancelRunOutcome> {
-        let Some((submission, request)) = self.request_cancel(run_id, reason).await? else {
+        self.cancel_run_with(run_id, reason, CancelOrigin::Request)
+            .await
+    }
+
+    /// [`Self::cancel_run`] with the origin `origin`, which the run's
+    /// termination reports unless an earlier request was recorded.
+    pub(crate) async fn cancel_run_with(
+        &self,
+        run_id: &RunId,
+        reason: Option<String>,
+        origin: CancelOrigin,
+    ) -> Result<CancelRunOutcome> {
+        let Some((submission, request)) = self.request_cancel(run_id, reason, origin).await? else {
             return Ok(CancelRunOutcome::NotActive);
         };
         // Settle the current step now: remove it while it is queued, or fire
@@ -36,9 +48,12 @@ impl RuntimeCore {
             }
             let claimed = ClaimedStep::parse(&job)?;
             // The effects are built before the outcome is known, and the queue
-            // applies them only on `Removed`.
-            let ending = Ending::cancelled(CancelOrigin::Request, request.reason.clone());
-            let effects = self.termination_effects(&claimed, ending, None, submission);
+            // applies them only on `Removed`. The owned queues are read for
+            // each step, because a step that settled in between can have
+            // submitted owned work.
+            let owned = self.owned_queues(submission.owner(run_id)).await?;
+            let ending = Ending::cancelled(request.origin.into(), request.reason.clone());
+            let effects = self.termination_effects(&claimed, ending, None, submission, &owned);
             match self.queue.cancel_with(&job.id, effects).await?.0 {
                 taquba::CancelOutcome::Removed => return Ok(CancelRunOutcome::Removed),
                 taquba::CancelOutcome::Requested => return Ok(CancelRunOutcome::Requested),
@@ -47,14 +62,15 @@ impl RuntimeCore {
         }
     }
 
-    /// Record a cancellation request for `reason` on the run record of
-    /// `run_id`. Returns the record's submission and the recorded request when
-    /// the run is active, `None` otherwise. A run with a recorded request keeps
-    /// the first request.
+    /// Record a cancellation request for `reason` by `origin` on the run record
+    /// of `run_id`. Returns the record's submission and the recorded request
+    /// when the run is active, `None` otherwise. A run with a recorded request
+    /// keeps the first request.
     async fn request_cancel(
         &self,
         run_id: &RunId,
         reason: Option<String>,
+        origin: CancelOrigin,
     ) -> Result<Option<(Submission, DurableCancelRequest)>> {
         let key = run_kv_key(run_id);
         loop {
@@ -69,6 +85,7 @@ impl RuntimeCore {
             }
             let request = DurableCancelRequest {
                 reason: reason.clone(),
+                origin: origin.into(),
                 requested_at_ms: self.clock.now_ms(),
             };
             record.cancel_request = Some(request.clone());

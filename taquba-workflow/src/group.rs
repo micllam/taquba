@@ -23,8 +23,9 @@ use crate::keys::{
     HEADER_GROUP, HEADER_GROUP_KEY, RunId, group_count_name, group_member_kv_key,
     group_members_kv_prefix, run_kv_key,
 };
-use crate::kv::run_kv_entry_keys;
+use crate::kv::run_swept_keys;
 use crate::memo::MemoStore;
+use crate::owner::{Owner, OwnerRef};
 use crate::runtime::{
     CancelRunOutcome, RunOptions, RunSpec, RuntimeCore, StepEnqueueOpts, StepWait,
 };
@@ -142,11 +143,13 @@ impl GroupMember {
     }
 }
 
-/// The members of one group, in submission order.
+/// The members of one group in submission order and the owner of its first
+/// submission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Manifest {
     pub(crate) group_id: RunId,
     pub(crate) members: Vec<GroupMember>,
+    pub(crate) owner: Option<OwnerRef>,
 }
 
 /// The durable state of a group, read from its manifest and member records by
@@ -356,7 +359,7 @@ impl GroupStore {
                 .iter()
                 .flat_map(|(_, member)| member.run_ids(&removal.group_id))
             {
-                deletes.extend(run_kv_entry_keys(self.queue.view(), &run_id).await?);
+                deletes.extend(run_swept_keys(self.queue.view(), &run_id).await?);
                 deletes.push(run_kv_key(&run_id));
             }
             let effects = SettlementEffects {
@@ -506,10 +509,11 @@ impl RunGroup {
     /// same set submits every member whose last recorded termination is not a
     /// success, so a group is re-submitted after a crash or to run its failed
     /// members again. The member set compares keys and inputs, and a later
-    /// submission applies its own attempt limits. Two members with one key are
-    /// rejected with [`Error::DuplicateMemberKey`]. `options` applies to every
-    /// member. A submission that fails returns after the members submitted so
-    /// far.
+    /// submission applies its own attempt limits and owner. Two members with
+    /// one key are rejected with [`Error::DuplicateMemberKey`]. `options`
+    /// applies to every member, and the manifest stores the owner of the first
+    /// submission. A submission that fails returns after the members submitted
+    /// so far.
     pub async fn submit(&self, members: Vec<GroupMember>, options: &RunOptions) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
         for member in &members {
@@ -520,6 +524,7 @@ impl RunGroup {
         let manifest = Manifest {
             group_id: self.id.clone(),
             members,
+            owner: options.owner.as_ref().map(|owner| owner.run.clone()),
         };
         match self.store().read_manifest(&self.id).await? {
             Some(existing)
@@ -541,10 +546,24 @@ impl RunGroup {
     /// termination is not a success: a member still active continues, and the
     /// rest run, with the attempt limits of the first submission. Returns
     /// [`Error::GroupNotFound`] for a group never submitted. `options` applies
-    /// as in [`submit`](Self::submit).
+    /// as in [`submit`](Self::submit). The members of an owned group need the
+    /// owner of a running step of the owner run in `options`, and a resume
+    /// without it fails with [`Error::OwnerStepEnded`].
     pub async fn resume(&self, options: &RunOptions) -> Result<()> {
         let manifest = self.manifest().await?;
-        self.submit_members(manifest.members, options).await
+        // The stored owner does not have a step, so its submission fails.
+        let owner = options.owner.clone().or_else(|| {
+            manifest.owner.map(|run| Owner {
+                run,
+                queue: Some(self.core().queue.clone()),
+                step: None,
+            })
+        });
+        let options = RunOptions {
+            owner,
+            ..options.clone()
+        };
+        self.submit_members(manifest.members, &options).await
     }
 
     async fn submit_members(&self, members: Vec<GroupMember>, options: &RunOptions) -> Result<()> {
@@ -987,6 +1006,7 @@ mod tests {
             .write_manifest(&Manifest {
                 group_id: rid("h"),
                 members: vec![member("a")],
+                owner: None,
             })
             .await
             .unwrap();

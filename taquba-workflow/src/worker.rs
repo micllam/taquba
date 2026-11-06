@@ -16,6 +16,7 @@ use crate::error::{self, Error, worker_error};
 use crate::group::Membership;
 use crate::keys::{HEADER_RUN_ID, HEADER_STEP, RunId, next_step_job_id, submitter_headers};
 use crate::kv::KvReadHandle;
+use crate::owner::{HEADER_OWNED, HEADER_OWNER, OwnedQueues, Owner, OwnerRef, OwnerStep};
 use crate::runner::{Delivery, Step, StepError, StepErrorKind, StepOutcome, StepRunner, Trigger};
 use crate::runtime::{RuntimeCore, RuntimeInner, StepEnqueueOpts};
 use crate::terminal::{CancelOrigin, TerminalStatus};
@@ -38,12 +39,13 @@ impl<R: StepRunner + 'static> Worker for StepWorker<R> {
 
 /// One claimed step job as the worker path identifies it: the run and step
 /// named by the job's reserved headers, the run's group membership when the run
-/// is in a group, the submitter's headers with the reserved ones removed and
-/// the queue record itself.
+/// is in a group, its owner when the run is owned, the submitter's headers with
+/// the reserved ones removed and the queue record itself.
 pub(crate) struct ClaimedStep<'a> {
     pub(crate) run_id: RunId,
     pub(crate) step_number: u32,
     pub(crate) membership: Option<Membership>,
+    pub(crate) owner: Option<OwnerRef>,
     /// Submitter-supplied headers, without the reserved `workflow.` keys.
     pub(crate) headers: HashMap<String, String>,
     pub(crate) job: &'a JobRecord,
@@ -51,8 +53,8 @@ pub(crate) struct ClaimedStep<'a> {
 
 impl<'a> ClaimedStep<'a> {
     /// Identify the claimed step from `job`'s headers. Fails, permanently, for
-    /// a job without the run id header, with a run id or group id that is not
-    /// valid or with a step header that is not a `u32`.
+    /// a job without the run id header, with a run id, group id or owner that
+    /// is not valid or with a step header that is not a `u32`.
     pub(crate) fn parse(job: &'a JobRecord) -> Result<Self, Error> {
         let run_id = RunId::new(
             job.headers
@@ -73,6 +75,11 @@ impl<'a> ClaimedStep<'a> {
             run_id,
             step_number,
             membership: Membership::from_headers(&job.headers)?,
+            owner: job
+                .headers
+                .get(HEADER_OWNER)
+                .map(|value| OwnerRef::from_header(value))
+                .transpose()?,
             headers,
             job,
         })
@@ -92,10 +99,15 @@ impl<'a> ClaimedStep<'a> {
     }
 
     fn reserved_headers_with_none(&self) -> Vec<(&'static str, String)> {
-        self.membership
+        let mut headers = self
+            .membership
             .as_ref()
             .map(Membership::reserved_headers)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if let Some(owner) = &self.owner {
+            headers.push((HEADER_OWNER, owner.header_value()));
+        }
+        headers
     }
 }
 
@@ -145,14 +157,17 @@ impl RuntimeCore {
     /// The error that settles a failed step: a permanent error, or a transient
     /// one on the last attempt, dead-letters the step and terminates the run,
     /// and another transient error retries the step.
-    fn step_failure(
+    async fn step_failure(
         &self,
         claimed: &ClaimedStep<'_>,
         err: StepError,
         submission: Submission,
     ) -> WorkerError {
         if err.kind == StepErrorKind::Permanent || claimed.job.is_last_attempt() {
-            self.terminating_failure(claimed, err, submission)
+            match self.owned_queues(submission.owner(&claimed.run_id)).await {
+                Ok(owned) => self.terminating_failure(claimed, err, submission, &owned),
+                Err(read) => worker_error(read),
+            }
         } else {
             err.into_worker_error()
         }
@@ -161,14 +176,15 @@ impl RuntimeCore {
     /// The error a step returns for a failure that terminates its run: the
     /// effects of the `Failed` termination on a [`FailWith`], so the core
     /// applies them only with the dead-lettering settlement.
-    pub(crate) fn terminating_failure(
+    fn terminating_failure(
         &self,
         claimed: &ClaimedStep<'_>,
         error: StepError,
         submission: Submission,
+        owned: &OwnedQueues,
     ) -> WorkerError {
         let ending = Ending::failed(error.message.clone(), Some(error.kind));
-        let effects = self.termination_effects(claimed, ending, None, submission);
+        let effects = self.termination_effects(claimed, ending, None, submission, owned);
         FailWith::new(error.into_worker_error(), effects).into()
     }
 
@@ -193,7 +209,11 @@ impl RuntimeCore {
             }
             None => None,
         };
-        Ok(self.termination_effects(claimed, ending, result, submission))
+        let owned = self
+            .owned_queues(submission.owner(&claimed.run_id))
+            .await
+            .map_err(worker_error)?;
+        Ok(self.termination_effects(claimed, ending, result, submission, &owned))
     }
 
     /// The settlement of `outcome` for `claimed`: the effects of the run's
@@ -211,8 +231,8 @@ impl RuntimeCore {
         submission: Submission,
     ) -> Result<SettlementEffects, WorkerError> {
         match (outcome, external_cancel) {
-            (_, Some(ExternalCancel { reason })) => {
-                let ending = Ending::cancelled(CancelOrigin::Request, reason);
+            (_, Some(ExternalCancel { reason, origin })) => {
+                let ending = Ending::cancelled(origin, reason);
                 self.terminate_recorded(claimed, ending, None, submission)
                     .await
             }
@@ -239,7 +259,7 @@ impl RuntimeCore {
                         .await
                     {
                         Ok(effects) => Ok(effects),
-                        Err(err) => Err(self.step_failure(claimed, err.into(), submission)),
+                        Err(err) => Err(self.step_failure(claimed, err.into(), submission).await),
                     }
                 }
             },
@@ -254,7 +274,7 @@ impl RuntimeCore {
                 self.terminate_recorded(claimed, ending, None, submission)
                     .await
             }
-            (Err(err), None) => Err(self.step_failure(claimed, err, submission)),
+            (Err(err), None) => Err(self.step_failure(claimed, err, submission).await),
         }
     }
 }
@@ -263,6 +283,7 @@ impl RuntimeCore {
 /// request on the run record.
 pub(crate) struct ExternalCancel {
     pub(crate) reason: Option<String>,
+    pub(crate) origin: CancelOrigin,
 }
 
 impl<R: StepRunner> RuntimeInner<R> {
@@ -274,6 +295,9 @@ impl<R: StepRunner> RuntimeInner<R> {
         job: &JobRecord,
         lease: &LeaseHandle,
     ) -> Result<SettlementEffects, WorkerError> {
+        if let Some(owner) = job.headers.get(HEADER_OWNED) {
+            return self.core.cancel_owned(job, owner).await;
+        }
         let claimed = match ClaimedStep::parse(job) {
             Ok(claimed) => claimed,
             Err(err) => {
@@ -294,7 +318,7 @@ impl<R: StepRunner> RuntimeInner<R> {
             .map_err(worker_error)?
             .ok_or_else(|| worker_error(Error::InconsistentRunState(run_id.clone())))?;
         if let Some(request) = &record.cancel_request {
-            let ending = Ending::cancelled(CancelOrigin::Request, request.reason.clone());
+            let ending = Ending::cancelled(request.origin.into(), request.reason.clone());
             return self
                 .core
                 .terminate_recorded(&claimed, ending, None, Submission::from(&record))
@@ -308,6 +332,7 @@ impl<R: StepRunner> RuntimeInner<R> {
         let claim_cancel = lease.cancel_token().clone();
 
         let effects_handle = EffectsHandle::for_delivery(&self.core.queue_name, run_id);
+        let owner_step = lease.fence().map(OwnerStep::new);
         let step = Step {
             delivery: Delivery {
                 run_id: run_id.clone(),
@@ -322,6 +347,11 @@ impl<R: StepRunner> RuntimeInner<R> {
                 run_memo: self.core.memo_store.new_run_memo(run_id),
                 effects: effects_handle.clone(),
                 kv: KvReadHandle::for_delivery(self.core.queue.clone(), run_id.clone()),
+                owner: Owner {
+                    run: Submission::from(&record).owner(run_id),
+                    queue: Some(self.core.queue.clone()),
+                    step: owner_step.clone(),
+                },
             },
             step_number,
             payload: job.payload.clone(),
@@ -348,12 +378,17 @@ impl<R: StepRunner> RuntimeInner<R> {
         // retained handle clone after this point cannot join the settlement, so
         // staging it errors.
         let staged = effects_handle.seal_and_take();
+        // Every owned submission of the step has committed or fails from here,
+        // so a termination below reads all of the owner's queues.
+        if let Some(owner_step) = &owner_step {
+            owner_step.seal().await;
+        }
         let replayed_step_output = replayed.is_some();
         let caller_effects = replayed.unwrap_or(staged);
 
         // A request that lands after this read is recorded on the run record
         // and settles the next step before it runs. A token fired by a request
-        // reads the request's reason from the run record.
+        // reads the request's reason and origin from the run record.
         let external_cancel = if claim_cancel.is_cancelled() {
             let request = self
                 .core
@@ -362,8 +397,15 @@ impl<R: StepRunner> RuntimeInner<R> {
                 .await
                 .map_err(worker_error)?
                 .and_then(|record| record.cancel_request);
-            Some(ExternalCancel {
-                reason: request.and_then(|request| request.reason),
+            Some(match request {
+                Some(request) => ExternalCancel {
+                    reason: request.reason,
+                    origin: request.origin.into(),
+                },
+                None => ExternalCancel {
+                    reason: None,
+                    origin: CancelOrigin::Request,
+                },
             })
         } else {
             None

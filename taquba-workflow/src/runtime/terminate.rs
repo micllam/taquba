@@ -11,7 +11,8 @@ use crate::durable::{
 use crate::effects::TerminalEffects;
 use crate::error::Result;
 use crate::group::terminated_member;
-use crate::keys::{run_kv_key, step_kv_key};
+use crate::keys::{owned_run_kv_key, run_kv_key, step_kv_key};
+use crate::owner::OwnedQueues;
 use crate::sweep::run_periodically;
 use crate::terminal::{RunTermination, TerminatedRun};
 use crate::worker::{ClaimedStep, Ending};
@@ -72,7 +73,10 @@ impl RuntimeCore {
     /// the step that produced the outcome, or the pending step a cancellation
     /// removes, and the run ends with `ending`. `result` contains the stored
     /// reference and the bytes of the result of a succeeded run, and
-    /// `submission` comes from the run record.
+    /// `submission` comes from the run record. `owned` contains the queues of
+    /// the run's owned work as the caller read them after the run's step ended,
+    /// and the effects cancel the work on each queue. The termination of an
+    /// owned run deletes its index entry.
     ///
     /// The effects are pure: this function does not write or mutate state, so a
     /// caller that builds them and then commits a non-terminal outcome does not
@@ -86,6 +90,7 @@ impl RuntimeCore {
         ending: Ending,
         result: Option<(DurableResult, Vec<u8>)>,
         submission: Submission,
+        owned: &OwnedQueues,
     ) -> SettlementEffects {
         let (reference, result) = result.unzip();
         let termination = self.termination(terminal_step, ending, reference, submission);
@@ -114,6 +119,10 @@ impl RuntimeCore {
             );
             effects = effects.count_down(membership.count_name());
         }
+        if let Some(owner) = &terminal_step.owner {
+            effects = effects.kv_delete(owned_run_kv_key(owner, &self.queue_name, run_id));
+        }
+        effects = self.owner_termination_effects(effects, owned);
         match &self.memo_sweep {
             Some(sweep) => sweep.mark(effects, run_id, terminated_at_ms),
             None => effects,
@@ -163,8 +172,9 @@ impl RuntimeCore {
                 .clone()
                 .unwrap_or_else(|| "step dead-lettered outside the worker".to_string());
             let ending = Ending::failed(error, None);
-            let effects =
-                self.termination_effects(&claimed, ending, None, Submission::from(&record));
+            let submission = Submission::from(&record);
+            let owned = self.owned_queues(submission.owner(run_id)).await?;
+            let effects = self.termination_effects(&claimed, ending, None, submission, &owned);
             self.queue.commit_effects(effects).await?;
             warn!(run_id = %run_id, step_number = claimed.step_number, job_id = %job.id, "terminated a run whose step was dead-lettered outside the worker");
             terminated += 1;

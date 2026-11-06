@@ -71,6 +71,18 @@ pub enum Error {
     #[error("count `{0}` uses the reserved `workflow/` prefix")]
     ReservedCountName(String),
 
+    /// A submission named an [`crate::Owner`] whose step has returned or lost
+    /// its claim, or the stored owner of a group, which does not have a step. A
+    /// submission with an owner must happen during the owner's step.
+    #[error("the step of owner run `{0}` has ended")]
+    OwnerStepEnded(RunId),
+
+    /// A submission named an [`crate::Owner`] of a runtime over another
+    /// [`taquba::Queue`], or of [`crate::Delivery::detached`]. The owned
+    /// runtime must share the owner's queue to read the owner's record.
+    #[error("owner run `{0}` belongs to another queue")]
+    OwnerOfAnotherQueue(RunId),
+
     /// [`crate::RunSpec::effects`] contains a [`taquba::KvCompare`]. A failed
     /// compare reruns a step, which the runtime does not define for the effects
     /// of a caller.
@@ -205,6 +217,8 @@ impl Error {
             | Self::ReservedKvKey(_)
             | Self::ReservedCountName(_)
             | Self::KvCompareInEffects
+            | Self::OwnerStepEnded(_)
+            | Self::OwnerOfAnotherQueue(_)
             | Self::ReservedQueue(_)
             | Self::ConflictingKvEffect(_)
             | Self::EffectsSealed
@@ -277,6 +291,8 @@ mod tests {
             (Error::ReservedKvKey("workflow/x".into()), true),
             (Error::ReservedCountName("workflow/x".into()), true),
             (Error::KvCompareInEffects, true),
+            (Error::OwnerStepEnded(rid("owner")), true),
+            (Error::OwnerOfAnotherQueue(rid("owner")), true),
             (Error::ReservedQueue("workflow-steps".into()), true),
             (Error::ConflictingKvEffect("k".into()), true),
             (Error::EffectsSealed, true),

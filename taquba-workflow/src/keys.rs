@@ -13,6 +13,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use taquba::{EnqueueRequest, Queue, SettlementEffects};
 
 use crate::error::{Error, Result};
+use crate::owner::OwnerRef;
 
 /// Header key carrying the run identifier on every step job.
 pub const HEADER_RUN_ID: &str = "workflow.run_id";
@@ -142,6 +143,50 @@ pub(crate) const RUN_KV_ENTRY_PREFIX: &[u8] = b"workflow/run-kv/";
 /// `workflow/groups/{group_id}/{key}`, one per member, written with the
 /// member's submission and rewritten in the settlement that terminates it.
 pub(crate) const GROUP_KV_PREFIX: &[u8] = b"workflow/groups/";
+
+/// Prefix of the index of owned runs:
+/// `workflow/owned/{owner}:{submission_id}/{queue}/{run_id}`, written with the
+/// submission of each owned run and deleted with its termination. A queue name
+/// does not contain `/`, so the prefix of one queue contains its entries alone.
+pub(crate) const OWNED_KV_PREFIX: &[u8] = b"workflow/owned/";
+
+/// Prefix of the queues with owned runs of each owner:
+/// `workflow/owner-queues/{owner}/{submission_id}`, removed with the owner by
+/// the memo sweep and the group sweep.
+pub(crate) const OWNER_QUEUES_KV_PREFIX: &[u8] = b"workflow/owner-queues/";
+
+/// The index entry of the run `run_id` on `queue`, owned by `owner`.
+pub(crate) fn owned_run_kv_key(owner: &OwnerRef, queue: &str, run_id: &RunId) -> Vec<u8> {
+    prefixed(
+        OWNED_KV_PREFIX,
+        &format!("{}/{queue}/{run_id}", owner.header_value()),
+    )
+}
+
+/// The range of the index entries of the runs on `queue` owned by `owner`, from
+/// their prefix to the prefix with `0`, the byte after `/`, in its place.
+pub(crate) fn owned_runs_range(owner: &OwnerRef, queue: &str) -> Range<Vec<u8>> {
+    let owner = owner.header_value();
+    let start = prefixed(OWNED_KV_PREFIX, &format!("{owner}/{queue}/"));
+    let end = prefixed(OWNED_KV_PREFIX, &format!("{owner}/{queue}0"));
+    start..end
+}
+
+/// The key of the queues with owned runs of `owner`.
+pub(crate) fn owner_queues_kv_key(owner: &OwnerRef) -> Vec<u8> {
+    prefixed(
+        OWNER_QUEUES_KV_PREFIX,
+        &format!("{}/{}", owner.run_id, owner.submission_id),
+    )
+}
+
+/// The range of the keys of the queues of every submission of `run_id` as an
+/// owner.
+pub(crate) fn owner_queues_range(run_id: &RunId) -> Range<Vec<u8>> {
+    let start = prefixed(OWNER_QUEUES_KV_PREFIX, &format!("{run_id}/"));
+    let end = prefixed(OWNER_QUEUES_KV_PREFIX, &format!("{run_id}0"));
+    start..end
+}
 
 /// Prefix under which the member records of one group are stored.
 pub(crate) fn group_members_kv_prefix(group_id: &RunId) -> Vec<u8> {
@@ -369,6 +414,8 @@ mod tests {
             RUN_KV_ENTRY_PREFIX,
             GROUP_KV_PREFIX,
             GROUP_TERMINAL_KV_PREFIX,
+            OWNED_KV_PREFIX,
+            OWNER_QUEUES_KV_PREFIX,
         ] {
             assert!(
                 prefix.starts_with(RESERVED_KV_PREFIX.as_bytes()),

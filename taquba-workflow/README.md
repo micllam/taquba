@@ -124,9 +124,10 @@ A `Step` dereferences to its `Delivery`: the run id, the submitter's headers,
 the queue job id, the attempt count and limit (`Delivery::is_last_attempt`
 reports whether a transient error from this attempt dead-letters the step) and
 the delivery's handles (the cancellation token, the lease, the per-step and
-run-scoped memos, the staged KV effects and committed KV reads).
-`jobs::JobContext` dereferences to the same type. `Delivery::detached` and
-`Step::detached` build instances without a queue, for tests.
+run-scoped memos, the staged KV effects, the committed KV reads and the run as
+the owner of [owned work](#owned-work)). `jobs::JobContext` dereferences to the
+same type. `Delivery::detached` and `Step::detached` build instances without a
+queue, for tests.
 
 ## Submissions
 
@@ -221,6 +222,22 @@ terminates with the reason on `RunTermination::error` and
   `Cancelled` once the step returns. Watching the token reduces the latency of
   cancelling a slow step. The semantics are the same.
 - A step claimed after the request is settled as cancelled without running.
+
+## Owned work
+
+A step submits a run, a group or a job as the owned work of its run, with
+`RunOptions::owner` set to `Delivery::owner`. The termination of the owner with
+any status cancels its active owned runs with `CancelOrigin::Owner`, so the work
+that a step fans out ends with the run that started it. Owned work can run on
+another runtime over the same queue, which must run its worker to apply the
+cancel.
+
+An owner is valid while its step runs. A submission fails with
+`Error::OwnerStepEnded` once the step has returned or lost its claim, and with
+`Error::OwnerOfAnotherQueue` for the owner of a runtime over another `Queue`. A
+group stores the owner of its first submission, so `RunGroup::resume` of an
+owned group must pass the owner of a running step of the owner run. A duplicate
+submission keeps the owner of the first.
 
 ## Long-running steps
 

@@ -12,8 +12,9 @@ use crate::durable::DurableStepRef;
 use crate::error::{Error, Result};
 use crate::group::{GroupStore, RunGroup};
 use crate::keys::{RunId, run_kv_key};
-use crate::kv::run_kv_entry_keys;
+use crate::kv::run_swept_keys;
 use crate::memo::MemoStore;
+use crate::owner::Owner;
 use crate::runner::StepRunner;
 use crate::sweep::{Clearable, Cleared, Sweep};
 use crate::terminal::{TerminalHook, TerminatedRun};
@@ -53,6 +54,10 @@ pub struct RunOptions {
     /// queue's scheduled state until the queue's clock passes this time. With
     /// `None`, the step-0 job is claimable at once.
     pub run_at: Option<SystemTime>,
+    /// The run that owns this run, from [`Delivery::owner`](crate::Delivery) of
+    /// one of its steps. The owner's termination cancels this run. A duplicate
+    /// submission keeps the owner of the first.
+    pub owner: Option<Owner>,
 }
 
 /// Spec passed to [`WorkflowRuntime::submit`].
@@ -155,7 +160,7 @@ impl Clearable for RunStore {
         if !marked {
             return Ok(Cleared::Superseded);
         }
-        let mut keys = run_kv_entry_keys(self.queue.view(), run_id).await?;
+        let mut keys = run_swept_keys(self.queue.view(), run_id).await?;
         self.memo_store.clear_memos_for_run(run_id).await?;
         keys.push(run_kv_key(run_id));
         Ok(Cleared::Removed(keys))

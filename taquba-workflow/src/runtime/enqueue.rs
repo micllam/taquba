@@ -12,6 +12,8 @@ use crate::keys::{
     DEDUP_PREFIX, HEADER_RUN_ID, HEADER_STEP, RunId, check_effects, check_headers, hash_input,
     next_step_job_id, run_kv_key, step_kv_key,
 };
+use crate::owner::{HEADER_OWNER, SubmissionId};
+use crate::terminal::CancelOrigin;
 use crate::worker::ClaimedStep;
 
 /// The encoded current-step pointer for `job_id` at `step_number`.
@@ -83,6 +85,7 @@ impl RuntimeCore {
         let run_id = self.validate_spec(&spec)?;
         let request = DurableCancelRequest {
             reason,
+            origin: CancelOrigin::Request.into(),
             requested_at_ms: self.clock.now_ms(),
         };
         self.enqueue_run(&run_id, spec, None, Some(request)).await
@@ -105,8 +108,29 @@ impl RuntimeCore {
     /// and the step's dedup key serialises two submissions that both find the
     /// record absent. A `membership` is set on the step job, and its pending
     /// member record and the increment of the count of its group commit with
-    /// the enqueue. A `cancel_request` is written on the run record.
+    /// the enqueue. A `cancel_request` is written on the run record. The
+    /// submission of an owned run compares the owner's set of queues, and a
+    /// change of the set before the commit starts the submission again.
     async fn enqueue_run(
+        &self,
+        run_id: &RunId,
+        spec: RunSpec,
+        membership: Option<&Membership>,
+        cancel_request: Option<DurableCancelRequest>,
+    ) -> Result<SubmitOutcome> {
+        loop {
+            let attempt = self
+                .enqueue_run_once(run_id, spec.clone(), membership, cancel_request.clone())
+                .await;
+            match attempt {
+                Err(Error::Queue(taquba::Error::KvCompareFailed { .. })) => continue,
+                attempt => return attempt,
+            }
+        }
+    }
+
+    /// One attempt of [`Self::enqueue_run`].
+    async fn enqueue_run_once(
         &self,
         run_id: &RunId,
         spec: RunSpec,
@@ -140,14 +164,18 @@ impl RuntimeCore {
             None => {}
         }
 
+        let mut reserved_headers = membership
+            .map(Membership::reserved_headers)
+            .unwrap_or_default();
+        if let Some(owner) = &spec.options.owner {
+            reserved_headers.push((HEADER_OWNER, owner.run.header_value()));
+        }
         let opts = StepEnqueueOpts {
             run_at: spec.options.run_at,
             priority: spec.options.priority,
             max_attempts: spec.options.max_attempts_per_step,
             wait: None,
-            reserved_headers: membership
-                .map(Membership::reserved_headers)
-                .unwrap_or_default(),
+            reserved_headers,
         };
         let job_id = self.queue.next_job_id();
         let request = self.step_enqueue_request(
@@ -161,6 +189,7 @@ impl RuntimeCore {
 
         let record_bytes = durable::encode(&DurableRun::Active(DurableRunRecord {
             run_id: run_id.clone(),
+            submission_id: SubmissionId::of_job(&job_id),
             submitted_at_ms: self.clock.now_ms(),
             input_hash,
             cancel_request,
@@ -177,18 +206,35 @@ impl RuntimeCore {
                 )
                 .count_up(membership.count_name());
         }
+        // The seal of the owner's step waits for the guard, which the enqueue
+        // keeps until its commit.
+        let _owned = match &spec.options.owner {
+            Some(owner) => {
+                let guard = self.open_owned_submission(owner).await?;
+                effects = self
+                    .owned_submission_effects(effects, owner, run_id)
+                    .await?;
+                Some(guard)
+            }
+            None => None,
+        };
         let submitted = SubmitOutcome {
             run_id: run_id.clone(),
             newly_submitted: true,
             job_id,
         };
 
-        match self
+        let enqueued = self
             .queue
             .enqueue_with_effects(&request.queue, request.payload, request.options, effects)
-            .await?
-            .0
-        {
+            .await;
+        let enqueued = match (enqueued, &spec.options.owner) {
+            (Err(taquba::Error::ClaimLost), Some(owner)) => {
+                return Err(Error::OwnerStepEnded(owner.run.run_id.clone()));
+            }
+            (enqueued, _) => enqueued?,
+        };
+        match enqueued.0 {
             EnqueueResult::New(_) => {}
             // A concurrent submission committed first, and its record contains
             // the input to check against. A dedup hit without a record is a

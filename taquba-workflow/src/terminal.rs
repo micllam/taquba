@@ -56,6 +56,9 @@ pub enum CancelOrigin {
     /// A request through [`crate::WorkflowRuntime::cancel`] or a
     /// [`crate::CancelCommand`].
     Request,
+    /// The termination of the run's [`crate::Owner`]. A run with a recorded
+    /// request reports [`Self::Request`], because the first request wins.
+    Owner,
 }
 
 impl CancelOrigin {
@@ -65,6 +68,7 @@ impl CancelOrigin {
         match self {
             CancelOrigin::Runner => "runner",
             CancelOrigin::Request => "request",
+            CancelOrigin::Owner => "owner",
         }
     }
 }

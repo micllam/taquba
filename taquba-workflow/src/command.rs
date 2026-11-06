@@ -127,6 +127,7 @@ impl SubmitCommand {
                 priority: self.priority,
                 max_attempts_per_step: self.max_attempts_per_step,
                 run_at: self.run_at.map(|ms| UNIX_EPOCH + Duration::from_millis(ms)),
+                owner: None,
             },
             effects: Default::default(),
         }

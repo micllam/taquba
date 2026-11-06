@@ -50,3 +50,7 @@ Each rule identifies the code it applies to, whose docs describe the mechanism.
   presentation, a per-member setting other than the attempt limit or membership
   on the run record. A member setting must stay out of the member set that a
   later submission is compared with.
+- **Owned work** (`owner.rs`). The cancel of owned work must stay a job that the
+  owner's termination stages on the step queue of the owned runtime. Do not send
+  it through the control queue, and do not add a removal of owned work by the
+  owner's sweep.
