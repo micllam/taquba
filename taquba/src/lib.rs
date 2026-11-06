@@ -1,14 +1,9 @@
-//! A durable, single-process task queue for Rust **without a stateful service
-//! to operate**. Queue state lives directly in the application's object
-//! storage, and compute is stateless and replaceable.
-//!
-//! > The foundation of the [Taquba ecosystem](https://github.com/micllam/taquba).
-//! > The workspace README describes the durable-execution workflow runtime,
-//! > cron, jobs and webhooks crates that build on this queue.
-//!
-//! Built on [SlateDB] and the [`object_store`] crate. Use Taquba for durable
-//! background jobs whose state persists across node loss, ephemeral disks and
-//! region failures, without operating a queue server or a database server.
+//! A durable task queue whose state lives in object storage, through [SlateDB]
+//! and the [`object_store`] crate. One process owns a store and commits every
+//! transition, and its producers and workers share one [`Queue`]. The
+//! [README](https://github.com/micllam/taquba/tree/master/taquba) states when
+//! the queue is the correct choice, and `taquba-workflow` runs durable
+//! multi-step processes on it.
 //!
 //! # Quick start
 //!
@@ -34,27 +29,6 @@
 //! `examples/quickstart.rs` is a runnable version, and `examples/worker.rs`
 //! runs the worker loop with retries and dead-letter inspection.
 //!
-//! # Cargo features
-//!
-//! The in-memory and local-disk stores work without a feature flag. A cloud
-//! store requires the feature of its backend:
-//!
-//! ```bash
-//! cargo add taquba --features aws    # S3 / MinIO
-//! cargo add taquba --features gcp    # Google Cloud Storage
-//! cargo add taquba --features azure  # Azure Blob
-//! ```
-//!
-//! [`open_url`] opens the store of a URL such as `s3://bucket/prefix`, with the
-//! provider options from the environment.
-//!
-//! The optional `metrics` feature emits throughput, dead-rate and latency
-//! metrics through the [`metrics`](https://docs.rs/metrics) facade, and
-//! SlateDB's storage metrics through the same recorder. The crate does not
-//! include an exporter, and the metrics are no-ops until the host process
-//! installs a recorder. Spans and log events go through
-//! [`tracing`](https://docs.rs/tracing), with or without the feature.
-//!
 //! # Job lifecycle
 //!
 //! ```text
@@ -70,63 +44,62 @@
 //!                                                      attempt limit
 //! ```
 //!
-//! A scheduled job waits until its `run_at`, unless a call, a signal to its id
-//! or a count reaching zero wakes it earlier. A worker keeps a claimed job
-//! under a lease, and the job returns to pending if the lease expires before
-//! the settlement. Delivery is therefore at least once, so a worker must be
+//! [`Queue::enqueue_with`] takes [`EnqueueOptions`]: a `run_at`, a priority, a
+//! dedup key and a wait for a signal or for a count to reach zero. A scheduled
+//! job becomes pending at its `run_at`, or earlier through
+//! [`Queue::wake_scheduled`], [`Queue::signal`] or its count reaching zero.
+//!
+//! [`Queue::claim`] puts a job under a lease, and [`Queue::renew_lease`]
+//! extends it. The job returns to pending if the lease expires before the
+//! settlement. Delivery is therefore at least once, so a worker must be
 //! idempotent.
 //!
-//! A settlement commits atomically with its effects, such as follow-up jobs and
-//! writes to the caller's state. One process owns a store and commits every
-//! transition, and other processes send their requests through an inbox.
+//! [`Queue::ack`], [`Queue::nack`] and [`Queue::dead_letter`] settle a claim. A
+//! nack retries the job after a backoff until the attempt limit of its
+//! [`QueueConfig`], and then dead-letters it. [`Queue::cancel`] removes a
+//! pending or scheduled job and fires the cancellation token of a claimed job.
+//! [`Queue::requeue_dead_job`] returns a dead job to pending.
 //!
-//! # When to choose Taquba
+//! # API map
 //!
-//! Choose object storage as the backing store when at least one of the
-//! following is true:
+//! - **Opening a store.** [`Queue::open_with_options`] takes [`OpenOptions`]
+//!   and a [`QueueConfig`] per queue. [`open_url`] builds the object store from
+//!   a URL such as `s3://bucket/prefix` and the environment.
+//! - **Workers.** The [`worker`] module runs the loop of claims and
+//!   settlements: [`Worker`], [`run_worker`], [`run_worker_concurrent`] and
+//!   [`WorkerHandle`]. A [`PermanentFailure`] dead-letters a job without a
+//!   retry.
+//! - **Settlement effects.** [`Queue::ack_with`], [`Queue::nack_with`],
+//!   [`Queue::dead_letter_with`] and [`Queue::enqueue_with_effects`] commit
+//!   [`SettlementEffects`] in the transaction of the call. The effects are
+//!   enqueues, KV writes under [`KvCompare`] conditions, count changes and
+//!   [`ExpiryIndex`] entries. A [`ClaimFence`] makes effects conditional on a
+//!   live claim.
+//! - **Reads.** [`QueueView`], from [`Queue::view`], reads jobs, attempt
+//!   history, KV entries and statistics. [`QueueReader`] gives another process
+//!   a lagging copy of the view and reads the [`WriterHeartbeat`].
+//! - **Other processes.** An [`InboxSender`] sends enqueues, cancellations and
+//!   signals, which the writer applies.
+//! - **Time.** The queue reads every time from its [`Clock`]. [`MockClock`]
+//!   moves time by hand in tests.
 //!
-//! - Payloads are big: payloads above a threshold are offloaded to their
-//!   own objects with a transactional lifecycle, written once and
-//!   deleted when the job leaves the queue.
-//! - Backlogs are big or bursty: a million-job backlog costs only its
-//!   storage and does not require maintenance.
-//! - The workload is mostly idle: an idle queue incurs only storage
-//!   costs, and per-tenant isolation is a key prefix. There is no
-//!   server with a baseline cost that accrues while nothing runs.
-//! - State crosses machine or account boundaries: a bucket is reachable
-//!   from a laptop, a CI runner or a spot instance with credentials
-//!   alone, so compute is replaceable by construction.
-//! - The work coordinates data already in the bucket: queue state,
-//!   payloads, results and history share one lifecycle, one restore
-//!   domain and one access policy.
-//! - The execution trail must be tamper-proof: attempt history, results
-//!   and terminal markers commit in the same transactions as the work,
-//!   and object lock makes the trail immutable by storage policy.
-//! - Steps are slow and IO-bound: for steps that take much longer than an
-//!   object-store write, the per-transition durability cost is negligible
-//!   and a retried run does not re-pay memoized steps. Such steps also sit
-//!   far from the commit-rate ceiling. LLM calls and rate-limited external
-//!   APIs are the strongest fit.
+//! # Cargo features
 //!
-//! # When not to choose Taquba
+//! The in-memory and local-disk stores work without a feature flag. A cloud
+//! store requires the feature of its backend:
 //!
-//! - The queue must share the application's database transactions: a
-//!   database-backed queue enqueues jobs and commits their effects
-//!   inside the application's own transactions.
-//! - A worker fleet across machines: Taquba is single-writer, so one
-//!   process owns each store. This caps compute that runs in the
-//!   worker process itself at one node. Steps that call remote services
-//!   scale with async concurrency inside the single process.
-//! - Latency-sensitive paths: every durable transition is an object-store
-//!   write, so a PUT round trip bounds the end-to-end latency from below. A
-//!   write-ahead log on a store with lower write latency
-//!   ([`OpenOptions::wal_object_store`]) lowers that bound.
-//! - Short jobs at high volume: throughput is bound by the durable
-//!   commit rate, and sub-millisecond jobs pay the durability cost on
-//!   every transition.
+//! ```bash
+//! cargo add taquba --features aws    # S3 / MinIO
+//! cargo add taquba --features gcp    # Google Cloud Storage
+//! cargo add taquba --features azure  # Azure Blob
+//! ```
 //!
-//! Measured performance numbers, with the environment and commit that produced
-//! them, are recorded in `taquba-bencher/RESULTS.md` in the source repository.
+//! The optional `metrics` feature emits throughput, dead-rate and latency
+//! metrics through the [`metrics`](https://docs.rs/metrics) facade, and
+//! SlateDB's storage metrics through the same recorder. The crate does not
+//! include an exporter, and the metrics are no-ops until the host process
+//! installs a recorder. Spans and log events go through
+//! [`tracing`](https://docs.rs/tracing), with or without the feature.
 //!
 //! # Stability
 //!
@@ -137,6 +110,10 @@
 //! [SlateDB]: https://github.com/slatedb/slatedb
 
 #![warn(missing_docs)]
+
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 mod background;
 mod claim_cursor;

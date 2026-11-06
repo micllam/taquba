@@ -4,18 +4,20 @@
 [![docs.rs](https://img.shields.io/docsrs/taquba)](https://docs.rs/taquba)
 [![license](https://img.shields.io/crates/l/taquba.svg)](#license)
 
-A durable, single-process task queue for Rust **without a stateful service to
-operate**. Queue state lives directly in the application's object storage, and
-compute is stateless and replaceable.
+A durable task queue for Rust whose state lives in object storage. Jobs, their
+payloads and the application's own state are stored in S3, GCS, Azure Blob or a
+local directory through [SlateDB](https://github.com/slatedb/slatedb). There is
+no queue server or database server to operate.
 
-> The foundation of the [Taquba ecosystem](https://github.com/micllam/taquba).
-> The workspace README describes the durable-execution workflow runtime, cron,
-> jobs and webhooks crates that build on this queue.
+Taquba is embedded: one process owns a store and commits every transition, and
+its producers and workers share one `Queue`. Workers are stateless, so a
+replacement process resumes where the previous one stopped. Other processes send
+their requests through an inbox.
 
-Built on [SlateDB](https://github.com/slatedb/slatedb) and the
-[`object_store`](https://docs.rs/object_store) crate. Use Taquba for durable
-background jobs whose state persists across node loss, ephemeral disks and
-region failures, without operating a queue server or a database server.
+> An application with durable multi-step processes or typed jobs should use
+> [`taquba-workflow`](https://github.com/micllam/taquba/tree/master/taquba-workflow),
+> the durable-execution runtime built on this queue. The
+> [workspace README](https://github.com/micllam/taquba) describes every crate.
 
 ## Quick start
 
@@ -44,30 +46,9 @@ async fn main() -> taquba::Result<()> {
 }
 ```
 
-[`examples/quickstart.rs`](examples/quickstart.rs) is a runnable version, and
-[`examples/worker.rs`](examples/worker.rs) runs the worker loop with retries and
-dead-letter inspection.
-
-## Cargo features
-
-The in-memory and local-disk stores work without a feature flag. A cloud store
-requires the feature of its backend:
-
-```bash
-cargo add taquba --features aws    # S3 / MinIO
-cargo add taquba --features gcp    # Google Cloud Storage
-cargo add taquba --features azure  # Azure Blob
-```
-
-`open_url` opens the store of a URL such as `s3://bucket/prefix`, with the
-provider options from the environment.
-
-The optional `metrics` feature emits throughput, dead-rate and latency metrics
-through the [`metrics`](https://docs.rs/metrics) facade, and SlateDB's storage
-metrics through the same recorder. The crate does not include an exporter, and
-the metrics are no-ops until the host process installs a recorder. Spans and log
-events go through [`tracing`](https://docs.rs/tracing), with or without the
-feature.
+The [examples](https://github.com/micllam/taquba/tree/master/taquba/examples)
+include a worker loop with retries and dead-letter inspection, and stores on
+local disk.
 
 ## Job lifecycle
 
@@ -84,62 +65,69 @@ scheduled ──────────────────▶ pending ─�
                                                      attempt limit
 ```
 
-A scheduled job waits until its `run_at`, unless a call, a signal to its id or a
-count reaching zero wakes it earlier. A worker keeps a claimed job under a
-lease, and the job returns to pending if the lease expires before the
-settlement. Delivery is therefore at least once, so a worker must be idempotent.
+A scheduled job becomes pending at its `run_at`, or earlier on a wake or a
+signal to its id. A worker keeps a claimed job under a lease, and the job
+returns to pending if the lease expires before the settlement. Delivery is
+therefore at least once, so a worker must be idempotent.
 
-A settlement commits atomically with its effects, such as follow-up jobs and
-writes to the caller's state. One process owns a store and commits every
-transition, and other processes send their requests through an inbox.
+A cancellation removes a pending or scheduled job and asks the worker of a
+claimed job to stop. A dead job stays for inspection until a requeue returns it
+to pending.
+
+## Transactional settlement
+
+A settlement commits in one transaction with its effects:
+
+- Follow-up jobs.
+- Writes and deletes of the application's keys, with conditions on their current
+  values.
+- Changes to counts, the named numbers of active items that a scheduled job can
+  wait for.
+
+After a crash, the settlement and all its effects are present, or none of them.
+A state machine built on the queue therefore stays consistent without an outbox
+or a second datastore.
+[`examples/atomic_settlement.rs`](https://github.com/micllam/taquba/blob/master/taquba/examples/atomic_settlement.rs)
+acknowledges an order, enqueues its confirmation and records its status in one
+commit.
+
+## Storage backends
+
+The in-memory and local-disk stores work without a feature flag. A cloud store
+requires the feature of its backend:
+
+```bash
+cargo add taquba --features aws    # S3 / MinIO
+cargo add taquba --features gcp    # Google Cloud Storage
+cargo add taquba --features azure  # Azure Blob
+```
+
+The `metrics` feature emits queue and storage metrics through the
+[`metrics`](https://docs.rs/metrics) facade. Spans and log events go through
+[`tracing`](https://docs.rs/tracing).
 
 ## When to choose Taquba
 
-Choose object storage as the backing store when at least one of the following is
-true:
+Taquba is the correct choice when:
 
-- Payloads are big: payloads above a threshold are offloaded to their own
-  objects with a transactional lifecycle, written once and deleted when the job
-  leaves the queue.
-- Backlogs are big or bursty: a million-job backlog costs only its storage and
-  does not require maintenance.
-- The workload is mostly idle: an idle queue incurs only storage costs, and
-  per-tenant isolation is a key prefix. There is no server with a baseline cost
-  that accrues while nothing runs.
-- State crosses machine or account boundaries: a bucket is reachable from a
-  laptop, a CI runner or a spot instance with credentials alone, so compute is
-  replaceable by construction.
-- The work coordinates data already in the bucket: queue state, payloads,
-  results and history share one lifecycle, one restore domain and one access
-  policy.
-- The execution trail must be tamper-proof: attempt history, results and
-  terminal markers commit in the same transactions as the work, and object lock
-  makes the trail immutable by storage policy.
-- Steps are slow and IO-bound: for steps that take much longer than an
-  object-store write, the per-transition durability cost is negligible and a
-  retried run does not re-pay memoized steps. Such steps also sit far from the
-  commit-rate ceiling. LLM calls and rate-limited external APIs are the
-  strongest fit.
+- Steps are slow and IO-bound, such as LLM calls and rate-limited APIs.
+- Backlogs are large or bursty, or the workload is mostly idle.
+- Payloads are large.
+- State crosses machines or accounts, or belongs with data already in a bucket.
 
-## When not to choose Taquba
+A different tool is the correct choice for:
 
-- The queue must share the application's database transactions: a
-  database-backed queue enqueues jobs and commits their effects inside the
-  application's own transactions.
-- A worker fleet across machines: Taquba is single-writer, so one process owns
-  each store. This caps compute that runs in the worker process itself at one
-  node. Steps that call remote services scale with async concurrency inside the
-  single process.
-- Latency-sensitive paths: every durable transition is an object-store write, so
-  a PUT round trip bounds the end-to-end latency from below. A write-ahead log
-  on a store with lower write latency (`OpenOptions::wal_object_store`) lowers
-  that bound.
-- Short jobs at high volume: throughput is bound by the durable commit rate, and
-  sub-millisecond jobs pay the durability cost on every transition.
+- A queue that must share the application's database transactions.
+- Compute spread over a fleet of workers on several machines.
+- A latency-sensitive path, because each transition waits for an object-store
+  write.
+- Short jobs at high volume.
 
-Measured performance numbers, with the environment and commit that produced
-them, are recorded in
-[`taquba-bencher/RESULTS.md`](https://github.com/micllam/taquba/blob/master/taquba-bencher/RESULTS.md).
+The
+[workspace README](https://github.com/micllam/taquba#when-to-use-it-and-when-not-to)
+explains each criterion, and
+[`taquba-bencher/RESULTS.md`](https://github.com/micllam/taquba/blob/master/taquba-bencher/RESULTS.md)
+records the measurements.
 
 ## Stability
 
