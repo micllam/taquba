@@ -15,27 +15,25 @@
 //! is used only for between-step state (the research findings as UTF-8 bytes
 //! after step 0).
 //!
-//! The example chooses the LLM provider from the environment:
-//!
-//! - `LLM_PROVIDER=anthropic` (default if `ANTHROPIC_API_KEY` is set):
-//!   uses `claude-haiku-4-5`.
-//! - `LLM_PROVIDER=openai` (default if only `OPENAI_API_KEY` is set):
-//!   uses `gpt-5-nano`.
-//!
-//! Run with either:
+//! The example runs `claude-haiku-5-5` when `ANTHROPIC_API_KEY` is set, and
+//! `gpt-6-luna` otherwise:
 //!
 //! ```text
 //! ANTHROPIC_API_KEY=... cargo run -p taquba-workflow --example rig_agent
 //! OPENAI_API_KEY=...    cargo run -p taquba-workflow --example rig_agent
-//! LLM_PROVIDER=openai OPENAI_API_KEY=... cargo run -p taquba-workflow --example rig_agent
 //! ```
+//!
+//! A provider error that Rig classifies as retryable fails the step as
+//! transient, and the queue retries it. Any other error, such as a rejected
+//! key, dead-letters the step.
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rig_agent::prelude::*;
 use rig_agent::tool::ToolContext;
-use rig_core::providers::{anthropic, openai};
+use rig_core::catalog::Catalog;
+use rig_core::operation::Completion;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use taquba::Queue;
@@ -100,10 +98,11 @@ impl Tool for LookupFact {
 const STEP_RESEARCH: u32 = 0;
 const STEP_WRITE: u32 = 1;
 
-// GPT-5-class reasoning models count *hidden* reasoning tokens against the same
-// limit as visible output, so reasoning can consume a small `max_tokens` (such
-// as 512) before any text is emitted, and the visible message is then empty.
-// 4096 leaves comfortable headroom for both that case and Claude Haiku.
+const ANTHROPIC_MODEL: &str = "anthropic/claude-haiku-5-5";
+const OPENAI_MODEL: &str = "openai/gpt-6-luna";
+
+// A reasoning model counts its hidden reasoning tokens against `max_tokens`,
+// and a small limit can leave the visible reply empty.
 const MAX_TOKENS: u64 = 4096;
 
 const RESEARCH_PREAMBLE: &str = "You are a researcher. Use the `lookup_fact` tool to gather information \
@@ -114,26 +113,25 @@ const WRITE_PREAMBLE: &str = "You are a technical writer. Given a topic and rese
      a polished one-paragraph summary aimed at a curious general audience. \
      Do not add facts beyond what is in the findings.";
 
-/// Pre-built clients for both supported providers. Each `run_step` chooses one
-/// based on the `provider` field and builds its agents per step. An agent is a
-/// config wrapper around the shared client, so building one does not create a
-/// client.
-enum Provider {
-    Anthropic(anthropic::Client),
-    Openai(openai::Client),
-}
-
-impl Provider {
-    fn label(&self) -> &'static str {
-        match self {
-            Provider::Anthropic(_) => "anthropic/claude-haiku-4-5",
-            Provider::Openai(_) => "openai/gpt-5-nano",
-        }
-    }
-}
-
+/// The agents of the two steps, built once on the selected model.
 struct RigRunner {
-    provider: Provider,
+    researcher: Agent,
+    writer: Agent,
+}
+
+impl RigRunner {
+    fn new(model: DynModel<Completion>) -> Self {
+        let researcher = AgentBuilder::new(model.clone())
+            .preamble(RESEARCH_PREAMBLE)
+            .tool(LookupFact)
+            .max_tokens(MAX_TOKENS)
+            .build();
+        let writer = AgentBuilder::new(model)
+            .preamble(WRITE_PREAMBLE)
+            .max_tokens(MAX_TOKENS)
+            .build();
+        Self { researcher, writer }
+    }
 }
 
 impl StepRunner for RigRunner {
@@ -146,7 +144,13 @@ impl StepRunner for RigRunner {
 
         match step.step_number {
             STEP_RESEARCH => {
-                let findings = research(&self.provider, &topic).await?;
+                let findings = self
+                    .researcher
+                    .prompt(topic.as_str())
+                    .max_turns(5)
+                    .await
+                    .map_err(|e| step_error("research", e))?
+                    .output();
                 if findings.trim().is_empty() {
                     return Err(StepError::transient(
                         "research step returned empty findings (model may have \
@@ -160,7 +164,12 @@ impl StepRunner for RigRunner {
             STEP_WRITE => {
                 let findings = std::str::from_utf8(&step.payload)
                     .map_err(|e| StepError::permanent(format!("non-utf8 findings payload: {e}")))?;
-                let summary = write(&self.provider, &topic, findings).await?;
+                let summary = self
+                    .writer
+                    .prompt(format!("Topic: {topic}\n\nFindings: {findings}"))
+                    .await
+                    .map_err(|e| step_error("write", e))?
+                    .output();
                 println!("[step 1] final summary: {summary}");
                 Ok(StepOutcome::Succeed {
                     result: summary.into_bytes(),
@@ -173,116 +182,41 @@ impl StepRunner for RigRunner {
     }
 }
 
-async fn research(provider: &Provider, topic: &str) -> std::result::Result<String, StepError> {
-    let map_err = |e: anyhow::Error| StepError::transient(format!("research call failed: {e}"));
-    match provider {
-        Provider::Anthropic(c) => {
-            let agent = c
-                .agent(anthropic::completion::CLAUDE_HAIKU_4_5)
-                .preamble(RESEARCH_PREAMBLE)
-                .tool(LookupFact)
-                .max_tokens(MAX_TOKENS)
-                .build();
-            agent
-                .prompt(topic)
-                .max_turns(5)
-                .await
-                .map_err(|e| map_err(e.into()))
-        }
-        Provider::Openai(c) => {
-            let agent = c
-                .agent(openai::completion::GPT_5_NANO)
-                .preamble(RESEARCH_PREAMBLE)
-                .tool(LookupFact)
-                .max_tokens(MAX_TOKENS)
-                .build();
-            agent
-                .prompt(topic)
-                .max_turns(5)
-                .await
-                .map_err(|e| map_err(e.into()))
-        }
-    }
-}
-
-async fn write(
-    provider: &Provider,
-    topic: &str,
-    findings: &str,
-) -> std::result::Result<String, StepError> {
-    let prompt = format!("Topic: {topic}\n\nFindings: {findings}");
-    let map_err = |e: anyhow::Error| StepError::transient(format!("write call failed: {e}"));
-    match provider {
-        Provider::Anthropic(c) => {
-            let agent = c
-                .agent(anthropic::completion::CLAUDE_HAIKU_4_5)
-                .preamble(WRITE_PREAMBLE)
-                .max_tokens(MAX_TOKENS)
-                .build();
-            agent
-                .prompt(prompt.as_str())
-                .await
-                .map_err(|e| map_err(e.into()))
-        }
-        Provider::Openai(c) => {
-            let agent = c
-                .agent(openai::completion::GPT_5_NANO)
-                .preamble(WRITE_PREAMBLE)
-                .max_tokens(MAX_TOKENS)
-                .build();
-            agent
-                .prompt(prompt.as_str())
-                .await
-                .map_err(|e| map_err(e.into()))
-        }
-    }
-}
-
-/// Decide which provider to use:
-///   1. If `LLM_PROVIDER` is set, use it (and require the matching key).
-///   2. Otherwise, prefer `ANTHROPIC_API_KEY`, then `OPENAI_API_KEY`.
-fn select_provider() -> Result<Provider> {
-    let explicit = std::env::var("LLM_PROVIDER").ok();
-    let has_anthropic = std::env::var_os("ANTHROPIC_API_KEY").is_some();
-    let has_openai = std::env::var_os("OPENAI_API_KEY").is_some();
-
-    let choice = match explicit.as_deref() {
-        Some("anthropic") => "anthropic",
-        Some("openai") => "openai",
-        Some(other) => {
-            bail!("LLM_PROVIDER=`{other}` is not recognized; use `anthropic` or `openai`")
-        }
-        None if has_anthropic => "anthropic",
-        None if has_openai => "openai",
-        None => bail!(
-            "set ANTHROPIC_API_KEY or OPENAI_API_KEY (and optionally LLM_PROVIDER) to run \
-             this example"
-        ),
+/// The step error of a failed prompt of `stage`: transient when Rig classifies
+/// the failure as retryable, permanent otherwise.
+fn step_error(stage: &str, err: PromptError) -> StepError {
+    let retryable = match &err {
+        PromptError::Provider(error) => error.is_retryable(),
+        PromptError::Report(report) => report.is_retryable(),
+        PromptError::MaxTurns { .. }
+        | PromptError::Cancelled { .. }
+        | PromptError::UnknownToolCall { .. } => false,
+        _ => true,
     };
-
-    match choice {
-        "anthropic" => {
-            let client =
-                anthropic::Client::from_env().context("ANTHROPIC_API_KEY missing or invalid")?;
-            Ok(Provider::Anthropic(client))
-        }
-        "openai" => {
-            let client = openai::Client::from_env().context("OPENAI_API_KEY missing or invalid")?;
-            Ok(Provider::Openai(client))
-        }
-        _ => unreachable!(),
+    let message = format!("{stage} call failed: {err}");
+    if retryable {
+        StepError::transient(message)
+    } else {
+        StepError::permanent(message)
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let provider = select_provider()?;
-    println!("using provider: {}", provider.label());
+    let reference = if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
+        ANTHROPIC_MODEL
+    } else {
+        OPENAI_MODEL
+    };
+    let model = Catalog::builtin()
+        .connect(reference)
+        .with_context(|| format!("cannot connect the model `{reference}`"))?;
+    println!("using model: {reference}");
 
     let store = Arc::new(InMemory::new());
     let queue = Arc::new(Queue::open(store.clone(), "rig-demo").await?);
 
-    let runtime = WorkflowRuntime::builder(queue, store, RigRunner { provider })
+    let runtime = WorkflowRuntime::builder(queue, store, RigRunner::new(model))
         .max_concurrent_steps(2)
         .build()?;
     let worker = runtime.spawn(std::future::pending());
