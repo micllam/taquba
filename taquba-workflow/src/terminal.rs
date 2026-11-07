@@ -159,7 +159,7 @@ mod webhook {
     use tracing::error;
 
     /// Terminal hook that delivers an HTTP webhook via `taquba-webhooks` when a
-    /// run terminates.
+    /// run terminates. Requires the `webhooks` feature.
     ///
     /// The hook reads the target URL from the run's submission headers under
     /// [`Self::URL_HEADER`] (default `"callback_url"`). A run without that

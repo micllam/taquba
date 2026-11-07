@@ -98,6 +98,9 @@ impl<J: Job> JobGroup<J> {
     /// failed or was cancelled is reported as a [`JobError`]. Returns
     /// [`Error::GroupNotFound`](crate::Error::GroupNotFound) for a group never
     /// submitted.
+    ///
+    /// A caller should compute progress, a failure threshold or a cost total as
+    /// a fold over the stream.
     pub async fn results(&self) -> Result<impl Stream<Item = Result<GroupResult<J>>> + use<J>> {
         let results = self.group.results().await?;
         Ok(results.map(|member| {

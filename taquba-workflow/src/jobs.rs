@@ -7,10 +7,13 @@
 //! crate adds the function abstraction: typed inputs and outputs, a type
 //! registry, a typed view of the run's result and an awaitable handle.
 //!
-//! Use a job when the caller awaits a typed return value, and a
-//! [`StepRunner`](crate::StepRunner) directly when one entity moves through
-//! several durable steps with cancellation and a terminal hook. The word "job"
-//! refers to the typed function here.
+//! A job suits a caller that awaits a typed return value without intermediate
+//! steps to persist. A [`JobGroup`] suits many inputs through one function,
+//! with the results read as they complete. A [`StepRunner`](crate::StepRunner)
+//! suits a caller that observes the run through cancellation, headers and a
+//! terminal hook, even for a single step.
+//!
+//! The word "job" refers to the typed function here.
 //! [`Delivery::job_id`](crate::Delivery::job_id) identifies the queue job that
 //! delivers a step. Chaining jobs to model a multi-step process is a sign the
 //! work belongs in a workflow.

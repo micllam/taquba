@@ -45,17 +45,20 @@ impl<R: StepRunner> WorkflowRuntimeBuilder<R> {
 
     /// The name of the Taquba queue that step jobs are enqueued onto. Defaults
     /// to `"workflow-steps"`. Multiple runtimes can share a `Queue` handle by
-    /// using distinct queue names.
+    /// using distinct queue names. The settings of
+    /// [`taquba::OpenOptions::queue_configs`] apply to the steps under this
+    /// name.
     #[must_use]
     pub fn queue_name(mut self, name: impl Into<String>) -> Self {
         self.queue_name = name.into();
         self
     }
 
-    /// The object-store path prefix of the
-    /// [`Delivery::memo`](crate::Delivery::memo) entries. Defaults to
-    /// `"{queue_name}-memo"`, so runtimes with distinct queue names on one
-    /// object store have distinct memo namespaces.
+    /// The object-store path prefix of the runtime's [`MemoStore`]: the memo
+    /// entries, the step-output replay records, the results of succeeded runs
+    /// and the manifests of run groups. Defaults to `"{queue_name}-memo"`, so
+    /// runtimes with distinct queue names on one object store have distinct
+    /// memo namespaces.
     #[must_use]
     pub fn memo_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.memo_prefix = Some(prefix.into());
@@ -79,11 +82,29 @@ impl<R: StepRunner> WorkflowRuntimeBuilder<R> {
         self
     }
 
-    /// Enable memo retention with the given window. When set, the runtime
-    /// writes a terminal marker for every run that reaches a terminal state,
-    /// and the in-process sweeper clears that run's memo entries and terminal
-    /// record `retention` after termination. When unset (default), no marker is
-    /// written and memo entries and terminal records are retained indefinitely.
+    /// Enable memo retention with the given window. When unset (default), the
+    /// runtime retains the state of a terminated run indefinitely.
+    ///
+    /// Every terminated run has a terminal record, which contains its status,
+    /// error, final step, time of termination, submission time and headers.
+    /// With retention set, a sweep removes the state of a run `retention` after
+    /// its termination. The state comprises the memo entries, the step-output
+    /// replay records, the result object, the terminal record and the run KV
+    /// entries. The sweep runs when the worker starts and at every poll
+    /// interval, so it removes a run within a poll interval of the end of its
+    /// window.
+    ///
+    /// A run id submitted again after [`RunGroup::forget`] keeps the state of
+    /// its new run. Every reader tolerates absence: a step that finds an entry
+    /// absent runs the work again, as a redelivery does.
+    ///
+    /// ```rust,ignore
+    /// let runtime = WorkflowRuntime::builder(queue, store, runner)
+    ///     .memo_retention(Duration::from_secs(24 * 60 * 60))
+    ///     .build()?;
+    /// ```
+    ///
+    /// [`RunGroup::forget`]: crate::RunGroup::forget
     #[must_use]
     pub fn memo_retention(mut self, retention: Duration) -> Self {
         self.memo_retention = Some(retention);
@@ -95,15 +116,18 @@ impl<R: StepRunner> WorkflowRuntimeBuilder<R> {
     /// When enabled, the runtime writes every [`StepOutcome`] the runner
     /// returns, including `Fail` and `Cancel`, to object storage before
     /// applying it. Step errors ([`StepError`](crate::StepError)) are not
-    /// recorded, so retries still invoke the runner. The replay key is scoped
-    /// to `(run_id, step_number, SHA-256(step payload))`. If the same step is
-    /// delivered again after a crash before ack, the stored outcome is replayed
-    /// without invoking the runner again. The record includes the effects
-    /// staged through [`Delivery::effects`](crate::Delivery::effects), so a
-    /// replayed outcome applies them as well. A replayed
-    /// [`StepOutcome::Continue`] with a [`Trigger::After`] delay reduces the
-    /// delay by the time already elapsed after the outcome was stored,
-    /// preserving the original schedule.
+    /// recorded, so retries still invoke the runner. A record belongs to a run,
+    /// a step and the payload of the step. If the same step is delivered again
+    /// after a crash before ack, the stored outcome is replayed without
+    /// invoking the runner again. The record includes the effects staged
+    /// through [`Delivery::effects`](crate::Delivery::effects), so a replayed
+    /// outcome applies them as well.
+    ///
+    /// A replayed [`StepOutcome::Continue`] keeps the original schedule. The
+    /// replay reduces the delay of [`Trigger::After`] and the timeouts of
+    /// [`Trigger::OnSignal`] and [`Trigger::OnGroup`] by the time elapsed after
+    /// the outcome was stored. The memo sweep of [`Self::memo_retention`]
+    /// removes the records of a run.
     ///
     /// This is disabled by default because it adds one object-store read per
     /// step delivery (the replay lookup) plus one write per recorded outcome,
@@ -112,6 +136,8 @@ impl<R: StepRunner> WorkflowRuntimeBuilder<R> {
     /// [`StepOutcome`]: crate::StepOutcome
     /// [`StepOutcome::Continue`]: crate::StepOutcome::Continue
     /// [`Trigger::After`]: crate::Trigger::After
+    /// [`Trigger::OnSignal`]: crate::Trigger::OnSignal
+    /// [`Trigger::OnGroup`]: crate::Trigger::OnGroup
     #[must_use]
     pub fn step_output_replay(mut self) -> Self {
         self.step_output_replay = true;
@@ -120,6 +146,22 @@ impl<R: StepRunner> WorkflowRuntimeBuilder<R> {
 
     /// Override the [`Clock`] the runtime reads its timestamps from. Defaults
     /// to the same clock the [`Queue`] was opened with (via [`Queue::clock`]).
+    ///
+    /// The clock determines the submission time of a run, the time of its
+    /// termination, the delay of [`Trigger::After`] and the retention windows.
+    /// A [`MockClock`](taquba::MockClock) passed to
+    /// [`taquba::OpenOptions::clock`] moves the queue and the runtime in
+    /// lockstep:
+    ///
+    /// ```rust,ignore
+    /// let clock = MockClock::new(1_700_000_000_000);
+    /// let opts = OpenOptions::default().clock(Arc::new(clock.clone()));
+    /// let queue = Queue::open_with_options(store.clone(), "db", opts).await?;
+    /// let runtime = WorkflowRuntime::builder(queue, store, runner).build()?;
+    /// // `runtime` reads the same clock as `queue`.
+    /// ```
+    ///
+    /// [`Trigger::After`]: crate::Trigger::After
     #[must_use]
     pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;

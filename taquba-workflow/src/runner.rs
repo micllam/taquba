@@ -199,7 +199,8 @@ pub struct Step {
     /// continued with `OnSignal`, and a [`taquba::Queue::signal`] call for this
     /// step's job id arrived before the timeout. `None` when the timeout
     /// elapsed first or [`taquba::Queue::wake_scheduled`] ended the wait, and
-    /// on every step not preceded by an `OnSignal` wait.
+    /// on every step not preceded by an `OnSignal` wait. Every redelivery of
+    /// the step observes the same value.
     pub signal: Option<Vec<u8>>,
 }
 
@@ -253,8 +254,16 @@ pub enum Trigger {
     /// [`taquba::Queue::signal`], or after `timeout`, whichever comes first.
     /// The next step reads [`Step::signal`] to distinguish the two:
     /// `Some(payload)` when a signal arrived, `None` when the timeout elapsed
-    /// first. The queue rejects a signal sent before this step settles, so the
-    /// step stages the request that leads to the signal in its effects.
+    /// first. The queue rejects a signal sent before this step settles, after
+    /// the timeout or a second time with [`taquba::SignalOutcome::NotWaiting`].
+    /// The step should therefore stage the request that leads to the signal in
+    /// its effects.
+    ///
+    /// The waiting step is a scheduled job in the store, so the wait persists
+    /// across a restart and does not occupy a worker. A waiting run resumes
+    /// under the runner of the process that claims the next step. The wait
+    /// suits an approval, a webhook callback or a remote reply, with the
+    /// timeout as the escalation path.
     OnSignal {
         /// Upper bound on the wait. When it elapses first, the next step runs
         /// with [`Step::signal`] `None`.
@@ -268,7 +277,10 @@ pub enum Trigger {
     /// [`Error::GroupNotFound`](crate::Error::GroupNotFound). A group has one
     /// waiting step: while it is waiting, a wait for the group from another run
     /// fails that other run. The next step reads the status or the results of
-    /// the group, which show whether the timeout elapsed first.
+    /// the group, which show whether the timeout elapsed first. The wait does
+    /// not occupy a worker, and [`RunState::WaitingForGroup`] reports it.
+    ///
+    /// [`RunState::WaitingForGroup`]: crate::RunState::WaitingForGroup
     OnGroup {
         /// The id of the group.
         group_id: RunId,
@@ -349,6 +361,28 @@ impl StepOutcome {
 
     /// Continue the run with the next step claimable when a signal to
     /// [`Delivery::next_job_id`] arrives, or after `timeout` at the latest.
+    ///
+    /// In the example that follows, a step requests a payment with the id of
+    /// the wait and waits for the payment webhook, escalating after seven days:
+    ///
+    /// ```rust,ignore
+    /// // In the runner:
+    /// step.effects.enqueue(EnqueueRequest {
+    ///     queue: "payment-requests".to_string(),
+    ///     payload: payment_request(&order_id, &step.next_job_id),
+    ///     options: EnqueueOptions::default(),
+    /// })?;
+    /// Ok(StepOutcome::continue_on_signal(
+    ///     order_id.into_bytes(),
+    ///     Duration::from_secs(7 * 24 * 3600),
+    /// ))
+    ///
+    /// // In the webhook handler, with the id that the payment request included:
+    /// match queue.signal(&wait_id, body).await? {
+    ///     SignalOutcome::Delivered => { /* the waiting run was woken */ }
+    ///     SignalOutcome::NotWaiting => { /* the wait ended without a change */ }
+    /// }
+    /// ```
     pub fn continue_on_signal(payload: Vec<u8>, timeout: Duration) -> Self {
         Self::Continue {
             payload,
@@ -440,6 +474,10 @@ pub enum StepErrorKind {
 /// Taquba is at-least-once, and a step is claimed and processed more than once
 /// if a lease expires before the worker acks. Returning the same `StepOutcome`
 /// for the same input is the easiest way to satisfy this.
+///
+/// The runner decides each next step. The runtime does not execute a declared
+/// graph or replay an event history, and it records a side effect only where
+/// the runner memoizes it.
 pub trait StepRunner: Send + Sync {
     /// Process a single step of a workflow run. Return
     /// [`StepOutcome::Continue`] to enqueue the next step,

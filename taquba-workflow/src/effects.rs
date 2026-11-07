@@ -17,10 +17,11 @@ use crate::keys::{RunId, check_enqueue, check_kv_key, run_kv_entry_key};
 /// returns (`Continue`, `Succeed`, `Fail` and `Cancel`): either the settlement
 /// and every staged effect commit together or none of them do. Delivery is
 /// at-least-once, so a retried step stages its effects again and every staged
-/// value must be correct when applied more than once. No effects are applied
-/// when the runner returns a [`StepError`](crate::StepError) or when an
-/// external [`WorkflowRuntime::cancel`](crate::WorkflowRuntime::cancel)
-/// overrides the runner's outcome.
+/// value must be correct when applied more than once: a step should write
+/// absolute values. No effects are applied when the runner returns a
+/// [`StepError`](crate::StepError) or when an external
+/// [`WorkflowRuntime::cancel`](crate::WorkflowRuntime::cancel) overrides the
+/// runner's outcome.
 ///
 /// Each operation is validated when it is staged: keys of the caller KV
 /// namespace must not start with the reserved `workflow/` prefix
@@ -181,8 +182,9 @@ impl EffectsHandle {
     }
 
     /// Stage a write of `value` under `key` in the run KV space of the
-    /// delivery's run. An entry of the space belongs to its run: the memo sweep
-    /// and the group sweep delete it with the run, and
+    /// delivery's run. The space contains the state of one run, such as a
+    /// progress entry or a transcript. An entry of the space belongs to its
+    /// run: the memo sweep and the group sweep delete it with the run, and
     /// [`KvReadHandle::get_run_kv`](crate::KvReadHandle::get_run_kv) and
     /// [`WorkflowView::run_kv`](crate::WorkflowView::run_kv) read it.
     ///

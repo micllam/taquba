@@ -15,7 +15,7 @@
 //!
 //! # Layout
 //!
-//! [`MemoStore`] owns a single object-store prefix and partitions it into two
+//! [`MemoStore`] owns a single object-store prefix and partitions it into these
 //! sub-prefixes:
 //!
 //! - `<prefix>/memos/<run_id>/<step_number>/<sha256(user_key)>`: per-step
@@ -32,6 +32,8 @@
 //! - `<prefix>/results/<run_id>/<job_id>/<attempt>`: the result of a run that
 //!   succeeded, written by the attempt `attempt` of its final step's job
 //!   `job_id` before the settlement that terminates the run.
+//! - `<prefix>/groups/<group_id>/manifest`: the manifest of a run group,
+//!   written by the group module.
 //!
 //! # Cleanup
 //!
@@ -59,8 +61,8 @@ use crate::keys::{RunId, hex_sha256};
 /// Backing store for [`Memo`] entries, parametrised by an [`ObjectStore`] and a
 /// path prefix. Builds per-step [`Memo`] views via [`MemoStore::new_memo`].
 ///
-/// Owns the memo, step-output and result sub-prefixes. The module docs describe
-/// the path layout.
+/// The prefix contains the memo entries of each run, the step-output replay
+/// records, the results of succeeded runs and the manifests of run groups.
 #[derive(Clone)]
 pub struct MemoStore {
     objects: ObjectPrefix,
@@ -77,11 +79,9 @@ impl std::fmt::Debug for MemoStore {
 }
 
 impl MemoStore {
-    /// Build a `MemoStore` over the given object store and path prefix. Memo
-    /// entries live under `<prefix>/memos/...`, step-output replay entries
-    /// under `<prefix>/step-outputs/...` and run results under
-    /// `<prefix>/results/...`. The prefix must not overlap with the queue's
-    /// SlateDB path or with any other consumer of the same store.
+    /// Build a `MemoStore` over the given object store and path prefix. The
+    /// prefix must not overlap with the queue's SlateDB path or with any other
+    /// consumer of the same store.
     pub fn new(store: Arc<dyn ObjectStore>, prefix: impl Into<String>) -> Self {
         Self {
             objects: ObjectPrefix::new(store, prefix),
@@ -110,6 +110,11 @@ impl MemoStore {
     /// during individual deletes are logged (best-effort cleanup) but do not
     /// stop the sweep. An aggregated error is returned only if a list operation
     /// fails.
+    ///
+    /// A custom cleanup should select the terminated runs with
+    /// [`WorkflowView::runs`](crate::WorkflowView::runs) and
+    /// [`RunFilter::Terminated`](crate::RunFilter::Terminated). The terminal
+    /// records and the run KV entries of those runs remain.
     pub async fn clear_memos_for_run(&self, run_id: &RunId) -> Result<usize> {
         let memo_deleted = self
             .clear_prefix(run_id, self.memos_run_prefix(run_id), "memo")
@@ -247,6 +252,10 @@ enum MemoScope {
 
 /// A view onto a [`MemoStore`] scoped to a `(run_id, step_number)` pair, or to
 /// a run as a whole.
+///
+/// A memo is a retry-safety cache, and its readers must tolerate an absent
+/// entry by running the work again. The durable channel between steps is the
+/// payload of [`StepOutcome::Continue`](crate::StepOutcome::Continue).
 #[derive(Clone)]
 pub struct Memo {
     store: MemoStore,
@@ -308,6 +317,13 @@ impl Memo {
     ///
     /// A side effect inside `compute` runs again when the process terminates
     /// after `compute` returns and before the value is stored.
+    ///
+    /// ```rust,ignore
+    /// let draft: Draft = step
+    ///     .memo
+    ///     .memoized("draft", async { expensive_call(&step.payload).await })
+    ///     .await?;
+    /// ```
     pub async fn memoized<R, F, E>(&self, key: &str, compute: F) -> std::result::Result<R, E>
     where
         R: Serialize + DeserializeOwned,
@@ -326,7 +342,23 @@ impl Memo {
         Ok(value)
     }
 
-    /// [`Self::memoized`] under [`Self::content_key`] of `input`.
+    /// [`Self::memoized`] under [`Self::content_key`] of `input`. The entry
+    /// stays scoped to the run and step of the memo, and other runs do not
+    /// share it.
+    ///
+    /// ```rust,ignore
+    /// #[derive(serde::Serialize)]
+    /// struct DraftInput<'a> {
+    ///     operation: &'static str,
+    ///     payload: &'a [u8],
+    /// }
+    ///
+    /// let input = DraftInput { operation: "draft", payload: &step.payload };
+    /// let draft: Draft = step
+    ///     .memo
+    ///     .memoized_by_content(&input, async { expensive_call(&step.payload).await })
+    ///     .await?;
+    /// ```
     pub async fn memoized_by_content<K, R, F, E>(
         &self,
         input: &K,
@@ -351,6 +383,9 @@ impl Memo {
     /// logical content into different bytes and therefore different keys. If
     /// several logical operations can receive identical inputs, include an
     /// operation name in the serialized input.
+    ///
+    /// The key is for [`Self::get`] and [`Self::put`], and it locates an entry
+    /// from outside the runtime.
     pub fn content_key<T>(input: &T) -> Result<String>
     where
         T: Serialize + ?Sized,

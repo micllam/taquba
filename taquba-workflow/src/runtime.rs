@@ -64,8 +64,7 @@ pub struct RunOptions {
 #[derive(Debug, Clone, Default)]
 pub struct RunSpec {
     /// Caller-supplied run identifier. If `None`, the runtime generates a ULID.
-    /// The dedup key for the first step job is `run:{run_id}:0`, so
-    /// re-submitting the same `run_id` while the run is active returns the
+    /// Re-submitting the same `run_id` while the run is active returns the
     /// existing job and does not create a duplicate.
     ///
     /// A run id identifies one run until
@@ -96,9 +95,10 @@ pub struct RunSpec {
 
 /// Outcome of [`WorkflowRuntime::submit`].
 ///
-/// `submit` is idempotent on `run_id`: re-submitting an active or terminated
-/// run is a no-op and the returned `SubmitOutcome` has
-/// `newly_submitted = false`.
+/// `submit` is idempotent on `(run_id, input)`: re-submitting an active or
+/// terminated run with the same input is a no-op and the returned
+/// `SubmitOutcome` has `newly_submitted = false`. A re-submission with another
+/// input fails with [`Error::InputMismatch`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmitOutcome {
     /// The run's identifier (generated if the spec did not include one).
@@ -168,6 +168,10 @@ impl Clearable for RunStore {
 }
 
 /// Durable runtime for workflow runs. A clone copies one `Arc`.
+///
+/// The runtime is an embedded library: its producers and workers share the
+/// `Arc<Queue>` of one process, without a server. A process restarted mid-run
+/// resumes each run at its last completed step.
 pub struct WorkflowRuntime<R> {
     pub(crate) inner: Arc<RuntimeInner<R>>,
 }
@@ -230,6 +234,9 @@ impl<R: StepRunner> WorkflowRuntime<R> {
     /// the returned [`SubmitOutcome`] has `newly_submitted = false`. A
     /// re-submission of such a `run_id` with a *different* input is rejected
     /// with [`Error::InputMismatch`]. A new run requires a fresh `run_id`.
+    ///
+    /// The run record catches a duplicate after a restart, and after step 0 has
+    /// run.
     pub async fn submit(&self, spec: RunSpec) -> Result<SubmitOutcome> {
         self.inner.core.submit(spec).await
     }

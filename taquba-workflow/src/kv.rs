@@ -24,6 +24,9 @@ use crate::keys::{
 /// misses (for example a marker a crashed settlement never committed)
 /// re-executes work that must be idempotent downstream.
 ///
+/// Outside a step, [`taquba::QueueView::kv_get`] and a [`taquba::QueueReader`]
+/// read the caller KV namespace.
+///
 /// A clone of the handle increments a reference count. The handle does not
 /// expose a write or settlement operation. Use [`KvReadHandle::detached`] when
 /// constructing a [`Step`](crate::Step) in tests.

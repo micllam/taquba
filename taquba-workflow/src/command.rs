@@ -39,7 +39,8 @@ use crate::runtime::{CancelRunOutcome, RunOptions, RunSpec, RuntimeCore};
 /// Every field of a submission other than `run_id` and `input`, and the reason
 /// of a cancellation, may be absent. A sender in another language writes the
 /// inbox entry of the core kind `enqueue` for the control queue, with the
-/// payload in its `payload` field.
+/// payload in its `payload` field. A process that signals a waiting run should
+/// send a [`taquba::SignalEntry`], the core kind `signal`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Command {
@@ -78,12 +79,13 @@ impl From<Command> for EnqueueEntry {
 /// command, and a submission of an existing run id with another input fails the
 /// command.
 ///
-/// A sender delays the first step of the run with [`Self::run_at`], and the
-/// command creates the run at its application. A command job delayed with the
-/// `run_at` of its [`EnqueueEntry`] applies at that time. It applies as a
+/// A sender should delay the first step of the run with [`Self::run_at`], and
+/// the command creates the run at its application. A command job delayed with
+/// the `run_at` of its [`EnqueueEntry`] applies at that time. It applies as a
 /// duplicate while the terminal record of an earlier run of its id is retained,
 /// and starts a new run after the memo sweep removes that record. A
-/// cancellation of the run applies each waiting submission of it.
+/// cancellation of the run applies each waiting submission of it: the first
+/// creates the run as cancelled, and the others apply against that run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmitCommand {
     /// [`RunSpec::run_id`].
