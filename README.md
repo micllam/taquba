@@ -159,7 +159,7 @@ the substrate. The components are for programs that already use the stack.
 
 | Tier | Crate | What it does | Best for |
 |---|---|---|---|
-| Execution | [`taquba-workflow`](./taquba-workflow) | Runs one durable multi-step process: a sequence of steps with per-step memoization, retries, durable signals and a terminal hook. Its `jobs` module runs one typed async function as a single-step run and returns the result to an awaiting caller, and submits many such jobs as one durable group whose results stream back as they complete | LLM agent runs, payment flows, document pipelines, typed background tasks, batch LLM and document workloads |
+| Execution | [`taquba-workflow`](./taquba-workflow) | Durable multi-step runs, typed jobs and job groups | LLM agent runs, document pipelines, payment flows, typed background tasks |
 | Substrate | [`taquba`](./taquba) | Durable task queue with transactional KV, leases, retries, scheduling and dead-letter | A custom execution layer, or background jobs with opaque payloads |
 | Component | [`taquba-cron`](./taquba-cron) | POSIX cron scheduling onto a Taquba queue | Periodic enqueues (reports, sweeps, reminders) |
 | Component | [`taquba-webhooks`](./taquba-webhooks) | HTTP webhook delivery with retries and dead-letter | Outbound webhook fan-out with durable retries |
@@ -168,23 +168,9 @@ Every crate above the substrate consumes one `Arc<Queue>`.
 
 ### Choosing between them
 
-- **A single-step workflow or a job.** Use a typed job (the `jobs` module) when
-  the caller awaits a typed return value in process, and a step runner when the
-  caller observes the run through cancellation, headers and a terminal hook.
-- **Chained jobs or a workflow.** A job can submit further jobs, and a chain of
-  jobs approximates a pipeline. Chained jobs do not share a run identity, an
-  end-to-end terminal status or a resume point. A process modelled by chaining
-  belongs in a step runner.
-- **Independent jobs or a job group.** Submitting N typed jobs and awaiting
-  their handles yields N independent results. A job group submits the N as one
-  durable set: a second submission runs again only the members that did not
-  succeed, the results stream back as they complete, and each member's completed
-  phases persist across a retry through its memo.
-- **Fan-out inside one run.** A workflow step opens a job group named after the
-  step, submits one job per item and joins the results. A retry of the step
-  re-submits the group and joins the recorded results of the members that
-  completed. Demonstrated in
-  [`taquba-workflow/examples/fanout_jobs.rs`](./taquba-workflow/examples/fanout_jobs.rs).
+A process with several steps should run on `taquba-workflow`. Its
+[README](./taquba-workflow#typed-jobs-and-groups) states when a step runner, a
+typed job or a job group is the correct choice.
 
 ## Stability
 

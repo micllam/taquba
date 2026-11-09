@@ -126,7 +126,9 @@ the wait persists across a restart and does not occupy a worker.
 The `jobs` module runs a typed async function as a single-step run and returns
 its result to the awaiting caller. A typed job suits a caller that awaits a
 value, and a step runner suits a caller that observes the run through
-cancellation, headers and a terminal hook.
+cancellation, headers and a terminal hook. A job can submit further jobs, but a
+chain of jobs does not have a run identity, an end-to-end status or a resume
+point. A multi-step process should therefore run in a step runner.
 
 ```rust,ignore
 use taquba_workflow::jobs::{Job, JobContext, JobRunner};
