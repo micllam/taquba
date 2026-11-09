@@ -4,93 +4,83 @@
 [![docs.rs](https://img.shields.io/docsrs/taquba-webhooks)](https://docs.rs/taquba-webhooks)
 [![license](https://img.shields.io/crates/l/taquba-webhooks.svg)](#license)
 
-HTTP webhook delivery on top of the [Taquba](../taquba) durable task queue.
+Outbound HTTP webhooks for the
+[`taquba`](https://github.com/micllam/taquba/tree/master/taquba) queue. An
+application enqueues a delivery as a job, and a worker sends the request to the
+receiver with retries. The deliveries are stored with the queue, in S3, GCS,
+Azure Blob or a local directory, so a pending delivery persists across a
+restart.
+
+The worker runs in the process that owns the queue and keeps only the status of
+each response. It suits a notification that does not need a reply, such as an
+alert, an event relay or the callback of a finished workflow run. A delivery can
+commit in the settlement of other work, and the queue then enqueues it only when
+that work commits.
 
 > Part of the [Taquba ecosystem](https://github.com/micllam/taquba). The
-> workspace README describes the queue core and the other crates that compose
-> with this one.
+> workspace README states when object storage is the correct choice and how the
+> crates compose.
 
-Aimed at workloads where a webhook is the announcement of an event (alerting on
-a timeseries DB, event relays, push notifications).
+## Quick start
 
-## Usage
+```bash
+cargo add taquba-webhooks taquba
+cargo add tokio --features full
+```
 
-Taquba is single-process: producer and worker run in the same process and share
-one `Arc<Queue>`.
-
-```rust
+```rust,no_run
 use std::sync::Arc;
 use std::time::Duration;
 use taquba::{Queue, object_store::memory::InMemory, run_worker};
 use taquba_webhooks::{WebhookRequest, WebhookWorker, enqueue_webhook};
 
-let queue = Arc::new(Queue::open(Arc::new(InMemory::new()), "demo").await?);
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = Queue::open(Arc::new(InMemory::new()), "demo").await?;
 
-// Worker: deliver each request.
-let worker_queue = queue.clone();
-tokio::spawn(async move {
+    let request = WebhookRequest::new("https://example.com/hook")
+        .header("Content-Type", "application/json")
+        .timeout(Duration::from_secs(10));
+    enqueue_webhook(&queue, "webhooks", request, br#"{"event":"ping"}"#.to_vec()).await?;
+
     let worker = WebhookWorker::new();
     run_worker(
-        &worker_queue,
+        &queue,
         "webhooks",
         &worker,
         Duration::from_millis(100),
         std::future::pending::<()>(),
     )
-    .await
-});
-
-// Producer: enqueue a delivery.
-let request = WebhookRequest::new("https://example.com/hook")
-    .header("Content-Type", "application/json")
-    .timeout(Duration::from_secs(10));
-enqueue_webhook(&queue, "webhooks", request, br#"{"event":"ping"}"#.to_vec()).await?;
+    .await?;
+    Ok(())
+}
 ```
 
-`webhook_enqueue_request` builds the enqueue request without performing it. A
-delivery staged into a settlement transaction via
-`taquba::SettlementEffects::enqueues` commits atomically with an
-acknowledgement.
+The
+[example](https://github.com/micllam/taquba/tree/master/taquba-webhooks/examples)
+delivers requests to a local HTTP listener and prints what arrives.
 
-## Reserved header keys
+## Delivery
 
-Webhook configuration travels with each job in `JobRecord::headers` under
-reserved keys:
+A 2xx response completes a delivery. A 4xx response other than 408 and 429
+dead-letters it without a retry, because the receiver has rejected the request.
+Any other failure, such as a 5xx response or a timeout, retries the delivery
+with backoff up to the attempt limit of the queue.
 
-| Key | Required | Meaning |
-|---|---|---|
-| `webhook.url` | yes | Target URL |
-| `webhook.method` | no | HTTP method (default `POST`) |
-| `webhook.timeout_ms` | no | Per-request timeout (default `DEFAULT_TIMEOUT`, 30s) |
-| `http.<name>` | no | HTTP header to send, such as `http.Content-Type` |
+Every request has a timeout, and the worker extends the lease of the job to
+cover it. The job therefore remains claimed while a slow receiver responds, and
+the queue does not deliver it to another worker meanwhile.
 
-The worker ignores other entries in `headers`, and an application can use them
-for its own metadata.
+## Idempotent receivers
 
-## Delivery semantics
+Delivery is at least once, and a retry sends a request again after a lost
+response. By default each request has the id of its job in the header
+`Webhook-Id`, and a receiver must deduplicate on it.
 
-- **2xx response**: ack (Taquba marks the job done).
-- **5xx, 408 Request Timeout, 429 Too Many Requests, transport errors,
-  timeouts**: nack. Taquba retries on its configured exponential backoff up to
-  the queue's `max_attempts`, then dead-letters.
-- **Other 4xx (client errors), missing/invalid configuration headers**:
-  dead-letter immediately via `taquba::PermanentFailure`. The receiver has
-  explicitly rejected the request, so retries cannot succeed.
+## Stability
 
-## Bounded deliveries
-
-Every delivery is bounded: the request timeout is the job's `webhook.timeout_ms`
-header when present, otherwise the worker's default (`DEFAULT_TIMEOUT`, 30s,
-configurable via `WebhookWorker::with_default_timeout`). Before sending, the
-worker extends the job's lease to cover the timeout, so a slow receiver does not
-cause the job to be re-queued mid-delivery.
-
-## Receiver-side idempotency
-
-Each delivery includes a `Webhook-Id` header (configurable via
-`WebhookWorker::with_delivery_id_header`) that contains `JobRecord::id`. Taquba
-delivers a job at least once, so receivers must deduplicate on this header to
-handle retries correctly.
+taquba-webhooks is pre-1.0. A minor release can break the Rust API and the
+on-disk format, whereas a patch release preserves both.
 
 <!-- vale off -->
 

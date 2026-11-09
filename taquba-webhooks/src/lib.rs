@@ -1,12 +1,10 @@
-//! HTTP webhook delivery on top of the [Taquba] durable task queue.
+//! HTTP webhook delivery on a [Taquba] queue. [`enqueue_webhook`] enqueues a
+//! [`WebhookRequest`] as a job, and a [`WebhookWorker`] sends it to the
+//! receiver. The
+//! [README](https://github.com/micllam/taquba/tree/master/taquba-webhooks)
+//! states which workloads the crate suits.
 //!
-//! Aimed at workloads where a webhook is the announcement of an event (alerting
-//! on a timeseries DB, event relays, push notifications).
-//!
-//! # Usage
-//!
-//! Taquba is single-process: producer and worker run in the same process and
-//! share one `Arc<Queue>`.
+//! # Quick start
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -39,55 +37,38 @@
 //! # Ok(()) }
 //! ```
 //!
-//! # Reserved header keys
+//! # Job headers
 //!
-//! Webhook configuration travels with each job in
-//! [`taquba::JobRecord::headers`] under reserved keys:
+//! The configuration of a delivery is stored in [`taquba::JobRecord::headers`],
+//! under reserved keys. A producer that enqueues a delivery without this
+//! crate's API must write them:
 //!
 //! | Key | Required | Meaning |
 //! |---|---|---|
 //! | [`HEADER_URL`] (`webhook.url`) | yes | Target URL |
 //! | [`HEADER_METHOD`] (`webhook.method`) | no | HTTP method (default `POST`) |
-//! | [`HEADER_TIMEOUT_MS`] (`webhook.timeout_ms`) | no | Per-request timeout (default [`DEFAULT_TIMEOUT`]) |
+//! | [`HEADER_TIMEOUT_MS`] (`webhook.timeout_ms`) | no | Request timeout in milliseconds (default: the worker's) |
 //! | [`HTTP_HEADER_PREFIX`]`<name>` (`http.<name>`) | no | HTTP header to send |
 //!
-//! The worker ignores other entries in `headers`, and an application can use
-//! them for its own metadata.
+//! # API map
 //!
-//! [`webhook_enqueue_request`] builds the enqueue request without performing
-//! it. A delivery staged into a settlement transaction via
-//! [`taquba::SettlementEffects::enqueues`] commits atomically with an
-//! acknowledgement.
-//!
-//! # Delivery semantics
-//!
-//! - **2xx response**: ack (Taquba marks the job done).
-//! - **5xx, 408 Request Timeout, 429 Too Many Requests, transport errors,
-//!   timeouts**: nack. Taquba retries on its configured exponential backoff
-//!   up to the queue's `max_attempts`, then dead-letters.
-//! - **Other 4xx (client errors), missing/invalid configuration headers**:
-//!   dead-letter immediately via [`taquba::PermanentFailure`]. The receiver
-//!   has explicitly rejected the request, so retries cannot succeed.
-//!
-//! # Bounded deliveries
-//!
-//! Every delivery is bounded: the request timeout is the job's
-//! [`HEADER_TIMEOUT_MS`] header when present, otherwise the worker's default
-//! ([`DEFAULT_TIMEOUT`], configurable via
-//! [`WebhookWorker::with_default_timeout`]). Before sending, the worker extends
-//! the job's lease to cover the timeout, so a slow receiver does not cause the
-//! job to be re-queued mid-delivery.
-//!
-//! # Receiver-side idempotency
-//!
-//! Each delivery includes a `Webhook-Id` header (configurable via
-//! [`WebhookWorker::with_delivery_id_header`]) that contains
-//! [`taquba::JobRecord::id`]. Taquba delivers a job at least once, so receivers
-//! must deduplicate on this header to handle retries correctly.
+//! - **Producer.** A [`WebhookRequest`] describes a delivery, and
+//!   [`enqueue_webhook`] enqueues it. [`webhook_enqueue_request`] builds the
+//!   enqueue for [`taquba::SettlementEffects::enqueues`], so the delivery
+//!   commits with a settlement.
+//! - **Worker.** [`WebhookWorker`] implements [`taquba::Worker`] for
+//!   [`taquba::run_worker`]. It maps each response to an acknowledgement, a
+//!   retry or a dead letter.
+//! - **Errors.** [`Error::is_permanent`] states whether the worker dead-letters
+//!   a job on an error.
 //!
 //! [Taquba]: https://docs.rs/taquba
 
 #![warn(missing_docs)]
+
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 use std::collections::HashMap;
 use std::time::Duration;
