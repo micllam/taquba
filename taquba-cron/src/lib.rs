@@ -1,10 +1,7 @@
-//! POSIX cron-style scheduling on a [Taquba] queue.
-//!
-//! A schedule pairs a named cron expression with a payload. When the
-//! expression's firing time arrives, the scheduler enqueues the payload onto a
-//! Taquba queue. The scheduler runs in one process and sleeps until the next
-//! firing, waking at least once a second to read the queue's clock. A wake
-//! without a due firing does not read from the store.
+//! Cron scheduling on a [Taquba] queue. A [`CronScheduler`] enqueues the
+//! payload of a [`Schedule`] as a job at each firing of its [`Expression`]. The
+//! [README](https://github.com/micllam/taquba/tree/master/taquba-cron) states
+//! which workloads the scheduler suits.
 //!
 //! # Quick start
 //!
@@ -31,163 +28,31 @@
 //! [`CronScheduler::spawn`] runs the scheduler as a Tokio task instead and
 //! returns a [`taquba::WorkerHandle`] that stops it.
 //!
-//! # Per-schedule options
+//! # API map
 //!
-//! A [`Schedule`] has a setter for each optional field: HTTP-style headers, a
-//! priority, a maximum attempt count and backfill.
-//!
-//! ```
-//! use std::collections::HashMap;
-//! use taquba_cron::Schedule;
-//!
-//! let schedule = Schedule::new("hook", "0 9 * * *".parse()?, "hooks", b"ping".to_vec())
-//!     .headers(HashMap::from([("webhook.url".into(), "https://example.com/hook".into())]))
-//!     .priority(Some(taquba::PRIORITY_HIGH))
-//!     .max_attempts(Some(10));
-//! # Ok::<(), taquba_cron::Error>(())
-//! ```
-//!
-//! Every enqueued job has the header [`FIRE_MS_HEADER`] (`cron.fire_ms`), the
-//! firing time as a Unix timestamp in milliseconds. The header
-//! [`PREVIOUS_FIRE_MS_HEADER`] (`cron.previous_fire_ms`) is the occurrence of
-//! the expression before the firing time, in the same form, so the two headers
-//! bound the interval that the job covers. The scheduler computes the previous
-//! occurrence from the expression, whether or not that occurrence was enqueued.
-//! Header names with the `cron.` prefix are reserved, and a schedule with such
-//! a header is rejected.
-//!
-//! # Backfill
-//!
-//! By default the scheduler drops a firing that it misses while it is not
-//! running. A schedule with [`Schedule::backfill`] replays missed firings. The
-//! scheduler stores the time of the last enqueued firing in the queue's KV
-//! namespace, at the key [`watermark_key`]. On start it enqueues one job per
-//! occurrence between that watermark and the current time, from the oldest. It
-//! then resumes live firings. [`Backfill::lookback`] bounds the replay, and the
-//! scheduler skips an occurrence older than the lookback.
-//!
-//! ```
-//! use std::time::Duration;
-//! use taquba_cron::{Backfill, BackfillStart, Schedule};
-//!
-//! let schedule = Schedule::new("sweep", "0 * * * *".parse()?, "sweeps", b"sweep".to_vec())
-//!     .backfill(Some(Backfill {
-//!         lookback: Duration::from_secs(6 * 60 * 60),
-//!         start: BackfillStart::CurrentTime,
-//!     }));
-//! # Ok::<(), taquba_cron::Error>(())
-//! ```
-//!
-//! The scheduler writes the watermark in the transaction of the enqueue, so the
-//! two commit together. The watermark advances only when a firing is enqueued:
-//! an enqueue error under backfill keeps the schedule at the failed firing, and
-//! the scheduler retries it.
-//!
-//! A replay enqueues one firing of a schedule at a time, and the other
-//! schedules fire between two firings of the replay. A shutdown or a removal of
-//! the schedule also takes effect there. A replay that a shutdown ends resumes
-//! at the watermark on the next start.
-//!
-//! [`Backfill::start`] determines the start of a schedule without a watermark.
-//! With [`BackfillStart::CurrentTime`] the schedule starts at the current time
-//! and does not replay a firing. With [`BackfillStart::Lookback`] the first run
-//! replays the occurrences within the lookback. That start requires a bounded
-//! lookback, and a registration with `Duration::MAX` fails with
-//! [`Error::UnboundedStart`].
-//!
-//! The watermark records a position in the occurrence sequence and is
-//! independent of the expression. After an expression change, the scheduler
-//! replays the missed occurrences of the new expression after the watermark.
-//! The watermark stays in the KV namespace after its schedule is removed, and
-//! [`CronScheduler::clear_watermark`] deletes it. Keys with the prefix
-//! [`RESERVED_KV_PREFIX`] (`cron/`) of the KV namespace are reserved for this
-//! crate.
-//!
-//! # Changes while the scheduler runs
-//!
-//! [`CronScheduler::handle`] returns a [`ScheduleHandle`], which registers and
-//! removes schedules before and during [`CronScheduler::run`]. The running
-//! scheduler applies a change before its next firing. A schedule registered
-//! through the handle starts at the time the scheduler applies it, or at its
-//! watermark under backfill.
-//!
-//! ```no_run
-//! # use std::sync::Arc;
-//! # use taquba::{Queue, object_store::memory::InMemory};
-//! # use taquba_cron::{CronScheduler, Schedule};
-//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! # let queue = Arc::new(Queue::open(Arc::new(InMemory::new()), "demo").await?);
-//! let scheduler = CronScheduler::new(queue);
-//! let handle = scheduler.handle();
-//! let worker = scheduler.spawn(std::future::pending::<()>());
-//!
-//! handle.schedule(Schedule::new(
-//!     "hourly-sweep",
-//!     "0 * * * *".parse()?,
-//!     "sweeps",
-//!     b"sweep".to_vec(),
-//! ))?;
-//! assert!(handle.unschedule("hourly-sweep"));
-//! # worker.shutdown().await?;
-//! # Ok(()) }
-//! ```
-//!
-//! [`ScheduleHandle::unschedule`] keeps the backfill watermark. A change of an
-//! expression is an `unschedule` and a `schedule` with the same name, and the
-//! schedule resumes at the watermark. After the scheduler stops, a registration
-//! through the handle fails with [`Error::Stopped`].
-//!
-//! [`ScheduleHandle::replace_all`] takes the whole schedule set, for a consumer
-//! that builds the set from configuration. A schedule equal to a registered
-//! schedule is untouched and keeps its next firing. Every other schedule is a
-//! new registration, and a registered schedule that is absent from the set is
-//! removed. The call applies the whole set or, on an error, no part of it.
-//!
-//! # Cron syntax
-//!
-//! Expressions are 5-field POSIX cron, parsed by [`croner`]:
-//!
-//! ```text
-//! ┌───────────── minute       (0-59)
-//! │ ┌─────────── hour         (0-23)
-//! │ │ ┌───────── day of month (1-31)
-//! │ │ │ ┌─────── month        (1-12)
-//! │ │ │ │ ┌───── day of week  (0-6, Sunday = 0)
-//! │ │ │ │ │
-//! * * * * *
-//! ```
-//!
-//! A step follows a range or `*`, as in `5-59/5 * * * *`, and the form
-//! `5/5 * * * *` is rejected. An expression with a seconds field or a year
-//! field is rejected. An [`Expression`] is parsed from a string, and the parse
-//! fails with [`Error::InvalidExpression`]. [`Expression::next_after`] and
-//! [`Expression::previous_before`] return the occurrence after and before a
-//! time, as Unix timestamps in milliseconds.
-//!
-//! All firing times are evaluated in UTC, against the clock the queue was
-//! opened with ([`taquba::Queue::clock`]).
-//!
-//! # Guarantees
-//!
-//! - **At-most-once enqueue per firing.** Each firing is enqueued via Taquba
-//!   with a deterministic [`taquba::EnqueueOptions::dedup_key`] of
-//!   `"cron:{name}:{fire_time_ms}"`, so a retry or a duplicate attempt for
-//!   one firing instant cannot produce more than one job.
-//! - **No backfill by default.** If the scheduler is offline at a firing
-//!   time, it drops the firing. The next firing is the next *future*
-//!   occurrence. A schedule with
-//!   [`Schedule::backfill`] set replays the missed firings within its
-//!   lookback exactly once. Only the persisted watermark stops a firing from
-//!   being enqueued twice, because claiming a job releases its dedup key.
-//! - **Single-instance schedules.** A given schedule (identified by `name`)
-//!   must be owned by at most one [`CronScheduler`] at a time.
-//! - **No schedule persistence.** Schedules exist only in memory, and an
-//!   application must register them again on startup. The *enqueued jobs* are
-//!   durable via Taquba, as is the backfill watermark.
+//! - **Scheduler.** [`CronScheduler::new`] builds a scheduler on a queue, and
+//!   [`CronScheduler::run`] runs it until a shutdown future resolves.
+//! - **Schedules.** A [`Schedule`] pairs a name and an [`Expression`] with the
+//!   queue, payload, headers, priority and attempt limit of its jobs. Each job
+//!   has the headers [`FIRE_MS_HEADER`] and [`PREVIOUS_FIRE_MS_HEADER`].
+//! - **Changes.** [`CronScheduler::handle`] returns a [`ScheduleHandle`], which
+//!   registers, replaces and removes schedules before and during the run.
+//! - **Backfill.** A schedule with a [`Backfill`] replays the firings missed
+//!   while the scheduler was not running. [`CronScheduler::clear_watermark`]
+//!   deletes the watermark of a schedule.
+//! - **Expressions.** [`Expression::next_after`] and
+//!   [`Expression::previous_before`] return the occurrences around a time.
+//! - **Reserved names.** [`RESERVED_HEADER_PREFIX`], [`RESERVED_KV_PREFIX`] and
+//!   [`RESERVED_DEDUP_PREFIX`] mark the headers, KV keys and dedup keys of this
+//!   crate.
 //!
 //! [Taquba]: https://docs.rs/taquba
 
 #![warn(missing_docs)]
+
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
