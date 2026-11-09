@@ -158,8 +158,8 @@ succeed. A step fans out by submitting a group and waiting for it.
 ## Stability
 
 taquba-workflow is pre-1.0. A minor release can break the Rust API and the
-on-disk format, and a patch release preserves both. An upgrade to a new minor
-version requires a store without active runs.
+on-disk format, whereas a patch release preserves both. An upgrade to a new
+minor version requires a store without active runs.
 
 <!-- vale off -->
 

@@ -133,8 +133,8 @@ records the measurements.
 ## Stability
 
 Taquba is pre-1.0. A minor release can break the Rust API and the on-disk
-format, and a patch release preserves both. An upgrade to a new minor version
-requires a drained queue or an empty store.
+format, whereas a patch release preserves both. An upgrade to a new minor
+version requires a drained queue or an empty store.
 
 <!-- vale off -->
 
