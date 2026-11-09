@@ -167,15 +167,14 @@ pub struct OpenOptions {
     /// Override SlateDB's WAL flush interval. `None` keeps SlateDB's own
     /// default.
     ///
-    /// The transitions that await durability (`enqueue`, `ack`, `nack`,
-    /// `dead_letter`) block until the next flush tick, so this value is the
-    /// lower bound on their per-operation latency. `claim` and the background
-    /// sweeps commit without awaiting the flush and are not bound by it.
+    /// Each `Queue` method that writes to the store blocks until the next flush
+    /// tick, so this value is the lower bound on its latency. The background
+    /// sweeps, which methods such as `Queue::reap_now` also run, commit without
+    /// waiting for the flush.
     ///
-    /// Does not affect durability semantics: the awaiting transitions wait for
-    /// the flush at any interval, and a non-awaiting transition lost in a crash
-    /// is redone on recovery, so at-least-once delivery is preserved regardless
-    /// of the interval chosen.
+    /// Does not affect durability semantics: the methods wait for the flush at
+    /// any interval, and a sweep lost in a crash is redone on recovery, so
+    /// at-least-once delivery is preserved regardless of the interval chosen.
     pub flush_interval: Option<Duration>,
     /// How often the background metrics sampler reads per-queue depth and the
     /// oldest-pending age and emits them as gauges. `None` (the default)

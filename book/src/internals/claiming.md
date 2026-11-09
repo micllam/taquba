@@ -132,33 +132,30 @@ does not delete the entry that B owns.
 
 ### Commit durability
 
-The claim transaction commits without waiting for the WAL flush
-([Durability](store.md#durability)), because every outcome leaves the job
-claimable again.
+The claim transaction commits inside the claim lock without waiting for the WAL
+flush ([Durability](store.md#durability)). The claim releases the lock, waits
+for the flush and then delivers its jobs. The next claim on the queue waits only
+for the release of the lock.
 
 ```text
-              claim commits, applied in memory
-                             │
-              ┌──────────────┴──────────────┐
-              │                             │
-       process survives               process dies
-              │                             │
-              ▼                ┌────────────┴────────────┐
-        the flush completes    │                         │
-        and the claim    before the flush          after the flush
-        is durable             │                         │
-                               ▼                         ▼
-                        the pending key           the claimed record
-                        was never deleted,        is found when the
-                        so the job is             queue opens, and the
-                        still Pending             job returns to Pending
+          claim commits in memory and releases the claim lock
+                                 │
+                       the claim waits for its flush
+                ┌────────────────┴────────────────┐
+                │                                 │
+       the flush completes              the process dies, or a
+                │                       second writer fences it
+                ▼                                 │
+       the jobs are delivered                     ▼
+       with the claimed record          the jobs are not delivered,
+       durable                          and the pending key was never
+                                        deleted from the store
 ```
 
-The two crash cases differ in one respect: the claim that reached the WAL counts
-as an attempt, and the claim lost with the WAL does not. A process that dies
-between a claim and its flush therefore leaves the attempt count one lower than
-a durable claim leaves it. The job is delivered again in both cases, which is
-the only property a claim must preserve.
+A crash after the delivery leaves the claimed record. The next open returns the
+job to `Pending` with the attempt counted, or dead-letters it after its last
+attempt. A job is therefore dead-lettered even when each of its deliveries ends
+the process, such as through an abort or an out-of-memory kill.
 
 ## Settlement
 

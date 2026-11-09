@@ -402,7 +402,10 @@ mod tests {
 
         let first = q.core.commit(first, Durability::Awaited).await.unwrap();
         let second = q.core.commit(second, Durability::Awaited).await.unwrap();
-        assert_eq!((first, second), (Commit::Committed, Commit::Conflict));
+        assert!(matches!(
+            (first, second),
+            (Commit::Committed(_), Commit::Conflict)
+        ));
 
         q.close().await.unwrap();
     }

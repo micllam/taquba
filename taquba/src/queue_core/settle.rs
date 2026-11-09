@@ -3,10 +3,11 @@
 
 use tracing::debug;
 
+use crate::claim::Claim;
 use crate::effects::SettlementEffects;
 use crate::error::{Error, Result};
 use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
-use crate::job::{Claim, JobRecord, JobStatus};
+use crate::job::{JobRecord, JobStatus};
 use crate::queue::EnqueueResult;
 use crate::queue_core::QueueCore;
 use crate::txn::{Attempt, ClaimEnd, Durability, read_claim};

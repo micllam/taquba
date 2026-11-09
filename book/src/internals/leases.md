@@ -2,7 +2,7 @@
 
 This chapter describes what a worker receives when it claims a job, and the
 in-memory state, separate from the store, that records when a claim expires and
-how it is cancelled. The code is in `taquba/src/job.rs` ([source][job]),
+how it is cancelled. The code is in `taquba/src/claim.rs` ([source][claim]),
 `taquba/src/lease_registry.rs` ([source][lease_registry]) and
 `taquba/src/lease.rs` ([source][lease]).
 
@@ -187,5 +187,5 @@ manifest poll, whichever comes first. The poll runs every second.
 [renew_lease]: https://docs.rs/taquba/latest/taquba/struct.Queue.html#method.renew_lease
 [cancel]: https://docs.rs/taquba/latest/taquba/struct.Queue.html#method.cancel
 [lease_registry]: https://github.com/micllam/taquba/blob/master/taquba/src/lease_registry.rs
-[job]: https://github.com/micllam/taquba/blob/master/taquba/src/job.rs
+[claim]: https://github.com/micllam/taquba/blob/master/taquba/src/claim.rs
 [lease]: https://github.com/micllam/taquba/blob/master/taquba/src/lease.rs

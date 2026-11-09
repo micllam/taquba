@@ -11,12 +11,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::background::Shutdown;
+use crate::claim::Claim;
 use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
 use crate::completion::CompletionWaiters;
 use crate::error::Result;
 use crate::inbox::InboxState;
-use crate::job::{Claim, JobRecord, JobStatus};
+use crate::job::{JobRecord, JobStatus};
 use crate::lease_registry::LeaseRegistry;
 use crate::options::QueueConfig;
 use crate::payload_store::PayloadStore;

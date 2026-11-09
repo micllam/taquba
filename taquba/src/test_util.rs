@@ -9,9 +9,10 @@ pub(crate) use slatedb::object_store::memory::InMemory;
 
 pub(crate) use slatedb::object_store::Error as StoreError;
 
+pub(crate) use crate::claim::Claim;
 pub(crate) use crate::clock::{Clock, MockClock};
 pub(crate) use crate::effects::SettlementEffects;
-pub(crate) use crate::job::{Claim, JobRecord, JobStatus};
+pub(crate) use crate::job::{JobRecord, JobStatus};
 pub(crate) use crate::keys::{KeyTag, QueueName, tag_prefix};
 pub(crate) use crate::lease::LeaseHandle;
 pub(crate) use crate::options::{

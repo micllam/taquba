@@ -116,6 +116,7 @@
 struct ReadmeDoctests;
 
 mod background;
+mod claim;
 mod claim_cursor;
 mod clock;
 mod codec;
@@ -157,6 +158,7 @@ mod view;
 /// [`worker::WorkerHandle`] that runs a loop as a Tokio task.
 pub mod worker;
 
+pub use claim::Claim;
 pub use clock::{Clock, MockClock, SystemClock};
 pub use effects::{EnqueueRequest, KvCompare, SettlementEffects};
 pub use error::{Error, FormError, Result, StoreUrlError};
@@ -173,7 +175,7 @@ pub use inbox::{
     DEFAULT_INBOX_INTERVAL, DEFAULT_INBOX_RECORD_RETENTION, DEFAULT_INBOX_TOUCH_POLL_INTERVAL,
     INBOX_UNREADABLE_AFTER, InboxOptions, default_inbox_path,
 };
-pub use job::{Claim, JobRecord, JobStatus};
+pub use job::{JobRecord, JobStatus};
 pub use keys::{MAX_QUEUE_NAME_LEN, QueueName};
 pub use kv::{KvOrder, KvPage, KvRange, MAX_KV_VALUE_SIZE};
 pub use lease::{ClaimFence, LeaseHandle};

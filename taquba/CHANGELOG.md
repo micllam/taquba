@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The key of a claimed record contains its claim id after the job id, so the
   `Claimed` key space has a new on-disk layout. Every claimed job of a store
   must be settled before the upgrade.
+- A claim now returns once it is durable, so every delivery counts toward
+  `max_attempts` across a crash. A caller must now raise the timeout around a
+  claim above one `OpenOptions::flush_interval` plus the write latency of the
+  store.
 
 ### Fixed
 

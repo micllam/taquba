@@ -9,6 +9,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, instrument, warn};
 
 use crate::background::{BackgroundTask, Ticker};
+use crate::claim::Claim;
 use crate::claim_cursor::ClaimCursor;
 use crate::clock::Clock;
 use crate::completion::{CompletionWaiters, Registration};
@@ -16,7 +17,7 @@ use crate::effects::{EnqueueRequest, PreparedEffects, SettlementEffects};
 use crate::error::{Error, Form, Result};
 use crate::history::AttemptOutcome;
 use crate::inbox::{Inbox, InboxState};
-use crate::job::{Claim, JobRecord, JobStatus};
+use crate::job::{JobRecord, JobStatus};
 use crate::keys::QueueName;
 use crate::lease_registry::{LeaseRegistry, Renewal};
 use crate::options::{EnqueueOptions, OpenOptions, QueueConfig};
@@ -647,12 +648,19 @@ impl Queue {
     /// Claim the next pending job with an explicit lease duration. Returns
     /// `None` if the queue is empty.
     ///
-    /// The claim commit does not await WAL durability. If the process crashes
-    /// before the claim is flushed, the job is still pending on recovery and is
-    /// redelivered immediately, without waiting for its lease to expire.
-    /// At-least-once delivery is unaffected. Any later durable commit (ack,
-    /// nack, enqueue) flushes preceding WAL entries, so a settled job's claim
-    /// is always durable.
+    /// The call returns once the claim is durable, so every delivery consumes
+    /// an attempt. After a crash, the next open requeues the job without
+    /// waiting for its lease to expire, or dead-letters it after its last
+    /// attempt. Fails with the store's error once the store closes, including a
+    /// fence by a second writer. The lease starts at the commit, before the
+    /// wait for the flush, so the worker receives `lease_duration` less that
+    /// wait.
+    ///
+    /// A claim future dropped before it returns leaves its jobs claimed until
+    /// their leases expire, with the attempt consumed. A timeout around a claim
+    /// must therefore exceed one flush interval and the write latency of the
+    /// store. [`Self::claim_with_wait`] bounds the wait for a job without
+    /// dropping a claim.
     ///
     /// Same-queue claim attempts serialise through an in-process
     /// `tokio::sync::Mutex`, so a transaction-conflict retry does not decide
@@ -717,8 +725,8 @@ impl Queue {
     /// `run_at`. The claim consumes an attempt, releases the job's dedup key
     /// and registers its lease exactly as a scan claim does, so the reaper
     /// requeues it when the lease expires and the next open requeues it after a
-    /// crash. The claim commits without awaiting WAL durability, as
-    /// [`Self::claim`] does.
+    /// crash. The call returns once the claim is durable, as [`Self::claim`]
+    /// does.
     ///
     /// Exactly one caller wins the transition: a concurrent scan claim,
     /// scheduler promotion, [`Self::cancel`] and this call conflict on the

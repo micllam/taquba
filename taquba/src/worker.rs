@@ -8,9 +8,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::claim::Claim;
 use crate::effects::SettlementEffects;
 use crate::error::{Error, Result};
-use crate::job::{Claim, JobRecord};
+use crate::job::JobRecord;
 use crate::lease::LeaseHandle;
 use crate::queue::Queue;
 

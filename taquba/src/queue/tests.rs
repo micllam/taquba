@@ -71,6 +71,48 @@ async fn a_claim_on_a_fenced_empty_queue_fails() {
 }
 
 #[tokio::test]
+async fn a_fenced_writer_does_not_deliver_a_claim() {
+    let store = make_store();
+    let first = Queue::open(store.clone(), "test").await.unwrap();
+    first.enqueue("work", b"payload".to_vec()).await.unwrap();
+
+    let second = Queue::open(store, "test").await.unwrap();
+    assert!(first.claim("work", Duration::from_secs(30)).await.is_err());
+    assert_eq!(second.view().stats("work").await.unwrap().pending, 1);
+    second.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_delivered_claim_consumes_an_attempt_across_a_fence() {
+    let store = make_store();
+    let first = Queue::open(store.clone(), "test").await.unwrap();
+    let id = first
+        .enqueue_with(
+            "work",
+            b"payload".to_vec(),
+            EnqueueOptions {
+                max_attempts: Some(1),
+                ..EnqueueOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let claim = first
+        .claim("work", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .unwrap();
+    // The successor takes the store while the claim is in flight, as after a
+    // crash of the first process. After its last attempt, the job is
+    // dead-lettered at the open.
+    let second = Queue::open(store, "test").await.unwrap();
+    drop(claim);
+    let job = second.view().get_job(&id).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Dead);
+    second.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn test_enqueue_and_claim() {
     let q = Queue::open(make_store(), "test").await.unwrap();
 

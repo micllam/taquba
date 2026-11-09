@@ -372,7 +372,7 @@ impl QueueCore {
                     txn.delete(inbox_record_key(&queue, id))?;
                 }
             }
-            if self.commit(txn, Durability::Deferred).await? == Commit::Conflict {
+            if let Commit::Conflict = self.commit(txn, Durability::Deferred).await? {
                 for (_, applied_at) in batch {
                     scan.retain(*applied_at);
                 }
@@ -406,7 +406,7 @@ impl QueueCore {
             txn.stage_remove(key, job)?;
         }
         match self.commit(txn, Durability::Deferred).await? {
-            Commit::Committed => {}
+            Commit::Committed(_) => {}
             Commit::Conflict => return Ok(false),
         }
         if existed && let Some(payload_ref) = &job.payload_ref {

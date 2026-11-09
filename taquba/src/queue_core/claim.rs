@@ -9,12 +9,13 @@ use slatedb::config::ScanOptions;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
+use crate::claim::{Claim, StagedClaim};
 use crate::error::Result;
-use crate::job::{Claim, JobRecord, JobStatus};
+use crate::job::{JobRecord, JobStatus};
 use crate::keys::{QueueName, dedup_index_key, pending_prefix};
 use crate::queue::ClaimOutcome;
 use crate::queue_core::QueueCore;
-use crate::txn::{Attempt, Commit, Durability, Txn};
+use crate::txn::{Commit, Durability, Flush, Txn, get_indexed_job};
 
 /// Generate a claim id. A ULID's low 64 bits fall inside its 80-bit random
 /// component, so claim ids are distinct across claims of the same job. The
@@ -46,23 +47,22 @@ impl QueueCore {
         if self.claim_cursor.known_empty(queue) {
             return Ok(Vec::new());
         }
-        let mut jobs = {
+        let claimed = {
             let lock = self.claim_cursor.claim_lock_for(queue);
             let _guard = lock.lock().await;
             self.claim_batch_locked(queue, max_jobs, lease_duration)
                 .await?
         };
-        // Offloaded payloads are fetched after the claim lock is released, so
-        // other claims on the queue proceed during the object-store reads. On a
-        // fetch failure the claim has already committed: the affected jobs stay
-        // claimed until their leases expire and are then redelivered. Their
-        // cancel tokens stay registered, so a cancel during that window still
-        // fires the token and persists the request.
-        self.materialize_payloads(&mut jobs).await?;
-        Ok(jobs)
+        let Some((staged, flush)) = claimed else {
+            return Ok(Vec::new());
+        };
+        // The claim lock is released before the wait for the flush, so other
+        // claims on the queue proceed while the WAL flushes.
+        self.deliver(staged, flush).await
     }
 
-    /// The scan-and-claim transaction of [`Self::claim_batch`]. The caller must
+    /// The scan-and-claim transaction of [`Self::claim_batch`] with the flush
+    /// of its commit. Returns `None` when the queue is empty. The caller must
     /// hold the queue's claim lock for the duration of the call. Offloaded
     /// payloads are not fetched here, so the lock is never held across a
     /// payload read.
@@ -71,7 +71,7 @@ impl QueueCore {
         queue: &QueueName,
         max_jobs: usize,
         lease_duration: Duration,
-    ) -> Result<Vec<Claim>> {
+    ) -> Result<Option<(Vec<StagedClaim>, Flush)>> {
         let prefix = pending_prefix(queue);
         let prefix_bytes = prefix.as_slice();
         let timer = crate::obs::start();
@@ -81,7 +81,7 @@ impl QueueCore {
             // epoch after this read and revokes the emptiness recorded below.
             let scan = self.claim_cursor.begin_claim(queue);
             if scan.known_empty {
-                return Ok(Vec::new());
+                return Ok(None);
             }
             let mut txn = self.begin()?;
 
@@ -137,7 +137,7 @@ impl QueueCore {
                 // without a key establishes that the queue is empty, without a
                 // read of the tombstone band from the front.
                 self.claim_cursor.mark_empty(queue, &scan);
-                return Ok(Vec::new());
+                return Ok(None);
             }
 
             let now = self.now_ms();
@@ -147,19 +147,16 @@ impl QueueCore {
                 .key
                 .clone();
 
-            let mut jobs = Vec::with_capacity(candidates.len());
+            let mut staged = Vec::with_capacity(candidates.len());
             for kv in &candidates {
                 let job = JobRecord::decode(&kv.key, &kv.value)?;
-                jobs.push(self.stage_claim(&mut txn, &kv.key, job, now, lease_duration)?);
+                staged.push(self.stage_claim(&mut txn, &kv.key, job, now, lease_duration)?);
             }
 
-            // Claims commit without awaiting WAL durability. The claimed state
-            // only matters across a restart, where either version of it
-            // recovers: a claim lost with the unflushed WAL leaves the job
-            // pending, and a durable one is requeued at open. The only
-            // difference is that the durable claim consumed an attempt.
+            // The commit returns before the flush, and the caller waits for the
+            // flush after releasing the claim lock.
             match self.commit(txn, Durability::Deferred).await? {
-                Commit::Committed => {
+                Commit::Committed(flush) => {
                     self.claim_cursor.advance(queue, last_pending_key, &scan);
                     if drained {
                         // The scan ran dry inside this snapshot, so nothing is
@@ -168,12 +165,12 @@ impl QueueCore {
                         // read revokes it.
                         self.claim_cursor.mark_empty(queue, &scan);
                     }
-                    // The claim histogram measures the claim transaction.
-                    // Offloaded payload fetches happen after the claim lock is
-                    // released and are not included.
-                    crate::obs::claimed(queue, jobs.len() as u64, timer);
-                    debug!(queue = %queue, count = jobs.len(), "jobs claimed");
-                    return Ok(jobs);
+                    // The claim histogram measures the claim transaction. The
+                    // flush and the offloaded payload fetches happen after the
+                    // claim lock is released and are not included.
+                    crate::obs::claimed(queue, staged.len() as u64, timer);
+                    debug!(queue = %queue, count = staged.len(), "jobs claimed");
+                    return Ok(Some((staged, flush)));
                 }
                 Commit::Conflict => {
                     warn!(queue = %queue, "claim transaction conflict, retrying");
@@ -191,41 +188,37 @@ impl QueueCore {
         lease_duration: Duration,
     ) -> Result<ClaimOutcome> {
         let timer = crate::obs::start();
-        // `Err` is an outcome reached without a commit. The claim lock and the
-        // claim cursor are not touched, as in `cancel`: removing a pending key
-        // keeps every live key at or after the scan bound, and a concurrent
-        // scan claim conflicts on the key.
-        let claimed: std::result::Result<Claim, ClaimOutcome> = self
-            .transition_by_id(
-                id,
-                Durability::Deferred,
-                || Ok(Err(ClaimOutcome::NotFound)),
-                |mut txn, current_key, job| async move {
-                    if !matches!(job.status, JobStatus::Pending | JobStatus::Scheduled) {
-                        return Ok((txn, Attempt::Abort(Err(ClaimOutcome::NotClaimable))));
-                    }
-                    let claim = self.stage_claim(
-                        &mut txn,
-                        &current_key,
-                        job,
-                        self.now_ms(),
-                        lease_duration,
-                    )?;
-                    Ok((txn, Attempt::Commit(Ok(claim))))
-                },
-            )
-            .await?;
-        match claimed {
-            Ok(claim) => {
-                let mut jobs = vec![claim];
-                self.materialize_payloads(&mut jobs).await?;
-                let claim = jobs.pop().expect("one claim was materialized");
-                crate::obs::claimed(&claim.queue, 1, timer);
-                debug!(queue = %claim.queue, job_id = %id, "job claimed by id");
-                Ok(ClaimOutcome::Claimed(Box::new(claim)))
+        // The claim lock and the claim cursor are not touched, as in `cancel`:
+        // removing a pending key keeps every live key at or after the scan
+        // bound, and a concurrent scan claim conflicts on the key.
+        let (staged, flush) = loop {
+            let mut txn = self.begin()?;
+            let Some((_, current_key, job)) = get_indexed_job(&txn, id).await? else {
+                return Ok(ClaimOutcome::NotFound);
+            };
+            if !matches!(job.status, JobStatus::Pending | JobStatus::Scheduled) {
+                return Ok(ClaimOutcome::NotClaimable);
             }
-            Err(outcome) => Ok(outcome),
-        }
+            let staged =
+                self.stage_claim(&mut txn, &current_key, job, self.now_ms(), lease_duration)?;
+            match self.commit(txn, Durability::Deferred).await? {
+                Commit::Committed(flush) => {
+                    // The claim histogram measures the claim transaction, as in
+                    // the scan claim.
+                    let queue = &staged.job().queue;
+                    crate::obs::claimed(queue, 1, timer);
+                    debug!(queue = %queue, job_id = %id, "job claimed by id");
+                    break (staged, flush);
+                }
+                Commit::Conflict => debug!(job_id = %id, "claim by id conflict, retrying"),
+            }
+        };
+        let claim = self
+            .deliver(vec![staged], flush)
+            .await?
+            .pop()
+            .expect("one claim was delivered");
+        Ok(ClaimOutcome::Claimed(Box::new(claim)))
     }
 
     /// Stage the claim of `job`, read at `key`, in `txn`: the claimed record
@@ -238,7 +231,7 @@ impl QueueCore {
         mut job: JobRecord,
         now: u64,
         lease_duration: Duration,
-    ) -> Result<Claim> {
+    ) -> Result<StagedClaim> {
         job.status = JobStatus::Claimed;
         job.claimed_at = Some(now);
         job.attempts += 1;
@@ -269,14 +262,32 @@ impl QueueCore {
         if let Some(dk) = dedup_key_to_release.as_deref() {
             txn.delete(dedup_index_key(&job.queue, dk))?;
         }
-        Ok(Claim::new(job, cancel))
+        Ok(StagedClaim::new(job, cancel))
+    }
+
+    /// Wait for the flush that `staged` committed in and fetch the offloaded
+    /// payloads, then return the claims for delivery. The next open after a
+    /// crash therefore finds every delivered claim and counts its attempt. On a
+    /// failure the claims have already committed in memory: their jobs stay
+    /// claimed until their leases expire and are then redelivered. Their cancel
+    /// tokens stay registered, so a cancel during that window still fires the
+    /// token and persists the request.
+    async fn deliver(&self, mut staged: Vec<StagedClaim>, flush: Flush) -> Result<Vec<Claim>> {
+        let (durable, fetched) =
+            futures_util::future::join(flush.wait(), self.materialize_payloads(&mut staged)).await;
+        let durable = durable?;
+        fetched?;
+        Ok(staged
+            .into_iter()
+            .map(|claim| claim.into_claim(&durable))
+            .collect())
     }
 
     /// Fetch the offloaded payloads of `jobs` concurrently. The slowest object
     /// bounds the wall time of a batch, and the fetch times do not add up. Jobs
     /// with inline payloads are untouched. On a fetch failure, one error is
     /// returned after every fetch settles.
-    async fn materialize_payloads(&self, jobs: &mut [Claim]) -> Result<()> {
+    async fn materialize_payloads(&self, jobs: &mut [StagedClaim]) -> Result<()> {
         let store = &self.payload_store;
         let fetched =
             futures_util::future::join_all(jobs.iter_mut().map(|c| store.materialize(c.job_mut())))
@@ -289,7 +300,6 @@ impl QueueCore {
 mod tests {
     use super::*;
     use crate::test_util::*;
-    use crate::txn::get_indexed_job;
 
     async fn open_at(clock: &MockClock) -> Queue {
         let opts = OpenOptions {
@@ -302,28 +312,33 @@ mod tests {
     }
 
     /// Stage two claims of the job `id`, the loser after the winner, then
-    /// commit the winner and let the loser conflict. Returns the winning claim.
+    /// commit the winner and let the loser conflict. Returns the winning claim,
+    /// delivered.
     async fn race(q: &Queue, id: &str, winner_lease: Duration, loser_lease: Duration) -> Claim {
         let core = &q.core;
         let stage = async |lease| {
             let mut txn = core.begin().unwrap();
             let (_, key, job) = get_indexed_job(&txn, id).await.unwrap().unwrap();
-            let claim = core
+            let staged = core
                 .stage_claim(&mut txn, &key, job, core.now_ms(), lease)
                 .unwrap();
-            (txn, claim)
+            (txn, staged)
         };
         let (winner_txn, winner) = stage(winner_lease).await;
         let (loser_txn, _) = stage(loser_lease).await;
-        assert_eq!(
-            core.commit(winner_txn, Durability::Awaited).await.unwrap(),
-            Commit::Committed
-        );
-        assert_eq!(
-            core.commit(loser_txn, Durability::Awaited).await.unwrap(),
+        let Commit::Committed(flush) = core.commit(winner_txn, Durability::Deferred).await.unwrap()
+        else {
+            panic!("the winner conflicted");
+        };
+        assert!(matches!(
+            core.commit(loser_txn, Durability::Deferred).await.unwrap(),
             Commit::Conflict
-        );
-        winner
+        ));
+        core.deliver(vec![winner], flush)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
     }
 
     #[tokio::test]

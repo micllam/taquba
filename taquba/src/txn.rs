@@ -4,7 +4,7 @@ use std::future::Future;
 use std::ops::Deref;
 
 use bytes::Bytes;
-use slatedb::{DbTransaction, IsolationLevel};
+use slatedb::{DbTransaction, IsolationLevel, WriteHandle};
 
 use tracing::{debug, warn};
 
@@ -252,28 +252,33 @@ pub(crate) enum Durability {
 }
 
 /// Outcome of a commit without a storage error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Commit {
-    Committed,
+    /// The transaction committed, with the state of its WAL flush.
+    Committed(Flush),
     /// Another transaction committed a conflicting write, and the caller
     /// retries against fresh state.
     Conflict,
 }
 
-/// Commit `txn`. A transaction conflict is reported as [`Commit::Conflict`],
-/// and a storage failure is returned as an error.
-async fn commit(txn: DbTransaction, durability: Durability) -> Result<Commit> {
-    match txn.commit().await {
-        Ok(handle) => {
-            if let (Durability::Awaited, Some(handle)) = (durability, handle) {
-                handle.await_durable().await?;
-            }
-            Ok(Commit::Committed)
+/// The WAL flush of a committed transaction, which only [`QueueCore::commit`]
+/// creates. The flush is outstanding while the handle is present. It is
+/// complete when the transaction wrote nothing or its commit awaited the flush.
+pub(crate) struct Flush(Option<WriteHandle>);
+
+impl Flush {
+    /// Wait until the writes are durable. Fails with the store's error when the
+    /// store closes first, including a fence by a second writer.
+    pub(crate) async fn wait(self) -> Result<Durable> {
+        if let Some(handle) = self.0 {
+            handle.await_durable().await?;
         }
-        Err(e) if e.kind() == slatedb::ErrorKind::Transaction => Ok(Commit::Conflict),
-        Err(e) => Err(e.into()),
+        Ok(Durable(()))
     }
 }
+
+/// The proof that the writes of a commit are durable, which only
+/// [`Flush::wait`] creates.
+pub(crate) struct Durable(());
 
 /// The decision of one attempt of a body run by [`QueueCore::retry`], which the
 /// body returns with its transaction.
@@ -295,8 +300,9 @@ impl QueueCore {
         })
     }
 
-    /// Write the counters of `txn` and commit it as [`commit`] does, then apply
-    /// its notes when it committed.
+    /// Write the counters of `txn` and commit it with `durability`. Once the
+    /// commit returns, update the claim cursor, the time bounds and the enqueue
+    /// counter for the writes of `txn`.
     pub(crate) async fn commit(&self, txn: Txn, durability: Durability) -> Result<Commit> {
         let Txn { txn, notes, stats } = txn;
         for ((queue, status), delta) in &stats {
@@ -304,34 +310,44 @@ impl QueueCore {
                 update_stats(&txn, queue, *status, *delta)?;
             }
         }
-        let outcome = commit(txn, durability).await?;
-        if outcome == Commit::Committed {
-            for (queue, (min_key, count)) in &notes.pending {
-                self.claim_cursor
-                    .note_pending_inserts(queue, min_key, *count);
+        let handle = match txn.commit().await {
+            Ok(handle) => handle,
+            Err(e) if e.kind() == slatedb::ErrorKind::Transaction => return Ok(Commit::Conflict),
+            Err(e) => return Err(e.into()),
+        };
+        let flush = match (handle, durability) {
+            (Some(handle), Durability::Deferred) => Flush(Some(handle)),
+            (Some(handle), Durability::Awaited) => {
+                handle.await_durable().await?;
+                Flush(None)
             }
-            if let Some(run_at) = notes.scheduled {
-                self.scheduled_bound.lower(run_at);
-            }
-            if let Some(completed_at) = notes.done {
-                self.done_bound.lower(completed_at);
-            }
-            for (index, at_ms) in &notes.expiry {
-                index.written(*at_ms);
-            }
-            if let (Some(applied_at), Some(inbox)) = (notes.inbox, &self.inbox) {
-                inbox.bound.lower(applied_at);
-            }
-            let mut enqueued: BTreeMap<&QueueName, u64> = BTreeMap::new();
-            for (queue, id) in &notes.enqueued {
-                *enqueued.entry(queue).or_default() += 1;
-                debug!(queue = %queue, job_id = %id, "job enqueued");
-            }
-            for (queue, count) in enqueued {
-                crate::obs::enqueued(queue, count);
-            }
+            (None, _) => Flush(None),
+        };
+        for (queue, (min_key, count)) in &notes.pending {
+            self.claim_cursor
+                .note_pending_inserts(queue, min_key, *count);
         }
-        Ok(outcome)
+        if let Some(run_at) = notes.scheduled {
+            self.scheduled_bound.lower(run_at);
+        }
+        if let Some(completed_at) = notes.done {
+            self.done_bound.lower(completed_at);
+        }
+        for (index, at_ms) in &notes.expiry {
+            index.written(*at_ms);
+        }
+        if let (Some(applied_at), Some(inbox)) = (notes.inbox, &self.inbox) {
+            inbox.bound.lower(applied_at);
+        }
+        let mut enqueued: BTreeMap<&QueueName, u64> = BTreeMap::new();
+        for (queue, id) in &notes.enqueued {
+            *enqueued.entry(queue).or_default() += 1;
+            debug!(queue = %queue, job_id = %id, "job enqueued");
+        }
+        for (queue, count) in enqueued {
+            crate::obs::enqueued(queue, count);
+        }
+        Ok(Commit::Committed(flush))
     }
 
     /// Run `body` against a fresh transaction until its commit does not
@@ -349,7 +365,7 @@ impl QueueCore {
             match body(self.begin()?).await? {
                 (_, Attempt::Abort(value)) => return Ok(value),
                 (txn, Attempt::Commit(value)) => match self.commit(txn, durability).await? {
-                    Commit::Committed => return Ok(value),
+                    Commit::Committed(_) => return Ok(value),
                     Commit::Conflict => {
                         debug!("transaction conflict, retrying against fresh state");
                         continue;
@@ -529,7 +545,7 @@ mod tests {
         let mut txn = core.begin().unwrap();
         txn.insert_job(&job).unwrap();
         let outcome = core.commit(txn, Durability::Awaited).await.unwrap();
-        assert_eq!(outcome, Commit::Committed);
+        assert!(matches!(outcome, Commit::Committed(_)));
         assert!(!core.claim_cursor.known_empty("work"));
 
         q.close().await.unwrap();
