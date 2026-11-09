@@ -208,6 +208,10 @@ pub const FIRE_MS_HEADER: &str = "cron.fire_ms";
 /// Header attached to every enqueued job, storing the occurrence of the
 /// expression before the firing time as a decimal Unix timestamp in
 /// milliseconds. It is absent for a firing without an earlier occurrence.
+///
+/// The scheduler computes the previous occurrence from the expression, whether
+/// or not that occurrence was enqueued. With [`FIRE_MS_HEADER`], the header
+/// bounds the interval that the job covers.
 pub const PREVIOUS_FIRE_MS_HEADER: &str = "cron.previous_fire_ms";
 
 /// Prefix of the header names reserved for this crate. A schedule whose
@@ -253,7 +257,23 @@ fn lookback_floor(now: DateTime<Utc>, lookback: Duration) -> Option<DateTime<Utc
         .and_then(|d| now.checked_sub_signed(d))
 }
 
-/// A parsed 5-field cron expression, the type of [`Schedule::expression`].
+/// A parsed 5-field POSIX cron expression, the type of
+/// [`Schedule::expression`]. [`croner`] parses the text, and the occurrences
+/// are evaluated in UTC.
+///
+/// ```text
+/// ┌───────────── minute       (0-59)
+/// │ ┌─────────── hour         (0-23)
+/// │ │ ┌───────── day of month (1-31)
+/// │ │ │ ┌─────── month        (1-12)
+/// │ │ │ │ ┌───── day of week  (0-6, Sunday = 0)
+/// │ │ │ │ │
+/// * * * * *
+/// ```
+///
+/// A step follows a range or `*`, as in `5-59/5 * * * *`, and the form
+/// `5/5 * * * *` is rejected. An expression with a seconds field or a year
+/// field is rejected. A failed parse returns [`Error::InvalidExpression`].
 ///
 /// ```
 /// use taquba_cron::Expression;
@@ -371,8 +391,36 @@ pub enum Error {
 /// Result alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Replay policy for firings missed while the scheduler was not running. See
-/// the crate documentation, section "Backfill".
+/// Replay policy for firings missed while the scheduler was not running.
+///
+/// The scheduler stores the time of the last enqueued firing of a schedule in
+/// the queue's KV namespace, at [`watermark_key`]. It writes the watermark in
+/// the transaction of the enqueue, so the two commit together. On start it
+/// enqueues one job per occurrence after the watermark, oldest first, up to the
+/// current time. It then resumes live firings. It skips an occurrence older
+/// than [`Self::lookback`].
+///
+/// ```
+/// use std::time::Duration;
+/// use taquba_cron::{Backfill, BackfillStart, Schedule};
+///
+/// let schedule = Schedule::new("sweep", "0 * * * *".parse()?, "sweeps", b"sweep".to_vec())
+///     .backfill(Some(Backfill {
+///         lookback: Duration::from_secs(6 * 60 * 60),
+///         start: BackfillStart::CurrentTime,
+///     }));
+/// # Ok::<(), taquba_cron::Error>(())
+/// ```
+///
+/// The watermark advances only when a firing is enqueued, so after a failed
+/// enqueue the scheduler retries that firing. The watermark alone prevents a
+/// second enqueue of a firing, because a claim releases the dedup key of the
+/// job.
+///
+/// The watermark records a position in the occurrence sequence and is
+/// independent of the expression. After a change of the expression, the
+/// scheduler replays the missed occurrences of the new expression after the
+/// watermark.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Backfill {
     /// Occurrences at or before this far before the current time are not
@@ -589,6 +637,17 @@ impl Registry {
 /// Build with [`Self::new`], register schedules through [`Self::handle`], then
 /// call [`Self::run`]. The handle also registers and removes schedules while
 /// the scheduler runs.
+///
+/// The scheduler evaluates firing times against the clock of the queue
+/// ([`taquba::Queue::clock`]). It enqueues each firing with the dedup key
+/// `cron:{name}:{fire_time_ms}`, so a repeated enqueue of a firing whose job
+/// waits does not produce a second job. Without [`Schedule::backfill`], it
+/// drops a firing missed while it is not running, and the next firing is the
+/// next future occurrence.
+///
+/// Schedules exist only in memory, so an application must register them again
+/// at each start. The enqueued jobs and the backfill watermarks are durable in
+/// the queue. A schedule must belong to at most one scheduler at a time.
 pub struct CronScheduler {
     queue: Arc<Queue>,
     registry: Arc<Registry>,
@@ -615,13 +674,17 @@ impl ScheduleHandle {
     /// Register a schedule. It fails with [`Error::DuplicateName`],
     /// [`Error::ReservedHeader`] or [`Error::UnboundedStart`], and with
     /// [`Error::Stopped`] after the scheduler is dropped.
+    ///
+    /// The schedule starts at the time the running scheduler applies the
+    /// registration, or at its watermark under backfill.
     pub fn schedule(&self, schedule: Schedule) -> Result<()> {
         self.registry.register(schedule)?;
         self.registry.changed.notify_one();
         Ok(())
     }
 
-    /// Replace the registered schedules with `schedules`. A schedule equal to a
+    /// Replace the registered schedules with `schedules`, for a consumer that
+    /// builds the schedule set from configuration. A schedule equal to a
     /// registered schedule is untouched and keeps its next firing. Every other
     /// schedule is a new registration, and a registered schedule that is absent
     /// from `schedules` is removed, as by [`Self::unschedule`].
@@ -639,6 +702,10 @@ impl ScheduleHandle {
     /// Remove the schedule `name` and return whether it was registered. The
     /// backfill watermark of the schedule stays in place. A firing that the
     /// scheduler enqueues during the call is still enqueued.
+    ///
+    /// To change the expression of a schedule, a caller should unschedule it
+    /// and register it again under the same name. Under backfill, the schedule
+    /// resumes at its watermark.
     pub fn unschedule(&self, name: &str) -> bool {
         let mut state = self.registry.state.lock().unwrap();
         let before = state.entries.len();
@@ -698,9 +765,10 @@ impl CronScheduler {
     /// Sleeps until the soonest next firing across all entries, enqueues one
     /// due firing per entry, then recomputes. A sleep lasts at most a second,
     /// so a firing is late by at most a second after a forward step of the
-    /// queue's clock or a suspension of the host. A replay under backfill
-    /// continues at the next tick, so `shutdown` and a change through a
-    /// [`ScheduleHandle`] take effect between two firings of the replay.
+    /// queue's clock or a suspension of the host. A wake without a due firing
+    /// does not read from the store. A replay under backfill continues at the
+    /// next tick, so `shutdown` and a change through a [`ScheduleHandle`] take
+    /// effect between two firings of the replay.
     pub async fn run<F>(mut self, shutdown: F) -> Result<()>
     where
         F: std::future::Future<Output = ()>,
