@@ -128,9 +128,9 @@ restarting
 
 **A different tool is the better choice when any of the following is true:**
 
-- **The queue must share the application's database transactions.** A
-  database-backed queue enqueues jobs and commits their effects inside the
-  application's own transactions.
+- **Enqueues must commit in the transactions of another database.** A queue
+  stored in the application's database enqueues jobs and commits their effects
+  inside the application's own transactions.
 - **A worker fleet across machines is required.** Compute that runs in the
   worker process (GPU or CPU hours) is capped at one node. Steps that call
   remote services scale with async concurrency inside the process. Development
@@ -138,7 +138,10 @@ restarting
 - **The path is latency-sensitive.** Every durable transition waits for an
   object-store write, so end-to-end latency has a lower bound of one PUT round
   trip: tens to hundreds of milliseconds on S3. A user-facing request path that
-  waits for such a write inherits that lower bound.
+  waits for such a write inherits that lower bound. The bound falls with a
+  shorter `OpenOptions::flush_interval` and a write-ahead log on a store with
+  lower write latency, through `OpenOptions::wal_object_store`. A recent
+  transition then has the durability of that store.
 - **Jobs are short and volume is high.** Throughput is bound by the durable
   commit rate: thousands of transitions per second against S3, scaling with
   concurrency. Sub-millisecond jobs incur the durability cost on every
