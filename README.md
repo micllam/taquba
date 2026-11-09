@@ -174,9 +174,9 @@ typed job or a job group is the correct choice.
 
 ## Stability
 
-Pre-1.0. A minor version bump can break source compatibility and the on-disk
-layout. Drain in-flight runs before upgrading across minors. Patch bumps
-preserve both.
+The crates are pre-1.0. A minor release can break the Rust API and the on-disk
+format, whereas a patch release preserves both. An upgrade to a new minor
+version requires a drained queue or an empty store.
 
 ## Links
 
