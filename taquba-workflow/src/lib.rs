@@ -13,24 +13,40 @@
 //! use taquba::{Queue, object_store::memory::InMemory};
 //! use taquba_workflow::{RunSpec, Step, StepError, StepOutcome, StepRunner, WorkflowRuntime};
 //!
-//! struct EchoRunner;
+//! struct Summarize;
 //!
-//! impl StepRunner for EchoRunner {
+//! impl StepRunner for Summarize {
 //!     async fn run_step(&self, step: &Step) -> Result<StepOutcome, StepError> {
-//!         Ok(StepOutcome::Succeed { result: step.payload.clone() })
+//!         match step.step_number {
+//!             // A retry of step 0 reads the recorded summary and does not
+//!             // call the model again.
+//!             0 => {
+//!                 let summary: String = step
+//!                     .memo
+//!                     .memoized("summary", call_model(&step.payload))
+//!                     .await?;
+//!                 Ok(StepOutcome::continue_now(summary.into_bytes()))
+//!             }
+//!             // Step 1 receives the summary as its payload.
+//!             _ => Ok(StepOutcome::Succeed { result: step.payload.clone() }),
+//!         }
 //!     }
+//! }
+//!
+//! async fn call_model(input: &[u8]) -> Result<String, StepError> {
+//!     Ok(format!("summary of {} bytes", input.len()))
 //! }
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let store = Arc::new(InMemory::new());
 //! let queue = Arc::new(Queue::open(store.clone(), "demo").await?);
 //!
-//! let runtime = WorkflowRuntime::builder(queue, store, EchoRunner).build()?;
+//! let runtime = WorkflowRuntime::builder(queue, store, Summarize).build()?;
 //!
 //! let worker = runtime.spawn(std::future::pending::<()>());
 //!
 //! let submitted = runtime.submit(RunSpec {
-//!     input: b"hello".to_vec(),
+//!     input: b"a long document".to_vec(),
 //!     ..Default::default()
 //! }).await?;
 //! let run = runtime.wait(&submitted.run_id).await?;
