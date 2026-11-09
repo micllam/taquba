@@ -1,5 +1,6 @@
-//! In-memory registry of claimed jobs' leases: the authoritative source of
-//! every claim's current expiry, claim id and cancellation token.
+//! In-memory registry of claimed jobs' leases: the source of a claim's current
+//! expiry and cancellation token. The claimed key in the store identifies the
+//! live claim of a job.
 //!
 //! Lease state is process state and is never durable. The queue is
 //! single-writer and single-process, so every path that consults or changes a
@@ -9,20 +10,24 @@
 //! record, and every claimed record found at open is re-queued before workers
 //! start. Renewal is therefore a memory operation without a durable write.
 //!
-//! Coherence with the store follows two rules. An entry is inserted before the
-//! transaction writing its claim commits, so a failed commit leaves a stale
-//! entry: it is discarded when it comes due (the reaper does not find a claimed
-//! record for it). With the opposite order, a missing entry leaves its claim
-//! invisible to the reaper until the next open. And an entry is removed only
-//! after the transaction ending its claim commits, fenced on the claim id, so a
-//! removal that runs after a re-claim of the same job cannot delete the new
-//! claim's entry.
+//! The registry uses the claim id as part of its key, so each claim has its own
+//! entry. Two rules keep the registry coherent with the store:
+//!
+//! **Insert before the commit.** An entry is inserted before the transaction
+//! writing its claim commits. A claim that fails to commit, including one that
+//! lost to another claim of the job, leaves its entry and the winner's entry
+//! intact. The store does not have a record at the loser's key, so the reaper
+//! drops the loser's entry once its expiry passes. The store can apply the
+//! commit of a claim whose future was dropped, and the reaper finds that claim
+//! through the entry inserted before the commit.
+//!
+//! **Remove after the commit.** An entry is removed only after the transaction
+//! ending its claim commits.
 //!
 //! The entry also contains the claim's cancellation token, fired by
 //! [`Queue::cancel`](crate::Queue::cancel) through the registry. The token is
 //! registered before the claim commits, so a cancellation racing the commit
-//! finds it, and is removed with the entry, so a settlement's cleanup cannot
-//! discard the token of a later claim of the same job.
+//! finds it, and is removed with its entry.
 //!
 //! The reaper examines due entries in place: [`LeaseRegistry::take_due`] marks
 //! entries and leaves them in the registry, and a marked entry refuses renewal.
@@ -36,7 +41,7 @@
 //! including a fence by a second writer. Closing fires every entry's token, and
 //! a closed registry refuses every renewal with [`Error::ClaimLost`].
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio_util::sync::CancellationToken;
@@ -63,9 +68,26 @@ pub(crate) struct DueLease {
     pub(crate) claim_id: u64,
 }
 
+/// The key of an entry.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ClaimKey {
+    queue: QueueName,
+    id: String,
+    claim_id: u64,
+}
+
+impl ClaimKey {
+    fn new(queue: &QueueName, id: &str, claim_id: u64) -> Self {
+        Self {
+            queue: queue.clone(),
+            id: id.to_string(),
+            claim_id,
+        }
+    }
+}
+
 struct Entry {
     expires_at: u64,
-    claim_id: u64,
     /// The claim's cooperative cancellation token, fired by
     /// [`LeaseRegistry::cancel`].
     cancel: CancellationToken,
@@ -76,15 +98,29 @@ struct Entry {
 
 #[derive(Default)]
 struct Inner {
-    by_job: HashMap<(QueueName, String), Entry>,
-    /// Expiry-ordered view of `by_job`. Every mutation updates both under one
-    /// lock, and the tuple is unique because a job has at most one lease.
-    by_expiry: BTreeSet<(u64, QueueName, String)>,
+    by_claim: BTreeMap<ClaimKey, Entry>,
+    /// Expiry-ordered view of `by_claim`. Every mutation updates the two
+    /// collections under one lock.
+    by_expiry: BTreeSet<(u64, ClaimKey)>,
     /// Set by [`LeaseRegistry::close`] and never cleared.
     closed: bool,
 }
 
-/// Claimed jobs' leases. The registry uses the job as its key and orders the
+impl Inner {
+    /// The entries of the job `id` of `queue`, in claim id order. The range
+    /// requires the field order of `ClaimKey`: queue, job id, claim id.
+    fn job_entries(
+        &self,
+        queue: &QueueName,
+        id: &str,
+    ) -> impl Iterator<Item = (&ClaimKey, &Entry)> {
+        let first = ClaimKey::new(queue, id, 0);
+        let last = ClaimKey::new(queue, id, u64::MAX);
+        self.by_claim.range(first..=last)
+    }
+}
+
+/// Claimed jobs' leases. The registry uses the claim as its key and orders the
 /// leases by expiry.
 ///
 /// Shared between the queue and the reaper via `Clone`, and all clones
@@ -99,10 +135,10 @@ impl LeaseRegistry {
         Self::default()
     }
 
-    /// Record a claim's lease and cancellation token, replacing any previous
-    /// entry for the job. Called before the transaction writing the claim
-    /// commits, so a failed commit leaves a stale entry, discarded when it
-    /// comes due.
+    /// Record a claim's lease and cancellation token. The entries of other
+    /// claims of the job stay in place. Called before the transaction writing
+    /// the claim commits, so a failed commit leaves a stale entry, which the
+    /// reaper discards once its expiry passes.
     pub(crate) fn insert(
         &self,
         queue: &QueueName,
@@ -112,31 +148,21 @@ impl LeaseRegistry {
         cancel: CancellationToken,
     ) {
         let mut inner = self.lock();
-        let key = (queue.clone(), id.to_string());
-        if let Some(old) = inner.by_job.get(&key) {
-            let old_expires = old.expires_at;
-            inner
-                .by_expiry
-                .remove(&(old_expires, key.0.clone(), key.1.clone()));
-        }
-        inner
-            .by_expiry
-            .insert((expires_at, key.0.clone(), key.1.clone()));
-        inner.by_job.insert(
-            key,
-            Entry {
-                expires_at,
-                claim_id,
-                cancel,
-                reaping: false,
-            },
-        );
+        let key = ClaimKey::new(queue, id, claim_id);
+        inner.by_expiry.insert((expires_at, key.clone()));
+        let entry = Entry {
+            expires_at,
+            cancel,
+            reaping: false,
+        };
+        let previous = inner.by_claim.insert(key, entry);
+        debug_assert!(previous.is_none(), "claim ids are unique");
     }
 
-    /// Apply `expires_at` to the lease per `mode`. Returns whether the expiry
-    /// changed. Fails with [`Error::ClaimLost`] when the registry is closed,
-    /// the job does not have a lease, the lease belongs to a different claim or
-    /// the reaper already took the entry as due. Otherwise fails with
+    /// Apply `expires_at` to the lease of the claim `claim_id` per `mode`.
+    /// Returns whether the expiry changed. Fails with [`Error::ClaimLost`] when
+    /// the registry is closed, the claim does not have a lease or the reaper
+    /// already took the entry as due. Otherwise fails with
     /// [`Error::CancelRequested`] when the claim's token `cancel` fired. A
     /// failure leaves the registry unchanged.
     pub(crate) fn renew(
@@ -157,9 +183,9 @@ impl LeaseRegistry {
         if cancel.is_cancelled() {
             return Err(Error::CancelRequested);
         }
-        let key = (queue.clone(), id.to_string());
-        let old_expires = match inner.by_job.get(&key) {
-            Some(e) if e.claim_id == claim_id && !e.reaping => e.expires_at,
+        let key = ClaimKey::new(queue, id, claim_id);
+        let old_expires = match inner.by_claim.get(&key) {
+            Some(e) if !e.reaping => e.expires_at,
             _ => return Err(Error::ClaimLost),
         };
         if old_expires == expires_at
@@ -167,47 +193,41 @@ impl LeaseRegistry {
         {
             return Ok(false);
         }
+        inner.by_expiry.remove(&(old_expires, key.clone()));
+        inner.by_expiry.insert((expires_at, key.clone()));
         inner
-            .by_expiry
-            .remove(&(old_expires, key.0.clone(), key.1.clone()));
-        inner
-            .by_expiry
-            .insert((expires_at, key.0.clone(), key.1.clone()));
-        inner
-            .by_job
+            .by_claim
             .get_mut(&key)
             .expect("entry present above")
             .expires_at = expires_at;
         Ok(true)
     }
 
-    /// The job's current expiry and claim id, or `None` when it does not have a
-    /// lease.
-    pub(crate) fn current(&self, queue: &QueueName, id: &str) -> Option<(u64, u64)> {
+    /// The expiry of the lease of the claim `claim_id`, or `None` when the
+    /// claim does not have an entry.
+    pub(crate) fn expiry(&self, queue: &QueueName, id: &str, claim_id: u64) -> Option<u64> {
         self.lock()
-            .by_job
-            .get(&(queue.clone(), id.to_string()))
-            .map(|e| (e.expires_at, e.claim_id))
+            .by_claim
+            .get(&ClaimKey::new(queue, id, claim_id))
+            .map(|entry| entry.expires_at)
     }
 
-    /// Fire the cancellation token of the claim currently holding the job.
-    /// Returns `false` when the job does not have a lease. The entry remains,
-    /// and a claim ends through a settlement or the reaper.
+    /// Fire the cancellation token of every claim of the job with an entry: the
+    /// live claim, and a claim that the reaper is ending or that failed to
+    /// commit. Returns `false` when the job does not have an entry. The entries
+    /// remain until a settlement or the reaper ends their claims.
     pub(crate) fn cancel(&self, queue: &QueueName, id: &str) -> bool {
         // Fired outside the lock: firing wakes waiters, and a waiter must be
         // free to read the registry.
-        let token = self
+        let tokens: Vec<CancellationToken> = self
             .lock()
-            .by_job
-            .get(&(queue.clone(), id.to_string()))
-            .map(|entry| entry.cancel.clone());
-        match token {
-            Some(token) => {
-                token.cancel();
-                true
-            }
-            None => false,
+            .job_entries(queue, id)
+            .map(|(_, entry)| entry.cancel.clone())
+            .collect();
+        for token in &tokens {
+            token.cancel();
         }
+        !tokens.is_empty()
     }
 
     /// Mark the registry closed and fire every entry's cancellation token.
@@ -216,7 +236,7 @@ impl LeaseRegistry {
         let tokens: Vec<CancellationToken> = {
             let mut inner = self.lock();
             inner.closed = true;
-            inner.by_job.values().map(|e| e.cancel.clone()).collect()
+            inner.by_claim.values().map(|e| e.cancel.clone()).collect()
         };
         // Fired outside the lock, as in `cancel`.
         for token in tokens {
@@ -230,59 +250,64 @@ impl LeaseRegistry {
     /// leaves every entry in the registry.
     pub(crate) fn take_due(&self, now: u64) -> Vec<DueLease> {
         let mut inner = self.lock();
-        let due_keys: Vec<(u64, QueueName, String)> = inner
+        let due_keys: Vec<(u64, ClaimKey)> = inner
             .by_expiry
             .iter()
-            .take_while(|(expires_at, _, _)| *expires_at <= now)
+            .take_while(|(expires_at, _)| *expires_at <= now)
             .cloned()
             .collect();
         let mut due = Vec::with_capacity(due_keys.len());
-        for (expires_at, queue, id) in due_keys {
-            let key = (queue, id);
-            let entry = inner
-                .by_job
+        for (expires_at, key) in due_keys {
+            inner
+                .by_claim
                 .get_mut(&key)
-                .expect("index entry has a job entry");
-            entry.reaping = true;
+                .expect("index entry has a claim entry")
+                .reaping = true;
+            let ClaimKey {
+                queue,
+                id,
+                claim_id,
+            } = key;
             due.push(DueLease {
-                queue: key.0,
-                id: key.1,
+                queue,
+                id,
                 expires_at,
-                claim_id: entry.claim_id,
+                claim_id,
             });
         }
         due
     }
 
-    /// Remove the job's entry if it still belongs to the claim `claim_id`
-    /// identifies. Called after the transaction ending the claim commits. The
-    /// fence makes a removal that runs after a re-claim of the same job a
-    /// no-op, so the new claim's entry stays in place.
+    /// Remove the entry of the claim `claim_id`. Called after the transaction
+    /// ending the claim commits. The entries of other claims of the job stay in
+    /// place.
     pub(crate) fn remove(&self, queue: &QueueName, id: &str, claim_id: u64) {
         let mut inner = self.lock();
-        let key = (queue.clone(), id.to_string());
-        let Some(entry) = inner.by_job.get(&key) else {
-            return;
-        };
-        if entry.claim_id != claim_id {
-            return;
+        let key = ClaimKey::new(queue, id, claim_id);
+        if let Some(entry) = inner.by_claim.remove(&key) {
+            inner.by_expiry.remove(&(entry.expires_at, key));
         }
-        let expires_at = entry.expires_at;
-        inner.by_job.remove(&key);
-        inner.by_expiry.remove(&(expires_at, key.0, key.1));
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.lock().by_job.len()
+        self.lock().by_claim.len()
+    }
+
+    /// The expiry and the claim id of each entry of the job, in claim id order.
+    #[cfg(test)]
+    pub(crate) fn leases(&self, queue: &QueueName, id: &str) -> Vec<(u64, u64)> {
+        self.lock()
+            .job_entries(queue, id)
+            .map(|(key, entry)| (entry.expires_at, key.claim_id))
+            .collect()
     }
 
     #[cfg(test)]
     pub(crate) fn contains(&self, queue: &QueueName, id: &str, expires_at: u64) -> bool {
-        self.lock()
-            .by_job
-            .get(&(queue.clone(), id.to_string()))
-            .is_some_and(|e| e.expires_at == expires_at)
+        self.leases(queue, id)
+            .iter()
+            .any(|(expiry, _)| *expiry == expires_at)
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -368,14 +393,15 @@ mod tests {
     }
 
     #[test]
-    fn cancel_fires_the_current_claims_token_and_keeps_the_entry() {
+    fn cancel_fires_the_token_of_every_claim_of_the_job_and_keeps_the_entries() {
         let registry = LeaseRegistry::new();
-        let cancel = CancellationToken::new();
-        registry.insert(&qn("q"), "a", 10, 1, cancel.clone());
+        let (first, second) = (CancellationToken::new(), CancellationToken::new());
+        registry.insert(&qn("q"), "a", 10, 1, first.clone());
+        registry.insert(&qn("q"), "a", 10, 2, second.clone());
 
         assert!(registry.cancel(&qn("q"), "a"));
-        assert!(cancel.is_cancelled());
-        assert_eq!(registry.len(), 1);
+        assert!(first.is_cancelled() && second.is_cancelled());
+        assert_eq!(registry.len(), 2);
         assert!(!registry.cancel(&qn("q"), "missing"));
     }
 
@@ -396,13 +422,13 @@ mod tests {
     }
 
     #[test]
-    fn insert_replaces_a_stale_entry_for_the_same_job() {
+    fn each_claim_of_a_job_has_its_own_entry() {
         let registry = LeaseRegistry::new();
         registry.insert(&qn("q"), "a", 10, 1, CancellationToken::new());
         registry.insert(&qn("q"), "a", 30, 2, CancellationToken::new());
-        assert_eq!(registry.len(), 1);
-        assert!(registry.take_due(10).is_empty());
-        assert_eq!(registry.take_due(30).len(), 1);
+        assert_eq!(registry.leases(&qn("q"), "a"), vec![(10, 1), (30, 2)]);
+        let due: Vec<_> = registry.take_due(10).iter().map(|d| d.claim_id).collect();
+        assert_eq!(due, vec![1]);
     }
 
     use crate::test_util::*;
@@ -424,7 +450,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let original_expiry = q.lease_expiry("work", &job.id).unwrap();
+        let original_expiry = q.lease_expiry(&job).unwrap();
 
         let new_expiry = q.renew_lease(&job, Duration::from_secs(30)).unwrap();
         assert!(new_expiry > original_expiry, "renewed expiry must be later");
@@ -469,7 +495,7 @@ mod tests {
 
         assert_eq!(q.cancel(&job.id).await.unwrap(), CancelOutcome::Requested);
 
-        let expiry = q.lease_expiry("work", &job.id);
+        let expiry = q.lease_expiry(&job);
         assert!(matches!(
             q.renew_lease(&job, Duration::from_secs(600)),
             Err(Error::CancelRequested)
@@ -478,7 +504,7 @@ mod tests {
             lease.ensure_at_least(Duration::from_secs(600)),
             Err(Error::CancelRequested)
         ));
-        assert_eq!(q.lease_expiry("work", &job.id), expiry);
+        assert_eq!(q.lease_expiry(&job), expiry);
 
         // The claim is still held, so the delivery settles as usual.
         q.nack(&job, "cancelled").await.unwrap();
@@ -506,7 +532,7 @@ mod tests {
 
         clock.advance(Duration::from_secs(10));
         let renewed = q.renew_lease(&job, Duration::from_secs(60)).unwrap();
-        assert_eq!(q.lease_expiry("work", &job.id), Some(renewed));
+        assert_eq!(q.lease_expiry(&job), Some(renewed));
 
         // The claim taken before the renewal keeps its claim id, so it still
         // settles the delivery.
@@ -593,12 +619,11 @@ mod tests {
         assert!(
             q.core
                 .lease_registry
-                .current(&qn("work"), &job.id)
-                .is_none()
+                .leases(&qn("work"), &job.id)
+                .is_empty()
         );
-        assert!(q.lease_expiry("work", &job.id).is_none());
 
-        // Nothing is left to come due, so the reaper does not requeue the job,
+        // No entry is left to expire, so the reaper does not requeue the job,
         // even past the renewed expiry.
         assert!(renewed > clock.now_ms());
         clock.advance(Duration::from_secs(61));
@@ -667,7 +692,7 @@ mod tests {
         while let Some(kv) = iter.next().await.unwrap() {
             let job = JobRecord::decode(&kv.key, &kv.value).unwrap();
             assert!(
-                q.core.lease_registry.current(&job.queue, &job.id).is_some(),
+                q.lease_expiry(&job).is_some(),
                 "no lease entry for {}/{}",
                 job.queue,
                 job.id

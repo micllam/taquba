@@ -16,13 +16,12 @@ later claim delivers it again.
 Every worker reads from and writes to the store directly, and the queue does not
 identify workers.
 
-Exclusivity is therefore decided in two places:
-
-- The store decides who claims a job. The move out of the pending space into the
-  claimed space is one transaction, and exactly one worker can make it.
-- The in-memory [lease registry](leases.md#the-lease-registry) decides whose
-  claim is current. A job that is reaped and claimed again is written with the
-  same key and the same record. The store cannot tell the two claims apart.
+The store decides exclusivity: a single transaction moves a job from the pending
+space into the claimed space, and exactly one competing claim commits. Because
+the claimed key contains the claim id, each claim of a job has its own key,
+including a claim after a reap. The in-memory
+[lease registry](leases.md#the-lease-registry) keeps the expiry and the
+cancellation token of each claim in an entry under the same id.
 
 Every claim has an expiry, because a worker that stops responding leaves the
 claimed record in place. A job whose expiry passes returns to the queue.
@@ -174,38 +173,26 @@ scheduled and claimed again before its flush completes. A crash in that window
 loses the settlement and the new claim together, and the job is delivered once
 more at the next open.
 
-After the commit the queue removes the lease registry entry if its claim id
-still matches the claim's. The condition covers the gap between the commit and
-the removal, in which the job can be claimed again:
-
-```text
-settlement commits     the job is scheduled or pending again
-  │
-  │  a new claim of the job replaces the registry entry with its own
-  │
-removal runs           the entry's claim id is the new claim's, so the
-                       removal leaves it in place
-```
-
-That is the second of the [registry rules](leases.md#the-lease-registry).
+After the commit the queue removes the lease registry entry of the claim. Each
+claim has its own entry, so a new claim of the job that registers between the
+commit and the removal keeps its entry. That is the second of the
+[registry rules](leases.md#the-lease-registry).
 
 ### The settlement fence
 
-The settlement fence rejects a settlement whose claim is not the current one.
-Every settlement begins by ending the claim, in `txn::take_claim`, which
-performs three checks. Each check catches a different case.
+The settlement fence rejects a settlement whose claim has ended. Every
+settlement begins by reading the claim's record, in `txn::read_claim`, and ends
+the claim in `txn::stage_claim_end`. The two steps make two checks, and each
+check catches a different case.
 
-- **The registry claim id must match.** This check rejects a settlement that a
-  re-claim superseded. The presence of the key cannot do the same. A reap and a
-  re-claim rewrite the same claimed key, and that key then looks untouched.
-- **The claimed record is read inside the transaction.** A settlement that
-  begins while the registry lags the store passes the claim id check. It began
-  after the commit that ended its claim, so it does not conflict with anything.
-  The read catches it, because the record is gone.
-- **The claimed key is deleted in the transaction.** SlateDB's snapshot
-  isolation tracks the write set. A requeue or a re-claim that commits after the
-  snapshot writes the same key, so the settlement's commit is rejected as a
-  conflict.
+- **The claimed record is read inside the transaction**, at the key that
+  contains the claim's id. A reap, a requeue or a settlement of the claim
+  deletes that key, and a re-claim writes another key. A settlement that begins
+  after the claim has ended therefore does not find the record.
+- **The claimed key is deleted in the transaction**, by the transition that ends
+  the claim. SlateDB's snapshot isolation tracks the write set. An end of the
+  claim that commits after the snapshot deletes the same key, so the
+  settlement's commit is rejected as a conflict.
 
 The checks run inside the settlement's retry loop, on every retry, because each
 retry begins from a fresh snapshot. A settlement that fails any of them returns

@@ -17,7 +17,6 @@ use crate::keys::{
     KeyTag, QueueName, attempt_history_key, claimed_key, dedup_index_key, inbox_expiry_key,
     inbox_record_key, job_index_key,
 };
-use crate::lease_registry::LeaseRegistry;
 use crate::queue_core::QueueCore;
 use crate::stats::update_stats;
 
@@ -76,11 +75,14 @@ impl Txn {
     /// Move `job` from its record at `from` to its record at
     /// [`JobRecord::stored_key`], and repoint its index entry to that key. A
     /// job that leaves the scheduled state leaves its signal wait and its count
-    /// wait.
+    /// wait, and a job that leaves the claimed state leaves its claim id.
     pub(crate) fn move_job(&mut self, from: &[u8], job: &mut JobRecord) -> Result<()> {
         if job.status != JobStatus::Scheduled {
             job.signal_wait = false;
             job.count_wait = None;
+        }
+        if job.status != JobStatus::Claimed {
+            job.claim_id = None;
         }
         let key = job.stored_key();
         if from == key.as_slice() {
@@ -208,52 +210,29 @@ pub(crate) async fn get_indexed_job(
     Ok(Some((index_key, current_key, job)))
 }
 
-/// Verify that the claim `claim_id` identifies is still the job's live claim,
-/// stage the deletion of its record and return the stored record. Returns
-/// [`Error::ClaimLost`] when the claim ended.
+/// Verify that the claim `claim_id` identifies is still live, without ending
+/// it: the claimed record joins the read set of `txn`, so a commit that ends
+/// the claim before `txn` commits fails `txn` with a conflict. Returns the
+/// record's key and the stored record, or [`Error::ClaimLost`] when the claim
+/// has ended.
 ///
-/// This is the fence every settlement passes through, in three parts. The
-/// registry claim id check rejects a settlement superseded by a re-claim. The
-/// in-transaction record read rejects a settlement whose claim ended while its
-/// registry entry, removed only after the ending commit, was still present. The
-/// staged delete makes a settlement racing a concurrent requeue or re-claim a
-/// transaction conflict. The claimed key does not identify a claim, because a
-/// reap and a re-claim rewrite the same key. Call it inside the retry loop so a
-/// retry re-runs both checks. A renewal changes neither the claim id nor the
-/// record, so a claim held across a renewal still settles.
+/// This is the fence every settlement and every claim fence passes through. The
+/// claimed key contains the claim id, so the record exists only while the claim
+/// is live, and a settlement after a requeue, a reap or a re-claim does not
+/// find it. Call it inside the retry loop so a retry reads the record again. A
+/// renewal changes neither the claim id nor the record, so a claim held across
+/// a renewal still settles.
 ///
 /// A settlement that writes a record must base it on the returned record, which
 /// includes changes committed during the claim (a cancel's `cancel_requested`
 /// flag). The claim's own copy predates them.
-pub(crate) async fn take_claim(
-    txn: &DbTransaction,
-    registry: &LeaseRegistry,
-    queue: &QueueName,
-    id: &str,
-    claim_id: u64,
-) -> Result<JobRecord> {
-    let (key, job) = read_claim(txn, registry, queue, id, claim_id).await?;
-    txn.delete(&key)?;
-    Ok(job)
-}
-
-/// Verify that the claim `claim_id` identifies is still the job's live claim,
-/// as [`take_claim`] does, without ending it: the claimed record joins the read
-/// set of `txn`, so a commit that ends or replaces the claim before `txn`
-/// commits fails `txn` with a conflict. Returns the record's key and the stored
-/// record, or [`Error::ClaimLost`] when the claim ended.
 pub(crate) async fn read_claim(
     txn: &DbTransaction,
-    registry: &LeaseRegistry,
     queue: &QueueName,
     id: &str,
     claim_id: u64,
 ) -> Result<(Vec<u8>, JobRecord)> {
-    match registry.current(queue, id) {
-        Some((_, current)) if current == claim_id => {}
-        _ => return Err(Error::ClaimLost),
-    }
-    let key = claimed_key(queue, id);
+    let key = claimed_key(queue, id, claim_id);
     txn.mark_read([&key])?;
     let Some(raw) = txn.get(&key).await? else {
         return Err(Error::ClaimLost);
@@ -415,21 +394,21 @@ impl Txn {
         self.move_job(from, job)
     }
 
-    /// Stage the transition that ends the claim of `job`, the stored claimed
-    /// record. On return `job` is the record as written.
+    /// Stage the transition that ends the claim of `job`, the claimed record
+    /// stored at `from`. On return `job` is the record as written.
     pub(crate) fn stage_claim_end(
         &mut self,
+        from: &[u8],
         job: &mut JobRecord,
         end: &ClaimEnd<'_>,
         now: u64,
     ) -> Result<()> {
-        let from = claimed_key(&job.queue, &job.id);
         match *end {
             ClaimEnd::Done { keep } => {
                 job.status = JobStatus::Done;
                 job.completed_at = Some(now);
                 if !keep {
-                    return self.stage_remove(&from, job);
+                    return self.stage_remove(from, job);
                 }
                 append_attempt(
                     self,
@@ -442,7 +421,7 @@ impl Txn {
                         error: None,
                     },
                 )?;
-                self.move_job(&from, job)
+                self.move_job(from, job)
             }
             ClaimEnd::Retry {
                 run_at,
@@ -465,11 +444,11 @@ impl Txn {
                     },
                 )?;
                 match run_at {
-                    None => self.stage_to_pending(&from, job)?,
+                    None => self.stage_to_pending(from, job)?,
                     Some(run_at) => {
                         job.status = JobStatus::Scheduled;
                         job.run_at = Some(run_at);
-                        self.move_job(&from, job)?;
+                        self.move_job(from, job)?;
                     }
                 }
                 debug!(
@@ -482,7 +461,7 @@ impl Txn {
                 );
                 Ok(())
             }
-            ClaimEnd::Dead { error } => self.stage_dead_letter(&from, job, now, error),
+            ClaimEnd::Dead { error } => self.stage_dead_letter(from, job, now, error),
         }
     }
 

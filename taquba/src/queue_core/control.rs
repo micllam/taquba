@@ -152,12 +152,12 @@ impl QueueCore {
         Ok((outcome, results.unwrap_or_default()))
     }
 
-    /// Complete a cancel after its transaction. It fires the lease token of the
-    /// job and settles the completion waiters of a removed job, and returns the
-    /// removed job, whose payload object the caller deletes. The token of a
-    /// removed job fires as well, for the worker of a claim that the reaper
-    /// requeued before the cancel. A claimed job reaches its waiters at its
-    /// settlement.
+    /// Complete a cancel after its transaction. It fires the lease tokens of
+    /// the job's claims and settles the completion waiters of a removed job,
+    /// and returns the removed job, whose payload object the caller deletes.
+    /// The tokens of a removed job fire as well, for the worker of a claim that
+    /// the reaper requeued before the cancel. A claimed job reaches its waiters
+    /// at its settlement.
     pub(crate) fn finish_cancel(&self, staged: StagedCancel) -> Option<JobRecord> {
         match staged {
             StagedCancel::Removed(job) => {

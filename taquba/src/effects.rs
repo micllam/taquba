@@ -373,14 +373,7 @@ impl QueueCore {
         prepared: &PreparedEffects,
     ) -> Result<Vec<EnqueueResult>> {
         if let Some(fence) = &prepared.claim_fence {
-            read_claim(
-                txn,
-                &self.lease_registry,
-                &fence.queue,
-                &fence.id,
-                fence.claim_id,
-            )
-            .await?;
+            read_claim(txn, &fence.queue, &fence.id, fence.claim_id).await?;
         }
         for compare in &prepared.kv_compares {
             let scoped = user_scoped_key(&compare.key);

@@ -923,18 +923,19 @@ impl Queue {
         Ok(new_expiry)
     }
 
-    /// The current lease expiry of a claimed job, as epoch milliseconds.
+    /// The current lease expiry of the claim of `job`, as epoch milliseconds.
+    /// `job` is the record of a claimed job: a [`Claim`] dereferences to it,
+    /// and [`QueueView::list_jobs`](crate::QueueView::list_jobs) returns it.
     ///
     /// The lease is process state, so this is a synchronous read of the
-    /// in-memory lease registry and reflects any renewal. Returns `None` when
-    /// no live lease for the job exists in this process, including when the job
-    /// is in any state other than `Claimed`.
-    pub fn lease_expiry(&self, queue: &str, id: &str) -> Option<u64> {
-        let queue = QueueName::new(queue).ok()?;
+    /// in-memory lease registry and reflects any renewal. Returns `None` for a
+    /// record in any state other than `Claimed`, and for a claim without a live
+    /// lease in this process.
+    pub fn lease_expiry(&self, job: &JobRecord) -> Option<u64> {
+        let claim_id = job.claim_id?;
         self.core
             .lease_registry
-            .current(&queue, id)
-            .map(|(expires_at, _)| expires_at)
+            .expiry(&job.queue, &job.id, claim_id)
     }
 
     /// Wait until the given job reaches a terminal state.

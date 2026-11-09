@@ -868,7 +868,7 @@ mod tests {
         for job in &first {
             assert_eq!(job.status, JobStatus::Claimed);
             assert_eq!(job.attempts, 1);
-            assert!(q.lease_expiry("work", &job.id).is_some());
+            assert!(q.lease_expiry(job).is_some());
         }
 
         let rest = q.claim_batch("work", 3, lease).await.unwrap();

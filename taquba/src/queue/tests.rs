@@ -88,7 +88,7 @@ async fn test_enqueue_and_claim() {
     assert_eq!(job.status, JobStatus::Claimed);
     assert_eq!(job.attempts, 1);
     assert!(job.claimed_at.is_some());
-    assert!(q.lease_expiry("email", &job.id).is_some());
+    assert!(q.lease_expiry(&job).is_some());
 
     q.close().await.unwrap();
 }
@@ -580,7 +580,7 @@ async fn a_queue_takes_its_config_override_or_the_default() {
     let job = q.claim_next("fast").await.unwrap().unwrap();
     assert_eq!(job.max_attempts, 1);
     // Lease is 5s
-    assert_eq!(q.lease_expiry("fast", &job.id), Some(initial + 5_000));
+    assert_eq!(q.lease_expiry(&job), Some(initial + 5_000));
     assert_eq!(job.claimed_at, Some(initial));
 
     q.ack(&job).await.unwrap();
@@ -1742,7 +1742,7 @@ async fn a_claim_by_id_is_reaped_when_its_lease_expires() {
     else {
         panic!("the pending job is claimed");
     };
-    assert_eq!(q.lease_expiry("q", &id), Some(1_010_000));
+    assert_eq!(q.lease_expiry(&claim), Some(1_010_000));
 
     clock.advance(Duration::from_secs(11));
     q.reap_now().await.unwrap();

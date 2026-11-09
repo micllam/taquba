@@ -744,7 +744,7 @@ mod tests {
             .jobs;
         assert_eq!(claimed.len(), 1);
         let expiry = queue
-            .lease_expiry(DEFAULT_QUEUE_NAME, &claimed[0].id)
+            .lease_expiry(&claimed[0])
             .expect("a running delivery holds a lease");
         assert!(
             expiry >= base + 600_000,

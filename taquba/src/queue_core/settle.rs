@@ -9,7 +9,7 @@ use crate::history::{AttemptOutcome, JobAttempt, append_attempt};
 use crate::job::{Claim, JobRecord, JobStatus};
 use crate::queue::EnqueueResult;
 use crate::queue_core::QueueCore;
-use crate::txn::{Attempt, ClaimEnd, Durability, take_claim};
+use crate::txn::{Attempt, ClaimEnd, Durability, read_claim};
 
 impl QueueCore {
     /// The settlement of a claim. The effects are prepared once before the
@@ -33,10 +33,10 @@ impl QueueCore {
             self.retry(Durability::Awaited, |mut txn| async move {
                 // The returned record is the base for the written record. The
                 // claim's copy predates a cancel committed during the delivery.
-                let mut job = take_claim(&txn, &self.lease_registry, queue, id, claim_id).await?;
+                let (key, mut job) = read_claim(&txn, queue, id, claim_id).await?;
                 let now = self.now_ms();
                 let end = end_for(&job, now);
-                txn.stage_claim_end(&mut job, &end, now)?;
+                txn.stage_claim_end(&key, &mut job, &end, now)?;
                 let staged = if end.is_terminal() {
                     Some(self.stage_effects(&mut txn, prepared).await?)
                 } else {

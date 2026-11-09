@@ -1,10 +1,10 @@
 # Leases and cancellation
 
 This chapter describes what a worker receives when it claims a job, and the
-in-memory state, separate from the store, that decides which claim of a job is
-current, when it expires and how it is cancelled. The code is in
-`taquba/src/job.rs` ([source][job]), `taquba/src/lease_registry.rs`
-([source][lease_registry]) and `taquba/src/lease.rs` ([source][lease]).
+in-memory state, separate from the store, that records when a claim expires and
+how it is cancelled. The code is in `taquba/src/job.rs` ([source][job]),
+`taquba/src/lease_registry.rs` ([source][lease_registry]) and
+`taquba/src/lease.rs` ([source][lease]).
 
 ## The `Claim` value
 
@@ -24,16 +24,16 @@ A `Claim` is the worker's side of the delivery. It contains three things:
 The claim id and the cancellation token are described in turn.
 
 The claim id is 64 random bits that identify this one delivery. The queue
-generates it at claim time and keeps a copy in memory, and at settlement it
-compares the two copies. A match establishes that the caller's claim is still
-the live one. [The lease registry](#the-lease-registry) describes where the
-queue's copy is kept and how the comparison works.
+generates it at claim time and writes the claimed record at a key that contains
+it. A settlement reads the record at that key, and finds it only while the claim
+is live. [The settlement fence](claiming.md#the-settlement-fence) describes the
+check.
 
 Every settlement takes a `&Claim`, and so does [`renew_lease`][renew_lease].
-Only `Queue::claim` and `claim_batch` create a `Claim`, and the claim id inside
-it is private. A worker can therefore settle only the claims it owns. A
-settlement that fails on a transient storage error keeps the `Claim` intact, so
-the caller retries with the same value.
+Only the claim calls of `Queue` create a `Claim`. A `JobRecord` contains the
+claim id, but no settlement call takes a `JobRecord`. A worker can therefore
+settle only the claims it owns. A settlement that fails on a transient storage
+error keeps the `Claim` intact, so the caller retries with the same value.
 
 The cancellation token is the handle for cancelling the processing of a claimed
 job. [`Queue::cancel`][cancel] fires it while the claim is live, and a worker
@@ -94,23 +94,15 @@ concern.
 
 ## The lease registry
 
-A claimed job has one key in the store, and its value is the job record. A job
-that is claimed, reaped and claimed again is written with that same key each
-time. The record differs only in its attempt count and claim time. The store
-therefore does not record three facts about a claimed job:
-
-- Which claim of the job is current.
-- When the claim expires.
-- How to interrupt the work while it runs.
-
-`LeaseRegistry` ([lease_registry.rs][lease_registry]) records all three. It
-contains one entry per live claim, and the entry names which claim is current,
-when it expires and how to stop it.
+The key of a claimed record contains its claim id, so the store records which
+claim of a job is current. It does not record when the claim expires, or how to
+interrupt the work while it runs. `LeaseRegistry`
+([lease_registry.rs][lease_registry]) records both, in one entry per claim.
 
 The `Claim` and the registry entry are the two parts of one lease. The worker
 task owns the `Claim`, which is the proof that this claim of the job belongs to
-this task. The queue owns the entry, which records which claim of the job is
-live now.
+this task. The queue owns the entry, which records when the claim expires and
+how to stop it.
 
 The reaper and `Queue::cancel` reach a lease through the entry, because neither
 has the `Claim`. A settlement reaches it through the `Claim`, and the claim id
@@ -118,9 +110,9 @@ joins the two parts.
 
 ```text
 worker task                          queue
-┌─ Claim ─────────────────┐          ┌─ LeaseRegistry entry (queue, id) ─┐
-│ record                  │          │ expiry                            │
-│ claim id ───────────────┼──────────┼ claim id                          │
+┌─ Claim ─────────────────┐          ┌─ LeaseRegistry entry ─────────────┐
+│ record                  │          │ key: queue, id, claim id          │
+│ claim id ───────────────┼──────────┼ expiry                            │
 │ cancellation token ─────┼──────────┼ cancellation token                │
 └─────────────────────────┘          │ reaping mark                      │
                                      └───────────────────────────────────┘
@@ -129,18 +121,16 @@ reached through the Claim:           reached through the entry:
 ack, nack, dead_letter, renew_lease  the reaper, Queue::cancel
 ```
 
-The entry's copy of the claim id is the queue's record of which claim is live. A
-job that is claimed again after a failure gets a different claim id, so the copy
-inside an older `Claim` no longer matches. The claim id is never written to the
-store.
+The claim id is part of the entry's key, so each claim of a job has its own
+entry. When two claims of a job race, both the winner and the loser have an
+entry.
 
 Each field of the entry has its writer and its reader:
 
 | Field | Written by | Read by |
 | --- | --- | --- |
-| expiry | The claim sets it, and renewal extends it. | The reaper, which takes the entries that are due, soonest first, through a second index of the entries, ordered by expiry. |
-| claim id | The claim sets it. | Settlement, which compares it with the claim id in the `Claim` and refuses the settlement when the two differ. |
-| cancellation token | The claim creates it. | `Queue::cancel` and a close of the store fire it, and the worker stops early when it fires. |
+| expiry | The claim sets it, and renewal extends it. | The reaper, which takes the entries that are due, soonest first, through a second index of the entries that orders them by expiry. It reads the claimed record at the entry's claim id. |
+| cancellation token | The claim creates it. | `Queue::cancel` fires the token of every entry of the job, a close of the store fires every token, and the worker stops early when its token fires. |
 | reaping mark | The reaper sets it when the entry is due. | Renewal, which refuses a marked entry. |
 
 The reaper marks each due entry and leaves it in place. Renewal and the reaper
@@ -152,19 +142,17 @@ Nothing in the registry is written to the store, because a lease matters only to
 the process that owns it. Recovery when the queue opens returns every claim it
 finds, regardless of its expiry.
 
-The [settlement fence](claiming.md#the-settlement-fence) rests on two rules
-about that entry:
+Two rules keep the registry coherent with the store:
 
 - The queue inserts the entry before the claim's transaction commits. A failed
   commit therefore leaves a stale entry, and the reaper drops it when it is due
-  and finds the claimed record gone. The opposite order risks a missing entry. A
-  missing entry hides a live claim from the reaper until the queue opens again.
-  A cancellation that arrives during the commit then does not find a token to
-  fire.
+  and does not find a record at the claim's key. The opposite order would risk a
+  missing entry. The store can apply a commit whose claim future was dropped,
+  and that claim's entry would then be missing. The reaper would not see the
+  live claim until the queue opens again, and a cancellation that arrived during
+  the commit would not find a token to fire.
 - The queue removes the entry only after the transaction that ends the claim
-  commits, and only if the entry's claim id matches the claim's. A removal that
-  runs after the job is claimed again does not remove anything, and the entry of
-  the new claim stays in place.
+  commits. The removal leaves the entries of other claims of the job in place.
 
 The second rule makes the registry lag the store. Between an ending commit and
 its removal, the entry still refers to a claim that already ended.

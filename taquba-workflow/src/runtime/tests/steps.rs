@@ -12,9 +12,16 @@ impl StepRunner for RenewingRunner {
         step.lease
             .ensure_at_least(Duration::from_secs(600))
             .map_err(|e| StepError::transient(e.to_string()))?;
+        let job = self
+            .queue
+            .view()
+            .get_job(&step.job_id)
+            .await
+            .unwrap()
+            .expect("a running step has a record");
         let expiry = self
             .queue
-            .lease_expiry("workflow-steps", &step.job_id)
+            .lease_expiry(&job)
             .expect("a running step holds a lease");
         let _ = self.tx.send(expiry);
         Ok(StepOutcome::Succeed { result: Vec::new() })

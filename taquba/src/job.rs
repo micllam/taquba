@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::codec::encode;
-use crate::keys::{KeyTag, QueueName, claimed_key, dead_key, done_key, pending_key, scheduled_key};
+use crate::keys::{
+    KeyTag, QueueName, claimed_key, dead_key, done_key, parse_claim_id, pending_key, scheduled_key,
+};
 
 /// A single job stored in a Taquba queue.
 ///
@@ -52,6 +54,11 @@ pub struct JobRecord {
     /// from, and the stored value does not contain a copy of it.
     #[serde(skip, default = "JobStatus::initial")]
     pub status: JobStatus,
+    /// The id of the claim of a claimed record, which identifies a delivery.
+    /// Derived from the key the record is read from, and `None` in every other
+    /// state.
+    #[serde(skip)]
+    pub claim_id: Option<u64>,
     /// How many delivery attempts started so far. Incremented on each
     /// [`Queue::claim`](crate::Queue::claim).
     pub attempts: u32,
@@ -143,11 +150,6 @@ pub struct JobRecord {
 /// [`QueueView::list_jobs`](crate::QueueView::list_jobs) therefore cannot
 /// settle a delivery the caller does not hold.
 ///
-/// The claim id is unique per claim but not ordered, so it identifies a
-/// delivery without ranking it. It fences settlement against the queue's own
-/// state and is deliberately not exposed: it is not a fencing token for an
-/// external system, which needs monotonicity to reject a stale writer.
-///
 /// Dereferences to the claimed [`JobRecord`], so a caller reads `claim.payload`
 /// and `claim.id` directly.
 ///
@@ -170,22 +172,20 @@ pub struct JobRecord {
 /// record itself is reachable through [`Claim::job`] and [`Claim::into_job`].
 #[derive(Debug)]
 pub struct Claim {
+    /// The claimed record, with its `claim_id`.
     job: JobRecord,
-    claim_id: u64,
     cancel: CancellationToken,
 }
 
 impl Claim {
-    pub(crate) fn new(job: JobRecord, claim_id: u64, cancel: CancellationToken) -> Self {
-        Claim {
-            job,
-            claim_id,
-            cancel,
-        }
+    /// The claim of the claimed record `job`, which must have a `claim_id`.
+    pub(crate) fn new(job: JobRecord, cancel: CancellationToken) -> Self {
+        debug_assert!(job.claim_id.is_some(), "a claimed record has a claim_id");
+        Claim { job, cancel }
     }
 
     pub(crate) fn claim_id(&self) -> u64 {
-        self.claim_id
+        self.job.claim_id.expect("a claimed record has a claim_id")
     }
 
     /// The delivery's cooperative cancellation token, fired by
@@ -208,8 +208,10 @@ impl Claim {
         &self.job
     }
 
-    /// Consume the claim and return the record, discarding the claim id. The
-    /// record can no longer settle the delivery.
+    /// Consume the claim and return its record.
+    ///
+    /// Settlement requires the claim, so the delivery cannot be settled after
+    /// the call. The job returns to the queue when its lease expires.
     pub fn into_job(self) -> JobRecord {
         self.job
     }
@@ -247,6 +249,7 @@ impl JobRecord {
             payload_ref: None,
             headers: HashMap::new(),
             status: JobStatus::Pending,
+            claim_id: None,
             attempts: 0,
             max_attempts,
             enqueued_at,
@@ -264,22 +267,29 @@ impl JobRecord {
         }
     }
 
-    /// Decode a record stored under `key`, taking its state from the key space.
-    /// A key outside the job-state key spaces is a decode error.
+    /// Decode a record stored under `key`. The key gives the record its state
+    /// and, for a claimed record, its claim id. Fails with a decode error for a
+    /// key outside the job-state key spaces.
     pub(crate) fn decode(key: &[u8], bytes: &[u8]) -> crate::error::Result<JobRecord> {
+        let no_record = || {
+            let message = format!("key {key:02x?} is not the key of a job record");
+            rmp_serde::decode::Error::Syntax(message)
+        };
         let status = KeyTag::of(key)
             .and_then(KeyTag::job_status)
-            .ok_or_else(|| {
-                rmp_serde::decode::Error::Syntax(format!("key {key:02x?} holds no job record"))
-            })?;
+            .ok_or_else(no_record)?;
         let mut job: JobRecord = rmp_serde::from_slice(bytes)?;
         job.status = status;
+        if status == JobStatus::Claimed {
+            job.claim_id = Some(parse_claim_id(key).ok_or_else(no_record)?);
+        }
         Ok(job)
     }
 
     /// The key the record is stored under, in the key space of its state:
     /// [`Self::decode`] reads the state back from it. A scheduled record must
-    /// have a `run_at` and a done record a `completed_at`.
+    /// have a `run_at`, a claimed record a `claim_id` and a done record a
+    /// `completed_at`.
     pub(crate) fn stored_key(&self) -> Vec<u8> {
         let (queue, id) = (&self.queue, self.id.as_str());
         match self.status {
@@ -288,7 +298,10 @@ impl JobRecord {
                 let run_at = self.run_at.expect("a scheduled record has a run_at");
                 scheduled_key(queue, run_at, id)
             }
-            JobStatus::Claimed => claimed_key(queue, id),
+            JobStatus::Claimed => {
+                let claim_id = self.claim_id.expect("a claimed record has a claim_id");
+                claimed_key(queue, id, claim_id)
+            }
             JobStatus::Done => {
                 let completed_at = self.completed_at.expect("a done record has a completed_at");
                 done_key(completed_at, queue, id)
@@ -322,6 +335,7 @@ impl JobRecord {
             payload_ref: self.payload_ref.clone(),
             headers: self.headers.clone(),
             status: self.status,
+            claim_id: self.claim_id,
             attempts: self.attempts,
             max_attempts: self.max_attempts,
             enqueued_at: self.enqueued_at,
@@ -422,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_reads_the_status_back_from_the_stored_key() {
+    fn decode_reads_the_state_and_the_claim_id_back_from_the_stored_key() {
         for status in [
             JobStatus::Pending,
             JobStatus::Scheduled,
@@ -434,8 +448,10 @@ mod tests {
             job.status = status;
             job.run_at = Some(10);
             job.completed_at = Some(20);
-            let decoded = JobRecord::decode(&job.stored_key(), &job.stored_bytes());
-            assert_eq!(decoded.unwrap().status, status);
+            job.claim_id = Some(30);
+            let decoded = JobRecord::decode(&job.stored_key(), &job.stored_bytes()).unwrap();
+            let claim_id = (status == JobStatus::Claimed).then_some(30);
+            assert_eq!((decoded.status, decoded.claim_id), (status, claim_id));
         }
     }
 }

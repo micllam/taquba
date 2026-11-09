@@ -109,8 +109,9 @@ record encodes only the fields that contain information.
 
 Four pieces of state describe a job and are not in its record:
 
-- **The live lease.** Its expiry and claim id are process state in the lease
-  registry, so they do not appear on any record.
+- **The live lease.** Its expiry and cancellation token are process state in the
+  lease registry, so they do not appear on any record. The claimed key contains
+  the claim id, and `JobRecord::decode` sets `JobRecord::claim_id` from the key.
 - **The queue's configuration.** `lease_duration`, the retry backoff bounds,
   `keep_done_jobs` and `dead_retention` stay in [`QueueConfig`][QueueConfig].
   The queue reads them per queue at the moment they are needed.

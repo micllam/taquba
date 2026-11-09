@@ -100,7 +100,7 @@ impl JobView {
             payload_preview.push('…');
         }
         // `Some` only for a job claimed by this process.
-        let lease_expires_at = q.lease_expiry(&job.queue, &job.id);
+        let lease_expires_at = q.lease_expiry(&job);
         Self {
             id: job.id,
             queue: job.queue.into_string(),

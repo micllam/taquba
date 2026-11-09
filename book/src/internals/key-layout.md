@@ -82,7 +82,7 @@ follows the two-byte header.
 | Space | Byte | Fields | Value |
 | --- | --- | --- | --- |
 | `Pending` | `0x01` | qlen, queue, priority `u32` BE, `enqueued_at` `u64` BE, id | job record |
-| `Claimed` | `0x02` | qlen, queue, id | job record |
+| `Claimed` | `0x02` | qlen, queue, id, claim id `u64` BE | job record |
 | `Scheduled` | `0x03` | `run_at` `u64` BE, qlen, queue, id | job record |
 | `Done` | `0x04` | `completed_at` `u64` BE, qlen, queue, id | job record |
 | `Dead` | `0x05` | qlen, queue, id | job record |
@@ -129,6 +129,10 @@ A record's status is derived from the key space its key belongs to:
 - Deserialising the bytes directly yields `Pending` regardless of the key they
   came from, so nothing in the crate calls `rmp_serde::from_slice` on a record.
 
+A claimed key contains the claim id after the job id, and `decode` reads the id
+from it in the same way. The claims of a job therefore have distinct keys, and
+only a claim whose transaction committed has a record.
+
 ## Scan order
 
 The field a scan orders by comes first.
@@ -144,7 +148,8 @@ at that key.
 
 `Pending`, `Claimed` and `Dead` lead with the queue name, so the claim scan and
 `list_jobs` ([view.rs][view]) read one queue's range. `Pending` is ordered by
-priority, then by enqueue time and then by id, and the other two by id.
+priority, then by enqueue time and then by id, `Claimed` by id and then by claim
+id, and `Dead` by id.
 
 `Claimed` is read whole once, by `requeue_interrupted_claims`
 ([reaper.rs][reaper]) when the queue is opened. That read requeues every claim

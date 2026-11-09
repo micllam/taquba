@@ -876,7 +876,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids(&page), vec![a.clone(), b, c]);
-        assert_eq!(q.lease_expiry("work", &a), Some(renewed));
+        assert_eq!(q.lease_expiry(&ca), Some(renewed));
 
         drop((cb, cc));
         q.close().await.unwrap();

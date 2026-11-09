@@ -6,7 +6,7 @@
 //! priorities are big-endian `u32`, and a queue name followed by further fields
 //! is preceded by its length as one byte (queue names are limited to
 //! [`MAX_QUEUE_NAME_LEN`] bytes). Job IDs are stored as their byte form and
-//! always occupy the tail of a key.
+//! occupy the tail of a key, except in `Claimed`, where the claim id follows.
 //!
 //! Scan layouts follow one rule: the field the scan orders by comes first. The
 //! `Scheduled` and `Done` spaces lead with a timestamp so the scheduler and
@@ -22,12 +22,13 @@
 //!
 //! A count has its record in `Count` at its name while its number is not zero.
 //!
-//! A claimed job occupies one key: `Claimed` contains the record at a key
-//! stable for the life of the claim. The lease itself, the current expiry and
-//! the claim id, is process state kept in `crate::lease_registry` and never
-//! stored: a lease of a process that no longer runs is lost, so every claimed
-//! record found at open is re-queued and a renewal does not write durable
-//! state.
+//! A claimed job occupies one key: `Claimed` contains the record at a key with
+//! the claim id after the job id. Only the live claim of a job has a record, so
+//! a settlement or a reap of another claim of the job does not find one. The
+//! lease itself, the current expiry and the cancellation token, is process
+//! state kept in `crate::lease_registry` and never stored: a lease of a process
+//! that no longer runs is lost, so every claimed record found at open is
+//! re-queued and a renewal does not write durable state.
 //!
 //! User KV keys are `[KeyTag::User, caller bytes]` without a version byte:
 //! caller bytes are opaque data outside the schema of this module.
@@ -166,10 +167,11 @@ pub(crate) const KEY_VERSION: u8 = 1;
 pub(crate) enum KeyTag {
     /// `[tag, ver, qlen, queue, priority u32 BE, enqueued_at u64 BE, id]`
     Pending = 0x01,
-    /// `[tag, ver, qlen, queue, id]`. The value is the job record. The key is
-    /// stable for the lifetime of the claim, so a lease renewal leaves it
-    /// untouched. The claim's lease is kept in `crate::lease_registry`, outside
-    /// every key space.
+    /// `[tag, ver, qlen, queue, id, claim_id u64 BE]`. The value is the job
+    /// record. Two claims of a job have different keys, and the key is stable
+    /// for the lifetime of its claim, so a lease renewal leaves it untouched.
+    /// The claim's lease is process state in `crate::lease_registry` and is not
+    /// stored.
     Claimed = 0x02,
     /// `[tag, ver, run_at u64 BE, qlen, queue, id]`
     Scheduled = 0x03,
@@ -320,8 +322,18 @@ fn queue_prefix(tag: KeyTag, queue: &QueueName) -> Vec<u8> {
     k
 }
 
-pub(crate) fn claimed_key(queue: &QueueName, id: &str) -> Vec<u8> {
-    queue_first_key(KeyTag::Claimed, queue, id)
+pub(crate) fn claimed_key(queue: &QueueName, id: &str, claim_id: u64) -> Vec<u8> {
+    let mut k = queue_first_key(KeyTag::Claimed, queue, id);
+    k.extend_from_slice(&claim_id.to_be_bytes());
+    k
+}
+
+/// Parse the claim id from the tail of a claimed key. Returns `None` when the
+/// key is not a current-version claimed key or is too short.
+pub(crate) fn parse_claim_id(key: &[u8]) -> Option<u64> {
+    let rest = key.strip_prefix(header(KeyTag::Claimed).as_slice())?;
+    let tail: [u8; 8] = rest.get(rest.len().checked_sub(8)?..)?.try_into().ok()?;
+    Some(u64::from_be_bytes(tail))
 }
 
 pub(crate) fn claimed_prefix(queue: &QueueName) -> Vec<u8> {
@@ -553,7 +565,17 @@ mod tests {
 
     #[test]
     fn claimed_keys_of_nested_queue_names_do_not_collide() {
-        assert_ne!(claimed_key(&qn("ab"), "01A"), claimed_key(&qn("a"), "b01A"));
+        assert_ne!(
+            claimed_key(&qn("ab"), "01A", 7),
+            claimed_key(&qn("a"), "b01A", 7)
+        );
+    }
+
+    #[test]
+    fn claimed_key_round_trips_the_claim_id() {
+        let key = claimed_key(&qn("work"), "01A", u64::MAX - 1);
+        assert_eq!(parse_claim_id(&key), Some(u64::MAX - 1));
+        assert_eq!(parse_claim_id(&dead_key(&qn("work"), "01A")), None);
     }
 
     #[test]
@@ -603,7 +625,7 @@ mod tests {
     fn key_spaces_do_not_overlap() {
         let keys = [
             pending_key(&qn("q"), 1, 0, "id"),
-            claimed_key(&qn("q"), "id"),
+            claimed_key(&qn("q"), "id", 1),
             scheduled_key(&qn("q"), 1, "id"),
             done_key(1, &qn("q"), "id"),
             dead_key(&qn("q"), "id"),

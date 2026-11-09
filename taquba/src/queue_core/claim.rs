@@ -14,7 +14,7 @@ use crate::job::{Claim, JobRecord, JobStatus};
 use crate::keys::{QueueName, dedup_index_key, pending_prefix};
 use crate::queue::ClaimOutcome;
 use crate::queue_core::QueueCore;
-use crate::txn::{Attempt, Commit, Durability};
+use crate::txn::{Attempt, Commit, Durability, Txn};
 
 /// Generate a claim id. A ULID's low 64 bits fall inside its 80-bit random
 /// component, so claim ids are distinct across claims of the same job. The
@@ -141,7 +141,6 @@ impl QueueCore {
             }
 
             let now = self.now_ms();
-            let lease_expires_at = now + lease_duration.as_millis() as u64;
             let last_pending_key = candidates
                 .last()
                 .expect("candidates checked non-empty above")
@@ -150,42 +149,8 @@ impl QueueCore {
 
             let mut jobs = Vec::with_capacity(candidates.len());
             for kv in &candidates {
-                let mut job = JobRecord::decode(&kv.key, &kv.value)?;
-                job.status = JobStatus::Claimed;
-                job.claimed_at = Some(now);
-                job.attempts += 1;
-
-                // Remove the dedup_key from the record BEFORE serializing the
-                // claimed-state copy. With the key left on, a later nack
-                // returns the record to pending with the key still set. The
-                // next claim then deletes a dedup index that can by then belong
-                // to a *different* job, which corrupts the dedup invariant.
-                let dedup_key_to_release = job.dedup_key.take();
-                let claim_id = new_claim_id();
-                txn.move_job(&kv.key, &mut job)?;
-                // A cancellation requested during an earlier claim of the job
-                // is persisted on the record and fires this claim's token
-                // immediately.
-                let cancel = tokio_util::sync::CancellationToken::new();
-                if job.cancel_requested {
-                    cancel.cancel();
-                }
-                // Registered before the commit, so a failed commit leaves a
-                // stale entry, which the reaper discards when due. A missing
-                // entry hides the claim from the reaper until the next open,
-                // and a cancellation racing the commit does not find a token to
-                // fire.
-                self.lease_registry.insert(
-                    &job.queue,
-                    &job.id,
-                    lease_expires_at,
-                    claim_id,
-                    cancel.clone(),
-                );
-                if let Some(dk) = dedup_key_to_release.as_deref() {
-                    txn.delete(dedup_index_key(&job.queue, dk))?;
-                }
-                jobs.push(Claim::new(job, claim_id, cancel));
+                let job = JobRecord::decode(&kv.key, &kv.value)?;
+                jobs.push(self.stage_claim(&mut txn, &kv.key, job, now, lease_duration)?);
             }
 
             // Claims commit without awaiting WAL durability. The claimed state
@@ -235,38 +200,18 @@ impl QueueCore {
                 id,
                 Durability::Deferred,
                 || Ok(Err(ClaimOutcome::NotFound)),
-                |mut txn, current_key, mut job| async move {
+                |mut txn, current_key, job| async move {
                     if !matches!(job.status, JobStatus::Pending | JobStatus::Scheduled) {
                         return Ok((txn, Attempt::Abort(Err(ClaimOutcome::NotClaimable))));
                     }
-                    let now = self.now_ms();
-                    job.status = JobStatus::Claimed;
-                    job.claimed_at = Some(now);
-                    job.attempts += 1;
-                    // The dedup key leaves the record before the claimed copy
-                    // is written, as in the scan claim, so a later requeue
-                    // cannot release another job's index entry.
-                    let dedup_key_to_release = job.dedup_key.take();
-                    let claim_id = new_claim_id();
-                    txn.move_job(&current_key, &mut job)?;
-                    let cancel = tokio_util::sync::CancellationToken::new();
-                    if job.cancel_requested {
-                        cancel.cancel();
-                    }
-                    // Registered before the commit, as in the scan claim. A
-                    // failed commit leaves a stale entry that is discarded when
-                    // due, and a missing entry hides the claim from the reaper.
-                    self.lease_registry.insert(
-                        &job.queue,
-                        &job.id,
-                        now + lease_duration.as_millis() as u64,
-                        claim_id,
-                        cancel.clone(),
-                    );
-                    if let Some(dk) = dedup_key_to_release.as_deref() {
-                        txn.delete(dedup_index_key(&job.queue, dk))?;
-                    }
-                    Ok((txn, Attempt::Commit(Ok(Claim::new(job, claim_id, cancel)))))
+                    let claim = self.stage_claim(
+                        &mut txn,
+                        &current_key,
+                        job,
+                        self.now_ms(),
+                        lease_duration,
+                    )?;
+                    Ok((txn, Attempt::Commit(Ok(claim))))
                 },
             )
             .await?;
@@ -283,6 +228,50 @@ impl QueueCore {
         }
     }
 
+    /// Stage the claim of `job`, read at `key`, in `txn`: the claimed record
+    /// with its attempt counted, the release of its dedup key and a lease that
+    /// expires `lease_duration` after `now`.
+    fn stage_claim(
+        &self,
+        txn: &mut Txn,
+        key: &[u8],
+        mut job: JobRecord,
+        now: u64,
+        lease_duration: Duration,
+    ) -> Result<Claim> {
+        job.status = JobStatus::Claimed;
+        job.claimed_at = Some(now);
+        job.attempts += 1;
+        // The claim removes the dedup key from the record before it writes the
+        // claimed copy. With the key kept, a later nack would return the record
+        // to pending with the key set, and the next claim would delete a dedup
+        // index entry that by then belongs to another job.
+        let dedup_key_to_release = job.dedup_key.take();
+        let claim_id = new_claim_id();
+        job.claim_id = Some(claim_id);
+        txn.move_job(key, &mut job)?;
+        // A cancellation requested during an earlier claim of the job is
+        // persisted on the record and fires this claim's token immediately.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        if job.cancel_requested {
+            cancel.cancel();
+        }
+        // Registered before the commit. A claim that fails to commit leaves its
+        // entry, and the reaper drops the entry when due because the claim's
+        // record is absent.
+        self.lease_registry.insert(
+            &job.queue,
+            &job.id,
+            now + lease_duration.as_millis() as u64,
+            claim_id,
+            cancel.clone(),
+        );
+        if let Some(dk) = dedup_key_to_release.as_deref() {
+            txn.delete(dedup_index_key(&job.queue, dk))?;
+        }
+        Ok(Claim::new(job, cancel))
+    }
+
     /// Fetch the offloaded payloads of `jobs` concurrently. The slowest object
     /// bounds the wall time of a batch, and the fetch times do not add up. Jobs
     /// with inline payloads are untouched. On a fetch failure, one error is
@@ -293,5 +282,87 @@ impl QueueCore {
             futures_util::future::join_all(jobs.iter_mut().map(|c| store.materialize(c.job_mut())))
                 .await;
         fetched.into_iter().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::*;
+    use crate::txn::get_indexed_job;
+
+    async fn open_at(clock: &MockClock) -> Queue {
+        let opts = OpenOptions {
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap()
+    }
+
+    /// Stage two claims of the job `id`, the loser after the winner, then
+    /// commit the winner and let the loser conflict. Returns the winning claim.
+    async fn race(q: &Queue, id: &str, winner_lease: Duration, loser_lease: Duration) -> Claim {
+        let core = &q.core;
+        let stage = async |lease| {
+            let mut txn = core.begin().unwrap();
+            let (_, key, job) = get_indexed_job(&txn, id).await.unwrap().unwrap();
+            let claim = core
+                .stage_claim(&mut txn, &key, job, core.now_ms(), lease)
+                .unwrap();
+            (txn, claim)
+        };
+        let (winner_txn, winner) = stage(winner_lease).await;
+        let (loser_txn, _) = stage(loser_lease).await;
+        assert_eq!(
+            core.commit(winner_txn, Durability::Awaited).await.unwrap(),
+            Commit::Committed
+        );
+        assert_eq!(
+            core.commit(loser_txn, Durability::Awaited).await.unwrap(),
+            Commit::Conflict
+        );
+        winner
+    }
+
+    #[tokio::test]
+    async fn the_winner_of_a_claim_race_settles() {
+        let q = open_at(&MockClock::new(1_700_000_000_000)).await;
+        let id = q.enqueue("work", b"p".to_vec()).await.unwrap();
+        let lease = Duration::from_secs(30);
+
+        let claim = race(&q, &id, lease, lease).await;
+        q.ack(&claim).await.unwrap();
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_lease_of_a_losing_claim_does_not_reap_the_winner() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let q = open_at(&clock).await;
+        let id = q.enqueue("work", b"p".to_vec()).await.unwrap();
+
+        let _claim = race(&q, &id, Duration::from_secs(60), Duration::from_secs(1)).await;
+        clock.advance(Duration::from_secs(2));
+        q.reap_now().await.unwrap();
+        let job = q.view().get_job(&id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Claimed);
+
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancel_fires_the_token_of_the_winner_of_a_claim_race() {
+        let q = open_at(&MockClock::new(1_700_000_000_000)).await;
+        let id = q.enqueue("work", b"p".to_vec()).await.unwrap();
+        let lease = Duration::from_secs(30);
+
+        let claim = race(&q, &id, lease, lease).await;
+        q.cancel(&id).await.unwrap();
+        assert!(claim.cancel_token().is_cancelled());
+
+        q.close().await.unwrap();
     }
 }

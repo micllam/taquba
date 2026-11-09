@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `JobRecord::claim_id`: the id of the claim of a claimed record, which
+  identifies a delivery, and `None` in every other state. A struct literal of
+  `JobRecord` must now add `claim_id: None`.
+
+### Changed
+
+- `Queue::lease_expiry` takes the record of a claimed job and returns the expiry
+  of the lease of its claim. A caller that previously passed a queue and an id
+  must now pass the `Claim` of the job, or its record from `QueueView::get_job`
+  or `QueueView::list_jobs`.
+- The key of a claimed record contains its claim id after the job id, so the
+  `Claimed` key space has a new on-disk layout. Every claimed job of a store
+  must be settled before the upgrade.
+
+### Fixed
+
+- A claim by id that races another claim of the same job keeps the lease of the
+  winning claim. In 0.17.0, the losing claim replaced it: the winner's
+  settlement failed with `Error::ClaimLost`, a cancel fired the loser's token,
+  and the reaper requeued the job at the loser's expiry.
+
 ## [0.17.0] - 2026-11-06
 
 ### Added

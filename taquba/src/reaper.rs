@@ -145,30 +145,19 @@ impl QueueCore {
             ..
         } = lease;
         let (id, claim_id) = (id.as_str(), *claim_id);
-        let claimed_key_bytes = &claimed_key(queue, id);
+        let claimed_key_bytes = &claimed_key(queue, id, claim_id);
 
         // The commit does not await WAL durability: each expired claim has its
         // own transaction, so a commit that awaits the flush serialises the
         // sweep at one job per flush interval. A commit lost in a crash is
         // redone by the requeue of claimed records at the next open.
         let reaped = self.retry(Durability::Deferred, |mut txn| async move {
-            // A settlement removes the entry after its commit. When the entry
-            // is gone or belongs to a new claim, the reap aborts. The check
-            // runs after the transaction begins: a claim transition the check
-            // does not see must then commit after the snapshot and conflict on
-            // the staged delete of the claimed key. A check before the
-            // transaction lets a late settlement and re-claim complete in
-            // between, and this transaction then reads the new claim's record,
-            // which the store does not distinguish from the old claim's.
-            match registry.current(queue, id) {
-                Some((_, current)) if current == claim_id => {}
-                _ => return Ok((txn, Attempt::Abort(None))),
-            }
-
-            // An entry without a claimed record is the residue of a claim whose
-            // commit failed (the entry is registered first), or of a settlement
-            // whose entry removal did not run yet. Neither case leaves a claim
-            // to recover, so the entry is dropped.
+            // An entry without a claimed record at its claim's key belongs to a
+            // claim whose commit failed (the entry is registered first), or to
+            // a claim whose end committed before its entry removal ran. Neither
+            // case leaves a claim to recover, so the entry is dropped. A
+            // settlement that commits after this snapshot conflicts on the
+            // staged delete of the claimed key.
             let Some(raw) = txn.get(claimed_key_bytes).await? else {
                 registry.remove(queue, id, claim_id);
                 debug!(queue = %queue, job_id = %id, "dropped lease entry with no claimed record");
@@ -177,7 +166,7 @@ impl QueueCore {
 
             let mut job = JobRecord::decode(claimed_key_bytes, &raw)?;
             let end = unsettled_claim_end(&job, AttemptOutcome::LeaseExpired, "lease expired");
-            txn.stage_claim_end(&mut job, &end, self.now_ms())?;
+            txn.stage_claim_end(claimed_key_bytes, &mut job, &end, self.now_ms())?;
             Ok((txn, Attempt::Commit(Some((job, end)))))
         })
         .await?;
@@ -203,14 +192,14 @@ impl QueueCore {
     /// notes its pending key, which sorts before the restored clean-close
     /// bound.
     pub(crate) async fn requeue_interrupted_claims(&self) -> Result<()> {
-        let mut interrupted: Vec<JobRecord> = Vec::new();
+        let mut interrupted: Vec<(Vec<u8>, JobRecord)> = Vec::new();
         let mut iter = self
             .db
             .scan_prefix_with_options(tag_prefix(KeyTag::Claimed), .., &sweep_scan_options())
             .await?;
         while let Some(kv) = iter.next().await? {
             match JobRecord::decode(&kv.key, &kv.value) {
-                Ok(job) => interrupted.push(job),
+                Ok(job) => interrupted.push((kv.key.to_vec(), job)),
                 // Re-queueing needs the record, so the key is left in place for
                 // later inspection.
                 Err(e) => warn!(key = ?kv.key, "undecodable claimed record at open: {e}"),
@@ -218,7 +207,7 @@ impl QueueCore {
         }
         drop(iter);
 
-        for job in &interrupted {
+        for (key, job) in &interrupted {
             // The commit does not await WAL durability: a commit that awaits
             // the flush serialises the open at one job per flush interval. A
             // requeue lost in a crash is redone by the next open from the
@@ -230,7 +219,7 @@ impl QueueCore {
                     AttemptOutcome::Interrupted,
                     "claim interrupted by process exit",
                 );
-                txn.stage_claim_end(&mut job, &end, self.now_ms())?;
+                txn.stage_claim_end(key, &mut job, &end, self.now_ms())?;
                 Ok((txn, Attempt::Commit(())))
             })
             .await?;
@@ -445,18 +434,17 @@ mod tests {
 
         // Two jobs, one with retries left and one out of attempts, so the
         // requeue and dead-letter branches are both covered.
-        let retried = q.enqueue("work", b"a".to_vec()).await.unwrap();
-        let doomed = q
-            .enqueue_with(
-                "work",
-                b"b".to_vec(),
-                EnqueueOptions {
-                    max_attempts: Some(1),
-                    ..EnqueueOptions::default()
-                },
-            )
-            .await
-            .unwrap();
+        q.enqueue("work", b"a".to_vec()).await.unwrap();
+        q.enqueue_with(
+            "work",
+            b"b".to_vec(),
+            EnqueueOptions {
+                max_attempts: Some(1),
+                ..EnqueueOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         let claimed = q
             .claim_batch("work", 2, Duration::from_secs(30))
             .await
@@ -466,16 +454,15 @@ mod tests {
         clock.advance(Duration::from_secs(31));
         q.reap_now().await.unwrap();
 
-        for id in [&retried, &doomed] {
-            assert!(q.core.lease_registry.current(&qn("work"), id).is_none());
+        for claim in &claimed {
             assert!(
                 q.core
-                    .db
-                    .get(&claimed_key(&qn("work"), id))
-                    .await
-                    .unwrap()
-                    .is_none()
+                    .lease_registry
+                    .leases(&qn("work"), &claim.id)
+                    .is_empty()
             );
+            let key = claimed_key(&qn("work"), &claim.id, claim.claim_id());
+            assert!(q.core.db.get(&key).await.unwrap().is_none());
         }
         let stats = q.view().stats("work").await.unwrap();
         assert_eq!(stats.claimed, 0);
@@ -737,7 +724,7 @@ mod tests {
 
         clock.advance(Duration::from_secs(31));
         q.reap_now().await.unwrap();
-        assert!(q.core.lease_registry.current(&qn("work"), &id).is_none());
+        assert!(q.core.lease_registry.leases(&qn("work"), &id).is_empty());
         assert!(!q.core.lease_registry.cancel(&qn("work"), &id));
         assert!(!token.is_cancelled());
 
@@ -1472,9 +1459,13 @@ mod tests {
         assert_eq!(claims.len(), 2);
 
         // The poisoned record sorts first, both jobs sharing an expiry.
+        let poisoned = claims.iter().find(|c| c.id == poison).unwrap();
         q.core
             .db
-            .put(claimed_key(&qn("work"), &poison), b"not messagepack")
+            .put(
+                claimed_key(&qn("work"), &poison, poisoned.claim_id()),
+                b"not messagepack",
+            )
             .await
             .unwrap();
 

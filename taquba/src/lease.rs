@@ -241,11 +241,11 @@ mod tests {
         handle.ensure_at_least(Duration::from_secs(60)).unwrap();
 
         cancel.cancel();
-        let before = registry.current(&qn("q"), "a");
+        let before = registry.leases(&qn("q"), "a");
         assert!(matches!(
             handle.ensure_at_least(Duration::from_secs(600)),
             Err(Error::CancelRequested)
         ));
-        assert_eq!(registry.current(&qn("q"), "a"), before);
+        assert_eq!(registry.leases(&qn("q"), "a"), before);
     }
 }
