@@ -167,7 +167,8 @@ pub struct WebhookRequest {
     pub method: String,
     /// Outgoing HTTP headers (sent on the wire to the target URL).
     pub headers: HashMap<String, String>,
-    /// Optional per-request timeout. The worker enforces it via reqwest.
+    /// Optional per-request timeout. `None` leaves the default timeout of the
+    /// [`WebhookWorker`].
     pub timeout: Option<Duration>,
 }
 
@@ -196,8 +197,8 @@ impl WebhookRequest {
         self
     }
 
-    /// Set a per-request timeout. Without it, the reqwest client's default
-    /// applies.
+    /// Set a per-request timeout. Without it, the default timeout of the
+    /// [`WebhookWorker`] applies.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);

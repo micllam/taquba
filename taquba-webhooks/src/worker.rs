@@ -24,6 +24,19 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// configured on the [`reqwest::Client`]. Before sending, the worker extends
 /// the job's lease to cover the timeout, so a slow receiver does not cause the
 /// job to be re-queued mid-delivery.
+///
+/// A 2xx response acknowledges the job. A 4xx response other than 408 and 429,
+/// or an invalid configuration header, dead-letters the job at once. Every
+/// other response, a transport error and a timeout fail the attempt, and the
+/// queue retries the job with backoff up to its attempt limit.
+///
+/// By default each request has the header `Webhook-Id` with the
+/// [`taquba::JobRecord::id`] of the job. Delivery is at least once, so a
+/// receiver must deduplicate on that header.
+///
+/// The worker sends the job's header entries with the [`HTTP_HEADER_PREFIX`] as
+/// HTTP headers. It ignores the entries without a reserved key, which an
+/// application can use for its own metadata.
 pub struct WebhookWorker {
     client: reqwest::Client,
     delivery_id_header: Option<String>,
