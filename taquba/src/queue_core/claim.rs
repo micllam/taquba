@@ -18,9 +18,7 @@ use crate::queue_core::QueueCore;
 use crate::txn::{Commit, Durability, Flush, Txn, get_indexed_job};
 
 /// Generate a claim id. A ULID's low 64 bits fall inside its 80-bit random
-/// component, so claim ids are distinct across claims of the same job. The
-/// value identifies a claim and is not ordered, so it fences only against this
-/// queue's own state and is not a fencing token for anything outside it.
+/// component, so claim ids are distinct across claims of the same job.
 fn new_claim_id() -> u64 {
     Ulid::new().0 as u64
 }
