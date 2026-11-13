@@ -53,8 +53,8 @@ pub(crate) struct ClaimedStep<'a> {
 
 impl<'a> ClaimedStep<'a> {
     /// Identify the claimed step from `job`'s headers. Fails, permanently, for
-    /// a job without the run id header, with a run id, group id or owner that
-    /// is not valid or with a step header that is not a `u32`.
+    /// a job without the run id or the step header, with a run id, group id or
+    /// owner that is not valid or with a step header that is not a `u32`.
     pub(crate) fn parse(job: &'a JobRecord) -> Result<Self, Error> {
         let run_id = RunId::new(
             job.headers
