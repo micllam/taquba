@@ -441,6 +441,11 @@ mod tests {
             );
         }
         assert!(RunId::new("a".repeat(MAX_RUN_ID_LEN)).is_ok());
+        assert!(matches!(
+            "run/1".parse::<RunId>(),
+            Err(Error::InvalidRunId { .. })
+        ));
+        assert_eq!("run-1".parse::<RunId>().unwrap(), "run-1");
         assert!(crate::durable::decode::<RunId>(&rmp_serde::to_vec("").unwrap()).is_err());
         assert_eq!(
             crate::durable::decode::<RunId>(&rmp_serde::to_vec("run-1").unwrap()).unwrap(),

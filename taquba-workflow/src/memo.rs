@@ -443,7 +443,8 @@ mod tests {
 
     #[tokio::test]
     async fn put_get_round_trips() {
-        let memo = make_memo();
+        let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let memo = MemoStore::new(backing.clone(), "memo").new_memo(&rid("run-1"), 0);
         assert_eq!(memo.get("missing").await.unwrap(), None);
         memo.put("k", b"first").await.unwrap();
         assert_eq!(memo.get("k").await.unwrap(), Some(b"first".to_vec()));
@@ -452,6 +453,9 @@ mod tests {
         memo.put("k2", b"").await.unwrap();
         assert_eq!(memo.get("k2").await.unwrap(), Some(Vec::new()));
         assert_eq!(memo.get("k").await.unwrap(), Some(b"second".to_vec()));
+        // A memo of another store over the same storage reads the entry.
+        let reader = MemoStore::new(backing, "memo").new_memo(&rid("run-1"), 0);
+        assert_eq!(reader.get("k").await.unwrap(), Some(b"second".to_vec()));
     }
 
     #[tokio::test]
@@ -476,6 +480,15 @@ mod tests {
         let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
         let at_step_0 = store.new_memo(&rid("run-1"), 0);
         let for_run = store.new_run_memo(&rid("run-1"));
+        assert_eq!(
+            (at_step_0.run_id().as_str(), at_step_0.step_number()),
+            ("run-1", Some(0))
+        );
+        assert_eq!(store.new_memo(&rid("run-1"), 1).step_number(), Some(1));
+        assert_eq!(
+            (for_run.run_id().as_str(), for_run.step_number()),
+            ("run-1", None)
+        );
         at_step_0.put("k", b"step-0").await.unwrap();
         for_run.put("k", b"run").await.unwrap();
         assert_eq!(at_step_0.get("k").await.unwrap(), Some(b"step-0".to_vec()));
@@ -763,60 +776,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn instances_sharing_a_backing_store_see_the_same_entries() {
-        // Two MemoStores over the same object store + prefix yield memos that
-        // observe each other's writes. Each memo reads from the storage, which
-        // is the source of truth.
-        let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let writer = MemoStore::new(backing.clone(), "memo").new_memo(&rid("run-1"), 0);
-        let reader = MemoStore::new(backing, "memo").new_memo(&rid("run-1"), 0);
-        writer.put("k", b"shared").await.unwrap();
-        assert_eq!(reader.get("k").await.unwrap(), Some(b"shared".to_vec()));
-    }
-
-    #[tokio::test]
     async fn clear_memos_for_run_removes_only_that_runs_entries() {
-        let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let store = MemoStore::new(backing, "memo");
-        let in_run_a = store.new_memo(&rid("run-a"), 0);
-        let in_run_a_step1 = store.new_memo(&rid("run-a"), 1);
-        let in_run_b = store.new_memo(&rid("run-b"), 0);
-        in_run_a.put("k", b"a-0").await.unwrap();
-        in_run_a_step1.put("k", b"a-1").await.unwrap();
-        in_run_b.put("k", b"b-0").await.unwrap();
-
-        let deleted = store.clear_memos_for_run(&rid("run-a")).await.unwrap();
-        assert_eq!(deleted, 2);
-
-        assert_eq!(in_run_a.get("k").await.unwrap(), None);
-        assert_eq!(in_run_a_step1.get("k").await.unwrap(), None);
-        assert_eq!(in_run_b.get("k").await.unwrap(), Some(b"b-0".to_vec()));
-        assert_eq!(store.clear_memos_for_run(&rid("run-a")).await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn clear_memos_for_run_does_not_match_run_id_as_prefix() {
         let store = MemoStore::new(Arc::new(InMemory::new()), "memo");
-        store
-            .new_memo(&rid("run"), 0)
-            .put("k", b"short")
-            .await
-            .unwrap();
-        store
-            .new_memo(&rid("run-suffix"), 0)
-            .put("k", b"long")
-            .await
-            .unwrap();
+        let at_step_0 = store.new_memo(&rid("run"), 0);
+        let at_step_1 = store.new_memo(&rid("run"), 1);
+        // A run id that starts with the cleared one.
+        let other = store.new_memo(&rid("run-suffix"), 0);
+        at_step_0.put("k", b"step-0").await.unwrap();
+        at_step_1.put("k", b"step-1").await.unwrap();
+        other.put("k", b"other").await.unwrap();
 
-        let deleted = store.clear_memos_for_run(&rid("run")).await.unwrap();
-        assert_eq!(deleted, 1);
-        assert_eq!(
-            store
-                .new_memo(&rid("run-suffix"), 0)
-                .get("k")
-                .await
-                .unwrap(),
-            Some(b"long".to_vec()),
-        );
+        assert_eq!(store.clear_memos_for_run(&rid("run")).await.unwrap(), 2);
+        assert_eq!(at_step_0.get("k").await.unwrap(), None);
+        assert_eq!(at_step_1.get("k").await.unwrap(), None);
+        assert_eq!(other.get("k").await.unwrap(), Some(b"other".to_vec()));
+        assert_eq!(store.clear_memos_for_run(&rid("run")).await.unwrap(), 0);
     }
 }

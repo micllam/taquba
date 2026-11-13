@@ -347,12 +347,15 @@ mod tests {
     use crate::test_util::{open_queue_at, rid};
     use crate::view::RunState;
 
-    /// Succeeds at its first step.
-    struct Succeeds;
+    /// Continues each step to a step that waits an hour for a signal.
+    struct Waits;
 
-    impl StepRunner for Succeeds {
+    impl StepRunner for Waits {
         async fn run_step(&self, _: &Step) -> std::result::Result<StepOutcome, StepError> {
-            Ok(StepOutcome::Succeed { result: Vec::new() })
+            Ok(StepOutcome::continue_on_signal(
+                Vec::new(),
+                Duration::from_secs(3_600),
+            ))
         }
     }
 
@@ -361,6 +364,8 @@ mod tests {
     enum Work {
         /// The run `owned`.
         Run,
+        /// The run `owned`, whose step 0 is claimable from its submission.
+        RunNow,
         /// The group `g` with the members `a` and `b`.
         Group,
     }
@@ -378,7 +383,7 @@ mod tests {
     /// Submits `work` on `members` with the owner of step 0, keeps the owner
     /// and ends step 0 with `end`. Step 1 succeeds.
     struct Owning {
-        members: WorkflowRuntime<Succeeds>,
+        members: WorkflowRuntime<Waits>,
         work: Work,
         end: End,
         kept: Arc<Mutex<Option<Owner>>>,
@@ -390,9 +395,15 @@ mod tests {
                 return Ok(StepOutcome::Succeed { result: Vec::new() });
             }
             *self.kept.lock().unwrap() = Some(step.owner.clone());
-            let options = owned(&step.owner);
+            let options = match self.work {
+                Work::RunNow => RunOptions {
+                    run_at: None,
+                    ..owned(&step.owner)
+                },
+                Work::Run | Work::Group => owned(&step.owner),
+            };
             match self.work {
-                Work::Run => {
+                Work::Run | Work::RunNow => {
                     self.members
                         .submit(RunSpec {
                             run_id: Some(rid("owned")),
@@ -417,11 +428,8 @@ mod tests {
         }
     }
 
-    fn members_runtime(
-        queue: &Arc<Queue>,
-        store: &Arc<dyn ObjectStore>,
-    ) -> WorkflowRuntime<Succeeds> {
-        WorkflowRuntime::builder(queue.clone(), store.clone(), Succeeds)
+    fn members_runtime(queue: &Arc<Queue>, store: &Arc<dyn ObjectStore>) -> WorkflowRuntime<Waits> {
+        WorkflowRuntime::builder(queue.clone(), store.clone(), Waits)
             .queue_name("members")
             .poll_interval(Duration::from_millis(10))
             .build()
@@ -433,7 +441,7 @@ mod tests {
     fn owners_runtime(
         queue: &Arc<Queue>,
         store: &Arc<dyn ObjectStore>,
-        members: &WorkflowRuntime<Succeeds>,
+        members: &WorkflowRuntime<Waits>,
         work: Work,
         end: End,
     ) -> (WorkflowRuntime<Owning>, Arc<Mutex<Option<Owner>>>) {
@@ -524,6 +532,53 @@ mod tests {
             .await
             .unwrap();
         assert!(entries.is_empty(), "each member deleted its index entry");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_owned_run_keeps_its_owner_across_its_steps() {
+        let (queue, store, _clock) = open_queue_at(10_000).await;
+        let members = members_runtime(&queue, &store);
+        let (owners, kept) = owners_runtime(&queue, &store, &members, Work::RunNow, End::Wait);
+        let owner_id = run_owner_step(&owners).await;
+        let worker = members.spawn(std::future::pending::<()>());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while members.status(&rid("owned")).await.unwrap().unwrap().state
+                != (RunState::Waiting {
+                    timeout_at_ms: 10_000 + 3_600_000,
+                })
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the owned run reached its wait at step 1 in time");
+
+        owners.cancel(&owner_id, None).await.unwrap();
+        let cancelled = tokio::time::timeout(Duration::from_secs(10), members.wait(&rid("owned")))
+            .await
+            .expect("the owned run terminated in time")
+            .unwrap();
+        worker.shutdown().await.unwrap();
+
+        assert_eq!(cancelled.termination.final_step.number, 1);
+        assert_eq!(
+            cancelled.termination.cancelled_by,
+            Some(CancelOrigin::Owner)
+        );
+        // Step 1 deletes the index entry only with the owner of its header.
+        let owner = kept.lock().unwrap().clone().unwrap();
+        let entries: Vec<_> = queue
+            .view()
+            .kv_entries(
+                OWNED_KV_PREFIX,
+                owned_runs_range(&owner.run, "members"),
+                KvOrder::Ascending,
+                OWNED_PAGE_SIZE,
+            )
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(entries.is_empty());
     }
 
     #[tokio::test(start_paused = true)]

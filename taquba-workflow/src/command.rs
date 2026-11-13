@@ -447,6 +447,22 @@ mod tests {
             .send("other", EnqueueEntry::from(cancel))
             .await
             .unwrap();
+        // The second entry of a key reads the job of the first, which fails.
+        let keyed = |payload: Vec<u8>| EnqueueEntry {
+            payload,
+            options: taquba::EnqueueOptions::default().dedup_key(Some("key".to_string())),
+        };
+        let first_of_key = sender.send(CONTROL, keyed(b"{}".to_vec())).await.unwrap();
+        let submit = Command::Submit(SubmitCommand::new(rid("run-2"), b"y"));
+        let second_of_key = sender
+            .send(CONTROL, keyed(EnqueueEntry::from(submit).payload))
+            .await
+            .unwrap();
+        let existing = queue.enqueue("taken", Vec::new()).await.unwrap();
+        let submit = Command::Submit(SubmitCommand::new(rid("run-3"), b"z"));
+        let mut taken_entry = EnqueueEntry::from(submit);
+        taken_entry.options.id_override = Some(existing);
+        let taken = sender.send(CONTROL, taken_entry).await.unwrap();
         assert_eq!(view.command(CONTROL, &applied).await.unwrap(), None);
 
         // Without a worker, the command job waits on the control queue.
@@ -459,15 +475,30 @@ mod tests {
             view.command("other", &outside).await.unwrap(),
             Some(CommandState::Rejected(Rejection::QueueNotAccepted))
         );
+        assert_eq!(
+            view.command(CONTROL, &taken).await.unwrap(),
+            Some(CommandState::Rejected(Rejection::DuplicateJobId))
+        );
 
         let tx = spawn(&runtime);
         for _ in 0..500 {
             let states = (
                 view.command(CONTROL, &applied).await.unwrap(),
                 view.command(CONTROL, &malformed).await.unwrap(),
+                view.command(CONTROL, &second_of_key).await.unwrap(),
             );
-            if let (Some(CommandState::Applied), Some(CommandState::Failed(reason))) = states {
+            if let (
+                Some(CommandState::Applied),
+                Some(CommandState::Failed(reason)),
+                Some(CommandState::Failed(keyed_reason)),
+            ) = states
+            {
                 assert!(reason.contains("malformed command"));
+                assert!(keyed_reason.contains("malformed command"));
+                assert_eq!(
+                    view.command(CONTROL, &first_of_key).await.unwrap(),
+                    Some(CommandState::Failed(keyed_reason))
+                );
                 let _ = tx.send(());
                 return;
             }

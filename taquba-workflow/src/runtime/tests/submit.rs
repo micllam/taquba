@@ -275,7 +275,7 @@ async fn submit_rejects_the_reserved_names_in_its_headers_and_effects() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn submit_applies_the_deletes_and_expiry_entries_of_the_spec() {
+async fn submit_applies_the_deletes_expiry_entries_and_count_changes_of_the_spec() {
     let (queue, store, _clock) = open_queue_at(10_000).await;
     let runtime = WorkflowRuntime::builder(queue.clone(), store, ScriptedRunner::new(vec![]))
         .build()
@@ -294,13 +294,42 @@ async fn submit_applies_the_deletes_and_expiry_entries_of_the_spec() {
             input: b"x".to_vec(),
             effects: SettlementEffects::default()
                 .kv_delete(b"app/stale")
-                .expiry_entry(&index, 8_000, b"run"),
+                .expiry_entry(&index, 8_000, b"run")
+                .count_up("app/submitted"),
             ..Default::default()
         })
         .await
         .unwrap();
 
     assert!(queue.view().kv_get(b"app/stale").await.unwrap().is_none());
+    // The waiter becomes pending at the change that brings the count to zero,
+    // so a single count down shows a count of 1.
+    let waiter = queue
+        .enqueue_with(
+            "app-waiters",
+            Vec::new(),
+            EnqueueOptions {
+                count_wait: Some("app/submitted".to_string()),
+                ..EnqueueOptions::default().run_at(UNIX_EPOCH + Duration::from_secs(3_600))
+            },
+        )
+        .await
+        .unwrap();
+    let status = || async {
+        queue
+            .view()
+            .job_record(&waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+    };
+    assert_eq!(status().await, JobStatus::Scheduled);
+    queue
+        .commit_effects(SettlementEffects::default().count_down("app/submitted"))
+        .await
+        .unwrap();
+    assert_eq!(status().await, JobStatus::Pending);
     let mut seen = Vec::new();
     index
         .pass(&queue, 10_000, Duration::ZERO, |at_ms, suffix| {

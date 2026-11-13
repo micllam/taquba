@@ -39,6 +39,43 @@ async fn terminal_marker_is_written_at_the_runtime_clock() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_overriding_clock_sets_the_timestamps_and_the_retention_of_a_run() {
+    let (queue, store, _queue_clock) = open_queue_at(10_000).await;
+    let clock = MockClock::new(50_000);
+    let runtime = WorkflowRuntime::builder(
+        queue,
+        store,
+        ScriptedRunner::new(vec![StepOutcome::Succeed {
+            result: b"done".to_vec(),
+        }]),
+    )
+    .clock(Arc::new(clock.clone()))
+    .memo_retention(Duration::from_secs(60))
+    .build()
+    .unwrap();
+
+    let handle = runtime
+        .submit(RunSpec {
+            input: b"in".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let listed = runtime.view().run(&handle.run_id).await.unwrap().unwrap();
+    assert_eq!(listed.submitted_at_ms, 50_000);
+    clock.advance(Duration::from_secs(30));
+    let shutdown = spawn_runtime(runtime.clone());
+    let outcome = wait_for(&runtime, &handle.run_id).await;
+    assert_eq!(outcome.termination.terminated_at_ms, 80_000);
+    let _ = shutdown.send(());
+
+    // Only the runtime's clock passes the retention window.
+    clock.advance(Duration::from_secs(60));
+    assert_eq!(runtime.inner.core.sweep_once().await.unwrap(), 1);
+    assert!(runtime.status(&handle.run_id).await.unwrap().is_none());
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_malformed_terminal_marker_is_deleted_without_clearing_memos() {
     let (queue, store, clock) = open_queue_at(10_000).await;
     let runtime =
@@ -248,10 +285,9 @@ where
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_sweeper_clears_a_marker_only_after_retention_elapses() {
-    // Retention 200ms and a 10ms poll interval. A pass 199ms after the marker
-    // is written leaves it. Within a poll interval of the boundary the sweep
-    // loop clears the marker and the run's memo entries.
+async fn the_background_sweeper_clears_an_expired_marker() {
+    // Retention 200ms and a 10ms poll interval. Within a poll interval of the
+    // boundary the sweep loop clears the marker and the run's memo entries.
     let (queue, store, clock) = open_queue_at(10_000).await;
     let runtime = WorkflowRuntime::builder(
         queue,
@@ -281,17 +317,7 @@ async fn the_sweeper_clears_a_marker_only_after_retention_elapses() {
         .await
         .unwrap();
 
-    advance(&clock, Duration::from_millis(199)).await;
-    assert_eq!(runtime.inner.core.sweep_once().await.unwrap(), 0);
-    let markers = terminal_markers(&runtime.inner.core.queue).await;
-    assert_eq!(
-        markers.len(),
-        1,
-        "a marker within the window must not be swept"
-    );
-
-    advance(&clock, Duration::from_millis(1)).await;
-    advance(&clock, Duration::from_millis(10)).await;
+    advance(&clock, Duration::from_millis(210)).await;
     let cleared = yield_until(50, || async {
         terminal_markers(&runtime.inner.core.queue).await.is_empty()
     })

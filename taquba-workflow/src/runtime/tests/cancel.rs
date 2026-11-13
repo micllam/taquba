@@ -383,7 +383,7 @@ async fn cancel_signals_step_token_for_cooperative_short_circuit() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn cancel_returns_false_for_a_terminated_or_unknown_run() {
+async fn cancel_reports_not_active_and_leaves_a_terminated_or_unknown_run() {
     // Submit a run that succeeds normally, wait for its termination, then call
     // `cancel`. The terminal record replaced the run record with the success,
     // so `cancel` must report `NotActive`.
@@ -428,6 +428,13 @@ async fn cancel_returns_false_for_a_terminated_or_unknown_run() {
     assert_eq!(
         runtime.cancel(&rid("never-submitted"), None).await.unwrap(),
         CancelRunOutcome::NotActive
+    );
+    assert!(
+        runtime
+            .status(&rid("never-submitted"))
+            .await
+            .unwrap()
+            .is_none()
     );
 
     let _ = shutdown.send(());

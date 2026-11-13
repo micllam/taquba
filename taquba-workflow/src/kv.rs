@@ -118,5 +118,6 @@ mod tests {
     async fn a_detached_handle_reads_no_value() {
         let handle = KvReadHandle::detached();
         assert_eq!(handle.get(b"any").await.unwrap(), None);
+        assert_eq!(handle.get_run_kv(b"any").await.unwrap(), None);
     }
 }

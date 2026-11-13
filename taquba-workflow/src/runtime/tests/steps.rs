@@ -316,18 +316,24 @@ async fn restart_resumes_at_next_step() {
 
 /// Submits a run whose runner always returns [`StepError::transient`], capped
 /// at `max_attempts`. Asserts the runner is invoked exactly `max_attempts`
-/// times (per-step max-attempts propagation) and that the run terminates as
-/// failed with its marker on the exhausting attempt.
+/// times (per-step max-attempts propagation), that only the last attempt
+/// reports [`Delivery::is_last_attempt`](crate::Delivery::is_last_attempt) and
+/// that the run terminates as failed with its marker on the exhausting attempt.
 async fn assert_transient_retries_until_max(max_attempts: u32) {
+    struct Recording(Arc<StdMutex<Vec<bool>>>);
+    impl StepRunner for Recording {
+        async fn run_step(&self, step: &Step) -> std::result::Result<StepOutcome, StepError> {
+            self.0.lock().unwrap().push(step.is_last_attempt());
+            Err(StepError::transient("flaky"))
+        }
+    }
+
     let (queue, store) = open_queue_with(fast_options()).await;
-    let calls = Arc::new(AtomicU32::new(0));
+    let last_attempts = Arc::new(StdMutex::new(Vec::new()));
     let runtime = WorkflowRuntime::builder(
         queue.clone(),
         store.clone(),
-        FixedRunner {
-            result: Err(StepError::transient("flaky")),
-            calls: calls.clone(),
-        },
+        Recording(last_attempts.clone()),
     )
     .memo_retention(Duration::from_secs(60))
     .build()
@@ -350,9 +356,11 @@ async fn assert_transient_retries_until_max(max_attempts: u32) {
 
     assert_eq!(outcome.termination.status, TerminalStatus::Failed);
     assert_eq!(outcome.termination.error.as_deref(), Some("flaky"));
+    let mut expected = vec![false; max_attempts as usize - 1];
+    expected.push(true);
     assert_eq!(
-        calls.load(Ordering::SeqCst),
-        max_attempts,
+        *last_attempts.lock().unwrap(),
+        expected,
         "runner called once per attempt up to max_attempts"
     );
 
@@ -380,7 +388,7 @@ async fn assert_transient_retries_until_max(max_attempts: u32) {
 }
 
 #[tokio::test(start_paused = true)]
-async fn transient_retries_until_max_attempts() {
+async fn a_transient_error_retries_until_the_last_attempt() {
     assert_transient_retries_until_max(1).await;
     assert_transient_retries_until_max(3).await;
 }
@@ -436,6 +444,62 @@ async fn step_memo_survives_across_attempts_of_the_same_step() {
         outcome.result.as_deref(),
         Some(b"first-attempt-value".as_slice())
     );
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_step_job_with_malformed_headers_dead_letters_on_its_first_attempt() {
+    let (queue, store) = open_queue_with(fast_options()).await;
+    let runtime = WorkflowRuntime::builder(queue.clone(), store, UnreachableRunner)
+        .build()
+        .unwrap();
+    let cases = [
+        (
+            EnqueueOptions::default(),
+            format!("missing header `{HEADER_RUN_ID}`"),
+        ),
+        (
+            EnqueueOptions::default().header(HEADER_RUN_ID, "malformed"),
+            format!("missing header `{HEADER_STEP}`"),
+        ),
+        (
+            EnqueueOptions::default()
+                .header(HEADER_RUN_ID, "malformed")
+                .header(HEADER_STEP, "x"),
+            format!("invalid `{HEADER_STEP}` header `x`"),
+        ),
+    ];
+    let mut expected = Vec::new();
+    for (options, error) in cases {
+        let id = queue
+            .enqueue_with("workflow-steps", Vec::new(), options.max_attempts(3))
+            .await
+            .unwrap();
+        expected.push((id, error));
+    }
+    let shutdown = spawn_runtime(runtime.clone());
+
+    let mut dead = Vec::new();
+    for _ in 0..200 {
+        dead = queue
+            .view()
+            .dead_jobs("workflow-steps", None, 10)
+            .await
+            .unwrap();
+        if dead.len() == expected.len() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(dead.len(), expected.len());
+    for (id, error) in expected {
+        let job = dead.iter().find(|job| job.id == id).unwrap();
+        assert_eq!(job.attempts, 1);
+        assert!(job.last_error.as_deref().unwrap().contains(&error));
+    }
+    assert!(terminal_markers(&queue).await.is_empty());
+    assert!(runtime.status(&rid("malformed")).await.unwrap().is_none());
 
     let _ = shutdown.send(());
 }

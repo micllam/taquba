@@ -438,7 +438,7 @@ mod tests {
 
     use serde::{Deserialize, Serialize};
     use taquba::object_store::{ObjectStore, memory::InMemory};
-    use taquba::{JobStatus, OpenOptions, Queue, QueueConfig};
+    use taquba::{JobStatus, MockClock, OpenOptions, Queue, QueueConfig};
 
     use crate::jobs::handle::JoinError;
     use crate::jobs::job::payload_idempotency_key;
@@ -917,12 +917,13 @@ mod tests {
         let first = runner.submit(CountedKeyed { n: 5 }).await.unwrap();
         assert!(first.newly_submitted());
         let first_id = first.id().to_string();
-        assert_eq!(first.await.unwrap(), 5);
+        assert_eq!(first.clone().await.unwrap(), 5);
         assert_eq!(runs.load(Ordering::SeqCst), 1);
 
         // The retention sweep removes the terminal record with the memos.
         clock.advance(Duration::from_secs(61));
         assert_eq!(runner.runtime.inner.core.sweep_once().await.unwrap(), 1);
+        assert!(first.fetch_result().await.unwrap().is_none());
 
         // The re-submission does not find a terminal record and runs the job
         // again under the same id.
@@ -969,29 +970,207 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn retention_removes_the_outcome_record() {
-        let t0 = 1_700_000_000_000;
-        let (queue, store, clock) = open_queue_at_with(t0, fast_options()).await;
+    async fn join_timeout_reads_none_then_the_output_then_not_found_after_retention() {
+        let (queue, store, clock) = open_queue_at_with(10_000, fast_options()).await;
         let runner = JobRunner::builder(queue, store)
             .state("ok")
             .retention(Duration::from_secs(60))
             .register::<Adder>()
             .build();
-        let handle = runner.spawn(std::future::pending::<()>());
 
-        let job = runner.submit(Adder { a: 1, b: 1 }).await.unwrap();
-        assert_eq!(job.clone().await.unwrap(), 2);
-        assert!(job.fetch_result().await.unwrap().is_some());
+        let job = runner.submit(Adder { a: 1, b: 2 }).await.unwrap();
+        assert!(
+            job.join_timeout(Duration::from_secs(1))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let handle = runner.spawn(std::future::pending::<()>());
+        let output = job.join_timeout(Duration::from_secs(10)).await.unwrap();
+        assert_eq!(output.unwrap().unwrap(), 3);
+        handle.shutdown().await.unwrap();
 
         clock.advance(Duration::from_secs(61));
-        tokio::time::advance(Duration::from_secs(61)).await;
-        for _ in 0..50 {
-            if job.fetch_result().await.unwrap().is_none() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(runner.runtime.inner.core.sweep_once().await.unwrap(), 1);
+        assert!(matches!(
+            job.join_timeout(Duration::from_secs(1)).await,
+            Err(Error::RunNotFound(_))
+        ));
+    }
+
+    /// A job whose fields differ from those of [`Narrow`], under the same name.
+    #[derive(Serialize, Deserialize)]
+    struct Wide {
+        a: i64,
+    }
+
+    impl Job for Wide {
+        const NAME: &'static str = "test.narrow";
+        type Output = ();
+        type Error = TestError;
+
+        async fn run(&self, _: JobContext<'_>) -> std::result::Result<(), TestError> {
+            Ok(())
         }
-        assert!(job.fetch_result().await.unwrap().is_none());
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Narrow {
+        s: String,
+    }
+
+    impl Job for Narrow {
+        const NAME: &'static str = "test.narrow";
+        type Output = ();
+        type Error = TestError;
+
+        async fn run(&self, _: JobContext<'_>) -> std::result::Result<(), TestError> {
+            Ok(())
+        }
+    }
+
+    /// An output whose serialization fails.
+    #[derive(Debug, Deserialize)]
+    struct Unencodable;
+
+    impl Serialize for Unencodable {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> std::result::Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("unencodable"))
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct ReturnsUnencodable;
+
+    impl Job for ReturnsUnencodable {
+        const NAME: &'static str = "test.returns-unencodable";
+        type Output = Unencodable;
+        type Error = TestError;
+
+        async fn run(&self, _: JobContext<'_>) -> std::result::Result<Unencodable, TestError> {
+            Ok(Unencodable)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_undecodable_input_or_an_unencodable_output_fails_the_job_permanently() {
+        let (queue, store) = open_queue_with(
+            fast_options().default_queue_config(
+                QueueConfig::default()
+                    .max_attempts(3)
+                    .retry_backoff_base(Duration::ZERO),
+            ),
+        )
+        .await;
+        let runner = JobRunner::builder(queue.clone(), store)
+            .register::<Narrow>()
+            .register::<ReturnsUnencodable>()
+            .build();
+        let handle = runner.spawn(std::future::pending::<()>());
+
+        let input = runner.submit(Wide { a: 1 }).await.unwrap();
+        let error = input.join().await.unwrap().unwrap_err();
+        assert_eq!(error.kind, StepErrorKind::Permanent);
+        assert!(error.message.contains("invalid input for `test.narrow`"));
+
+        let output = runner.submit(ReturnsUnencodable).await.unwrap();
+        let error = output.join().await.unwrap().unwrap_err();
+        assert_eq!(error.kind, StepErrorKind::Permanent);
+        assert!(error.message.contains("failed to serialize"));
+
+        let dead = queue
+            .view()
+            .dead_jobs(DEFAULT_QUEUE_NAME, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(dead.len(), 2);
+        assert!(dead.iter().all(|job| job.attempts == 1));
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_job_runner_runs_its_jobs_on_its_named_queue() {
+        let (queue, store) = open_queue().await;
+        let runner = JobRunner::builder(queue.clone(), store)
+            .queue_name("custom-jobs")
+            .state("ok")
+            .register::<Adder>()
+            .build();
+
+        let job = runner.submit(Adder { a: 1, b: 2 }).await.unwrap();
+        assert_eq!(queue.view().stats("custom-jobs").await.unwrap().pending, 1);
+        assert_eq!(count_jobs(&queue, JobStatus::Pending).await, 0);
+        let handle = runner.spawn(std::future::pending::<()>());
+        assert_eq!(job.await.unwrap(), 3);
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "max_concurrent_jobs must be at least 1")]
+    async fn max_concurrent_jobs_rejects_zero() {
+        let (queue, store) = open_queue().await;
+        let _ = JobRunner::builder(queue, store).max_concurrent_jobs(0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn group_retention_removes_a_job_group_after_its_window_on_the_runner_clock() {
+        let (queue, store, _queue_clock) = open_queue_at_with(10_000, fast_options()).await;
+        let clock = MockClock::new(10_000);
+        let runner = JobRunner::builder(queue, store)
+            .state("ok")
+            .clock(Arc::new(clock.clone()))
+            .group_retention(Duration::from_secs(1))
+            .register::<Adder>()
+            .build();
+        let handle = runner.spawn(std::future::pending::<()>());
+
+        let group = runner.group::<Adder>(crate::test_util::rid("adders"));
+        group.submit(vec![Adder { a: 1, b: 2 }]).await.unwrap();
+        let results = tokio::time::timeout(Duration::from_secs(10), group.join())
+            .await
+            .expect("join finished in time")
+            .unwrap();
+        assert_eq!(results[0].result.as_ref().unwrap(), &3);
+        handle.shutdown().await.unwrap();
+
+        // Only the runner's clock passes the window.
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(runner.runtime.inner.core.sweep_once().await.unwrap(), 1);
+        assert!(matches!(group.status().await, Err(Error::GroupNotFound(_))));
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct ReadsState;
+
+    impl Job for ReadsState {
+        const NAME: &'static str = "test.reads-state";
+        type Output = (bool, Option<String>);
+        type Error = TestError;
+
+        async fn run(
+            &self,
+            ctx: JobContext<'_>,
+        ) -> std::result::Result<(bool, Option<String>), TestError> {
+            Ok((
+                ctx.try_state::<u64>().is_some(),
+                ctx.try_state::<&'static str>().map(|s| s.to_string()),
+            ))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn try_state_reads_a_registered_type_and_none_otherwise() {
+        let (queue, store) = open_queue().await;
+        let runner = JobRunner::builder(queue, store)
+            .state("ok")
+            .register::<ReadsState>()
+            .build();
+        let handle = runner.spawn(std::future::pending::<()>());
+
+        let read = runner.submit(ReadsState).await.unwrap().await.unwrap();
+        assert_eq!(read, (false, Some("ok".to_string())));
 
         handle.shutdown().await.unwrap();
     }

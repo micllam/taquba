@@ -563,66 +563,104 @@ async fn a_webhook_hook_that_targets_the_runtime_queue_fails_the_build() {
 
 #[cfg(feature = "webhooks")]
 #[tokio::test(start_paused = true)]
-async fn the_webhook_hook_stages_its_delivery_in_the_terminating_settlement() {
+async fn the_webhook_hook_delivers_each_termination_in_its_settlement() {
     use crate::terminal::WebhookTerminalHook;
 
     let (queue, store) = open_queue().await;
     let runtime = WorkflowRuntime::builder(
         queue.clone(),
         store,
-        ScriptedRunner::new(vec![StepOutcome::Succeed {
-            result: b"payload".to_vec(),
-        }]),
+        ScriptedRunner::new(vec![
+            StepOutcome::Succeed {
+                result: b"payload".to_vec(),
+            },
+            StepOutcome::Fail {
+                reason: "rejected".to_string(),
+            },
+            StepOutcome::Cancel {
+                reason: "obsolete".to_string(),
+            },
+            StepOutcome::Succeed {
+                result: b"unsent".to_vec(),
+            },
+        ]),
     )
-    .terminal_hook(WebhookTerminalHook::new("callbacks"))
+    .terminal_hook(WebhookTerminalHook::new("callbacks").with_timeout(Duration::from_secs(5)))
     .build()
     .unwrap();
-    runtime
-        .submit(RunSpec {
-            run_id: Some(rid("with-callback")),
-            input: Vec::new(),
-            options: RunOptions {
-                headers: HashMap::from([(
-                    "callback_url".to_string(),
-                    "https://example.com/done".to_string(),
-                )]),
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    let job = queue
-        .claim("workflow-steps", Duration::from_secs(30))
-        .await
-        .unwrap()
-        .unwrap();
-    let effects = runtime
-        .inner
-        .process_step(&job, &LeaseHandle::detached())
-        .await
-        .unwrap();
-    queue.ack_with(&job, effects).await.unwrap();
+    let callback = HashMap::from([(
+        "callback_url".to_string(),
+        "https://example.com/done".to_string(),
+    )]);
 
-    let webhook = queue
-        .claim("callbacks", Duration::from_secs(30))
-        .await
-        .unwrap()
-        .expect("the delivery committed with the termination");
-    assert_eq!(webhook.payload.as_slice(), b"payload");
+    // Each run is settled at its step 0 with the next outcome of the script.
+    let mut deliveries = Vec::new();
+    for (run_id, headers) in [
+        ("succeeded", callback.clone()),
+        ("failed", callback.clone()),
+        ("runner-cancelled", callback.clone()),
+        ("without-url", HashMap::new()),
+    ] {
+        submit_and_settle_step_0(&queue, &runtime, run_id, headers).await;
+        deliveries.push(
+            queue
+                .claim("callbacks", Duration::from_secs(30))
+                .await
+                .unwrap(),
+        );
+    }
+    let [succeeded, failed, runner_cancelled, without_url] = deliveries.try_into().unwrap();
+
+    let succeeded = succeeded.expect("the delivery committed with the termination");
+    assert_eq!(succeeded.payload.as_slice(), b"payload");
     assert_eq!(
-        webhook.headers.get("webhook.url").unwrap(),
+        succeeded.headers.get("webhook.url").unwrap(),
         "https://example.com/done"
     );
     assert_eq!(
-        webhook.headers.get("http.Workflow-Run-Status").unwrap(),
+        succeeded.headers.get("http.Workflow-Run-Id").unwrap(),
         "succeeded"
     );
+    assert_eq!(
+        succeeded.headers.get("http.Workflow-Run-Status").unwrap(),
+        "succeeded"
+    );
+    assert_eq!(succeeded.headers.get("webhook.timeout_ms").unwrap(), "5000");
     assert!(
-        !webhook
+        !succeeded
             .headers
             .contains_key("http.Workflow-Run-Cancelled-By")
     );
+
+    let failed = failed.unwrap();
+    assert_eq!(failed.payload.as_slice(), b"rejected");
+    assert_eq!(
+        failed.headers.get("http.Workflow-Run-Id").unwrap(),
+        "failed"
+    );
+    assert_eq!(
+        failed.headers.get("http.Workflow-Run-Status").unwrap(),
+        "failed"
+    );
+
+    let runner_cancelled = runner_cancelled.unwrap();
+    assert_eq!(runner_cancelled.payload.as_slice(), b"obsolete");
+    assert_eq!(
+        runner_cancelled
+            .headers
+            .get("http.Workflow-Run-Status")
+            .unwrap(),
+        "cancelled"
+    );
+    assert_eq!(
+        runner_cancelled
+            .headers
+            .get("http.Workflow-Run-Cancelled-By")
+            .unwrap(),
+        "runner"
+    );
+
+    assert!(without_url.is_none());
 
     // A cancelled run delivers its reason and the origin of the cancel.
     runtime
@@ -630,10 +668,7 @@ async fn the_webhook_hook_stages_its_delivery_in_the_terminating_settlement() {
             run_id: Some(rid("cancelled-callback")),
             input: Vec::new(),
             options: RunOptions {
-                headers: HashMap::from([(
-                    "callback_url".to_string(),
-                    "https://example.com/done".to_string(),
-                )]),
+                headers: callback,
                 ..Default::default()
             },
             ..Default::default()
@@ -656,5 +691,75 @@ async fn the_webhook_hook_stages_its_delivery_in_the_terminating_settlement() {
             .get("http.Workflow-Run-Cancelled-By")
             .unwrap(),
         "request"
+    );
+}
+
+/// Submit the run `run_id` with `headers`, then claim, process and ack its
+/// first step.
+#[cfg(feature = "webhooks")]
+async fn submit_and_settle_step_0<R: StepRunner>(
+    queue: &Queue,
+    runtime: &WorkflowRuntime<R>,
+    run_id: &str,
+    headers: HashMap<String, String>,
+) {
+    runtime
+        .submit(RunSpec {
+            run_id: Some(rid(run_id)),
+            input: Vec::new(),
+            options: RunOptions {
+                headers,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let job = queue
+        .claim("workflow-steps", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .unwrap();
+    let effects = runtime
+        .inner
+        .process_step(&job, &LeaseHandle::detached())
+        .await
+        .unwrap();
+    queue.ack_with(&job, effects).await.unwrap();
+}
+
+#[cfg(feature = "webhooks")]
+#[tokio::test(start_paused = true)]
+async fn a_hook_with_a_url_header_reads_the_url_from_that_header() {
+    use crate::terminal::WebhookTerminalHook;
+
+    let (queue, store) = open_queue().await;
+    let runtime = WorkflowRuntime::builder(
+        queue.clone(),
+        store,
+        FixedRunner::new(Ok(StepOutcome::Succeed { result: Vec::new() })),
+    )
+    .terminal_hook(WebhookTerminalHook::new("callbacks").with_url_header("notify"))
+    .build()
+    .unwrap();
+
+    let url = |key: &str| HashMap::from([(key.to_string(), "https://example.com/n".to_string())]);
+    submit_and_settle_step_0(&queue, &runtime, "default-header", url("callback_url")).await;
+    assert!(
+        queue
+            .claim("callbacks", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    submit_and_settle_step_0(&queue, &runtime, "notify-header", url("notify")).await;
+    let webhook = queue
+        .claim("callbacks", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        webhook.headers.get("webhook.url").unwrap(),
+        "https://example.com/n"
     );
 }
