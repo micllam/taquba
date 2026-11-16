@@ -179,7 +179,8 @@ impl WebhookRequest {
     }
 
     /// Set a per-request timeout. Without it, the default timeout of the
-    /// [`WebhookWorker`] applies.
+    /// [`WebhookWorker`] applies. The timeout saturates at `u64::MAX`
+    /// milliseconds.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
@@ -211,7 +212,8 @@ pub fn webhook_enqueue_request(
     job_headers.insert(HEADER_URL.to_string(), url);
     job_headers.insert(HEADER_METHOD.to_string(), method);
     if let Some(t) = timeout {
-        job_headers.insert(HEADER_TIMEOUT_MS.to_string(), t.as_millis().to_string());
+        let ms = u64::try_from(t.as_millis()).unwrap_or(u64::MAX);
+        job_headers.insert(HEADER_TIMEOUT_MS.to_string(), ms.to_string());
     }
     for (name, value) in headers {
         job_headers.insert(format!("{HTTP_HEADER_PREFIX}{name}"), value);

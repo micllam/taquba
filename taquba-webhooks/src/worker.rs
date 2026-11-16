@@ -229,6 +229,19 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a_timeout_of_the_maximum_duration_saturates() {
+        let request = crate::webhook_enqueue_request(
+            "webhooks",
+            WebhookRequest::new("https://example.com").timeout(Duration::MAX),
+            Vec::new(),
+        );
+        assert_eq!(
+            effective_timeout(&request.options.headers, DEFAULT_TIMEOUT).unwrap(),
+            Duration::from_millis(u64::MAX)
+        );
+    }
+
     #[tokio::test]
     async fn deliver_classifies_the_response_status() {
         // The receiver returns the status in the request path.

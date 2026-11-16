@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A `WebhookRequest::timeout` of `Duration::MAX` reaches the worker as the
+  longest timeout. In 0.13.0 the worker rejected the delivery as permanent with
+  `Error::InvalidTimeout`.
+
 ## [0.13.0] - 2026-11-06
 
 ### Changed
