@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   winning claim. In 0.17.0, the losing claim replaced it: the winner's
   settlement failed with `Error::ClaimLost`, a cancel fired the loser's token,
   and the reaper requeued the job at the loser's expiry.
+- `run_worker_concurrent` lets its in-flight jobs finish after a claim error and
+  then returns the error. In 0.17.0 it dropped them, and each job lost an
+  attempt at the expiry of its lease.
 
 ## [0.17.0] - 2026-11-06
 

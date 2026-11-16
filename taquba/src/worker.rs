@@ -266,7 +266,8 @@ where
 /// returning, without an internal bound. [`run_worker`] describes recovery from
 /// a supervisor kill.
 ///
-/// Claim errors propagate and terminate the loop. Settlement failures and
+/// A claim error ends the loop like a shutdown: the loop waits for the
+/// in-flight set to drain and then returns the error. Settlement failures and
 /// panics inside spawned tasks are logged but do not terminate the loop.
 /// [`run_worker`] describes the [`Error::ClaimLost`] case and a closed store.
 pub async fn run_worker_concurrent<W, F>(
@@ -284,6 +285,7 @@ where
     assert!(concurrency > 0, "concurrency must be at least 1");
     let mut set = tokio::task::JoinSet::new();
     let mut shutdown = std::pin::pin!(shutdown);
+    let mut claim_error = None;
 
     'main: loop {
         // Reap completed tasks (non-blocking) and log any panics.
@@ -312,7 +314,13 @@ where
         // work or shutdown.
         let free = concurrency - set.len();
         let lease = queue_handle.queue_config(queue).lease_duration;
-        let jobs = queue_handle.claim_batch(queue, free, lease).await?;
+        let jobs = match queue_handle.claim_batch(queue, free, lease).await {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                claim_error = Some(e);
+                break 'main;
+            }
+        };
         if jobs.is_empty() {
             tokio::select! {
                 biased;
@@ -335,15 +343,11 @@ where
         }
     }
 
-    debug!(
-        queue = queue,
-        in_flight = set.len(),
-        "draining workers on shutdown"
-    );
+    debug!(queue = queue, in_flight = set.len(), "draining workers");
     while let Some(result) = set.join_next().await {
         note_task_result(queue, result);
     }
-    Ok(())
+    claim_error.map_or(Ok(()), Err)
 }
 
 /// Log a spawned worker task that ended by panic. A settlement failure is
@@ -715,6 +719,80 @@ mod tests {
             4,
             "a batch claim fills the free capacity without exceeding it",
         );
+    }
+
+    struct GatedWorker {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        finished: Arc<AtomicUsize>,
+    }
+
+    impl Worker for GatedWorker {
+        async fn process(
+            &self,
+            _job: &JobRecord,
+            _lease: &LeaseHandle,
+        ) -> std::result::Result<(), WorkerError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            self.finished.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_error_of_the_concurrent_loop_lets_the_in_flight_job_finish() {
+        let payloads = FaultStore::wrap();
+        let opts = OpenOptions {
+            payload_store: Some(payloads.clone()),
+            default_queue_config: QueueConfig {
+                keep_done_jobs: Some(Duration::from_secs(3600)),
+                ..offload_opts().default_queue_config
+            },
+            ..offload_opts()
+        };
+        let queue = Arc::new(
+            Queue::open_with_options(Arc::new(InMemory::new()), "test", opts)
+                .await
+                .unwrap(),
+        );
+        let inline = queue.enqueue("work", vec![0u8; 8]).await.unwrap();
+        let worker = Arc::new(GatedWorker {
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            finished: Arc::new(AtomicUsize::new(0)),
+        });
+        let run = tokio::spawn({
+            let (queue, worker) = (queue.clone(), worker.clone());
+            async move {
+                run_worker_concurrent(
+                    &queue,
+                    "work",
+                    worker,
+                    2,
+                    Duration::from_secs(60),
+                    std::future::pending(),
+                )
+                .await
+            }
+        });
+        worker.started.notified().await;
+
+        // The fetch of the offloaded payload fails while the queue's own store
+        // stays open, so the next claim returns an error.
+        payloads.fail_reads_ending(Some(""));
+        queue.enqueue("work", vec![0u8; 128]).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        worker.release.notify_one();
+
+        let ended = tokio::time::timeout(Duration::from_secs(60), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(ended, Err(Error::PayloadStore(_))), "{ended:?}");
+        assert_eq!(worker.finished.load(Ordering::SeqCst), 1);
+        let job = queue.view().get_job(&inline).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Done);
     }
 
     struct EffectfulFailureWorker {
