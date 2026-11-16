@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `StepOutcome::continue_after`, `StepOutcome::continue_on_signal` and
+  `StepOutcome::continue_on_group` with a duration of `Duration::MAX` keep the
+  next step scheduled indefinitely. In 0.16.0 the worker panicked on the
+  overflow of the time.
+
 ## [0.16.0] - 2026-11-06
 
 ### Added

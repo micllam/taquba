@@ -291,9 +291,13 @@ impl RuntimeCore {
     }
 
     /// The instant `delay` after the runtime's clock now, as a [`SystemTime`]
-    /// for an enqueue's `run_at`.
+    /// for an enqueue's `run_at`. The time saturates at `u64::MAX`
+    /// milliseconds.
     pub(crate) fn run_at_after(&self, delay: Duration) -> SystemTime {
-        UNIX_EPOCH + Duration::from_millis(self.clock.now_ms()) + delay
+        let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        // Panics on Windows, where `SystemTime` ends before `u64::MAX`
+        // milliseconds, on a delay of `Duration::MAX`.
+        UNIX_EPOCH + Duration::from_millis(self.clock.now_ms().saturating_add(delay_ms))
     }
 
     /// Build the effects that advance the run of `claimed` to its next step,

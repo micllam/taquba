@@ -197,6 +197,40 @@ async fn continue_after_delays_next_step_until_promotion() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_delay_of_the_maximum_duration_keeps_the_step_scheduled() {
+    let initial = 1_700_000_000_000u64;
+    let (queue, store, _clock) = open_queue_at(initial).await;
+    let runtime = WorkflowRuntime::builder(
+        queue.clone(),
+        store.clone(),
+        ScriptedRunner::new(vec![StepOutcome::continue_after(
+            b"step1".to_vec(),
+            Duration::MAX,
+        )]),
+    )
+    .build()
+    .unwrap();
+    let shutdown = spawn_runtime(runtime.clone());
+    let handle = runtime
+        .submit(RunSpec {
+            input: b"start".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        runtime.status(&handle.run_id).await.unwrap().unwrap().state,
+        RunState::Scheduled {
+            run_at_ms: u64::MAX
+        }
+    );
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_step_reports_its_attempt_limit() {
     struct Recording(Arc<std::sync::Mutex<Option<u32>>>);
     impl StepRunner for Recording {
