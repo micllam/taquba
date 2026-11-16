@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `max_attempts` across a crash. A caller must now raise the timeout around a
   claim above one `OpenOptions::flush_interval` plus the write latency of the
   store.
+- Updated slatedb from 0.18.0 to 0.18.1.
 
 ### Fixed
 
