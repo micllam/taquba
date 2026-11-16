@@ -275,7 +275,7 @@ impl QueueCore {
                     .await?
             }
         };
-        let mut victims: Vec<(Vec<u8>, JobRecord, Option<u64>)> = Vec::new();
+        let mut victims = Vec::new();
         while let Some(kv) = iter.next().await? {
             let at_in_key = parse_key_timestamp(&kv.key, tag);
             if let Some(scan) = &mut scan {
@@ -308,14 +308,19 @@ impl QueueCore {
                 }
                 continue;
             }
-            victims.push((kv.key.to_vec(), job, at_in_key));
+            victims.push(Victim {
+                key: kv.key.to_vec(),
+                value: kv.value,
+                job,
+                at_in_key,
+            });
         }
         drop(iter);
 
         let mut payload_refs = Vec::new();
-        for (key, job, at_in_key) in victims {
-            if !self.sweep_victim(&key, &job, &mut payload_refs).await?
-                && let (Some(scan), Some(at_in_key)) = (&mut scan, at_in_key)
+        for victim in victims {
+            if !self.sweep_victim(&victim, &mut payload_refs).await?
+                && let (Some(scan), Some(at_in_key)) = (&mut scan, victim.at_in_key)
             {
                 scan.retain(at_in_key);
             }
@@ -383,37 +388,46 @@ impl QueueCore {
     }
 
     /// Delete one expired record in its own transaction: re-check that the
-    /// record still exists, then stage its removal, which decrements the dead
-    /// counter of a dead record so `QueueStats::dead` reflects the live size of
-    /// the dead-letter set.
+    /// value of the key is still the value that the scan read, then stage its
+    /// removal, which decrements the dead counter of a dead record so
+    /// `QueueStats::dead` reflects the live size of the dead-letter set. A dead
+    /// key does not contain a time, so a job revived and dead-lettered again
+    /// after the scan writes a new value to the key, and the sweep keeps it.
     ///
     /// The commit does not await WAL durability: a commit lost in a crash
-    /// leaves the record in place for the next sweep and the existence re-check
-    /// keeps the rerun idempotent, including the counter decrement. A
-    /// conflicting commit leaves the victim to the next sweep. The payload ref
-    /// of a removed record goes to `payload_refs`, whose objects the sweep
-    /// deletes after one flush at its end. Returns `false` when a conflict left
-    /// the record in place.
-    async fn sweep_victim(
-        &self,
-        key: &[u8],
-        job: &JobRecord,
-        payload_refs: &mut Vec<String>,
-    ) -> Result<bool> {
+    /// leaves the record in place for the next sweep and the re-check keeps the
+    /// rerun idempotent, including the counter decrement. A conflicting commit
+    /// leaves the victim to the next sweep. The payload ref of a removed record
+    /// goes to `payload_refs`, whose objects the sweep deletes after one flush
+    /// at its end. Returns `false` when a conflict or a new record left the key
+    /// in place.
+    async fn sweep_victim(&self, victim: &Victim, payload_refs: &mut Vec<String>) -> Result<bool> {
         let mut txn = self.begin()?;
-        let existed = txn.get(key).await?.is_some();
+        let existed = match txn.get(&victim.key).await? {
+            Some(current) if current != victim.value => return Ok(false),
+            current => current.is_some(),
+        };
         if existed {
-            txn.stage_remove(key, job)?;
+            txn.stage_remove(&victim.key, &victim.job)?;
         }
         match self.commit(txn, Durability::Deferred).await? {
             Commit::Committed(_) => {}
             Commit::Conflict => return Ok(false),
         }
-        if existed && let Some(payload_ref) = &job.payload_ref {
+        if existed && let Some(payload_ref) = &victim.job.payload_ref {
             payload_refs.push(payload_ref.clone());
         }
         Ok(true)
     }
+}
+
+/// An expired record that a retention scan read, with its key, its stored value
+/// and the time of a done key.
+struct Victim {
+    key: Vec<u8>,
+    value: Bytes,
+    job: JobRecord,
+    at_in_key: Option<u64>,
 }
 
 #[cfg(test)]
@@ -899,6 +913,69 @@ mod tests {
             "long-retention queue must be untouched by the same sweep"
         );
 
+        q.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sweep_victim_keeps_a_job_dead_lettered_again_after_the_scan() {
+        let clock = MockClock::new(1_700_000_000_000);
+        let retention = Duration::from_millis(50);
+        let opts = OpenOptions {
+            reaper_interval: Duration::from_secs(3600),
+            default_queue_config: QueueConfig {
+                dead_retention: Some(retention),
+                ..QueueConfig::default()
+            },
+            clock: Arc::new(clock.clone()),
+            ..OpenOptions::default()
+        };
+        let q = Queue::open_with_options(make_store(), "test", opts)
+            .await
+            .unwrap();
+        let fail_once = || async {
+            let job = q
+                .claim("work", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .unwrap();
+            q.nack(&job, "fatal").await.unwrap();
+        };
+        let options = EnqueueOptions {
+            max_attempts: Some(1),
+            ..Default::default()
+        };
+        let id = q
+            .enqueue_with("work", b"x".to_vec(), options)
+            .await
+            .unwrap();
+        fail_once().await;
+
+        // The record that the sweep's scan reads once its retention has ended.
+        let key = crate::keys::dead_key(&qn("work"), &id);
+        let value = q.core.db.get(&key).await.unwrap().unwrap();
+        let victim = Victim {
+            job: JobRecord::decode(&key, &value).unwrap(),
+            key,
+            value,
+            at_in_key: None,
+        };
+        clock.advance(retention * 2);
+
+        // Before the sweep reaches the victim, the job is revived and fails
+        // again.
+        q.requeue_dead_job(&id).await.unwrap();
+        fail_once().await;
+        let history = q.view().attempt_history(&id).await.unwrap();
+        let mut payload_refs = Vec::new();
+        q.core
+            .sweep_victim(&victim, &mut payload_refs)
+            .await
+            .unwrap();
+
+        let job = q.view().get_job(&id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Dead);
+        assert_eq!(job.failed_at, Some(clock.now_ms()));
+        assert_eq!(q.view().attempt_history(&id).await.unwrap(), history);
         q.close().await.unwrap();
     }
 

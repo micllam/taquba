@@ -37,6 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `run_worker_concurrent` lets its in-flight jobs finish after a claim error and
   then returns the error. In 0.17.0 it dropped them, and each job lost an
   attempt at the expiry of its lease.
+- The dead retention sweep keeps a job that `Queue::requeue_dead_job` revived
+  and that was dead-lettered again during the sweep. In 0.17.0 the sweep removed
+  its new dead record, its attempt history and its payload object.
 
 ## [0.17.0] - 2026-11-06
 
