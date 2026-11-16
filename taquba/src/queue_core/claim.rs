@@ -253,7 +253,7 @@ impl QueueCore {
         self.lease_registry.insert(
             &job.queue,
             &job.id,
-            now + lease_duration.as_millis() as u64,
+            crate::clock::after(now, lease_duration),
             claim_id,
             cancel.clone(),
         );

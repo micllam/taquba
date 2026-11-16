@@ -82,3 +82,13 @@ impl Clock for MockClock {
 pub(crate) fn default_clock() -> Arc<dyn Clock> {
     Arc::new(SystemClock)
 }
+
+/// `duration` in milliseconds, saturating at `u64::MAX`.
+pub(crate) fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The time `duration` after `now_ms`, saturating at `u64::MAX`.
+pub(crate) fn after(now_ms: u64, duration: Duration) -> u64 {
+    now_ms.saturating_add(millis(duration))
+}

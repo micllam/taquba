@@ -255,7 +255,7 @@ impl QueueCore {
         let mut scan = None;
         let mut iter = match min_cutoff {
             Some(max_retention) => {
-                let retention_ms = u64::try_from(max_retention.as_millis()).unwrap_or(u64::MAX);
+                let retention_ms = crate::clock::millis(max_retention);
                 let Some(started) = self.done_bound.begin(now, retention_ms) else {
                     return Ok(());
                 };
@@ -299,7 +299,9 @@ impl QueueCore {
                 continue;
             };
             let retained = match retention_for(&job.queue) {
-                Some(retention) => terminal_at >= now.saturating_sub(retention.as_millis() as u64),
+                Some(retention) => {
+                    terminal_at >= now.saturating_sub(crate::clock::millis(retention))
+                }
                 None => true,
             };
             if retained {
@@ -343,7 +345,7 @@ impl QueueCore {
     /// lost in a crash leaves the records for the next sweep.
     pub(crate) async fn sweep_inbox_records(&self, inbox: &InboxState) -> Result<()> {
         let now = self.now_ms();
-        let retention_ms = u64::try_from(inbox.retention.as_millis()).unwrap_or(u64::MAX);
+        let retention_ms = crate::clock::millis(inbox.retention);
         let Some(mut scan) = inbox.bound.begin(now, retention_ms) else {
             return Ok(());
         };

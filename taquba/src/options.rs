@@ -569,7 +569,7 @@ mod run_at_ms {
         run_at
             .map(|at| {
                 at.duration_since(UNIX_EPOCH)
-                    .map_or(0, |since| since.as_millis() as u64)
+                    .map_or(0, crate::clock::millis)
             })
             .serialize(serializer)
     }

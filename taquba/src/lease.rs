@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use crate::clock::Clock;
+use crate::clock::{self, Clock};
 use crate::error::Result;
 use crate::keys::QueueName;
 use crate::lease_registry::{LeaseRegistry, Renewal};
@@ -126,9 +126,10 @@ impl LeaseHandle {
         let Some(inner) = &self.inner else {
             return Ok(());
         };
-        let needed = inner.clock.now_ms()
-            + remaining.as_millis() as u64
-            + SETTLEMENT_MARGIN.as_millis() as u64;
+        let needed = clock::after(
+            inner.clock.now_ms(),
+            remaining.saturating_add(SETTLEMENT_MARGIN),
+        );
         if inner.registry.renew(
             &inner.queue,
             &inner.id,

@@ -1792,3 +1792,47 @@ async fn a_claim_by_id_is_reaped_when_its_lease_expires() {
     assert_eq!(job.status, JobStatus::Pending);
     assert!(matches!(q.ack(&claim).await, Err(Error::ClaimLost)));
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_deadline_of_the_maximum_duration_saturates() {
+    let clock = MockClock::new(1_000_000);
+    let opts = OpenOptions {
+        clock: Arc::new(clock.clone()),
+        default_queue_config: QueueConfig {
+            retry_backoff_base: Duration::MAX,
+            retry_backoff_max: Duration::MAX,
+            ..QueueConfig::default()
+        },
+        ..OpenOptions::default()
+    };
+    let q = Queue::open_with_options(make_store(), "test", opts)
+        .await
+        .unwrap();
+    let id = q.enqueue("q", b"work".to_vec()).await.unwrap();
+
+    let claim = q.claim("q", Duration::MAX).await.unwrap().unwrap();
+    assert_eq!(q.lease_expiry(&claim), Some(u64::MAX));
+    assert_eq!(q.renew_lease(&claim, Duration::MAX).unwrap(), u64::MAX);
+    q.lease_handle(&claim)
+        .ensure_at_least(Duration::MAX)
+        .unwrap();
+    clock.advance(Duration::from_secs(86_400));
+    q.reap_now().await.unwrap();
+    let job = q.view().get_job(&id).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Claimed);
+
+    q.nack(&claim, "retry").await.unwrap();
+    let job = q.view().get_job(&id).await.unwrap().unwrap();
+    assert_eq!(job.run_at, Some(u64::MAX));
+
+    // The queue is empty when the wait starts, so the claim waits for the
+    // enqueue without a deadline.
+    let (waited, _) = tokio::join!(
+        q.claim_with_wait("q", Duration::from_secs(10), Duration::MAX),
+        async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            q.enqueue("q", b"next".to_vec()).await.unwrap();
+        }
+    );
+    assert_eq!(waited.unwrap().unwrap().payload, b"next");
+}

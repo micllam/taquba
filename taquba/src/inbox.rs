@@ -447,7 +447,7 @@ impl QueueCore {
             .await?;
             return Ok(None);
         };
-        let after = u64::try_from(INBOX_UNREADABLE_AFTER.as_millis()).unwrap_or(u64::MAX);
+        let after = crate::clock::millis(INBOX_UNREADABLE_AFTER);
         Ok(
             (now.saturating_sub(first) >= after).then(|| Rejection::Unreadable {
                 detail: err.to_string(),

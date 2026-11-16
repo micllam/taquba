@@ -40,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The dead retention sweep keeps a job that `Queue::requeue_dead_job` revived
   and that was dead-lettered again during the sweep. In 0.17.0 the sweep removed
   its new dead record, its attempt history and its payload object.
+- A lease, a renewal, a retry backoff and the wait of `Queue::claim_with_wait`
+  of `Duration::MAX` last indefinitely. In 0.17.0 `claim_with_wait` panicked,
+  and the others panicked or ended immediately.
 
 ## [0.17.0] - 2026-11-06
 

@@ -238,12 +238,12 @@ impl QueueCore {
         let max_attempts = opts.max_attempts.unwrap_or(cfg.max_attempts);
         let priority = opts.priority.unwrap_or(cfg.default_priority);
 
-        // A `run_at` that is at or before now is just an immediate enqueue.
+        // The enqueue writes a job with a `run_at` at or before now as pending.
         let run_at = opts.run_at.and_then(|when| {
-            let ms = when
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let ms = crate::clock::millis(
+                when.duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default(),
+            );
             (ms > self.now_ms()).then_some(ms)
         });
 

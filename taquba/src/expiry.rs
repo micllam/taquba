@@ -120,7 +120,7 @@ impl ExpiryIndex {
         F: FnMut(u64, Vec<u8>) -> Fut,
         Fut: Future<Output = Expired>,
     {
-        let retention_ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
+        let retention_ms = crate::clock::millis(retention);
         let Some(mut scan) = self.bound.begin(now_ms, retention_ms) else {
             return Ok(0);
         };

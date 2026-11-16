@@ -153,7 +153,7 @@ impl HeartbeatTask {
         let record = HeartbeatRecord {
             counter: self.next_counter,
             at_ms: self.core.now_ms(),
-            interval_ms: self.interval.as_millis() as u64,
+            interval_ms: crate::clock::millis(self.interval),
             writer_epoch: self.writer_epoch,
             closed,
         };

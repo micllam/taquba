@@ -11,7 +11,7 @@ use tracing::{debug, instrument, warn};
 use crate::background::{BackgroundTask, Ticker};
 use crate::claim::Claim;
 use crate::claim_cursor::ClaimCursor;
-use crate::clock::Clock;
+use crate::clock::{self, Clock};
 use crate::completion::{CompletionWaiters, Registration};
 use crate::effects::{EnqueueRequest, PreparedEffects, SettlementEffects};
 use crate::error::{Error, Form, Result};
@@ -623,7 +623,8 @@ impl Queue {
         lease_duration: Duration,
         max_wait: Duration,
     ) -> Result<Option<Claim>> {
-        let deadline = tokio::time::Instant::now() + max_wait;
+        // `None` for a wait past the range of an `Instant`, which never ends.
+        let deadline = tokio::time::Instant::now().checked_add(max_wait);
         loop {
             if let Some(job) = self.claim(queue, lease_duration).await? {
                 // Pass the wakeup on: the wait below can consume a permit that
@@ -633,15 +634,17 @@ impl Queue {
                 return Ok(Some(job));
             }
             let now = tokio::time::Instant::now();
-            if now >= deadline {
-                return Ok(None);
-            }
+            let remaining = match deadline {
+                Some(deadline) if now >= deadline => return Ok(None),
+                Some(deadline) => deadline - now,
+                None => Duration::MAX,
+            };
             // An insert between the empty scan and this wait leaves a permit
             // that the wait consumes, so no insert is missed. A wake does not
             // reserve the job: another worker can claim it first, and then the
             // loop waits out the remaining time. A stale permit costs one extra
             // pass.
-            self.wait_for_jobs_on(queue, deadline - now).await;
+            self.wait_for_jobs_on(queue, remaining).await;
         }
     }
 
@@ -825,7 +828,7 @@ impl Queue {
                     cfg.retry_backoff_max,
                 );
                 ClaimEnd::Retry {
-                    run_at: (!backoff.is_zero()).then(|| now + backoff.as_millis() as u64),
+                    run_at: (!backoff.is_zero()).then(|| clock::after(now, backoff)),
                     outcome: AttemptOutcome::Retried,
                     error: Some(error),
                 }
@@ -916,7 +919,7 @@ impl Queue {
     #[instrument(skip(self, claim), fields(queue = %claim.queue, job_id = %claim.id))]
     pub fn renew_lease(&self, claim: &Claim, extension: Duration) -> Result<u64> {
         let job = claim.job();
-        let new_expiry = self.now_ms() + extension.as_millis() as u64;
+        let new_expiry = clock::after(self.now_ms(), extension);
         if self.core.lease_registry.renew(
             &job.queue,
             &job.id,
