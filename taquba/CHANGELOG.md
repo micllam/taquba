@@ -43,6 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A lease, a renewal, a retry backoff and the wait of `Queue::claim_with_wait`
   of `Duration::MAX` last indefinitely. In 0.17.0 `claim_with_wait` panicked,
   and the others panicked or ended immediately.
+- `Queue::wait_for_completion` on a claimed job with an offloaded payload
+  returns the `Done` outcome of an ack that does not keep the record. In 0.17.0
+  a wait that read the claimed record before the ack returned
+  `WaitOutcome::NotFound` when the ack deleted the payload object before the
+  wait fetched it.
 
 ## [0.17.0] - 2026-11-06
 

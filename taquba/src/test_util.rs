@@ -77,11 +77,46 @@ use slatedb::object_store::{
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+/// A point that stops the next request to pass it after [`Self::hold_next`],
+/// until the test releases the request.
+#[derive(Debug, Default)]
+pub(crate) struct Gate {
+    hold_next: AtomicBool,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl Gate {
+    /// Hold the next request that passes the gate.
+    pub(crate) fn hold_next(&self) {
+        self.hold_next.store(true, Ordering::SeqCst);
+    }
+
+    /// Wait until a held request has reached the gate.
+    pub(crate) async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Release the held request.
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+
+    async fn pass(&self) {
+        if self.hold_next.swap(false, Ordering::SeqCst) {
+            self.reached.notify_one();
+            self.release.notified().await;
+        }
+    }
+}
+
 /// In-memory object store whose `put` and `delete` requests fail with a
 /// synthetic service-unavailable error while the corresponding flag is set. A
 /// read fails only at a path that ends with the suffix of
 /// [`Self::fail_reads_ending`], and a list is held only after
-/// [`Self::hold_next_list`].
+/// [`Self::hold_next_list`]. The gate [`Self::read_gate`] stops a read before
+/// the store returns its object, and [`Self::delete_gate`] stops a delete after
+/// the store applies it.
 #[derive(Debug)]
 pub(crate) struct FaultStore {
     inner: Arc<dyn ObjectStore>,
@@ -95,6 +130,8 @@ pub(crate) struct FaultStore {
     hold_list: AtomicBool,
     list_release: Arc<tokio::sync::Notify>,
     lists: AtomicUsize,
+    pub(crate) read_gate: Gate,
+    pub(crate) delete_gate: Arc<Gate>,
 }
 
 impl FaultStore {
@@ -108,6 +145,8 @@ impl FaultStore {
             hold_list: AtomicBool::new(false),
             list_release: Arc::new(tokio::sync::Notify::new()),
             lists: AtomicUsize::new(0),
+            read_gate: Gate::default(),
+            delete_gate: Arc::new(Gate::default()),
         })
     }
 
@@ -207,6 +246,7 @@ impl ObjectStore for FaultStore {
         if failing.is_some_and(|suffix| location.as_ref().ends_with(&suffix)) {
             return Err(Self::synthetic_503());
         }
+        self.read_gate.pass().await;
         self.inner.get_opts(location, options).await
     }
 
@@ -221,7 +261,17 @@ impl ObjectStore for FaultStore {
                 .map(|location| location.and(Err(Self::synthetic_503())))
                 .boxed();
         }
-        self.inner.delete_stream(locations)
+        let gate = self.delete_gate.clone();
+        self.inner
+            .delete_stream(locations)
+            .then(move |deleted| {
+                let gate = gate.clone();
+                async move {
+                    gate.pass().await;
+                    deleted
+                }
+            })
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&StorePath>) -> BoxStream<'static, StoreResult<ObjectMeta>> {

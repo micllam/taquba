@@ -421,4 +421,50 @@ mod tests {
         ));
         assert!(q.core.completion_waiters.inner_is_empty());
     }
+
+    #[tokio::test]
+    async fn test_wait_for_completion_reports_an_ack_that_deletes_the_payload_during_the_read() {
+        let payloads = FaultStore::wrap();
+        let opts = OpenOptions {
+            payload_store: Some(payloads.clone()),
+            ..offload_opts()
+        };
+        let q = Arc::new(
+            Queue::open_with_options(make_store(), "test", opts)
+                .await
+                .unwrap(),
+        );
+        let payload = vec![7u8; 256];
+        let id = q.enqueue("work", payload.clone()).await.unwrap();
+        let job = q
+            .claim("work", Duration::from_secs(10))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The wait reads the claimed record and stops at the fetch of its
+        // payload. The ack then commits and deletes the object, and stops after
+        // the delete, before it returns.
+        payloads.read_gate.hold_next();
+        let waiter = tokio::spawn({
+            let q = q.clone();
+            async move { q.wait_for_completion(&id).await }
+        });
+        payloads.read_gate.reached().await;
+        payloads.delete_gate.hold_next();
+        let ack = tokio::spawn({
+            let q = q.clone();
+            async move { q.ack(&job).await }
+        });
+        payloads.delete_gate.reached().await;
+        payloads.read_gate.release();
+        let outcome = waiter.await.unwrap().unwrap();
+        payloads.delete_gate.release();
+        ack.await.unwrap().unwrap();
+
+        match outcome {
+            WaitOutcome::Done(record) => assert_eq!(record.payload, payload),
+            other => panic!("expected Done(record), got {other:?}"),
+        }
+    }
 }

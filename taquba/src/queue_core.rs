@@ -97,11 +97,9 @@ impl QueueCore {
     }
 
     /// Complete a claim-ending transition after its commit. It removes the
-    /// lease entry, fenced on `claim_id`, deletes the payload object of a done
-    /// job whose record was not kept and delivers a terminal outcome to the
-    /// job's completion waiters. The delivered record includes its payload
-    /// inline, taken from `claim` when one is given and otherwise fetched from
-    /// the payload store, only when the job has waiters.
+    /// lease entry, fenced on `claim_id`, delivers a terminal outcome to the
+    /// job's completion waiters and then deletes the payload object of a done
+    /// job whose record was not kept.
     pub(crate) async fn finish_claim_end(
         &self,
         job: &JobRecord,
@@ -110,9 +108,17 @@ impl QueueCore {
         claim: Option<&Claim>,
     ) {
         self.lease_registry.remove(&job.queue, &job.id, claim_id);
+        self.settle_claim_end(job, end, claim).await;
         if let ClaimEnd::Done { keep: false } = end {
             self.payload_store.delete_for(job).await;
         }
+    }
+
+    /// Deliver the outcome of a terminal claim end to the job's completion
+    /// waiters. The delivered record includes its payload inline, taken from
+    /// `claim` when one is given and otherwise fetched from the payload store,
+    /// only when the job has waiters.
+    async fn settle_claim_end(&self, job: &JobRecord, end: &ClaimEnd<'_>, claim: Option<&Claim>) {
         if !end.is_terminal() || !self.completion_waiters.has_waiters(&job.id) {
             return;
         }
