@@ -40,7 +40,8 @@ pub const DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD: usize = 256 * 1024;
 pub struct QueueConfig {
     /// Maximum delivery attempts before a job is dead-lettered. Attempts count
     /// claims: a job interrupted by a process restart is requeued at the next
-    /// open, and its next claim consumes an attempt. The producer of a job that
+    /// open, and its next claim consumes an attempt. A limit of 0 acts as 1,
+    /// because the claim counts the first delivery. The producer of a job that
     /// can outlive several hard restarts should raise its limit with
     /// [`EnqueueOptions::max_attempts`].
     pub max_attempts: u32,
@@ -424,7 +425,8 @@ impl Default for OpenOptions {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EnqueueOptions {
-    /// Override the queue's default `max_attempts` for just this job.
+    /// Override the queue's default `max_attempts` for just this job. A limit
+    /// of 0 acts as 1, as for [`QueueConfig::max_attempts`].
     pub max_attempts: Option<u32>,
     /// Override the queue's `default_priority`. Use [`PRIORITY_HIGH`],
     /// [`PRIORITY_NORMAL`], [`PRIORITY_LOW`] or any `u32`. Lower wins.

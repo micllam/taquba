@@ -1672,6 +1672,32 @@ async fn an_exhausted_nack_clears_claimed_at_on_the_dead_record() {
     q.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn a_limit_of_zero_attempts_delivers_a_job_once() {
+    let q = Queue::open(make_store(), "test").await.unwrap();
+    let id = q
+        .enqueue_with(
+            "work",
+            b"job".to_vec(),
+            EnqueueOptions {
+                max_attempts: Some(0),
+                ..EnqueueOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let job = q
+        .claim("work", Duration::from_secs(5))
+        .await
+        .unwrap()
+        .unwrap();
+
+    q.nack(&job, "fatal").await.unwrap();
+    let dead = q.view().get_job(&id).await.unwrap().unwrap();
+    assert_eq!((dead.status, dead.attempts), (JobStatus::Dead, 1));
+    q.close().await.unwrap();
+}
+
 // Every claimed record must have a registry entry. A record without one is
 // invisible to the reaper until the next open.
 
