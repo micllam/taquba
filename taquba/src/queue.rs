@@ -670,17 +670,14 @@ impl Queue {
     /// which worker takes the head of the pending key space. The lock is
     /// per-queue, so different queues' claim paths still run in parallel.
     ///
-    /// A per-queue in-memory cursor records the most recently claimed key and
-    /// is used as the start bound on the next scan. This lets steady-state
-    /// claims skip over the tombstones left by previously claimed (and deleted)
-    /// pending entries. When the cursor scan ends without a key inside the
-    /// queue's prefix (cursor exhausted, or an older job was requeued by `nack`
-    /// before the cursor), the claim falls back to a front prefix scan and
-    /// resets the cursor. When the front scan also ends without a key, the
-    /// queue is marked empty in memory and subsequent claims return `None`
-    /// without scanning until the next pending insert, so polling an empty
-    /// queue does not re-read the tombstone band left by previously claimed
-    /// jobs.
+    /// A per-queue in-memory bound is the key that the next scan starts from:
+    /// after the most recently claimed key, or at an earlier key that a later
+    /// insert wrote, such as a job that `nack` requeued. Steady-state claims
+    /// therefore skip the tombstones left by previously claimed pending
+    /// entries. The first claim after an open scans from the front of the
+    /// queue's prefix, unless [`Self::close`] persisted the bound. When a scan
+    /// ends without a key, the queue is marked empty in memory, and later
+    /// claims return `None` without a scan until the next pending insert.
     #[instrument(skip(self), fields(queue))]
     pub async fn claim(&self, queue: &str, lease_duration: Duration) -> Result<Option<Claim>> {
         Ok(self.claim_batch(queue, 1, lease_duration).await?.pop())

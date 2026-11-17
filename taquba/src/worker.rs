@@ -131,7 +131,7 @@ pub trait Worker: Send + Sync {
     /// Process a single claimed job.
     ///
     /// Return `Ok(())` to ack the job (mark it complete) or `Err(_)` to nack it
-    /// (re-queue with backoff, or dead-letter once `attempts` exceeds
+    /// (re-queue with backoff, or dead-letter once `attempts` reaches
     /// `max_attempts`). The returned error is converted to a string via
     /// `Display` and stored on the job's `last_error` field.
     ///
