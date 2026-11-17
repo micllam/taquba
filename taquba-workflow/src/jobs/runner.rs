@@ -373,10 +373,6 @@ impl JobRunnerBuilder {
     /// [`WorkflowRuntimeBuilder::group_retention`][group-retention]. When unset
     /// (default), a group is retained until [`JobGroup::forget`].
     ///
-    /// # Panics
-    ///
-    /// [`build`](Self::build) panics if `retention < 1ms`.
-    ///
     /// [group-retention]: crate::WorkflowRuntimeBuilder::group_retention
     #[must_use]
     pub fn group_retention(mut self, retention: Duration) -> Self {
