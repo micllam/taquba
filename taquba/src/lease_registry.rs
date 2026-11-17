@@ -49,16 +49,6 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{Error, Result};
 use crate::keys::QueueName;
 
-/// How [`LeaseRegistry::renew`] applies the requested expiry.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Renewal {
-    /// Set the expiry to the requested value, which can shorten the lease.
-    Set,
-    /// Raise the expiry to the requested value when the lease ends sooner. A
-    /// lease that already lasts longer is unchanged.
-    Extend,
-}
-
 /// A due lease that the reaper marked and is examining.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct DueLease {
@@ -159,12 +149,13 @@ impl LeaseRegistry {
         debug_assert!(previous.is_none(), "claim ids are unique");
     }
 
-    /// Apply `expires_at` to the lease of the claim `claim_id` per `mode`.
-    /// Returns whether the expiry changed. Fails with [`Error::ClaimLost`] when
-    /// the registry is closed, the claim does not have a lease or the reaper
-    /// already took the entry as due. Otherwise fails with
-    /// [`Error::CancelRequested`] when the claim's token `cancel` fired. A
-    /// failure leaves the registry unchanged.
+    /// Raise the expiry of the lease of the claim `claim_id` to `expires_at`
+    /// when the lease ends sooner, and leave a longer lease unchanged. Returns
+    /// the expiry after the call and whether it changed. Fails with
+    /// [`Error::ClaimLost`] when the registry is closed, the claim does not
+    /// have a lease or the reaper already took the entry as due. Otherwise
+    /// fails with [`Error::CancelRequested`] when the claim's token `cancel`
+    /// fired. A failure leaves the registry unchanged.
     pub(crate) fn renew(
         &self,
         queue: &QueueName,
@@ -172,8 +163,7 @@ impl LeaseRegistry {
         claim_id: u64,
         cancel: &CancellationToken,
         expires_at: u64,
-        mode: Renewal,
-    ) -> Result<bool> {
+    ) -> Result<(u64, bool)> {
         let mut inner = self.lock();
         // Checked under the lock that `close` takes to set the mark, so a token
         // fired by `close` is never reported as a cancellation.
@@ -188,10 +178,8 @@ impl LeaseRegistry {
         if cancel.is_cancelled() {
             return Err(Error::CancelRequested);
         }
-        if old_expires == expires_at
-            || (matches!(mode, Renewal::Extend) && old_expires > expires_at)
-        {
-            return Ok(false);
+        if old_expires >= expires_at {
+            return Ok((old_expires, false));
         }
         inner.by_expiry.remove(&(old_expires, key.clone()));
         inner.by_expiry.insert((expires_at, key.clone()));
@@ -200,7 +188,7 @@ impl LeaseRegistry {
             .get_mut(&key)
             .expect("entry present above")
             .expires_at = expires_at;
-        Ok(true)
+        Ok((expires_at, true))
     }
 
     /// The expiry of the lease of the claim `claim_id`, or `None` when the
@@ -319,14 +307,11 @@ impl LeaseRegistry {
 mod tests {
     use super::*;
 
-    fn renew_set(
-        registry: &LeaseRegistry,
-        id: &str,
-        claim_id: u64,
-        expires_at: u64,
-    ) -> Result<bool> {
+    fn renew(registry: &LeaseRegistry, id: &str, claim_id: u64, expires_at: u64) -> Result<bool> {
         let live = CancellationToken::new();
-        registry.renew(&qn("q"), id, claim_id, &live, expires_at, Renewal::Set)
+        registry
+            .renew(&qn("q"), id, claim_id, &live, expires_at)
+            .map(|(_, changed)| changed)
     }
 
     #[test]
@@ -347,14 +332,14 @@ mod tests {
         let registry = LeaseRegistry::new();
         registry.insert(&qn("q"), "a", 100, 1, CancellationToken::new());
         assert!(registry.take_due(99).is_empty());
-        assert!(renew_set(&registry, "a", 1, 200).is_ok());
+        assert!(renew(&registry, "a", 1, 200).is_ok());
     }
 
     #[test]
     fn a_renewal_moves_the_entry_in_expiry_order() {
         let registry = LeaseRegistry::new();
         registry.insert(&qn("q"), "a", 10, 1, CancellationToken::new());
-        assert!(renew_set(&registry, "a", 1, 40).is_ok());
+        assert!(renew(&registry, "a", 1, 40).is_ok());
 
         assert!(registry.take_due(10).is_empty());
         let due = registry.take_due(40);
@@ -366,7 +351,7 @@ mod tests {
     fn a_renewal_to_an_unchanged_expiry_keeps_the_entry() {
         let registry = LeaseRegistry::new();
         registry.insert(&qn("q"), "a", 10, 1, CancellationToken::new());
-        assert_eq!(renew_set(&registry, "a", 1, 10).ok(), Some(false));
+        assert_eq!(renew(&registry, "a", 1, 10).ok(), Some(false));
         assert!(registry.contains(&qn("q"), "a", 10));
         assert_eq!(registry.take_due(10).len(), 1);
     }
@@ -375,11 +360,11 @@ mod tests {
     fn renewal_is_refused_for_a_stale_claim_id_and_for_a_marked_entry() {
         let registry = LeaseRegistry::new();
         registry.insert(&qn("q"), "a", 10, 1, CancellationToken::new());
-        assert!(renew_set(&registry, "a", 2, 40).is_err());
-        assert!(renew_set(&registry, "missing", 1, 40).is_err());
+        assert!(renew(&registry, "a", 2, 40).is_err());
+        assert!(renew(&registry, "missing", 1, 40).is_err());
 
         assert_eq!(registry.take_due(10).len(), 1);
-        assert!(renew_set(&registry, "a", 1, 40).is_err());
+        assert!(renew(&registry, "a", 1, 40).is_err());
     }
 
     #[test]
@@ -388,7 +373,7 @@ mod tests {
         let cancel = CancellationToken::new();
         registry.insert(&qn("q"), "a", 10, 1, cancel.clone());
         registry.cancel(&qn("q"), "a");
-        let renew = || registry.renew(&qn("q"), "a", 1, &cancel, 40, Renewal::Set);
+        let renew = || registry.renew(&qn("q"), "a", 1, &cancel, 40);
         assert!(matches!(renew(), Err(Error::CancelRequested)));
 
         assert_eq!(registry.take_due(10).len(), 1);
@@ -449,7 +434,7 @@ mod tests {
     use crate::test_util::*;
 
     #[tokio::test]
-    async fn test_renew_lease() {
+    async fn a_renewal_extends_a_lease_and_never_shortens_it() {
         let clock = MockClock::new(1_700_000_000_000);
         let opts = OpenOptions {
             clock: Arc::new(clock.clone()),
@@ -469,6 +454,12 @@ mod tests {
 
         let new_expiry = q.renew_lease(&job, Duration::from_secs(30)).unwrap();
         assert!(new_expiry > original_expiry, "renewed expiry must be later");
+        assert_eq!(
+            q.renew_lease(&job, Duration::from_secs(5)).unwrap(),
+            new_expiry,
+            "a shorter renewal keeps the expiry"
+        );
+        assert_eq!(q.lease_expiry(&job), Some(new_expiry));
 
         // Reaper skips the renewed lease even after the original expiry passes.
         clock.advance(Duration::from_secs(1));

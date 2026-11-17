@@ -9,7 +9,7 @@ use tracing::debug;
 use crate::clock::{self, Clock};
 use crate::error::Result;
 use crate::keys::QueueName;
-use crate::lease_registry::{LeaseRegistry, Renewal};
+use crate::lease_registry::LeaseRegistry;
 
 /// Margin added on top of a requested remaining duration, so a delivery that
 /// runs to its declared bound still has lease left to settle in.
@@ -130,14 +130,14 @@ impl LeaseHandle {
             inner.clock.now_ms(),
             remaining.saturating_add(SETTLEMENT_MARGIN),
         );
-        if inner.registry.renew(
+        let (_, extended) = inner.registry.renew(
             &inner.queue,
             &inner.id,
             inner.claim_id,
             &self.cancel,
             needed,
-            Renewal::Extend,
-        )? {
+        )?;
+        if extended {
             crate::obs::renewed(&inner.queue);
             debug!(queue = %inner.queue, job_id = %inner.id, new_expiry = needed, "lease extended");
         }

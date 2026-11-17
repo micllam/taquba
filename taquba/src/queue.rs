@@ -19,7 +19,7 @@ use crate::history::AttemptOutcome;
 use crate::inbox::{Inbox, InboxState};
 use crate::job::{JobRecord, JobStatus};
 use crate::keys::QueueName;
-use crate::lease_registry::{LeaseRegistry, Renewal};
+use crate::lease_registry::LeaseRegistry;
 use crate::options::{EnqueueOptions, OpenOptions, QueueConfig};
 use crate::payload_store::{PayloadStore, default_payload_path};
 use crate::queue_core::{QueueConfigs, QueueCore};
@@ -893,8 +893,9 @@ impl Queue {
         self.core.requeue_dead_job(id).await
     }
 
-    /// Extend the lease on a claimed job, returning the new expiry as epoch
-    /// milliseconds.
+    /// Extend the lease on a claimed job to `extension` from now, returning the
+    /// new expiry as epoch milliseconds. A lease that already ends later is
+    /// unchanged, and the call returns its expiry.
     ///
     /// Call this periodically for long-running jobs to prevent the reaper from
     /// treating them as abandoned and re-queuing them.
@@ -916,15 +917,15 @@ impl Queue {
     #[instrument(skip(self, claim), fields(queue = %claim.queue, job_id = %claim.id))]
     pub fn renew_lease(&self, claim: &Claim, extension: Duration) -> Result<u64> {
         let job = claim.job();
-        let new_expiry = clock::after(self.now_ms(), extension);
-        if self.core.lease_registry.renew(
+        let requested = clock::after(self.now_ms(), extension);
+        let (new_expiry, extended) = self.core.lease_registry.renew(
             &job.queue,
             &job.id,
             claim.claim_id(),
             claim.cancel_token(),
-            new_expiry,
-            Renewal::Set,
-        )? {
+            requested,
+        )?;
+        if extended {
             crate::obs::renewed(&job.queue);
         }
         debug!(queue = %job.queue, job_id = %job.id, new_expiry, "lease renewed");

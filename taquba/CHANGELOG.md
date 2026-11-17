@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Error::ClaimLost` for a cancelled job whose claim ended or whose lease the
   reaper took. In 0.17.0 they failed with `Error::CancelRequested`, which
   reports the claim as still held.
+- `Queue::renew_lease` leaves a lease that already ends later than the extension
+  unchanged and returns its expiry. In 0.17.0 the renewal shortened the lease to
+  the extension.
 
 ## [0.17.0] - 2026-11-06
 
