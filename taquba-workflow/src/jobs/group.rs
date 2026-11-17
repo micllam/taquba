@@ -122,8 +122,8 @@ impl<J: Job> JobGroup<J> {
         })
     }
 
-    /// Wait until every member terminates and return their results in
-    /// submission order. See [`results`](Self::results).
+    /// Wait until every member terminates and return their results in the order
+    /// of the group's first submission. See [`results`](Self::results).
     pub async fn join(&self) -> Result<Vec<GroupResult<J>>> {
         let manifest = self.group.manifest().await?;
         let mut results: HashMap<String, std::result::Result<J::Output, JobError>> = HashMap::new();
@@ -208,7 +208,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_group_joins_its_results_in_submission_order_and_reruns_failures() {
+    async fn a_group_joins_its_results_in_its_first_order_and_reruns_failures() {
         let (queue, store) = open_queue().await;
         let runs = Arc::new(AtomicU32::new(0));
         let runner = JobRunner::builder(queue, store)
@@ -255,13 +255,16 @@ mod tests {
             (3, 0, 2, 1)
         );
 
-        // A second submission runs the failed member again only.
-        group.submit(jobs()).await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10), group.join())
+        // A second submission in another order runs the failed member again
+        // only, and the join keeps the order of the first submission.
+        group.submit(jobs().into_iter().rev()).await.unwrap();
+        let results = tokio::time::timeout(std::time::Duration::from_secs(10), group.join())
             .await
             .expect("join finished in time")
             .unwrap();
         assert_eq!(runs.load(Ordering::SeqCst), 4);
+        let keys: Vec<&str> = results.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, ["square:3", "square:13", "square:2"]);
 
         let err = group.submit(vec![Square { n: 3 }]).await.unwrap_err();
         assert!(matches!(err, Error::GroupMismatch(id) if id == "squares"));

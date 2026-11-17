@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `StepOutcome::continue_on_group` with a duration of `Duration::MAX` keep the
   next step scheduled indefinitely. In 0.16.0 the worker panicked on the
   overflow of the time.
+- `RunGroup::submit` and `JobGroup::submit` accept a later submission with the
+  members of the group in another order, and `JobGroup::join` returns the
+  results in the order of the first submission. In 0.16.0 the submission failed
+  with `Error::GroupMismatch`.
 
 ## [0.16.0] - 2026-11-06
 

@@ -143,6 +143,13 @@ impl GroupMember {
     }
 }
 
+/// The identities of `members` in key order, which compare as a member set.
+fn member_set(members: &[GroupMember]) -> Vec<(&str, &[u8])> {
+    let mut identities: Vec<_> = members.iter().map(GroupMember::identity).collect();
+    identities.sort_unstable();
+    identities
+}
+
 /// The members of one group in submission order and the owner of its first
 /// submission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -508,9 +515,9 @@ impl RunGroup {
     /// rejected with [`Error::GroupMismatch`], and a later submission with the
     /// same set submits every member whose last recorded termination is not a
     /// success, so a group is re-submitted after a crash or to run its failed
-    /// members again. The member set compares keys and inputs, and a later
-    /// submission applies its own attempt limits and owner. Two members with
-    /// one key are rejected with [`Error::DuplicateMemberKey`]. `options`
+    /// members again. The member set compares keys and inputs in any order, and
+    /// a later submission applies its own attempt limits and owner. Two members
+    /// with one key are rejected with [`Error::DuplicateMemberKey`]. `options`
     /// applies to every member, and the manifest stores the owner of the first
     /// submission. A submission that fails returns after the members submitted
     /// so far.
@@ -527,13 +534,7 @@ impl RunGroup {
             owner: options.owner.as_ref().map(|owner| owner.run.clone()),
         };
         match self.store().read_manifest(&self.id).await? {
-            Some(existing)
-                if existing
-                    .members
-                    .iter()
-                    .map(GroupMember::identity)
-                    .ne(manifest.members.iter().map(GroupMember::identity)) =>
-            {
+            Some(existing) if member_set(&existing.members) != member_set(&manifest.members) => {
                 return Err(Error::GroupMismatch(self.id.clone()));
             }
             Some(_) => {}
