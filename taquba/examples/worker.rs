@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use taquba::{
-    JobRecord, LeaseHandle, OpenOptions, Queue, QueueConfig, Worker, WorkerError,
+    JobRecord, LeaseHandle, OpenOptions, Queue, QueueConfig, Worker, WorkerError, WorkerHandle,
     object_store::memory::InMemory, run_worker,
 };
 
@@ -76,21 +76,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The worker fails every 3rd call, demonstrating automatic retry.
     let worker = Arc::new(PrintWorker::new(3));
 
-    // Run the worker with a oneshot shutdown signal. When the queue is fully
-    // drained we send `()`, run_worker finishes its current poll and returns
-    // cleanly (no aborted in-flight jobs).
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    // Run the worker as a task. Once the queue is drained, `shutdown` stops the
+    // loop after its in-flight jobs settle.
     let q2 = q.clone();
     let w = worker.clone();
-    let handle = tokio::spawn(async move {
+    let handle = WorkerHandle::spawn(std::future::pending(), move |stop| async move {
         run_worker(
             &q2,
             "jobs",
             w.as_ref(),
             Duration::from_millis(50),
-            async move {
-                let _ = shutdown_rx.await;
-            },
+            stop.cancelled_owned(),
         )
         .await
     });
@@ -104,8 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let _ = shutdown_tx.send(());
-    let _ = handle.await;
+    handle.shutdown().await?;
 
     println!();
     let s = q.view().stats("jobs").await?;

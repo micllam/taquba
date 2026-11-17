@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use taquba::{
     EnqueueOptions, JobRecord, LeaseHandle, OpenOptions, PRIORITY_HIGH, PRIORITY_LOW,
-    PRIORITY_NORMAL, Queue, QueueConfig, Worker, WorkerError, object_store::memory::InMemory,
-    run_worker,
+    PRIORITY_NORMAL, Queue, QueueConfig, Worker, WorkerError, WorkerHandle,
+    object_store::memory::InMemory, run_worker,
 };
 
 // A real application encodes these as JSON or MessagePack. This example uses a
@@ -158,21 +158,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // exercise the retry path.
     let worker = Arc::new(EmailWorker::new(4));
 
-    let (t_shutdown_tx, t_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let (m_shutdown_tx, m_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
     println!("Processing transactional queue (high priority)...");
     let qt = q.clone();
     let wt = worker.clone();
-    let t_handle = tokio::spawn(async move {
+    let t_handle = WorkerHandle::spawn(std::future::pending(), move |stop| async move {
         run_worker(
             &qt,
             "transactional",
             wt.as_ref(),
             Duration::from_millis(25),
-            async move {
-                let _ = t_shutdown_rx.await;
-            },
+            stop.cancelled_owned(),
         )
         .await
     });
@@ -184,15 +179,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Processing marketing queue (low priority)...");
     let qm = q.clone();
     let wm = worker.clone();
-    let m_handle = tokio::spawn(async move {
+    let m_handle = WorkerHandle::spawn(std::future::pending(), move |stop| async move {
         run_worker(
             &qm,
             "marketing",
             wm.as_ref(),
             Duration::from_millis(25),
-            async move {
-                let _ = m_shutdown_rx.await;
-            },
+            stop.cancelled_owned(),
         )
         .await
     });
@@ -213,10 +206,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let _ = t_shutdown_tx.send(());
-    let _ = m_shutdown_tx.send(());
-    let _ = t_handle.await;
-    let _ = m_handle.await;
+    t_handle.shutdown().await?;
+    m_handle.shutdown().await?;
 
     println!();
     let ts = q.view().stats("transactional").await?;

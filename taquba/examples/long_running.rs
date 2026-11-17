@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use taquba::{
-    JobRecord, LeaseHandle, OpenOptions, Queue, QueueConfig, Worker, WorkerError,
+    JobRecord, LeaseHandle, OpenOptions, Queue, QueueConfig, Worker, WorkerError, WorkerHandle,
     object_store::memory::InMemory, run_worker,
 };
 
@@ -74,17 +74,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bounded_id = q.enqueue("work", b"bounded".to_vec()).await?;
     println!("enqueued {phased_id} (phased) and {bounded_id} (bounded); lease is {LEASE:?}");
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let q2 = q.clone();
-    let handle = tokio::spawn(async move {
+    let handle = WorkerHandle::spawn(std::future::pending(), move |stop| async move {
         run_worker(
             &q2,
             "work",
             &LongRunningWorker,
             Duration::from_millis(50),
-            async move {
-                let _ = shutdown_rx.await;
-            },
+            stop.cancelled_owned(),
         )
         .await
     });
@@ -93,8 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         q.wait_for_completion_timeout(id, Duration::from_secs(15))
             .await?;
     }
-    let _ = shutdown_tx.send(());
-    let _ = handle.await;
+    handle.shutdown().await?;
 
     // Both jobs outlived the lease and still settled on their first attempt:
     // nothing was reaped back to pending or dead-lettered.

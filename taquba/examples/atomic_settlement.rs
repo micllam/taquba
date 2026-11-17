@@ -27,7 +27,8 @@ use std::time::Duration;
 
 use taquba::{
     EnqueueOptions, EnqueueRequest, EnqueueResult, JobRecord, LeaseHandle, Queue,
-    SettlementEffects, Worker, WorkerError, object_store::memory::InMemory, run_worker,
+    SettlementEffects, Worker, WorkerError, WorkerHandle, object_store::memory::InMemory,
+    run_worker,
 };
 
 const ORDERS_QUEUE: &str = "orders";
@@ -116,36 +117,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     submit_order(&q, "1001").await?;
     println!();
 
-    // One worker loop per queue, each stopped via a oneshot once every order is
+    // One worker loop per queue, each shut down once every order is
     // "confirmed".
-    let (orders_tx, orders_rx) = tokio::sync::oneshot::channel::<()>();
-    let (confirm_tx, confirm_rx) = tokio::sync::oneshot::channel::<()>();
     let order_loop = {
         let q = q.clone();
-        tokio::spawn(async move {
+        WorkerHandle::spawn(std::future::pending(), move |stop| async move {
             run_worker(
                 &q,
                 ORDERS_QUEUE,
                 &OrderWorker,
                 Duration::from_millis(50),
-                async move {
-                    let _ = orders_rx.await;
-                },
+                stop.cancelled_owned(),
             )
             .await
         })
     };
     let confirm_loop = {
         let q = q.clone();
-        tokio::spawn(async move {
+        WorkerHandle::spawn(std::future::pending(), move |stop| async move {
             run_worker(
                 &q,
                 CONFIRMATIONS_QUEUE,
                 &ConfirmationWorker,
                 Duration::from_millis(50),
-                async move {
-                    let _ = confirm_rx.await;
-                },
+                stop.cancelled_owned(),
             )
             .await
         })
@@ -166,10 +161,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let _ = orders_tx.send(());
-    let _ = confirm_tx.send(());
-    order_loop.await??;
-    confirm_loop.await??;
+    order_loop.shutdown().await?;
+    confirm_loop.shutdown().await?;
 
     println!();
     for order_id in orders {

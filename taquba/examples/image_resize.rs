@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use taquba::{
     EnqueueOptions, JobRecord, LeaseHandle, OpenOptions, PRIORITY_HIGH, PRIORITY_NORMAL, Queue,
-    QueueConfig, Worker, WorkerError, object_store::memory::InMemory, run_worker,
+    QueueConfig, Worker, WorkerError, WorkerHandle, object_store::memory::InMemory, run_worker,
 };
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -146,17 +146,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Drain the queue.
     println!("Processing (high-priority thumbnails drain first)...");
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let q2 = q.clone();
-    let handle = tokio::spawn(async move {
+    let handle = WorkerHandle::spawn(std::future::pending(), move |stop| async move {
         run_worker(
             &q2,
             "resize",
             &ResizeWorker,
             Duration::from_millis(10),
-            async move {
-                let _ = shutdown_rx.await;
-            },
+            stop.cancelled_owned(),
         )
         .await
     });
@@ -168,8 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let _ = shutdown_tx.send(());
-    let _ = handle.await;
+    handle.shutdown().await?;
 
     let s = q.view().stats("resize").await?;
     println!();
