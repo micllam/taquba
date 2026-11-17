@@ -288,12 +288,14 @@ impl<R: StepRunner> WorkflowRuntime<R> {
     /// with a recorded request keeps the reason of the first request.
     ///
     /// Returns [`CancelRunOutcome::Removed`] or [`CancelRunOutcome::Requested`]
-    /// once the request is recorded on the run's durable record, and
-    /// [`CancelRunOutcome::NotActive`] if the run is unknown or already
-    /// terminal. A run whose current step the queue dead-lettered outside the
-    /// worker is not active, and the worker's dead-step reconciliation
-    /// terminates it as failed. The request reaches a run after a restart and
-    /// from any runtime over the same queue.
+    /// once the request is recorded on the run's durable record and reaches the
+    /// run's current step, and [`CancelRunOutcome::NotActive`] if the run is
+    /// unknown or terminal. A run that terminates after the request is recorded
+    /// and before the request reaches its step is not active either, and its
+    /// termination reports whether the request applied. A run whose current
+    /// step the queue dead-lettered outside the worker is not active, and the
+    /// worker's dead-step reconciliation terminates it as failed. The request
+    /// reaches a run after a restart and from any runtime over the same queue.
     ///
     /// The run terminates as
     /// [`TerminalStatus::Cancelled`](crate::TerminalStatus::Cancelled):

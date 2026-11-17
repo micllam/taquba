@@ -31,11 +31,21 @@ impl RuntimeCore {
         let Some((submission, request)) = self.request_cancel(run_id, reason, origin).await? else {
             return Ok(CancelRunOutcome::NotActive);
         };
-        // Settle the current step now: remove it while it is queued, or fire
-        // the claim's cancellation token, the parent of
-        // `Delivery::cancel_token`, while it runs. A step that settles in
-        // between is followed to its successor. A step claimed after the
-        // request terminates the run on its own.
+        self.cancel_current_step(run_id, submission, &request).await
+    }
+
+    /// Settle the current step of `run_id` for the recorded `request`: remove
+    /// the step while it is queued, or fire the claim's cancellation token, the
+    /// parent of `Delivery::cancel_token`, while it runs. A step that settles
+    /// in between is followed to its successor. A step claimed after the
+    /// request terminates the run on its own, and the call then returns
+    /// [`CancelRunOutcome::NotActive`].
+    pub(super) async fn cancel_current_step(
+        &self,
+        run_id: &RunId,
+        submission: Submission,
+        request: &DurableCancelRequest,
+    ) -> Result<CancelRunOutcome> {
         loop {
             let Some((_, job)) = self.view.current_job(run_id).await? else {
                 // Terminated on its own after the request was recorded.
@@ -66,7 +76,7 @@ impl RuntimeCore {
     /// of `run_id`. Returns the record's submission and the recorded request
     /// when the run is active, `None` otherwise. A run with a recorded request
     /// keeps the first request.
-    async fn request_cancel(
+    pub(super) async fn request_cancel(
         &self,
         run_id: &RunId,
         reason: Option<String>,

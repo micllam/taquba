@@ -441,6 +441,61 @@ async fn cancel_reports_not_active_and_leaves_a_terminated_or_unknown_run() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn cancel_reports_not_active_for_a_run_that_terminates_after_the_request_is_recorded() {
+    // The two phases of `cancel` run with the termination of the run between
+    // them: the request is recorded, and the step settles before the request
+    // reaches it.
+    let (queue, store, _clock) = open_queue_at(10_000).await;
+    let runtime = WorkflowRuntime::builder(
+        queue.clone(),
+        store.clone(),
+        ScriptedRunner::new(vec![StepOutcome::Succeed {
+            result: b"done".to_vec(),
+        }]),
+    )
+    .build()
+    .unwrap();
+    let handle = runtime
+        .submit(RunSpec {
+            input: b"x".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let claim = queue
+        .claim("workflow-steps", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("step 0 is claimable");
+    let core = &runtime.inner.core;
+    let (submission, request) = core
+        .request_cancel(&handle.run_id, None, CancelOrigin::Request)
+        .await
+        .unwrap()
+        .expect("the run is active");
+
+    let effects = runtime
+        .inner
+        .process_step(&claim, &queue.lease_handle(&claim))
+        .await
+        .unwrap();
+    queue.ack_with(&claim, effects).await.unwrap();
+    assert_eq!(
+        core.cancel_current_step(&handle.run_id, submission, &request)
+            .await
+            .unwrap(),
+        CancelRunOutcome::NotActive
+    );
+
+    let outcome = runtime.wait(&handle.run_id).await.unwrap();
+    assert_eq!(outcome.termination.status, TerminalStatus::Cancelled);
+    assert_eq!(
+        outcome.termination.cancelled_by,
+        Some(CancelOrigin::Request)
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn cancelling_a_running_step_overrides_its_outcome_and_writes_its_marker_at_settlement() {
     // Between the request and the settlement the run reports Cancelling and
     // keeps its record without a marker (the queue discards the effects on the
