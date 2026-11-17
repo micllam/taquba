@@ -48,6 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a wait that read the claimed record before the ack returned
   `WaitOutcome::NotFound` when the ack deleted the payload object before the
   wait fetched it.
+- `Queue::renew_lease` and `LeaseHandle::ensure_at_least` fail with
+  `Error::ClaimLost` for a cancelled job whose claim ended or whose lease the
+  reaper took. In 0.17.0 they failed with `Error::CancelRequested`, which
+  reports the claim as still held.
 
 ## [0.17.0] - 2026-11-06
 

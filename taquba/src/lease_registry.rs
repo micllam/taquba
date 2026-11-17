@@ -180,14 +180,14 @@ impl LeaseRegistry {
         if inner.closed {
             return Err(Error::ClaimLost);
         }
-        if cancel.is_cancelled() {
-            return Err(Error::CancelRequested);
-        }
         let key = ClaimKey::new(queue, id, claim_id);
         let old_expires = match inner.by_claim.get(&key) {
             Some(e) if !e.reaping => e.expires_at,
             _ => return Err(Error::ClaimLost),
         };
+        if cancel.is_cancelled() {
+            return Err(Error::CancelRequested);
+        }
         if old_expires == expires_at
             || (matches!(mode, Renewal::Extend) && old_expires > expires_at)
         {
@@ -380,6 +380,21 @@ mod tests {
 
         assert_eq!(registry.take_due(10).len(), 1);
         assert!(renew_set(&registry, "a", 1, 40).is_err());
+    }
+
+    #[test]
+    fn a_lost_claim_is_reported_before_a_cancellation() {
+        let registry = LeaseRegistry::new();
+        let cancel = CancellationToken::new();
+        registry.insert(&qn("q"), "a", 10, 1, cancel.clone());
+        registry.cancel(&qn("q"), "a");
+        let renew = || registry.renew(&qn("q"), "a", 1, &cancel, 40, Renewal::Set);
+        assert!(matches!(renew(), Err(Error::CancelRequested)));
+
+        assert_eq!(registry.take_due(10).len(), 1);
+        assert!(matches!(renew(), Err(Error::ClaimLost)));
+        registry.remove(&qn("q"), "a", 1);
+        assert!(matches!(renew(), Err(Error::ClaimLost)));
     }
 
     #[test]
