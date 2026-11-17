@@ -355,10 +355,13 @@ impl<R: StepRunner> WorkflowRuntime<R> {
     /// Run the step worker loop until `shutdown` resolves. Spawns up to
     /// `max_concurrent_steps` step processors, the dead-step reconciliation
     /// that terminates runs whose step the queue dead-lettered outside the
-    /// worker, a memo-retention sweeper when
-    /// [`WorkflowRuntimeBuilder::memo_retention`] is set and a command worker
-    /// when [`WorkflowRuntimeBuilder::control_queue`] is set, all running in
-    /// parallel. All halt cleanly when `shutdown` resolves or a worker errors.
+    /// worker, a memo sweep when [`WorkflowRuntimeBuilder::memo_retention`] is
+    /// set, a group sweep when [`WorkflowRuntimeBuilder::group_retention`] is
+    /// set and a command worker when [`WorkflowRuntimeBuilder::control_queue`]
+    /// is set, all running in parallel. Every loop stops when `shutdown`
+    /// resolves or the step worker or the command worker returns. The step
+    /// processors finish their in-flight steps first, and the call returns once
+    /// every loop has returned.
     pub async fn run<F>(&self, shutdown: F) -> Result<()>
     where
         F: Future<Output = ()>,
@@ -377,7 +380,7 @@ impl<R: StepRunner> WorkflowRuntime<R> {
 
     /// [`Self::run`] over a token: the worker and the background loops stop
     /// when `stop` is cancelled, and `stop` is cancelled when the worker
-    /// returns on its own, so the background loops halt with it.
+    /// returns on its own, so the background loops stop with it.
     async fn run_with(&self, stop: CancellationToken) -> Result<()>
     where
         R: 'static,
