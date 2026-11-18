@@ -434,7 +434,7 @@ mod tests {
     use crate::test_util::*;
 
     #[tokio::test]
-    async fn a_renewal_extends_a_lease_and_never_shortens_it() {
+    async fn a_renewed_claim_outlives_its_original_expiry_and_settles() {
         let clock = MockClock::new(1_700_000_000_000);
         let opts = OpenOptions {
             clock: Arc::new(clock.clone()),
@@ -452,14 +452,10 @@ mod tests {
             .unwrap();
         let original_expiry = q.lease_expiry(&job).unwrap();
 
-        let new_expiry = q.renew_lease(&job, Duration::from_secs(30)).unwrap();
-        assert!(new_expiry > original_expiry, "renewed expiry must be later");
-        assert_eq!(
-            q.renew_lease(&job, Duration::from_secs(5)).unwrap(),
-            new_expiry,
-            "a shorter renewal keeps the expiry"
-        );
-        assert_eq!(q.lease_expiry(&job), Some(new_expiry));
+        q.lease_handle(&job)
+            .ensure_at_least(Duration::from_secs(30))
+            .unwrap();
+        assert!(q.lease_expiry(&job).unwrap() > original_expiry);
 
         // Reaper skips the renewed lease even after the original expiry passes.
         clock.advance(Duration::from_secs(1));
@@ -503,10 +499,6 @@ mod tests {
 
         let expiry = q.lease_expiry(&job);
         assert!(matches!(
-            q.renew_lease(&job, Duration::from_secs(600)),
-            Err(Error::CancelRequested)
-        ));
-        assert!(matches!(
             lease.ensure_at_least(Duration::from_secs(600)),
             Err(Error::CancelRequested)
         ));
@@ -514,39 +506,6 @@ mod tests {
 
         // The claim is still held, so the delivery settles as usual.
         q.nack(&job, "cancelled").await.unwrap();
-
-        q.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn renewal_leaves_the_claim_settleable() {
-        let clock = MockClock::new(1_700_000_000_000);
-        let opts = OpenOptions {
-            clock: Arc::new(clock.clone()),
-            ..OpenOptions::default()
-        };
-        let q = Queue::open_with_options(make_store(), "test", opts)
-            .await
-            .unwrap();
-
-        q.enqueue("work", b"payload".to_vec()).await.unwrap();
-        let job = q
-            .claim("work", Duration::from_secs(30))
-            .await
-            .unwrap()
-            .unwrap();
-
-        clock.advance(Duration::from_secs(10));
-        let renewed = q.renew_lease(&job, Duration::from_secs(60)).unwrap();
-        assert_eq!(q.lease_expiry(&job), Some(renewed));
-
-        // The claim taken before the renewal keeps its claim id, so it still
-        // settles the delivery.
-        q.ack(&job).await.unwrap();
-
-        let stats = q.view().stats("work").await.unwrap();
-        assert_eq!(stats.done, 1);
-        assert_eq!(stats.claimed, 0);
 
         q.close().await.unwrap();
     }
@@ -618,7 +577,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let renewed = q.renew_lease(&job, Duration::from_secs(60)).unwrap();
+        q.lease_handle(&job)
+            .ensure_at_least(Duration::from_secs(60))
+            .unwrap();
+        let renewed = q.lease_expiry(&job).unwrap();
 
         // The ack removes the lease entry the renewal moved.
         q.ack(&job).await.unwrap();
@@ -631,8 +593,7 @@ mod tests {
 
         // No entry is left to expire, so the reaper does not requeue the job,
         // even past the renewed expiry.
-        assert!(renewed > clock.now_ms());
-        clock.advance(Duration::from_secs(61));
+        clock.advance(Duration::from_millis(renewed - clock.now_ms() + 1));
         q.reap_now().await.unwrap();
         let stats = q.view().stats("work").await.unwrap();
         assert_eq!(stats.done, 1);
@@ -728,13 +689,10 @@ mod tests {
             .unwrap();
         assert_every_claim_has_a_lease_entry(&q).await;
 
-        let renewed = q.renew_lease(&claims[0], Duration::from_secs(90)).unwrap();
+        q.lease_handle(&claims[0])
+            .ensure_at_least(Duration::from_secs(90))
+            .unwrap();
         assert_every_claim_has_a_lease_entry(&q).await;
-        assert!(
-            q.core
-                .lease_registry
-                .contains(&qn("work"), &claims[0].id, renewed)
-        );
 
         q.close().await.unwrap();
     }
@@ -759,10 +717,6 @@ mod tests {
         lease.cancel_token().cancelled().await;
         assert!(matches!(
             lease.ensure_at_least(Duration::from_secs(60)),
-            Err(Error::ClaimLost)
-        ));
-        assert!(matches!(
-            first.renew_lease(&claim, Duration::from_secs(60)),
             Err(Error::ClaimLost)
         ));
 

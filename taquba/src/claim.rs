@@ -14,7 +14,7 @@ use crate::txn::Durable;
 /// [`Queue::ack_with`](crate::Queue::ack_with),
 /// [`Queue::nack`](crate::Queue::nack),
 /// [`Queue::dead_letter`](crate::Queue::dead_letter) and
-/// [`Queue::renew_lease`](crate::Queue::renew_lease). A [`JobRecord`] read
+/// [`Queue::lease_handle`](crate::Queue::lease_handle). A [`JobRecord`] read
 /// through [`QueueView::get_job`](crate::QueueView::get_job) or
 /// [`QueueView::list_jobs`](crate::QueueView::list_jobs) therefore cannot
 /// settle a delivery the caller does not hold.

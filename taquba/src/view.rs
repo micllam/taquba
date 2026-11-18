@@ -869,14 +869,15 @@ mod tests {
         assert_eq!(ids(&page), vec![a.clone(), b.clone(), c.clone()]);
 
         // A renewal leaves the ordering alone.
-        let renewed = q.renew_lease(&ca, Duration::from_secs(600)).unwrap();
+        q.lease_handle(&ca)
+            .ensure_at_least(Duration::from_secs(600))
+            .unwrap();
         let page = q
             .view()
             .list_jobs("work", JobStatus::Claimed, None, 10)
             .await
             .unwrap();
         assert_eq!(ids(&page), vec![a.clone(), b, c]);
-        assert_eq!(q.lease_expiry(&ca), Some(renewed));
 
         drop((cb, cc));
         q.close().await.unwrap();

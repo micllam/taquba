@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   store.
 - Updated slatedb from 0.18.0 to 0.18.1.
 
+### Removed
+
+- `Queue::renew_lease` is removed, so `LeaseHandle::ensure_at_least` is the only
+  call that extends a lease. A caller that claims jobs directly must now extend
+  the lease through `Queue::lease_handle` and read the new expiry with
+  `Queue::lease_expiry`.
+
 ### Fixed
 
 - A claim by id that races another claim of the same job keeps the lease of the
@@ -48,13 +55,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a wait that read the claimed record before the ack returned
   `WaitOutcome::NotFound` when the ack deleted the payload object before the
   wait fetched it.
-- `Queue::renew_lease` and `LeaseHandle::ensure_at_least` fail with
-  `Error::ClaimLost` for a cancelled job whose claim ended or whose lease the
-  reaper took. In 0.17.0 they failed with `Error::CancelRequested`, which
-  reports the claim as still held.
-- `Queue::renew_lease` leaves a lease that already ends later than the extension
-  unchanged and returns its expiry. In 0.17.0 the renewal shortened the lease to
-  the extension.
+- `LeaseHandle::ensure_at_least` fails with `Error::ClaimLost` for a cancelled
+  job whose claim ended or whose lease the reaper took. In 0.17.0 it failed with
+  `Error::CancelRequested`, which reports the claim as still held.
 
 ## [0.17.0] - 2026-11-06
 

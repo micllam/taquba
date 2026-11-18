@@ -49,10 +49,10 @@
 //! job becomes pending at its `run_at`, or earlier through
 //! [`Queue::wake_scheduled`], [`Queue::signal`] or its count reaching zero.
 //!
-//! [`Queue::claim`] puts a job under a lease, and [`Queue::renew_lease`]
-//! extends it. The job returns to pending if the lease expires before the
-//! settlement. Delivery is therefore at least once, so a worker must be
-//! idempotent.
+//! [`Queue::claim`] puts a job under a lease, and the [`LeaseHandle`] of
+//! [`Queue::lease_handle`] extends it. The job returns to pending if the lease
+//! expires before the settlement. Delivery is therefore at least once, so a
+//! worker must be idempotent.
 //!
 //! [`Queue::ack`], [`Queue::nack`] and [`Queue::dead_letter`] settle a claim. A
 //! nack retries the job after a backoff until the attempt limit of its

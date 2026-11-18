@@ -29,7 +29,7 @@ it. A settlement reads the record at that key, and finds it only while the claim
 is live. [The settlement fence](claiming.md#the-settlement-fence) describes the
 check.
 
-Every settlement takes a `&Claim`, and so does [`renew_lease`][renew_lease].
+Every settlement takes a `&Claim`, and so does [`lease_handle`][lease_handle].
 Only the claim calls of `Queue` create a `Claim`. A `JobRecord` contains the
 claim id, but no settlement call takes a `JobRecord`. A worker can therefore
 settle only the claims it owns. A settlement that fails on a transient storage
@@ -118,7 +118,7 @@ worker task                          queue
                                      └───────────────────────────────────┘
 
 reached through the Claim:           reached through the entry:
-ack, nack, dead_letter, renew_lease  the reaper, Queue::cancel
+ack, nack, dead_letter, lease_handle the reaper, Queue::cancel
 ```
 
 The claim id is part of the entry's key, so each claim of a job has its own
@@ -184,7 +184,7 @@ manifest poll, whichever comes first. The poll runs every second.
 [claim-method]: https://docs.rs/taquba/latest/taquba/struct.Queue.html#method.claim
 [claim_batch]: https://docs.rs/taquba/latest/taquba/struct.Queue.html#method.claim_batch
 [claim-struct]: https://docs.rs/taquba/latest/taquba/struct.Claim.html
-[renew_lease]: https://docs.rs/taquba/latest/taquba/struct.Queue.html#method.renew_lease
+[lease_handle]: https://docs.rs/taquba/latest/taquba/struct.Queue.html#method.lease_handle
 [cancel]: https://docs.rs/taquba/latest/taquba/struct.Queue.html#method.cancel
 [lease_registry]: https://github.com/micllam/taquba/blob/master/taquba/src/lease_registry.rs
 [claim]: https://github.com/micllam/taquba/blob/master/taquba/src/claim.rs

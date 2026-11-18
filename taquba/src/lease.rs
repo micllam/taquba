@@ -110,7 +110,9 @@ impl LeaseHandle {
     /// Extend the lease to last at least `remaining` from now when it ends
     /// sooner. An internal margin is added on top of `remaining`, so a delivery
     /// that runs to the requested bound still has lease left to settle in. The
-    /// lease is never shortened.
+    /// lease is never shortened. The renewal is a memory operation without a
+    /// durable write, and [`crate::Queue::lease_expiry`] reports the new
+    /// expiry.
     ///
     /// Call this at progress points of a long-running delivery. For a single
     /// slow call, give the call a timeout and pass that timeout here before

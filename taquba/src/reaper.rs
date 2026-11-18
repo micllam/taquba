@@ -524,7 +524,8 @@ mod tests {
         ));
 
         assert!(matches!(
-            q.renew_lease(&stale, Duration::from_secs(30)),
+            q.lease_handle(&stale)
+                .ensure_at_least(Duration::from_secs(30)),
             Err(Error::ClaimLost)
         ));
 
@@ -604,7 +605,8 @@ mod tests {
         assert!(q.view().kv_get(b"k").await.unwrap().is_none());
 
         assert!(matches!(
-            q.renew_lease(&stale, Duration::from_secs(30)),
+            q.lease_handle(&stale)
+                .ensure_at_least(Duration::from_secs(30)),
             Err(Error::ClaimLost)
         ));
 
@@ -1068,7 +1070,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let elapsed_since_enqueue = q.now_ms().saturating_sub(job.enqueued_at);
+        let elapsed_since_enqueue = q.clock().now_ms().saturating_sub(job.enqueued_at);
         assert!(
             elapsed_since_enqueue > schedule_delay.as_millis() as u64,
             "enqueued_at should be well over {}ms old (was {elapsed_since_enqueue}ms)",

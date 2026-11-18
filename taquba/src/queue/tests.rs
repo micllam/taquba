@@ -1838,7 +1838,6 @@ async fn a_deadline_of_the_maximum_duration_saturates() {
 
     let claim = q.claim("q", Duration::MAX).await.unwrap().unwrap();
     assert_eq!(q.lease_expiry(&claim), Some(u64::MAX));
-    assert_eq!(q.renew_lease(&claim, Duration::MAX).unwrap(), u64::MAX);
     q.lease_handle(&claim)
         .ensure_at_least(Duration::MAX)
         .unwrap();

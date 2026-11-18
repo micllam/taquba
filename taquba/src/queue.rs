@@ -407,12 +407,6 @@ impl Queue {
         &self.core.view
     }
 
-    /// Current time as a Unix timestamp in milliseconds, as read from this
-    /// queue's configured [`Clock`].
-    pub(crate) fn now_ms(&self) -> u64 {
-        self.core.now_ms()
-    }
-
     /// Generate a job id without enqueuing anything.
     ///
     /// For callers that need the id before the enqueue commits, to write a
@@ -431,12 +425,12 @@ impl Queue {
         self.core.configs.get(queue)
     }
 
-    /// Build the lease handle for a claim: the capability the worker loops pass
-    /// to [`Worker::process`](crate::worker::Worker::process). The handle
-    /// extends the lease and exposes the claim's cancellation token but cannot
-    /// settle the job, so a handler never has a claim and a queue together.
-    /// Callers running `Worker::process` from their own claim loop build the
-    /// handle here.
+    /// Build the lease handle for a claim: the capability that extends the
+    /// lease and exposes the claim's cancellation token but cannot settle the
+    /// job. The worker loops pass it to
+    /// [`Worker::process`](crate::worker::Worker::process), so a handler never
+    /// has a claim and a queue together. A caller that claims jobs directly
+    /// renews a lease through this handle.
     pub fn lease_handle(&self, claim: &Claim) -> crate::lease::LeaseHandle {
         crate::lease::LeaseHandle::new(
             self.core.lease_registry.clone(),
@@ -891,45 +885,6 @@ impl Queue {
     #[instrument(skip(self), fields(job_id = %id))]
     pub async fn requeue_dead_job(&self, id: &str) -> Result<()> {
         self.core.requeue_dead_job(id).await
-    }
-
-    /// Extend the lease on a claimed job to `extension` from now, returning the
-    /// new expiry as epoch milliseconds. A lease that already ends later is
-    /// unchanged, and the call returns its expiry.
-    ///
-    /// Call this periodically for long-running jobs to prevent the reaper from
-    /// treating them as abandoned and re-queuing them.
-    ///
-    /// The lease is process state, so renewal is a synchronous memory operation
-    /// without a durable write. The claim is unchanged and stays valid for
-    /// settlement, and [`Self::lease_expiry`] reports the current value.
-    ///
-    /// Fails with [`Error::ClaimLost`] once the claim ended, the reaper began
-    /// re-queuing the expired lease or the store closed. Fails with
-    /// [`Error::CancelRequested`] once [`Self::cancel`] was called on the job,
-    /// and the lease then expires.
-    ///
-    /// This method is for callers that call [`Self::claim`] /
-    /// [`Self::claim_batch`] directly and hold the [`Claim`]. Inside a
-    /// [`Worker::process`](crate::worker::Worker::process) hook the claim stays
-    /// with the worker loop. Extend the lease there through the
-    /// [`crate::LeaseHandle`] that the hook receives.
-    #[instrument(skip(self, claim), fields(queue = %claim.queue, job_id = %claim.id))]
-    pub fn renew_lease(&self, claim: &Claim, extension: Duration) -> Result<u64> {
-        let job = claim.job();
-        let requested = clock::after(self.now_ms(), extension);
-        let (new_expiry, extended) = self.core.lease_registry.renew(
-            &job.queue,
-            &job.id,
-            claim.claim_id(),
-            claim.cancel_token(),
-            requested,
-        )?;
-        if extended {
-            crate::obs::renewed(&job.queue);
-        }
-        debug!(queue = %job.queue, job_id = %job.id, new_expiry, "lease renewed");
-        Ok(new_expiry)
     }
 
     /// The current lease expiry of the claim of `job`, as epoch milliseconds.
